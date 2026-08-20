@@ -30,6 +30,7 @@ const (
 type Broadcast struct {
 	ID                int64
 	Message           string
+	Entities          []MessageEntity
 	TargetMode        BroadcastTargetMode
 	TargetCount       int64
 	MaterializedCount int64

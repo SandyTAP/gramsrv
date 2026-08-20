@@ -3,14 +3,110 @@ package postgres
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	broadcastapp "telesrv/internal/app/broadcast"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+func TestBroadcastDeliveryPreservesAutoEntitiesInHistoryAndUpdates(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	recipient := createLoginCodeDeliveryTestUser(t, ctx, pool, "BroadcastEntities")
+
+	broadcasts := NewBroadcastStore(pool)
+	messages := NewMessageStore(pool)
+	service := broadcastapp.NewService(broadcasts, messages, nil)
+	const text = "اعلان 🚀\n\n@matrixG"
+	want := []domain.MessageEntity{{Type: domain.MessageEntityMention, Offset: 10, Length: 8}}
+	ptsBefore := broadcastWatermark(t, ctx, pool, recipient.ID)
+
+	campaign, err := service.Create(ctx, text, domain.BroadcastTargetSelected, []int64{recipient.ID}, "integration-test")
+	if err != nil {
+		t.Fatalf("Create broadcast: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM broadcasts WHERE id = $1`, campaign.ID)
+	})
+	if campaign.Message != text || !reflect.DeepEqual(campaign.Entities, want) {
+		t.Fatalf("created campaign message/entities = %q/%+v, want %q/%+v", campaign.Message, campaign.Entities, text, want)
+	}
+
+	claims, err := broadcasts.ClaimBroadcastRecipients(ctx, "entity-worker", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimBroadcastRecipients: %v", err)
+	}
+	if len(claims) != 1 || claims[0].BroadcastID != campaign.ID || claims[0].UserID != recipient.ID {
+		t.Fatalf("claims = %+v, want campaign %d recipient %d", claims, campaign.ID, recipient.ID)
+	}
+	msg, err := messages.DeliverBroadcastRecipient(ctx, claims[0])
+	if err != nil {
+		t.Fatalf("DeliverBroadcastRecipient: %v", err)
+	}
+	if msg.Body != text || !reflect.DeepEqual(msg.Entities, want) {
+		t.Fatalf("delivered message body/entities = %q/%+v, want %q/%+v", msg.Body, msg.Entities, text, want)
+	}
+	if msg.Pts != ptsBefore+1 {
+		t.Fatalf("delivered pts = %d, want %d", msg.Pts, ptsBefore+1)
+	}
+
+	entityRows := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{name: "campaign", query: `SELECT entities::text FROM broadcasts WHERE id = $1`, args: []any{campaign.ID}},
+		{name: "logical message", query: `SELECT entities::text FROM private_messages WHERE sender_user_id = $1 AND id = $2`, args: []any{domain.OfficialSystemUserID, msg.UID}},
+		{name: "recipient box", query: `SELECT entities::text FROM message_boxes WHERE owner_user_id = $1 AND box_id = $2`, args: []any{recipient.ID, msg.ID}},
+	}
+	for _, row := range entityRows {
+		var raw string
+		if err := pool.QueryRow(ctx, row.query, row.args...).Scan(&raw); err != nil {
+			t.Fatalf("load %s entities: %v", row.name, err)
+		}
+		got, err := decodeMessageEntities(raw)
+		if err != nil {
+			t.Fatalf("decode %s entities: %v", row.name, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s entities = %+v, want %+v", row.name, got, want)
+		}
+	}
+
+	history, err := messages.ListByUser(ctx, recipient.ID, domain.MessageFilter{
+		HasPeer: true,
+		Peer:    domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("ListByUser: %v", err)
+	}
+	if len(history.Messages) != 1 || history.Messages[0].ID != msg.ID || !reflect.DeepEqual(history.Messages[0].Entities, want) {
+		t.Fatalf("history messages = %+v, want message %d with entities %+v", history.Messages, msg.ID, want)
+	}
+
+	updates := NewUpdateEventStore(pool)
+	events, err := updates.ListAfter(ctx, recipient.ID, ptsBefore, 10)
+	if err != nil {
+		t.Fatalf("ListAfter: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != domain.UpdateEventNewMessage || events[0].Pts != msg.Pts ||
+		events[0].Message.ID != msg.ID || !reflect.DeepEqual(events[0].Message.Entities, want) {
+		t.Fatalf("difference events = %+v, want new message %d/%d with entities %+v", events, msg.ID, msg.Pts, want)
+	}
+	batch, err := updates.BatchByCursor(ctx, []store.EventCursor{{UserID: recipient.ID, Pts: msg.Pts}})
+	if err != nil {
+		t.Fatalf("BatchByCursor: %v", err)
+	}
+	if len(batch) != 1 || batch[0].Message.ID != msg.ID || !reflect.DeepEqual(batch[0].Message.Entities, want) {
+		t.Fatalf("outbox events = %+v, want message %d with entities %+v", batch, msg.ID, want)
+	}
+}
 
 func TestBroadcastSelectedClaimsAreDisjointAndDeliveryIsIncomingOnly(t *testing.T) {
 	pool := testPool(t)
@@ -19,7 +115,7 @@ func TestBroadcastSelectedClaimsAreDisjointAndDeliveryIsIncomingOnly(t *testing.
 	secondUser := createLoginCodeDeliveryTestUser(t, ctx, pool, "BroadcastSecond")
 
 	broadcasts := NewBroadcastStore(pool)
-	campaign, err := broadcasts.CreateBroadcast(ctx, "maintenance complete", domain.BroadcastTargetSelected, []int64{firstUser.ID, secondUser.ID}, "integration-test")
+	campaign, err := broadcasts.CreateBroadcast(ctx, "maintenance complete", nil, domain.BroadcastTargetSelected, []int64{firstUser.ID, secondUser.ID}, "integration-test")
 	if err != nil {
 		t.Fatalf("CreateBroadcast: %v", err)
 	}
@@ -110,7 +206,7 @@ func TestBroadcastAllMaterializationUsesCreationHighWaterAndBoundedKeysets(t *te
 	secondUser := createLoginCodeDeliveryTestUser(t, ctx, pool, "BroadcastAllSecond")
 
 	broadcasts := NewBroadcastStore(pool)
-	campaign, err := broadcasts.CreateBroadcast(ctx, "all users", domain.BroadcastTargetAll, nil, "integration-test")
+	campaign, err := broadcasts.CreateBroadcast(ctx, "all users", nil, domain.BroadcastTargetAll, nil, "integration-test")
 	if err != nil {
 		t.Fatalf("CreateBroadcast all: %v", err)
 	}
