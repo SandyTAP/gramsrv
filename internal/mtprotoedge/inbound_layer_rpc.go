@@ -876,6 +876,7 @@ func (s *Server) prepareAdmittedLayerRPCReplay(ctx context.Context, c *Conn, msg
 		return nil, nil
 	}
 	ctx = s.withLayerRPCProfileEvidenceFresh(ctx, profileEvidenceFresh)
+	ctx = s.withLayerRPCIdentityHint(ctx, c)
 	after, err := preparer.PrepareAdmittedReplay(ctx, c.authKeyID, c.sessionID, msgID, admissionSeq, request)
 	if err != nil {
 		s.log.Warn("Prepare exact RPC replay side effects failed",
@@ -897,6 +898,36 @@ func (s *Server) withLayerRPCProfileEvidenceFresh(ctx context.Context, fresh boo
 		}
 	}
 	return ctx
+}
+
+func (s *Server) withLayerRPCIdentityHint(ctx context.Context, c *Conn) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil || c == nil {
+		return ctx
+	}
+	decorator, ok := s.layerRPC.(LayerRPCIdentityHintContext)
+	if !ok {
+		return ctx
+	}
+	businessAuthKeyID, businessResolved := c.BusinessAuthKeyID()
+	userID, userResolved := c.UserIDResolved()
+	decorated := decorator.WithLayerRPCIdentityHint(ctx, LayerRPCIdentityHint{
+		RawAuthKeyID:                c.AuthKeyID(),
+		SessionID:                   c.SessionID(),
+		BusinessAuthKeyID:           businessAuthKeyID,
+		BusinessAuthKeyResolved:     businessResolved,
+		UserID:                      userID,
+		UserIDResolved:              userResolved,
+		RawAuthKeyExpiresAt:         c.AuthKeyExpiresAt(),
+		RawAuthKeyExpiresAtResolved: true,
+		SessionUpdatesReady:         s.conns != nil && s.conns.ReceivesUpdatesForAuthKey(c.AuthKeyID(), c.SessionID()),
+	})
+	if decorated == nil {
+		return ctx
+	}
+	return decorated
 }
 
 // admitInboundLayerRPC is the force-style compatibility entry point used by

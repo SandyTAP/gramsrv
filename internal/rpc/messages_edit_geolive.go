@@ -87,7 +87,9 @@ func (r *Router) onEditMessageLiveLocation(ctx context.Context, req *tg.Messages
 			return nil, channelEditErr(err)
 		}
 		updates := r.channelEditMessageUpdates(ctx, userID, res)
-		r.enqueueChannelEditMessageFanout(ctx, userID, res)
+		if err := r.enqueueChannelEditMessageFanout(ctx, userID, res); err != nil {
+			return nil, internalErr()
+		}
 		return updates, nil
 	}
 	if peer.Type != domain.PeerTypeUser || r.deps.Messages == nil {

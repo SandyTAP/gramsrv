@@ -9,7 +9,7 @@ import (
 
 type BroadcastStore interface {
 	PreviewBroadcastRecipients(ctx context.Context, mode domain.BroadcastTargetMode, selectedUserIDs []int64) (int64, error)
-	CreateBroadcast(ctx context.Context, message string, mode domain.BroadcastTargetMode, selectedUserIDs []int64, createdBy string) (domain.Broadcast, error)
+	CreateBroadcast(ctx context.Context, message string, entities []domain.MessageEntity, mode domain.BroadcastTargetMode, selectedUserIDs []int64, createdBy string) (domain.Broadcast, error)
 	MaterializeBroadcastRecipients(ctx context.Context, limit int) (int, error)
 	ClaimBroadcastRecipients(ctx context.Context, leaseToken string, limit int, lease time.Duration) ([]BroadcastRecipientClaim, error)
 	ReleaseBroadcastRecipient(ctx context.Context, claim BroadcastRecipientClaim, cause string) error
@@ -26,5 +26,4 @@ type BroadcastRecipientClaim struct {
 	UserID      int64
 	Attempts    int
 	LeaseToken  string
-	Message     string
 }

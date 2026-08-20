@@ -15,11 +15,13 @@ import (
 	appchannels "telesrv/internal/app/channels"
 	appsecret "telesrv/internal/app/secretchat"
 	"telesrv/internal/domain"
+	"telesrv/internal/edgecontrol"
 	"telesrv/internal/postresponse"
+	"telesrv/internal/rpcidentity"
 	"telesrv/internal/store/memory"
 )
 
-func dispatchForReceivesUpdates(t *testing.T, sessions SessionBinder, wrapWithoutUpdates, loggedIn bool) context.Context {
+func dispatchForReceivesUpdates(t *testing.T, sessions EdgeController, wrapWithoutUpdates, loggedIn bool) context.Context {
 	t.Helper()
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
 
@@ -95,7 +97,9 @@ func TestInvokeWithoutUpdatesBaselineCommitsResultAndSecretEventsWithoutSubscrib
 	authKeyID := [8]byte{21}
 	deviceKey := businessAuthKeyInt64(authKeyID)
 	queue := memory.NewEncryptedQueueStore()
-	secret := appsecret.NewService(memory.NewSecretChatStore(), queue)
+	secretStore := memory.NewSecretChatStore()
+	secretStore.AttachEncryptedStateEvents(queue)
+	secret := appsecret.NewService(secretStore, queue)
 	eventID, err := queue.AppendStateEvent(context.Background(), domain.EncryptedStateEvent{
 		TargetUserID: userID,
 		ChatID:       77,
@@ -167,6 +171,132 @@ type fifoFlushCaptureSessions struct {
 	flushed []int
 }
 
+func (s *fifoFlushCaptureSessions) BeginSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, _ int64) (int64, edgecontrol.ChannelMembershipSyncDisposition, error) {
+	return 1, edgecontrol.ChannelMembershipSyncAcquired, nil
+}
+
+func (s *fifoFlushCaptureSessions) CommitSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, _ int64, _ int64) (bool, error) {
+	s.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, true)
+	return true, nil
+}
+
+type pagingChannelService struct {
+	*appchannels.Service
+	ids   []int64
+	calls []int64
+}
+
+func (s *pagingChannelService) ActiveChannelIDsForUser(_ context.Context, _ int64, afterChannelID int64, limit int) ([]int64, error) {
+	s.calls = append(s.calls, afterChannelID)
+	start := 0
+	for start < len(s.ids) && s.ids[start] <= afterChannelID {
+		start++
+	}
+	end := min(start+limit, len(s.ids))
+	return append([]int64(nil), s.ids[start:end]...), nil
+}
+
+type pagingMembershipSessions struct {
+	*captureSessions
+	pages       [][]int64
+	committed   bool
+	aborted     bool
+	disposition edgecontrol.ChannelMembershipSyncDisposition
+}
+
+func (s *pagingMembershipSessions) BeginSessionChannelMembershipSync(context.Context, [8]byte, int64, int64) (int64, edgecontrol.ChannelMembershipSyncDisposition, error) {
+	disposition := s.disposition
+	if disposition == "" {
+		disposition = edgecontrol.ChannelMembershipSyncAcquired
+	}
+	return 77, disposition, nil
+}
+
+func (s *pagingMembershipSessions) AppendSessionChannelMembershipSync(_ context.Context, _ [8]byte, _ int64, _ int64, syncID int64, channelIDs []int64) error {
+	if syncID != 77 {
+		return errors.New("unexpected membership sync id")
+	}
+	s.pages = append(s.pages, append([]int64(nil), channelIDs...))
+	return nil
+}
+
+func (s *pagingMembershipSessions) CommitSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, _ int64, syncID int64) (bool, error) {
+	if syncID != 77 {
+		return false, errors.New("unexpected membership sync id")
+	}
+	s.committed = true
+	s.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, true)
+	return true, nil
+}
+
+func (s *pagingMembershipSessions) AbortSessionChannelMembershipSync(context.Context, [8]byte, int64, int64, int64) {
+	s.aborted = true
+}
+
+func TestSessionChannelMembershipBootstrapStreamsBoundedPages(t *testing.T) {
+	const membershipCount = 2500
+	ids := make([]int64, membershipCount)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	channels := &pagingChannelService{
+		Service: appchannels.NewService(memory.NewChannelStore()),
+		ids:     ids,
+	}
+	sessions := &pagingMembershipSessions{captureSessions: &captureSessions{}}
+	r := New(Config{}, Deps{Sessions: sessions, Channels: channels}, zaptest.NewLogger(t), clock.System)
+	r.syncSessionChannelMembershipsForSession(context.Background(), 1000000110, [8]byte{1}, 76)
+
+	if !sessions.committed || sessions.aborted {
+		t.Fatalf("membership sync completion = committed:%v aborted:%v", sessions.committed, sessions.aborted)
+	}
+	wantPageSizes := []int{channelMembershipSyncPageSize, channelMembershipSyncPageSize, membershipCount - 2*channelMembershipSyncPageSize}
+	if len(sessions.pages) != len(wantPageSizes) {
+		t.Fatalf("append pages = %d, want %d", len(sessions.pages), len(wantPageSizes))
+	}
+	for i, want := range wantPageSizes {
+		if got := len(sessions.pages[i]); got != want {
+			t.Fatalf("append page %d size = %d, want %d", i, got, want)
+		}
+	}
+	if got, want := channels.calls, []int64{0, int64(channelMembershipSyncPageSize), int64(2 * channelMembershipSyncPageSize)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("channel page cursors = %v, want %v", got, want)
+	}
+}
+
+func TestSessionChannelMembershipBootstrapCoalescesInProgress(t *testing.T) {
+	channels := &pagingChannelService{Service: appchannels.NewService(memory.NewChannelStore()), ids: []int64{1, 2, 3}}
+	sessions := &pagingMembershipSessions{
+		captureSessions: &captureSessions{},
+		disposition:     edgecontrol.ChannelMembershipSyncInProgress,
+	}
+	r := New(Config{}, Deps{Sessions: sessions, Channels: channels}, zaptest.NewLogger(t), clock.System)
+	r.syncSessionChannelMembershipsForSession(context.Background(), 1000000110, [8]byte{1}, 76)
+	if len(channels.calls) != 0 || len(sessions.pages) != 0 || sessions.committed || sessions.aborted {
+		t.Fatalf("coalesced sync performed work: calls=%v pages=%v committed=%v aborted=%v",
+			channels.calls, sessions.pages, sessions.committed, sessions.aborted)
+	}
+}
+
+func TestMaybeMarkSessionReceivesUpdatesTrustsEdgeReadyHint(t *testing.T) {
+	rawAuthKeyID := [8]byte{0x44}
+	const sessionID = int64(44)
+	const userID = int64(1000000044)
+	sessions := &captureSessions{}
+	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	ctx := postresponse.WithCallbacks(WithRawAuthKeyID(WithSessionID(WithUserID(context.Background(), userID), sessionID), rawAuthKeyID))
+	ctx = r.WithLayerRPCIdentityHint(ctx, rpcidentity.LayerRPCIdentityHint{
+		RawAuthKeyID:        rawAuthKeyID,
+		SessionID:           sessionID,
+		SessionUpdatesReady: true,
+	})
+	r.maybeMarkSessionReceivesUpdates(ctx)
+	postresponse.Run(ctx)
+	if got := sessions.snapshot(); got.receivesCalls != 0 {
+		t.Fatalf("Edge-ready hint staged readiness calls=%d", got.receivesCalls)
+	}
+}
+
 func (s *fifoFlushCaptureSessions) SetReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64, receives bool) {
 	if receives {
 		s.flushMu.Lock()
@@ -236,6 +366,46 @@ func TestDispatchDefersMembershipAndFIFOFlushUntilPostResponse(t *testing.T) {
 	}
 	if !sessions.snapshot().receives {
 		t.Fatal("session not ready after result delivery")
+	}
+}
+
+func TestCoreExecPostResponseActionSyncsMembershipWithExplicitSession(t *testing.T) {
+	const (
+		userID    = int64(1000000112)
+		sessionID = int64(88)
+	)
+	rawAuthKeyID := [8]byte{9, 8, 7}
+	channelSvc := appchannels.NewService(memory.NewChannelStore())
+	created, err := channelSvc.CreateMegagroupFromCreateChat(context.Background(), userID, domain.CreateChannelRequest{
+		Title: "coreexec delivery barrier",
+		Date:  1700000001,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	sessions := &captureSessions{membershipSyncAcquired: true}
+	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
+		Sessions: sessions,
+		Channels: channelSvc,
+	}, zaptest.NewLogger(t), clock.System)
+
+	err = r.RunPostResponseActions(context.Background(), []postresponse.Action{{
+		Kind: postresponse.ActionUpdatesDelivery,
+		UpdatesDelivery: postresponse.UpdatesDeliveryAction{
+			MarkSessionReady: true,
+			ReadyRawAuthKey:  rawAuthKeyID,
+			ReadySessionID:   sessionID,
+			ReadyUserID:      userID,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("run post-response actions: %v", err)
+	}
+	if got := sessions.onlineChannelMemberIDs(created.Channel.ID); !reflect.DeepEqual(got, []int64{userID}) {
+		t.Fatalf("membership after coreexec action = %v, want [%d]", got, userID)
+	}
+	if got := sessions.snapshot(); !got.receives || got.sessionID != sessionID {
+		t.Fatalf("ready after coreexec action = receives:%v session:%d, want receives true session %d", got.receives, got.sessionID, sessionID)
 	}
 }
 

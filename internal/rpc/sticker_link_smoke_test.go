@@ -191,12 +191,13 @@ func TestStickersBotCreatePackLinkInstallIsolationSmoke(t *testing.T) {
 	messagesService := appmessages.NewService(messageStore, dialogStore,
 		appmessages.WithBotResponder(botsService))
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Account:  accountService,
-		Users:    appusers.NewService(userStore),
-		Messages: messagesService,
-		Files:    files,
-		Polls:    apppolls.NewService(pollStore),
-		Sessions: &captureSessions{},
+		Account:       accountService,
+		Users:         appusers.NewService(userStore),
+		Messages:      messagesService,
+		Files:         files,
+		Polls:         apppolls.NewService(pollStore),
+		Sessions:      &captureSessions{},
+		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
 	}, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(r)
 	botsService.SetTextDraftPusher(r)

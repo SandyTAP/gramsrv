@@ -13,24 +13,25 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func TestAccountUpdateBirthdayPersistsFullUserAndPushesRefresh(t *testing.T) {
+func TestAccountUpdateBirthdayPersistsFullUserAndQueuesRefresh(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550003301", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	sessions := &captureSessions{}
 	router := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 
 	birthday := tg.Birthday{Day: 14, Month: 2}
 	birthday.SetYear(1990)
 	req := &tg.AccountUpdateBirthdayRequest{}
 	req.SetBirthday(birthday)
-	callCtx := WithSessionID(WithUserID(ctx, owner.ID), 4242)
+	authKeyID := [8]byte{4, 2, 4, 2}
+	callCtx := WithRawAuthKeyID(WithSessionID(WithUserID(ctx, owner.ID), 4242), authKeyID)
 	ok, err := router.onAccountUpdateBirthday(callCtx, req)
 	if err != nil || !ok {
 		t.Fatalf("update birthday = ok %v err %v, want true/nil", ok, err)
@@ -57,14 +58,15 @@ func TestAccountUpdateBirthdayPersistsFullUserAndPushesRefresh(t *testing.T) {
 		t.Fatalf("full user birthday = %+v yearOK=%v, want 14/2/1990", gotBirthday, gotYearOK)
 	}
 
-	snap := sessions.snapshot()
-	if snap.userID != owner.ID || snap.sessionID != 4242 {
-		t.Fatalf("push target user/session = %d/%d, want %d/4242", snap.userID, snap.sessionID, owner.ID)
+	items := delivery.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("delivery rows = %d, want 1", len(items))
 	}
-	updates, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", snap.message)
+	if items[0].TargetUserID != owner.ID || items[0].ExcludeSessionID != 4242 || items[0].ExcludeAuthKeyID != authKeyID {
+		t.Fatalf("delivery target/exclude = user %d session %d auth %v, want user %d session 4242 auth %v",
+			items[0].TargetUserID, items[0].ExcludeSessionID, items[0].ExcludeAuthKeyID, owner.ID, authKeyID)
 	}
+	updates := lastQueuedDeliveryUpdates(t, delivery)
 	hasUserUpdate := false
 	for _, update := range updates.Updates {
 		if u, ok := update.(*tg.UpdateUser); ok && u.UserID == owner.ID {

@@ -7,9 +7,10 @@ import (
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/edgecontrol"
 )
 
-const channelMembershipSyncPageSize = domain.MaxSynchronousChannelDialogFanout
+const channelMembershipSyncPageSize = edgecontrol.MaxChannelMembershipSyncPage
 const publicChannelSubscriptionTTL = 75 * time.Second
 
 func (r *Router) trackChannelInterest(ctx context.Context, userID int64, channelIDs ...int64) {
@@ -62,10 +63,6 @@ func (r *Router) syncSessionChannelMemberships(ctx context.Context, userID int64
 	if userID == 0 || r.deps.Sessions == nil || r.deps.Channels == nil {
 		return
 	}
-	provider, ok := r.deps.Sessions.(OnlineUserProvider)
-	if !ok {
-		return
-	}
 	rawAuthKeyID, ok := RawAuthKeyIDFrom(ctx)
 	if !ok {
 		return
@@ -74,11 +71,51 @@ func (r *Router) syncSessionChannelMemberships(ctx context.Context, userID int64
 	if !ok {
 		return
 	}
-	// 在读取持久成员列表之前采样修订号：读取窗口内若发生增量 join/leave
-	// （AddUserChannelMembership/RemoveUserChannelMembership），全量替换会覆盖增量，
-	// SetSessionChannelMemberships 据此改走合并路径并保持未就绪重试。
-	expectedGen := provider.ChannelMembershipGeneration(rawAuthKeyID, sessionID)
-	channelIDs := make([]int64, 0, channelMembershipSyncPageSize)
+	r.syncSessionChannelMembershipsForSession(ctx, userID, rawAuthKeyID, sessionID)
+}
+
+func (r *Router) syncSessionChannelMembershipsForSession(ctx context.Context, userID int64, rawAuthKeyID [8]byte, sessionID int64) {
+	if userID == 0 || rawAuthKeyID == ([8]byte{}) || sessionID == 0 || r.deps.Sessions == nil {
+		return
+	}
+	provider, ok := r.deps.Sessions.(OnlineUserProvider)
+	if !ok {
+		return
+	}
+	// Edge owns the staging generation. Pages are sent as they are read so a
+	// large account never builds one unbounded Core heap slice or one oversized
+	// Core->Edge control command. Another synced session for the same user on
+	// this Edge may satisfy Begin immediately without a PostgreSQL scan.
+	syncID, disposition, err := provider.BeginSessionChannelMembershipSync(ctx, rawAuthKeyID, sessionID, userID)
+	if err != nil {
+		r.log.Warn("begin session channel membership sync failed", zap.Int64("user_id", userID), zap.Error(err))
+		return
+	}
+	switch disposition {
+	case edgecontrol.ChannelMembershipSyncPrepared:
+		return
+	case edgecontrol.ChannelMembershipSyncInProgress:
+		r.log.Debug("session channel membership sync already in progress", zap.Int64("user_id", userID))
+		return
+	case edgecontrol.ChannelMembershipSyncAcquired:
+		// This caller exclusively owns syncID and is the only one allowed to
+		// stream pages and commit.
+	default:
+		r.log.Warn("begin session channel membership sync returned invalid disposition",
+			zap.Int64("user_id", userID),
+			zap.String("disposition", string(disposition)))
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			provider.AbortSessionChannelMembershipSync(context.Background(), rawAuthKeyID, sessionID, userID, syncID)
+		}
+	}()
+	if r.deps.Channels == nil {
+		r.log.Warn("session channel membership sync missing channel authority", zap.Int64("user_id", userID))
+		return
+	}
 	after := int64(0)
 	for {
 		page, err := r.deps.Channels.ActiveChannelIDsForUser(ctx, userID, after, channelMembershipSyncPageSize)
@@ -93,21 +130,40 @@ func (r *Router) syncSessionChannelMemberships(ctx context.Context, userID int64
 			break
 		}
 		progressed := false
+		validPage := make([]int64, 0, len(page))
 		for _, channelID := range page {
 			if channelID == 0 {
 				continue
 			}
-			channelIDs = append(channelIDs, channelID)
+			validPage = append(validPage, channelID)
 			if channelID > after {
 				after = channelID
 				progressed = true
+			}
+		}
+		if len(validPage) > 0 {
+			if err := provider.AppendSessionChannelMembershipSync(ctx, rawAuthKeyID, sessionID, userID, syncID, validPage); err != nil {
+				r.log.Warn("append session channel membership sync failed",
+					zap.Int64("user_id", userID),
+					zap.Int64("after_channel_id", after),
+					zap.Int("page_size", len(validPage)),
+					zap.Error(err))
+				return
 			}
 		}
 		if !progressed || len(page) < channelMembershipSyncPageSize {
 			break
 		}
 	}
-	provider.SetSessionChannelMemberships(rawAuthKeyID, sessionID, userID, channelIDs, expectedGen)
+	synced, err := provider.CommitSessionChannelMembershipSync(ctx, rawAuthKeyID, sessionID, userID, syncID)
+	if err != nil {
+		r.log.Warn("commit session channel membership sync failed", zap.Int64("user_id", userID), zap.Error(err))
+		return
+	}
+	committed = true
+	if !synced {
+		r.log.Debug("session channel membership sync raced; next RPC will retry", zap.Int64("user_id", userID))
+	}
 }
 
 func (r *Router) addOnlineChannelMemberships(channelID int64, userIDs ...int64) {

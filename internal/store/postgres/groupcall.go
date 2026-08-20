@@ -814,30 +814,17 @@ LIMIT $2`, checkOlderThan, limit)
 	return out, nil
 }
 
-func (s *GroupCallStore) ResetAllParticipants(ctx context.Context, now int) ([]domain.GroupCall, error) {
-	rows, err := s.db.Query(ctx, `
-SELECT DISTINCT c.call_id
-FROM group_calls c
-JOIN group_call_participants p ON p.call_id = c.call_id AND NOT p.left_call
-WHERE c.state = 'active'`)
-	if err != nil {
-		return nil, fmt.Errorf("list active group calls: %w", err)
-	}
-	var callIDs []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		callIDs = append(callIDs, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+func (s *GroupCallStore) ResetParticipantsForCalls(ctx context.Context, callIDs []int64, now int) ([]domain.GroupCall, error) {
 	var out []domain.GroupCall
+	seen := make(map[int64]struct{}, len(callIDs))
 	for _, callID := range callIDs {
+		if callID <= 0 {
+			continue
+		}
+		if _, ok := seen[callID]; ok {
+			continue
+		}
+		seen[callID] = struct{}{}
 		tx, err := s.begin(ctx, "reset group call participants")
 		if err != nil {
 			return out, err

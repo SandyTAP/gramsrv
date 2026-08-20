@@ -142,7 +142,9 @@ func (r *Router) onMessagesEditMessage(ctx context.Context, req *tg.MessagesEdit
 		updates := r.channelEditMessageUpdates(ctx, userID, res)
 		// 编辑 fan-out 异步化 + 跨 viewer 投影预热（设计 Phase 0/Phase 1；P1-x bot 高频 editMessage
 		// 是稳态放大源）。同步 echo 仍走上面单 viewer 的 channelEditMessageUpdates。
-		r.enqueueChannelEditMessageFanout(ctx, userID, res)
+		if err := r.enqueueChannelEditMessageFanout(ctx, userID, res); err != nil {
+			return nil, internalErr()
+		}
 		return updates, nil
 	}
 	if peer.Type != domain.PeerTypeUser || r.deps.Messages == nil {
@@ -173,7 +175,9 @@ func (r *Router) onMessagesEditMessage(ctx context.Context, req *tg.MessagesEdit
 	if err != nil {
 		return nil, messageEditErr(err)
 	}
-	r.enqueueBotAPIPrivateEditUpdatesAsync(ctx, res)
+	if err := r.enqueueBotAPIPrivateEditUpdatesAsync(ctx, res); err != nil {
+		return nil, internalErr()
+	}
 	self := res.Self()
 	if self.Event.Pts == 0 || self.Message.ID == 0 {
 		return nil, messageIDInvalidErr()

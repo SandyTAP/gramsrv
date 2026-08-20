@@ -729,9 +729,9 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 		}
 	}
 	r.invalidateRPCProjectionForViewer(userID)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	if hasNote {
-		r.pushContactNoteRefreshIfReliableDispatch(ctx, userID, peerUser)
+		r.pushContactNoteRefreshAfterDurableReset(ctx, userID, peerUser)
 	}
 	return updates, nil
 }
@@ -775,7 +775,7 @@ func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserCla
 	}
 
 	r.invalidateRPCProjectionForViewer(userID)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	return updates, nil
 }
 
@@ -838,7 +838,7 @@ func (r *Router) onContactsDeleteContacts(ctx context.Context, ids []tg.InputUse
 	r.invalidateRPCProjectionForViewer(userID)
 	r.applyUsernamesToPeerObjects(ctx, users, nil)
 	out := &tg.Updates{Updates: updates, Users: users, Date: int(r.clock.Now().Unix())}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, out)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }
 
@@ -870,14 +870,10 @@ func (r *Router) onContactsUpdateContactNote(ctx context.Context, req *tg.Contac
 	}
 	r.invalidateRPCProjectionForViewer(userID)
 	peerUser := contactUserForUpdates(contact)
-	if r.hasReliableUpdateDispatch() {
-		// contactsReset is already delivered by the durable outbox. updateUser
-		// is intentionally a transient online refresh hint and must not copy a
-		// private note into the shared update log.
-		r.pushContactNoteRefreshIfReliableDispatch(ctx, userID, peerUser)
-	} else {
-		r.pushUserUpdates(ctx, userID, r.contactNoteRefreshUpdates(ctx, userID, peerUser, int(r.clock.Now().Unix()), true))
-	}
+	// contactsReset is delivered by durable outbox + Egress. updateUser is
+	// intentionally a transient online refresh hint and must not copy a private
+	// note into the shared update log.
+	r.pushContactNoteRefreshAfterDurableReset(ctx, userID, peerUser)
 	return true, nil
 }
 
@@ -1079,12 +1075,12 @@ func (r *Router) contactNoteRefreshUpdates(ctx context.Context, viewerUserID int
 	return out
 }
 
-// pushContactNoteRefreshIfReliableDispatch complements the durable
-// contactsReset event. Reliable dispatch already owns the reset, while this
-// best-effort online nudge makes other loaded TDesktop profiles refetch
-// users.getFullUser immediately. Offline correctness does not depend on it.
-func (r *Router) pushContactNoteRefreshIfReliableDispatch(ctx context.Context, userID int64, peerUser domain.User) {
-	if !r.hasReliableUpdateDispatch() || peerUser.ID == 0 {
+// pushContactNoteRefreshAfterDurableReset complements the durable contactsReset
+// event. Egress already owns the reset, while this transient online nudge makes
+// other loaded TDesktop profiles refetch users.getFullUser immediately. Offline
+// correctness does not depend on it.
+func (r *Router) pushContactNoteRefreshAfterDurableReset(ctx context.Context, userID int64, peerUser domain.User) {
+	if r.deps.Updates == nil || peerUser.ID == 0 {
 		return
 	}
 	r.pushUserMessageTransient(
@@ -1146,12 +1142,12 @@ func (r *Router) recordAcceptedContactTargetUpdates(ctx context.Context, userID,
 	}
 	updates := r.contactPeerSettingsUpdates(ctx, targetUserID, peerUser, settings, true)
 	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, targetUserID, updates)
+	r.requireReliableDispatchForUserUpdate(ctx, targetUserID, updates)
 	return nil
 }
 
 func (r *Router) pushContactsReset(ctx context.Context, userID int64) {
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateContactsReset{}},
 		Date:    int(r.clock.Now().Unix()),
 		Seq:     0,
@@ -1205,20 +1201,21 @@ func (r *Router) recordPeerSettingsForUser(ctx context.Context, stateAuthKeyID [
 	return err
 }
 
-type reliableUpdateDispatchReporter interface {
-	UsesReliableDispatch() bool
-}
-
-func (r *Router) hasReliableUpdateDispatch() bool {
-	reporter, ok := r.deps.Updates.(reliableUpdateDispatchReporter)
-	return ok && reporter.UsesReliableDispatch()
-}
-
-func (r *Router) pushUserUpdatesIfNoReliableDispatch(ctx context.Context, userID int64, updates *tg.Updates) {
-	if r.hasReliableUpdateDispatch() {
+// requireReliableDispatchForUserUpdate keeps Core/RPC fail-closed: durable user
+// updates must flow through transactional outbox + independent Egress, never a
+// Core-owned session delivery side channel.
+func (r *Router) requireReliableDispatchForUserUpdate(_ context.Context, userID int64, updates *tg.Updates) {
+	if r.deps.Updates != nil {
 		return
 	}
-	r.pushUserUpdates(ctx, userID, updates)
+	count := 0
+	if updates != nil {
+		count = len(updates.Updates)
+	}
+	r.log.Error("durable user update missing Updates service",
+		zap.Int64("user_id", userID),
+		zap.Int("updates", count),
+	)
 }
 
 func (r *Router) pushUserUpdates(ctx context.Context, userID int64, updates *tg.Updates) int {

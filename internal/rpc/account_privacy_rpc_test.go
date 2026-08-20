@@ -19,14 +19,17 @@ func TestAccountPrivacyAllKeysRoundTripWithoutAdvancingPts(t *testing.T) {
 	const userID int64 = 8101
 	authKeyID := [8]byte{8, 1}
 	sessionID := int64(81)
-	privacy := appprivacy.NewService(memory.NewPrivacyStore(), memory.NewContactStore())
+	privacyStore := memory.NewPrivacyStore()
+	delivery := attachPrivacyDeliveryOutbox(privacyStore)
+	privacy := appprivacy.NewService(privacyStore, memory.NewContactStore())
 	events := memory.NewUpdateEventStore()
 	updates := appupdates.NewService(memory.NewUpdateStateStore(), events)
 	sessions := &captureSessions{}
 	router := New(Config{}, Deps{
-		Privacy:  privacy,
-		Updates:  updates,
-		Sessions: sessions,
+		Privacy:        privacy,
+		Updates:        updates,
+		Sessions:       sessions,
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 	requestCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, userID), authKeyID), sessionID)
 
@@ -52,7 +55,7 @@ func TestAccountPrivacyAllKeysRoundTripWithoutAdvancingPts(t *testing.T) {
 		{"saved_music", &tg.InputPrivacyKeySavedMusic{}, domain.PrivacyKeySavedMusic, func(v tg.PrivacyKeyClass) bool { _, ok := v.(*tg.PrivacyKeySavedMusic); return ok }},
 	}
 
-	for _, test := range keys {
+	for i, test := range keys {
 		t.Run(test.name, func(t *testing.T) {
 			gotKey, ok := domainPrivacyKeyFromInput(test.input)
 			if !ok || gotKey != test.domain {
@@ -84,30 +87,29 @@ func TestAccountPrivacyAllKeysRoundTripWithoutAdvancingPts(t *testing.T) {
 			if _, ok := get.Rules[0].(*tg.PrivacyValueDisallowAll); !ok {
 				t.Fatalf("getPrivacy rule=%T, want disallowAll", get.Rules[0])
 			}
-			pushed, ok := sessions.lastUserPush().(*tg.Updates)
-			if !ok || len(pushed.Updates) != 1 {
-				t.Fatalf("online push=%T/%+v, want one updatePrivacy", sessions.lastUserPush(), pushed)
+			items := delivery.Snapshot()
+			if len(items) != i+1 {
+				t.Fatalf("delivery outbox items=%d, want %d", len(items), i+1)
+			}
+			item := items[len(items)-1]
+			if item.TargetUserID != userID || item.ExcludeAuthKeyID != authKeyID || item.ExcludeSessionID != sessionID {
+				t.Fatalf("delivery outbox target/exclusion=%+v, want user %d excluding %x/%d", item, userID, authKeyID, sessionID)
+			}
+			pushed := lastQueuedDeliveryUpdates(t, delivery)
+			if len(pushed.Updates) != 1 {
+				t.Fatalf("delivery payload updates=%d, want one updatePrivacy", len(pushed.Updates))
 			}
 			privacyUpdate, ok := pushed.Updates[0].(*tg.UpdatePrivacy)
 			if !ok {
-				t.Fatalf("online push update=%T, want updatePrivacy(%q)", pushed.Updates[0], test.domain)
+				t.Fatalf("delivery payload update=%T, want updatePrivacy(%q)", pushed.Updates[0], test.domain)
 			}
 			if !test.wire(privacyUpdate.Key) {
-				t.Fatalf("online push key=%T, want %q", privacyUpdate.Key, test.domain)
+				t.Fatalf("delivery payload key=%T, want %q", privacyUpdate.Key, test.domain)
 			}
 		})
 	}
-	if pushedUserIDs := sessions.pushedUserIDs(); len(pushedUserIDs) != len(keys) {
-		t.Fatalf("online privacy pushes=%v, want exactly one per key", pushedUserIDs)
-	} else {
-		for i, pushedUserID := range pushedUserIDs {
-			if pushedUserID != userID {
-				t.Fatalf("online privacy push[%d] target=%d, want owner %d", i, pushedUserID, userID)
-			}
-		}
-	}
-	if snapshot := sessions.snapshot(); snapshot.sessionID != sessionID || snapshot.userID != userID {
-		t.Fatalf("online push exclusion/target=%+v, want current session %d excluded for user %d", snapshot, sessionID, userID)
+	if pushedUserIDs := sessions.pushedUserIDs(); len(pushedUserIDs) != 0 {
+		t.Fatalf("direct online privacy pushes=%v, want durable delivery only", pushedUserIDs)
 	}
 
 	recorded, err := events.ListAfter(ctx, userID, 0, 100)
@@ -157,5 +159,52 @@ func TestAccountPrivacyAllKeysRoundTripWithoutAdvancingPts(t *testing.T) {
 	}
 	if difference.State.Pts != 1 || len(difference.Events) != 1 || difference.Events[0].Type != domain.UpdateEventNewMessage {
 		t.Fatalf("difference after adjacent message=%+v, want one contiguous new_message at pts=1", difference)
+	}
+}
+
+func TestAccountSetPrivacyRequiresDeliveryOutbox(t *testing.T) {
+	ctx := context.Background()
+	const userID int64 = 8111
+	privacyStore := memory.NewPrivacyStore()
+	privacy := appprivacy.NewService(privacyStore, memory.NewContactStore())
+	router := New(Config{}, Deps{
+		Privacy: privacy,
+	}, zaptest.NewLogger(t), clock.System)
+
+	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, userID), [8]byte{1, 1}), 11)
+	if set, err := router.onAccountSetPrivacy(reqCtx, &tg.AccountSetPrivacyRequest{
+		Key:   &tg.InputPrivacyKeyPhoneNumber{},
+		Rules: []tg.InputPrivacyRuleClass{&tg.InputPrivacyValueDisallowAll{}},
+	}); set != nil || err == nil {
+		t.Fatalf("setPrivacy without delivery outbox = %T/%v, want failure", set, err)
+	}
+	if _, found, err := privacyStore.GetPrivacyRules(ctx, userID, domain.PrivacyKeyPhoneNumber); err != nil || found {
+		t.Fatalf("privacy mutated without delivery outbox: found=%v err=%v", found, err)
+	}
+}
+
+func TestAccountSetPrivacyRequiresPrivacyDeliveryAggregate(t *testing.T) {
+	ctx := context.Background()
+	const userID int64 = 8112
+	privacyStore := memory.NewPrivacyStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	privacy := appprivacy.NewService(privacyStore, memory.NewContactStore())
+	router := New(Config{}, Deps{
+		Privacy:        privacy,
+		DeliveryOutbox: delivery,
+	}, zaptest.NewLogger(t), clock.System)
+
+	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, userID), [8]byte{1, 2}), 12)
+	if set, err := router.onAccountSetPrivacy(reqCtx, &tg.AccountSetPrivacyRequest{
+		Key:   &tg.InputPrivacyKeyPhoneNumber{},
+		Rules: []tg.InputPrivacyRuleClass{&tg.InputPrivacyValueDisallowAll{}},
+	}); set != nil || err == nil {
+		t.Fatalf("setPrivacy without aggregate delivery store = %T/%v, want failure", set, err)
+	}
+	if _, found, err := privacyStore.GetPrivacyRules(ctx, userID, domain.PrivacyKeyPhoneNumber); err != nil || found {
+		t.Fatalf("privacy mutated without aggregate delivery store: found=%v err=%v", found, err)
+	}
+	if items := delivery.Snapshot(); len(items) != 0 {
+		t.Fatalf("delivery outbox mutated without aggregate delivery store: %+v", items)
 	}
 }

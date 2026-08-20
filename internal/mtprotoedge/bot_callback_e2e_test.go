@@ -23,6 +23,7 @@ import (
 	"telesrv/internal/app/account"
 	"telesrv/internal/app/auth"
 	botsapp "telesrv/internal/app/bots"
+	appchannels "telesrv/internal/app/channels"
 	"telesrv/internal/app/contacts"
 	"telesrv/internal/app/dialogs"
 	"telesrv/internal/app/help"
@@ -32,6 +33,7 @@ import (
 	"telesrv/internal/app/users"
 	"telesrv/internal/rpc"
 	"telesrv/internal/store/memory"
+	"telesrv/internal/store/storetest"
 )
 
 // botCallbackEnv 搭建一套内存 server，供 P3 callback / startBot / markup e2e 复用。
@@ -70,16 +72,19 @@ func newBotCallbackEnv(t *testing.T, ctx context.Context) *botCallbackEnv {
 	deps := rpc.Deps{
 		Auth: auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore,
 			memory.NewTempAuthKeyBindingStore(authKeyStore), "12345", auth.WithBotLogin(botStore)),
-		Account:  account.NewService(memory.NewPasswordStore()),
-		Help:     help.NewService(helpStore, helpStore),
-		Users:    users.NewService(userStore),
-		Updates:  updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts: contacts.NewService(memory.NewContactStore()),
-		Dialogs:  dialogs.NewService(dialogStore),
-		Messages: messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
-		Bots:     botsService,
-		LangPack: langpack.NewService(langPackStore),
-		Sessions: activeSessions,
+		Account:       account.NewService(memory.NewPasswordStore()),
+		Help:          help.NewService(helpStore, helpStore),
+		Users:         users.NewService(userStore),
+		Updates:       updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:      contacts.NewService(memory.NewContactStore()),
+		Dialogs:       dialogs.NewService(dialogStore),
+		Messages:      messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
+		Channels:      appchannels.NewService(memory.NewChannelStore()),
+		Bots:          botsService,
+		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
+		BotCallbacks:  storetest.NewBotCallbackRegistryStore(),
+		LangPack:      langpack.NewService(langPackStore),
+		Sessions:      activeSessions,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(router)

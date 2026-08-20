@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func fanoutTestJob(recipients []int64, originUser, originSession int64, built ma
 			if built != nil {
 				built[viewerUserID] = true
 			}
-			return &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateChannelTooLong{ChannelID: 1001}}, Date: 1}
+			return &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateChannelTooLong{ChannelID: 1001, Pts: 5}}, Date: 1}
 		},
 	}
 }
@@ -43,8 +44,70 @@ func fanoutHasID(ids []int64, want int64) bool {
 	return false
 }
 
+func TestChannelFanoutJobPrefetchFailureSendsRecoveryNudge(t *testing.T) {
+	sessions := &captureSessions{}
+	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	built := make(map[int64]bool)
+
+	r.runChannelFanoutJob(context.Background(), channelFanoutJob{
+		scope:        channelFanoutExplicit,
+		originUserID: 10,
+		channelID:    1001,
+		pts:          7,
+		recipients:   []int64{20},
+		prefetch: func(context.Context, []int64) bool {
+			return false
+		},
+		build: func(_ context.Context, viewerUserID int64) *tg.Updates {
+			built[viewerUserID] = true
+			return &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateChannelTooLong{ChannelID: 1001, Pts: 7}}, Date: 1}
+		},
+	})
+
+	if len(built) != 0 {
+		t.Fatalf("build called after prefetch failure: %v", built)
+	}
+	if got := sessions.pushedUserIDs(); len(got) != 2 || got[0] != 20 || got[1] != 10 {
+		t.Fatalf("pushes after prefetch failure = %v, want recovery nudge to recipient 20 and origin 10", got)
+	}
+	updates, ok := sessions.lastUserPush().(*tg.Updates)
+	if !ok || len(updates.Updates) != 1 {
+		t.Fatalf("recovery payload = %#v, want one UpdateChannelTooLong", sessions.lastUserPush())
+	}
+	nudge, ok := updates.Updates[0].(*tg.UpdateChannelTooLong)
+	if !ok {
+		t.Fatalf("recovery update = %T, want UpdateChannelTooLong", updates.Updates[0])
+	}
+	pts, present := nudge.GetPts()
+	if !present || nudge.ChannelID != 1001 || pts != 7 {
+		t.Fatalf("recovery nudge = %+v pts_present=%v, want channel=1001 pts=7", nudge, present)
+	}
+}
+
+func startChannelFanoutForTest(t *testing.T, r *Router) context.CancelFunc {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.RunChannelFanout(ctx)
+		close(done)
+	}()
+	for i := 0; i < 200 && !r.channelFanout.started.Load(); i++ {
+		time.Sleep(time.Millisecond)
+	}
+	if !r.channelFanout.started.Load() {
+		cancel()
+		<-done
+		t.Fatal("dispatcher did not start")
+	}
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 type recoveryFanoutSessions struct {
-	SessionBinder
+	EdgeController
 
 	onlineChannels []int64
 	pushStarted    chan struct{}
@@ -90,6 +153,33 @@ func (s *recoveryFanoutSessions) PushToUserExceptAuthKeySession(ctx context.Cont
 	s.nudges[nudge.ChannelID] = append(s.nudges[nudge.ChannelID], pts)
 	s.mu.Unlock()
 	return 1, nil
+}
+
+func (s *recoveryFanoutSessions) UserLocationRecordsForUsers(_ context.Context, userIDs []int64) (map[int64][]EdgeLocationRecord, error) {
+	out := make(map[int64][]EdgeLocationRecord, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			continue
+		}
+		if _, ok := out[userID]; ok {
+			continue
+		}
+		out[userID] = []EdgeLocationRecord{{InstanceID: "edge-recovery", UserID: userID, ReceivesUpdates: true}}
+	}
+	return out, nil
+}
+
+func (s *recoveryFanoutSessions) PushToUserLocationBatches(ctx context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	sent := 0
+	var firstErr error
+	for _, push := range pushes {
+		n, err := s.PushToUserExceptAuthKeySession(ctx, push.TargetUserID, push.ExcludeAuthKeyID, push.ExcludeSessionID, push.MessageType, push.Update)
+		sent += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return sent, firstErr
 }
 
 func (s *recoveryFanoutSessions) OnlineChannelMemberUserIDsExcluding(_ int64, _ map[int64]struct{}, _ int) []int64 {
@@ -187,24 +277,96 @@ func (s *recoveryFanoutChannels) callCount() int {
 	return s.calls
 }
 
-// TestChannelFanoutDispatcherSyncFallback：dispatcher 未启动时 Enqueue 同步执行——
-// 保持测试/未装配场景行为不变，recipients 立即被推送、发起 session 作为 exclude 透传。
-// deps.Channels=nil 时 channelFanoutRecipients 直接返回 explicit recipients。
-func TestChannelFanoutDispatcherSyncFallback(t *testing.T) {
+type locationAwareFanoutSessions struct {
+	*captureSessions
+
+	mu                 sync.Mutex
+	locations          map[int64][]EdgeLocationRecord
+	batchCalls         int
+	pushBatchCalls     int
+	locationPushes     []int64
+	locationDeliveries []ChannelDeliveryWatermark
+	lastExcludeSession int64
+}
+
+func (s *locationAwareFanoutSessions) UserLocationRecordsForUsers(_ context.Context, userIDs []int64) (map[int64][]EdgeLocationRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchCalls++
+	out := make(map[int64][]EdgeLocationRecord, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			continue
+		}
+		if _, ok := out[userID]; ok {
+			continue
+		}
+		out[userID] = append([]EdgeLocationRecord(nil), s.locations[userID]...)
+	}
+	return out, nil
+}
+
+func (s *locationAwareFanoutSessions) PushToUserLocationBatches(_ context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pushBatchCalls++
+	sent := 0
+	for _, push := range pushes {
+		if len(push.Locations) == 0 {
+			continue
+		}
+		s.locationPushes = append(s.locationPushes, push.TargetUserID)
+		s.locationDeliveries = append(s.locationDeliveries, push.ChannelDelivery)
+		s.lastExcludeSession = push.ExcludeSessionID
+		sent++
+	}
+	return sent, nil
+}
+
+func (s *locationAwareFanoutSessions) locationPushedUserIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.locationPushes...)
+}
+
+func (s *locationAwareFanoutSessions) batchCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.batchCalls
+}
+
+func (s *locationAwareFanoutSessions) pushBatchCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pushBatchCalls
+}
+
+func (s *locationAwareFanoutSessions) lastLocationExcludeSession() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastExcludeSession
+}
+
+func (s *locationAwareFanoutSessions) locationDeliveryWatermarks() []ChannelDeliveryWatermark {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ChannelDeliveryWatermark(nil), s.locationDeliveries...)
+}
+
+// TestChannelFanoutDispatcherRequiresStartedWorker：dispatcher 未启动时 Enqueue 不允许
+// 回退到请求线程直推；生产入口必须显式启动后台 worker。
+func TestChannelFanoutDispatcherRequiresStartedWorker(t *testing.T) {
 	cs := &captureSessions{}
 	r := New(Config{}, Deps{Sessions: cs}, zaptest.NewLogger(t), clock.System)
 	built := map[int64]bool{}
 	r.channelFanout.Enqueue(context.Background(), fanoutTestJob([]int64{2001, 2002}, 0, 99, built))
 
 	pushed := cs.pushedUserIDs()
-	if len(pushed) != 2 || !fanoutHasID(pushed, 2001) || !fanoutHasID(pushed, 2002) {
-		t.Fatalf("sync fallback pushed = %v, want [2001 2002]", pushed)
+	if len(pushed) != 0 {
+		t.Fatalf("not-started fanout pushed = %v, want none", pushed)
 	}
-	if got := cs.snapshot().sessionID; got != 99 {
-		t.Fatalf("exclude session = %d, want 99 (origin session passed explicitly, not via request ctx)", got)
-	}
-	if !built[2001] || !built[2002] {
-		t.Fatalf("build not invoked per viewer: %v", built)
+	if len(built) != 0 {
+		t.Fatalf("not-started fanout built payloads = %v, want none", built)
 	}
 }
 
@@ -213,15 +375,8 @@ func TestChannelFanoutDispatcherSyncFallback(t *testing.T) {
 func TestChannelFanoutDispatcherDeliversAsync(t *testing.T) {
 	cs := &captureSessions{}
 	r := New(Config{}, Deps{Sessions: cs}, zaptest.NewLogger(t), clock.System)
-	ctx, cancel := context.WithCancel(context.Background())
+	cancel := startChannelFanoutForTest(t, r)
 	defer cancel()
-	go r.RunChannelFanout(ctx)
-	for i := 0; i < 200 && !r.channelFanout.started.Load(); i++ {
-		time.Sleep(time.Millisecond)
-	}
-	if !r.channelFanout.started.Load() {
-		t.Fatal("dispatcher did not start")
-	}
 
 	// built map 跨 goroutine，只断言 mutex 保护的 pushedUserIDs，不读 built。
 	r.channelFanout.Enqueue(context.Background(), fanoutTestJob([]int64{3001}, 0, 7, nil))
@@ -241,19 +396,125 @@ func TestChannelFanoutDispatcherDeliversAsync(t *testing.T) {
 	}
 }
 
+func TestChannelFanoutDispatcherUsesBatchedLocationsForAsyncPush(t *testing.T) {
+	cs := &locationAwareFanoutSessions{
+		captureSessions: &captureSessions{},
+		locations: map[int64][]EdgeLocationRecord{
+			3001: {{InstanceID: "edge-b", UserID: 3001, ReceivesUpdates: true}},
+			3002: {{InstanceID: "edge-c", UserID: 3002, ReceivesUpdates: true}},
+		},
+	}
+	r := New(Config{}, Deps{Sessions: cs}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
+
+	r.channelFanout.Enqueue(context.Background(), fanoutTestJob([]int64{3001, 3002}, 0, 7, nil))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(cs.locationPushedUserIDs()) == 2 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	got := cs.locationPushedUserIDs()
+	if len(got) != 2 || !fanoutHasID(got, 3001) || !fanoutHasID(got, 3002) {
+		t.Fatalf("location-aware pushes = %v, want [3001 3002]", got)
+	}
+	if got := cs.batchCallCount(); got != 1 {
+		t.Fatalf("batch location calls = %d, want 1", got)
+	}
+	if got := cs.pushBatchCallCount(); got != 1 {
+		t.Fatalf("batch push calls = %d, want 1", got)
+	}
+	if ordinary := cs.pushedUserIDs(); len(ordinary) != 0 {
+		t.Fatalf("ordinary per-user pushes = %v, want none", ordinary)
+	}
+	if got := cs.lastLocationExcludeSession(); got != 7 {
+		t.Fatalf("location-aware exclude session = %d, want 7", got)
+	}
+	for _, got := range cs.locationDeliveryWatermarks() {
+		want := ChannelDeliveryWatermark{Kind: ChannelDeliveryNudge, ChannelID: 1001, MinPts: 5, MaxPts: 5}
+		if got != want {
+			t.Fatalf("location-aware delivery watermark = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestChannelFanoutDeliveryWatermarkExtractsSingleChannelRanges(t *testing.T) {
+	nudge, ok := channelFanoutDeliveryWatermark(&tg.Updates{Updates: []tg.UpdateClass{
+		&tg.UpdateChannelTooLong{ChannelID: 1001, Pts: 5},
+		&tg.UpdateChannelTooLong{ChannelID: 1001, Pts: 7},
+	}})
+	if !ok {
+		t.Fatal("nudge delivery watermark unexpectedly rejected")
+	}
+	if want := (ChannelDeliveryWatermark{Kind: ChannelDeliveryNudge, ChannelID: 1001, MinPts: 5, MaxPts: 7}); nudge != want {
+		t.Fatalf("nudge delivery watermark = %#v, want %#v", nudge, want)
+	}
+
+	payload, ok := channelFanoutDeliveryWatermark(&tg.Updates{Updates: []tg.UpdateClass{
+		&tg.UpdateNewChannelMessage{
+			Message: &tg.Message{PeerID: &tg.PeerChannel{ChannelID: 1001}},
+			Pts:     8,
+		},
+		&tg.UpdateNewChannelMessage{
+			Message: &tg.Message{PeerID: &tg.PeerChannel{ChannelID: 1001}},
+			Pts:     9,
+		},
+	}})
+	if !ok {
+		t.Fatal("payload delivery watermark unexpectedly rejected")
+	}
+	if want := (ChannelDeliveryWatermark{Kind: ChannelDeliveryPayload, ChannelID: 1001, MinPts: 8, MaxPts: 9}); payload != want {
+		t.Fatalf("payload delivery watermark = %#v, want %#v", payload, want)
+	}
+
+	if _, ok := channelFanoutDeliveryWatermark(&tg.Updates{Updates: []tg.UpdateClass{
+		&tg.UpdateChannelTooLong{ChannelID: 1001, Pts: 10},
+		&tg.UpdateNewChannelMessage{
+			Message: &tg.Message{PeerID: &tg.PeerChannel{ChannelID: 1001}},
+			Pts:     11,
+		},
+	}}); ok {
+		t.Fatal("mixed nudge/payload delivery watermark accepted")
+	}
+
+	empty, ok := channelFanoutDeliveryWatermark(&tg.Updates{Updates: []tg.UpdateClass{
+		&tg.UpdateReadChannelInbox{ChannelID: 1001, MaxID: 33},
+	}})
+	if !ok {
+		t.Fatal("read inbox-only update should not be rejected")
+	}
+	if empty.Present() {
+		t.Fatalf("read inbox-only update produced delivery watermark: %#v", empty)
+	}
+}
+
 // TestChannelFanoutDispatcherInvokesPrefetch：worker 在逐 viewer build 之前调用一次 prefetch，
 // 且传入「解析后的 recipients + 兜底 origin」——这是 fan-out 跨 viewer 投影预热（O(owner)）的入口。
 func TestChannelFanoutDispatcherInvokesPrefetch(t *testing.T) {
 	cs := &captureSessions{}
 	r := New(Config{}, Deps{Sessions: cs}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	var gotViewers []int64
+	prefetched := make(chan struct{})
+	var once sync.Once
 	job := fanoutTestJob([]int64{2001, 2002}, 5, 99, nil)
-	job.prefetch = func(_ context.Context, viewers []int64) {
+	job.prefetch = func(_ context.Context, viewers []int64) bool {
 		gotViewers = append([]int64(nil), viewers...)
+		once.Do(func() { close(prefetched) })
+		return true
 	}
 	// deps.Channels=nil → channelFanoutRecipients 返回 explicit recipients=[2001 2002]；origin=5 兜底追加。
 	r.channelFanout.Enqueue(context.Background(), job)
+	select {
+	case <-prefetched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetch did not run")
+	}
 
 	want := map[int64]bool{2001: true, 2002: true, 5: true}
 	if len(gotViewers) != len(want) {
@@ -326,6 +587,15 @@ type prefetchRecordingUsersService struct {
 	gotViewers    []int64
 	gotOwnerIDs   []int64
 	forViewerCall int
+	byIDsCalls    int
+	omitViewer    int64
+}
+
+func (s *prefetchRecordingUsersService) ByIDs(ctx context.Context, viewerUserID int64, userIDs []int64) ([]domain.User, error) {
+	s.mu.Lock()
+	s.byIDsCalls++
+	s.mu.Unlock()
+	return s.mapUsersService.ByIDs(ctx, viewerUserID, userIDs)
 }
 
 func (s *prefetchRecordingUsersService) ByIDsForViewers(_ context.Context, viewerUserIDs, userIDs []int64) (map[int64][]domain.User, error) {
@@ -336,40 +606,344 @@ func (s *prefetchRecordingUsersService) ByIDsForViewers(_ context.Context, viewe
 	s.mu.Unlock()
 	out := make(map[int64][]domain.User, len(viewerUserIDs))
 	for _, v := range viewerUserIDs {
-		out[v] = nil
+		if v == s.omitViewer {
+			continue
+		}
+		for _, id := range userIDs {
+			user, ok := s.mapUsersService.users[id]
+			if !ok {
+				user = domain.User{ID: id}
+			}
+			out[v] = append(out[v], user)
+		}
 	}
 	return out, nil
 }
 
+func (s *prefetchRecordingUsersService) snapshot() (forViewerCall int, viewers, ownerIDs []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.forViewerCall, append([]int64(nil), s.gotViewers...), append([]int64(nil), s.gotOwnerIDs...)
+}
+
+func TestPrefetchChannelFanoutUsersRejectsMissingViewersAndOwners(t *testing.T) {
+	users := &prefetchRecordingUsersService{omitViewer: 3002, mapUsersService: mapUsersService{users: map[int64]domain.User{
+		2001: {ID: 2001, FirstName: "must not scalar load"},
+		2002: {ID: 2002, FirstName: "must not scalar load"},
+	}}}
+	r := New(Config{}, Deps{Users: users}, zaptest.NewLogger(t), clock.System)
+	cache := newViewerPeerCache(r)
+	if r.prefetchChannelFanoutUsers(context.Background(), cache, []int64{3001, 3002}, []int64{2001, 2002}) {
+		t.Fatal("prefetchChannelFanoutUsers accepted an incomplete batch result")
+	}
+	users.mu.Lock()
+	byIDsCalls := users.byIDsCalls
+	users.mu.Unlock()
+	if byIDsCalls != 0 {
+		t.Fatalf("scalar ByIDs calls = %d, want 0 after fail-closed batch validation", byIDsCalls)
+	}
+}
+
 // TestChannelEditMessageFanoutInvokesPrefetch：enqueueChannelEditMessageFanout 在逐 viewer build
-// 前用「channelEditMessageFanoutOwnerIDs(res) + recipients+origin」预热（dispatcher 未启动→同步
-// 回退，prefetch 同步执行）。锁定 edit 路径接入了 O(owner) 预热而非逐 viewer 投影。
+// 前用「channelEditMessageFanoutOwnerIDs(res) + recipients+origin」预热。锁定 edit 路径接入了
+// O(owner) 预热而非逐 viewer 投影。
 func TestChannelEditMessageFanoutInvokesPrefetch(t *testing.T) {
 	users := &prefetchRecordingUsersService{mapUsersService: mapUsersService{users: map[int64]domain.User{}}}
 	registry := newFakeUsernameRegistry()
 	cs := &captureSessions{}
 	r := New(Config{}, Deps{Sessions: cs, Users: users, Usernames: registry}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	res := editFanoutTestResult(5, 6)
-	r.enqueueChannelEditMessageFanout(context.Background(), 5, res)
-
-	if users.forViewerCall != 1 {
-		t.Fatalf("ByIDsForViewers called %d times, want 1 (prefetch must run once before per-viewer build)", users.forViewerCall)
+	if err := r.enqueueChannelEditMessageFanout(context.Background(), 5, res); err != nil {
+		t.Fatalf("enqueueChannelEditMessageFanout: %v", err)
 	}
-	gotViewers := ownerIDSet(users.gotViewers)
+	select {
+	case <-registry.firstBatchDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("username registry prefetch did not complete")
+	}
+
+	forViewerCall, viewers, ownerIDs := users.snapshot()
+	if forViewerCall != 1 {
+		t.Fatalf("ByIDsForViewers called %d times, want 1 (prefetch must run once before per-viewer build)", forViewerCall)
+	}
+	gotViewers := ownerIDSet(viewers)
 	for _, want := range []int64{3001, 3002, 5} {
 		if !gotViewers[want] {
-			t.Fatalf("prefetch viewers %v missing %d (recipients+origin)", users.gotViewers, want)
+			t.Fatalf("prefetch viewers %v missing %d (recipients+origin)", viewers, want)
 		}
 	}
-	gotOwners := ownerIDSet(users.gotOwnerIDs)
+	gotOwners := ownerIDSet(ownerIDs)
 	for _, want := range []int64{2001, 2002, 2003, 2004} {
 		if !gotOwners[want] {
-			t.Fatalf("prefetch owner ids %v missing %d (must equal channelEditMessageFanoutOwnerIDs)", users.gotOwnerIDs, want)
+			t.Fatalf("prefetch owner ids %v missing %d (must equal channelEditMessageFanoutOwnerIDs)", ownerIDs, want)
 		}
 	}
-	if registry.batchCalls != 1 || registry.peerCalls != 0 {
-		t.Fatalf("username registry reads = batch %d / peer %d, want one prefetch for all viewers", registry.batchCalls, registry.peerCalls)
+	batchCalls, peerCalls := registry.readCounts()
+	if batchCalls != 1 || peerCalls != 0 {
+		t.Fatalf("username registry reads = batch %d / peer %d, want one prefetch for all viewers", batchCalls, peerCalls)
+	}
+}
+
+type viewerProjectedFanoutUsers struct {
+	mapUsersService
+	mu         sync.Mutex
+	batchCalls int
+	byIDsCalls int
+}
+
+func (s *viewerProjectedFanoutUsers) ByIDs(ctx context.Context, viewerUserID int64, userIDs []int64) ([]domain.User, error) {
+	s.mu.Lock()
+	s.byIDsCalls++
+	s.mu.Unlock()
+	return s.mapUsersService.ByIDs(ctx, viewerUserID, userIDs)
+}
+
+func (s *viewerProjectedFanoutUsers) ByIDsForViewers(_ context.Context, viewerUserIDs, userIDs []int64) (map[int64][]domain.User, error) {
+	s.mu.Lock()
+	s.batchCalls++
+	s.mu.Unlock()
+	out := make(map[int64][]domain.User, len(viewerUserIDs))
+	for _, viewerID := range uniquePeerIDs(viewerUserIDs) {
+		for _, userID := range uniquePeerIDs(userIDs) {
+			user, ok := s.users[userID]
+			if !ok {
+				continue
+			}
+			user.FirstName = fmt.Sprintf("%s/viewer-%d", user.FirstName, viewerID)
+			out[viewerID] = append(out[viewerID], user)
+		}
+	}
+	return out, nil
+}
+
+func (s *viewerProjectedFanoutUsers) counts() (batch, scalar int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.batchCalls, s.byIDsCalls
+}
+
+type perUserFanoutSessions struct {
+	*captureSessions
+	mu      sync.Mutex
+	updates map[int64]*tg.Updates
+}
+
+func newPerUserFanoutSessions() *perUserFanoutSessions {
+	return &perUserFanoutSessions{captureSessions: &captureSessions{}, updates: make(map[int64]*tg.Updates)}
+}
+
+func (s *perUserFanoutSessions) PushToUserLocationBatches(ctx context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	sent := 0
+	for _, push := range pushes {
+		select {
+		case <-ctx.Done():
+			return sent, ctx.Err()
+		default:
+		}
+		if len(push.Locations) == 0 || push.Update == nil {
+			continue
+		}
+		updates, ok := push.Update.(*tg.Updates)
+		if !ok {
+			continue
+		}
+		s.mu.Lock()
+		s.updates[push.TargetUserID] = updates
+		s.mu.Unlock()
+		sent++
+	}
+	return sent, nil
+}
+
+func (s *perUserFanoutSessions) waitUpdates(t *testing.T, count int) map[int64]*tg.Updates {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		if len(s.updates) >= count {
+			out := make(map[int64]*tg.Updates, len(s.updates))
+			for userID, updates := range s.updates {
+				out[userID] = updates
+			}
+			s.mu.Unlock()
+			return out
+		}
+		s.mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.Fatalf("fanout updates = %d, want %d", len(s.updates), count)
+	return nil
+}
+
+type monoforumProjectionFanoutFixture struct {
+	r          *Router
+	users      *viewerProjectedFanoutUsers
+	sessions   *perUserFanoutSessions
+	registry   *fakeUsernameRegistry
+	verify     *fakeBotVerifications
+	mono       domain.Channel
+	parent     domain.Channel
+	adminID    int64
+	subscriber int64
+}
+
+func newMonoforumProjectionFanoutFixture(t *testing.T) monoforumProjectionFanoutFixture {
+	t.Helper()
+	const (
+		adminID    = int64(6101)
+		subscriber = int64(6102)
+	)
+	users := &viewerProjectedFanoutUsers{mapUsersService: mapUsersService{users: map[int64]domain.User{
+		adminID:    {ID: adminID, AccessHash: 11, FirstName: "Admin", Username: "admin_name"},
+		subscriber: {ID: subscriber, AccessHash: 12, FirstName: "Subscriber", Username: "subscriber_name"},
+	}}}
+	registry := newFakeUsernameRegistry()
+	verify := newFakeBotVerifications()
+	parent := domain.Channel{ID: 7101, AccessHash: 21, Title: "Parent", Broadcast: true}
+	mono := domain.Channel{ID: 7102, AccessHash: 22, Title: "Direct", Monoforum: true, LinkedMonoforumID: parent.ID}
+	peers := []domain.Peer{
+		{Type: domain.PeerTypeUser, ID: adminID},
+		{Type: domain.PeerTypeUser, ID: subscriber},
+		{Type: domain.PeerTypeChannel, ID: parent.ID},
+		{Type: domain.PeerTypeChannel, ID: mono.ID},
+	}
+	for i, peer := range peers {
+		registry.byPeer[peer] = []domain.Username{
+			{Username: fmt.Sprintf("editable_%d", i), Editable: true, Active: true},
+			{Username: fmt.Sprintf("collectible_%d", i), Active: true, CollectibleID: int64(100 + i)},
+		}
+		verify.marks[peer] = domain.CustomVerification{Peer: peer, IconDocumentID: int64(9000 + i)}
+	}
+	sessions := newPerUserFanoutSessions()
+	r := New(Config{}, Deps{
+		Sessions:         sessions,
+		Users:            users,
+		Usernames:        registry,
+		BotVerifications: verify,
+	}, zaptest.NewLogger(t), clock.System)
+	return monoforumProjectionFanoutFixture{
+		r: r, users: users, sessions: sessions, registry: registry, verify: verify,
+		mono: mono, parent: parent, adminID: adminID, subscriber: subscriber,
+	}
+}
+
+func assertMonoforumViewerEnvelope(t *testing.T, updates *tg.Updates, viewerID int64) {
+	t.Helper()
+	if updates == nil {
+		t.Fatal("updates are nil")
+	}
+	seenViewer := false
+	for _, item := range updates.Users {
+		user, ok := item.(*tg.User)
+		if !ok || user == nil {
+			continue
+		}
+		if user.ID == viewerID {
+			seenViewer = true
+			if !user.Self {
+				t.Fatalf("viewer user %d has self=false: %+v", viewerID, user)
+			}
+		}
+		if user.ID != viewerID && user.Self {
+			t.Fatalf("non-viewer user %d has self=true for viewer %d", user.ID, viewerID)
+		}
+		if want := fmt.Sprintf("viewer-%d", viewerID); !strings.Contains(user.FirstName, want) {
+			t.Fatalf("user %d first_name = %q, want viewer projection %q", user.ID, user.FirstName, want)
+		}
+		if vector, ok := user.GetUsernames(); !ok || len(vector) != 2 {
+			t.Fatalf("user %d usernames = %+v set=%v, want prefetched registry vector", user.ID, vector, ok)
+		}
+		if icon, ok := user.GetBotVerificationIcon(); !ok || icon <= 0 {
+			t.Fatalf("user %d bot verification = %d set=%v", user.ID, icon, ok)
+		}
+	}
+	if !seenViewer {
+		t.Fatalf("viewer %d missing from Users: %+v", viewerID, updates.Users)
+	}
+}
+
+func TestEnqueueMonoforumMessageFanoutConsumesViewerPrefetch(t *testing.T) {
+	f := newMonoforumProjectionFanoutFixture(t)
+	cancel := startChannelFanoutForTest(t, f.r)
+	defer cancel()
+	savedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: f.subscriber}
+	message := domain.ChannelMessage{
+		ChannelID: f.mono.ID, ID: 10, SenderUserID: f.adminID, SavedPeer: savedPeer,
+		Body: "reply", Date: 100,
+	}
+	res := domain.SendChannelMessageResult{
+		Channel: f.mono, Message: message,
+		Event: domain.ChannelUpdateEvent{
+			ChannelID: f.mono.ID, Type: domain.ChannelUpdateNewMessage, Pts: 3, PtsCount: 1,
+			Date: 100, SenderUserID: f.adminID, Message: message,
+		},
+		Recipients: []int64{f.adminID, f.subscriber},
+	}
+	f.r.enqueueMonoforumMessageFanout(context.Background(), f.adminID, f.mono, savedPeer, res)
+
+	got := f.sessions.waitUpdates(t, 2)
+	assertMonoforumViewerEnvelope(t, got[f.adminID], f.adminID)
+	assertMonoforumViewerEnvelope(t, got[f.subscriber], f.subscriber)
+	batch, scalar := f.users.counts()
+	if batch != 1 || scalar != 0 {
+		t.Fatalf("user projection calls = batch %d / scalar %d, want 1 / 0", batch, scalar)
+	}
+	if f.registry.batchCalls != 1 || f.registry.peerCalls != 0 {
+		t.Fatalf("username reads = batch %d / peer %d, want 1 / 0", f.registry.batchCalls, f.registry.peerCalls)
+	}
+	if f.verify.batchCalls != 1 || f.verify.peerCalls != 0 {
+		t.Fatalf("verification reads = batch %d / peer %d, want 1 / 0", f.verify.batchCalls, f.verify.peerCalls)
+	}
+}
+
+func TestEnqueueSuggestedPostApprovalFanoutConsumesViewerPrefetch(t *testing.T) {
+	f := newMonoforumProjectionFanoutFixture(t)
+	cancel := startChannelFanoutForTest(t, f.r)
+	defer cancel()
+	savedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: f.subscriber}
+	original := domain.ChannelMessage{
+		ChannelID: f.mono.ID, ID: 20, SenderUserID: f.subscriber, SavedPeer: savedPeer,
+		Body: "suggested", Date: 200,
+	}
+	service := domain.ChannelMessage{
+		ChannelID: f.mono.ID, ID: 21, SenderUserID: f.adminID, SavedPeer: savedPeer,
+		Date: 201, Action: &domain.ChannelMessageAction{Type: domain.ChannelActionSuggestedPostApproval},
+	}
+	result := domain.ToggleSuggestedPostApprovalResult{
+		Monoforum: f.mono, Parent: f.parent, SavedPeer: savedPeer,
+		OriginalMessage: original,
+		OriginalEvent: domain.ChannelUpdateEvent{
+			ChannelID: f.mono.ID, Type: domain.ChannelUpdateEditMessage, Pts: 4, PtsCount: 1,
+			Date: 200, SenderUserID: f.subscriber, Message: original,
+		},
+		ServiceMessage: service,
+		ServiceEvent: domain.ChannelUpdateEvent{
+			ChannelID: f.mono.ID, Type: domain.ChannelUpdateNewMessage, Pts: 5, PtsCount: 1,
+			Date: 201, SenderUserID: f.adminID, Message: service,
+		},
+		Recipients: []int64{f.adminID, f.subscriber},
+	}
+	if err := f.r.enqueueSuggestedPostApprovalFanout(context.Background(), f.adminID, result); err != nil {
+		t.Fatalf("enqueueSuggestedPostApprovalFanout: %v", err)
+	}
+
+	got := f.sessions.waitUpdates(t, 2)
+	assertMonoforumViewerEnvelope(t, got[f.adminID], f.adminID)
+	assertMonoforumViewerEnvelope(t, got[f.subscriber], f.subscriber)
+	batch, scalar := f.users.counts()
+	if batch != 1 || scalar != 0 {
+		t.Fatalf("user projection calls = batch %d / scalar %d, want 1 / 0", batch, scalar)
+	}
+	if f.registry.batchCalls != 1 || f.registry.peerCalls != 0 {
+		t.Fatalf("username reads = batch %d / peer %d, want 1 / 0", f.registry.batchCalls, f.registry.peerCalls)
+	}
+	if f.verify.batchCalls != 1 || f.verify.peerCalls != 0 {
+		t.Fatalf("verification reads = batch %d / peer %d, want 1 / 0", f.verify.batchCalls, f.verify.peerCalls)
 	}
 }
 
@@ -414,6 +988,19 @@ func (s *overflowNudgeSessions) PushToUserExceptAuthKeySession(ctx context.Conte
 	return s.captureSessions.PushToUserExceptAuthKeySession(ctx, userID, excludeAuthKeyID, excludeSessionID, typ, msg)
 }
 
+func (s *overflowNudgeSessions) PushToUserLocationBatches(ctx context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	sent := 0
+	var firstErr error
+	for _, push := range pushes {
+		n, err := s.PushToUserExceptAuthKeySession(ctx, push.TargetUserID, push.ExcludeAuthKeyID, push.ExcludeSessionID, push.MessageType, push.Update)
+		sent += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return sent, firstErr
+}
+
 func (s *overflowNudgeSessions) OnlineChannelMemberUserIDsExcluding(channelID int64, exclude map[int64]struct{}, limit int) []int64 {
 	online := s.onlineByChannel[channelID]
 	out := make([]int64, 0, len(online))
@@ -456,6 +1043,19 @@ func (s *nudgeSessions) PushToUserExceptAuthKeySession(ctx context.Context, user
 	return s.captureSessions.PushToUserExceptAuthKeySession(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg)
 }
 
+func (s *nudgeSessions) PushToUserLocationBatches(ctx context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	sent := 0
+	var firstErr error
+	for _, push := range pushes {
+		n, err := s.PushToUserExceptAuthKeySession(ctx, push.TargetUserID, push.ExcludeAuthKeyID, push.ExcludeSessionID, push.MessageType, push.Update)
+		sent += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return sent, firstErr
+}
+
 func (s *nudgeSessions) OnlineChannelMemberUserIDsExcluding(_ int64, exclude map[int64]struct{}, limit int) []int64 {
 	out := make([]int64, 0, len(s.online))
 	for _, id := range s.online {
@@ -481,11 +1081,21 @@ func (s *nudgeSessions) msgFor(userID int64) bin.Encoder {
 func TestChannelFanoutDispatcherNudgesBeyondCapMembers(t *testing.T) {
 	cs := newNudgeSessions([]int64{2001, 2002, 2003})
 	r := New(Config{}, Deps{Sessions: cs}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 	// deps.Channels=nil → channelFanoutRecipients 返回 explicit recipients=[2001]（收完整 payload）。
 	// 2002/2003 是 cap 外在线成员（OnlineChannelMemberUserIDsExcluding 排除 2001 后返回）。
 	r.channelFanout.Enqueue(context.Background(), fanoutTestJob([]int64{2001}, 0, 99, nil))
 
-	pushed := cs.pushedUserIDs()
+	var pushed []int64
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pushed = cs.pushedUserIDs()
+		if fanoutHasID(pushed, 2001) && fanoutHasID(pushed, 2002) && fanoutHasID(pushed, 2003) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	for _, want := range []int64{2001, 2002, 2003} {
 		if !fanoutHasID(pushed, want) {
 			t.Fatalf("user %d not pushed: %v", want, pushed)
@@ -513,12 +1123,25 @@ func TestChannelFanoutDispatcherNudgesBeyondCapMembers(t *testing.T) {
 func TestChannelEditMessageFanoutNudgePtsUsesMaxContainer(t *testing.T) {
 	cs := newNudgeSessions([]int64{3001, 4001}) // 4001 是 cap 外在线成员（不在 recipients）
 	r := New(Config{}, Deps{Sessions: cs, Users: mapUsersService{users: map[int64]domain.User{}}}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	// 仅服务消息容器有 pts：Event.Pts=0, ServiceEvent.Pts=11。deps.Channels=nil → recipients=[3001 3002]。
 	res := editFanoutTestResult(0, 11)
-	r.enqueueChannelEditMessageFanout(context.Background(), 0, res)
+	if err := r.enqueueChannelEditMessageFanout(context.Background(), 0, res); err != nil {
+		t.Fatalf("enqueueChannelEditMessageFanout: %v", err)
+	}
 
-	ups, ok := cs.msgFor(4001).(*tg.Updates)
+	var msg bin.Encoder
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg = cs.msgFor(4001)
+		if msg != nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	ups, ok := msg.(*tg.Updates)
 	if !ok || len(ups.Updates) != 1 {
 		t.Fatalf("nudge to 4001 not single-update *tg.Updates: %#v", cs.msgFor(4001))
 	}

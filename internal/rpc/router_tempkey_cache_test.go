@@ -23,7 +23,7 @@ type expiringCaptureSessions struct {
 }
 
 type metadataBlindSessions struct {
-	SessionBinder
+	EdgeController
 }
 
 func (s *expiringCaptureSessions) AuthKeyExpiresAtForSession([8]byte, int64) (int, bool) {
@@ -87,7 +87,7 @@ func TestCachedRawSessionWithoutMetadataFailsClosedToDurableResolver(t *testing.
 	// Missing metadata is not evidence that raw is permanent.
 	base := &captureSessions{}
 	base.BindAuthKeyForSession(tempAuthKeyID, 553, tempAuthKeyID)
-	sessions := &metadataBlindSessions{SessionBinder: base}
+	sessions := &metadataBlindSessions{EdgeController: base}
 	auth := &captureAuthService{
 		resolvedAuthKeyID: permAuthKeyID,
 		hasResolved:       true,

@@ -14,7 +14,7 @@ import (
 //
 // ⚠ P0-2 活性契约：客户端只在 Connecting 态发 checkGroupCall（媒体连通后心跳停止），
 // 单凭 last_check_date 判死会把所有连上媒体的健康参与者踢光。约定的判据是
-// 「max(心跳, 媒体面活性)」：M0（SFU disabled）客户端恒 Connecting、4s 心跳不断，
+// 「max(心跳, 媒体面活性)」：媒体面未上报活性时客户端仍会持续 Connecting、4s 心跳不断，
 // 纯水位成立；M1 起 SFU 必须对媒体面存活（ICE consent/近期 SRTP 收包）的 endpoint
 // 周期性刷新 last_check_date（liveness reporter），使单一水位同时承载两路活性。
 type GroupCallSweepDispatcher struct {

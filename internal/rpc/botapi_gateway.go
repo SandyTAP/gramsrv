@@ -108,9 +108,9 @@ func (r *Router) BotAPIGiftPremiumSubscription(
 	return true, nil
 }
 
-var botAPIAuthKeyID = [8]byte{'B', 'O', 'T', 'A', 'P', 'I', 0, 1}
-
 const botAPIChannelChatIDBase int64 = 1000000000000
+
+var errBotAPIUpdateStoreRequired = errors.New("BOT_API_UPDATE_STORE_REQUIRED")
 
 // BotAPISelf returns the authenticated bot as a domain user.
 func (r *Router) BotAPISelf(ctx context.Context, botID int64) (domain.User, error) {
@@ -128,74 +128,64 @@ func (r *Router) BotAPISelf(ctx context.Context, botID int64) (domain.User, erro
 }
 
 // BotAPIUpdates returns durable update_id based events projected for the HTTP
-// Bot API. New deployments use the dedicated Bot API queue; the legacy
-// user_update_events fallback is kept for tests that have not wired the queue.
+// Bot API. The Bot API queue is the only supported source of truth.
 func (r *Router) BotAPIUpdates(ctx context.Context, botID int64, offset int64) ([]domain.UpdateEvent, error) {
 	if r == nil || botID == 0 {
 		return nil, nil
 	}
-	if r.deps.BotAPIUpdates != nil {
-		return r.botAPIQueuedUpdates(ctx, botID, offset)
+	if r.deps.BotAPIUpdates == nil {
+		return nil, errBotAPIUpdateStoreRequired
 	}
-	if r.deps.Updates == nil {
-		return nil, nil
-	}
-	fromPts := 0
-	if offset > 0 {
-		fromPts = int(offset - 1)
-	} else if st, found, err := r.deps.Updates.ConfirmedState(ctx, botAPIAuthKeyID, botID); err != nil {
-		return nil, err
-	} else if found {
-		fromPts = st.Pts
-	}
-	diff, err := r.deps.Updates.GetDifference(ctx, botAPIAuthKeyID, botID, domain.UpdateState{Pts: fromPts})
-	if err != nil {
-		return nil, err
-	}
-	if len(diff.Events) == 0 {
-		return nil, nil
-	}
-	return r.enrichUpdateEvents(ctx, botID, diff.Events), nil
+	return r.botAPIQueuedUpdates(ctx, botID, offset)
 }
 
 func (r *Router) BotAPISetAllowedUpdates(ctx context.Context, botID int64, allowed []domain.BotAPIUpdateKind) error {
 	if r == nil || r.deps.BotAPIUpdates == nil || botID == 0 {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return r.deps.BotAPIUpdates.SetBotAPIAllowedUpdates(ctx, botID, allowed)
 }
 
 func (r *Router) BotAPIDropPendingUpdates(ctx context.Context, botID int64) error {
 	if r == nil || r.deps.BotAPIUpdates == nil || botID == 0 {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return r.deps.BotAPIUpdates.DropPendingBotAPIUpdates(ctx, botID)
 }
 
 func (r *Router) BotAPIPendingUpdateCount(ctx context.Context, botID int64) (int, error) {
 	if r == nil || r.deps.BotAPIUpdates == nil || botID == 0 {
-		return 0, nil
+		return 0, errBotAPIUpdateStoreRequired
 	}
 	return r.deps.BotAPIUpdates.PendingBotAPIUpdateCount(ctx, botID)
 }
 
 func (r *Router) AcquireBotAPIPollLease(ctx context.Context, botID int64, owner string, ttl time.Duration) (bool, error) {
+	if r == nil {
+		return false, errBotAPIUpdateStoreRequired
+	}
 	leases, ok := r.deps.BotAPIUpdates.(store.BotAPIPollLeaseStore)
 	if !ok || botID <= 0 {
-		return true, nil
+		return false, errBotAPIUpdateStoreRequired
 	}
 	return leases.AcquireBotAPIPollLease(ctx, botID, owner, ttl)
 }
 
 func (r *Router) ReleaseBotAPIPollLease(ctx context.Context, botID int64, owner string) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	leases, ok := r.deps.BotAPIUpdates.(store.BotAPIPollLeaseStore)
 	if !ok || botID <= 0 {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return leases.ReleaseBotAPIPollLease(ctx, botID, owner)
 }
 
 func (r *Router) BotAPISetWebhook(ctx context.Context, config domain.BotAPIWebhook, dropPending bool) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
 		return errors.New("WEBHOOK_UNSUPPORTED")
@@ -204,6 +194,9 @@ func (r *Router) BotAPISetWebhook(ctx context.Context, config domain.BotAPIWebho
 }
 
 func (r *Router) BotAPIDeleteWebhook(ctx context.Context, botID int64, dropPending bool) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
 		return errors.New("WEBHOOK_UNSUPPORTED")
@@ -212,56 +205,74 @@ func (r *Router) BotAPIDeleteWebhook(ctx context.Context, botID int64, dropPendi
 }
 
 func (r *Router) BotAPIWebhook(ctx context.Context, botID int64) (domain.BotAPIWebhook, bool, error) {
+	if r == nil {
+		return domain.BotAPIWebhook{}, false, errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return domain.BotAPIWebhook{}, false, nil
+		return domain.BotAPIWebhook{}, false, errBotAPIUpdateStoreRequired
 	}
 	return webhooks.BotAPIWebhook(ctx, botID)
 }
 
 func (r *Router) ListDueBotAPIWebhooks(ctx context.Context, limit int) ([]domain.BotAPIWebhook, error) {
+	if r == nil {
+		return nil, errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return nil, nil
+		return nil, errBotAPIUpdateStoreRequired
 	}
 	return webhooks.ListDueBotAPIWebhooks(ctx, limit)
 }
 
 func (r *Router) AcquireBotAPIWebhookLease(ctx context.Context, botID int64, owner string, ttl time.Duration) (bool, error) {
+	if r == nil {
+		return false, errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return false, nil
+		return false, errBotAPIUpdateStoreRequired
 	}
 	return webhooks.AcquireBotAPIWebhookLease(ctx, botID, owner, ttl)
 }
 
 func (r *Router) ReleaseBotAPIWebhookLease(ctx context.Context, botID int64, owner string) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return webhooks.ReleaseBotAPIWebhookLease(ctx, botID, owner)
 }
 
 func (r *Router) RecordBotAPIWebhookFailure(ctx context.Context, botID int64, owner string, nextAttempt time.Time, message string) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return webhooks.RecordBotAPIWebhookFailure(ctx, botID, owner, nextAttempt, message)
 }
 
 func (r *Router) RecordBotAPIWebhookSuccess(ctx context.Context, botID int64, owner string, nextAttempt time.Time) error {
+	if r == nil {
+		return errBotAPIUpdateStoreRequired
+	}
 	webhooks, ok := r.deps.BotAPIUpdates.(store.BotAPIWebhookStore)
 	if !ok {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return webhooks.RecordBotAPIWebhookSuccess(ctx, botID, owner, nextAttempt)
 }
 
 func (r *Router) ConfirmBotAPIWebhookDelivery(ctx context.Context, botID, updateID int64) error {
 	if r == nil || r.deps.BotAPIUpdates == nil || botID <= 0 || updateID <= 0 {
-		return nil
+		return errBotAPIUpdateStoreRequired
 	}
 	return r.deps.BotAPIUpdates.ConfirmBotAPIUpdates(ctx, botID, updateID)
 }
@@ -749,8 +760,12 @@ func (r *Router) botAPISendChannelMessage(ctx context.Context, botID, channelID 
 		return domain.Message{}, botAPIChannelSendErr(err)
 	}
 	if !res.Duplicate {
-		r.enqueueChannelMessageFanout(ctx, botID, res, nil)
-		r.pushChannelDiscussionUpdate(ctx, botID, res.Discussion)
+		if err := r.enqueueChannelMessageFanout(ctx, botID, res, nil); err != nil {
+			return domain.Message{}, err
+		}
+		if err := r.pushChannelDiscussionUpdate(ctx, botID, res.Discussion); err != nil {
+			return domain.Message{}, err
+		}
 		r.maybeEnqueueWebPageResolve(botID, domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}, res.Message.ID, res.Message.Media)
 	}
 	return botAPIMessageFromChannel(botID, res.Message), nil
@@ -1001,7 +1016,9 @@ func (r *Router) BotAPIEditRichMessage(ctx context.Context, botID, chatID int64,
 		if err != nil {
 			return domain.Message{}, channelEditErr(err)
 		}
-		r.enqueueChannelEditMessageFanout(ctx, botID, res)
+		if err := r.enqueueChannelEditMessageFanout(ctx, botID, res); err != nil {
+			return domain.Message{}, err
+		}
 		return botAPIMessageFromChannel(botID, res.Message), nil
 	}
 	if r.deps.Messages == nil {
@@ -1015,7 +1032,9 @@ func (r *Router) BotAPIEditRichMessage(ctx context.Context, botID, chatID int64,
 	if err != nil {
 		return domain.Message{}, err
 	}
-	r.enqueueBotAPIPrivateEditUpdatesAsync(ctx, res)
+	if err := r.enqueueBotAPIPrivateEditUpdatesAsync(ctx, res); err != nil {
+		return domain.Message{}, err
+	}
 	self := res.Self()
 	if self.Message.ID == 0 {
 		return domain.Message{}, errors.New("MESSAGE_ID_INVALID")
@@ -1112,7 +1131,7 @@ func (r *Router) BotAPIDeleteMessage(ctx context.Context, botID, chatID int64, m
 }
 
 // BotAPIAnswerCallbackQuery bridges Bot API answerCallbackQuery to the same
-// process-local callback registry used by messages.setBotCallbackAnswer.
+// shared callback registry used by messages.setBotCallbackAnswer.
 func (r *Router) BotAPIAnswerCallbackQuery(ctx context.Context, botID int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error) {
 	if r == nil || r.callbacks == nil || botID == 0 {
 		return false, errors.New("BOT_INVALID")

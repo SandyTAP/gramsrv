@@ -11,7 +11,7 @@ import (
 )
 
 // Compile-time proof that the shipped use-case service satisfies the admin port.
-// cmd/telesrv wires *botverification.Service into Dependencies.BotVerification
+// cmd/telesrv-core wires *botverification.Service into Dependencies.BotVerification
 // directly, so a drifting method set has to fail here rather than at integration
 // time.
 var _ BotVerificationService = (*botverificationapp.Service)(nil)

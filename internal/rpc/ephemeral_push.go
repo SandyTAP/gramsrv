@@ -61,7 +61,7 @@ func (r *Router) deliverEphemeralPushLocal(ctx context.Context, event store.Ephe
 	if online, ok := r.deps.Sessions.(OnlineUserProvider); ok && !online.IsUserOnline(event.TargetUserID) {
 		return
 	}
-	binder, ok := r.deps.Sessions.(ExactLayerTransientSessionBinder)
+	binder, ok := r.deps.Sessions.(LayerAwareTransientPusher)
 	if !ok {
 		return
 	}

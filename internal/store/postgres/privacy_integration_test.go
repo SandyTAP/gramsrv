@@ -49,11 +49,12 @@ VALUES ($1, 1, 1, 1700000000, 'privacy')`, user.ID); err == nil {
 	}
 
 	type updateFootprint struct {
-		eventCount   int
-		maxPts       int
-		outboxCount  int
-		watermarkRow int
-		watermarkPts int
+		eventCount      int
+		maxPts          int
+		outboxCount     int
+		edgeOutboxCount int
+		watermarkRow    int
+		watermarkPts    int
 	}
 	readFootprint := func() updateFootprint {
 		t.Helper()
@@ -69,6 +70,12 @@ SELECT count(*)
 FROM dispatch_outbox
 WHERE target_user_id = $1`, user.ID).Scan(&got.outboxCount); err != nil {
 			t.Fatalf("read outbox footprint: %v", err)
+		}
+		if err := pool.QueryRow(ctx, `
+SELECT count(*)
+FROM edge_delivery_outbox
+WHERE target_user_id = $1`, user.ID).Scan(&got.edgeOutboxCount); err != nil {
+			t.Fatalf("read edge delivery outbox footprint: %v", err)
 		}
 		if err := pool.QueryRow(ctx, `
 SELECT count(*), COALESCE(max(contiguous_pts), 0)
@@ -99,5 +106,52 @@ WHERE user_id = $1`, user.ID).Scan(&got.watermarkRow, &got.watermarkPts); err !=
 	after := readFootprint()
 	if after != before {
 		t.Fatalf("privacy write changed PTS footprint: before=%+v after=%+v", before, after)
+	}
+
+	rollbackErr := errors.New("build privacy payload")
+	withDelivery := domain.PrivacyRules{
+		OwnerUserID: user.ID,
+		Key:         domain.PrivacyKeyPhoneNumber,
+		Rules:       []domain.PrivacyRule{{Kind: domain.PrivacyRuleAllowAll}},
+	}
+	if err := store.SetPrivacyRulesWithDelivery(ctx, withDelivery, func(domain.PrivacyRules) ([]byte, error) {
+		return nil, rollbackErr
+	}, [8]byte{8, 8}, 88); !errors.Is(err, rollbackErr) {
+		t.Fatalf("set privacy with failing delivery err=%v, want %v", err, rollbackErr)
+	}
+	got, found, err = store.GetPrivacyRules(ctx, user.ID, want.Key)
+	if err != nil || !found {
+		t.Fatalf("get privacy rules after rollback: found=%v err=%v", found, err)
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Kind != domain.PrivacyRuleDisallowAll {
+		t.Fatalf("privacy rules after rollback=%+v, want original disallow_all", got)
+	}
+	if rolledBack := readFootprint(); rolledBack != before {
+		t.Fatalf("failing privacy delivery changed footprint: before=%+v after=%+v", before, rolledBack)
+	}
+
+	if err := store.SetPrivacyRulesWithDelivery(ctx, withDelivery, func(rules domain.PrivacyRules) ([]byte, error) {
+		if rules.OwnerUserID != user.ID || rules.Key != domain.PrivacyKeyPhoneNumber {
+			t.Fatalf("delivery builder rules=%+v, want user %d phone_number", rules, user.ID)
+		}
+		return []byte{0x01}, nil
+	}, [8]byte{8, 9}, 89); err != nil {
+		t.Fatalf("set privacy with delivery: %v", err)
+	}
+	got, found, err = store.GetPrivacyRules(ctx, user.ID, want.Key)
+	if err != nil || !found {
+		t.Fatalf("get privacy rules after delivery: found=%v err=%v", found, err)
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Kind != domain.PrivacyRuleAllowAll {
+		t.Fatalf("privacy rules after delivery=%+v, want allow_all", got)
+	}
+	afterDelivery := readFootprint()
+	if afterDelivery.eventCount != before.eventCount ||
+		afterDelivery.maxPts != before.maxPts ||
+		afterDelivery.outboxCount != before.outboxCount ||
+		afterDelivery.watermarkRow != before.watermarkRow ||
+		afterDelivery.watermarkPts != before.watermarkPts ||
+		afterDelivery.edgeOutboxCount != before.edgeOutboxCount+1 {
+		t.Fatalf("privacy delivery footprint=%+v, want PTS unchanged and one edge delivery over %+v", afterDelivery, before)
 	}
 }

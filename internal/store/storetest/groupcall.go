@@ -49,7 +49,7 @@ func RunGroupCallStoreContract(t *testing.T, factory GroupCallStoreFactory) {
 	t.Run("DiscardClearsParticipants", func(t *testing.T) { contractDiscard(t, factory) })
 	t.Run("ListPagination", func(t *testing.T) { contractListPagination(t, factory) })
 	t.Run("UpdateParticipant", func(t *testing.T) { contractUpdateParticipant(t, factory) })
-	t.Run("ResetAllParticipants", func(t *testing.T) { contractReset(t, factory) })
+	t.Run("ResetParticipantsForCalls", func(t *testing.T) { contractResetScoped(t, factory) })
 	t.Run("JoinVideoStateLifecycle", func(t *testing.T) { contractJoinVideoState(t, factory) })
 	t.Run("ConferenceChainBlocks", func(t *testing.T) { contractConferenceChainBlocks(t, factory) })
 	t.Run("ConferenceInviteIdempotency", func(t *testing.T) { contractConferenceInviteIdempotency(t, factory) })
@@ -360,24 +360,47 @@ func contractUpdateParticipant(t *testing.T, factory GroupCallStoreFactory) {
 	}
 }
 
-func contractReset(t *testing.T, factory GroupCallStoreFactory) {
+func contractResetScoped(t *testing.T, factory GroupCallStoreFactory) {
 	st, channelID := factory(t)
 	ctx := context.Background()
-	call := newContractCall(t, st, channelID, channelID*100+1)
 	now := baseNow()
-	join(t, st, call.ID, 101, 7001, now)
-	mut := join(t, st, call.ID, 102, 7002, now+1)
-	v := mut.Call.Version
-	calls, err := st.ResetAllParticipants(ctx, now+100)
-	if err != nil || len(calls) != 1 {
-		t.Fatalf("reset = %d calls err=%v", len(calls), err)
+	callA := newContractCall(t, st, channelID, channelID*100+21)
+	if _, _, err := st.SetGroupCallTitle(ctx, callA.ID, "call-a"); err != nil {
+		t.Fatalf("name call A: %v", err)
 	}
-	if calls[0].ParticipantsCount != 0 || calls[0].Version != v+1 {
-		t.Fatalf("reset call = %+v, want count=0 version=%d", calls[0], v+1)
+	if _, _, err := st.SetGroupCallTitle(ctx, callA.ID, "call-a-final"); err != nil {
+		t.Fatalf("name call A again: %v", err)
 	}
-	// 重启清理后客户端 touch 返回未在会 → 触发 rejoin。
-	if _, joined, err := st.TouchParticipant(ctx, call.ID, 101, now+101); err != nil || joined {
-		t.Fatalf("touch after reset joined=%v err=%v, want false", joined, err)
+	// The active-call uniqueness rule means ordinary channel calls need distinct
+	// channels. A scoped reset must still leave the untouched call active.
+	callB, err := st.CreateGroupCall(ctx, domain.GroupCall{
+		ID: channelID*100 + 22, AccessHash: channelID*100 + 29, ChannelID: channelID + 1, CreatorUserID: 1, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("create second group call: %v", err)
+	}
+	mutA := join(t, st, callA.ID, 101, 7101, now+1)
+	mutB := join(t, st, callB.ID, 102, 7201, now+2)
+	reset, err := st.ResetParticipantsForCalls(ctx, []int64{callA.ID, callA.ID, -1}, now+100)
+	if err != nil || len(reset) != 1 {
+		t.Fatalf("scoped reset = %d calls err=%v", len(reset), err)
+	}
+	if reset[0].ID != callA.ID || reset[0].ParticipantsCount != 0 || reset[0].Version != mutA.Call.Version+1 {
+		t.Fatalf("scoped reset call = %+v, want call A count=0 version=%d", reset[0], mutA.Call.Version+1)
+	}
+	gotB, found, err := st.GetGroupCall(ctx, callB.ID)
+	if err != nil || !found {
+		t.Fatalf("get call B: found=%v err=%v", found, err)
+	}
+	if gotB.ParticipantsCount != mutB.Call.ParticipantsCount || gotB.Version != mutB.Call.Version || !gotB.Active() {
+		t.Fatalf("call B changed by scoped reset: got %+v, want count=%d version=%d active",
+			gotB, mutB.Call.ParticipantsCount, mutB.Call.Version)
+	}
+	if _, joined, err := st.TouchParticipant(ctx, callA.ID, 101, now+101); err != nil || joined {
+		t.Fatalf("touch call A after scoped reset joined=%v err=%v, want false", joined, err)
+	}
+	if _, joined, err := st.TouchParticipant(ctx, callB.ID, 102, now+101); err != nil || !joined {
+		t.Fatalf("touch call B after scoped reset joined=%v err=%v, want true", joined, err)
 	}
 }
 
@@ -525,7 +548,7 @@ func contractConferenceEmptyDiscards(t *testing.T, factory GroupCallStoreFactory
 		t.Fatalf("create reset conference call: %v", err)
 	}
 	join(t, st, resetCall.ID, 1, 7301, now+11)
-	reset, err := st.ResetAllParticipants(ctx, now+12)
+	reset, err := st.ResetParticipantsForCalls(ctx, []int64{resetCall.ID}, now+12)
 	if err != nil || len(reset) != 1 {
 		t.Fatalf("reset conferences = %+v err=%v, want one affected call", reset, err)
 	}

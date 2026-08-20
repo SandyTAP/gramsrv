@@ -413,7 +413,7 @@ func (r *Router) recordChatlistFilterUpdate(ctx context.Context, userID int64, f
 		}
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, tgUpdateForOutboxEvent(event))
+	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return nil
 }
 
@@ -441,7 +441,7 @@ func (r *Router) chatlistFilterUpdates(ctx context.Context, userID int64, filter
 	if folder != nil {
 		out.Users, out.Chats = r.tgChatlistPeerEnvelope(ctx, userID, append(folder.PinnedPeers, folder.IncludePeers...))
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, out)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }
 

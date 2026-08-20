@@ -14,6 +14,8 @@ import (
 	"github.com/iamxvbaba/td/mt"
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tlprofile"
+
+	"telesrv/internal/store"
 )
 
 type inboundItemKind uint8
@@ -1016,7 +1018,8 @@ func (s *Server) executeInboundPlan(ctx context.Context, cs *connState, c *Conn,
 			}
 		case inboundItemDestroyAuthKey:
 			s.log.Debug("Received destroy_auth_key", zap.String("auth_key_id", c.authKeyHex))
-			if err := s.authKeys.Delete(ctx, c.authKeyID); err != nil {
+			deleteCtx := store.WithAuthKeyDeleteOrigin(ctx, store.AuthKeyDeleteOrigin{ExceptSessionID: c.sessionID})
+			if err := s.authKeys.Delete(deleteCtx, c.authKeyID); err != nil {
 				s.log.Warn("Delete auth key failed", zap.String("auth_key_id", c.authKeyHex), zap.Error(err))
 				return c.SendRequiredControl(ctx, proto.MessageServerResponse, &destroyAuthKeyRPCResult{
 					RequestMessageID: item.msgID,

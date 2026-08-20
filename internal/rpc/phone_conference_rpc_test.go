@@ -15,9 +15,9 @@ import (
 
 	appgroupcalls "telesrv/internal/app/groupcalls"
 	appmessages "telesrv/internal/app/messages"
-	appphone "telesrv/internal/app/phone"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/sfu"
 	"telesrv/internal/store/memory"
 )
 
@@ -48,7 +48,8 @@ func newConferenceFixture(t *testing.T) *conferenceFixture {
 		Users:      appusers.NewService(users),
 		Messages:   messageSvc,
 		GroupCalls: groupSvc,
-		Phone:      appphone.NewService(appphone.Config{}, appphone.WithClock(clk)),
+		Phone:      newRPCPhoneService(t, clk),
+		SFU:        sfu.Disabled(),
 		Sessions:   sessions,
 	}, zaptest.NewLogger(t), clk)
 	mk := func(hash int64, phone, name string) domain.User {

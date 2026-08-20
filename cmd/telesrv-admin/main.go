@@ -82,55 +82,30 @@ type uiConfig struct {
 	// that matters for the selected blob backend: permanent localfs storage or
 	// the S3 upload spool.
 	DiskStatsPath string
-	// Permissions is the right set a panel session is issued with, from
-	// TELESRV_ADMIN_UI_PERMISSIONS. The shipped default is the single wildcard
-	// entry, so introducing the permission model never locks an operator out of a
-	// panel that worked before.
+	// Permissions is the right set a panel session is issued with.
 	Permissions []string
 }
 
-// loadConfig 通过 internal/config.Load() 加载 .env 配置文件与环境变量，
-// 并转换为 telesrv-admin 需要的 uiConfig。环境变量优先级高于 .env 文件。
+// loadConfig reads the standalone admin YAML and converts it to uiConfig.
 func loadConfig() (uiConfig, error) {
-	appCfg, err := config.Load()
+	appCfg, err := config.LoadAdmin()
 	if err != nil {
 		return uiConfig{}, fmt.Errorf("load config: %w", err)
 	}
 
-	adminAPIAddr := appCfg.AdminAPIAddr
-	if strings.TrimSpace(adminAPIAddr) == "" {
-		adminAPIAddr = defaultAdminAPIAddr
-	}
-
-	if appCfg.AdminUIPassword == "" && appCfg.AdminUIToken == "" {
-		return uiConfig{}, fmt.Errorf("TELESRV_ADMIN_UI_PASSWORD or TELESRV_ADMIN_UI_TOKEN is required")
-	}
-	if strings.TrimSpace(appCfg.AdminAPIToken) == "" {
-		return uiConfig{}, fmt.Errorf("TELESRV_ADMIN_API_TOKEN is required for admin write actions")
-	}
-	if appCfg.AdminSessionKey == "" {
-		return uiConfig{}, fmt.Errorf("TELESRV_ADMIN_SESSION_KEY is required")
-	}
-	sum := sha256.Sum256([]byte(appCfg.AdminSessionKey))
+	sum := sha256.Sum256([]byte(appCfg.SessionKey))
 
 	return uiConfig{
-		Addr:          appCfg.AdminUIAddr,
+		Addr:          appCfg.Addr,
 		PostgresDSN:   appCfg.PostgresDSN,
-		AdminAPIURL:   adminAPIURL(adminAPIAddr),
+		AdminAPIURL:   adminAPIURL(appCfg.AdminAPIAddr),
 		AdminAPIToken: appCfg.AdminAPIToken,
-		Password:      appCfg.AdminUIPassword,
-		Token:         appCfg.AdminUIToken,
+		Password:      appCfg.Password,
+		Token:         appCfg.Token,
 		SessionKey:    sum[:],
-		DiskStatsPath: dashboardDiskPath(appCfg),
-		Permissions:   appCfg.AdminUIPermissions,
+		DiskStatsPath: appCfg.DiskStatsPath,
+		Permissions:   appCfg.Permissions,
 	}, nil
-}
-
-func dashboardDiskPath(cfg config.Config) string {
-	if strings.EqualFold(strings.TrimSpace(cfg.BlobBackendKind), "s3") && strings.TrimSpace(cfg.BlobStagingDir) != "" {
-		return cfg.BlobStagingDir
-	}
-	return cfg.BlobDir
 }
 
 func adminAPIURL(addr string) string {

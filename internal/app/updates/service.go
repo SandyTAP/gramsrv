@@ -54,15 +54,6 @@ func NewService(states store.UpdateStateStore, events store.UpdateEventStore, op
 	return s
 }
 
-// UsesReliableDispatch 表示设置类 update 已写入 transactional outbox，由 outbox worker 投递在线 session。
-func (s *Service) UsesReliableDispatch() bool {
-	if s == nil || s.events == nil {
-		return false
-	}
-	_, ok := s.events.(dispatchingEventAppender)
-	return ok
-}
-
 // GetState 返回当前 auth_key + user 维度已确认的 update 状态。
 // user_update_events 是账号级 durable log；auth_key 维度只保存设备已经通过
 // getDifference 确认到的状态，不能在 getState 中直接推进到账号最新水位。

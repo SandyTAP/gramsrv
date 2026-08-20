@@ -8,7 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RateLimiter 用 Redis INCR + TTL 实现固定窗口限流。
+// RateLimiter 用 Redis Lua INCRBY + PEXPIRE 实现固定窗口限流。
 type RateLimiter struct {
 	c *redis.Client
 }

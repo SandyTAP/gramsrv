@@ -2,8 +2,8 @@
 package config
 
 import (
-	"bufio"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -18,10 +18,7 @@ import (
 	"telesrv/internal/links"
 )
 
-const (
-	defaultConfigFile  = ".env"
-	defaultCountryCode = "CN"
-)
+const defaultCountryCode = "CN"
 
 // Config 是 telesrv 的运行配置。
 type Config struct {
@@ -34,6 +31,9 @@ type Config struct {
 	WebSocketAllowedOrigins []string
 	// AdvertiseIP 是写入 help.getConfig DCOptions 的对外可达 IP（客户端据此连接本 DC）。
 	AdvertiseIP string
+	// AdvertisePort 是写入 help.getConfig DCOptions 的对外可达端口。
+	// 默认跟随 ListenAddr；独立 Core 进程应显式设置为 Edge 对外端口。
+	AdvertisePort int
 	// RSAKeyPath 是 server RSA 私钥的 PEM 路径；不存在时自动生成。
 	RSAKeyPath string
 	// DC 是本 server 的 DC ID。
@@ -89,6 +89,78 @@ type Config struct {
 	AdminAPIAddr string
 	// AdminAPIToken 是 Admin API bearer token；开启 AdminAPIAddr 时必须显式配置。
 	AdminAPIToken string
+	// GroupCallControlAddr 是 Core 接收独立 SFU 媒体活性回报的内部 HTTP 监听地址；Core 入口必填。
+	GroupCallControlAddr string
+	// GroupCallControlURL 是独立 SFU 调用 Core 媒体活性回报 API 的内部 URL。
+	GroupCallControlURL string
+	// GroupCallControlToken 是 groupcall control API/client 共用的 bearer token。
+	GroupCallControlToken string
+	// CoreExecGRPCAddr 是 Core 暴露生产 CoreExec gRPC API 的内部监听地址；Core 入口必填。
+	CoreExecGRPCAddr string
+	// CoreExecGRPCResolver 选择 Edge -> CoreExec gRPC 服务发现 provider：static 或 dns。
+	CoreExecGRPCResolver string
+	// CoreExecGRPCTargets 是 Edge 调用 CoreExec gRPC API 的静态多 endpoint 列表。
+	CoreExecGRPCTargets string
+	// CoreExecGRPCRequestTimeout 是 Edge -> CoreExec gRPC unary request 默认 deadline。
+	CoreExecGRPCRequestTimeout time.Duration
+	// CoreExecGRPCTLSCertFile/CoreExecGRPCTLSKeyFile 是 CoreExec gRPC server TLS 证书与私钥；二者必须同时配置。
+	CoreExecGRPCTLSCertFile string
+	CoreExecGRPCTLSKeyFile  string
+	// CoreExecGRPCTLSClientCAFile 配置后，CoreExec gRPC server 要求并验证 Edge client certificate。
+	CoreExecGRPCTLSClientCAFile string
+	// CoreExecGRPCTLSCAFile 是 Edge 调 CoreExec gRPC 时信任的 root CA bundle。
+	CoreExecGRPCTLSCAFile string
+	// CoreExecGRPCTLSServerName 是 Edge gRPC client 校验证书时使用的 server name。
+	CoreExecGRPCTLSServerName string
+	// CoreExecGRPCTLSClientCertFile/CoreExecGRPCTLSClientKeyFile 是 Edge gRPC client certificate；二者必须同时配置。
+	CoreExecGRPCTLSClientCertFile string
+	CoreExecGRPCTLSClientKeyFile  string
+	// CoreExecToken 是 CoreExec gRPC API/client 共用的 bearer token；Core 与 Edge 入口必填。
+	CoreExecToken string
+	// EgressAckGRPCAddr 是 Egress 暴露 late client ACK 写回 API 的内部监听地址。
+	EgressAckGRPCAddr string
+	// EgressAckGRPCResolver 选择 Edge -> Egress ACK gRPC 服务发现 provider：static 或 dns。
+	EgressAckGRPCResolver string
+	// EgressAckGRPCTargets 是 Edge 调用 Egress ACK gRPC API 的多 endpoint 列表。
+	EgressAckGRPCTargets string
+	// EgressAckGRPCRequestTimeout 是 Edge -> Egress ACK gRPC unary request 默认 deadline。
+	EgressAckGRPCRequestTimeout time.Duration
+	// EgressAckGRPCTLSCertFile/EgressAckGRPCTLSKeyFile 是 Egress ACK gRPC server TLS 证书与私钥；二者必须同时配置。
+	EgressAckGRPCTLSCertFile string
+	EgressAckGRPCTLSKeyFile  string
+	// EgressAckGRPCTLSClientCAFile 配置后，Egress ACK gRPC server 要求并验证 Edge client certificate。
+	EgressAckGRPCTLSClientCAFile string
+	// EgressAckGRPCTLSCAFile 是 Edge 调 Egress ACK gRPC 时信任的 root CA bundle。
+	EgressAckGRPCTLSCAFile string
+	// EgressAckGRPCTLSServerName 是 Edge gRPC client 校验证书时使用的 server name。
+	EgressAckGRPCTLSServerName string
+	// EgressAckGRPCTLSClientCertFile/EgressAckGRPCTLSClientKeyFile 是 Edge gRPC client certificate；二者必须同时配置。
+	EgressAckGRPCTLSClientCertFile string
+	EgressAckGRPCTLSClientKeyFile  string
+	// EgressAckToken 是 Egress ACK gRPC API/client 共用的 bearer token。
+	EgressAckToken string
+	// FileGRPCAddr 是独立 FileData 服务的内部监听地址；cmd/telesrv-file 必须配置。
+	FileGRPCAddr string
+	// FileGRPCTargets 是 Core/Edge 调 FileData 的目标列表，逗号分隔。
+	FileGRPCTargets string
+	// FileGRPCResolver 选择 FileData 服务发现 provider：static 或 dns。
+	FileGRPCResolver string
+	// FileGRPCRequestTimeout 是 Core/Edge -> FileData unary/stream request 默认 deadline。
+	FileGRPCRequestTimeout time.Duration
+	// FileGRPCTLSCertFile/FileGRPCTLSKeyFile 是 FileData gRPC server TLS 证书与私钥；二者必须同时配置。
+	FileGRPCTLSCertFile string
+	FileGRPCTLSKeyFile  string
+	// FileGRPCTLSClientCAFile 配置后，FileData gRPC server 要求并验证 Core/Edge client certificate。
+	FileGRPCTLSClientCAFile string
+	// FileGRPCTLSCAFile 是 Core/Edge 调 FileData gRPC 时信任的 root CA bundle。
+	FileGRPCTLSCAFile string
+	// FileGRPCTLSServerName 是 Core/Edge gRPC client 校验证书时使用的 server name。
+	FileGRPCTLSServerName string
+	// FileGRPCTLSClientCertFile/FileGRPCTLSClientKeyFile 是 Core/Edge gRPC client certificate；二者必须同时配置。
+	FileGRPCTLSClientCertFile string
+	FileGRPCTLSClientKeyFile  string
+	// FileToken 是 FileData gRPC API/client 共用的 bearer token。
+	FileToken string
 	// PublicBaseURL 是所有客户端可见 telesrv 链接的公开根 URL。
 	// 生产默认 https://telesrv.net；本地可设为 http://127.0.0.1:2401。
 	PublicBaseURL string
@@ -168,6 +240,13 @@ type Config struct {
 	RedisPassword string
 	// RedisDB 是 Redis 逻辑库编号。
 	RedisDB int
+	// InstanceID 是当前进程在跨 Edge/Core 控制、在线位置索引与 pub/sub 去重中的稳定标识。
+	// 为空时进程会在启动时按 hostname/pid/time 生成一个临时实例 ID。
+	InstanceID string
+	// EdgeLocationTTL / HeartbeatInterval 控制 O(1) Edge instance location lease 的
+	// 存活时间与续租周期；session 位置只在状态变化时增量写入，不随 heartbeat 全量刷新。
+	EdgeLocationTTL               time.Duration
+	EdgeLocationHeartbeatInterval time.Duration
 
 	// DevAuthCode 是开发固定验证码；生产短信/风控不在当前范围内。
 	DevAuthCode string
@@ -297,6 +376,16 @@ type Config struct {
 	// TempKeyResolveCacheTTL 是 temp→perm 绑定的进程内复核周期。绑定/revoke 有精确
 	// 失效，TTL 作为跨进程或异常路径兜底；默认 30m 避免大连接数下每 5s 全量打 PG。
 	TempKeyResolveCacheTTL time.Duration
+	// AuthUserCacheTTL 是 auth_key->user 正向授权缓存的兜底复核周期。写侧
+	// invalidation 仍是主路径；TTL 防止跨 Core pub/sub/control 丢失后旧授权永久留在内存。
+	AuthUserCacheTTL time.Duration
+	// AuthKeyCacheMaxEntries 是 Edge raw auth_key_id->key material 正向热缓存容量。
+	// Edge 不持久化 auth_keys，也不在热路径访问 PostgreSQL；缓存只保存 key/salt/expiry，
+	// Layer/client metadata 仍由 CoreExec durable profile resolver 负责。
+	AuthKeyCacheMaxEntries int
+	// AuthKeyCacheTTL 只限制 Edge auth key 热缓存资源占用。destroy_auth_key 通过
+	// Core 发布 Redis 失效事件即时清理缓存并关闭 raw-key sessions，不能依赖 TTL 保正确性。
+	AuthKeyCacheTTL time.Duration
 
 	// ChannelRowCacheMaxEntries 是「共享频道行」进程内缓存容量(channelID→domain.Channel)。
 	// 由 channels 表 LISTEN/NOTIFY 触发器实时失效(强一致、零 TTL)。<=0 禁用缓存与监听。
@@ -314,14 +403,12 @@ type Config struct {
 	// ChannelBoostCacheTTL 是 boost 读投影在未收到写侧通知时的最大陈旧窗口。
 	ChannelBoostCacheTTL time.Duration
 
-	// OutboxWorkers 是并发 outbox worker 数。用户先稳定哈希到固定 logical shard，
+	// OutboxWorkers 是 telesrv-egress 并发 outbox worker 数。用户先稳定哈希到固定 logical shard，
 	// 每个 shard 只归一个 worker，故提高 worker 数不会破坏同一用户 pts 顺序。
 	OutboxWorkers int
-	// OutboxBatch 是 transactional outbox worker 每次 claim 的最大条数。
+	// OutboxBatch 是 telesrv-egress 每次 claim transactional outbox 的最大条数。
 	// 调大提升吞吐、增大单批 PG/推送压力；调小降低延迟抖动。配套压测见 docs/message-module.md。
 	OutboxBatch int
-	// OutboxInterval 是 outbox worker 两次 claim 之间的轮询间隔。
-	OutboxInterval time.Duration
 	// OutboxLeaseTimeout 是 'dispatching' 行被判定为租约过期、允许其它 worker 重新 claim 的时长。
 	// 取值需大于单批投递耗时，否则会重复推送；过大则 worker 崩溃后积压恢复变慢。
 	OutboxLeaseTimeout time.Duration
@@ -332,7 +419,7 @@ type Config struct {
 	// OutboxPoisonCleanupInterval 独立于大表 retention 周期清理 terminal failed head，
 	// 避免一条确定性坏事件长期冻结同账号更高 pts 的在线投递 lane。
 	OutboxPoisonCleanupInterval time.Duration
-	// OutboundPushTimeout 是 best-effort updates 推送等待 outbound 队列接受的最长时间。
+	// OutboundPushTimeout 是 telesrv-egress 等待 Edge 确认 outbound 队列接受的最长时间。
 	OutboundPushTimeout time.Duration
 	// SendRateLimit 是账号级发送窗口内允许的消息条数；<=0 表示关闭发送限流。
 	SendRateLimit int
@@ -575,13 +662,41 @@ type Config struct {
 	// LiveStreamSegmentKeep 是每路流内存保留的 segment 秒数（默认 32）。
 	LiveStreamSegmentKeep int
 
-	// SFUEnable 为 false 时群通话只走信令（M0 模式，无媒体）。
-	SFUEnable bool
-	// SFUUDPPort 是内嵌 SFU 的单 UDP 端口（pion ICE UDPMux）。Windows 防火墙需放行。
+	// SFUUDPPort 是独立 SFU 的单 UDP 端口（pion ICE UDPMux）。Windows 防火墙需放行。
 	SFUUDPPort int
 	// SFUAdvertiseIP 是写进下行 candidate 的客户端可达地址，默认回落 AdvertiseIP。
 	// ⚠ 127.0.0.1 会让真机 ICE 永远连不上且无任何 RPC 错误（纯媒体面静默失败）。
 	SFUAdvertiseIP string
+	// SFUOwnerTTL / HeartbeatInterval 控制 callID -> sfu instance owner 租约。
+	// 多 SFU 时同一 call 必须粘到同一个 owner，不能由每个实例各自开房间。
+	SFUOwnerTTL               time.Duration
+	SFUOwnerHeartbeatInterval time.Duration
+	// SFUInstanceTTL / HeartbeatInterval 控制可用 SFU 媒体实例发现租约。
+	SFUInstanceTTL               time.Duration
+	SFUInstanceHeartbeatInterval time.Duration
+	// SFUInstanceHealthTimeout 是 Core remote owner selector 对单个 SFU /healthz 探测的上限。
+	SFUInstanceHealthTimeout time.Duration
+	// SFUInstanceMaxActiveCalls 为 0 表示不限制；>0 时 owner selector 不再选择已满实例。
+	SFUInstanceMaxActiveCalls int
+	// SFUControlGRPCAddr 暴露独立 SFU 的 gRPC control API；cmd/telesrv-sfu 必须配置。
+	SFUControlGRPCAddr string
+	// SFUControlGRPCURL 是其它 Core/SFU 实例调用本 SFU gRPC control API 的地址；为空回退 SFUControlGRPCAddr。
+	SFUControlGRPCURL string
+	// SFUControlGRPCRequestTimeout 是 Core -> SFU gRPC control unary request 默认 deadline。
+	SFUControlGRPCRequestTimeout time.Duration
+	// SFUControlGRPCTLSCertFile/SFUControlGRPCTLSKeyFile 是 SFU gRPC control server TLS 证书与私钥；二者必须同时配置。
+	SFUControlGRPCTLSCertFile string
+	SFUControlGRPCTLSKeyFile  string
+	// SFUControlGRPCTLSClientCAFile 配置后，SFU gRPC control server 要求并验证 Core/client certificate。
+	SFUControlGRPCTLSClientCAFile string
+	// SFUControlGRPCTLSCAFile 是 Core/probe 调 SFU gRPC control 时信任的 root CA bundle。
+	SFUControlGRPCTLSCAFile string
+	// SFUControlGRPCTLSServerName 是 Core/probe gRPC client 校验证书时使用的 server name。
+	SFUControlGRPCTLSServerName string
+	// SFUControlGRPCTLSClientCertFile/SFUControlGRPCTLSClientKeyFile 是 Core/probe gRPC client certificate；二者必须同时配置。
+	SFUControlGRPCTLSClientCertFile string
+	SFUControlGRPCTLSClientKeyFile  string
+	SFUControlToken                 string
 }
 
 // AdminScopedToken is one adminapi bearer token restricted to a permission set.
@@ -605,12 +720,7 @@ type AIProviderConfig struct {
 	Thinking        string
 }
 
-// Load 从环境变量与可选配置文件读取配置并填充默认值。环境变量优先于配置文件。
-func Load() (Config, error) {
-	fileEnv, err := loadConfigEnv()
-	if err != nil {
-		return Config{}, err
-	}
+func loadFromEnv(fileEnv envSource) (Config, error) {
 	envBoolOr := fileEnv.envBoolOr
 	envOr := fileEnv.envOr
 	envListOr := fileEnv.envListOr
@@ -680,6 +790,15 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_ADVERTISE_IP: %w", err)
 	}
+	listenAddr := envOr("TELESRV_LISTEN", "0.0.0.0:2398")
+	listenPort, err := portFromListenAddr("TELESRV_LISTEN", listenAddr)
+	if err != nil {
+		return Config{}, err
+	}
+	advertisePort, err := portFromOptionalEnv(fileEnv, "TELESRV_ADVERTISE_PORT", listenPort)
+	if err != nil {
+		return Config{}, err
+	}
 	// The composite rating weight defaults are the domain formula's own defaults;
 	// see RatingWeight* below.
 	defaultRatingWeights := domain.DefaultAccountRatingWeights()
@@ -701,7 +820,7 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:      envOr("TELESRV_LISTEN", "0.0.0.0:2398"),
+		ListenAddr:      listenAddr,
 		WebSocketEnable: envBoolOr("TELESRV_WEBSOCKET_ENABLE", true),
 		WebSocketAllowedOrigins: envListOr("TELESRV_WEBSOCKET_ALLOWED_ORIGINS", []string{
 			"http://localhost:1234",
@@ -710,6 +829,7 @@ func Load() (Config, error) {
 		// help.getConfig 必须下发至少一个可重连的主 DC 地址；远端部署不能
 		// 沿用 loopback 默认值，需显式设置客户端实际可达的 IP。
 		AdvertiseIP:                       advertiseIP,
+		AdvertisePort:                     advertisePort,
 		RSAKeyPath:                        envOr("TELESRV_RSA_KEY", "data/server_rsa.pem"),
 		DC:                                envIntOr("TELESRV_DC", 2),
 		DefaultCountryCode:                countryCode,
@@ -738,6 +858,45 @@ func Load() (Config, error) {
 		BotAPIAddr:                           envAllowEmptyOr("TELESRV_BOT_API_ADDR", ""),
 		AdminAPIAddr:                         envAllowEmptyOr("TELESRV_ADMIN_API_ADDR", ""),
 		AdminAPIToken:                        envOr("TELESRV_ADMIN_API_TOKEN", ""),
+		GroupCallControlAddr:                 envAllowEmptyOr("TELESRV_GROUPCALL_CONTROL_ADDR", ""),
+		GroupCallControlURL:                  envAllowEmptyOr("TELESRV_GROUPCALL_CONTROL_URL", ""),
+		GroupCallControlToken:                envOr("TELESRV_GROUPCALL_CONTROL_TOKEN", ""),
+		CoreExecGRPCAddr:                     envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_ADDR", ""),
+		CoreExecGRPCResolver:                 strings.ToLower(strings.TrimSpace(envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_RESOLVER", "static"))),
+		CoreExecGRPCTargets:                  envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TARGETS", ""),
+		CoreExecGRPCRequestTimeout:           envDurationOr("TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT", 5*time.Second),
+		CoreExecGRPCTLSCertFile:              envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE", ""),
+		CoreExecGRPCTLSKeyFile:               envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE", ""),
+		CoreExecGRPCTLSClientCAFile:          envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE", ""),
+		CoreExecGRPCTLSCAFile:                envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CA_FILE", ""),
+		CoreExecGRPCTLSServerName:            envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_SERVER_NAME", ""),
+		CoreExecGRPCTLSClientCertFile:        envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE", ""),
+		CoreExecGRPCTLSClientKeyFile:         envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE", ""),
+		CoreExecToken:                        envOr("TELESRV_CORE_EXEC_TOKEN", ""),
+		EgressAckGRPCAddr:                    envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_ADDR", ""),
+		EgressAckGRPCResolver:                strings.ToLower(strings.TrimSpace(envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "static"))),
+		EgressAckGRPCTargets:                 envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TARGETS", ""),
+		EgressAckGRPCRequestTimeout:          envDurationOr("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", 5*time.Second),
+		EgressAckGRPCTLSCertFile:             envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE", ""),
+		EgressAckGRPCTLSKeyFile:              envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE", ""),
+		EgressAckGRPCTLSClientCAFile:         envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE", ""),
+		EgressAckGRPCTLSCAFile:               envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE", ""),
+		EgressAckGRPCTLSServerName:           envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME", ""),
+		EgressAckGRPCTLSClientCertFile:       envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE", ""),
+		EgressAckGRPCTLSClientKeyFile:        envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE", ""),
+		EgressAckToken:                       envOr("TELESRV_EGRESS_ACK_TOKEN", ""),
+		FileGRPCAddr:                         envAllowEmptyOr("TELESRV_FILE_GRPC_ADDR", ""),
+		FileGRPCTargets:                      envAllowEmptyOr("TELESRV_FILE_GRPC_TARGETS", ""),
+		FileGRPCResolver:                     strings.ToLower(strings.TrimSpace(envOr("TELESRV_FILE_GRPC_RESOLVER", "static"))),
+		FileGRPCRequestTimeout:               envDurationOr("TELESRV_FILE_GRPC_REQUEST_TIMEOUT", 10*time.Second),
+		FileGRPCTLSCertFile:                  envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_CERT_FILE", ""),
+		FileGRPCTLSKeyFile:                   envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_KEY_FILE", ""),
+		FileGRPCTLSClientCAFile:              envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE", ""),
+		FileGRPCTLSCAFile:                    envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_CA_FILE", ""),
+		FileGRPCTLSServerName:                envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_SERVER_NAME", ""),
+		FileGRPCTLSClientCertFile:            envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE", ""),
+		FileGRPCTLSClientKeyFile:             envAllowEmptyOr("TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE", ""),
+		FileToken:                            envOr("TELESRV_FILE_TOKEN", ""),
 		PublicBaseURL:                        publicBaseURL,
 		Branding:                             brandConfig,
 		UpdatePublicURL:                      updatePublicURL,
@@ -778,6 +937,11 @@ func Load() (Config, error) {
 		RedisAddr:        envOr("TELESRV_REDIS_ADDR", "127.0.0.1:6399"), // 同理避开 localhost→IPv6 回退延迟
 		RedisPassword:    envOr("TELESRV_REDIS_PASSWORD", ""),
 		RedisDB:          envIntOr("TELESRV_REDIS_DB", 0),
+		InstanceID:       strings.TrimSpace(envAllowEmptyOr("TELESRV_INSTANCE_ID", "")),
+		EdgeLocationTTL:  envDurationOr("TELESRV_EDGE_LOCATION_TTL", 90*time.Second),
+		EdgeLocationHeartbeatInterval: envDurationOr(
+			"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL", 30*time.Second,
+		),
 
 		DevAuthCode:                   envOr("TELESRV_DEV_AUTH_CODE", "12345"),
 		AuthCodeTTL:                   envDurationOr("TELESRV_AUTH_CODE_TTL", 5*time.Minute),
@@ -846,6 +1010,9 @@ func Load() (Config, error) {
 		TranslationRateWindow:         envDurationOr("TELESRV_TRANSLATION_RATE_WINDOW", time.Minute),
 		TempKeyResolveCacheMaxEntries: envIntOr("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", 262144),
 		TempKeyResolveCacheTTL:        envDurationOr("TELESRV_TEMP_KEY_CACHE_TTL", 30*time.Minute),
+		AuthUserCacheTTL:              envDurationOr("TELESRV_AUTH_USER_CACHE_TTL", time.Minute),
+		AuthKeyCacheMaxEntries:        envIntOr("TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES", 262144),
+		AuthKeyCacheTTL:               envDurationOr("TELESRV_AUTH_KEY_CACHE_TTL", 30*time.Minute),
 		ChannelRowCacheMaxEntries:     envIntOr("TELESRV_CHANNEL_ROW_CACHE_MAX", 50000),
 		ChannelMemberCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_MEMBER_CACHE_MAX", 100000),
 		ChannelDialogCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_DIALOG_CACHE_MAX", 100000),
@@ -854,7 +1021,6 @@ func Load() (Config, error) {
 
 		OutboxWorkers:         envIntOr("TELESRV_OUTBOX_WORKERS", 4),
 		OutboxBatch:           envIntOr("TELESRV_OUTBOX_BATCH", 100),
-		OutboxInterval:        envDurationOr("TELESRV_OUTBOX_INTERVAL", 200*time.Millisecond),
 		OutboxLeaseTimeout:    envDurationOr("TELESRV_OUTBOX_LEASE_TIMEOUT", 30*time.Second),
 		OutboxPoisonRetention: envDurationOr("TELESRV_OUTBOX_POISON_RETENTION", time.Minute),
 		OutboxPoisonCleanupInterval: envDurationOr(
@@ -966,9 +1132,27 @@ func Load() (Config, error) {
 		CallTURNCredentialTTL: envDurationOr("TELESRV_CALL_TURN_CREDENTIAL_TTL", 6*time.Hour),
 		CallForceRelay:        envBoolOr("TELESRV_CALL_FORCE_RELAY", false),
 
-		SFUEnable:      envBoolOr("TELESRV_SFU_ENABLE", true),
-		SFUUDPPort:     envIntOr("TELESRV_SFU_UDP_PORT", 12399),
-		SFUAdvertiseIP: envOr("TELESRV_SFU_ADVERTISE_IP", ""),
+		SFUUDPPort:                   envIntOr("TELESRV_SFU_UDP_PORT", 12399),
+		SFUAdvertiseIP:               envOr("TELESRV_SFU_ADVERTISE_IP", ""),
+		SFUOwnerTTL:                  envDurationOr("TELESRV_SFU_OWNER_TTL", 2*time.Minute),
+		SFUOwnerHeartbeatInterval:    envDurationOr("TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL", 30*time.Second),
+		SFUInstanceTTL:               envDurationOr("TELESRV_SFU_INSTANCE_TTL", 90*time.Second),
+		SFUInstanceHeartbeatInterval: envDurationOr("TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL", 30*time.Second),
+		SFUInstanceHealthTimeout:     envDurationOr("TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT", time.Second),
+		SFUInstanceMaxActiveCalls:    envIntOr("TELESRV_SFU_INSTANCE_MAX_ACTIVE_CALLS", 0),
+		SFUControlGRPCAddr:           envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_ADDR", ""),
+		SFUControlGRPCURL:            envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_URL", ""),
+		SFUControlGRPCRequestTimeout: envDurationOr("TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT", 5*time.Second),
+		SFUControlGRPCTLSCertFile:    envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE", ""),
+		SFUControlGRPCTLSKeyFile:     envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE", ""),
+		SFUControlGRPCTLSClientCAFile: envAllowEmptyOr(
+			"TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE", "",
+		),
+		SFUControlGRPCTLSCAFile:         envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_CA_FILE", ""),
+		SFUControlGRPCTLSServerName:     envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_SERVER_NAME", ""),
+		SFUControlGRPCTLSClientCertFile: envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE", ""),
+		SFUControlGRPCTLSClientKeyFile:  envAllowEmptyOr("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_KEY_FILE", ""),
+		SFUControlToken:                 envOr("TELESRV_SFU_CONTROL_TOKEN", ""),
 
 		LiveStreamEnable:      envBoolOr("TELESRV_LIVESTREAM_ENABLE", true),
 		LiveStreamRtmpAddr:    envOr("TELESRV_LIVESTREAM_RTMP_ADDR", ":2400"),
@@ -1004,13 +1188,197 @@ func Load() (Config, error) {
 	if err := validateBlobStorageConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.AuthKeyCacheMaxEntries <= 0 {
+		return Config{}, fmt.Errorf("TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES must be greater than zero")
+	}
+	if cfg.AuthKeyCacheTTL <= 0 || cfg.AuthKeyCacheTTL > 24*time.Hour {
+		return Config{}, fmt.Errorf("TELESRV_AUTH_KEY_CACHE_TTL must be greater than zero and at most 24h")
+	}
 	if cfg.DC <= 0 || int64(cfg.DC) > int64(1<<31-1) {
 		return Config{}, fmt.Errorf("TELESRV_DC must be a positive TL int32")
+	}
+	if cfg.CoreExecGRPCRequestTimeout <= 0 || cfg.CoreExecGRPCRequestTimeout > time.Minute {
+		return Config{}, fmt.Errorf("TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
+	}
+	if err := validateCoreExecGRPCResolverConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateCoreExecGRPCTLSConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if cfg.EgressAckGRPCRequestTimeout <= 0 || cfg.EgressAckGRPCRequestTimeout > time.Minute {
+		return Config{}, fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
+	}
+	if err := validateEgressAckGRPCResolverConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateEgressAckGRPCTLSConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if cfg.FileGRPCRequestTimeout <= 0 || cfg.FileGRPCRequestTimeout > time.Minute {
+		return Config{}, fmt.Errorf("TELESRV_FILE_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
+	}
+	if err := validateFileGRPCResolverConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateFileGRPCTLSConfig(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.UpdateRequestTimeout <= 0 || cfg.UpdateRequestTimeout > 30*time.Second {
 		return Config{}, fmt.Errorf("TELESRV_UPDATE_REQUEST_TIMEOUT must be greater than zero and at most 30s")
 	}
+	if err := validateEdgeLocationConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateSFUOwnerConfig(cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func validateEdgeLocationConfig(cfg Config) error {
+	if cfg.EdgeLocationTTL <= 0 {
+		return fmt.Errorf("TELESRV_EDGE_LOCATION_TTL must be positive")
+	}
+	if cfg.EdgeLocationHeartbeatInterval <= 0 {
+		return fmt.Errorf("TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL must be positive")
+	}
+	if cfg.EdgeLocationHeartbeatInterval >= cfg.EdgeLocationTTL {
+		return fmt.Errorf("TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL must be less than TELESRV_EDGE_LOCATION_TTL")
+	}
+	return nil
+}
+
+func validateCoreExecGRPCResolverConfig(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.CoreExecGRPCResolver)) {
+	case "", "static", "dns":
+		return nil
+	default:
+		return fmt.Errorf("TELESRV_CORE_EXEC_GRPC_RESOLVER must be static or dns")
+	}
+}
+
+func validateCoreExecGRPCTLSConfig(cfg Config) error {
+	if (strings.TrimSpace(cfg.CoreExecGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.CoreExecGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE and TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE must be configured together")
+	}
+	if strings.TrimSpace(cfg.CoreExecGRPCTLSClientCAFile) != "" &&
+		(strings.TrimSpace(cfg.CoreExecGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.CoreExecGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE and TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE")
+	}
+	if (strings.TrimSpace(cfg.CoreExecGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.CoreExecGRPCTLSClientKeyFile) == "") {
+		return fmt.Errorf("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
+	}
+	return nil
+}
+
+func validateEgressAckGRPCResolverConfig(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.EgressAckGRPCResolver)) {
+	case "", "static", "dns":
+		return nil
+	default:
+		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_RESOLVER must be static or dns")
+	}
+}
+
+func validateEgressAckGRPCTLSConfig(cfg Config) error {
+	if (strings.TrimSpace(cfg.EgressAckGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.EgressAckGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE must be configured together")
+	}
+	if strings.TrimSpace(cfg.EgressAckGRPCTLSClientCAFile) != "" &&
+		(strings.TrimSpace(cfg.EgressAckGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.EgressAckGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE")
+	}
+	if (strings.TrimSpace(cfg.EgressAckGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.EgressAckGRPCTLSClientKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
+	}
+	return nil
+}
+
+func validateFileGRPCResolverConfig(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.FileGRPCResolver)) {
+	case "", "static", "dns":
+		return nil
+	default:
+		return fmt.Errorf("TELESRV_FILE_GRPC_RESOLVER must be static or dns")
+	}
+}
+
+func validateFileGRPCTLSConfig(cfg Config) error {
+	if (strings.TrimSpace(cfg.FileGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.FileGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_FILE_GRPC_TLS_CERT_FILE and TELESRV_FILE_GRPC_TLS_KEY_FILE must be configured together")
+	}
+	if strings.TrimSpace(cfg.FileGRPCTLSClientCAFile) != "" &&
+		(strings.TrimSpace(cfg.FileGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.FileGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_FILE_GRPC_TLS_CERT_FILE and TELESRV_FILE_GRPC_TLS_KEY_FILE")
+	}
+	if (strings.TrimSpace(cfg.FileGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.FileGRPCTLSClientKeyFile) == "") {
+		return fmt.Errorf("TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
+	}
+	return nil
+}
+
+func validateSFUOwnerConfig(cfg Config) error {
+	if cfg.SFUOwnerTTL <= 0 {
+		return fmt.Errorf("TELESRV_SFU_OWNER_TTL must be positive")
+	}
+	if cfg.SFUOwnerHeartbeatInterval <= 0 {
+		return fmt.Errorf("TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL must be positive")
+	}
+	if cfg.SFUOwnerHeartbeatInterval >= cfg.SFUOwnerTTL {
+		return fmt.Errorf("TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL must be less than TELESRV_SFU_OWNER_TTL")
+	}
+	if cfg.SFUInstanceTTL <= 0 {
+		return fmt.Errorf("TELESRV_SFU_INSTANCE_TTL must be positive")
+	}
+	if cfg.SFUInstanceHeartbeatInterval <= 0 {
+		return fmt.Errorf("TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL must be positive")
+	}
+	if cfg.SFUInstanceHeartbeatInterval >= cfg.SFUInstanceTTL {
+		return fmt.Errorf("TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL must be less than TELESRV_SFU_INSTANCE_TTL")
+	}
+	if cfg.SFUInstanceHealthTimeout <= 0 {
+		return fmt.Errorf("TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT must be positive")
+	}
+	if cfg.SFUInstanceMaxActiveCalls < 0 {
+		return fmt.Errorf("TELESRV_SFU_INSTANCE_MAX_ACTIVE_CALLS must be non-negative")
+	}
+	if cfg.SFUControlGRPCRequestTimeout <= 0 || cfg.SFUControlGRPCRequestTimeout > time.Minute {
+		return fmt.Errorf("TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
+	}
+	if err := validateSFUControlGRPCTLSConfig(cfg); err != nil {
+		return err
+	}
+	if strings.Contains(strings.TrimSpace(cfg.SFUControlToken), "\n") || strings.Contains(strings.TrimSpace(cfg.SFUControlToken), "\r") {
+		return fmt.Errorf("TELESRV_SFU_CONTROL_TOKEN must not contain newlines")
+	}
+	if strings.Contains(strings.TrimSpace(cfg.GroupCallControlToken), "\n") || strings.Contains(strings.TrimSpace(cfg.GroupCallControlToken), "\r") {
+		return fmt.Errorf("TELESRV_GROUPCALL_CONTROL_TOKEN must not contain newlines")
+	}
+	if strings.Contains(strings.TrimSpace(cfg.CoreExecToken), "\n") || strings.Contains(strings.TrimSpace(cfg.CoreExecToken), "\r") {
+		return fmt.Errorf("TELESRV_CORE_EXEC_TOKEN must not contain newlines")
+	}
+	if strings.Contains(strings.TrimSpace(cfg.EgressAckToken), "\n") || strings.Contains(strings.TrimSpace(cfg.EgressAckToken), "\r") {
+		return fmt.Errorf("TELESRV_EGRESS_ACK_TOKEN must not contain newlines")
+	}
+	if strings.Contains(strings.TrimSpace(cfg.FileToken), "\n") || strings.Contains(strings.TrimSpace(cfg.FileToken), "\r") {
+		return fmt.Errorf("TELESRV_FILE_TOKEN must not contain newlines")
+	}
+	return nil
+}
+
+func validateSFUControlGRPCTLSConfig(cfg Config) error {
+	if (strings.TrimSpace(cfg.SFUControlGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.SFUControlGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE and TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE must be configured together")
+	}
+	if strings.TrimSpace(cfg.SFUControlGRPCTLSClientCAFile) != "" &&
+		(strings.TrimSpace(cfg.SFUControlGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.SFUControlGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE and TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE")
+	}
+	if (strings.TrimSpace(cfg.SFUControlGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.SFUControlGRPCTLSClientKeyFile) == "") {
+		return fmt.Errorf("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
+	}
+	return nil
 }
 
 func validateBlobStorageConfig(cfg Config) error {
@@ -1105,6 +1473,33 @@ func normalizeAdvertiseIP(raw string) (string, error) {
 		return "", fmt.Errorf("must be a unicast address usable by clients")
 	}
 	return addr.String(), nil
+}
+
+func portFromListenAddr(envKey, listenAddr string) (int, error) {
+	_, portText, err := net.SplitHostPort(strings.TrimSpace(listenAddr))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a host:port listen address: %w", envKey, err)
+	}
+	return parseTCPPort(envKey, portText)
+}
+
+func portFromOptionalEnv(env envSource, key string, def int) (int, error) {
+	raw := strings.TrimSpace(env.envAllowEmptyOr(key, ""))
+	if raw == "" {
+		return def, nil
+	}
+	return parseTCPPort(key, raw)
+}
+
+func parseTCPPort(envKey, raw string) (int, error) {
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a base-10 TCP port: %w", envKey, err)
+	}
+	if port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("%s must be between 1 and 65535", envKey)
+	}
+	return port, nil
 }
 
 func validateTelegramLoginConfig(cfg Config) error {
@@ -1577,95 +1972,16 @@ func defaultAIProviderAPIKey(env envSource, name string) string {
 	}
 }
 
-type envSource map[string]string
-
-func loadConfigEnv() (envSource, error) {
-	path, explicit := os.LookupEnv("TELESRV_CONFIG")
-	if !explicit {
-		path = defaultConfigFile
-	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, nil
-	}
-	env, err := readEnvFile(path)
-	if err != nil {
-		if !explicit && os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("config file %q: %w", path, err)
-	}
-	return env, nil
+type envSource struct {
+	values     map[string]string
+	processEnv bool
 }
 
-func readEnvFile(path string) (envSource, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+func newEnvSource(values map[string]string, processEnv bool) envSource {
+	if values == nil {
+		values = map[string]string{}
 	}
-	defer func() { _ = f.Close() }()
-
-	values := make(envSource)
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return nil, fmt.Errorf("line %d: expected KEY=VALUE", lineNo)
-		}
-		key = strings.TrimSpace(key)
-		if !strings.HasPrefix(key, "TELESRV_") || !validEnvKey(key) {
-			return nil, fmt.Errorf("line %d: unsupported key %q; use TELESRV_* keys", lineNo, key)
-		}
-		value = strings.TrimSpace(value)
-		if unquoted, ok := unquoteEnvValue(value); ok {
-			value = unquoted
-		}
-		values[key] = value
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return values, nil
-}
-
-func validEnvKey(key string) bool {
-	if key == "" {
-		return false
-	}
-	for i, r := range key {
-		if r == '_' || ('A' <= r && r <= 'Z') || (i > 0 && '0' <= r && r <= '9') {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func unquoteEnvValue(value string) (string, bool) {
-	if len(value) < 2 {
-		return "", false
-	}
-	quote := value[0]
-	if quote != '"' && quote != '\'' {
-		return "", false
-	}
-	if value[len(value)-1] != quote {
-		return "", false
-	}
-	if quote == '\'' {
-		return value[1 : len(value)-1], true
-	}
-	unquoted, err := strconv.Unquote(value)
-	if err != nil {
-		return value[1 : len(value)-1], true
-	}
-	return unquoted, true
+	return envSource{values: values, processEnv: processEnv}
 }
 
 func (e envSource) envBoolOr(key string, def bool) bool {
@@ -1681,10 +1997,12 @@ func (e envSource) envBoolOr(key string, def bool) bool {
 }
 
 func (e envSource) envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if e.processEnv {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
 	}
-	if v := e[key]; v != "" {
+	if v := e.values[key]; v != "" {
 		return v
 	}
 	return def
@@ -1693,10 +2011,12 @@ func (e envSource) envOr(key, def string) string {
 // envAllowEmptyOr is for nullable settings where an explicitly empty process
 // environment value must override a non-empty config-file value or default.
 func (e envSource) envAllowEmptyOr(key, def string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
+	if e.processEnv {
+		if v, ok := os.LookupEnv(key); ok {
+			return v
+		}
 	}
-	if v, ok := e[key]; ok {
+	if v, ok := e.values[key]; ok {
 		return v
 	}
 	return def

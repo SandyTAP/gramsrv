@@ -2,23 +2,33 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // SecretChatStore 是 store.SecretChatStore 的进程内实现（rpc/app 单测 fixture 用）。
 // 行为契约与 postgres 实现由 storetest 共享 contract test 钉死；凡动握手态迁移
 // 语义两边必须同步。
 type SecretChatStore struct {
-	mu    sync.Mutex
-	chats map[int]domain.SecretChat
+	mu          sync.Mutex
+	chats       map[int]domain.SecretChat
+	stateEvents *EncryptedQueueStore
 }
 
 // NewSecretChatStore 创建内存实现。
 func NewSecretChatStore() *SecretChatStore {
 	return &SecretChatStore{chats: make(map[int]domain.SecretChat)}
+}
+
+func (s *SecretChatStore) AttachEncryptedStateEvents(queue *EncryptedQueueStore) *SecretChatStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stateEvents = queue
+	return s
 }
 
 func cloneSecretChat(c domain.SecretChat) domain.SecretChat {
@@ -41,6 +51,27 @@ func (s *SecretChatStore) CreateSecretChat(_ context.Context, chat domain.Secret
 	}
 	s.chats[chat.ID] = cloneSecretChat(chat)
 	return nil
+}
+
+func (s *SecretChatStore) encryptedStateEvents() (*EncryptedQueueStore, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stateEvents == nil {
+		return nil, store.ErrSecretChatStateEventStoreMissing
+	}
+	return s.stateEvents, nil
+}
+
+func (s *SecretChatStore) CreateSecretChatWithStateEvent(ctx context.Context, chat domain.SecretChat, ev domain.EncryptedStateEvent) error {
+	queue, err := s.encryptedStateEvents()
+	if err != nil {
+		return err
+	}
+	if err := s.CreateSecretChat(ctx, chat); err != nil {
+		return err
+	}
+	_, err = queue.AppendStateEvent(ctx, ev)
+	return err
 }
 
 func (s *SecretChatStore) GetSecretChat(_ context.Context, chatID int) (domain.SecretChat, bool, error) {
@@ -78,6 +109,26 @@ func (s *SecretChatStore) AcceptSecretChat(_ context.Context, chatID int, partic
 	return cloneSecretChat(c), nil
 }
 
+func (s *SecretChatStore) AcceptSecretChatWithStateEvents(ctx context.Context, chatID int, participantAuthKeyID int64, gb []byte, keyFingerprint int64, events []domain.EncryptedStateEvent) (domain.SecretChat, error) {
+	queue, err := s.encryptedStateEvents()
+	if err != nil {
+		return domain.SecretChat{}, err
+	}
+	if len(events) == 0 {
+		return domain.SecretChat{}, fmt.Errorf("secretchat: missing accept state events")
+	}
+	chat, err := s.AcceptSecretChat(ctx, chatID, participantAuthKeyID, gb, keyFingerprint)
+	if err != nil {
+		return domain.SecretChat{}, err
+	}
+	for _, ev := range events {
+		if _, err := queue.AppendStateEvent(ctx, ev); err != nil {
+			return domain.SecretChat{}, err
+		}
+	}
+	return chat, nil
+}
+
 func (s *SecretChatStore) DiscardSecretChat(_ context.Context, chatID int, historyDeleted bool) (domain.SecretChat, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -92,6 +143,23 @@ func (s *SecretChatStore) DiscardSecretChat(_ context.Context, chatID int, histo
 	c.HistoryDeleted = historyDeleted
 	s.chats[chatID] = c
 	return cloneSecretChat(c), false, nil
+}
+
+func (s *SecretChatStore) DiscardSecretChatWithStateEvent(ctx context.Context, chatID int, historyDeleted bool, ev domain.EncryptedStateEvent) (domain.SecretChat, bool, error) {
+	queue, err := s.encryptedStateEvents()
+	if err != nil {
+		return domain.SecretChat{}, false, err
+	}
+	chat, already, err := s.DiscardSecretChat(ctx, chatID, historyDeleted)
+	if err != nil {
+		return domain.SecretChat{}, false, err
+	}
+	if !already {
+		if _, err := queue.AppendStateEvent(ctx, ev); err != nil {
+			return domain.SecretChat{}, false, err
+		}
+	}
+	return chat, already, nil
 }
 
 func (s *SecretChatStore) ListActiveSecretChatsByAuthKey(_ context.Context, authKeyID int64) ([]domain.SecretChat, error) {

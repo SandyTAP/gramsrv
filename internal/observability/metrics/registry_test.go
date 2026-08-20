@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"telesrv/internal/coreexec"
 	"telesrv/internal/mtprotoedge"
 	"telesrv/internal/rpc"
 )
@@ -16,6 +17,7 @@ var (
 	_ mtprotoedge.RPCResultMetrics        = (*Registry)(nil)
 	_ mtprotoedge.LogicalOutboxMetrics    = (*Registry)(nil)
 	_ mtprotoedge.ConnectionIntakeMetrics = (*Registry)(nil)
+	_ coreexec.Metrics                    = (*Registry)(nil)
 	_ rpc.Metrics                         = (*Registry)(nil)
 )
 
@@ -45,6 +47,54 @@ func TestRegistryExportsBoundedAggregateMetrics(t *testing.T) {
 	}
 	if !strings.Contains(body, "telesrv_metrics_dropped_observations_total 2") {
 		t.Fatalf("overflow counter missing from:\n%s", body)
+	}
+}
+
+func TestRegistryExportsCoreExecGRPCMetrics(t *testing.T) {
+	registry := New()
+	registry.CoreExecGRPCCall("client", "dispatch_admitted", "ok", 5*time.Millisecond)
+	registry.CoreExecGRPCCall("server", "get_info", "version_mismatch", 7*time.Millisecond)
+
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	body := recorder.Body.String()
+	if !strings.Contains(body, `telesrv_coreexec_grpc_calls_total{side="client",operation="dispatch_admitted",outcome="ok"} 1`) {
+		t.Fatalf("client CoreExec metric missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_coreexec_grpc_call_seconds_bucket{side="server",operation="get_info",outcome="version_mismatch"`) {
+		t.Fatalf("server CoreExec histogram missing:\n%s", body)
+	}
+}
+
+func TestRegistryExportsCoreExecPendingAdmissionMetrics(t *testing.T) {
+	registry := New()
+	registry.CoreExecPendingAdmissionRejected("grpc", "capacity")
+	registry.AddGaugeProvider(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "telesrv_coreexec_pending_admissions", Labels: []Label{{Name: "transport", Value: "grpc"}}, Value: 7},
+			{Name: "telesrv_coreexec_pending_admission_capacity", Labels: []Label{{Name: "transport", Value: "grpc"}}, Value: 8192},
+			{Name: "telesrv_coreexec_pending_admission_oldest_age_seconds", Labels: []Label{{Name: "transport", Value: "grpc"}}, Value: 1.5},
+			{Name: "telesrv_coreexec_pending_admission_ttl_seconds", Labels: []Label{{Name: "transport", Value: "grpc"}}, Value: 120},
+		}
+	})
+
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	body := recorder.Body.String()
+	if !strings.Contains(body, `telesrv_coreexec_pending_admission_rejected_total{transport="grpc",reason="capacity"} 1`) {
+		t.Fatalf("pending admission reject counter missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_coreexec_pending_admissions{transport="grpc"} 7`) {
+		t.Fatalf("pending admission gauge missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_coreexec_pending_admission_capacity{transport="grpc"} 8192`) {
+		t.Fatalf("pending admission capacity gauge missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_coreexec_pending_admission_oldest_age_seconds{transport="grpc"} 1.5`) {
+		t.Fatalf("pending admission oldest-age gauge missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_coreexec_pending_admission_ttl_seconds{transport="grpc"} 120`) {
+		t.Fatalf("pending admission ttl gauge missing:\n%s", body)
 	}
 }
 

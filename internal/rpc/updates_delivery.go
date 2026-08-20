@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,6 +35,8 @@ type updatesDeliveryPlan struct {
 	secretEventIDs      []int64
 
 	markSessionReady bool
+	readyRawAuthKey  [8]byte
+	readySessionID   int64
 	readyUserID      int64
 
 	publishBootstrap bool
@@ -71,11 +74,13 @@ func (p *updatesDeliveryPlan) stageCursor(authKeyID [8]byte, userID int64, state
 	p.cursorMode = mode
 }
 
-func (p *updatesDeliveryPlan) stageSessionReady(userID int64) {
+func (p *updatesDeliveryPlan) stageSessionReady(ctx context.Context, userID int64) {
 	if p == nil {
 		return
 	}
 	p.markSessionReady = true
+	p.readyRawAuthKey = rawAuthKeyIDForOrigin(ctx)
+	p.readySessionID, _ = SessionIDFrom(ctx)
 	p.readyUserID = userID
 }
 
@@ -93,7 +98,7 @@ func (p *updatesDeliveryPlan) suppressSessionActivation() {
 	p.bootstrapUserID = 0
 }
 
-func (p *updatesDeliveryPlan) stageBaseline(userID, secretDeviceKey int64, secretEventIDs []int64, subscribe, bootstrap bool) {
+func (p *updatesDeliveryPlan) stageBaseline(ctx context.Context, userID, secretDeviceKey int64, secretEventIDs []int64, subscribe, bootstrap bool) {
 	if p == nil {
 		return
 	}
@@ -105,7 +110,7 @@ func (p *updatesDeliveryPlan) stageBaseline(userID, secretDeviceKey int64, secre
 	if !subscribe {
 		return
 	}
-	p.stageSessionReady(userID)
+	p.stageSessionReady(ctx, userID)
 	if bootstrap && userID != 0 {
 		p.publishBootstrap = true
 		p.bootstrapUserID = userID
@@ -148,11 +153,11 @@ func (r *Router) stageSessionUpdatesReadyAfterDelivery(ctx context.Context, user
 		return
 	}
 	if plan, ok := updatesDeliveryPlanFrom(ctx); ok {
-		plan.stageSessionReady(userID)
+		plan.stageSessionReady(ctx, userID)
 		return
 	}
 	plan := updatesDeliveryPlan{baseCtx: context.WithoutCancel(ctx)}
-	plan.stageSessionReady(userID)
+	plan.stageSessionReady(ctx, userID)
 	r.registerUpdatesDeliveryPlan(ctx, &plan)
 }
 
@@ -177,7 +182,7 @@ func (r *Router) stageUpdatesBaselineAfterDelivery(
 			authKeyID, _ := AuthKeyIDFrom(ctx)
 			plan.stageCursor(authKeyID, userID, *cursor, mode)
 		}
-		plan.stageBaseline(userID, secretDeviceKey, secretEventIDs, subscribe, bootstrap)
+		plan.stageBaseline(ctx, userID, secretDeviceKey, secretEventIDs, subscribe, bootstrap)
 	}
 	if plan, ok := updatesDeliveryPlanFrom(ctx); ok {
 		stage(plan)
@@ -193,9 +198,75 @@ func (r *Router) registerUpdatesDeliveryPlan(ctx context.Context, plan *updatesD
 		return
 	}
 	snapshot := plan.snapshot()
-	postresponse.Register(ctx, func() {
-		r.runUpdatesDeliveryPlan(snapshot)
-	})
+	if postresponse.RegisterAction(ctx, snapshot.postResponseAction()) && postresponse.TypedActionDelivery(ctx) {
+		return
+	}
+	postresponse.Register(ctx, func() { r.runUpdatesDeliveryPlan(snapshot) })
+}
+
+func (p updatesDeliveryPlan) postResponseAction() postresponse.Action {
+	return postresponse.Action{
+		Kind: postresponse.ActionUpdatesDelivery,
+		UpdatesDelivery: postresponse.UpdatesDeliveryAction{
+			CommitCursor:        p.commitCursor,
+			CursorAuthKey:       p.cursorAuthKey,
+			CursorUserID:        p.cursorUserID,
+			CursorState:         postresponse.UpdateState(p.cursorState),
+			CursorMode:          uint8(p.cursorMode),
+			MarkSecretDelivered: p.markSecretDelivered,
+			SecretDeviceKey:     p.secretDeviceKey,
+			SecretEventIDs:      append([]int64(nil), p.secretEventIDs...),
+			MarkSessionReady:    p.markSessionReady,
+			ReadyRawAuthKey:     p.readyRawAuthKey,
+			ReadySessionID:      p.readySessionID,
+			ReadyUserID:         p.readyUserID,
+			PublishBootstrap:    p.publishBootstrap,
+			BootstrapUserID:     p.bootstrapUserID,
+		},
+	}
+}
+
+func updatesDeliveryPlanFromAction(action postresponse.UpdatesDeliveryAction) updatesDeliveryPlan {
+	return updatesDeliveryPlan{
+		baseCtx:             context.Background(),
+		commitCursor:        action.CommitCursor,
+		cursorAuthKey:       action.CursorAuthKey,
+		cursorUserID:        action.CursorUserID,
+		cursorState:         domain.UpdateState(action.CursorState),
+		cursorMode:          domain.UpdateStateCommitMode(action.CursorMode),
+		markSecretDelivered: action.MarkSecretDelivered,
+		secretDeviceKey:     action.SecretDeviceKey,
+		secretEventIDs:      append([]int64(nil), action.SecretEventIDs...),
+		markSessionReady:    action.MarkSessionReady,
+		readyRawAuthKey:     action.ReadyRawAuthKey,
+		readySessionID:      action.ReadySessionID,
+		readyUserID:         action.ReadyUserID,
+		publishBootstrap:    action.PublishBootstrap,
+		bootstrapUserID:     action.BootstrapUserID,
+	}
+}
+
+func (r *Router) RunPostResponseActions(ctx context.Context, actions []postresponse.Action) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, action := range actions {
+		switch action.Kind {
+		case postresponse.ActionUpdatesDelivery:
+			plan := updatesDeliveryPlanFromAction(action.UpdatesDelivery)
+			plan.baseCtx = ctx
+			r.runUpdatesDeliveryPlan(plan)
+		case postresponse.ActionAccountAuthorizationTeardown:
+			teardown := action.AccountAuthorizationTeardown
+			if teardown.UserID <= 0 || teardown.AuthKeyID == ([8]byte{}) {
+				return fmt.Errorf("rpc: invalid account authorization teardown post-response action")
+			}
+			r.retireDeletedAccountAuthorization(teardown.AuthKeyID)
+		default:
+			return fmt.Errorf("rpc: unsupported post-response action %q", action.Kind)
+		}
+	}
+	return nil
 }
 
 // runUpdatesDeliveryPlan is ordered deliberately:
@@ -236,7 +307,7 @@ func (r *Router) runUpdatesDeliveryPlan(plan updatesDeliveryPlan) {
 	}
 	if plan.markSessionReady {
 		ctx, cancel := context.WithTimeout(baseCtx, updatesDeliveryPhaseTimeout)
-		r.markSessionReceivesUpdatesNow(ctx, plan.readyUserID)
+		r.markSessionReceivesUpdatesNowExplicit(ctx, plan.readyUserID, plan.readyRawAuthKey, plan.readySessionID)
 		cancel()
 	}
 	if plan.publishBootstrap {

@@ -29,7 +29,15 @@ func TestSetReceivesUpdatesFlushesPendingBeforeActivation(t *testing.T) {
 
 	// 完全就绪还要求 membership 路由建立（ReceivesUpdatesForAuthKey 的另一半条件）。
 	srv.Conns().BindUserForAuthKey(raw, auth.SessionID, 100)
-	srv.Conns().SetSessionChannelMemberships(raw, auth.SessionID, 100, nil, srv.Conns().ChannelMembershipGeneration(raw, auth.SessionID))
+	syncTestSessionChannelMemberships(t, srv.Conns(), raw, auth.SessionID, 100, nil)
+	// Membership commit now performs the production activation atomically. This
+	// focused test resets only the connection-local half so it can exercise the
+	// pending FIFO transition explicitly without discarding the prepared baseline.
+	srv.Conns().mu.Lock()
+	if c := srv.Conns().bySession[sessionKey{authKeyID: raw, sessionID: auth.SessionID}]; c != nil {
+		c.receivesUpdates.Store(false)
+	}
+	srv.Conns().mu.Unlock()
 
 	// 未就绪：推送进 pending 而非直发。
 	for i := 0; i < 2; i++ {

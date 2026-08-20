@@ -12,7 +12,7 @@ import (
 )
 
 // Compile-time proof that the shipped use-case service satisfies the admin port.
-// cmd/telesrv wires *verification.Service into Dependencies.Verification
+// cmd/telesrv-core wires *verification.Service into Dependencies.Verification
 // directly, so a drifting method set has to fail here rather than at integration
 // time.
 var _ VerificationService = (*verificationapp.Service)(nil)

@@ -16,6 +16,7 @@ import (
 
 	appupdates "telesrv/internal/app/updates"
 	"telesrv/internal/domain"
+	"telesrv/internal/postresponse"
 	rpchandler "telesrv/internal/rpc"
 	"telesrv/internal/store/memory"
 )
@@ -78,6 +79,10 @@ func (h identifiedRouterHandler) DispatchWithMethod(ctx context.Context, authKey
 
 func (h identifiedRouterHandler) NegotiatedLayer(authKeyID [8]byte, sessionID int64) (int, bool) {
 	return h.router.NegotiatedLayer(authKeyID, sessionID)
+}
+
+func (h identifiedRouterHandler) RunPostResponseActions(ctx context.Context, actions []postresponse.Action) error {
+	return h.router.RunPostResponseActions(h.requestContext(ctx), actions)
 }
 
 func newBlockingCloseRPCResultTransport() *blockingCloseRPCResultTransport {

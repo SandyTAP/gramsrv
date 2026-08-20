@@ -432,6 +432,8 @@ func TestChannelsDeleteHistoryForEveryoneDrainsBatchesAndKeepsDialogVisible(t *t
 		}
 	}
 	pushedBefore := len(sessions.pushedUserIDs())
+	cancelFanout := startChannelFanoutForTest(t, r)
+	defer cancelFanout()
 
 	clearReq := &tg.ChannelsDeleteHistoryRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash},
@@ -457,7 +459,7 @@ func TestChannelsDeleteHistoryForEveryoneDrainsBatchesAndKeepsDialogVisible(t *t
 		}
 	}
 	// 两批（1000+1）删除，每批向 owner 和 friend 各推送一次。
-	if pushedAfter := len(sessions.pushedUserIDs()); pushedAfter-pushedBefore != 4 {
+	if pushedAfter := len(waitForPushedUserIDs(t, sessions, pushedBefore+4)); pushedAfter-pushedBefore != 4 {
 		t.Fatalf("pushed fanout count = %d, want 4 (two batches to both members)", pushedAfter-pushedBefore)
 	}
 	history, err := channelStore.ListChannelHistory(ctx, owner.ID, domain.ChannelHistoryFilter{ChannelID: channel.ID, Limit: 10})

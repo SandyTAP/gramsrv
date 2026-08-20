@@ -21,7 +21,7 @@ import (
 )
 
 // Compile-time proof that the shipped use-case services satisfy the admin ports.
-// cmd/telesrv wires *usernames.Service and *rating.Service into
+// cmd/telesrv-core wires *usernames.Service and *rating.Service into
 // Dependencies.Usernames / Dependencies.Rating directly, so a drifting method set
 // has to fail here rather than at integration time.
 var (
@@ -1907,7 +1907,7 @@ func TestRevokeCollectibleUsernameChecksExpectedOwner(t *testing.T) {
 	}
 	if _, err := svc.RevokeCollectibleUsername(ctx, RevokeCollectibleUsernameRequest{
 		CommandMeta: CommandMeta{CommandID: "wrong-owner-refund", Actor: "bot", Reason: "refund"},
-		Username: "durov", ExpectedOwnerUserID: 1002,
+		Username:    "durov", ExpectedOwnerUserID: 1002,
 	}); err == nil || !strings.Contains(err.Error(), CodeCollectibleNotOwned) {
 		t.Fatalf("wrong-owner revoke err=%v, want %s", err, CodeCollectibleNotOwned)
 	}

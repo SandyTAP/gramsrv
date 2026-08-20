@@ -38,13 +38,13 @@ func (s *MessageStore) DeliverBroadcastRecipient(ctx context.Context, claim stor
 	}()
 
 	var userID int64
-	var message, status, leaseToken string
+	var message, entitiesJSON, status, leaseToken string
 	if err := tx.QueryRow(ctx, `
-SELECT r.user_id, b.message, r.status, r.lease_token
+SELECT r.user_id, b.message, b.entities::text, r.status, r.lease_token
 FROM broadcast_recipients r
 JOIN broadcasts b ON b.id = r.broadcast_id
 WHERE r.id = $1 AND r.broadcast_id = $2
-FOR UPDATE OF r`, claim.RecipientID, claim.BroadcastID).Scan(&userID, &message, &status, &leaseToken); err != nil {
+FOR UPDATE OF r`, claim.RecipientID, claim.BroadcastID).Scan(&userID, &message, &entitiesJSON, &status, &leaseToken); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Message{}, domain.ErrBroadcastLeaseLost
 		}
@@ -68,6 +68,10 @@ SELECT EXISTS (
 	if !eligible || domain.IsSystemUserID(userID) {
 		return domain.Message{}, domain.ErrBroadcastRecipientInvalid
 	}
+	entities, err := decodeMessageEntities(entitiesJSON)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("decode broadcast entities: %w", err)
+	}
 	date := int(time.Now().Unix())
 	base := domain.Message{
 		OwnerUserID: userID,
@@ -75,6 +79,7 @@ SELECT EXISTS (
 		From:        domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},
 		Date:        date,
 		Body:        message,
+		Entities:    entities,
 	}
 	if err := ensureOfficialSystemUserWithDB(ctx, tx, base); err != nil {
 		return domain.Message{}, err
@@ -88,7 +93,7 @@ SELECT EXISTS (
 		RecipientDelivered: true,
 		MessageDate:        int32(date),
 		Body:               message,
-		EntitiesJson:       []byte("[]"),
+		EntitiesJson:       []byte(entitiesJSON),
 		QuoteEntitiesJson:  []byte("[]"),
 		MediaJson:          []byte("{}"),
 		ReplyMarkupJson:    []byte("{}"),
@@ -119,7 +124,7 @@ SELECT EXISTS (
 		MessageDate:       int32(date),
 		Outgoing:          false,
 		Body:              message,
-		EntitiesJson:      []byte("[]"),
+		EntitiesJson:      []byte(entitiesJSON),
 		QuoteEntitiesJson: []byte("[]"),
 		Pts:               int32(pts),
 		MediaJson:         []byte("{}"),

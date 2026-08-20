@@ -3,6 +3,7 @@ package broadcast
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,10 +37,30 @@ func TestNormalizeRequestRejectsAmbiguousTargets(t *testing.T) {
 	}
 }
 
+func TestCreatePersistsNormalizedAutomaticEntities(t *testing.T) {
+	st := &fakeBroadcastStore{}
+	service := NewService(st, nil, nil)
+
+	_, err := service.Create(context.Background(), " \nاعلان 🚀\n\n@matrixG\t ", domain.BroadcastTargetSelected, []int64{101}, " operator ")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if st.createdMessage != "اعلان 🚀\n\n@matrixG" {
+		t.Fatalf("created message = %q", st.createdMessage)
+	}
+	want := []domain.MessageEntity{{Type: domain.MessageEntityMention, Offset: 10, Length: 8}}
+	if !reflect.DeepEqual(st.createdEntities, want) {
+		t.Fatalf("created entities = %+v, want %+v", st.createdEntities, want)
+	}
+	if st.createdBy != "operator" {
+		t.Fatalf("created by = %q, want operator", st.createdBy)
+	}
+}
+
 func TestRunCycleReleasesOnlyFailedClaims(t *testing.T) {
 	claims := []store.BroadcastRecipientClaim{
-		{RecipientID: 1, BroadcastID: 10, UserID: 101, LeaseToken: "lease", Message: "hello"},
-		{RecipientID: 2, BroadcastID: 10, UserID: 102, LeaseToken: "lease", Message: "hello"},
+		{RecipientID: 1, BroadcastID: 10, UserID: 101, LeaseToken: "lease"},
+		{RecipientID: 2, BroadcastID: 10, UserID: 102, LeaseToken: "lease"},
 	}
 	st := &fakeBroadcastStore{materialized: 3, claims: claims}
 	delivery := &fakeBroadcastDelivery{failRecipientID: 2}
@@ -61,16 +82,22 @@ func TestRunCycleReleasesOnlyFailedClaims(t *testing.T) {
 }
 
 type fakeBroadcastStore struct {
-	materialized int
-	claims       []store.BroadcastRecipientClaim
-	released     []store.BroadcastRecipientClaim
+	materialized    int
+	claims          []store.BroadcastRecipientClaim
+	released        []store.BroadcastRecipientClaim
+	createdMessage  string
+	createdEntities []domain.MessageEntity
+	createdBy       string
 }
 
 func (s *fakeBroadcastStore) PreviewBroadcastRecipients(context.Context, domain.BroadcastTargetMode, []int64) (int64, error) {
 	return 0, nil
 }
 
-func (s *fakeBroadcastStore) CreateBroadcast(context.Context, string, domain.BroadcastTargetMode, []int64, string) (domain.Broadcast, error) {
+func (s *fakeBroadcastStore) CreateBroadcast(_ context.Context, message string, entities []domain.MessageEntity, _ domain.BroadcastTargetMode, _ []int64, createdBy string) (domain.Broadcast, error) {
+	s.createdMessage = message
+	s.createdEntities = append([]domain.MessageEntity(nil), entities...)
+	s.createdBy = createdBy
 	return domain.Broadcast{}, nil
 }
 

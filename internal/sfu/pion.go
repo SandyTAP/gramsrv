@@ -20,7 +20,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// PionConfig 是内嵌 SFU 的运行参数。
+// PionConfig 是独立 SFU 媒体引擎的运行参数。
 type PionConfig struct {
 	// UDPPort 是单 UDP 监听端口（pion ICE UDPMux，全部 endpoint 复用）。
 	UDPPort int
@@ -133,7 +133,7 @@ type endpoint struct {
 	closeOnce    sync.Once
 }
 
-// NewPion 启动内嵌 SFU：绑定 UDP 端口、生成进程级 DTLS 证书。
+// NewPion 启动 SFU 媒体引擎：绑定 UDP 端口、生成进程级 DTLS 证书。
 func NewPion(cfg PionConfig) (Service, error) {
 	if cfg.UDPPort <= 0 {
 		return nil, fmt.Errorf("sfu: invalid udp port %d", cfg.UDPPort)
@@ -181,6 +181,16 @@ func NewPion(cfg PionConfig) (Service, error) {
 }
 
 func (s *pionSFU) Enabled() bool { return true }
+
+func (s *pionSFU) ActiveCallIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, 0, len(s.rooms))
+	for callID := range s.rooms {
+		out = append(out, callID)
+	}
+	return out
+}
 
 // Join 为参与者建立媒体 endpoint：本端生成独立 ufrag/pwd，ICE CONTROLLING 等待
 // 客户端 Binding Request（上行 JSON 无 candidates，对端地址靠 peer-reflexive 学得），

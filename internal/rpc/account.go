@@ -888,10 +888,16 @@ func (r *Router) onAccountSetPrivacy(ctx context.Context, req *tg.AccountSetPriv
 	if err != nil {
 		return nil, err
 	}
-	if r.deps.Privacy == nil {
-		return &tg.AccountPrivacyRules{Rules: tgPrivacyRules(rules), Users: []tg.UserClass{}, Chats: []tg.ChatClass{}}, nil
+	if err := r.requireAccountDelivery(userID, "account.setPrivacy"); err != nil {
+		return nil, err
 	}
-	saved, err := r.deps.Privacy.SetRules(ctx, userID, domainKey, rules)
+	svc, ok := r.deps.Privacy.(PrivacyDeliveryService)
+	if !ok {
+		r.log.Error("account.setPrivacy requires durable privacy delivery service", zap.Int64("user_id", userID))
+		return nil, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	saved, err := svc.SetRulesWithDelivery(ctx, userID, domainKey, rules, r.privacyDeliveryPayloadBuilder(), excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return nil, privacyErr(err)
 	}
@@ -900,20 +906,6 @@ func (r *Router) onAccountSetPrivacy(ctx context.Context, req *tg.AccountSetPriv
 		return nil, err
 	}
 	r.invalidateRPCProjectionForUser(userID)
-	// updatePrivacy is an absolute, non-PTS account-state notification. The
-	// originating session applies account.setPrivacy's response; other online
-	// sessions receive this best-effort update, while offline sessions reload
-	// the authoritative rules through account.getPrivacy.
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdatePrivacy{
-			Key:   tgPrivacyKey(saved.Key),
-			Rules: tgPrivacyRules(saved.Rules),
-		}},
-		Users: []tg.UserClass{},
-		Chats: []tg.ChatClass{},
-		Date:  int(r.clock.Now().Unix()),
-		Seq:   0,
-	})
 	if domainKey == domain.PrivacyKeyStatusTimestamp {
 		r.pushStatusPrivacyRefresh(ctx, userID)
 	}
@@ -1536,26 +1528,31 @@ func (r *Router) onAccountUpdateProfile(ctx context.Context, req *tg.AccountUpda
 	if err != nil {
 		return nil, internalErr()
 	}
-	svc, ok := r.deps.Users.(UserIdentityService)
+	svc, ok := r.deps.Users.(UserProfileDeliveryService)
 	if !ok {
+		r.log.Error("account.updateProfile requires durable user delivery service", zap.Int64("user_id", userID))
+		return nil, internalErr()
+	}
+	if err := r.requireProfileDelivery(userID, "account.updateProfile"); err != nil {
 		return nil, internalErr()
 	}
 	firstName, hasFirstName := req.GetFirstName()
 	lastName, hasLastName := req.GetLastName()
 	about, hasAbout := req.GetAbout()
-	u, err := svc.UpdateProfile(ctx, userID, domain.UserProfileUpdate{
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	u, err := svc.UpdateProfileWithDelivery(ctx, userID, domain.UserProfileUpdate{
 		FirstName:    firstName,
 		HasFirstName: hasFirstName,
 		LastName:     lastName,
 		HasLastName:  hasLastName,
 		About:        about,
 		HasAbout:     hasAbout,
-	})
+	}, r.usernameDeliveryPayloadBuilder(ctx), excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return nil, profileErr(err)
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	return r.pushUsernameUpdate(ctx, u), nil
+	return r.tgSelfUserWithUsernames(ctx, u), nil
 }
 
 func (r *Router) onAccountCheckUsername(ctx context.Context, username string) (bool, error) {
@@ -1579,16 +1576,21 @@ func (r *Router) onAccountUpdateUsername(ctx context.Context, username string) (
 	if err != nil {
 		return nil, internalErr()
 	}
-	svc, ok := r.deps.Users.(UserIdentityService)
+	svc, ok := r.deps.Users.(UserProfileDeliveryService)
 	if !ok {
+		r.log.Error("account.updateUsername requires durable user delivery service", zap.Int64("user_id", userID))
 		return nil, internalErr()
 	}
-	u, err := svc.UpdateUsername(ctx, userID, username)
+	if err := r.requireProfileDelivery(userID, "account.updateUsername"); err != nil {
+		return nil, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	u, err := svc.UpdateUsernameWithDelivery(ctx, userID, username, r.usernameDeliveryPayloadBuilder(ctx), excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return nil, usernameErr(err)
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	return r.pushUsernameUpdate(ctx, u), nil
+	return r.tgSelfUserWithUsernames(ctx, u), nil
 }
 
 // onAccountReorderUsernames rewrites the caller's active username order
@@ -1641,14 +1643,18 @@ func (r *Router) onAccountToggleUsername(ctx context.Context, req *tg.AccountTog
 
 // onAccountUpdateBirthday 持久化资料页生日（account.updateBirthday）。birthday 缺省即清除；
 // 月/日/年非法返回 BIRTHDAY_INVALID。生日落在 userFull（按隐私 PrivacyKeyBirthday 对外裁剪）。
-// 写入后推 updateUser 信号给本人其它在线 session，促使已加载 full profile 的客户端重拉。
+// 写入后生成 non-PTS durable delivery，促使本人其它在线 session 重拉已加载的 full profile。
 func (r *Router) onAccountUpdateBirthday(ctx context.Context, req *tg.AccountUpdateBirthdayRequest) (bool, error) {
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return false, internalErr()
 	}
-	svc, ok := r.deps.Users.(UserIdentityService)
+	svc, ok := r.deps.Users.(UserProfileDeliveryService)
 	if !ok {
+		r.log.Error("account.updateBirthday requires durable user delivery service", zap.Int64("user_id", userID))
+		return false, internalErr()
+	}
+	if err := r.requireProfileDelivery(userID, "account.updateBirthday"); err != nil {
 		return false, internalErr()
 	}
 	var birthday domain.Birthday
@@ -1658,7 +1664,8 @@ func (r *Router) onAccountUpdateBirthday(ctx context.Context, req *tg.AccountUpd
 			birthday.Year = year
 		}
 	}
-	u, err := svc.UpdateBirthday(ctx, userID, birthday)
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	u, err := svc.UpdateBirthdayWithDelivery(ctx, userID, birthday, r.selfUserRefreshDeliveryPayloadBuilder(ctx), excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrBirthdayInvalid) {
 			return false, birthdayInvalidErr()
@@ -1666,7 +1673,6 @@ func (r *Router) onAccountUpdateBirthday(ctx context.Context, req *tg.AccountUpd
 		return false, internalErr()
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	r.pushSelfUserChangedUpdate(ctx, u)
 	return true, nil
 }
 
@@ -1718,7 +1724,8 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 	}
 	svc, ok := r.deps.Users.(UserPremiumService)
 	if !ok {
-		return true, nil // 服务未接通（精简测试装配）时保持旧 stub 语义
+		r.log.Error("account.updateEmojiStatus requires durable-capable user service", zap.Int64("user_id", userID))
+		return false, internalErr()
 	}
 	value, err := r.domainUserEmojiStatus(ctx, userID, status)
 	if err != nil {
@@ -1735,46 +1742,46 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 		u, event, durableWrite, err = durable.UpdateEmojiStatusWithEvent(
 			ctx, userID, value, int(r.clock.Now().Unix()), rawAuthKeyIDForOrigin(ctx), sessionID,
 		)
-	} else {
-		u, err = svc.UpdateEmojiStatus(ctx, userID, value)
+		if err != nil {
+			if errors.Is(err, domain.ErrPremiumRequired) {
+				return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
+			}
+			if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
+				return false, tgerr400("COLLECTIBLE_INVALID")
+			}
+			return false, internalErr()
+		}
 	}
-	if err != nil {
-		if errors.Is(err, domain.ErrPremiumRequired) {
-			return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
+	if !durableWrite {
+		updates, ok := r.deps.Updates.(UserEmojiStatusUpdatesService)
+		if !ok {
+			r.log.Error("account.updateEmojiStatus missing durable update event service", zap.Int64("user_id", userID))
+			return false, internalErr()
 		}
-		if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
-			return false, tgerr400("COLLECTIBLE_INVALID")
+		u, err = svc.UpdateEmojiStatus(ctx, userID, value)
+		if err != nil {
+			if errors.Is(err, domain.ErrPremiumRequired) {
+				return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
+			}
+			if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
+				return false, tgerr400("COLLECTIBLE_INVALID")
+			}
+			return false, internalErr()
 		}
-		return false, internalErr()
+		event, _, err = updates.RecordUserEmojiStatus(ctx, authKeyID, userID, value, rawAuthKeyIDForOrigin(ctx), sessionID)
+		if err != nil {
+			return false, internalErr()
+		}
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
 	update := &tg.UpdateUserEmojiStatus{UserID: u.ID, EmojiStatus: tgUserEmojiStatusValue(value)}
 	self := r.tgSelfUserWithUsernames(ctx, u)
-	if durableWrite {
-		if sessionID != 0 {
-			r.bookkeepAuxPtsForCurrentSession(ctx, event)
-		}
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
-		})
-	} else if updates, ok := r.deps.Updates.(UserEmojiStatusUpdatesService); ok {
-		event, _, recordErr := updates.RecordUserEmojiStatus(ctx, authKeyID, userID, value, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if recordErr != nil {
-			return false, internalErr()
-		}
-		if sessionID != 0 {
-			r.bookkeepAuxPtsForCurrentSession(ctx, event)
-		}
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
-		})
-	} else {
-		// Lightweight test deployments without the durable extension retain the
-		// previous online-only behavior; production wiring implements it.
-		r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: int(r.clock.Now().Unix()),
-		})
+	if sessionID != 0 {
+		r.bookkeepAuxPtsForCurrentSession(ctx, event)
 	}
+	r.requireReliableDispatchForUserUpdate(ctx, u.ID, &tg.Updates{
+		Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
+	})
 	return true, nil
 }
 
@@ -1835,20 +1842,20 @@ func (r *Router) onAccountUpdateColor(ctx context.Context, req *tg.AccountUpdate
 	if err != nil {
 		return false, err
 	}
-	svc, ok := r.deps.Users.(UserColorService)
+	svc, ok := r.deps.Users.(UserProfileDeliveryService)
 	if !ok {
-		return true, nil // 精简测试装配或旧 wiring 未接入时保持兼容 stub 语义。
+		r.log.Error("account.updateColor requires durable user delivery service", zap.Int64("user_id", userID))
+		return false, internalErr()
 	}
-	u, err := svc.UpdateColor(ctx, userID, req.GetForProfile(), color)
+	if err := r.requireProfileDelivery(userID, "account.updateColor"); err != nil {
+		return false, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	u, err := svc.UpdateColorWithDelivery(ctx, userID, req.GetForProfile(), color, r.selfUserRefreshDeliveryPayloadBuilder(ctx), excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return false, internalErr()
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: u.ID}},
-		Users:   []tg.UserClass{r.tgSelfUserWithUsernames(ctx, u)},
-		Date:    int(r.clock.Now().Unix()),
-	})
 	return true, nil
 }
 
@@ -1948,48 +1955,6 @@ func (r *Router) onAccountGetCollectibleEmojiStatuses(ctx context.Context, hash 
 		return &tg.AccountEmojiStatusesNotModified{}, nil
 	}
 	return &tg.AccountEmojiStatuses{Hash: catalogHash, Statuses: statuses}, nil
-}
-
-func (r *Router) pushUsernameUpdate(ctx context.Context, u domain.User) *tg.User {
-	// updateUserName carries the vector clients persist, so it has to be the full
-	// registry list when one exists. One peer, one registry read; the overlay
-	// degrades to tgUsernames(u.Username) whenever the registry is unavailable.
-	// Keep the RPC result and pushed update as distinct tg.User objects: TL Encode
-	// recomputes flags, so sharing one pointer across response and push delivery
-	// would make otherwise independent encoders mutate the same object.
-	self := r.tgSelfUser(u)
-	pushedSelf := r.tgSelfUser(u)
-	users := []tg.UserClass{self, pushedSelf}
-	r.applyUsernamesToPeerObjects(ctx, users, nil)
-	if u.ID == 0 {
-		return self
-	}
-	usernames := tgUsernames(u.Username)
-	if vector, ok := pushedSelf.GetUsernames(); ok && len(vector) > 0 {
-		usernames = vector
-	}
-	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateUserName{
-			UserID:    u.ID,
-			FirstName: u.FirstName,
-			LastName:  u.LastName,
-			Usernames: usernames,
-		}},
-		Users: []tg.UserClass{pushedSelf},
-		Date:  int(r.clock.Now().Unix()),
-	})
-	return self
-}
-
-func (r *Router) pushSelfUserChangedUpdate(ctx context.Context, u domain.User) {
-	if u.ID == 0 {
-		return
-	}
-	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: u.ID}},
-		Users:   []tg.UserClass{r.tgSelfUserWithUsernames(ctx, u)},
-		Date:    int(r.clock.Now().Unix()),
-	})
 }
 
 func tgAuthorization(a domain.Authorization, currentAuthKeyID [8]byte, now int) tg.Authorization {

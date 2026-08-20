@@ -796,8 +796,12 @@ func (r *Router) sendStarsGiveawayPurchase(ctx context.Context, buyerUserID, for
 		updates = &tg.Updates{Date: int(r.clock.Now().Unix())}
 	}
 	if !result.Duplicate {
-		r.enqueueChannelMessageFanout(ctx, buyerUserID, result.ChannelSend, nil)
-		r.pushChannelDiscussionUpdate(ctx, buyerUserID, result.ChannelSend.Discussion)
+		if err := r.enqueueChannelMessageFanout(ctx, buyerUserID, result.ChannelSend, nil); err != nil {
+			return nil, internalErr()
+		}
+		if err := r.pushChannelDiscussionUpdate(ctx, buyerUserID, result.ChannelSend.Discussion); err != nil {
+			return nil, internalErr()
+		}
 	}
 	return &tg.PaymentsPaymentResult{Updates: updates}, nil
 }

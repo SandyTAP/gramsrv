@@ -45,13 +45,20 @@ func (r *Router) onUpdatesGetChannelDifference(ctx context.Context, req *tg.Upda
 		}
 		return nil, channelInvalidErr(err)
 	}
+	diff, err = r.enrichChannelDifferenceStrict(ctx, userID, diff)
+	if err != nil {
+		r.log.Error("project durable channel difference users",
+			zap.Int64("viewer_user_id", userID),
+			zap.Int64("channel_id", channelID),
+			zap.Error(err))
+		return nil, internalErr()
+	}
 	if diff.Channel.Username != "" && diff.Self.Status != domain.ChannelMemberActive {
 		// Telegram's public-channel passive delivery is enabled only after a
 		// successful short-poll difference. The runtime subscription is renewed
 		// by subsequent polls and never creates membership/dialog/read state.
 		r.refreshPublicChannelSubscription(ctx, userID, channelID)
 	}
-	diff = r.enrichChannelDifference(ctx, userID, diff)
 	out := r.tgChannelDifference(ctx, userID, diff)
 	if linked, ok := r.linkedDiscussionChat(ctx, userID, channelID); ok {
 		switch value := out.(type) {
@@ -199,9 +206,9 @@ func (r *Router) channelMessageUpdatesWithPeerCacheAndUsernames(ctx context.Cont
 	return r.channelMessagesUpdatesWithPeerCacheAndUsernames(ctx, viewerUserID, []domain.SendChannelMessageResult{res}, randomIDs, includeMessageIDs, nil, cache, usernames)
 }
 
-func (r *Router) pushChannelDiscussionUpdate(ctx context.Context, originUserID int64, discussion *domain.SendChannelDiscussionResult) {
+func (r *Router) pushChannelDiscussionUpdate(ctx context.Context, originUserID int64, discussion *domain.SendChannelDiscussionResult) error {
 	if discussion == nil || discussion.Channel.ID == 0 || discussion.Event.Pts == 0 {
-		return
+		return nil
 	}
 	res := domain.SendChannelMessageResult{
 		Channel:        discussion.Channel,
@@ -213,7 +220,7 @@ func (r *Router) pushChannelDiscussionUpdate(ctx context.Context, originUserID i
 	// 讨论组联动（broadcast↔linked megagroup）的第二轮 fan-out 也异步化 + 跨 viewer 投影预热
 	// （设计 Phase 0/Phase 1）。cache 仅被本 fan-out 闭包/预热使用、由单分片 worker 串行执行，
 	// 无跨 goroutine 竞态。
-	r.enqueueChannelMessageFanout(ctx, originUserID, res, nil)
+	return r.enqueueChannelMessageFanout(ctx, originUserID, res, nil)
 }
 
 func (r *Router) channelMessagesUpdatesWithPeerCache(ctx context.Context, viewerUserID int64, results []domain.SendChannelMessageResult, randomIDs []int64, includeMessageIDs bool, extraUserIDs []int64, cache *viewerPeerCache) *tg.Updates {
@@ -433,29 +440,26 @@ func (r *Router) pushChannelUpdatesWithScope(ctx context.Context, scope channelF
 		zap.Int64s("explicit", explicit),
 		zap.Int64s("recipients", recipients),
 	)
-	seen := make(map[int64]struct{}, len(recipients))
-	pushed := false
-	for _, userID := range recipients {
-		if userID == 0 {
-			continue
-		}
-		if _, ok := seen[userID]; ok {
-			continue
-		}
-		seen[userID] = struct{}{}
-		updates := build(userID)
-		if updates == nil {
-			continue
-		}
-		r.pushUserUpdates(ctx, userID, updates)
-		pushed = true
+	excludeSessionID, _ := SessionIDFrom(ctx)
+	delivered, ok := r.pushChannelFanoutLocationBatches(ctx, recipients,
+		rawAuthKeyIDForOrigin(ctx), excludeSessionID, build,
+		zap.String("channel_fanout_kind", "sync_channel_push"),
+		zap.Int64("channel_id", channelID),
+		zap.Int("scope", int(scope)),
+	)
+	if !ok {
+		return
 	}
-	if !pushed && originUserID != 0 {
-		updates := build(originUserID)
-		if updates == nil {
+	if len(delivered) == 0 && originUserID != 0 {
+		_, ok := r.pushChannelFanoutLocationBatches(ctx, []int64{originUserID},
+			rawAuthKeyIDForOrigin(ctx), excludeSessionID, build,
+			zap.String("channel_fanout_kind", "sync_origin_push"),
+			zap.Int64("channel_id", channelID),
+			zap.Int("scope", int(scope)),
+		)
+		if !ok {
 			return
 		}
-		r.pushUserUpdates(ctx, originUserID, updates)
 	}
 }
 

@@ -147,11 +147,12 @@ func (r *Router) onAuthBindTempAuthKey(ctx context.Context, req *tg.AuthBindTemp
 	// are not ordering evidence and cannot overwrite the transaction's winner.
 	r.invalidateAuthUserCache(id)
 	r.invalidateAuthUserCache(permID)
+	r.publishAuthInvalidation(ctx, id, permID)
 	unlockLayerCommit := r.lockAuthLayerCommit(id, permID)
 	defer unlockLayerCommit()
 	r.invalidateBoundAuthKeyLayerResolution(id, permID)
 	if r.deps.Sessions != nil {
-		if all, ok := r.deps.Sessions.(RawAuthKeySessionBinder); ok {
+		if all, ok := r.deps.Sessions.(RawAuthKeyIdentityBinder); ok {
 			all.BindAuthKeyForRawAuthKey(id, permID)
 		} else {
 			r.deps.Sessions.BindAuthKeyForSession(id, sessionID, permID)
@@ -233,7 +234,7 @@ func (r *Router) onAuthExportLoginToken(ctx context.Context, req *tg.AuthExportL
 		return nil, internalErr()
 	}
 	authz := r.authzFromCtx(ctx)
-	result, err := r.loginTokens.export(r.clock.Now(), target, authz, req.ExceptIDs)
+	result, err := r.loginTokens.exportContext(ctx, r.clock.Now(), target, authz, req.ExceptIDs)
 	if err != nil {
 		return nil, internalErr()
 	}
@@ -244,7 +245,7 @@ func (r *Router) onAuthExportLoginToken(ctx context.Context, req *tg.AuthExportL
 }
 
 func (r *Router) onAuthImportLoginToken(ctx context.Context, token []byte) (tg.AuthLoginTokenClass, error) {
-	result, err := r.loginTokens.lookup(r.clock.Now(), token)
+	result, err := r.loginTokens.lookupContext(ctx, r.clock.Now(), token)
 	if err != nil {
 		return nil, err
 	}
@@ -266,25 +267,25 @@ func (r *Router) onAuthAcceptLoginToken(ctx context.Context, token []byte) (*tg.
 		return nil, internalErr()
 	}
 	now := r.clock.Now()
-	accept, err := r.loginTokens.beginAccept(now, token, userID)
+	accept, err := r.loginTokens.beginAcceptContext(ctx, now, token, userID)
 	if err != nil {
 		return nil, err
 	}
 	scannerAuthKeyID, _ := AuthKeyIDFrom(ctx)
 	if scannerAuthKeyID != ([8]byte{}) && scannerAuthKeyID == accept.authz.AuthKeyID {
-		r.loginTokens.failAccept(token)
+		r.loginTokens.failAcceptContext(ctx, token)
 		return nil, authTokenExceptionErr()
 	}
 	authz := accept.authz
 	authz.UserID = userID
 	authz.PasswordPending = false
 	if err := r.clearAuthKeyState(ctx, authz.AuthKeyID); err != nil {
-		r.loginTokens.failAccept(token)
+		r.loginTokens.failAcceptContext(ctx, token)
 		return nil, internalErr()
 	}
 	bound, err := r.deps.Auth.AcceptLoginToken(ctx, authz, userID)
 	if err != nil {
-		r.loginTokens.failAccept(token)
+		r.loginTokens.failAcceptContext(ctx, token)
 		if errors.Is(err, auth.ErrSystemUserLoginForbidden) {
 			return nil, authKeyUnregisteredErr()
 		}
@@ -293,8 +294,9 @@ func (r *Router) onAuthAcceptLoginToken(ctx context.Context, token []byte) (*tg.
 	if bound.UserID == 0 {
 		bound.UserID = userID
 	}
-	r.loginTokens.finishAccept(now, token, userID, bound)
+	r.loginTokens.finishAcceptContext(ctx, now, token, userID, bound)
 	r.invalidateAuthUserCache(bound.AuthKeyID)
+	r.publishAuthInvalidation(ctx, bound.AuthKeyID)
 	r.setAuthUserCache(bound.AuthKeyID, userID, true)
 	r.bindLoginTokenTarget(accept.target, userID)
 	r.pushLoginTokenAccepted(ctx, accept.target)
@@ -533,6 +535,7 @@ func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, needSignUp
 			// 置为未授权，让后续鉴权重新读到 password_pending 并拒绝；待 checkPassword 通过后再授权。
 			if id, ok := AuthKeyIDFrom(ctx); ok {
 				r.invalidateAuthUserCache(id)
+				r.publishAuthInvalidation(ctx, id)
 			}
 			r.bindSessionUser(ctx, 0)
 		}
@@ -542,6 +545,7 @@ func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, needSignUp
 		return &tg.AuthAuthorizationSignUpRequired{}, nil
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
+		r.publishAuthInvalidation(ctx, id)
 		r.setAuthUserCache(id, u.ID, true)
 	}
 	r.bindSessionUser(ctx, u.ID)
@@ -744,6 +748,7 @@ func (r *Router) completePendingPasswordSignIn(ctx context.Context, authKeyID [8
 		return err
 	}
 	r.invalidateAuthUserCache(authKeyID)
+	r.publishAuthInvalidation(ctx, authKeyID)
 	r.setAuthUserCache(authKeyID, userID, true)
 	r.bindSessionUser(ctx, userID)
 	return nil
@@ -824,6 +829,7 @@ func (r *Router) onAuthFinishPasskeyLogin(ctx context.Context, req *tg.AuthFinis
 		return nil, passkeyErr(err)
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
+		r.publishAuthInvalidation(ctx, id)
 		r.setAuthUserCache(id, u.ID, true)
 	}
 	r.bindSessionUser(ctx, u.ID)
@@ -855,6 +861,7 @@ func (r *Router) onAuthImportBotAuthorization(ctx context.Context, req *tg.AuthI
 		return nil, importBotAuthorizationErr(err)
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
+		r.publishAuthInvalidation(ctx, id)
 		r.setAuthUserCache(id, u.ID, true)
 	}
 	r.bindSessionUser(ctx, u.ID)
@@ -883,6 +890,7 @@ func (r *Router) onAuthLogOut(ctx context.Context) (*tg.AuthLoggedOut, error) {
 		return nil, internalErr()
 	}
 	r.invalidateAuthUserCache(id)
+	r.publishAuthInvalidation(ctx, id)
 	r.unbindAuthKey(id)
 	// bot 登出不广播 offline（bot 无 presence 语义，与登录路径对称）。
 	if userErr == nil && authorized && userID != 0 && !r.userIsBot(ctx, userID) {
@@ -946,6 +954,8 @@ func (r *Router) unbindAuthKey(authKeyID [8]byte) {
 func (r *Router) revokeAuthKeySessions(authKeyID [8]byte) {
 	r.invalidateAuthUserCache(authKeyID)
 	rawTempAuthKeyIDs := r.invalidateTempAuthKeyCacheForPerm(authKeyID)
+	invalidateIDs := append([][8]byte{authKeyID}, rawTempAuthKeyIDs...)
+	r.publishAuthInvalidation(context.Background(), invalidateIDs...)
 	if terminator, ok := r.deps.Sessions.(SessionTerminator); ok {
 		terminator.CloseSessionsForBusinessAuthKey(authKeyID)
 	}

@@ -208,7 +208,8 @@ func (s *Server) handleAdmittedLayerRPC(
 			ErrorCode: 500, ErrorMessage: "NOT_IMPLEMENTED",
 		}, nil)
 	}
-	ctx = postresponse.WithCallbacks(ctx)
+	ctx = postresponse.WithTypedActionDelivery(postresponse.WithCallbacks(ctx))
+	ctx = s.withLayerRPCIdentityHint(ctx, c)
 	ctx, dbStats := dbtrace.WithStats(ctx)
 	start := s.clock.Now()
 	result, effectiveMethod, err := s.layerRPC.DispatchAdmitted(ctx, c.authKeyID, c.sessionID, msgID, admissionSeq, request)
@@ -243,7 +244,7 @@ func (s *Server) handleAdmittedLayerRPC(
 		var after func()
 		if err == nil && exact != nil {
 			terminal = exact
-			after = postresponse.Take(context.WithoutCancel(ctx))
+			after = postresponse.TakeWithExecutor(context.WithoutCancel(ctx), layerRPCPostResponseExecutor(s.layerRPC))
 		} else if errors.Is(ctxErr, context.DeadlineExceeded) {
 			terminal = &mt.RPCError{ErrorCode: 500, ErrorMessage: "RPC_TIMEOUT"}
 		}
@@ -256,6 +257,16 @@ func (s *Server) handleAdmittedLayerRPC(
 		return ctxErr
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.log.Info("RPC canceled", append(fields, zap.Error(err))...)
+			return err
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.log.Info("RPC timed out", append(fields, zap.Error(err))...)
+			return s.publishAdmittedLayerRPCResult(c, msgID, effectiveMethod, owner, businessSucceeded, &mt.RPCError{
+				ErrorCode: 500, ErrorMessage: "RPC_TIMEOUT",
+			}, nil)
+		}
 		var rpcErr *tgerr.Error
 		if errors.As(err, &rpcErr) {
 			s.log.Info("RPC error", append(fields, zap.Int("code", rpcErr.Code), zap.String("error", rpcErr.Message))...)
@@ -274,7 +285,12 @@ func (s *Server) handleAdmittedLayerRPC(
 		}, nil)
 	}
 	s.log.Info("RPC handled", fields...)
-	return s.publishAdmittedLayerRPCResult(c, msgID, effectiveMethod, owner, true, exact, postresponse.Take(ctx))
+	return s.publishAdmittedLayerRPCResult(c, msgID, effectiveMethod, owner, true, exact, postresponse.TakeWithExecutor(ctx, layerRPCPostResponseExecutor(s.layerRPC)))
+}
+
+func layerRPCPostResponseExecutor(handler LayerRPCHandler) postresponse.ActionExecutor {
+	executor, _ := handler.(postresponse.ActionExecutor)
+	return executor
 }
 
 var _ exactLayerRPCResultEncoder = (*layerRPCResultEncoder)(nil)

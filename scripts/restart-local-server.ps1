@@ -1,17 +1,23 @@
 <#
 .SYNOPSIS
-Builds and restarts the local telesrv process with explicit runtime logs.
+Builds and restarts the local telesrv Edge process with explicit runtime logs.
 
 .DESCRIPTION
-This helper is meant for Windows development loops. It builds the current
-workspace into a staging executable, stops the repo-local process currently
+This helper is meant for Windows Edge development loops. It builds the current
+workspace into a staging executable, stops the repo-local Edge process currently
 listening on the configured MTProto port, promotes the new executable, starts it
-hidden, and verifies that the port is listening again.
+hidden, and verifies that the port is listening again. CoreExec and Egress ACK
+gRPC targets are required because the Edge entrypoint does not run local Core or
+durable ACK writeback code.
 #>
 [CmdletBinding()]
 param(
     [string]$Listen = "0.0.0.0:2398",
     [string]$AdvertiseIP,
+    [string]$CoreExecGRPCTargets = $env:TELESRV_CORE_EXEC_GRPC_TARGETS,
+    [string]$CoreExecToken = $env:TELESRV_CORE_EXEC_TOKEN,
+    [string]$EgressAckGRPCTargets = $env:TELESRV_EGRESS_ACK_GRPC_TARGETS,
+    [string]$EgressAckToken = $env:TELESRV_EGRESS_ACK_TOKEN,
     [string]$ExePath,
     [string]$LogDir,
     [int]$HealthTimeoutSeconds = 20,
@@ -25,7 +31,7 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 if (-not $ExePath) {
-    $ExePath = Join-Path $RepoRoot "bin\telesrv.exe"
+    $ExePath = Join-Path $RepoRoot "bin\telesrv-edge.exe"
 }
 if (-not $LogDir) {
     $LogDir = Join-Path $RepoRoot "logs"
@@ -34,7 +40,7 @@ if (-not $LogDir) {
 $ExePath = [System.IO.Path]::GetFullPath($ExePath)
 $LogDir = [System.IO.Path]::GetFullPath($LogDir)
 $BinDir = Split-Path -Parent $ExePath
-$NextExePath = Join-Path $BinDir "telesrv.next.exe"
+$NextExePath = Join-Path $BinDir "telesrv-edge.next.exe"
 
 function Write-Step {
     param([string]$Message)
@@ -99,7 +105,7 @@ function Test-PathUnderRepo {
     return $full.StartsWith($RepoRoot, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-function Test-RepoTelesrvProcess {
+function Test-RepoEdgeProcess {
     param(
         [object]$Process,
         [string]$ExePath
@@ -124,24 +130,25 @@ function Test-RepoTelesrvProcess {
         if ($fullPath.Equals($fullExePath, [System.StringComparison]::OrdinalIgnoreCase)) {
             return $true
         }
-        if ($fullPath.StartsWith($binDir, [System.StringComparison]::OrdinalIgnoreCase) -and ($fileName -like "telesrv*.exe*")) {
+        if ($fullPath.StartsWith($binDir, [System.StringComparison]::OrdinalIgnoreCase) -and ($fileName -like "telesrv-edge*.exe*")) {
             return $true
         }
         return $false
     }
 
     # Path can be unavailable for protected or already-exiting processes. Only
-    # take ownership of telesrv-looking processes in that ambiguous state.
-    return (($Process.ProcessName -eq "telesrv") -or ($Process.ProcessName -like "telesrv*"))
+    # take ownership of Edge-looking processes in that ambiguous state.
+    return (($Process.ProcessName -eq "telesrv-edge") -or ($Process.ProcessName -like "telesrv-edge*"))
 }
 
-function Get-RepoTelesrvProcesses {
+function Get-RepoEdgeProcesses {
     param([int]$Port, [string]$ExePath)
     # 按 PID 去重，合并两条发现路径：
     #   1) 端口监听者——主路径，但 Get-NetTCPConnection 偶发返回空（曾漏判成 "no listener"，
     #      导致旧进程没被停、promote 复制撞文件锁）。
-    #   2) 按进程名/路径 + 仓库 bin 下 telesrv* 可执行文件——兜底覆盖端口漏报，并能抓到
-    #      “持有 telesrv.exe / telesrv.exe~ 文件锁但端口尚未就绪”的实例（promote 复制前必须停掉）。
+    #   2) 按进程名/路径 + 仓库 bin 下 telesrv-edge* 可执行文件——兜底覆盖端口漏报，并能抓到
+    #      “持有 telesrv-edge.exe / telesrv-edge.exe~ 文件锁但端口尚未就绪”的实例（promote 复制前必须停掉）。
+    # 这个脚本只接管 Edge；Core/Egress/SFU 即使同在 repo/bin 下，也不能被旧单体式进程名兜底误杀。
     $foundByPid = @{}
 
     $listenerPids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
@@ -160,23 +167,23 @@ function Get-RepoTelesrvProcesses {
             $path = $null
         }
         $procId = [int]$proc.Id
-        $isRepoProcess = Test-RepoTelesrvProcess -Process $proc -ExePath $ExePath
+        $isRepoProcess = Test-RepoEdgeProcess -Process $proc -ExePath $ExePath
         if ($isRepoProcess) {
             $foundByPid[$procId] = $proc
         } else {
-            throw "Port $Port is held by non-repo process PID $($proc.Id) ($($proc.ProcessName)) at '$path'"
+            throw "Port $Port is held by a non-Edge process PID $($proc.Id) ($($proc.ProcessName)) at '$path'"
         }
     }
 
-    $candidateProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq "telesrv" -or $_.ProcessName -like "telesrv*" })
+    $candidateProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq "telesrv-edge" -or $_.ProcessName -like "telesrv-edge*" })
     foreach ($proc in $candidateProcesses) {
         $procId = [int]$proc.Id
         if ($foundByPid.ContainsKey($procId)) {
             continue
         }
-        # 只接管仓库内的实例：路径在 repo/bin 下，或路径不可读但进程名看起来就是 telesrv（兜底）。
+        # 只接管仓库内的 Edge 实例：路径在 repo/bin 下，或路径不可读但进程名看起来就是 telesrv-edge（兜底）。
         # 仓库外的同名进程（用户在别处跑的）一律不动。
-        $isRepoProcess = Test-RepoTelesrvProcess -Process $proc -ExePath $ExePath
+        $isRepoProcess = Test-RepoEdgeProcess -Process $proc -ExePath $ExePath
         if ($isRepoProcess) {
             $foundByPid[$procId] = $proc
         }
@@ -222,7 +229,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Push-Location $RepoRoot
 try {
     if (-not $SkipBuild) {
-        Write-Step "Build telesrv"
+        Write-Step "Build telesrv-edge"
         $commit = Get-GitOutput @("rev-parse", "HEAD")
         $branch = Get-GitOutput @("branch", "--show-current")
         $dirty = Get-GitOutput @("status", "--porcelain", "--untracked-files=no") -Default ""
@@ -234,13 +241,13 @@ try {
         $ldflags = "-X main.gitCommit=$commit -X main.gitBranch=$branch -X main.gitTreeState=$treeState -X main.buildTime=$buildTime"
 
         Remove-Item -LiteralPath $NextExePath -ErrorAction SilentlyContinue
-        Invoke-External "go" @("build", "-ldflags", $ldflags, "-o", $NextExePath, ".\cmd\telesrv") | Out-Null
+        Invoke-External "go" @("build", "-ldflags", $ldflags, "-o", $NextExePath, ".\cmd\telesrv-edge") | Out-Null
         Write-Host "[ok] built $NextExePath"
         Write-Host "[ok] commit=$commit branch=$branch tree=$treeState build_time=$buildTime"
     }
 
-    Write-Step "Stop old telesrv processes"
-    $oldProcesses = @(Get-RepoTelesrvProcesses $ListenPort $ExePath)
+    Write-Step "Stop old telesrv-edge processes"
+    $oldProcesses = @(Get-RepoEdgeProcesses $ListenPort $ExePath)
     if ($oldProcesses.Count -eq 0) {
         Write-Host "[ok] no existing repo-local listener on port $ListenPort"
     } else {
@@ -256,7 +263,7 @@ try {
 
     if (-not $SkipBuild) {
         Write-Step "Promote executable"
-        # telesrv.exe 可能被外部 watcher/watchdog 抢先重生的实例占用文件锁；停掉持有者后短暂重试，
+        # telesrv-edge.exe 可能被外部 watcher/watchdog 抢先重生的实例占用文件锁；停掉持有者后短暂重试，
         # 避免直接撞 "being used by another process" 复制失败（曾因此 promote 失败）。
         $promoted = $false
         for ($attempt = 1; $attempt -le 10; $attempt++) {
@@ -265,7 +272,7 @@ try {
                 $promoted = $true
                 break
             } catch {
-                $holders = @(Get-RepoTelesrvProcesses $ListenPort $ExePath)
+                $holders = @(Get-RepoEdgeProcesses $ListenPort $ExePath)
                 foreach ($holder in $holders) {
                     Write-Host "[stop] PID $($holder.Id) holding $ExePath; retry $attempt/10"
                     Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
@@ -287,12 +294,28 @@ try {
         return
     }
 
-    Write-Step "Start telesrv"
+    Write-Step "Start telesrv-edge"
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $stdoutPath = Join-Path $LogDir "telesrv-$stamp.out.log"
-    $stderrPath = Join-Path $LogDir "telesrv-$stamp.err.log"
+    $stdoutPath = Join-Path $LogDir "telesrv-edge-$stamp.out.log"
+    $stderrPath = Join-Path $LogDir "telesrv-edge-$stamp.err.log"
 
     $env:TELESRV_LISTEN = $Listen
+    if (-not $CoreExecGRPCTargets) {
+        throw "CoreExec gRPC target is required: pass -CoreExecGRPCTargets or set TELESRV_CORE_EXEC_GRPC_TARGETS"
+    }
+    if (-not $CoreExecToken) {
+        throw "CoreExec token is required: pass -CoreExecToken or set TELESRV_CORE_EXEC_TOKEN"
+    }
+    $env:TELESRV_CORE_EXEC_GRPC_TARGETS = $CoreExecGRPCTargets
+    $env:TELESRV_CORE_EXEC_TOKEN = $CoreExecToken
+    if (-not $EgressAckGRPCTargets) {
+        throw "Egress ACK gRPC target is required: pass -EgressAckGRPCTargets or set TELESRV_EGRESS_ACK_GRPC_TARGETS"
+    }
+    if (-not $EgressAckToken) {
+        throw "Egress ACK token is required: pass -EgressAckToken or set TELESRV_EGRESS_ACK_TOKEN"
+    }
+    $env:TELESRV_EGRESS_ACK_GRPC_TARGETS = $EgressAckGRPCTargets
+    $env:TELESRV_EGRESS_ACK_TOKEN = $EgressAckToken
     if ($AdvertiseIP) {
         $env:TELESRV_ADVERTISE_IP = $AdvertiseIP
     }
@@ -313,7 +336,7 @@ try {
             if (Test-Path -LiteralPath $stderrPath) {
                 $errTail = (Get-Content -LiteralPath $stderrPath -Tail $Tail -ErrorAction SilentlyContinue) -join "`n"
             }
-            throw "telesrv exited during startup with code $($proc.ExitCode):`n$errTail"
+            throw "telesrv-edge exited during startup with code $($proc.ExitCode):`n$errTail"
         }
         $conn = @(Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue |
             Where-Object { $_.OwningProcess -eq $proc.Id })
@@ -324,7 +347,7 @@ try {
         Start-Sleep -Milliseconds 250
     }
     if (-not $listening) {
-        throw "telesrv PID $($proc.Id) did not listen on port $ListenPort within ${HealthTimeoutSeconds}s"
+        throw "telesrv-edge PID $($proc.Id) did not listen on port $ListenPort within ${HealthTimeoutSeconds}s"
     }
 
     Write-Host "[ok] started PID $($proc.Id), listening on $Listen"

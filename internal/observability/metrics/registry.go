@@ -351,6 +351,26 @@ func (r *Registry) ConnectionIntake(stage, outcome string, d time.Duration) {
 	r.observe("telesrv_mtproto_connection_intake_seconds", d, labels...)
 }
 
+// CoreExecGRPCCall implements coreexec.Metrics.
+func (r *Registry) CoreExecGRPCCall(side, operation, outcome string, d time.Duration) {
+	labels := []Label{
+		{Name: "side", Value: side},
+		{Name: "operation", Value: operation},
+		{Name: "outcome", Value: outcome},
+	}
+	r.inc("telesrv_coreexec_grpc_calls_total", labels...)
+	r.observe("telesrv_coreexec_grpc_call_seconds", d, labels...)
+}
+
+// CoreExecPendingAdmissionRejected implements coreexec.Metrics.
+func (r *Registry) CoreExecPendingAdmissionRejected(transport, reason string) {
+	labels := []Label{
+		{Name: "transport", Value: transport},
+		{Name: "reason", Value: reason},
+	}
+	r.inc("telesrv_coreexec_pending_admission_rejected_total", labels...)
+}
+
 // MessageSend implements rpc.Metrics.
 func (r *Registry) MessageSend(d time.Duration, duplicate bool, err error) {
 	dup := "false"

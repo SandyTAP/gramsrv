@@ -13,7 +13,7 @@ import (
 // 本文件实现 app/bots 的 rpc 回调：token revoke 后的 session 失效闭环，
 // 命令变更后的 updateBotCommands 在线推送、@Stickers 发布后的 updateStickerSets
 // 在线提示，以及 @ChatBot 流式草稿 transient 推送。Router 创建后经
-// botsService.SetRouterHooks / SetTextDraftPusher 装配（见 cmd/telesrv/main.go）。
+// botsService.SetRouterHooks / SetTextDraftPusher 装配（见 internal/node/core/runtime.go）。
 
 // maxBotCommandsPushPeers 限制单次命令变更的推送扇出（bot 的最近 dialog peer 数）。
 // 超出的离线/长尾用户靠 bot_info_version bump 在下次 getFullUser 时拿到新命令。

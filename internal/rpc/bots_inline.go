@@ -99,7 +99,10 @@ func (r *Router) onMessagesGetInlineBotResults(ctx context.Context, req *tg.Mess
 	}
 	now := r.clock.Now()
 	if cached, ok := r.inlines.cachedContext(ctx, now, cacheKey); ok {
-		results := r.inlines.registerCachedContext(ctx, now, bot.ID, userID, peer, cached)
+		results, err := r.inlines.registerCachedContext(ctx, now, bot.ID, userID, peer, cached)
+		if err != nil {
+			return nil, internalErr()
+		}
 		return r.tgBotInlineResults(ctx, userID, results), nil
 	}
 	if service := r.deps.ServiceBotInlineResults; service != nil && service.HandlesInlineBot(bot.ID) {
@@ -111,11 +114,17 @@ func (r *Router) onMessagesGetInlineBotResults(ctx context.Context, req *tg.Mess
 			if len(results.Results) > domain.MaxBotInlineResults {
 				return nil, internalErr()
 			}
-			registered := r.inlines.registerCachedContext(ctx, now, bot.ID, userID, peer, results)
+			registered, err := r.inlines.registerCachedContext(ctx, now, bot.ID, userID, peer, results)
+			if err != nil {
+				return nil, internalErr()
+			}
 			return r.tgBotInlineResults(ctx, userID, registered), nil
 		}
 	}
-	queryID, pending := r.inlines.registerWithCacheKeyContext(ctx, now, bot.ID, userID, peer, cacheKey)
+	queryID, pending, err := r.inlines.registerWithCacheKeyContext(ctx, now, bot.ID, userID, peer, cacheKey)
+	if err != nil {
+		return nil, internalErr()
+	}
 	defer r.inlines.deregisterIfUnansweredContext(ctx, queryID)
 
 	peerType := tgInlineQueryPeerType(ctx, r, userID, bot.ID, peer)
@@ -166,7 +175,11 @@ func (r *Router) onMessagesSetInlineBotResults(ctx context.Context, req *tg.Mess
 	if err != nil {
 		return false, err
 	}
-	if !r.inlines.resolveContext(ctx, r.clock.Now(), botID, req.QueryID, results) {
+	resolved, err := r.inlines.resolveContext(ctx, r.clock.Now(), botID, req.QueryID, results)
+	if err != nil {
+		return false, internalErr()
+	}
+	if !resolved {
 		return false, queryIDInvalidErr()
 	}
 	return true, nil
@@ -211,7 +224,10 @@ func (r *Router) onMessagesSendInlineBotResult(ctx context.Context, req *tg.Mess
 	if peer.Type != domain.PeerTypeUser && peer.Type != domain.PeerTypeChannel {
 		return nil, peerIDInvalidErr()
 	}
-	results, result, ok := r.inlines.resultForSendContext(ctx, r.clock.Now(), userID, req.QueryID, req.ID)
+	results, result, ok, err := r.inlines.resultForSendContext(ctx, r.clock.Now(), userID, req.QueryID, req.ID)
+	if err != nil {
+		return nil, internalErr()
+	}
 	if !ok {
 		return nil, inlineResultExpiredErr()
 	}
@@ -269,20 +285,19 @@ func (r *Router) inlineResultsAllowPeer(ctx context.Context, userID int64, resul
 }
 
 func (r *Router) awaitInlineBotResults(ctx context.Context, pending *pendingInlineQuery, userID, queryID int64) (domain.BotInlineResults, error) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case results := <-pending.ch:
-			return results, nil
-		case <-ticker.C:
-			if results, ok := r.inlines.resultsForQueryContext(ctx, r.clock.Now(), userID, queryID); ok {
-				return results, nil
-			}
-		case <-ctx.Done():
-			return domain.BotInlineResults{}, botResponseTimeoutErr()
-		}
+	select {
+	case results := <-pending.ch:
+		return results, nil
+	default:
 	}
+	results, ok, err := r.inlines.waitResultsContext(ctx, r.clock.Now(), userID, queryID)
+	if err != nil {
+		return domain.BotInlineResults{}, internalErr()
+	}
+	if ok {
+		return results, nil
+	}
+	return domain.BotInlineResults{}, botResponseTimeoutErr()
 }
 
 func (r *Router) domainInlineResultsFromTG(ctx context.Context, botID int64, req *tg.MessagesSetInlineBotResultsRequest) (domain.BotInlineResults, error) {

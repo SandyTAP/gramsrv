@@ -42,7 +42,7 @@ func (r *Router) pushEncryptedPeerUpdate(ctx context.Context, peerUserID, peerAu
 		Date:    now,
 		Seq:     0,
 	}
-	if targeted, ok := r.deps.Sessions.(AuthKeyTargetedSessionBinder); ok {
+	if targeted, ok := r.deps.Sessions.(AuthKeyTargetedSessionPusher); ok {
 		devKey := deviceAuthKeyBytes(peerAuthKeyID)
 		if transient {
 			_, _ = targeted.PushToUserAuthKeyTransient(ctx, peerUserID, devKey, proto.MessageFromServer, upd, r.cfg.OutboundPushTimeout)

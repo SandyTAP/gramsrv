@@ -287,8 +287,8 @@ RETURNING
   d.attempts;
 
 -- name: MarkDispatchDelivered :execrows
--- 方案 A：投递成功即删除。outbox 是任务队列，delivered 行无保留价值
--- （消息在 message_boxes、离线补偿在 user_update_events），删除让表维持「未完成任务」小稳态。
+-- 删除在线 outbox 行；消息事实仍在 message_boxes/user_update_events，
+-- 客户端漏掉实时推送时通过 updates.getDifference 恢复。
 -- claim 的锁序是 user_heads→outbox；completion 必须先显式锁同一 head 再删 outbox，
 -- 否则租约过期 claim 与完成恰好竞争时会形成 outbox→head / head→outbox 环路。
 WITH locked_head AS MATERIALIZED (
@@ -463,7 +463,7 @@ LEFT JOIN users fwd_u ON m.fwd_from_peer_type = 'user' AND fwd_u.id = m.fwd_from
 LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id;
 
 -- name: MarkDispatchDeliveredBatch :execrows
--- 批量删除一批已投递的 (target_user_id, id)；target_user_id 入 WHERE 命中唯一索引并避免串删。
+-- 批量删除一批在线 outbox 行；target_user_id 入 WHERE 命中唯一索引并避免串删。
 WITH input AS MATERIALIZED (
   SELECT tu.target_user_id, di.id, ea.attempts
   FROM unnest(@target_user_ids::bigint[]) WITH ORDINALITY AS tu(target_user_id, ord)

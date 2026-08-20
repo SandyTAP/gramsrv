@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap"
 
@@ -18,13 +19,13 @@ import (
 // 目标：把频道 payload fan-out 移出发送者 RPC 同步路径——发送者只等事务 + 自己视角 echo
 // （rpc_result），其余在线成员的投递交给本 dispatcher 的后台 worker。
 //
-// v1（单实例）关键取舍：
-//   - durable 真值仍是 channel_update_events；本 dispatcher 只做 best-effort 在线加速，
-//     丢失由客户端 getChannelDifference 兜底（设计决策 1）。
+// v1 关键取舍：
+//   - durable 真值仍是 channel_update_events；本 dispatcher 只做非权威在线加速，
+//     丢失由客户端 getChannelDifference 收敛（设计决策 1）。
 //   - 按 channelID 哈希到固定分片，使同一 channel 串行处理（FIFO → 单调 pts），满足
 //     DrKLO Android ~1.5s 乱序窗口与 TDesktop PtsWaiter 的连续性期望（设计 §10.2）。
-//   - 单实例 + 无 durable 重投队列 + 同 channel 串行 → 无乱序、无自重复，故 v1 不需要
-//     per-session at-most-once 双水位（那是 Phase 3 跨实例的事，设计 §9/§10.1）。
+//   - 跨实例 payload 已经通过 Redis location + push_user_batch 投递到 owning Edge；最终
+//     仍需要 Edge per-session channel waterline 吸收 stale location / 迁移 / 命令重试重复。
 //   - 有界队列满时不静默丢弃恢复触发：真实 payload job 降级为按 channel 合并、只保留
 //     最高 pts 的 UpdateChannelTooLong nudge。每个 shard 独立公平 drain；即使该频道随后
 //     静默，也不依赖“下一条消息”才能触发 getChannelDifference（设计约束 B）。
@@ -337,8 +338,9 @@ func (s *channelFanoutShard) signalEligibleOverflow() {
 // channelFanoutPrefetch 在 worker 解析出最终 recipient 集合后、逐 viewer build 之前调用一次，
 // 用于跨全部 recipient 一次性预热每 viewer 的用户投影（fan-out 模板化，O(owner)）。可选：为 nil
 // 时 build 仍逐 viewer 解析（行为不变）。在 worker goroutine 内串行执行，与 build 共享同一
-// viewerPeerCache，无跨 goroutine 竞态。
-type channelFanoutPrefetch func(ctx context.Context, viewers []int64)
+// viewerPeerCache，无跨 goroutine 竞态。返回 false 表示批量预热失败；worker 必须 fail-closed，
+// 不能静默退回逐 viewer 投影。
+type channelFanoutPrefetch func(ctx context.Context, viewers []int64) bool
 
 // channelFanoutDispatcher 把频道 payload fan-out 移出发送者 RPC，按 channelID 分片串行处理。
 type channelFanoutDispatcher struct {
@@ -367,7 +369,7 @@ type channelFanoutDispatcher struct {
 	nudgePending map[int64]int
 	nudgeLimit   int
 
-	// recoveryGeneration is the terminal in-memory saturation fallback. It deliberately carries
+	// recoveryGeneration is the terminal bounded recovery signal. It deliberately carries
 	// no channel id: the fixed recovery actor enumerates the online membership index and reloads
 	// each channel's durable max pts. Thus even when every key-bearing mailbox is full, publishing
 	// one constant-size generation cannot fail or block an RPC producer.
@@ -422,8 +424,8 @@ func (r *Router) enqueueChannelFanoutWithPrefetch(ctx context.Context, scope cha
 	})
 }
 
-// RunChannelFanout 启动频道 fan-out 后台 worker，由 main 与其它 dispatcher 一同 go 起。
-// 阻塞到 ctx 取消；未调用前 fan-out 同步执行（行为同旧版）。
+// RunChannelFanout 启动频道 fan-out 后台 worker，由 Core 入口与其它后台 worker 一同 go 起。
+// 阻塞到 ctx 取消；未调用前 fan-out 不允许回退到请求线程直推。
 func (r *Router) RunChannelFanout(ctx context.Context) {
 	r.channelFanout.Run(ctx)
 }
@@ -456,7 +458,7 @@ func newChannelFanoutDispatcher(r *Router, shards, buffer int) *channelFanoutDis
 }
 
 // Run 启动 worker：每分片一个 goroutine，保证同 channel 串行。阻塞到 ctx 取消。
-// 未调用 Run 前 Enqueue 回退为同步执行（保持测试/未装配场景行为不变）。
+// 未调用 Run 前 Enqueue fail-closed，不回到旧的请求线程直推路径。
 func (d *channelFanoutDispatcher) Run(ctx context.Context) {
 	if d == nil || !d.started.CompareAndSwap(false, true) {
 		return
@@ -605,17 +607,21 @@ func (d *channelFanoutDispatcher) shardIndex(channelID int64) int {
 	return int(idx)
 }
 
-// Enqueue 投递一条 fan-out 任务。dispatcher 未启动时同步执行（用请求 ctx，保持旧行为）；
+// Enqueue 投递一条 fan-out 任务。dispatcher 未启动时 fail-closed，不构建 payload、不直推 session；
 // 已启动时投入对应分片。满时正常 payload 不阻塞请求路径，而是按 channel 合并为最高 pts
 // 的 nudge-only overflow watermark，由同 shard worker 在更早的 FIFO payload 后公平 drain。
 // 若 overflow cardinality 也已满，只发布一个常量大小的全局 recovery generation；固定后台
 // actor 随后从 durable channel pts 重建全部在线 channel 的 nudge。RPC goroutine 永不等待 slot。
-func (d *channelFanoutDispatcher) Enqueue(reqCtx context.Context, job channelFanoutJob) {
+func (d *channelFanoutDispatcher) Enqueue(_ context.Context, job channelFanoutJob) {
 	if d == nil || job.build == nil {
 		return
 	}
 	if !d.started.Load() {
-		d.r.runChannelFanoutJob(reqCtx, job)
+		d.dropped.Add(1)
+		d.log.Error("channel fanout dispatcher not started; refused request-thread direct push",
+			zap.Int64("channel_id", job.channelID),
+			zap.Int("pts", job.pts),
+			zap.Int("scope", int(job.scope)))
 		return
 	}
 	d.enqueueMu.RLock()
@@ -870,9 +876,10 @@ func (r *Router) runChannelFanoutOverflowNudge(ctx context.Context, channelID in
 	return r.nudgeBeyondCapChannelMessageAudience(ctx, channelID, pts, nil)
 }
 
-// runChannelFanoutJob 执行一条 fan-out：与同步 pushChannelUpdatesWithScope 等价，区别是
-// build 接受 ctx、且排除发起设备用 job 显式携带的 (originAuthKeyID, originSessionID)
-// 叠加到 ctx 后复用 pushUserUpdates，而非依赖已失效的请求 ctx。
+// runChannelFanoutJob 执行一条 fan-out：与 pushChannelUpdatesWithScope 使用同一投影规则，区别是
+// build 接受 ctx、且排除发起设备用 job 显式携带的 (originAuthKeyID, originSessionID)。
+// 在线投递必须走批量 location snapshot + per-Edge session-control batch；缺少该能力时
+// fail closed 并依赖 durable channel difference 收敛，不能退回旧的 Core 逐用户直推。
 func (r *Router) runChannelFanoutJob(ctx context.Context, job channelFanoutJob) {
 	if r.deps.Sessions == nil || job.build == nil {
 		return
@@ -881,35 +888,47 @@ func (r *Router) runChannelFanoutJob(ctx context.Context, job channelFanoutJob) 
 	recipients := r.channelFanoutRecipients(ctx, job.scope, job.channelID, job.recipients)
 	// 预热跨 viewer 用户投影（fan-out 模板化）：在逐 viewer build 之前一次性算好每 recipient 的
 	// 投影并预热共享 cache，使 build 只命中缓存、不再 O(viewer) 逐个 ForViewer。覆盖 recipients +
-	// 兜底 origin（无在线 recipient 时 build 会回退给 origin）。失败/未实现时静默退化为逐 viewer。
+	// origin（无在线 recipient 时 build 需要给 origin 做一次完整视角）。失败/未实现时直接
+	// fail-closed，禁止静默退回逐 viewer projection。失败时真实 payload 不能构造，但已有
+	// durable channel event 仍应通过 viewer-independent too-long nudge 唤醒 difference。
 	if job.prefetch != nil {
 		viewers := recipients
 		if job.originUserID != 0 {
 			viewers = append(append(make([]int64, 0, len(recipients)+1), recipients...), job.originUserID)
 		}
-		job.prefetch(ctx, viewers)
+		if !job.prefetch(ctx, viewers) {
+			r.log.Warn("channel fanout prefetch failed; replacing online payload with recovery nudge",
+				zap.Int64("channel_id", job.channelID),
+				zap.Int("pts", job.pts),
+				zap.Int("viewers", len(viewers)),
+			)
+			r.recoverFailedChannelFanoutPrefetch(pushCtx, job, recipients)
+			return
+		}
 	}
-	seen := make(map[int64]struct{}, len(recipients))
-	pushed := false
-	for _, userID := range recipients {
-		if userID == 0 {
-			continue
-		}
-		if _, ok := seen[userID]; ok {
-			continue
-		}
-		seen[userID] = struct{}{}
-		updates := job.build(ctx, userID)
-		if updates == nil {
-			continue
-		}
-		r.pushUserUpdates(pushCtx, userID, updates)
-		pushed = true
+	delivered, ok := r.pushChannelFanoutLocationBatches(pushCtx, recipients,
+		job.originAuthKeyID, job.originSessionID,
+		func(userID int64) *tg.Updates { return job.build(ctx, userID) },
+		zap.String("channel_fanout_kind", "payload"),
+		zap.Int64("channel_id", job.channelID),
+		zap.Int("pts", job.pts),
+	)
+	if !ok {
+		return
 	}
-	if !pushed && job.originUserID != 0 {
-		seen[job.originUserID] = struct{}{}
-		if updates := job.build(ctx, job.originUserID); updates != nil {
-			r.pushUserUpdates(pushCtx, job.originUserID, updates)
+	if len(delivered) == 0 && job.originUserID != 0 {
+		originDelivered, ok := r.pushChannelFanoutLocationBatches(pushCtx, []int64{job.originUserID},
+			job.originAuthKeyID, job.originSessionID,
+			func(userID int64) *tg.Updates { return job.build(ctx, userID) },
+			zap.String("channel_fanout_kind", "origin_payload"),
+			zap.Int64("channel_id", job.channelID),
+			zap.Int("pts", job.pts),
+		)
+		if !ok {
+			return
+		}
+		for userID := range originDelivered {
+			delivered[userID] = struct{}{}
 		}
 	}
 	// P0-8：完整 payload 受 MaxChannelRealtimeFanout 封顶，超出 cap 的在线成员既收不到
@@ -917,33 +936,246 @@ func (r *Router) runChannelFanoutJob(ctx context.Context, job channelFanoutJob) 
 	// 的成员发廉价 UpdateChannelTooLong{pts} nudge，促其 getChannelDifference 收敛。
 	// 仅对会推进客户端 channel PtsWaiter 的真实 payload（members scope + 带 channel pts）做。
 	if job.scope == channelFanoutMembers && job.pts > 0 {
-		r.nudgeBeyondCapChannelMembers(pushCtx, job.channelID, job.pts, seen)
+		r.nudgeBeyondCapChannelMembers(pushCtx, job.channelID, job.pts, delivered)
 	} else if job.scope == channelFanoutMessageBox && job.pts > 0 {
-		r.nudgeBeyondCapChannelMessageAudience(pushCtx, job.channelID, job.pts, seen)
+		r.nudgeBeyondCapChannelMessageAudience(pushCtx, job.channelID, job.pts, delivered)
 	}
+}
+
+func (r *Router) recoverFailedChannelFanoutPrefetch(ctx context.Context, job channelFanoutJob, recipients []int64) {
+	if job.channelID == 0 || job.pts <= 0 {
+		return
+	}
+	targets := append([]int64(nil), recipients...)
+	if job.originUserID != 0 {
+		targets = append(targets, job.originUserID)
+	}
+	targets = uniqueRecipientIDs(targets)
+	delivered := make(map[int64]struct{}, len(targets))
+	if r.pushChannelFanoutTooLongNudges(ctx, job.channelID, job.pts, targets) {
+		for _, userID := range targets {
+			if userID != 0 {
+				delivered[userID] = struct{}{}
+			}
+		}
+	}
+	// Explicit monoforum/suggested-post recipients are already the full
+	// authorized audience. Member/message-box scopes may have additional online
+	// users beyond the full-payload cap, so nudge that recovery audience too.
+	switch job.scope {
+	case channelFanoutMembers:
+		r.nudgeBeyondCapChannelMembers(ctx, job.channelID, job.pts, delivered)
+	case channelFanoutMessageBox:
+		r.nudgeBeyondCapChannelMessageAudience(ctx, job.channelID, job.pts, delivered)
+	}
+}
+
+func (r *Router) pushChannelFanoutLocationBatches(ctx context.Context, targetUserIDs []int64, excludeAuthKeyID [8]byte, excludeSessionID int64, build func(int64) *tg.Updates, fields ...zap.Field) (map[int64]struct{}, bool) {
+	delivered := make(map[int64]struct{})
+	if len(targetUserIDs) == 0 {
+		return delivered, true
+	}
+	locationProvider, hasLocations := r.deps.Sessions.(UserLocationBatchProvider)
+	batchPusher, hasBatchPusher := r.deps.Sessions.(BatchLocationTargetedSessionPusher)
+	if !hasLocations || !hasBatchPusher {
+		logFields := append([]zap.Field{}, fields...)
+		logFields = append(logFields,
+			zap.Bool("has_location_batch_provider", hasLocations),
+			zap.Bool("has_batch_pusher", hasBatchPusher),
+			zap.Int("targets", len(targetUserIDs)),
+		)
+		r.log.Warn("channel fanout batch dependencies unavailable", logFields...)
+		return delivered, false
+	}
+	locationsByUser, err := locationProvider.UserLocationRecordsForUsers(ctx, targetUserIDs)
+	if err != nil {
+		logFields := append([]zap.Field{}, fields...)
+		logFields = append(logFields, zap.Int("targets", len(targetUserIDs)), zap.Error(err))
+		r.log.Warn("channel fanout user location prefetch failed", logFields...)
+		return delivered, false
+	}
+
+	seen := make(map[int64]struct{}, len(targetUserIDs))
+	batchPushes := make([]LocationTargetedUserPush, 0, len(targetUserIDs))
+	for _, userID := range targetUserIDs {
+		select {
+		case <-ctx.Done():
+			return delivered, false
+		default:
+		}
+		if userID == 0 {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		locations := locationsByUser[userID]
+		if !channelFanoutHasDeliverableLocation(userID, locations, excludeAuthKeyID, excludeSessionID) {
+			continue
+		}
+		updates := build(userID)
+		if updates == nil {
+			continue
+		}
+		delivery, ok := channelFanoutDeliveryWatermark(updates)
+		if !ok {
+			logFields := append([]zap.Field{}, fields...)
+			logFields = append(logFields, zap.Int64("target_user_id", userID))
+			r.log.Warn("channel fanout update has unsupported mixed channel delivery; skipping online payload", logFields...)
+			continue
+		}
+		batchPushes = append(batchPushes, LocationTargetedUserPush{
+			TargetUserID:     userID,
+			Locations:        locations,
+			ExcludeAuthKeyID: excludeAuthKeyID,
+			ExcludeSessionID: excludeSessionID,
+			MessageType:      proto.MessageFromServer,
+			Update:           updates,
+			ChannelDelivery:  delivery,
+		})
+	}
+	if len(batchPushes) == 0 {
+		return delivered, true
+	}
+	sent, err := batchPusher.PushToUserLocationBatches(ctx, batchPushes)
+	if err != nil {
+		logFields := append([]zap.Field{}, fields...)
+		logFields = append(logFields, zap.Int("pushes", len(batchPushes)), zap.Int("sent", sent), zap.Error(err))
+		r.log.Warn("channel fanout batch push failed", logFields...)
+		return delivered, false
+	}
+	for _, push := range batchPushes {
+		delivered[push.TargetUserID] = struct{}{}
+	}
+	return delivered, true
+}
+
+func channelFanoutHasDeliverableLocation(userID int64, locations []EdgeLocationRecord, excludeAuthKeyID [8]byte, excludeSessionID int64) bool {
+	for _, location := range locations {
+		if location.UserID != userID || !location.ReceivesUpdates || location.InstanceID == "" {
+			continue
+		}
+		if excludeSessionID != 0 && location.RawAuthKeyID == excludeAuthKeyID && location.SessionID == excludeSessionID {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func channelFanoutDeliveryWatermark(updates tg.UpdatesClass) (ChannelDeliveryWatermark, bool) {
+	var delivery ChannelDeliveryWatermark
+	add := func(update tg.UpdateClass) bool {
+		channelID, pts, _, ok, err := tg.IsChannelPtsUpdate(update)
+		if err != nil {
+			return false
+		}
+		if !ok {
+			return true
+		}
+		switch update.(type) {
+		case *tg.UpdateReadChannelInbox:
+			return true
+		case *tg.UpdateChannelTooLong:
+			if channelID <= 0 || pts <= 0 {
+				return true
+			}
+			return mergeChannelFanoutDeliveryWatermark(&delivery, ChannelDeliveryNudge, channelID, pts)
+		default:
+			if channelID <= 0 || pts <= 0 {
+				return false
+			}
+			return mergeChannelFanoutDeliveryWatermark(&delivery, ChannelDeliveryPayload, channelID, pts)
+		}
+	}
+	switch u := updates.(type) {
+	case *tg.Updates:
+		for _, update := range u.Updates {
+			if !add(update) {
+				return ChannelDeliveryWatermark{}, false
+			}
+		}
+	case *tg.UpdatesCombined:
+		for _, update := range u.Updates {
+			if !add(update) {
+				return ChannelDeliveryWatermark{}, false
+			}
+		}
+	case *tg.UpdateShort:
+		if !add(u.Update) {
+			return ChannelDeliveryWatermark{}, false
+		}
+	}
+	return delivery, true
+}
+
+func mergeChannelFanoutDeliveryWatermark(delivery *ChannelDeliveryWatermark, kind ChannelDeliveryKind, channelID int64, pts int) bool {
+	if delivery == nil {
+		return false
+	}
+	if !delivery.Present() {
+		*delivery = ChannelDeliveryWatermark{Kind: kind, ChannelID: channelID, MinPts: pts, MaxPts: pts}
+		return true
+	}
+	if delivery.Kind != kind || delivery.ChannelID != channelID {
+		return false
+	}
+	if pts < delivery.MinPts {
+		delivery.MinPts = pts
+	}
+	if pts > delivery.MaxPts {
+		delivery.MaxPts = pts
+	}
+	return true
 }
 
 // prefetchChannelFanoutUsers 跨全部 recipient 一次性投影 owner 用户（fan-out 模板化，O(owner)），
 // 把结果按 viewer 预热进共享 cache；之后每 viewer 的 build 只命中缓存，不再逐 viewer ForViewer。
-// ownerIDs 由调用方从消息/事件 peer refs 收集。deps.Users 未实现 BatchViewerUsersResolver 或解析
-// 失败时静默跳过——build 回退逐 viewer 解析，行为不变，仅退化为旧的 O(viewer) 成本。
-func (r *Router) prefetchChannelFanoutUsers(ctx context.Context, cache *viewerPeerCache, viewers, ownerIDs []int64) {
-	if cache == nil || len(viewers) == 0 || len(ownerIDs) == 0 || r.deps.Users == nil {
-		return
+// ownerIDs 由调用方从消息/事件 peer refs 收集。deps.Users 必须实现 BatchViewerUsersResolver；
+// 缺能力或解析失败时返回 false，由 worker fail-closed，禁止静默退回旧的 O(viewer) 成本。
+func (r *Router) prefetchChannelFanoutUsers(ctx context.Context, cache *viewerPeerCache, viewers, ownerIDs []int64) bool {
+	viewers = uniquePeerIDs(viewers)
+	ownerIDs = uniquePeerIDs(ownerIDs)
+	if len(viewers) == 0 || len(ownerIDs) == 0 {
+		return true
+	}
+	if cache == nil || r.deps.Users == nil {
+		r.log.Warn("channel fanout user prefetch unavailable",
+			zap.Bool("has_cache", cache != nil),
+			zap.Bool("has_users", r.deps.Users != nil),
+			zap.Int("viewers", len(viewers)),
+			zap.Int("owners", len(ownerIDs)),
+		)
+		return false
 	}
 	resolver, ok := r.deps.Users.(BatchViewerUsersResolver)
 	if !ok {
-		return
+		r.log.Warn("channel fanout batch user resolver unavailable",
+			zap.Int("viewers", len(viewers)),
+			zap.Int("owners", len(ownerIDs)),
+		)
+		return false
 	}
 	byViewer, err := resolver.ByIDsForViewers(ctx, viewers, ownerIDs)
 	if err != nil {
-		r.log.Warn("channel fanout user prefetch failed; falling back to per-viewer projection",
+		r.log.Warn("channel fanout user prefetch failed",
 			zap.Int("viewers", len(viewers)), zap.Int("owners", len(ownerIDs)), zap.Error(err))
-		return
+		return false
 	}
-	for viewer, users := range byViewer {
-		cache.primeUsers(viewer, users)
+	for _, viewer := range viewers {
+		if missingID, missing := missingProjectedUserID(ownerIDs, byViewer[viewer]); missing {
+			r.log.Warn("channel fanout user prefetch returned an incomplete envelope",
+				zap.Int64("viewer_user_id", viewer),
+				zap.Int64("missing_user_id", missingID),
+				zap.Int("owners", len(ownerIDs)))
+			return false
+		}
+		// The complete envelope was validated above. Prime the expected set so the
+		// builder cannot issue a scalar ByIDs query for the same viewer.
+		cache.primeExpectedUsers(viewer, ownerIDs, byViewer[viewer])
 	}
+	return true
 }
 
 // channelMessageFanoutOwnerIDs 收集一条频道消息 fan-out 会下发到 Users 数组里的全部 owner 用户 id
@@ -989,8 +1221,10 @@ func channelMessagesFanoutPeerRefs(results []domain.SendChannelMessageResult, ex
 // enqueueChannelMessageFanout 异步 fan-out 单条频道消息并预热跨 viewer 投影（「频道里出现一条新消息」
 // 类事件的常见形态：发送/转发单条/讨论组联动/forum topic 消息）。语义与 enqueueChannelFanout 一致，
 // 仅多了把每 viewer 投影一次性算好预热进共享 cache（O(owner)），不改变投递/排除/nudge 行为。
-func (r *Router) enqueueChannelMessageFanout(ctx context.Context, originUserID int64, res domain.SendChannelMessageResult, extraUserIDs []int64) {
-	r.enqueueBotAPIChannelMessageUpdate(ctx, originUserID, res)
+func (r *Router) enqueueChannelMessageFanout(ctx context.Context, originUserID int64, res domain.SendChannelMessageResult, extraUserIDs []int64) error {
+	if err := r.enqueueBotAPIChannelMessageUpdate(ctx, originUserID, res); err != nil {
+		return err
+	}
 	fanoutCache := newViewerPeerCache(r)
 	ownerIDs := channelMessageFanoutOwnerIDs(res, extraUserIDs)
 	usernamePeers := channelMessagesFanoutUsernamePeers([]domain.SendChannelMessageResult{res}, extraUserIDs)
@@ -998,9 +1232,12 @@ func (r *Router) enqueueChannelMessageFanout(ctx context.Context, originUserID i
 	skip := skipDeliverySet(res.SkipDeliveryUserIDs)
 	r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutMessageBox, originUserID, res.Channel.ID, res.Event.Pts, res.Recipients,
 		0,
-		func(bgCtx context.Context, viewers []int64) {
-			r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs)
+		func(bgCtx context.Context, viewers []int64) bool {
+			if !r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs) {
+				return false
+			}
 			usernames = r.usernameRegistryMap(bgCtx, usernamePeers)
+			return true
 		},
 		func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
 			// privacy bot 在 send 时被 SkipDeliveryUserIDs 排除（命令/@/回复以外的消息不可见）。
@@ -1013,6 +1250,7 @@ func (r *Router) enqueueChannelMessageFanout(ctx context.Context, originUserID i
 			}
 			return r.channelMessageUpdatesWithPeerCacheAndUsernames(bgCtx, viewerUserID, res, 0, fanoutCache, usernames)
 		})
+	return nil
 }
 
 // enqueueMonoforumMessageFanout only targets the subscriber sub-dialog and active parent-channel
@@ -1021,13 +1259,19 @@ func (r *Router) enqueueChannelMessageFanout(ctx context.Context, originUserID i
 func (r *Router) enqueueMonoforumMessageFanout(ctx context.Context, originUserID int64, mono domain.Channel, savedPeer domain.Peer, res domain.SendChannelMessageResult) {
 	fanoutCache := newViewerPeerCache(r)
 	ownerIDs := channelMessageFanoutOwnerIDs(res, []int64{savedPeer.ID})
+	projectionPeers := monoforumProjectionPeers(mono.ID, mono.LinkedMonoforumID, ownerIDs)
+	var overlays *monoforumPeerOverlays
 	r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutExplicit, originUserID, mono.ID, res.Event.Pts, res.Recipients,
 		0,
-		func(bgCtx context.Context, viewers []int64) {
-			r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs)
+		func(bgCtx context.Context, viewers []int64) bool {
+			if !r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs) {
+				return false
+			}
+			overlays = r.loadMonoforumPeerOverlays(bgCtx, projectionPeers)
+			return true
 		},
 		func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
-			return r.monoforumDeliveryUpdates(bgCtx, viewerUserID, mono, savedPeer, res)
+			return r.monoforumDeliveryUpdatesWithPeerCacheAndOverlays(bgCtx, viewerUserID, mono, savedPeer, res, fanoutCache, overlays)
 		})
 }
 
@@ -1090,8 +1334,10 @@ func channelEditMessageFanoutPeerRefs(res domain.EditChannelMessageResult) (map[
 // "X completed Y" 服务消息），ServiceEvent.Pts 在后分配恒更大；某些编辑只产 ServiceEvent（Event.Pts==0）。
 // nudge 须带 channel 当前最高 pts 才能让 >cap 在线成员的 getChannelDifference 拉齐到末尾——用 Event.Pts
 // 会在 Event.Pts==0 时漏发 nudge、或低于真实 pts。max() 在三种形态（仅 Event/仅 ServiceEvent/两者）都正确。
-func (r *Router) enqueueChannelEditMessageFanout(ctx context.Context, originUserID int64, res domain.EditChannelMessageResult) {
-	r.enqueueBotAPIChannelEditMessageUpdate(ctx, originUserID, res)
+func (r *Router) enqueueChannelEditMessageFanout(ctx context.Context, originUserID int64, res domain.EditChannelMessageResult) error {
+	if err := r.enqueueBotAPIChannelEditMessageUpdate(ctx, originUserID, res); err != nil {
+		return err
+	}
 	fanoutCache := newViewerPeerCache(r)
 	ownerIDs := channelEditMessageFanoutOwnerIDs(res)
 	usernamePeers := channelEditMessageFanoutUsernamePeers(res)
@@ -1099,33 +1345,43 @@ func (r *Router) enqueueChannelEditMessageFanout(ctx context.Context, originUser
 	nudgePts := max(res.Event.Pts, res.ServiceEvent.Pts)
 	r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutMessageBox, originUserID, res.Channel.ID, nudgePts, res.Recipients,
 		0,
-		func(bgCtx context.Context, viewers []int64) {
-			r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs)
+		func(bgCtx context.Context, viewers []int64) bool {
+			if !r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs) {
+				return false
+			}
 			usernames = r.usernameRegistryMap(bgCtx, usernamePeers)
+			return true
 		},
 		func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
 			return r.channelEditMessageUpdatesWithPeerCacheAndUsernames(bgCtx, viewerUserID, res, fanoutCache, usernames)
 		})
+	return nil
 }
 
 // enqueueChannelMessagesFanout 同 enqueueChannelMessageFanout，但把多条结果汇成一个 job（批量转发：
 // 一个 Updates 内含多条 UpdateNewChannelMessage），peer refs 取全部结果并集预热。channelID/pts/
 // recipients 由调用方按批量语义给定（pts 取最后一条；recipients 受大群截断口径影响）。
-func (r *Router) enqueueChannelMessagesFanout(ctx context.Context, originUserID, channelID int64, pts int, recipients []int64, results []domain.SendChannelMessageResult, extraUserIDs []int64) {
-	r.enqueueBotAPIChannelMessagesUpdate(ctx, originUserID, results)
+func (r *Router) enqueueChannelMessagesFanout(ctx context.Context, originUserID, channelID int64, pts int, recipients []int64, results []domain.SendChannelMessageResult, extraUserIDs []int64) error {
+	if err := r.enqueueBotAPIChannelMessagesUpdate(ctx, originUserID, results); err != nil {
+		return err
+	}
 	fanoutCache := newViewerPeerCache(r)
 	ownerIDs := channelMessagesFanoutOwnerIDs(results, extraUserIDs)
 	usernamePeers := channelMessagesFanoutUsernamePeers(results, extraUserIDs)
 	var usernames map[domain.Peer][]domain.Username
 	r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutMessageBox, originUserID, channelID, pts, recipients,
 		int64(len(results))*(64<<10),
-		func(bgCtx context.Context, viewers []int64) {
-			r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs)
+		func(bgCtx context.Context, viewers []int64) bool {
+			if !r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs) {
+				return false
+			}
 			usernames = r.usernameRegistryMap(bgCtx, usernamePeers)
+			return true
 		},
 		func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
 			return r.channelMessagesUpdatesWithPeerCacheAndUsernames(bgCtx, viewerUserID, results, nil, false, extraUserIDs, fanoutCache, usernames)
 		})
+	return nil
 }
 
 // defaultChannelNudgeMaxTargets 限一次 fan-out 的 nudge 上限：nudge 是 O(1)/人廉价 push，但 nudge 被
@@ -1144,15 +1400,21 @@ func (r *Router) channelNudgeMaxTargets() int {
 
 // nudgeBeyondCapChannelMembers 给频道在线成员中未收到完整 payload（不在 delivered 内）的成员发
 // UpdateChannelTooLong{pts}。nudge 必须带 pts（flags&1）——DrKLO 对不带 pts 的 tooLong 不触发
-// getChannelDifference（设计 §10.3）。走 pushUserUpdates（best-effort、未就绪入 pending、非
-// transient），符合设计 §决策4 的 nudge 投递可靠性要求。SessionManager 未实现 ChannelNudgeProvider
-// 时（测试/未装配）静默跳过，不影响完整 payload 投递。
+// getChannelDifference（设计 §10.3）。投递同样走批量 location snapshot + per-Edge
+// session-control batch，避免大群 cap 外恢复信号重新放大成逐 user Redis publish。
 func (r *Router) nudgeBeyondCapChannelMembers(ctx context.Context, channelID int64, pts int, delivered map[int64]struct{}) bool {
 	provider, ok := r.deps.Sessions.(ChannelNudgeProvider)
 	if !ok || channelID == 0 || pts <= 0 {
 		return true
 	}
 	targets := provider.OnlineChannelMemberUserIDsExcluding(channelID, delivered, r.channelNudgeMaxTargets())
+	if len(targets) == 0 {
+		return true
+	}
+	return r.pushChannelFanoutTooLongNudges(ctx, channelID, pts, targets)
+}
+
+func (r *Router) pushChannelFanoutTooLongNudges(ctx context.Context, channelID int64, pts int, targets []int64) bool {
 	if len(targets) == 0 {
 		return true
 	}
@@ -1166,20 +1428,14 @@ func (r *Router) nudgeBeyondCapChannelMembers(ctx context.Context, channelID int
 		Date:    date,
 		Seq:     0,
 	}
-	for _, userID := range targets {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		if userID == 0 {
-			continue
-		}
-		// The nudge is viewer-independent and immutable. Reuse the TL object across
-		// recipients; SessionManager encodes before enqueue and never mutates it.
-		r.pushUserUpdates(ctx, userID, updates)
-	}
-	return ctx.Err() == nil
+	excludeSessionID, _ := SessionIDFrom(ctx)
+	_, ok := r.pushChannelFanoutLocationBatches(ctx, targets, rawAuthKeyIDForOrigin(ctx), excludeSessionID,
+		func(int64) *tg.Updates { return updates },
+		zap.String("channel_fanout_kind", "too_long_nudge"),
+		zap.Int64("channel_id", channelID),
+		zap.Int("pts", pts),
+	)
+	return ok
 }
 
 // nudgeBeyondCapChannelMessageAudience extends member recovery to users with an
@@ -1239,23 +1495,5 @@ func (r *Router) nudgeBeyondCapChannelMessageAudience(ctx context.Context, chann
 	if len(targets) == 0 {
 		return true
 	}
-	date := int(r.clock.Now().Unix())
-	tooLong := &tg.UpdateChannelTooLong{ChannelID: channelID}
-	tooLong.SetPts(pts)
-	updates := &tg.Updates{
-		Updates: []tg.UpdateClass{tooLong},
-		Users:   []tg.UserClass{},
-		Chats:   []tg.ChatClass{},
-		Date:    date,
-		Seq:     0,
-	}
-	for _, userID := range targets {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		r.pushUserUpdates(ctx, userID, updates)
-	}
-	return true
+	return r.pushChannelFanoutTooLongNudges(ctx, channelID, pts, targets)
 }

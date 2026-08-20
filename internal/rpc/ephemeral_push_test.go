@@ -27,7 +27,7 @@ func (s *ephemeralPushChannels) ResolveChannel(context.Context, int64, int64) (d
 }
 
 type ephemeralPushSessions struct {
-	SessionBinder
+	EdgeController
 	OnlineUserProvider
 	mu         sync.Mutex
 	online     bool

@@ -5,9 +5,9 @@
 // 并以 DTLS client（setup="active"）主动发起握手。上行 join JSON 不含 ICE candidates，
 // SFU 只能凭 ufrag/pwd 认证的 STUN Binding Request 学到客户端地址（peer-reflexive）。
 //
-// M0 提供 Disabled 实现（纯信令联调）：下发语法完备的 ufrag/pwd/sha-256 指纹与空
-// candidates——客户端解析成功后停留在 Connecting 态（持续 4s checkGroupCall 心跳），
-// 属预期行为；M1 换 pion 实现后客户端无感切换。
+// Disabled 只用于显式测试或探针。
+// 生产群通话 join 必须通过远端 standalone SFU owner；不得因为依赖未注入而自动创建
+// Disabled 纯信令 fallback。
 package sfu
 
 import (
@@ -66,7 +66,7 @@ type ServerAnswer struct {
 
 // Service 是信令层⇄媒体面的边界（未来横向扩展/远端 SFU 的替换点）。
 type Service interface {
-	// Enabled 报告媒体面是否真实可用（false=M0 纯信令模式）。
+	// Enabled 报告媒体面是否真实可用。Disabled 只能显式注入，不能作为缺失依赖兜底。
 	Enabled() bool
 	// Join 为参与者分配/重建媒体 endpoint，返回 SFU 端传输参数。
 	// kind=EndpointPresentation 时是同一参与者的第二连接（独立 ICE/DTLS）。
@@ -80,10 +80,10 @@ type Service interface {
 	AliveUserIDs(callID int64) []int64
 }
 
-// disabled 是 M0 纯信令实现。
+// disabled 是显式测试/探针用的纯信令实现。
 type disabled struct{}
 
-// Disabled 返回纯信令模式的 SFU。
+// Disabled 返回纯信令 SFU。生产 RPC 与 Core remote owner 不得在依赖缺失时自动创建它。
 func Disabled() Service {
 	return disabled{}
 }

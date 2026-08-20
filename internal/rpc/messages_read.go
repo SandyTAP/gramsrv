@@ -53,7 +53,7 @@ func (r *Router) onMessagesReadMessageContents(ctx context.Context, ids []int) (
 			PtsCount: affected.PtsCount,
 		}
 		contents.SetDate(now)
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 			Updates: []tg.UpdateClass{contents},
 			Date:    now,
 			Seq:     0,
@@ -63,7 +63,7 @@ func (r *Router) onMessagesReadMessageContents(ctx context.Context, ids []int) (
 	// 让 sender 端的"未听"蓝点消失；reliable outbox 部署下由 worker 投递。
 	for _, event := range read.SenderEvents {
 		if update := tgOtherUpdateFromEvent(event); update != nil {
-			r.pushUserUpdatesIfNoReliableDispatch(ctx, event.UserID, &tg.Updates{
+			r.requireReliableDispatchForUserUpdate(ctx, event.UserID, &tg.Updates{
 				Updates: []tg.UpdateClass{update},
 				Date:    now,
 				Seq:     0,
@@ -187,32 +187,25 @@ func (r *Router) affectedHistory(ctx context.Context, authKeyID [8]byte, userID 
 }
 
 func (r *Router) pushReadHistoryEvent(ctx context.Context, userID int64, event domain.UpdateEvent) {
-	if r.hasReliableUpdateDispatch() {
-		return
-	}
-	if r.deps.Sessions == nil || userID == 0 {
-		return
-	}
-	var update tg.UpdateClass
+	var updates *tg.Updates
 	switch event.Type {
 	case domain.UpdateEventReadHistoryInbox:
-		update = tgReadHistoryInboxUpdate(event)
+		updates = &tg.Updates{Updates: []tg.UpdateClass{tgReadHistoryInboxUpdate(event)}}
 	case domain.UpdateEventReadHistoryOutbox:
-		update = tgReadHistoryOutboxUpdate(event)
+		updates = &tg.Updates{Updates: []tg.UpdateClass{tgReadHistoryOutboxUpdate(event)}}
 	case domain.UpdateEventReadChannelDiscussionInbox:
 		if event.Peer.ID != 0 {
-			update = &tg.UpdateReadChannelDiscussionInbox{ChannelID: event.Peer.ID, TopMsgID: event.TopMsgID, ReadMaxID: event.MaxID}
+			updates = &tg.Updates{Updates: []tg.UpdateClass{
+				&tg.UpdateReadChannelDiscussionInbox{ChannelID: event.Peer.ID, TopMsgID: event.TopMsgID, ReadMaxID: event.MaxID},
+			}}
 		}
 	}
-	if update == nil {
+	if updates == nil {
 		return
 	}
-	updates := &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, event),
-		Date:    event.Date,
-		Seq:     0,
-	}
-	r.pushUserMessage(ctx, userID, "push read history", updates)
+	updates.Updates = appendAuxPtsBookkeeping(updates.Updates, event)
+	updates.Date = event.Date
+	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 }
 
 func (r *Router) pushCurrentReadHistoryEvent(ctx context.Context, event domain.UpdateEvent) {
@@ -238,7 +231,7 @@ func (r *Router) pushCurrentReadHistoryEvent(ctx context.Context, event domain.U
 }
 
 // bookkeepAuxPtsForCurrentSession 把 aux 事件占用的账号 pts 同步给发起
-// session：可靠 outbox 投递排除了当前 session，而这些 RPC 的响应多为
+// session：独立 Egress 投递排除了当前 session，而这些 RPC 的响应多为
 // Bool/无 pts 容器，不补这一条当前设备的水位会落后并误判后续空洞。
 func (r *Router) bookkeepAuxPtsForCurrentSession(ctx context.Context, events ...domain.UpdateEvent) {
 	updates := make([]tg.UpdateClass, 0, len(events))
@@ -293,7 +286,11 @@ func tgReadHistoryInboxUpdate(event domain.UpdateEvent) tg.UpdateClass {
 		}
 		return update
 	}
-	return tgReadHistoryInbox(event)
+	update := tgReadHistoryInbox(event)
+	if update == nil {
+		return nil
+	}
+	return update
 }
 
 func tgReadHistoryOutbox(event domain.UpdateEvent) *tg.UpdateReadHistoryOutbox {
@@ -316,5 +313,9 @@ func tgReadHistoryOutboxUpdate(event domain.UpdateEvent) tg.UpdateClass {
 			MaxID:     event.MaxID,
 		}
 	}
-	return tgReadHistoryOutbox(event)
+	update := tgReadHistoryOutbox(event)
+	if update == nil {
+		return nil
+	}
+	return update
 }

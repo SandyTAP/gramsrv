@@ -18,7 +18,8 @@ type fakeStoryReadModelCache struct {
 }
 
 type fakeRPCProjectionReadModelCache struct {
-	users []int64
+	users   []int64
+	flushes int
 }
 
 func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForViewer(int64) {}
@@ -28,7 +29,18 @@ func (f *fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForUse
 func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForPeer(int64, domain.Peer) {
 }
 func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForChannel(int64) {}
-func (*fakeRPCProjectionReadModelCache) FlushRPCProjectionReadModel()                     {}
+func (f *fakeRPCProjectionReadModelCache) FlushRPCProjectionReadModel() {
+	f.flushes++
+}
+
+type fakeBaseUserCache struct {
+	deletedIDs []int64
+}
+
+func (f *fakeBaseUserCache) Delete(_ context.Context, ids []int64) error {
+	f.deletedIDs = append(f.deletedIDs, ids...)
+	return nil
+}
 
 func (f *fakeStoryReadModelCache) InvalidateStoryReadModelViewers(ids ...int64) {
 	f.mu.Lock()
@@ -111,6 +123,31 @@ func TestReadModelChangeListenerRoutesUserVisibility(t *testing.T) {
 	listener.handlePayload(`{"model":"user_visibility","owner_user_id":0,"peer_type":"user","peer_id":0,"version":4}`)
 	if len(rpcProjections.users) != 1 || len(stories.peersSnapshot()) != 1 {
 		t.Fatalf("invalid visibility events were not ignored: users=%v peers=%+v", rpcProjections.users, stories.peersSnapshot())
+	}
+}
+
+func TestReadModelChangeListenerRoutesLogicalUserDeletionAsCoarseInvalidation(t *testing.T) {
+	rpcProjections := &fakeRPCProjectionReadModelCache{}
+	baseUsers := &fakeBaseUserCache{}
+	listener := NewReadModelChangeListener("", ReadModelCacheSet{
+		RPCProjections: rpcProjections,
+		BaseUsers:      baseUsers,
+	}, nil)
+
+	listener.handlePayload(`{"model":"user_deleted","owner_user_id":777,"peer_type":"user","peer_id":777,"version":1}`)
+	if rpcProjections.flushes != 1 {
+		t.Fatalf("RPC projection flushes = %d, want 1", rpcProjections.flushes)
+	}
+	if len(rpcProjections.users) != 0 {
+		t.Fatalf("logical deletion used per-user scans: %v", rpcProjections.users)
+	}
+	if len(baseUsers.deletedIDs) != 1 || baseUsers.deletedIDs[0] != 777 {
+		t.Fatalf("base user invalidations = %v, want [777]", baseUsers.deletedIDs)
+	}
+
+	listener.handlePayload(`{"model":"user_deleted","owner_user_id":888,"peer_type":"channel","peer_id":888,"version":1}`)
+	if rpcProjections.flushes != 1 || len(baseUsers.deletedIDs) != 1 {
+		t.Fatalf("invalid user_deleted event was not ignored: flushes=%d base=%v", rpcProjections.flushes, baseUsers.deletedIDs)
 	}
 }
 

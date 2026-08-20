@@ -59,6 +59,7 @@ func newEncryptedFixture(t *testing.T) *encryptedFixture {
 	sessions := &phoneCaptureSessions{}
 	secretStore := memory.NewSecretChatStore()
 	queueStore := memory.NewEncryptedQueueStore()
+	secretStore.AttachEncryptedStateEvents(queueStore)
 	router := New(Config{}, Deps{
 		Users:       appusers.NewService(userStore),
 		SecretChats: appsecret.NewService(secretStore, queueStore),

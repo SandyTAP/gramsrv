@@ -44,9 +44,8 @@ type GroupCallStore interface {
 	// SweepStaleParticipants 清理保活水位早于 checkOlderThan 的活跃参与者
 	//（每清一人 version++）。注意调用方必须叠加 SFU 媒体面活性做双过期判定。
 	SweepStaleParticipants(ctx context.Context, checkOlderThan, now int, limit int) ([]domain.GroupCallMutation, error)
-	// ResetAllParticipants 服务端重启恢复：把全部活跃通话的参与者批量置 left
-	//（每通话 version++），conference 若因此变空则同步转 discarded，返回受影响的通话。
-	ResetAllParticipants(ctx context.Context, now int) ([]domain.GroupCall, error)
+	// ResetParticipantsForCalls 只重置指定 callIDs，供多 SFU owner 启动恢复按实例作用域清理。
+	ResetParticipantsForCalls(ctx context.Context, callIDs []int64, now int) ([]domain.GroupCall, error)
 	// NextRaiseHandRating 分配全局单调递增的举手序号（举手排序用）。
 	NextRaiseHandRating(ctx context.Context, callID int64) (int64, error)
 	// SetParticipantOverride 写入 setter 对 target 的 per-viewer 覆盖（本地静音/音量），

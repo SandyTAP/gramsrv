@@ -407,12 +407,14 @@ func (r *Router) onChannelsEditTitle(ctx context.Context, req *tg.ChannelsEditTi
 		return r.channelStateUpdates(viewerUserID, res.Channel)
 	})
 	if res.Event.Pts != 0 {
-		r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
+		if err := r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
 			Channel:    res.Channel,
 			Message:    res.Message,
 			Event:      res.Event,
 			Recipients: res.Recipients,
-		}, nil)
+		}, nil); err != nil {
+			return nil, internalErr()
+		}
 	}
 	return updates, nil
 }
@@ -459,12 +461,14 @@ func (r *Router) onChannelsEditPhoto(ctx context.Context, req *tg.ChannelsEditPh
 		return r.channelStateUpdates(viewerUserID, res.Channel)
 	})
 	if res.Event.Pts != 0 {
-		r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
+		if err := r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
 			Channel:    res.Channel,
 			Message:    res.Message,
 			Event:      res.Event,
 			Recipients: res.Recipients,
-		}, nil)
+		}, nil); err != nil {
+			return nil, internalErr()
+		}
 	}
 	return updates, nil
 }

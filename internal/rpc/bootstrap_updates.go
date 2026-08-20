@@ -11,18 +11,15 @@ import (
 )
 
 const (
-	defaultBootstrapBatch    = 100
-	defaultBootstrapInterval = 200 * time.Millisecond
-	defaultBootstrapLease    = 30 * time.Second
+	defaultBootstrapBatch = 100
+	defaultBootstrapLease = 30 * time.Second
 )
 
 type BootstrapUpdateDispatcher struct {
-	router          *Router
-	log             *zap.Logger
-	batch           int
-	interval        time.Duration
-	maxIdleInterval time.Duration
-	leaseTimeout    time.Duration
+	router       *Router
+	log          *zap.Logger
+	batch        int
+	leaseTimeout time.Duration
 }
 
 type BootstrapUpdateOption func(*BootstrapUpdateDispatcher)
@@ -31,14 +28,6 @@ func WithBootstrapUpdateBatch(n int) BootstrapUpdateOption {
 	return func(d *BootstrapUpdateDispatcher) {
 		if n > 0 {
 			d.batch = n
-		}
-	}
-}
-
-func WithBootstrapUpdateInterval(interval time.Duration) BootstrapUpdateOption {
-	return func(d *BootstrapUpdateDispatcher) {
-		if interval > 0 {
-			d.interval = interval
 		}
 	}
 }
@@ -56,12 +45,10 @@ func NewBootstrapUpdateDispatcher(router *Router, log *zap.Logger, opts ...Boots
 		log = zap.NewNop()
 	}
 	d := &BootstrapUpdateDispatcher{
-		router:          router,
-		log:             log,
-		batch:           defaultBootstrapBatch,
-		interval:        defaultBootstrapInterval,
-		maxIdleInterval: defaultIdleDispatchMaxInterval,
-		leaseTimeout:    defaultBootstrapLease,
+		router:       router,
+		log:          log,
+		batch:        defaultBootstrapBatch,
+		leaseTimeout: defaultBootstrapLease,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -71,11 +58,32 @@ func NewBootstrapUpdateDispatcher(router *Router, log *zap.Logger, opts ...Boots
 	return d
 }
 
-func (d *BootstrapUpdateDispatcher) Run(ctx context.Context) {
+func (d *BootstrapUpdateDispatcher) RunWithWake(ctx context.Context, wake <-chan struct{}) {
 	if d == nil || d.router == nil {
 		return
 	}
-	runIdleBackoffLoop(ctx, d.interval, d.maxIdleInterval, d.DispatchOnce)
+	if wake == nil {
+		d.log.Error("bootstrap update wake channel is required")
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-wake:
+			if !ok {
+				return
+			}
+		}
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			if !d.DispatchOnce(ctx) {
+				break
+			}
+		}
+	}
 }
 
 func (d *BootstrapUpdateDispatcher) DispatchOnce(ctx context.Context) bool {

@@ -217,7 +217,9 @@ func (r *Router) onMessagesSendQuickReplyMessages(ctx context.Context, req *tg.M
 			return nil, messageSendErr(err)
 		}
 		if !sent.Duplicate {
-			r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent)
+			if err := r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent); err != nil {
+				return nil, internalErr()
+			}
 		}
 		res.SenderMessages = append(res.SenderMessages, sent.SenderMessage)
 		res.RecipientMessages = append(res.RecipientMessages, sent.RecipientMessage)
@@ -345,7 +347,7 @@ func (r *Router) pushQuickReplyMutation(ctx context.Context, userID int64, mutat
 	}
 	updates = appendAuxPtsBookkeeping(updates, event)
 	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: updates,
 		Users:   r.quickReplyUsers(ctx, userID),
 		Chats:   []tg.ChatClass{},

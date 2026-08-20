@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
 	appchannels "telesrv/internal/app/channels"
 	appgroupcalls "telesrv/internal/app/groupcalls"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/edgecontrol"
+	"telesrv/internal/sfu"
 	"telesrv/internal/store/memory"
 )
 
@@ -40,13 +43,22 @@ func (s *groupCallSessions) OnlineUserIDsForCandidates(candidateUserIDs []int64,
 	}
 	return out
 }
-func (s *groupCallSessions) TrackChannelInterest([8]byte, int64, int64, []int64)                {}
-func (s *groupCallSessions) ClearChannelInterest([8]byte, int64, int64)                         {}
-func (s *groupCallSessions) OnlineChannelUserIDs(int64, int) []int64                            { return nil }
-func (s *groupCallSessions) ChannelMembershipGeneration([8]byte, int64) int64                   { return 0 }
-func (s *groupCallSessions) SetSessionChannelMemberships([8]byte, int64, int64, []int64, int64) {}
-func (s *groupCallSessions) AddUserChannelMembership(int64, int64)                              {}
-func (s *groupCallSessions) RemoveUserChannelMembership(int64, int64)                           {}
+func (s *groupCallSessions) TrackChannelInterest([8]byte, int64, int64, []int64) {}
+func (s *groupCallSessions) ClearChannelInterest([8]byte, int64, int64)          {}
+func (s *groupCallSessions) OnlineChannelUserIDs(int64, int) []int64             { return nil }
+func (s *groupCallSessions) AddUserChannelMembership(int64, int64)               {}
+func (s *groupCallSessions) RemoveUserChannelMembership(int64, int64)            {}
+func (s *groupCallSessions) BeginSessionChannelMembershipSync(context.Context, [8]byte, int64, int64) (int64, edgecontrol.ChannelMembershipSyncDisposition, error) {
+	return 1, edgecontrol.ChannelMembershipSyncAcquired, nil
+}
+func (s *groupCallSessions) AppendSessionChannelMembershipSync(context.Context, [8]byte, int64, int64, int64, []int64) error {
+	return nil
+}
+func (s *groupCallSessions) CommitSessionChannelMembershipSync(context.Context, [8]byte, int64, int64, int64) (bool, error) {
+	return true, nil
+}
+func (s *groupCallSessions) AbortSessionChannelMembershipSync(context.Context, [8]byte, int64, int64, int64) {
+}
 func (s *groupCallSessions) OnlineChannelMemberUserIDs(channelID int64, limit int) []int64 {
 	return append([]int64(nil), s.online...)
 }
@@ -74,6 +86,7 @@ func newGroupCallFixture(t *testing.T) *groupCallFixture {
 		Users:      appusers.NewService(userStore),
 		Channels:   appchannels.NewService(channelStore),
 		GroupCalls: appgroupcalls.NewService(memory.NewGroupCallStore()),
+		SFU:        sfu.Disabled(),
 		Sessions:   sessions,
 	}, zaptest.NewLogger(t), clk)
 	f := &groupCallFixture{t: t, ctx: ctx, router: router, sessions: sessions, clk: clk}
@@ -147,6 +160,30 @@ func findUpdate[T tg.UpdateClass](t *testing.T, updates tg.UpdatesClass) T {
 	var zero T
 	t.Fatalf("updates %v missing %T", box.Updates, zero)
 	return zero
+}
+
+func TestJoinGroupCallRequiresExplicitSFU(t *testing.T) {
+	f := newGroupCallFixture(t)
+	ownerCtx := f.userCtx(f.owner, 11)
+	createRes, err := f.router.onPhoneCreateGroupCall(ownerCtx, &tg.PhoneCreateGroupCallRequest{
+		Peer:     &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("createGroupCall: %v", err)
+	}
+	call := findUpdate[*tg.UpdateGroupCall](t, createRes).Call.(*tg.GroupCall)
+	f.router.deps.SFU = nil
+	if res, err := f.router.onPhoneJoinGroupCall(ownerCtx, &tg.PhoneJoinGroupCallRequest{
+		Call:   &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash},
+		JoinAs: &tg.InputPeerSelf{},
+		Params: groupCallJoinParams(t, 1001),
+	}); res != nil || !tgerr.Is(err, "INTERNAL_SERVER_ERROR") {
+		t.Fatalf("joinGroupCall without SFU = result %T err %v, want INTERNAL_SERVER_ERROR", res, err)
+	}
+	if p, found, err := f.router.deps.GroupCalls.Participant(f.ctx, call.ID, f.owner.ID); err != nil || found {
+		t.Fatalf("participant after missing SFU = %+v found=%v err=%v, want no signal join committed", p, found, err)
+	}
 }
 
 // TestGroupCallPushSkipsNonMemberOnlineCandidates 验证群通话推送收件人必须过一次

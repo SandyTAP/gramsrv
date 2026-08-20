@@ -87,6 +87,9 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 		t.Fatalf("create chat: %v", err)
 	}
 	channel := created.Updates.(*tg.Updates).Chats[0].(*tg.Channel)
+	cancelFanout := startChannelFanoutForTest(t, r)
+	defer cancelFanout()
+	sessions.clearMessages()
 
 	var authKeyID [8]byte
 	authKeyID[0] = 9
@@ -111,6 +114,7 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	if msg.PeerID.(*tg.PeerChannel).ChannelID != channel.ID || msg.Message != "hello channel" || !msg.Out {
 		t.Fatalf("channel message = %#v, want outgoing channel text", msg)
 	}
+	waitForPushedUserIDs(t, sessions.captureSessions, 1)
 	pushed := sessions.snapshot()
 	if pushed.userID != friend.ID || pushed.sessionID != 77 || pushed.messageType != proto.MessageFromServer {
 		t.Fatalf("pushed channel update = user %d exclude session %d type %v, want friend/exclude/from_server", pushed.userID, pushed.sessionID, pushed.messageType)
@@ -676,8 +680,7 @@ func TestChannelReadHistoryWithReliableDispatchPushesCurrentSessionReadUpdate(t 
 	var authKeyID [8]byte
 	authKeyID[0] = 10
 	updates := &captureUpdates{
-		state:            domain.UpdateState{Pts: 900, Date: 1700000102, Seq: 3},
-		reliableDispatch: true,
+		state: domain.UpdateState{Pts: 900, Date: 1700000102, Seq: 3},
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{Updates: updates, Sessions: sessions}, zaptest.NewLogger(t), clock.System)

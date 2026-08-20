@@ -53,7 +53,10 @@ func (d *SuggestedPostDispatcher) DispatchOnce(ctx context.Context) bool {
 		return false
 	}
 	for _, result := range results {
-		d.router.enqueueSuggestedPostApprovalFanout(ctx, 0, result)
+		if err := d.router.enqueueSuggestedPostApprovalFanout(ctx, 0, result); err != nil {
+			d.log.Warn("enqueue suggested post approval fanout", zap.Error(err))
+			return false
+		}
 	}
 	return len(results) > 0
 }

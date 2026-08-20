@@ -88,7 +88,8 @@ func (s *Service) Create(ctx context.Context, message string, mode domain.Broadc
 	if err != nil {
 		return domain.Broadcast{}, err
 	}
-	return s.store.CreateBroadcast(ctx, message, mode, ids, strings.TrimSpace(createdBy))
+	entities := domain.DetectAutomaticMessageEntities(message, nil)
+	return s.store.CreateBroadcast(ctx, message, entities, mode, ids, strings.TrimSpace(createdBy))
 }
 
 func (s *Service) List(ctx context.Context, beforeID int64, limit int) ([]domain.Broadcast, bool, error) {

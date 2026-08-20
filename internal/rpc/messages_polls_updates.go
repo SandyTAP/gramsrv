@@ -207,8 +207,9 @@ func (r *Router) onEditMessageClosePoll(ctx context.Context, req *tg.MessagesEdi
 //
 // Phase 4 模板化：fan-out 前一次性批量加载所有收件人的 per-viewer poll 投影（ChannelPollFanoutViews
 // 把 viewer-invariant 聚合只算一次 + 批量 viewerOptions/可见性），消除原先每 viewer 一次 GetMessages
-// 的 N+1。dispatch 仍同步（poll 是 viewer-only 无 durable event，改异步丢队列即永久漏）。预取未覆盖
-// 的 viewer 回退逐 viewer loadMessagePoll 保正确（与旧路径字节同源）。actor echo 仍用 res poll（旧行为）。
+// 的 N+1。dispatch 仍同步（poll 是 viewer-only 无 durable event，改异步丢队列即永久漏）。
+// 批量视图是在线 fan-out 的唯一数据源；预取失败或未覆盖时跳过该 viewer，不再回到逐 viewer DB reload。
+// actor echo 仍用 res poll。
 func (r *Router) channelPollUpdates(ctx context.Context, userID int64, peer domain.Peer, msgID int, res domain.ChannelMessagePollResult, push bool) tg.UpdatesClass {
 	var batched map[int64]*domain.MessagePoll
 	if push && peer.Type == domain.PeerTypeChannel && r.deps.Channels != nil {
@@ -216,7 +217,7 @@ func (r *Router) channelPollUpdates(ctx context.Context, userID int64, peer doma
 		if len(recipients) > 0 {
 			views, err := r.deps.Channels.ChannelPollFanoutViews(ctx, res.Channel.ID, msgID, recipients, int(r.clock.Now().Unix()))
 			if err != nil {
-				r.log.Warn("channel poll fanout prefetch failed; falling back to per-viewer reload",
+				r.log.Warn("channel poll fanout prefetch failed; skipping non-origin online viewers",
 					zap.Int64("channel_id", res.Channel.ID), zap.Int("msg_id", msgID), zap.Error(err))
 			} else {
 				batched = views
@@ -233,12 +234,7 @@ func (r *Router) channelPollUpdates(ctx context.Context, userID int64, peer doma
 				}
 				poll = p
 			} else {
-				// 预取未覆盖（极少：并发/收件人集漂移）→ 回退逐 viewer 重载。
-				reloaded, _, found := r.loadMessagePoll(ctx, viewerUserID, peer, msgID)
-				if !found {
-					return nil
-				}
-				poll = reloaded
+				return nil
 			}
 		}
 		update := tgUpdateMessagePoll(peer, msgID, poll)

@@ -112,8 +112,12 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 		echoCache := newViewerPeerCache(r)
 		updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, res, p.randomID, echoCache)
 		if !res.Duplicate {
-			r.enqueueChannelMessageFanout(ctx, userID, res, nil)
-			r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion)
+			if err := r.enqueueChannelMessageFanout(ctx, userID, res, nil); err != nil {
+				return nil, false, internalErr()
+			}
+			if err := r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
+				return nil, false, internalErr()
+			}
 			// 频道链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
 			r.maybeEnqueueWebPageResolve(userID, peer, res.Message.ID, res.Message.Media)
 		}
@@ -219,7 +223,9 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	if !res.Duplicate {
 		// 链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
 		r.maybeEnqueueWebPageResolve(userID, peer, res.SenderMessage.ID, res.SenderMessage.Media)
-		r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res)
+		if err := r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res); err != nil {
+			return nil, false, internalErr()
+		}
 	}
 	return tgPrivateSendResultUpdates(res, p.randomID, true, users, chats), res.Duplicate, nil
 }
@@ -340,7 +346,7 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 			if req.ClearDraft {
 				r.clearDraftAfterSend(ctx, userID, peer, replyTo)
 			}
-			return r.monoforumSendUpdates(ctx, userID, replay.channel.Channel, savedPeer, replay.channel), nil
+			return r.monoforumSendUpdatesStrict(ctx, userID, replay.channel.Channel, savedPeer, replay.channel)
 		}
 		if r.messageEffectInvalid(ctx, req.Effect) {
 			return nil, effectIDInvalidErr()

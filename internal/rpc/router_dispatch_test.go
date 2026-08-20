@@ -1010,7 +1010,7 @@ func TestDispatchCachesUnauthenticatedIdentity(t *testing.T) {
 	}
 
 	if auth.resolveCount != 1 || auth.userIDCount != 1 {
-		t.Fatalf("identity lookups = resolve %d user %d, want one-time negative cache", auth.resolveCount, auth.userIDCount)
+		t.Fatalf("identity lookups = resolve %d user %d, want session-level unauthenticated identity reuse", auth.resolveCount, auth.userIDCount)
 	}
 	gotSession := sessions.snapshot()
 	if !gotSession.userResolved || gotSession.userID != 0 {
@@ -1235,7 +1235,8 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 			LastName:   "User",
 			Phone:      "15550000000",
 		}},
-		LangPack: seededLangPackService(t),
+		LangPack:    seededLangPackService(t),
+		LoginTokens: newTestLoginTokenStore(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	tests := []struct {

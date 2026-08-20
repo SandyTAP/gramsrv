@@ -27,10 +27,26 @@ type DispatchOutboxItem struct {
 	Attempts         int
 }
 
+type DispatchOutboxClientAck struct {
+	OutboxID     int64
+	TargetUserID int64
+	Pts          int
+	Attempt      int
+	AuthKeyID    [8]byte
+	SessionID    int64
+	ServerMsgID  int64
+	AckedAt      time.Time
+}
+
 // DispatchOutboxStore 持久化 transactional outbox。
 type DispatchOutboxStore interface {
 	ClaimPending(ctx context.Context, limit int) ([]DispatchOutboxItem, error)
 	MarkDelivered(ctx context.Context, item DispatchOutboxItem) error
+	MarkAbandoned(ctx context.Context, item DispatchOutboxItem, lastError string) error
 	MarkFailed(ctx context.Context, item DispatchOutboxItem, lastError string) error
 	DeleteFailed(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+}
+
+type DispatchOutboxClientAckStore interface {
+	MarkClientAcked(ctx context.Context, ack DispatchOutboxClientAck) error
 }

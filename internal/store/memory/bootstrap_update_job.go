@@ -134,11 +134,7 @@ func (s *BootstrapUpdateJobStore) MarkFailed(_ context.Context, id int64, lastEr
 			job.Status = domain.BootstrapUpdateJobFailed
 		} else {
 			job.Status = domain.BootstrapUpdateJobReady
-			delay := time.Duration(job.Attempts*job.Attempts) * time.Second
-			if delay > time.Minute {
-				delay = time.Minute
-			}
-			job.ReadyAt = now.Add(delay)
+			job.ReadyAt = now
 		}
 		job.LastError = lastError
 		job.UpdatedAt = now

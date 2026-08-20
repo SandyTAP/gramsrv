@@ -14,6 +14,8 @@ import (
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tlprofile"
 	"github.com/iamxvbaba/td/transport"
+
+	"telesrv/internal/edgecontrol"
 )
 
 // Conn 是一个已识别 session 的客户端连接，持有向其加密发送消息所需的全部上下文。
@@ -150,6 +152,9 @@ type Conn struct {
 	// rpcResultAcked is invoked by the sole outbound actor after it resolves an
 	// acknowledged server frame back to the rpc_result request msg_id.
 	rpcResultAcked func(*Conn, int64)
+	// outboxClientAcked is invoked by the sole outbound actor after a client
+	// msgs_ack resolves to a server-originated durable outbox frame.
+	outboxClientAcked func(*Conn, edgecontrol.OutboxDeliveryRef, int64)
 	// inflightRPCBytes 跟踪已预留/入队/执行中 inbound RPC 的 memory charge；legacy
 	// 等于 copied body，exact 是 typed materialization 的保守放大值。它配合
 	// maxInflightRPCBytes 给 RPC 队列设内存预算（不止限条数）。
@@ -172,6 +177,9 @@ type Conn struct {
 	userID                  atomic.Int64
 	userIDResolved          atomic.Bool
 	receivesUpdates         atomic.Bool
+	channelWatermarkMu      sync.Mutex
+	channelPayloadPts       map[int64]int
+	channelNudgePts         map[int64]int
 	// membershipsSynced 表示该连接的 channel membership 推送路由（byMemberChannel）
 	// 已成功建立。它与 receivesUpdates 共同构成「session 完全就绪」：membership
 	// 同步失败时保持 false，让置位短路放行、下一条 RPC 重试同步，避免
@@ -180,7 +188,7 @@ type Conn struct {
 	// membershipGen 是本连接 channel membership 索引的修订号：任何增量修订
 	// （join/leave/kick 的 Add/Remove、身份切换/下线的整体清除）都递增。全量同步方
 	// 在读取持久成员列表前采样、落地时带回比对，检测「读取窗口内发生增量修订」的
-	// 丢失更新竞态（SetSessionChannelMemberships 改走合并路径并保持未就绪重试）。
+	// 丢失更新竞态（paged membership commit 改走合并路径并保持未就绪重试）。
 	membershipGen atomic.Int64
 	// createdAt 是连接建立时刻，供同 auth_key session 数触顶时驱逐真正最旧的连接。
 	createdAt time.Time

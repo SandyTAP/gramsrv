@@ -195,8 +195,12 @@ WHERE receiver_auth_key_id = $1 AND qts <= $2 AND NOT acked`, receiverAuthKeyID,
 }
 
 func (s *EncryptedQueueStore) AppendStateEvent(ctx context.Context, ev domain.EncryptedStateEvent) (int64, error) {
+	return appendEncryptedStateEvent(ctx, s.db, ev)
+}
+
+func appendEncryptedStateEvent(ctx context.Context, db sqlcgen.DBTX, ev domain.EncryptedStateEvent) (int64, error) {
 	var id int64
-	if err := s.db.QueryRow(ctx, `
+	if err := db.QueryRow(ctx, `
 INSERT INTO encrypted_state_events (target_user_id, target_auth_key_id, chat_id, event_type, max_date, date)
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id`,

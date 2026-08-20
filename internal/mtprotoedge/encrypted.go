@@ -748,7 +748,7 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, method str
 		}, nil)
 	}
 
-	ctx = postresponse.WithCallbacks(ctx)
+	ctx = postresponse.WithTypedActionDelivery(postresponse.WithCallbacks(ctx))
 	ctx, dbStats := dbtrace.WithStats(ctx)
 	// legacyRPC is an unexported package-test hook, but its result still has to
 	// obey the production exact-codec invariant. Admit a defensive copy using
@@ -825,7 +825,7 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, method str
 		if terminal != nil {
 			var after func()
 			if runPostResponse {
-				after = postresponse.Take(context.WithoutCancel(ctx))
+				after = postresponse.TakeWithExecutor(context.WithoutCancel(ctx), legacyRPCPostResponseExecutor(s.rpc))
 			}
 			if sendErr := s.publishRPCResult(c, msgID, effectiveMethod, owner, terminal, after); sendErr != nil {
 				s.log.Debug("Publish canceled RPC result failed", append(fields, zap.Error(sendErr))...)
@@ -856,7 +856,12 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, method str
 	}
 
 	s.log.Info("RPC handled", fields...)
-	return s.publishRPCResult(c, msgID, effectiveMethod, owner, result, postresponse.Take(ctx))
+	return s.publishRPCResult(c, msgID, effectiveMethod, owner, result, postresponse.TakeWithExecutor(ctx, legacyRPCPostResponseExecutor(s.rpc)))
+}
+
+func legacyRPCPostResponseExecutor(handler legacyRPCHandler) postresponse.ActionExecutor {
+	executor, _ := handler.(postresponse.ActionExecutor)
+	return executor
 }
 
 var errRPCResultRetentionHandoff = errors.New("mtproto rpc result retention handoff failed")

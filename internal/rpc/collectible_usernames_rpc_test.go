@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,19 +32,27 @@ type fakeUsernameRegistry struct {
 	// err, when set, fails every read. Used for the degradation tests.
 	err error
 	// batchCalls / peerCalls count read fan-out so the tests can assert no N+1.
+	countMu    sync.Mutex
 	batchCalls int
 	peerCalls  int
+	// firstBatchDone lets asynchronous fan-out tests wait for the registry read
+	// itself to finish instead of observing an earlier stage of the worker.
+	firstBatchDone chan struct{}
+	firstBatchOnce sync.Once
 }
 
 func newFakeUsernameRegistry() *fakeUsernameRegistry {
 	return &fakeUsernameRegistry{
-		byPeer:       make(map[domain.Peer][]domain.Username),
-		collectibles: make(map[string]domain.CollectibleUsername),
+		byPeer:         make(map[domain.Peer][]domain.Username),
+		collectibles:   make(map[string]domain.CollectibleUsername),
+		firstBatchDone: make(chan struct{}),
 	}
 }
 
 func (f *fakeUsernameRegistry) PeerUsernames(_ context.Context, peer domain.Peer) ([]domain.Username, error) {
+	f.countMu.Lock()
 	f.peerCalls++
+	f.countMu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -51,7 +60,10 @@ func (f *fakeUsernameRegistry) PeerUsernames(_ context.Context, peer domain.Peer
 }
 
 func (f *fakeUsernameRegistry) UsernamesBatch(_ context.Context, peers []domain.Peer) (map[domain.Peer][]domain.Username, error) {
+	defer f.firstBatchOnce.Do(func() { close(f.firstBatchDone) })
+	f.countMu.Lock()
 	f.batchCalls++
+	f.countMu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -62,6 +74,12 @@ func (f *fakeUsernameRegistry) UsernamesBatch(_ context.Context, peers []domain.
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeUsernameRegistry) readCounts() (batch, peer int) {
+	f.countMu.Lock()
+	defer f.countMu.Unlock()
+	return f.batchCalls, f.peerCalls
 }
 
 func (f *fakeUsernameRegistry) ToggleUsername(_ context.Context, peer domain.Peer, username string, active bool) (bool, error) {
@@ -197,6 +215,7 @@ func TestTgUsernamesFromRegistryDegradesToScalar(t *testing.T) {
 type usernameProjectionFixture struct {
 	router   *Router
 	registry *fakeUsernameRegistry
+	delivery *memory.DeliveryOutboxStore
 	owner    domain.User
 	friend   domain.User
 }
@@ -205,6 +224,7 @@ func newUsernameProjectionFixture(t *testing.T, registry UsernameRegistryService
 	t.Helper()
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550002001", FirstName: "Owner", Username: "owner_slot"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
@@ -216,10 +236,12 @@ func newUsernameProjectionFixture(t *testing.T, registry UsernameRegistryService
 	fake, _ := registry.(*fakeUsernameRegistry)
 	return usernameProjectionFixture{
 		router: New(Config{}, Deps{
-			Users:     appusers.NewService(userStore),
-			Usernames: registry,
+			Users:          appusers.NewService(userStore),
+			Usernames:      registry,
+			DeliveryOutbox: delivery,
 		}, zaptest.NewLogger(t), clock.System),
 		registry: fake,
+		delivery: delivery,
 		owner:    owner,
 		friend:   friend,
 	}
@@ -513,8 +535,6 @@ func TestAuthLoginTokenSuccessProjectsCompleteSelfUsernames(t *testing.T) {
 func TestAccountProfileMutationResponsesKeepVectorOnlyUsernames(t *testing.T) {
 	registry := newFakeUsernameRegistry()
 	f := newUsernameProjectionFixture(t, registry)
-	sessions := &captureSessions{}
-	f.router.deps.Sessions = sessions
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: f.owner.ID}
 	registry.byPeer[peer] = []domain.Username{
 		{Username: "owner_slot", Editable: true, Active: true, SortOrder: 0},
@@ -533,14 +553,14 @@ func TestAccountProfileMutationResponsesKeepVectorOnlyUsernames(t *testing.T) {
 		t.Fatalf("account.updateProfile user = %T, want *tg.User", updated)
 	}
 	assertVectorOnlyUsernames(t, "account.updateProfile", self, []string{"owner_slot", "owner_collectible"})
-	profileEnvelope := sessions.lastUserPush().(*tg.Updates)
+	profileEnvelope := lastQueuedDeliveryUpdates(t, f.delivery)
 	pushed := profileEnvelope.Users[0].(*tg.User)
 	if pushed == self {
 		t.Fatal("account.updateProfile reused one mutable tg.User for RPC result and push")
 	}
 	assertUsernameUpdateEnvelope(t, "account.updateProfile push", profileEnvelope, []string{"owner_slot", "owner_collectible"})
-	if registry.peerCalls != 1 || registry.batchCalls != 0 {
-		t.Fatalf("account.updateProfile username reads = peer:%d batch:%d, want 1/0", registry.peerCalls, registry.batchCalls)
+	if registry.peerCalls != 2 || registry.batchCalls != 0 {
+		t.Fatalf("account.updateProfile username reads = peer:%d batch:%d, want 2/0", registry.peerCalls, registry.batchCalls)
 	}
 
 	registry.byPeer[peer] = []domain.Username{
@@ -556,14 +576,14 @@ func TestAccountProfileMutationResponsesKeepVectorOnlyUsernames(t *testing.T) {
 		t.Fatalf("account.updateUsername user = %T, want *tg.User", updated)
 	}
 	assertVectorOnlyUsernames(t, "account.updateUsername", self, []string{"renamed_slot", "owner_collectible"})
-	usernameEnvelope := sessions.lastUserPush().(*tg.Updates)
+	usernameEnvelope := lastQueuedDeliveryUpdates(t, f.delivery)
 	pushed = usernameEnvelope.Users[0].(*tg.User)
 	if pushed == self {
 		t.Fatal("account.updateUsername reused one mutable tg.User for RPC result and push")
 	}
 	assertUsernameUpdateEnvelope(t, "account.updateUsername push", usernameEnvelope, []string{"renamed_slot", "owner_collectible"})
-	if registry.peerCalls != 2 || registry.batchCalls != 0 {
-		t.Fatalf("profile mutation username reads = peer:%d batch:%d, want 2/0", registry.peerCalls, registry.batchCalls)
+	if registry.peerCalls != 4 || registry.batchCalls != 0 {
+		t.Fatalf("profile mutation username reads = peer:%d batch:%d, want 4/0", registry.peerCalls, registry.batchCalls)
 	}
 }
 

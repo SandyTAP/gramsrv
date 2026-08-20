@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-Checks the local telesrv runtime state.
+Checks the local telesrv Edge runtime state.
 
 .DESCRIPTION
 Reports the listening PID/process, git commit, schema version, MTProto port,
-Android connection/package status, and recent server log errors. The script is
+Android connection/package status, and recent Edge log errors. The script is
 read-only and is intended to run before/after Android and TDesktop validation.
 #>
 [CmdletBinding()]
@@ -25,9 +25,14 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 if (-not $ServerLogPath) {
-    $latestLog = Get-ChildItem (Join-Path $RepoRoot "logs") -Filter "telesrv-*.err.log" -ErrorAction SilentlyContinue |
+    $latestLog = Get-ChildItem (Join-Path $RepoRoot "logs") -Filter "telesrv-edge-*.err.log" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
+    if (-not $latestLog) {
+        $latestLog = Get-ChildItem (Join-Path $RepoRoot "logs") -Filter "telesrv-*.err.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
     if ($latestLog) {
         $ServerLogPath = $latestLog.FullName
     } else {
@@ -36,6 +41,13 @@ if (-not $ServerLogPath) {
 }
 
 $Failures = New-Object System.Collections.Generic.List[string]
+$ReadyLogPatterns = @(
+    "*telesrv edge ready*",
+    "*telesrv core role ready*",
+    "*telesrv egress ready*",
+    "*telesrv-sfu started*",
+    "*telesrv 服务就绪*"
+)
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -49,6 +61,15 @@ function Add-Failure([string]$Message) {
 
 function Write-Ok([string]$Message) {
     Write-Host "[ok] $Message"
+}
+
+function Test-ReadyLogLine([string]$Line) {
+    foreach ($pattern in $ReadyLogPatterns) {
+        if ($Line -like $pattern) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Invoke-External {
@@ -191,7 +212,7 @@ $lines = @(Read-SharedLogLines)
 if ($lines.Count -eq 0) {
     Add-Failure "server log is missing or empty"
 } else {
-    $readyLines = @($lines | Where-Object { $_ -like "*telesrv 服务就绪*" })
+    $readyLines = @($lines | Where-Object { Test-ReadyLogLine $_ })
     if ($readyLines.Count -gt 0) {
         $ready = @($readyLines)[-1]
         Write-Host $ready
@@ -207,7 +228,7 @@ if ($lines.Count -eq 0) {
             Write-Ok "runtime commit matches HEAD"
         }
     } else {
-        Add-Failure "server log has no 'telesrv 服务就绪' line"
+        Add-Failure "server log has no role ready line"
     }
     $recent = @($lines | Select-Object -Last $RecentLogLines)
     $bad = @($recent | Where-Object {

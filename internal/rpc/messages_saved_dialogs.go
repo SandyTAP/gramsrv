@@ -185,7 +185,7 @@ func (r *Router) onMessagesToggleSavedDialogPin(ctx context.Context, req *tg.Mes
 			recorded = event
 		}
 		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateSavedDialogPinned{
 				Pinned: pinned,
 				Peer:   tgDialogPeer(peers[0]),
@@ -235,7 +235,7 @@ func (r *Router) onMessagesReorderPinnedSavedDialogs(ctx context.Context, req *t
 	if len(peers) > 0 {
 		update.SetOrder(tgDialogPeers(peers))
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
 		Date:    date,
 		Seq:     0,

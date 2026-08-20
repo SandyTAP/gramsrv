@@ -62,7 +62,7 @@ func (s *ChannelStore) pollChannelMessageTarget(userID, channelID int64, message
 }
 
 // ChannelPollFanoutViews 批量加载一条 poll 消息对一组 viewer 的 per-viewer enrich（与 postgres 同口径，
-// 消除 fan-out 逐 viewer 重载 N+1）：成员/AvailableMinID 可见性复刻 channelAndMemberLocked +
+// 是在线 poll fan-out 的唯一批量投影入口）：成员/AvailableMinID 可见性复刻 channelAndMemberLocked +
 // pollChannelMessageTarget；poll enrich 委托 PollStore.EnrichPollForViewers（模板一次）。bot 历史过滤
 // 在 app 层叠加。Polls：key 存在=已评估；nil=不可见；非 nil=可见 enrich poll。
 func (s *ChannelStore) ChannelPollFanoutViews(_ context.Context, channelID int64, msgID int, viewers []int64, now int) (domain.ChannelPollFanoutViews, error) {

@@ -14,17 +14,17 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func TestAccountUpdateColorPersistsExplicitZeroAndPushesSelfUser(t *testing.T) {
+func TestAccountUpdateColorPersistsExplicitZeroAndQueuesSelfUser(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550003201", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	sessions := &captureSessions{}
 	router := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 
 	color := &tg.PeerColor{}
@@ -44,20 +44,17 @@ func TestAccountUpdateColorPersistsExplicitZeroAndPushesSelfUser(t *testing.T) {
 	assertDomainPeerColor(t, saved.Color, true, 0, 123456)
 	assertTgUserPeerColor(t, tgSelfUser(saved).GetColor, true, 0, 123456)
 
-	snap := sessions.snapshot()
-	if snap.userID != owner.ID {
-		t.Fatalf("push user = %d, want %d", snap.userID, owner.ID)
+	items := delivery.Snapshot()
+	if len(items) != 1 || items[0].TargetUserID != owner.ID {
+		t.Fatalf("delivery rows = %+v, want one row for owner", items)
 	}
-	updates, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", snap.message)
-	}
+	updates := lastQueuedDeliveryUpdates(t, delivery)
 	if len(updates.Users) != 1 {
-		t.Fatalf("pushed users = %d, want 1 self user", len(updates.Users))
+		t.Fatalf("queued users = %d, want 1 self user", len(updates.Users))
 	}
 	pushedUser, ok := updates.Users[0].(*tg.User)
 	if !ok {
-		t.Fatalf("pushed user = %T, want *tg.User", updates.Users[0])
+		t.Fatalf("queued user = %T, want *tg.User", updates.Users[0])
 	}
 	assertTgUserPeerColor(t, pushedUser.GetColor, true, 0, 123456)
 }
@@ -65,12 +62,14 @@ func TestAccountUpdateColorPersistsExplicitZeroAndPushesSelfUser(t *testing.T) {
 func TestAccountUpdateColorProfileSetAndClear(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 12, Phone: "15550003202", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
 	router := New(Config{}, Deps{
-		Users: appusers.NewService(userStore),
+		Users:          appusers.NewService(userStore),
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 
 	color := &tg.PeerColor{}
@@ -116,6 +115,43 @@ func TestAccountUpdateColorRejectsUnsupportedInputs(t *testing.T) {
 	collectible.SetColor(&tg.InputPeerColorCollectible{CollectibleID: 42})
 	if ok, err := router.onAccountUpdateColor(ctx, collectible); ok || !tgerr.Is(err, "COLOR_INVALID") {
 		t.Fatalf("collectible color = ok %v err %v, want COLOR_INVALID", ok, err)
+	}
+}
+
+func TestAccountUpdateColorRequiresUserDeliveryService(t *testing.T) {
+	router := New(Config{}, Deps{}, zaptest.NewLogger(t), clock.System)
+	ctx := WithUserID(context.Background(), 1000000001)
+
+	color := &tg.PeerColor{}
+	color.SetColor(0)
+	req := &tg.AccountUpdateColorRequest{}
+	req.SetColor(color)
+	if ok, err := router.onAccountUpdateColor(ctx, req); ok || err == nil {
+		t.Fatalf("update color without user delivery service = ok %v err %v, want failure", ok, err)
+	}
+}
+
+func TestAccountUpdateColorRequiresDeliveryOutbox(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 13, Phone: "15550003203", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	router := New(Config{}, Deps{
+		Users: appusers.NewService(userStore),
+	}, zaptest.NewLogger(t), clock.System)
+
+	color := &tg.PeerColor{}
+	color.SetColor(0)
+	req := &tg.AccountUpdateColorRequest{}
+	req.SetColor(color)
+	if ok, err := router.onAccountUpdateColor(WithUserID(ctx, owner.ID), req); ok || err == nil {
+		t.Fatalf("update color without delivery outbox = ok %v err %v, want failure", ok, err)
+	}
+	saved, _, _ := userStore.ByID(ctx, owner.ID)
+	if !saved.Color.Empty() {
+		t.Fatalf("color mutated without delivery outbox: %+v", saved.Color)
 	}
 }
 

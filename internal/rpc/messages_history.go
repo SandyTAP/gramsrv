@@ -489,7 +489,7 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 	chats := r.chatsForMessageUpdates(ctx, userID, found)
 	result := &tg.MessagesMessages{
 		Messages: out,
-		Users:    r.usersForMessageUpdates(ctx, userID, found),
+		Users:    r.usersForMessageUpdatesWithPreloaded(ctx, userID, found, r.preloadedMessageUsers(list)),
 		Chats:    chats,
 	}
 	r.applyPeerReadModelsToMessages(ctx, userID, result)
@@ -537,7 +537,7 @@ func (r *Router) onMessagesGetRichMessage(ctx context.Context, req *tg.MessagesG
 	}
 	result := &tg.MessagesMessages{
 		Messages: out,
-		Users:    r.usersForMessageUpdates(ctx, userID, found),
+		Users:    r.usersForMessageUpdatesWithPreloaded(ctx, userID, found, r.preloadedMessageUsers(list)),
 		Chats:    r.chatsForMessageUpdates(ctx, userID, found),
 	}
 	r.applyPeerReadModelsToMessages(ctx, userID, result)

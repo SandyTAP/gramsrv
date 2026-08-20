@@ -95,12 +95,20 @@ func TestMessagesGetOutboxReadDateReturnsDate(t *testing.T) {
 	}
 }
 
-func TestMessagesReadMessageContentsPushesUpdateToOtherSessions(t *testing.T) {
+func TestMessagesReadMessageContentsRequiresReliableDispatch(t *testing.T) {
 	authKeyID := [8]byte{9, 9, 9}
 	messages := &captureMessages{
 		readContentsRes: domain.ReadMessageContentsResult{
 			OwnerUserID: 1000000001,
 			MessageIDs:  []int{7, 8},
+			Event: domain.UpdateEvent{
+				UserID:     1000000001,
+				Type:       domain.UpdateEventReadMessageContents,
+				Pts:        42,
+				PtsCount:   2,
+				Date:       1700000200,
+				MessageIDs: []int{7, 8},
+			},
 		},
 	}
 	sessions := &captureSessions{}
@@ -115,33 +123,18 @@ func TestMessagesReadMessageContentsPushesUpdateToOtherSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("messages.readMessageContents: %v", err)
 	}
-	if affected.Pts != 42 || affected.PtsCount != 0 {
-		t.Fatalf("affected = %+v, want pts=42 pts_count=0", affected)
+	if affected.Pts != 42 || affected.PtsCount != 2 {
+		t.Fatalf("affected = %+v, want pts=42 pts_count=2", affected)
 	}
 	if messages.readContentsReq.OwnerUserID != 1000000001 || !reflect.DeepEqual(messages.readContentsReq.IDs, []int{7, 8}) {
 		t.Fatalf("read contents req = %+v", messages.readContentsReq)
 	}
-	snap := sessions.snapshot()
-	if snap.userID != 1000000001 || snap.sessionID != 55 || snap.messageType != proto.MessageFromServer {
-		t.Fatalf("push target = %+v", snap)
-	}
-	updates, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", snap.message)
-	}
-	if len(updates.Updates) != 1 {
-		t.Fatalf("updates = %+v", updates.Updates)
-	}
-	read, ok := updates.Updates[0].(*tg.UpdateReadMessagesContents)
-	if !ok {
-		t.Fatalf("update = %T, want *tg.UpdateReadMessagesContents", updates.Updates[0])
-	}
-	if !reflect.DeepEqual(read.Messages, []int{7, 8}) || read.Pts != 42 || read.PtsCount != 0 {
-		t.Fatalf("read update = %+v", read)
+	if msg := sessions.lastUserPush(); msg != nil {
+		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
 	}
 }
 
-func TestMessagesReadHistoryMarksDialogRead(t *testing.T) {
+func TestMessagesReadHistoryMarksDialogReadWithoutCoreSessionFallback(t *testing.T) {
 	var authKeyID [8]byte
 	authKeyID[0] = 7
 	messages := &captureMessages{readResult: domain.ReadHistoryResult{
@@ -184,9 +177,8 @@ func TestMessagesReadHistoryMarksDialogRead(t *testing.T) {
 	if got.Pts != 5 || got.PtsCount != 1 {
 		t.Fatalf("affected = %+v, want recorded read-history pts", got)
 	}
-	gotSession := sessions.snapshot()
-	if gotSession.userID != 1000000001 || gotSession.messageType != proto.MessageFromServer {
-		t.Fatalf("push target = user %d type %v, want read update push to other sessions", gotSession.userID, gotSession.messageType)
+	if msg := sessions.lastUserPush(); msg != nil {
+		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
 	}
 }
 
@@ -210,8 +202,7 @@ func TestMessagesReadHistoryWithReliableDispatchPushesCurrentSessionReadUpdate(t
 		},
 	}}
 	updates := &captureUpdates{
-		state:            domain.UpdateState{Pts: 5, Date: 1700000100, Seq: 3},
-		reliableDispatch: true,
+		state: domain.UpdateState{Pts: 5, Date: 1700000100, Seq: 3},
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{Messages: messages, Updates: updates, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
@@ -266,8 +257,7 @@ func TestMessagesReadHistoryAlreadyReadReturnsCurrentStateWithoutEcho(t *testing
 		Changed:          false,
 	}}
 	updates := &captureUpdates{
-		state:            domain.UpdateState{Pts: 7, Date: 1700000101, Seq: 3},
-		reliableDispatch: true,
+		state: domain.UpdateState{Pts: 7, Date: 1700000101, Seq: 3},
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{Messages: messages, Updates: updates, Sessions: sessions}, zaptest.NewLogger(t), clock.System)

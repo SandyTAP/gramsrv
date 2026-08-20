@@ -16,13 +16,22 @@ import (
 // 访问校验（self/bot/拉黑/隐私）在 rpc 层先行；本层做 DH 校验、chat_id wire 不变量、access_hash 分配、
 // 状态机迁移与 qts 队列写入。绑定维度是设备级 perm auth_key（int64）。
 type Service struct {
-	store store.SecretChatStore
-	queue store.EncryptedQueueStore
+	store       store.SecretChatStore
+	stateEvents store.SecretChatStateEventStore
+	queue       store.EncryptedQueueStore
 }
 
 // NewService 创建密聊服务。
 func NewService(st store.SecretChatStore, queue store.EncryptedQueueStore) *Service {
-	return &Service{store: st, queue: queue}
+	stateEvents, _ := st.(store.SecretChatStateEventStore)
+	return &Service{store: st, stateEvents: stateEvents, queue: queue}
+}
+
+func (s *Service) requireStateEventStore() (store.SecretChatStateEventStore, error) {
+	if s.stateEvents == nil {
+		return nil, store.ErrSecretChatStateEventStoreMissing
+	}
+	return s.stateEvents, nil
 }
 
 // RequestEncryption 受理 requestEncryption：校验 g_a → 校验 random_id/chat_id 全局唯一性 → 分配双
@@ -36,6 +45,10 @@ func (s *Service) RequestEncryption(ctx context.Context, req domain.SecretChatRe
 		return domain.SecretChat{}, domain.ErrSecretChatRandomIDDuplicate
 	}
 	ga, err := validateDHParam(req.GA)
+	if err != nil {
+		return domain.SecretChat{}, err
+	}
+	stateEvents, err := s.requireStateEventStore()
 	if err != nil {
 		return domain.SecretChat{}, err
 	}
@@ -71,7 +84,14 @@ func (s *Service) RequestEncryption(ctx context.Context, req domain.SecretChatRe
 		RandomID:              req.RandomID,
 		Date:                  req.Date,
 	}
-	if err := s.store.CreateSecretChat(ctx, chat); err == nil {
+	ev := domain.EncryptedStateEvent{
+		TargetUserID:    chat.ParticipantUserID,
+		TargetAuthKeyID: 0,
+		ChatID:          chat.ID,
+		Type:            domain.EncryptedStateEventEncryption,
+		Date:            chat.Date,
+	}
+	if err := stateEvents.CreateSecretChatWithStateEvent(ctx, chat, ev); err == nil {
 		return chat, nil
 	} else if !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
 		return domain.SecretChat{}, err
@@ -98,8 +118,12 @@ func sameSecretChatRequest(chat domain.SecretChat, req domain.SecretChatRequest,
 // 校验 g_b → 原子 CAS 绑定接受设备并落 g_b/key_fingerprint → normal。返回的密聊由
 // rpc 层投影为 participant 视角 encryptedChat（GAOrB=g_a，同步响应）与 admin 视角
 // encryptedChat（GAOrB=g_b，推送）。
-func (s *Service) AcceptEncryption(ctx context.Context, chatID int, viewerUserID, participantAuthKeyID, accessHash int64, gb []byte, keyFingerprint int64) (domain.SecretChat, error) {
+func (s *Service) AcceptEncryption(ctx context.Context, chatID int, viewerUserID, participantAuthKeyID, accessHash int64, gb []byte, keyFingerprint int64, date int) (domain.SecretChat, error) {
 	gbPadded, err := validateDHParam(gb)
+	if err != nil {
+		return domain.SecretChat{}, err
+	}
+	stateEvents, err := s.requireStateEventStore()
 	if err != nil {
 		return domain.SecretChat{}, err
 	}
@@ -117,13 +141,29 @@ func (s *Service) AcceptEncryption(ctx context.Context, chatID int, viewerUserID
 	case domain.SecretChatStateDiscarded:
 		return domain.SecretChat{}, domain.ErrSecretChatAlreadyDeclined
 	}
-	return s.store.AcceptSecretChat(ctx, chatID, participantAuthKeyID, gbPadded, keyFingerprint)
+	events := []domain.EncryptedStateEvent{
+		{
+			TargetUserID:    chat.AdminUserID,
+			TargetAuthKeyID: chat.AdminAuthKeyID,
+			ChatID:          chatID,
+			Type:            domain.EncryptedStateEventEncryption,
+			Date:            date,
+		},
+		{
+			TargetUserID:    chat.ParticipantUserID,
+			TargetAuthKeyID: 0,
+			ChatID:          chatID,
+			Type:            domain.EncryptedStateEventEncryption,
+			Date:            date,
+		},
+	}
+	return stateEvents.AcceptSecretChatWithStateEvents(ctx, chatID, participantAuthKeyID, gbPadded, keyFingerprint, events)
 }
 
 // DiscardEncryption 受理 discardEncryption：定位 + 参与者/绑定设备校验 → 迁移到 discarded。
 // already=true 表示已是终态（幂等成功）。返回的密聊由 rpc 层投影为对端
 // encryptedChatDiscarded 推送。
-func (s *Service) DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool) (domain.SecretChat, bool, error) {
+func (s *Service) DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool, date int) (domain.SecretChat, bool, error) {
 	chat, ok, err := s.store.GetSecretChat(ctx, chatID)
 	if err != nil {
 		return domain.SecretChat{}, false, err
@@ -140,7 +180,18 @@ func (s *Service) DiscardEncryption(ctx context.Context, chatID int, viewerUserI
 	if boundAuthKeyID == 0 && viewerUserID != chat.ParticipantUserID {
 		return domain.SecretChat{}, false, domain.ErrSecretChatNotFound
 	}
-	return s.store.DiscardSecretChat(ctx, chatID, deleteHistory)
+	stateEvents, err := s.requireStateEventStore()
+	if err != nil {
+		return domain.SecretChat{}, false, err
+	}
+	ev := domain.EncryptedStateEvent{
+		TargetUserID:    chat.PeerOf(viewerUserID),
+		TargetAuthKeyID: chat.PeerAuthKeyOf(viewerUserID),
+		ChatID:          chatID,
+		Type:            domain.EncryptedStateEventEncryption,
+		Date:            date,
+	}
+	return stateEvents.DiscardSecretChatWithStateEvent(ctx, chatID, deleteHistory, ev)
 }
 
 // GetSecretChat 取密聊快照（rpc 层访问校验用）。
@@ -151,11 +202,15 @@ func (s *Service) GetSecretChat(ctx context.Context, chatID int) (domain.SecretC
 // DiscardForAuthKey 级联 discard 绑定该设备 perm auth_key（作为 admin 或 participant）的
 // 全部活跃密聊，用于设备登出 / 授权撤销。返回本次实际从非终态迁移到 discarded 的密聊快照
 // （已是终态的不返回），供 rpc 层据此向对端推送 encryptedChatDiscarded。盲中继：不删历史
-// （history_deleted=false，对端自行决定本地处置）。出错时返回已成功 discard 的部分 + err，
-// 让调用方仍能通知这部分对端（登出/撤销是 best-effort，不因此回退）。
-func (s *Service) DiscardForAuthKey(ctx context.Context, authKeyID int64) ([]domain.SecretChat, error) {
+// （history_deleted=false，对端自行决定本地处置）。出错时返回已成功 discard 的部分 + err；
+// 每个成功迁移的 chat 都已经与对应 state event 同边界提交。
+func (s *Service) DiscardForAuthKey(ctx context.Context, authKeyID, ownerUserID int64, date int) ([]domain.SecretChat, error) {
 	if authKeyID == 0 {
 		return nil, nil
+	}
+	stateEvents, err := s.requireStateEventStore()
+	if err != nil {
+		return nil, err
 	}
 	chats, err := s.store.ListActiveSecretChatsByAuthKey(ctx, authKeyID)
 	if err != nil {
@@ -163,7 +218,18 @@ func (s *Service) DiscardForAuthKey(ctx context.Context, authKeyID int64) ([]dom
 	}
 	var discarded []domain.SecretChat
 	for _, c := range chats {
-		updated, already, derr := s.store.DiscardSecretChat(ctx, c.ID, false)
+		peer := c.PeerOf(ownerUserID)
+		if peer == 0 {
+			continue
+		}
+		ev := domain.EncryptedStateEvent{
+			TargetUserID:    peer,
+			TargetAuthKeyID: c.PeerAuthKeyOf(ownerUserID),
+			ChatID:          c.ID,
+			Type:            domain.EncryptedStateEventEncryption,
+			Date:            date,
+		}
+		updated, already, derr := stateEvents.DiscardSecretChatWithStateEvent(ctx, c.ID, false, ev)
 		if derr != nil {
 			if errors.Is(derr, domain.ErrSecretChatNotFound) {
 				continue
@@ -240,23 +306,6 @@ func (s *Service) AckQueue(ctx context.Context, deviceAuthKeyID int64, maxQts in
 		return nil
 	}
 	return s.queue.AckEncryptedMessages(ctx, deviceAuthKeyID, maxQts)
-}
-
-// RecordEncryptionEvent 写入 durable updateEncryption 状态事件（离线补偿）。
-// targetAuthKeyID=0 表示账号级（建链前邀请/撤回对 target 所有设备可见），非 0 表示
-// 绑定设备定向。投递时按 secret_chats 权威态重建（不固化快照）。
-func (s *Service) RecordEncryptionEvent(ctx context.Context, chatID int, targetUserID, targetAuthKeyID int64, date int) error {
-	if targetUserID == 0 {
-		return nil
-	}
-	_, err := s.queue.AppendStateEvent(ctx, domain.EncryptedStateEvent{
-		TargetUserID:    targetUserID,
-		TargetAuthKeyID: targetAuthKeyID,
-		ChatID:          chatID,
-		Type:            domain.EncryptedStateEventEncryption,
-		Date:            date,
-	})
-	return err
 }
 
 // RecordReadEvent 写入 durable updateEncryptedMessagesRead 状态事件（离线补偿，设备定向）。

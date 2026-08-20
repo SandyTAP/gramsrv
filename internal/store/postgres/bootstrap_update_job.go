@@ -138,7 +138,7 @@ UPDATE bootstrap_update_jobs
 SET status = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'ready' END,
     ready_at = CASE
       WHEN attempts >= $3 THEN ready_at
-      ELSE now() + make_interval(secs => LEAST(60, attempts * attempts))
+      ELSE now()
     END,
     last_error = $2,
     updated_at = now()

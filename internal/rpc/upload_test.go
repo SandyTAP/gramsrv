@@ -57,6 +57,42 @@ func TestUploadGetFileRejectsInvalidRanges(t *testing.T) {
 	}
 }
 
+func TestUploadGetFileHashesReturnsFileDataHashes(t *testing.T) {
+	files := &fakeFiles{
+		getFileHashes: []domain.FileHash{{
+			Offset: 128 << 10,
+			Limit:  7,
+			Hash:   []byte("hash"),
+		}},
+		getFileHashesFound: true,
+	}
+	r := &Router{deps: Deps{Files: files}}
+	hashes, err := r.onUploadGetFileHashes(context.Background(), &tg.UploadGetFileHashesRequest{
+		Location: &tg.InputDocumentFileLocation{ID: 42},
+		Offset:   128 << 10,
+	})
+	if err != nil {
+		t.Fatalf("onUploadGetFileHashes: %v", err)
+	}
+	if files.getFileHashCalls != 1 || files.getFileHashRequest.LocationKey != "doc:42" || files.getFileHashRequest.Offset != 128<<10 {
+		t.Fatalf("hash request = %+v calls=%d", files.getFileHashRequest, files.getFileHashCalls)
+	}
+	if len(hashes) != 1 || hashes[0].Offset != 128<<10 || hashes[0].Limit != 7 || string(hashes[0].Hash) != "hash" {
+		t.Fatalf("hashes = %+v", hashes)
+	}
+}
+
+func TestUploadGetFileHashesRejectsInvalidOffset(t *testing.T) {
+	r := &Router{deps: Deps{Files: &fakeFiles{}}}
+	_, err := r.onUploadGetFileHashes(context.Background(), &tg.UploadGetFileHashesRequest{
+		Location: &tg.InputDocumentFileLocation{ID: 42},
+		Offset:   -1,
+	})
+	if !tgerr.Is(err, "OFFSET_INVALID") {
+		t.Fatalf("err = %v, want OFFSET_INVALID", err)
+	}
+}
+
 func TestFileLocationKeyUsesDocumentID(t *testing.T) {
 	key, ok := fileLocationKey(&tg.InputDocumentFileLocation{
 		ID:        5382305375846410902,

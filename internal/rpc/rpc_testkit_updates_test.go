@@ -17,17 +17,12 @@ type captureUpdates struct {
 	events           []domain.UpdateEvent
 	excludeAuthKeyID [8]byte
 	excludeSessionID int64
-	reliableDispatch bool
 	difference       *domain.UpdateDifference
 	observedRequest  domain.UpdateState
 	observedCalls    int
 	committedState   domain.UpdateState
 	commitMode       domain.UpdateStateCommitMode
 	commitCalls      int
-}
-
-func (s *captureUpdates) UsesReliableDispatch() bool {
-	return s.reliableDispatch
 }
 
 func (s *captureUpdates) GetState(_ context.Context, authKeyID [8]byte, userID int64) (domain.UpdateState, error) {

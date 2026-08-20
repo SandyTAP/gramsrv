@@ -2,28 +2,74 @@
 
 英文版：[configuration.en.md](configuration.en.md)
 
-本文覆盖 `internal/config` 实际读取的全部配置。默认值和校验行为以 `internal/config/config.go` 为权威来源。所有配置修改都需要重启进程；telesrv 当前不支持配置热加载。
+本文覆盖 `internal/config` 实际读取的配置。服务入口现在使用按角色拆分的 YAML：
+`configs/edge.yaml`、`configs/core.yaml`、`configs/egress.yaml`、`configs/file.yaml`、
+`configs/sfu.yaml`、`configs/admin.yaml`。默认值和校验行为以 `internal/config` 下对应 role config Go 文件为权威来源。
+所有配置修改都需要重启进程；telesrv 当前不支持配置热加载。
 
 ## 1. 加载方式、语法与优先级
 
-- `TELESRV_CONFIG` 是选择 env 风格配置文件的**进程环境变量**。默认读取进程工作目录下的 `.env`；显式设为空可关闭文件加载。把它写在配置文件内部不会改变已选定的文件。
-- 优先级为：非空进程环境变量 → 非空文件值 → 代码默认值。四个可空监听项 `TELESRV_DEBUG_ADDR`、`TELESRV_BOT_API_ADDR`、`TELESRV_ADMIN_API_ADDR`、`TELESRV_PUBLIC_LINK_WEB_ADDR` 允许用显式空的进程环境变量覆盖文件中的非空值，从而关闭监听。
-- 文件支持空行、整行 `#` 注释、可选的 `export ` 前缀和 `KEY=VALUE`；支持单引号、双引号。行尾 `#` 不会被当作内联注释剥离。
-- 文件中的键必须以 `TELESRV_` 开头，且只能包含大写 ASCII 字母、数字和下划线。语法合法但当前二进制未知的 `TELESRV_*` 键会被接受但忽略。
-- bool 接受 `1/true/TRUE/True/yes/on` 和 `0/false/FALSE/False/no/off`；列表使用逗号分隔；时长使用 Go 格式，例如 `200ms`、`30s`、`5m`、`168h`。
-- int、float、bool、duration 的非法文本会回退代码默认值；URL、app scheme、app name 以及登录邮箱依赖关系校验失败会阻止启动。
+- `cmd/telesrv-edge|core|egress|file|sfu|admin` 默认分别读取 `configs/<role>.yaml`；也可用
+  `--config <path>` 或进程环境变量 `TELESRV_CONFIG=<path>` 指向自己的 YAML 文件。
+- YAML 使用严格解析：未知字段、非法结构、非法时长都会阻止启动。环境变量不再作为普通字段覆盖
+  YAML；只在 YAML 字符串中通过 `${NAME}` 展开 secret、DSN 或部署平台注入值。
+- `TELESRV_CONFIG` 只选择当前进程的配置文件。不要把它写进 YAML 内部；每个服务的 systemd unit、
+  Docker/Kubernetes 配置或本地启动脚本应分别传入自己的 config path。
+- YAML bool 使用 `true`/`false`；列表使用 YAML sequence；时长字段使用 Go 格式字符串，例如
+  `200ms`、`30s`、`5m`、`168h`。
 - 不要提交真实密码、token、私有 DSN 或 TURN secret。生产环境应使用受保护的 service environment 或密钥管理系统。
+
+代码边界同样按角色拆分：`internal/config/edge_config.go`、`core_config.go`、`egress_config.go`、
+`file_config.go`、`sfu_config.go`、`admin_config.go` 分别定义对应 YAML schema、`Load<Role>()` 和 runtime config
+类型。生产入口和 `internal/node/<role>` 不应再接收全局 `config.Config`；仓库不再提供对外的旧 env 文件入口。
 
 ## 2. MTProto 监听、传输与资源预算
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
-| `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP 监听地址，必须与 patched 客户端可达地址/端口一致。 |
+| `TELESRV_LISTEN` | string / `0.0.0.0:2398` | `cmd/telesrv-edge` 的 MTProto TCP 监听地址，patched 客户端必须能连到它。`cmd/telesrv-core` 不绑定 MTProto listener；不要把 Core 内部地址当作客户端 DC 地址。 |
 | `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | 写入 `help.getConfig.DCOptions`、媒体与通话回退路径的客户端可达 IP。默认 loopback 只适合纯本机 TDesktop；Android、局域网或远端验证必须显式设为宿主机 LAN IP/公网 IP。Windows 本地重启优先用 `scripts\restart-local-server.ps1 -Listen 0.0.0.0:2398 -AdvertiseIP <client-reachable-ip>`，避免手动 `Start-Process` 漏掉环境变量。 |
+| `TELESRV_ADVERTISE_PORT` | TCP port / `TELESRV_LISTEN` 端口 | 写入 `help.getConfig.DCOptions` 的客户端可达端口。`cmd/telesrv-edge` 默认跟随 `TELESRV_LISTEN`；`cmd/telesrv-core` 必须显式设为 Edge 对外端口，禁止把 Core 内部地址下发给客户端。 |
 | `TELESRV_RSA_KEY` | path / `data/server_rsa.pem` | MTProto RSA 私钥；缺失时自动生成。属于敏感文件，重启和升级间必须稳定保存。 |
 | `TELESRV_DC` | positive TL int32 / `2` | 服务端输出配置、媒体/DC 元数据和 `channelFull.stats_dc` 使用的规范 DC ID；必须在 `1..2147483647`，否则启动失败。当前单后端不会按它分区密钥交换状态。 |
 | `TELESRV_DEFAULT_COUNTRY_CODE` | ISO alpha-2 / `CN` | `help.getNearestDc` 返回的登录页默认国家。客户端把 `CN` 映射为国际区号 `+86`、`US` 映射为 `+1`。输入会 trim、转大写并校验为国家或自治地区；格式错误或未知值会让启动失败。 |
 | `TELESRV_STRICT_DC_CHECK` | bool / `false` | 默认 `false`，永久与临时密钥交换接受任意 wire int32 DC 标签。设为 `true` 时永久标签必须等于 `TELESRV_DC`、临时标签绝对值必须等于 `TELESRV_DC`；它仅是诊断开关，不提供多 DC 隔离。 |
+| `TELESRV_INSTANCE_ID` | string / 空 | 当前进程在 Edge/Core 控制、Redis 在线位置索引与 pub/sub 去重中的实例标识。空值由进程启动时按 hostname/pid/time 生成；多实例部署建议显式配置稳定、唯一的值。 |
+| `TELESRV_EDGE_LOCATION_TTL` | duration / `90s` | Edge 在线位置与 active raw-key lease 写入 Redis 的 TTL。必须大于零，并且大于心跳间隔；Core orphan-auth-key GC 读取该分布式 lease snapshot，读取失败会跳过删除。 |
+| `TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL` | duration / `30s` | 当前进程刷新在线 session 位置快照的周期。必须大于零且小于 `TELESRV_EDGE_LOCATION_TTL`。 |
+| `TELESRV_GROUPCALL_CONTROL_ADDR` | address / 空 | Core 接收独立 SFU 媒体活性回报的内部 HTTP 监听地址；`cmd/telesrv-core` 必须配置。 |
+| `TELESRV_GROUPCALL_CONTROL_URL` | URL / 空 | 独立 `telesrv-sfu` 调用 Core groupcall control API 的内部 URL。 |
+| `TELESRV_GROUPCALL_CONTROL_TOKEN` | secret string / 空 | groupcall control API bearer token；Core 与独立 SFU 必须一致。`cmd/telesrv-core` 与独立 `cmd/telesrv-sfu` 都必须显式配置非空值。 |
+| `TELESRV_CORE_EXEC_GRPC_ADDR` | address / 空 | `cmd/telesrv-core` 暴露生产 CoreExec gRPC API 的内部监听地址。Core 入口必须配置此项。 |
+| `TELESRV_CORE_EXEC_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> CoreExec gRPC 服务发现 provider。`static` 从 `TELESRV_CORE_EXEC_GRPC_TARGETS` 读取逗号分隔 endpoint 列表；`dns` 只读取一个 target：可以是裸 `host:port` 服务名，也可以是显式 gRPC DNS URI，例如 `dns:///telesrv-core.default.svc.cluster.local:2500`，或用于本地 canary 的 `dns://127.0.0.1:5353/coreexec.test:2500`。DNS mode 交给 gRPC DNS resolver 展开 A/AAAA 记录，适合 Kubernetes Service/headless DNS，且不需要新增 Consul/etcd/Nacos。非法值会阻止启动。 |
+| `TELESRV_CORE_EXEC_GRPC_TARGETS` | resolver target(s) / 空 | `cmd/telesrv-edge` 必填的 CoreExec gRPC endpoint 输入。`static` 下每项必须是裸 `host:port`，端口必须是 `1..65535` 数字，URL scheme 会被拒绝，允许逗号分隔多个 endpoint 并去重；IPv6 必须使用 `[::1]:2440` 这类 bracket 形式。`dns` 下只允许一个 target：裸 `host:port` 会被归一为 `dns:///host:port`，显式 `dns:///name:port` / `dns://authority:port/name:port` URI 也允许；多 Core 地址必须由 DNS 记录返回，不能在 env 中逗号拼接。gRPC client 使用 bearer token、启动 unary health + `GetInfo` 协议版本/能力/实例 ID 握手、`round_robin`，并在 service config 中启用 gRPC client-side health checking；NOT_SERVING Core 不进入 dispatch picker。gRPC 自动 retry 显式关闭；transport timeout/unavailable 会分类到 metrics/log，Edge 侧 gRPC status 错误日志会携带 request_id、operation 与 outcome，但 request_id 不进入 metrics label；Edge 只保留私有 TL admission shell 做 profile 校验和 raw wire 捕获，CoreExec 不可用时没有本地业务 dispatch fallback；业务重放必须经 RPC execution/outbox 语义确认。不能只用单个写死 Core 地址作为生产门禁。 |
+| `TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Edge -> CoreExec gRPC unary 调用默认 deadline；仅当上游 ctx 没有 deadline 时补上。必须大于 `0` 且不超过 `1m`。覆盖 dispatch、profile evidence、initConnection observer 与 replay commit，避免 Core 故障时 Edge 执行槽无界挂住。 |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE` / `TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE` | path / 空 | CoreExec gRPC server TLS 证书与私钥；二者必须同时配置。为空时保持本地/开发默认明文 gRPC。 |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | CoreExec gRPC server 用于验证 Edge client certificate 的 CA bundle；配置后启用 mTLS，并要求 server TLS cert/key 同时配置。 |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CA_FILE` | path / 空 | Edge gRPC client 信任 Core server certificate 的 root CA bundle；配置后客户端使用 TLS。 |
+| `TELESRV_CORE_EXEC_GRPC_TLS_SERVER_NAME` | string / 空 | Edge gRPC client 校验 Core server certificate 时使用的 server name；静态 target 是 IP 或 LB 地址但证书签给内部 DNS 名时应配置。非空也会启用 TLS。 |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge gRPC client certificate 与私钥；二者必须同时配置。与 server 的 `TLS_CLIENT_CA_FILE` 配套时形成 mTLS。 |
+| `TELESRV_CORE_EXEC_TOKEN` | secret string / 空 | CoreExec gRPC API bearer token；`cmd/telesrv-core` 与 `cmd/telesrv-edge` 都必须显式配置非空值，client 与 server 必须一致，且值不得包含换行。当前 gRPC 通道已支持静态多 endpoint 与 DNS resolver provider；后续可替换为 Envoy/xDS、Consul provider。当前不要配置独立 Consul/etcd/Nacos 组件来“提前解决”CoreExec 服务发现；该能力应保持在可替换 resolver 抽象里。Redis 仍只承担 Edge 在线位置、push/control ACK、短状态和 SFU owner，不作为 CoreExec 普通服务发现。 |
+| `TELESRV_FILE_GRPC_ADDR` | address / 空 | 独立 `cmd/telesrv-file` 暴露 FileData gRPC API 的内部监听地址。File 入口必须配置此项。 |
+| `TELESRV_FILE_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge/Core -> FileData gRPC 服务发现 provider。规则与 CoreExec resolver 相同：`static` 读取逗号分隔 `host:port` endpoint，`dns` 只读取一个裸 `host:port` 或显式 `dns:///name:port` / `dns://authority:port/name:port` target。非法值阻止启动。 |
+| `TELESRV_FILE_GRPC_TARGETS` | resolver target(s) / 空 | `cmd/telesrv-edge` 与 `cmd/telesrv-core` 必填的 FileData gRPC endpoint 输入。Edge 在打开 MTProto listener 前、Core 在暴露 CoreExec 前都会执行 health + `GetInfo` 握手；不可达、token 错误、协议版本不兼容或 FileData 后端不健康都会 fail fast。 |
+| `TELESRV_FILE_GRPC_REQUEST_TIMEOUT` | duration / `10s` | Edge/Core -> FileData gRPC 调用默认 deadline；仅当上游 ctx 没有 deadline 时补上。必须大于 `0` 且不超过 `1m`。覆盖上传分片、静态 range download、blob put/get 与 upload parts materialize。 |
+| `TELESRV_FILE_GRPC_TLS_CERT_FILE` / `TELESRV_FILE_GRPC_TLS_KEY_FILE` | path / 空 | FileData gRPC server TLS 证书与私钥；二者必须同时配置。为空时保持本地/开发默认明文 gRPC。 |
+| `TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | FileData gRPC server 用于验证 Edge/Core client certificate 的 CA bundle；配置后启用 mTLS，并要求 server TLS cert/key 同时配置。 |
+| `TELESRV_FILE_GRPC_TLS_CA_FILE` | path / 空 | Edge/Core gRPC client 信任 FileData server certificate 的 root CA bundle；配置后客户端使用 TLS。 |
+| `TELESRV_FILE_GRPC_TLS_SERVER_NAME` | string / 空 | Edge/Core gRPC client 校验 FileData server certificate 时使用的 server name；非空也会启用 TLS。 |
+| `TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge/Core 调用 FileData gRPC 时使用的 client certificate 与私钥；二者必须同时配置。 |
+| `TELESRV_FILE_TOKEN` | secret string / 空 | FileData gRPC API bearer token；`cmd/telesrv-file`、`cmd/telesrv-edge` 与 `cmd/telesrv-core` 都必须显式配置非空值，且不得包含换行。FileData 只承接上传分片、静态 blob range 和 materialize 数据面，不是消息/媒体权限权威。 |
+| `TELESRV_EGRESS_ACK_GRPC_ADDR` | address / 空 | `cmd/telesrv-egress` 暴露 late client ACK 写回 API 的内部监听地址。Egress 入口必须配置此项；Edge fabric 服务级确认已足够推进 online outbox，该 API 只用于 indeterminate 写出后的迟到 `msgs_ack`，并同时支持 PTS `dispatch_outbox` 与 non-PTS `edge_delivery_outbox`（后者使用 `pts=0` fence）。 |
+| `TELESRV_EGRESS_ACK_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> Egress ACK gRPC 服务发现 provider。规则与 CoreExec resolver 相同：`static` 读取逗号分隔 `host:port` endpoint，`dns` 只读取一个裸 `host:port` 或显式 `dns:///name:port` / `dns://authority:port/name:port` target。非法值阻止启动。 |
+| `TELESRV_EGRESS_ACK_GRPC_TARGETS` | resolver target(s) / 空 | `cmd/telesrv-edge` 必填的 Egress ACK gRPC endpoint 输入。Edge 在发布 MTProto listener 前会执行 health + `GetInfo` 握手；不可达、token 错误或协议版本不兼容都会 fail fast，避免客户端连接到无法推进 PTS outbox 或 non-PTS delivery queue ACK 的 Edge。 |
+| `TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Edge -> Egress ACK gRPC unary 调用默认 deadline；仅当上游 ctx 没有 deadline 时补上。必须大于 `0` 且不超过 `1m`。 |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE` | path / 空 | Egress ACK gRPC server TLS 证书与私钥；二者必须同时配置。为空时保持本地/开发默认明文 gRPC。 |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | Egress ACK gRPC server 用于验证 Edge client certificate 的 CA bundle；配置后启用 mTLS，并要求 server TLS cert/key 同时配置。 |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE` | path / 空 | Edge gRPC client 信任 Egress ACK server certificate 的 root CA bundle；配置后客户端使用 TLS。 |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME` | string / 空 | Edge gRPC client 校验 Egress ACK server certificate 时使用的 server name；非空也会启用 TLS。 |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge 调用 Egress ACK gRPC 时使用的 client certificate 与私钥；二者必须同时配置。 |
+| `TELESRV_EGRESS_ACK_TOKEN` | secret string / 空 | Egress ACK gRPC API bearer token；`cmd/telesrv-edge` 与 `cmd/telesrv-egress` 都必须显式配置非空值，且不得包含换行。 |
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | 在 MTProto 监听端口启用 MTProto-over-WebSocket 分流。 |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | 浏览器 WebSocket origin 白名单；`*` 只用于临时调试。 |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | 全局物理连接 admission 上限；负数关闭该门禁。 |
@@ -83,7 +129,7 @@ live expanded buffer 释放后会归还进程内存，但不会返还该 frame �
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / 空 | 多服务客户端可选的 host-based 根，例如 `owpg://example.com`。配置后生成 `owpg://example.com/oauth`、`owpg://example.com/<username>` 等；只允许精确 `<custom-scheme>://<host>`，禁止端口、path、query、fragment。`TELESRV_PUBLIC_APP_SCHEME` 仍作为旧链接输入兼容。 |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | username 页面 Web 客户端入口，校验规则同 `TELESRV_PUBLIC_BASE_URL`。 |
 | `TELESRV_PUBLIC_APP_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | 公开落地页产品名；trim 后非空、无控制字符、最多 64 个 Unicode 字符。 |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / 空 | 只读 username/avatar/sticker/emoji/chatlist/collectible gift 落地页监听；空值关闭。生产应 loopback + nginx 精确反代；`.env.example` 为开发启用 `127.0.0.1:2401`。 |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / 空 | 只读 username/avatar/sticker/emoji/chatlist/collectible gift 落地页监听；空值关闭。生产应 loopback + nginx 精确反代；本地可在 `configs/core.yaml` 中启用 `127.0.0.1:2401`。 |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | 在 `TELESRV_PUBLIC_LINK_WEB_ADDR` 上挂载自建 Telegram Login/OIDC Provider；启用时必须同时配置该 listener 与下列全部密钥文件。 |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | 绝对 origin URL / `TELESRV_PUBLIC_BASE_URL` | discovery 与 token 使用的精确公开 issuer；默认必须 HTTPS，禁止 path、credentials、query、fragment。开启下一项后可直接配置任意 HTTP 域名/IP。 |
 | `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP` | bool / `false` | 开启后允许任意合法 HTTP issuer、BotFather Web origin、redirect URI 和 native HTTP callback，不限制为 loopback，也不限制 IP 网段或端口。关闭时这些 Web URL 仍必须 HTTPS。 |
@@ -502,6 +548,9 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 |---|---|---|
 | `TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Router temp→perm auth-key binding 缓存容量。 |
 | `TELESRV_TEMP_KEY_CACHE_TTL` | duration / `30m` | 复核周期；正常写入由 bind/revoke 精确失效，TTL 兜底跨进程/异常路径。 |
+| `TELESRV_AUTH_USER_CACHE_TTL` | duration / `1m` | 正向 auth-key→user 授权缓存复核周期。写侧 Redis invalidation 仍是主路径；TTL 用于限制跨 Core 失效/控制消息遗漏后的旧授权陈旧窗口。`<=0` 关闭 TTL 兜底。 |
+| `TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Edge raw auth-key 热缓存容量。Edge 不连接 PostgreSQL；CoreExec/PG 是 auth key 权威，Edge 只缓存 key material、server salt 和 expiry，不缓存 Layer/client metadata。必须大于 `0`。 |
+| `TELESRV_AUTH_KEY_CACHE_TTL` | duration / `30m` | Edge auth-key 热缓存资源 TTL；只用于限制内存占用。`destroy_auth_key` 通过 Core 发布 Redis 失效事件并关闭 raw-key sessions，正确性不依赖 TTL。必须为 `(0,24h]`。 |
 | `TELESRV_CHANNEL_ROW_CACHE_MAX` | int / `50000` | 共享 channel row 缓存容量；`<=0` 同时关闭缓存及 LISTEN/NOTIFY listener。 |
 | `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `100000` | channel member/access read-model 缓存容量；`<=0` 关闭。 |
 | `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `100000` | viewer/channel dialog 投影缓存容量；`<=0` 关闭。 |
@@ -512,13 +561,12 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
-| `TELESRV_OUTBOX_WORKERS` | int / `4` | 并发 outbox worker 数；稳定逻辑分片保持单用户 pts 顺序。 |
-| `TELESRV_OUTBOX_BATCH` | int / `100` | 每次 poll 最大 claim 行数；增大提高吞吐，也增加 DB/推送突发。 |
-| `TELESRV_OUTBOX_INTERVAL` | duration / `200ms` | 两次 outbox claim 之间的等待。 |
-| `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | `dispatching` 行可被重新 claim 的超时；必须大于最坏单批投递耗时。 |
+| `TELESRV_OUTBOX_WORKERS` | int / `4` | `cmd/telesrv-egress` 并发 outbox worker 数；稳定逻辑分片保持 PTS `dispatch_outbox` 与 non-PTS `edge_delivery_outbox` 的单用户队头顺序。 |
+| `TELESRV_OUTBOX_BATCH` | int / `100` | `cmd/telesrv-egress` 每批最大 claim 行数；增大提高吞吐，也增加 DB/推送突发。 |
+| `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | `dispatching` 行可被其它 Egress 重新 claim 的超时；必须大于最坏单批投递耗时。 |
 | `TELESRV_OUTBOX_POISON_RETENTION` | duration / `1m` | terminal failed 投递头的排障保留窗口；durable update 仍可经 difference 恢复。 |
 | `TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL` | duration / `15s` | terminal failed head 清理周期，独立于大表 retention。 |
-| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | best-effort 在线 update 入队最长等待。 |
+| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | Egress 等待 Edge 确认在线 update 入队的最长时间；超时视为未确认投递，保留 durable outbox 等待 lease/reclaim。 |
 | `TELESRV_SEND_RATE_LIMIT` | int / `30` | 单账号每发送窗口允许的消息数；`<=0` 关闭。 |
 | `TELESRV_SEND_RATE_WINDOW` | duration / `1m` | 发送限流窗口。 |
 | `TELESRV_CATCHUP_RATE_LIMIT` | int / `0` | 单用户每窗口 difference/catch-up RPC 数；`<=0` 关闭。 |
@@ -633,9 +681,23 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | relay 分配端口范围上界（含），不得小于下界，防火墙需放行整个范围。 |
 | `TELESRV_CALL_TURN_CREDENTIAL_TTL` | duration / `6h` | 按通话签发的 TURN credential 有效期。 |
 | `TELESRV_CALL_FORCE_RELAY` | bool / `false` | 强制 `p2p_allowed=false`，用于验证 TURN relay 路径。 |
-| `TELESRV_SFU_ENABLE` | bool / `true` | 启用内嵌群通话媒体转发；false 保留仅信令 M0 模式。 |
 | `TELESRV_SFU_UDP_PORT` | int / `12399` | Pion ICE UDPMux 端口，必须放行防火墙。 |
 | `TELESRV_SFU_ADVERTISE_IP` | string / 空 | 下发给客户端的 ICE candidate IP；空值回退 `TELESRV_ADVERTISE_IP`，loopback 会静默破坏真机媒体。 |
+| `TELESRV_SFU_OWNER_TTL` | duration / `2m` | `callID -> sfu instance` owner 租约 TTL；多 SFU 下同一 call 必须粘同一 owner。 |
+| `TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL` | duration / `30s` | 独立 SFU active room 刷新 owner 租约的周期，必须小于 owner TTL。 |
+| `TELESRV_SFU_INSTANCE_TTL` | duration / `90s` | 可用 SFU 媒体实例注册到 Redis 的 TTL；Core 只会选择未过期实例，并在选择前通过 gRPC health + `GetInfo.instance_id` 探测候选 control。 |
+| `TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL` | duration / `30s` | `telesrv-sfu` 刷新 instance registry 的周期，必须小于 instance TTL。 |
+| `TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT` | duration / `1s` | Core remote owner selector 对单个候选 SFU gRPC control 健康探测的上限；超时仅视为该候选不可用并继续检查其它未满载实例，避免 Redis TTL 窗口内的半故障 SFU 阻塞 join。 |
+| `TELESRV_SFU_INSTANCE_MAX_ACTIVE_CALLS` | int / `0` | 单个 SFU instance 可承载的 active call 上限；`0` 表示不限制。heartbeat 会发布当前 active call 数，Core remote owner selector 跳过已满实例和健康探测失败实例，并在可用实例中优先选择低负载者。 |
+| `TELESRV_SFU_CONTROL_GRPC_ADDR` | address / 空 | 独立 `cmd/telesrv-sfu` 暴露 SFU owner-control gRPC API 的内部监听地址；`cmd/telesrv-sfu` 必须配置。 |
+| `TELESRV_SFU_CONTROL_GRPC_URL` | gRPC target / 空 | 写入 SFU instance/owner record 的可达 gRPC control 地址；为空回退 `TELESRV_SFU_CONTROL_GRPC_ADDR`。可用裸 `host:port` 或 `grpc://host:port`。 |
+| `TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Core -> SFU gRPC control unary 调用默认 deadline；必须大于 `0` 且不超过 `1m`。 |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE` / `TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE` | path / 空 | SFU gRPC control server TLS 证书与私钥；二者必须同时配置。 |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | SFU gRPC control server 信任的 client CA；配置后要求并验证 Core/probe client certificate，必须同时配置 server cert/key。 |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CA_FILE` | path / 空 | Core/probe 调 SFU gRPC control 时信任的 root CA bundle。 |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_SERVER_NAME` | string / 空 | Core/probe gRPC client 校验 SFU control server 证书时使用的 server name。 |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Core/probe 调 SFU gRPC control 时使用的 client certificate；二者必须同时配置，配合 `*_CLIENT_CA_FILE` 启用 mTLS。 |
+| `TELESRV_SFU_CONTROL_TOKEN` | secret string / 空 | SFU control API bearer token；非空时远端 client 必须使用同一值。独立 `cmd/telesrv-sfu` 必须显式配置非空值，避免生产媒体控制面无鉴权启动。 |
 | `TELESRV_LIVESTREAM_ENABLE` | bool / `true` | 启用频道 RTMP ingest 与 ffmpeg 切段。 |
 | `TELESRV_LIVESTREAM_RTMP_ADDR` | address / `:2400` | RTMP ingest TCP 监听地址。 |
 | `TELESRV_LIVESTREAM_RTMP_URL` | URL string / 空 | 返回 OBS 的服务器地址；空值派生 `rtmp://<AdvertiseIP>:2400/live`。 |
@@ -645,4 +707,4 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 
 ## 12. 生产部署最低检查清单
 
-生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。
+生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。

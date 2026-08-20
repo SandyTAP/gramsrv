@@ -7,7 +7,7 @@ practical community server.
 
 The protocol stack is built on the published
 [`github.com/iamxvbaba/td`](https://github.com/iamxvbaba/td) module
-(`v1.1.0`), using a canonical Layer 228 schema with sparse `tlprofile`
+(`v1.2.1`), using a canonical Layer 228 schema with sparse `tlprofile`
 exact Layer 225-228 compatibility profiles.
 
 If you are looking for a **Telegram server**, **MTProto server**,
@@ -47,7 +47,7 @@ Telegram-compatible servers.
 
 | Status | Trait | What it means |
 |---|---|---|
-| ✅ | One program startup | One Go binary prepares RSA keys, runs migrations, seeds data, opens MTProto, serves RPC handlers, dispatches updates, and starts workers. |
+| ✅ | Split production runtime | Edge owns MTProto connections, Core executes business RPCs, Egress delivers durable updates, FileData serves media bytes, and the standalone SFU owns realtime media rooms. |
 | ✅ | Fully open server code | Protocol edge, domain services, storage, compatibility handlers, media, updates, admin surfaces, and experiments are all in this repository. |
 
 ## Feature Checklist
@@ -72,7 +72,7 @@ codebase.
 | ✅ | Gifts and stars | Dynamic star gift catalog, admin import tools, collectible/unique gift upgrade flows, prepaid upgrade tracking, and local stars ledger foundations. |
 | ✅ | Premium with Stars | Built-in `@premiumbot`, native Layer 228 self/gift invoices, atomic Stars settlement, expiring entitlements, refunds, and Bot API `giftPremiumSubscription`. See [docs/premium-stars.md](docs/premium-stars.md). |
 | ✅ | Bots and mini apps | Bot service foundations, callbacks, inline helpers, webview/mini-app paths, a minimal Bot API gateway for libraries such as `python-telegram-bot`, persistent `getUpdates` delivery, and demo tools. |
-| ✅ | Calls and live streams | Private call signaling foundations, group call state, RTMP live streaming, scheduled video chats, channel `join_as`, SFU/TURN building blocks, liveness, and expiry workers. |
+| ✅ | Calls and live streams | Private call signaling foundations, group call state, RTMP live streaming, scheduled video chats, channel `join_as`, standalone SFU ownership, liveness, and expiry workers. |
 | ✅ | Admin and operations | Admin API/UI backend, PostgreSQL migrations, Redis volatile state, retention workers, pprof/debug hooks, and load-test helpers. |
 | ✅ | Desktop, Android, iOS, and Web focus | Telegram Desktop is the primary target, with Android, iOS, and Web compatibility paths actively covered by the same server. |
 | ✅ | Native client updates | Separate update/CDN service, TDesktop `/current4` plus signed package delivery, and localized `help.getAppUpdate` for Android/iOS. See [docs/update-service.md](docs/update-service.md). |
@@ -95,69 +95,58 @@ Start PostgreSQL and Redis:
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-Build and run the single server program:
-
-Windows (PowerShell):
+Build the split runtime entrypoints:
 
 ```powershell
-go build -o bin/gramsrv.exe ./cmd/telesrv
-.\bin\gramsrv.exe
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin/gramsrv-file.exe ./cmd/telesrv-file
+go build -o bin/gramsrv-core.exe ./cmd/telesrv-core
+go build -o bin/gramsrv-egress.exe ./cmd/telesrv-egress
+go build -o bin/gramsrv-sfu.exe ./cmd/telesrv-sfu
+go build -o bin/gramsrv-edge.exe ./cmd/telesrv-edge
 ```
 
-Linux / macOS:
+The checked-in local YAML examples use PostgreSQL and Redis from the Compose
+stack above. Set the secrets referenced by those YAML files:
 
-```bash
-go build -o bin/gramsrv ./cmd/telesrv
-./bin/gramsrv
+```powershell
+$env:TELESRV_POSTGRES_DSN="postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable"
+$env:TELESRV_CORE_EXEC_TOKEN="dev-coreexec-token"
+$env:TELESRV_FILE_TOKEN="dev-file-token"
+$env:TELESRV_EGRESS_ACK_TOKEN="dev-egress-ack-token"
+$env:TELESRV_GROUPCALL_CONTROL_TOKEN="dev-groupcall-control-token"
+$env:TELESRV_SFU_CONTROL_TOKEN="dev-sfu-control-token"
 ```
 
-On first start, `gramsrv` creates `data/server_rsa.pem`, applies database
-migrations, seeds bundled language packs, prepares optional media resources,
-starts MTProto on `0.0.0.0:2398`, and brings up the update/media/background
-workers in the same process.
+Start FileData, Core, Egress, SFU, and Edge in separate shells, with the same
+environment values in each shell:
 
-Useful local environment variables:
+```powershell
+.\bin\gramsrv-file.exe --config configs\examples\file.local.yaml
+.\bin\gramsrv-core.exe --config configs\examples\core.local.yaml
+.\bin\gramsrv-egress.exe --config configs\examples\egress.local.yaml
+.\bin\gramsrv-sfu.exe --config configs\examples\sfu.local.yaml
+.\bin\gramsrv-edge.exe --config configs\examples\edge.local.yaml
+```
 
-See the complete [English configuration reference](docs/configuration.en.md) or
-the [Chinese configuration reference](docs/configuration.zh-CN.md). `.env.example`
-is a copyable development template, not an exhaustive parameter dictionary.
+On first Core start, `gramsrv` creates `data/server_rsa.pem`, applies database
+migrations, and seeds bundled language packs. FileData owns upload parts and
+blob range reads, Edge owns the MTProto listener (`0.0.0.0:2398` in the local
+example), Egress owns durable PTS and non-PTS delivery queues, and SFU owns
+group-call media rooms. There is no single-process business fallback in v2.
 
-| Variable | Default | Meaning |
-|---|---:|---|
-| `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto listen address |
-| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | client-reachable fallback IP for media and calls |
-| `TELESRV_DC` | `2` | self-hosted DC id |
-| `TELESRV_DEV_AUTH_CODE` | `12345` | fixed login code for local development |
-| `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | `5` | wrong-code attempts before the code hash is deleted |
-| `TELESRV_LOGIN_EMAIL_ENABLE` | `false` | send login codes to confirmed login email addresses through SMTP |
-| `TELESRV_LOGIN_EMAIL_REQUIRE_SETUP` | `false` | force phone login/registration to set a login email first |
-| `TELESRV_SMTP_HOST` | empty | SMTP host used when login email verification is enabled |
-| `TELESRV_PUBLIC_BASE_URL` | `https://telesrv.net` | canonical external base URL for username, sticker, emoji, and chatlist links |
-| `TELESRV_PUBLIC_APP_SCHEME` | `telesrv` | custom URL scheme opened by public landing pages |
-| `TELESRV_PUBLIC_WEB_BASE_URL` | `https://web.telesrv.net` | Web client base URL shown on public landing pages |
-| `TELESRV_PUBLIC_APP_NAME` | `telesrv` | display product name for public landing pages |
-| `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL connection string |
-| `TELESRV_REDIS_ADDR` | `127.0.0.1:6399` | Redis address |
-| `TELESRV_LANGPACK_SEED_DIR` | `data/langpack` | bundled language pack seed directory |
-| `TELESRV_BLOB_DIR` | `data/blobs` | local media blob directory |
-| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | optional sticker/reaction seed directory |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | empty | optional public link landing listener, for example `127.0.0.1:2401` |
-| `TELESRV_BOT_API_ADDR` | empty | optional HTTP Bot API gateway listen address, for example `127.0.0.1:8081` |
-| `TELESRV_BOT_API_UPDATE_RETENTION` | `24h` | retention window for unconfirmed Bot API `getUpdates` queue entries |
-| `TELESRV_AI_ENABLED` | `true` | enable AI compose entry points |
-| `TELESRV_AI_PROVIDERS` | `local` | ordered AI provider chain, such as `local` or `kimi,local` |
-| `TELESRV_AI_TIMEOUT` | `15s` | per AI provider call timeout |
-| `TELESRV_AI_RATE_LIMIT` | `20` | per-account AI compose request budget |
-| `TELESRV_AI_RATE_WINDOW` | `1m` | AI compose rate-limit window |
-| `TELESRV_AI_LOG_CONTENT` | `false` | whether logs may include prompt/generated text |
-| `TELESRV_TRANSLATION_ENABLED` | `true` | enable Telegram message translation RPCs |
-| `TELESRV_TRANSLATION_PROVIDERS` | empty | optional subset of configured remote AI providers for translation |
-| `TELESRV_TRANSLATION_RATE_LIMIT` | `60` | per-account translated text item budget |
-| `TELESRV_BUSINESS_AI_PROVIDER` | `echo` | Business automation reply provider |
+On Windows, the local orchestration helper can build and start all five roles:
 
-The optional sticker seed directory is skipped when it does not exist.
-Optional OpenAI-compatible, Kimi/Moonshot, Gemini, and Anthropic provider
-variables are documented in `.env.example`.
+```powershell
+.\scripts\restart-local-microservices.ps1 -AdvertiseIP 127.0.0.1
+```
+
+Production entrypoints use one YAML file per process. Pass it with
+`--config <path>` or `TELESRV_CONFIG=<path>`. Environment variables are expanded
+only from YAML strings such as `${TELESRV_POSTGRES_DSN}`; they are not generic
+overrides for every configuration field. See the complete
+[English configuration reference](docs/configuration.en.md) or
+[Chinese configuration reference](docs/configuration.zh-CN.md).
 
 ## Public Deployment Ports
 
@@ -174,7 +163,7 @@ to the features you enable.
 
 | Port | Protocol | Purpose | Notes |
 |---|---|---|---|
-| 2399 | TCP | Admin REST API | Restrict to trusted IPs or put behind VPN |
+| 2599 | TCP | Admin REST API | Restrict to trusted IPs or put behind VPN |
 | 2600 | TCP | Admin Web UI | Use Nginx/reverse proxy + HTTPS in production |
 
 ### Optional feature ports
@@ -192,7 +181,12 @@ to the features you enable.
 
 | Port | Default bind | Purpose |
 |---|---|---|
-| 6060 | `127.0.0.1:6060` | pprof debugging endpoint |
+| 2420 | `127.0.0.1:2420` | Core group-call control callback |
+| 2440 | `127.0.0.1:2440` | CoreExec gRPC |
+| 2450 | `127.0.0.1:2450` | SFU control gRPC |
+| 2510 | `127.0.0.1:2510` | Egress ACK gRPC |
+| 2520 | `127.0.0.1:2520` | FileData gRPC |
+| 6060-6064 | loopback | per-role pprof/debug endpoints |
 | 5432 | `127.0.0.1:5432` | PostgreSQL |
 | 6399 | `127.0.0.1:6399` | Redis |
 
@@ -283,8 +277,13 @@ Recommended checks:
 ## Repository Layout
 
 ```text
-cmd/telesrv/              server entrypoint
+cmd/telesrv-edge/         MTProto long-connection Edge
+cmd/telesrv-core/         business RPC and CoreExec gRPC
+cmd/telesrv-egress/       durable update delivery
+cmd/telesrv-file/         file data-plane service
+cmd/telesrv-sfu/          standalone realtime media owner
 cmd/telesrv-admin/        admin backend and web UI
+configs/examples/         local per-role YAML examples
 deploy/                   docker-compose, migrations, deploy helpers
 data/                     bundled language packs and optional seed data
 internal/mtprotoedge/     MTProto transport, auth key, session, ack/resend
@@ -293,7 +292,7 @@ internal/app/             domain services
 internal/domain/          protocol-independent domain models
 internal/store/           memory/postgres/redis storage backends
 internal/seed/            bundled seed catalog loaders
-internal/sfu/             real-time SFU experiments
+internal/sfu/             standalone SFU control and ownership
 internal/turnsrv/         TURN/STUN building blocks
 ```
 
@@ -314,7 +313,7 @@ and send focused improvements. Helpful contributions include:
   and channel behavior.
 - Performance work on hot paths such as fan-out, pagination, storage queries,
   media upload/download, and connection handling.
-- Setup improvements that make the one-program local experience smoother.
+- Setup improvements that make the split local runtime easier to operate.
 
 If a change affects visible client behavior, please include the client
 version/commit, the RPC path you tested, and whether server logs stayed free of

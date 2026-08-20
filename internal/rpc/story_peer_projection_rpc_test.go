@@ -14,6 +14,7 @@ import (
 	appstories "telesrv/internal/app/stories"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/egress"
 	"telesrv/internal/store/memory"
 )
 
@@ -1275,7 +1276,7 @@ func TestBuildOutboxStoryUpdatesHydratesCompanionPeersWithStoriesMaxID(t *testin
 		Usernames: registry,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000300, 0)})
 
-	updates := r.BuildOutboxUpdates(ctx, []OutboxUpdateRequest{{
+	updates, err := r.buildOutboxUpdates(ctx, []egress.OutboxUpdateRequest{{
 		TargetUserID: viewer.ID,
 		Event: domain.UpdateEvent{
 			UserID:   viewer.ID,
@@ -1287,6 +1288,9 @@ func TestBuildOutboxStoryUpdatesHydratesCompanionPeersWithStoriesMaxID(t *testin
 			Story:    story,
 		},
 	}})
+	if err != nil {
+		t.Fatalf("buildOutboxUpdates: %v", err)
+	}
 	if len(updates) != 1 || updates[0] == nil {
 		t.Fatalf("updates = %+v, want one story update", updates)
 	}
@@ -1333,7 +1337,7 @@ func TestBuildOutboxNewStoryReactionHydratesReactorUser(t *testing.T) {
 		Stories: appstories.NewService(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000310, 0)})
 
-	updates := r.BuildOutboxUpdates(ctx, []OutboxUpdateRequest{{
+	updates, err := r.buildOutboxUpdates(ctx, []egress.OutboxUpdateRequest{{
 		TargetUserID: owner.ID,
 		Event: domain.UpdateEvent{
 			UserID:   owner.ID,
@@ -1347,6 +1351,9 @@ func TestBuildOutboxNewStoryReactionHydratesReactorUser(t *testing.T) {
 			Reaction: &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "🔥"},
 		},
 	}})
+	if err != nil {
+		t.Fatalf("buildOutboxUpdates: %v", err)
+	}
 	if len(updates) != 1 || updates[0] == nil {
 		t.Fatalf("updates = %+v, want one new story reaction update", updates)
 	}

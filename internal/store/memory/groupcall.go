@@ -537,11 +537,21 @@ func (s *GroupCallStore) SweepStaleParticipants(_ context.Context, checkOlderTha
 	return out, nil
 }
 
-func (s *GroupCallStore) ResetAllParticipants(_ context.Context, now int) ([]domain.GroupCall, error) {
+func (s *GroupCallStore) ResetParticipantsForCalls(_ context.Context, callIDs []int64, now int) ([]domain.GroupCall, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.resetParticipantsForCallsLocked(callIDs, now), nil
+}
+
+func (s *GroupCallStore) resetParticipantsForCallsLocked(callIDs []int64, now int) []domain.GroupCall {
 	var out []domain.GroupCall
-	for callID, rows := range s.participants {
+	seen := make(map[int64]struct{}, len(callIDs))
+	for _, callID := range callIDs {
+		if _, ok := seen[callID]; ok {
+			continue
+		}
+		seen[callID] = struct{}{}
+		rows := s.participants[callID]
 		call := s.calls[callID]
 		if !call.Active() {
 			continue
@@ -565,7 +575,7 @@ func (s *GroupCallStore) ResetAllParticipants(_ context.Context, now int) ([]dom
 		s.calls[callID] = call
 		out = append(out, call)
 	}
-	return out, nil
+	return out
 }
 
 func discardEmptyConference(call *domain.GroupCall, now int) {

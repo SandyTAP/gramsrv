@@ -62,8 +62,8 @@ func TestMessagesRequestWebViewProlongAndSendResult(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("send webview result: %v", err)
 	}
-	if f.router.webviews.size() != 0 {
-		t.Fatalf("webview registry size = %d, want consumed", f.router.webviews.size())
+	if _, ok := f.router.webviews.sessionForBotQueryContext(ctx, f.router.clock.Now(), f.bot.ID, botQueryID); ok {
+		t.Fatalf("webview session for bot query %q still exists after consume", botQueryID)
 	}
 	historyList, err := f.router.deps.Messages.GetHistory(ownerCtx, f.owner.ID, domain.MessageFilter{
 		HasPeer: true,
@@ -117,8 +117,8 @@ func TestBotAPIAnswerWebAppQueryUsesRouterWebViewSession(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("answer web app query from bot api: %v", err)
 	}
-	if f.router.webviews.size() != 0 {
-		t.Fatalf("webview registry size = %d, want consumed", f.router.webviews.size())
+	if _, ok := f.router.webviews.sessionForBotQueryContext(ctx, f.router.clock.Now(), f.bot.ID, botQueryID); ok {
+		t.Fatalf("webview session for bot query %q still exists after consume", botQueryID)
 	}
 	historyList, err := f.router.deps.Messages.GetHistory(ownerCtx, f.owner.ID, domain.MessageFilter{
 		HasPeer: true,
@@ -192,8 +192,8 @@ func TestMessagesWebViewRejectsInvalidSessionAndKeepsSessionOnBadResult(t *testi
 	}); err == nil || !strings.Contains(err.Error(), "RESULT_TYPE_INVALID") {
 		t.Fatalf("bad result err = %v, want RESULT_TYPE_INVALID", err)
 	}
-	if f.router.webviews.size() != 1 {
-		t.Fatalf("webview registry size after bad result = %d, want 1", f.router.webviews.size())
+	if _, ok := f.router.webviews.sessionForBotQueryContext(ctx, f.router.clock.Now(), f.bot.ID, botQueryID); !ok {
+		t.Fatalf("webview session for bot query %q missing after rejected result", botQueryID)
 	}
 	if _, err := f.router.onMessagesSendWebViewResultMessage(botCtx, &tg.MessagesSendWebViewResultMessageRequest{
 		BotQueryID: botQueryID,

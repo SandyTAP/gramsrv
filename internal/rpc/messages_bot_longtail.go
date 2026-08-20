@@ -69,7 +69,9 @@ func (r *Router) onMessagesSendWebViewData(ctx context.Context, req *tg.Messages
 	if err != nil {
 		return nil, messageSendErr(err)
 	}
-	r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res)
+	if err := r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res); err != nil {
+		return nil, internalErr()
+	}
 	var users []tg.UserClass
 	var chats []tg.ChatClass
 	if !res.Duplicate {
@@ -178,7 +180,9 @@ func (r *Router) onMessagesSendBotRequestedPeer(ctx context.Context, req *tg.Mes
 	if err != nil {
 		return nil, internalErr()
 	}
-	r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res)
+	if err := r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, res); err != nil {
+		return nil, internalErr()
+	}
 	if fromWebApp {
 		_ = r.deps.Bots.DeleteRequestedWebViewButton(ctx, botUser.ID, userID, webAppReqID)
 	}
@@ -441,7 +445,10 @@ func (r *Router) onMessagesGetPreparedInlineMessage(ctx context.Context, req *tg
 	if err != nil {
 		return nil, err
 	}
-	results, ok := r.inlines.preparedInlineContext(ctx, r.clock.Now(), userID, bot.ID, req.ID)
+	results, ok, err := r.inlines.preparedInlineContext(ctx, r.clock.Now(), userID, bot.ID, req.ID)
+	if err != nil {
+		return nil, internalErr()
+	}
 	if !ok || len(results.Results) != 1 {
 		return nil, resultIDInvalidErr()
 	}

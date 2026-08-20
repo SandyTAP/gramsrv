@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type privacyStoreKey struct {
@@ -14,12 +15,19 @@ type privacyStoreKey struct {
 
 // PrivacyStore is an in-memory account privacy rule store for tests/dev mode.
 type PrivacyStore struct {
-	mu    sync.RWMutex
-	rules map[privacyStoreKey]domain.PrivacyRules
+	mu             sync.RWMutex
+	rules          map[privacyStoreKey]domain.PrivacyRules
+	deliveryOutbox *DeliveryOutboxStore
 }
 
 func NewPrivacyStore() *PrivacyStore {
 	return &PrivacyStore{rules: make(map[privacyStoreKey]domain.PrivacyRules)}
+}
+
+func (s *PrivacyStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
 }
 
 func (s *PrivacyStore) GetPrivacyRules(_ context.Context, ownerUserID int64, key domain.PrivacyKey) (domain.PrivacyRules, bool, error) {
@@ -33,6 +41,28 @@ func (s *PrivacyStore) SetPrivacyRules(_ context.Context, rules domain.PrivacyRu
 	s.mu.Lock()
 	s.rules[privacyStoreKey{ownerUserID: rules.OwnerUserID, key: rules.Key}] = clonePrivacyRules(rules)
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *PrivacyStore) SetPrivacyRulesWithDelivery(ctx context.Context, rules domain.PrivacyRules, build store.PrivacyDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deliveryOutbox == nil || build == nil {
+		return store.ErrPrivacyDeliveryStoreMissing
+	}
+	payload, err := build(clonePrivacyRules(rules))
+	if err != nil {
+		return err
+	}
+	if _, err := s.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     rules.OwnerUserID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		return err
+	}
+	s.rules[privacyStoreKey{ownerUserID: rules.OwnerUserID, key: rules.Key}] = clonePrivacyRules(rules)
 	return nil
 }
 

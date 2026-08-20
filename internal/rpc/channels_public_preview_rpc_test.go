@@ -163,8 +163,12 @@ func TestPublicChannelPreviewRPCsAllowNonMember(t *testing.T) {
 		t.Fatalf("send live public post: %v", err)
 	}
 	sessions.clearMessages()
-	r.enqueueChannelMessageFanout(WithUserID(ctx, owner.ID), owner.ID, live, nil)
-	if !fanoutHasID(sessions.pushedUserIDs(), viewer.ID) {
+	cancelFanout := startChannelFanoutForTest(t, r)
+	defer cancelFanout()
+	if err := r.enqueueChannelMessageFanout(WithUserID(ctx, owner.ID), owner.ID, live, nil); err != nil {
+		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	}
+	if !fanoutHasID(waitForPushedUserIDs(t, sessions, 1), viewer.ID) {
 		t.Fatalf("live public preview fanout users = %v, want viewer %d", sessions.pushedUserIDs(), viewer.ID)
 	}
 	liveUpdates, ok := sessions.lastUserPush().(*tg.Updates)

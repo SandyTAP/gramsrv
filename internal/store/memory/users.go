@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"time"
 )
 
@@ -15,6 +16,7 @@ type UserStore struct {
 	byID             map[int64]domain.User
 	nextID           int64
 	usernameRegistry *CollectibleUsernameStore
+	deliveryOutbox   *DeliveryOutboxStore
 }
 
 // NewUserStore 创建内存 UserStore。内置系统账号
@@ -34,6 +36,12 @@ func NewUserStore() *UserStore {
 func (s *UserStore) AttachUsernameRegistry(registry *CollectibleUsernameStore) {
 	s.mu.Lock()
 	s.usernameRegistry = registry
+	s.mu.Unlock()
+}
+
+func (s *UserStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
 	s.mu.Unlock()
 }
 
@@ -213,6 +221,50 @@ func (s *UserStore) UpdateUsername(ctx context.Context, userID int64, username s
 	return u, nil
 }
 
+func (s *UserStore) UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
+	usernameLower := strings.ToLower(username)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.byID[userID]
+	if !ok || u.Deleted {
+		return domain.User{}, domain.ErrUsernameNotOccupied
+	}
+	if s.deliveryOutbox == nil || build == nil {
+		return domain.User{}, store.ErrDispatchLeaseLost
+	}
+	if usernameLower != "" {
+		for id, existing := range s.byID {
+			if id != userID && strings.ToLower(existing.Username) == usernameLower {
+				return domain.User{}, domain.ErrUsernameOccupied
+			}
+		}
+	}
+	oldUsername := u.Username
+	if s.usernameRegistry != nil {
+		if _, err := s.usernameRegistry.SetEditableUsername(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: userID}, username); err != nil {
+			return domain.User{}, err
+		}
+	}
+	u.Username = username
+	payload, err := build(s.deliverySnapshotLocked(ctx, u))
+	if err != nil {
+		s.rollbackEditableUsername(ctx, userID, oldUsername)
+		return domain.User{}, err
+	}
+	if _, err := s.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     userID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		s.rollbackEditableUsername(ctx, userID, oldUsername)
+		return domain.User{}, err
+	}
+	s.byID[userID] = u
+	return u, nil
+}
+
 func (s *UserStore) UpdatePhone(_ context.Context, userID int64, phone string) (domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,6 +296,35 @@ func (s *UserStore) UpdateProfile(_ context.Context, userID int64, firstName, la
 	return u, nil
 }
 
+func (s *UserStore) UpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.byID[userID]
+	if !ok || u.Deleted {
+		return domain.User{}, domain.ErrUsernameNotOccupied
+	}
+	if s.deliveryOutbox == nil || build == nil {
+		return domain.User{}, store.ErrDispatchLeaseLost
+	}
+	u.FirstName = firstName
+	u.LastName = lastName
+	u.About = about
+	payload, err := build(s.deliverySnapshotLocked(ctx, u))
+	if err != nil {
+		return domain.User{}, err
+	}
+	if _, err := s.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     userID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		return domain.User{}, err
+	}
+	s.byID[userID] = u
+	return u, nil
+}
+
 func (s *UserStore) UpdateBirthday(_ context.Context, userID int64, birthday domain.Birthday) (domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -252,6 +333,33 @@ func (s *UserStore) UpdateBirthday(_ context.Context, userID int64, birthday dom
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Birthday = birthday
+	s.byID[userID] = u
+	return u, nil
+}
+
+func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.byID[userID]
+	if !ok || u.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if s.deliveryOutbox == nil || build == nil {
+		return domain.User{}, store.ErrDispatchLeaseLost
+	}
+	u.Birthday = birthday
+	payload, err := build(s.deliverySnapshotLocked(ctx, u))
+	if err != nil {
+		return domain.User{}, err
+	}
+	if _, err := s.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     userID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		return domain.User{}, err
+	}
 	s.byID[userID] = u
 	return u, nil
 }
@@ -414,6 +522,58 @@ func (s *UserStore) UpdateColor(_ context.Context, userID int64, forProfile bool
 	}
 	s.byID[userID] = u
 	return u, nil
+}
+
+func (s *UserStore) UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.byID[userID]
+	if !ok || u.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if s.deliveryOutbox == nil || build == nil {
+		return domain.User{}, store.ErrDispatchLeaseLost
+	}
+	if forProfile {
+		u.ProfileColor = color
+	} else {
+		u.Color = color
+	}
+	payload, err := build(s.deliverySnapshotLocked(ctx, u))
+	if err != nil {
+		return domain.User{}, err
+	}
+	if _, err := s.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     userID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		return domain.User{}, err
+	}
+	s.byID[userID] = u
+	return u, nil
+}
+
+func (s *UserStore) deliverySnapshotLocked(ctx context.Context, u domain.User) store.UserDeliverySnapshot {
+	snapshot := store.UserDeliverySnapshot{User: u}
+	if s.usernameRegistry == nil || u.ID == 0 {
+		return snapshot
+	}
+	usernames, err := s.usernameRegistry.PeerUsernames(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
+	if err != nil {
+		return snapshot
+	}
+	snapshot.Usernames = usernames
+	snapshot.UsernamesLoaded = true
+	return snapshot
+}
+
+func (s *UserStore) rollbackEditableUsername(ctx context.Context, userID int64, username string) {
+	if s.usernameRegistry == nil {
+		return
+	}
+	_, _ = s.usernameRegistry.SetEditableUsername(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: userID}, username)
 }
 
 func (s *UserStore) UpdateLastSeen(_ context.Context, userID int64, lastSeenAt int) error {

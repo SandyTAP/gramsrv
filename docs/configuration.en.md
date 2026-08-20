@@ -2,28 +2,75 @@
 
 Chinese version: [configuration.zh-CN.md](configuration.zh-CN.md)
 
-This document describes every setting loaded by `internal/config`. Defaults and validation behavior in `internal/config/config.go` are authoritative. All settings require a process restart; telesrv does not hot-reload configuration.
+This document describes settings loaded by `internal/config`. Service entrypoints now use role-specific YAML files:
+`configs/edge.yaml`, `configs/core.yaml`, `configs/egress.yaml`, `configs/file.yaml`,
+`configs/sfu.yaml`, and `configs/admin.yaml`. Defaults and validation behavior in the corresponding role config Go files under
+`internal/config` are authoritative. All settings require a process restart; telesrv does not hot-reload configuration.
 
 ## 1. Loading, syntax, and precedence
 
-- `TELESRV_CONFIG` is a **process environment variable** selecting the env-style configuration file. Default: `.env` in the process working directory. An explicit empty value disables file loading. Setting it inside the file has no effect because the file has already been selected.
-- Precedence is: non-empty process environment value → non-empty file value → code default. The nullable listener settings (`TELESRV_DEBUG_ADDR`, `TELESRV_BOT_API_ADDR`, `TELESRV_ADMIN_API_ADDR`, and `TELESRV_PUBLIC_LINK_WEB_ADDR`) additionally allow an explicitly empty process value to disable a non-empty file value.
-- The file accepts blank lines, full-line `#` comments, optional `export `, and `KEY=VALUE`. Single- and double-quoted values are supported. Inline comments are not stripped.
-- File keys must start with `TELESRV_` and contain only uppercase ASCII letters, digits, and underscores. Unknown `TELESRV_*` keys are syntactically accepted but ignored by the current binary.
-- Booleans accept `1/true/TRUE/True/yes/on` and `0/false/FALSE/False/no/off`. Lists are comma-separated. Durations use Go duration syntax such as `200ms`, `30s`, `5m`, or `168h`.
-- Invalid integer, float, boolean, or duration text falls back to the code default. URL, app-scheme, app-name, and login-email dependency validation fails startup instead.
+- `cmd/telesrv-edge|core|egress|file|sfu|admin` read `configs/<role>.yaml` by default. Use
+  `--config <path>` or process environment `TELESRV_CONFIG=<path>` to point a process at its own YAML file.
+- YAML is parsed strictly: unknown fields, invalid structure, and invalid duration values fail startup. Environment
+  variables are no longer generic field overrides for service entrypoints; they are only expanded from YAML strings
+  such as `${POSTGRES_DSN}` or `${CORE_EXEC_TOKEN}` for secret/platform injection.
+- `TELESRV_CONFIG` only selects the current process config file. Do not put it inside YAML; systemd units,
+  Docker/Kubernetes manifests, and local scripts should pass one config path per role.
+- YAML booleans use `true`/`false`; lists use YAML sequences; duration fields use Go duration strings such as
+  `200ms`, `30s`, `5m`, or `168h`.
 - Never commit real passwords, tokens, private DSNs, or TURN secrets. Prefer a secret manager or protected service environment in production.
+
+The Go configuration boundary is role-scoped too: `internal/config/edge_config.go`, `core_config.go`,
+`egress_config.go`, `file_config.go`, `sfu_config.go`, and `admin_config.go` define the matching YAML schema, `Load<Role>()`, and runtime
+config type. Production entrypoints and `internal/node/<role>` should not accept the global `config.Config`; the repository no longer exposes the old env-file entrypoint.
 
 ## 2. MTProto listener, transport, and resource budgets
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
-| `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP listen address. Must match the address/port reachable by patched clients. |
+| `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP listen address for `cmd/telesrv-edge`. Patched clients must be able to reach it. `cmd/telesrv-core` does not bind the MTProto listener; do not treat the Core-internal address as the client DC address. |
 | `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | Client-reachable server IP written to `help.getConfig.DCOptions` and used by media/call fallbacks. The loopback default is only safe for pure local TDesktop validation; Android, LAN, and remote validation must set the host LAN/public IP explicitly. On Windows, prefer `scripts\restart-local-server.ps1 -Listen 0.0.0.0:2398 -AdvertiseIP <client-reachable-ip>` so a manual `Start-Process` launch cannot drop the environment. |
+| `TELESRV_ADVERTISE_PORT` | TCP port / `TELESRV_LISTEN` port | Client-reachable port written to `help.getConfig.DCOptions`. `cmd/telesrv-edge` defaults to the `TELESRV_LISTEN` port. `cmd/telesrv-core` must explicitly set this to the public Edge port; never advertise a Core-internal address to clients. |
 | `TELESRV_RSA_KEY` | path / `data/server_rsa.pem` | MTProto RSA private key. Generated when missing. Treat the file as a secret and keep it stable across restarts. |
 | `TELESRV_DC` | positive TL int32 / `2` | Canonical server DC ID used in server-originated configuration, media/DC metadata, and `channelFull.stats_dc`. It must be within `1..2147483647` or startup fails. It does not partition key-exchange state on the current single backend. |
 | `TELESRV_DEFAULT_COUNTRY_CODE` | ISO alpha-2 / `CN` | Country returned by `help.getNearestDc` for login-page preselection. Clients map `CN` to calling code `+86`, `US` to `+1`, and so on. Input is trimmed, uppercased, and validated as a country or autonomous area; malformed or unknown values fail startup. |
 | `TELESRV_STRICT_DC_CHECK` | bool / `false` | Default `false` accepts every wire int32 DC label for permanent and temporary key exchange. `true` requires permanent `dc_id == TELESRV_DC` and temporary `abs(dc_id) == TELESRV_DC`; it is only a diagnostic and does not provide multi-DC isolation. |
+| `TELESRV_INSTANCE_ID` | string / empty | Instance identifier for this process in Edge/Core control, Redis online-location indexes, and pub/sub source dedupe. Empty values are generated at startup from hostname/pid/time; multi-instance deployments should configure a stable unique value. |
+| `TELESRV_EDGE_LOCATION_TTL` | duration / `90s` | TTL for Edge online-location and active raw-key lease records written to Redis. It must be positive and greater than the heartbeat interval; Core orphan-auth-key GC reads this distributed lease snapshot and skips deletion when the snapshot is unavailable. |
+| `TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL` | duration / `30s` | Interval at which this process refreshes its online-session location snapshot. It must be positive and less than `TELESRV_EDGE_LOCATION_TTL`. |
+| `TELESRV_GROUPCALL_CONTROL_ADDR` | address / empty | Internal HTTP listen address used by Core to receive media-liveness reports from standalone SFU processes. `cmd/telesrv-core` requires it. |
+| `TELESRV_GROUPCALL_CONTROL_URL` | URL / empty | Internal URL used by standalone `telesrv-sfu` to call Core's groupcall control API. |
+| `TELESRV_GROUPCALL_CONTROL_TOKEN` | secret string / empty | Bearer token shared by Core and standalone SFU for the groupcall control API. `cmd/telesrv-core` and `cmd/telesrv-sfu` both require an explicit non-empty value. |
+| `TELESRV_CORE_EXEC_GRPC_ADDR` | address / empty | Internal listen address for the production CoreExec gRPC API on `cmd/telesrv-core`. The Core entrypoint requires this setting. |
+| `TELESRV_CORE_EXEC_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> CoreExec gRPC service-discovery provider. `static` consumes a comma-separated endpoint list from `TELESRV_CORE_EXEC_GRPC_TARGETS`. `dns` consumes exactly one target: either a bare `host:port` service name, or an explicit gRPC DNS URI such as `dns:///telesrv-core.default.svc.cluster.local:2500` or `dns://127.0.0.1:5353/coreexec.test:2500` for canaries with a custom DNS authority. DNS mode lets the gRPC DNS resolver expand A/AAAA records, which fits Kubernetes Service/headless DNS without adding Consul/etcd/Nacos. Unsupported values fail startup. |
+| `TELESRV_CORE_EXEC_GRPC_TARGETS` | resolver target(s) / empty | Required CoreExec gRPC endpoint input for `cmd/telesrv-edge`. With `static`, entries must be bare `host:port` values with numeric ports in `1..65535`; URL schemes are rejected, duplicates are removed, and comma-separated endpoints are allowed. IPv6 addresses must use bracket form, for example `[::1]:2440`. With `dns`, exactly one target is allowed; a bare `host:port` value is normalized to `dns:///host:port`, and explicit `dns:///name:port` / `dns://authority:port/name:port` URIs are accepted. Multiple Core addresses must come from DNS records, not comma-separated env values. The gRPC client uses bearer auth, startup unary health + `GetInfo` protocol-version/capability/instance-id handshake, `round_robin`, and gRPC client-side health checking through the service config; NOT_SERVING Core instances are kept out of the dispatch picker. gRPC automatic retries are explicitly disabled. Transport timeout/unavailable is classified in metrics/logs. Edge-side gRPC status error logs carry request_id, operation, and outcome, but request_id is not a metrics label. Edge keeps only a private TL admission shell for profile checks and raw-wire capture; it has no local business dispatch fallback when CoreExec is unavailable. Business replay must go through RPC execution/outbox semantics. A single hard-coded Core address is not enough for the production gate. |
+| `TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Default deadline for Edge -> CoreExec gRPC unary calls. It is added only when the upstream context has no deadline. Must be greater than `0` and at most `1m`. Covers dispatch, profile evidence, initConnection observer, and replay commit so a Core failure cannot hold Edge execution slots forever. |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE` / `TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE` | path / empty | CoreExec gRPC server TLS certificate and private key. They must be configured together. Empty keeps the local/development default plaintext gRPC channel. |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE` | path / empty | CA bundle used by the CoreExec gRPC server to verify Edge client certificates. Setting it enables mTLS and requires the server TLS cert/key settings. |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CA_FILE` | path / empty | Root CA bundle trusted by the Edge gRPC client when verifying Core server certificates. Setting it enables TLS on the client. |
+| `TELESRV_CORE_EXEC_GRPC_TLS_SERVER_NAME` | string / empty | Server name used by the Edge gRPC client when verifying the Core server certificate. Use it when static targets are IPs or LB addresses but the certificate is issued to an internal DNS name. A non-empty value also enables TLS. |
+| `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE` | path / empty | Edge gRPC client certificate and private key. They must be configured together. Use them with the server `TLS_CLIENT_CA_FILE` setting for mTLS. |
+| `TELESRV_CORE_EXEC_TOKEN` | secret string / empty | Bearer token for CoreExec gRPC APIs. `cmd/telesrv-core` and `cmd/telesrv-edge` both require an explicit non-empty value, and values must match on client and server and must not contain newlines. The current gRPC channel supports static multi-endpoint and DNS resolver providers; later providers may use Envoy/xDS or Consul. Do not introduce a standalone Consul/etcd/Nacos component just to pre-solve CoreExec discovery; discovery should stay behind the replaceable resolver abstraction. Redis still owns Edge location, push/control ACKs, short registries, and SFU owner records, not generic CoreExec service discovery. |
+| `TELESRV_FILE_GRPC_ADDR` | address / empty | Internal listen address for the standalone `cmd/telesrv-file` FileData gRPC API. Required by the File entrypoint. |
+| `TELESRV_FILE_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge/Core -> FileData gRPC service-discovery provider. It follows the CoreExec resolver rules: `static` consumes comma-separated `host:port` endpoints, while `dns` consumes exactly one bare `host:port` or explicit `dns:///name:port` / `dns://authority:port/name:port` target. Unsupported values fail startup. |
+| `TELESRV_FILE_GRPC_TARGETS` | resolver target(s) / empty | Required FileData gRPC endpoint input for `cmd/telesrv-edge` and `cmd/telesrv-core`. Edge probes FileData before opening the MTProto listener; Core probes it before exposing CoreExec. Unreachable FileData, token errors, protocol-version mismatch, or an unhealthy FileData backend fail fast. |
+| `TELESRV_FILE_GRPC_REQUEST_TIMEOUT` | duration / `10s` | Default deadline for Edge/Core -> FileData gRPC calls. It is added only when the upstream context has no deadline. Must be greater than `0` and at most `1m`. Covers upload parts, static range downloads, blob put/get, and upload-part materialization. |
+| `TELESRV_FILE_GRPC_TLS_CERT_FILE` / `TELESRV_FILE_GRPC_TLS_KEY_FILE` | path / empty | FileData gRPC server TLS certificate and private key. They must be configured together. Empty keeps the local/development default plaintext gRPC channel. |
+| `TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE` | path / empty | CA bundle used by the FileData gRPC server to verify Edge/Core client certificates. Setting it enables mTLS and requires the server TLS cert/key settings. |
+| `TELESRV_FILE_GRPC_TLS_CA_FILE` | path / empty | Root CA bundle trusted by Edge/Core gRPC clients when verifying FileData server certificates. Setting it enables TLS on the client. |
+| `TELESRV_FILE_GRPC_TLS_SERVER_NAME` | string / empty | Server name used by Edge/Core gRPC clients when verifying the FileData server certificate. A non-empty value also enables TLS. |
+| `TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE` | path / empty | Edge/Core gRPC client certificate and private key for FileData calls. They must be configured together. |
+| `TELESRV_FILE_TOKEN` | secret string / empty | Bearer token for FileData gRPC APIs. `cmd/telesrv-file`, `cmd/telesrv-edge`, and `cmd/telesrv-core` all require an explicit non-empty value, and it must not contain newlines. FileData handles upload parts, static blob ranges, and materialization only; it is not the message/media permission authority. |
+| `TELESRV_EGRESS_ACK_GRPC_ADDR` | address / empty | Internal listen address for the late client-ACK writeback API on `cmd/telesrv-egress`. The Egress entrypoint requires this setting. Service-level Edge fabric confirmation is enough to advance online outbox rows; this API is only a late signal for indeterminate writes and supports both PTS `dispatch_outbox` and non-PTS `edge_delivery_outbox` (the non-PTS lane uses `pts=0` in the fence). |
+| `TELESRV_EGRESS_ACK_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> Egress ACK gRPC service-discovery provider. It follows the CoreExec resolver rules: `static` consumes comma-separated `host:port` endpoints, while `dns` consumes exactly one bare `host:port` or explicit `dns:///name:port` / `dns://authority:port/name:port` target. Unsupported values fail startup. |
+| `TELESRV_EGRESS_ACK_GRPC_TARGETS` | resolver target(s) / empty | Required Egress ACK gRPC endpoint input for `cmd/telesrv-edge`. Edge performs health + `GetInfo` before publishing the MTProto listener; unreachable Egress ACK, token errors, or protocol-version mismatch fail fast so clients cannot connect to an Edge that cannot advance PTS outbox or non-PTS delivery queue ACK state. |
+| `TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Default deadline for Edge -> Egress ACK gRPC unary calls. It is added only when the upstream context has no deadline. Must be greater than `0` and at most `1m`. |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE` | path / empty | Egress ACK gRPC server TLS certificate and private key. They must be configured together. Empty keeps the local/development default plaintext gRPC channel. |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE` | path / empty | CA bundle used by the Egress ACK gRPC server to verify Edge client certificates. Setting it enables mTLS and requires the server TLS cert/key settings. |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE` | path / empty | Root CA bundle trusted by the Edge gRPC client when verifying Egress ACK server certificates. Setting it enables TLS on the client. |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME` | string / empty | Server name used by the Edge gRPC client when verifying the Egress ACK server certificate. A non-empty value also enables TLS. |
+| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE` | path / empty | Edge gRPC client certificate and private key for Egress ACK calls. They must be configured together. |
+| `TELESRV_EGRESS_ACK_TOKEN` | secret string / empty | Bearer token for Egress ACK gRPC APIs. `cmd/telesrv-edge` and `cmd/telesrv-egress` both require an explicit non-empty value, and it must not contain newlines. |
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | Enables MTProto-over-WebSocket demultiplexing on the MTProto listener. |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | Browser WebSocket origin allow-list. `*` is for temporary debugging only. |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | Global physical connection admission limit. Negative disables this gate. |
@@ -84,7 +131,7 @@ Retained typed graphs remain charged to the RPC scheduler budget above.
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / empty | Optional host-based root for multi-server clients, for example `owpg://example.com`. When set, links use `owpg://example.com/oauth`, `owpg://example.com/<username>`, and equivalent route paths. Only exact `<custom-scheme>://<host>` values are accepted; ports, paths, queries, and fragments are rejected. `TELESRV_PUBLIC_APP_SCHEME` remains an accepted legacy input. |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | Web-client root used by public username pages. Same URL validation as `TELESRV_PUBLIC_BASE_URL`. |
 | `TELESRV_PUBLIC_APP_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | Public landing-page product name; trimmed, non-empty, no control characters, maximum 64 Unicode characters. |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Username/avatar/sticker/emoji/chatlist/collectible-gift landing pages plus the hash-only moderation appeal form. Empty disables it. Production should bind loopback behind exact nginx routes. Moderation `freeze_account` actions fail closed when this listener is disabled because telesrv cannot issue a reachable appeal URL. `.env.example` enables `127.0.0.1:2401` for development. |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Username/avatar/sticker/emoji/chatlist/collectible-gift landing pages plus the hash-only moderation appeal form. Empty disables it. Production should bind loopback behind exact nginx routes. Moderation `freeze_account` actions fail closed when this listener is disabled because telesrv cannot issue a reachable appeal URL. Local development can enable `127.0.0.1:2401` in `configs/core.yaml`. |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | Mount the self-hosted Telegram Login/OIDC provider on `TELESRV_PUBLIC_LINK_WEB_ADDR`. Enabling it requires that listener and all key files below. |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | absolute origin URL / `TELESRV_PUBLIC_BASE_URL` | Exact public issuer used in discovery and tokens. HTTPS is required by default; paths, credentials, query, and fragment are rejected. The next setting permits any HTTP host/IP. |
 | `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP` | bool / `false` | When enabled, permits any valid HTTP issuer, BotFather Web origin, redirect URI, and native HTTP callback, without loopback, subnet, or port restrictions. When disabled, those Web URLs still require HTTPS. |
@@ -521,6 +568,9 @@ The following fallback keys are accepted from the **process environment only**. 
 |---|---|---|
 | `TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Router temporary→permanent auth-key binding cache capacity. |
 | `TELESRV_TEMP_KEY_CACHE_TTL` | duration / `30m` | Recheck period; exact bind/revoke invalidation handles normal writes, while TTL covers cross-process/exception paths. |
+| `TELESRV_AUTH_USER_CACHE_TTL` | duration / `1m` | Positive auth-key→user authorization cache recheck period. Write-side Redis invalidation remains the primary path; TTL bounds stale authorization if cross-Core invalidation/control messages are missed. `<=0` disables the TTL fallback. |
+| `TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Edge raw auth-key hot-cache capacity. Edge does not connect to PostgreSQL; CoreExec/PG is authoritative, while Edge caches only key material, server salt, and expiry, not Layer/client metadata. Must be greater than `0`. |
+| `TELESRV_AUTH_KEY_CACHE_TTL` | duration / `30m` | Resource TTL for the Edge auth-key hot cache. It only bounds memory use: `destroy_auth_key` publishes a Core Redis invalidation and closes raw-key sessions, so correctness does not depend on TTL. Must be `(0,24h]`. |
 | `TELESRV_CHANNEL_ROW_CACHE_MAX` | int / `50000` | Shared channel-row cache capacity. `<=0` disables both cache and its LISTEN/NOTIFY listener. |
 | `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `100000` | Channel member/access read-model cache capacity; `<=0` disables it. |
 | `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `100000` | Viewer/channel dialog projection cache capacity; `<=0` disables it. |
@@ -531,13 +581,12 @@ The following fallback keys are accepted from the **process environment only**. 
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
-| `TELESRV_OUTBOX_WORKERS` | int / `4` | Concurrent outbox workers. Stable logical sharding preserves per-user pts order. |
-| `TELESRV_OUTBOX_BATCH` | int / `100` | Maximum rows claimed per poll. Larger batches improve throughput but increase DB/push bursts. |
-| `TELESRV_OUTBOX_INTERVAL` | duration / `200ms` | Delay between outbox claims. |
-| `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | Time before a `dispatching` row can be reclaimed. Must exceed worst-case batch delivery time. |
+| `TELESRV_OUTBOX_WORKERS` | int / `4` | Concurrent `cmd/telesrv-egress` outbox workers. Stable logical sharding preserves per-user head order for both PTS `dispatch_outbox` and non-PTS `edge_delivery_outbox`. |
+| `TELESRV_OUTBOX_BATCH` | int / `100` | Maximum rows claimed per `cmd/telesrv-egress` batch. Larger batches improve throughput but increase DB/push bursts. |
+| `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | Time before a `dispatching` row can be reclaimed by another Egress instance. Must exceed worst-case batch delivery time. |
 | `TELESRV_OUTBOX_POISON_RETENTION` | duration / `1m` | Diagnostic retention for terminal failed delivery heads; durable update events remain recoverable through difference. |
 | `TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL` | duration / `15s` | Cleanup interval for terminal failed heads, independent of large-table retention. |
-| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | Maximum wait for best-effort online update enqueue. |
+| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | Maximum wait for Edge to confirm online update enqueue. Timeout is treated as unconfirmed delivery, leaving the durable outbox row for lease/reclaim. |
 | `TELESRV_SEND_RATE_LIMIT` | int / `30` | Per-account messages per send window; `<=0` disables send limiting. |
 | `TELESRV_SEND_RATE_WINDOW` | duration / `1m` | Send-rate window. |
 | `TELESRV_CATCHUP_RATE_LIMIT` | int / `0` | Per-user difference/catch-up RPCs per window; `<=0` disables the gate. |
@@ -719,9 +768,23 @@ that cannot do what it says fails startup instead of being silently unreachable.
 | `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | Inclusive relay allocation port maximum; must not be below the minimum. Open the whole range in the firewall. |
 | `TELESRV_CALL_TURN_CREDENTIAL_TTL` | duration / `6h` | Per-call TURN credential lifetime. |
 | `TELESRV_CALL_FORCE_RELAY` | bool / `false` | Forces `p2p_allowed=false` to test TURN relay paths. |
-| `TELESRV_SFU_ENABLE` | bool / `true` | Enables embedded group-call media forwarding. False leaves signaling-only M0 behavior. |
 | `TELESRV_SFU_UDP_PORT` | int / `12399` | Pion ICE UDPMux port; allow it through the firewall. |
 | `TELESRV_SFU_ADVERTISE_IP` | string / empty | Client-reachable ICE candidate IP. Empty falls back to `TELESRV_ADVERTISE_IP`; loopback silently breaks real-device media. |
+| `TELESRV_SFU_OWNER_TTL` | duration / `2m` | TTL for the `callID -> sfu instance` owner lease; one call must stick to one owner in multi-SFU mode. |
+| `TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL` | duration / `30s` | Refresh interval for active standalone SFU owner leases; must be lower than the owner TTL. |
+| `TELESRV_SFU_INSTANCE_TTL` | duration / `90s` | TTL for live SFU media instances registered in Redis. Core only selects unexpired instances and probes candidate control through gRPC health plus `GetInfo.instance_id` before assignment. |
+| `TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL` | duration / `30s` | Heartbeat interval used by `telesrv-sfu` to refresh instance discovery; must be lower than the instance TTL. |
+| `TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT` | duration / `1s` | Per-candidate timeout for Core remote owner selection probing SFU gRPC control health. A timeout marks only that candidate unavailable and the selector continues with other non-full instances, so a half-failed SFU inside the Redis TTL window cannot stall join. |
+| `TELESRV_SFU_INSTANCE_MAX_ACTIVE_CALLS` | int / `0` | Maximum active calls per SFU instance; `0` means unlimited. Heartbeats publish the current active call count, and the Core remote owner selector skips full or health-check-failing instances and prefers lower-load candidates. |
+| `TELESRV_SFU_CONTROL_GRPC_ADDR` | address / empty | Internal listen address for the standalone `cmd/telesrv-sfu` owner-control gRPC API. Required by `cmd/telesrv-sfu`. |
+| `TELESRV_SFU_CONTROL_GRPC_URL` | gRPC target / empty | Advertised gRPC control address written to SFU instance/owner records. Empty falls back to `TELESRV_SFU_CONTROL_GRPC_ADDR`. Use a bare `host:port` target or `grpc://host:port`. |
+| `TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Default deadline for Core -> SFU gRPC control unary calls. Must be greater than `0` and at most `1m`. |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE` / `TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE` | path / empty | SFU gRPC control server TLS certificate and private key. They must be configured together. |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE` | path / empty | Client CA trusted by the SFU gRPC control server. When set, Core/probe clients must present a verified certificate; server cert/key must also be configured. |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CA_FILE` | path / empty | Root CA bundle trusted by Core/probe clients when calling SFU gRPC control. |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_SERVER_NAME` | string / empty | Server name used by Core/probe gRPC clients when validating the SFU control server certificate. |
+| `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_KEY_FILE` | path / empty | Client certificate and private key used by Core/probe callers of SFU gRPC control. They must be configured together and enable mTLS with `*_CLIENT_CA_FILE`. |
+| `TELESRV_SFU_CONTROL_TOKEN` | secret string / empty | Bearer token for the SFU control API; non-empty values must match on remote clients. Standalone `cmd/telesrv-sfu` requires an explicit non-empty value so the production media control plane cannot start unauthenticated. |
 | `TELESRV_LIVESTREAM_ENABLE` | bool / `true` | Enables embedded RTMP ingest plus ffmpeg segmentation for channel livestreams. |
 | `TELESRV_LIVESTREAM_RTMP_ADDR` | address / `:2400` | RTMP ingest TCP listen address. |
 | `TELESRV_LIVESTREAM_RTMP_URL` | URL string / empty | OBS-facing server URL. Empty derives `rtmp://<AdvertiseIP>:2400/live`. |
@@ -731,4 +794,4 @@ that cannot do what it says fails startup instead of being silently unreachable.
 
 ## 12. Production minimum checklist
 
-At minimum, production operators should explicitly review and override the development credentials/endpoints: PostgreSQL DSN and TLS, Redis password/network exposure, RSA key persistence, fixed development auth code exposure, Admin credentials/session key, OTP Webhook/SMTP secrets, AI/Mapbox API keys, TURN secret and firewall ports, public URLs/scheme alignment, and non-loopback SFU/TURN advertise addresses for real devices.
+At minimum, production operators should explicitly review and override the development credentials/endpoints: PostgreSQL DSN and TLS, Redis password/network exposure, RSA key persistence, fixed development auth code exposure, Admin credentials/session key, OTP Webhook/SMTP secrets, AI/Mapbox API keys, CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS, TURN secret and firewall ports, public URLs/scheme alignment, and non-loopback SFU/TURN advertise addresses for real devices.

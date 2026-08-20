@@ -4,10 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/iamxvbaba/td/proto"
-	"github.com/iamxvbaba/td/tg"
-
 	"telesrv/internal/domain"
+	"telesrv/internal/edgecontrol"
 	"telesrv/internal/sfu"
 	"telesrv/internal/store"
 	"telesrv/internal/turnsrv"
@@ -56,190 +54,41 @@ type ClientTelemetryService interface {
 	Record(ctx context.Context, userID int64, kind domain.ClientTelemetryKind, peer domain.Peer, subjectIDs []int64, payload any, createdAt time.Time) (domain.ClientTelemetryEvent, bool, error)
 }
 
-// SessionBinder 抽象登录后 session 与 user 的在线绑定。
-//
-// MTProto session 的完整身份是 raw auth_key_id + session_id。所有定位单个 session
-// 的方法都必须携带这两个值；禁止退回只按 session_id 查询，否则不同 auth key 复用
-// 同一随机 session_id 时会产生跨账号绑定、排除或推送歧义。
-type SessionBinder interface {
-	BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte)
-	AuthKeyIDForSession(rawAuthKeyID [8]byte, sessionID int64) ([8]byte, bool)
-	BindUserForAuthKey(rawAuthKeyID [8]byte, sessionID, userID int64)
-	UserIDResolvedForAuthKey(rawAuthKeyID [8]byte, sessionID int64) (userID int64, resolved bool)
-	UnbindAuthKey(authKeyID [8]byte) int
-	SetReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64, receives bool)
-	PushToSessionForAuthKey(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg tg.UpdatesClass) error
-	// excludeAuthKeyID/excludeSessionID 必须同时为零（不排除）或同时非零（精确排除）。
-	PushToUserExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass) (int, error)
-}
+// EdgeController is the Core -> Edge control-plane dependency for live MTProto
+// sessions. Optional capabilities below are kept as narrow structural
+// contracts so Core can ask Edge for specific push/control behavior without
+// reintroducing local session ownership.
+type EdgeController = edgecontrol.Controller
+type RawAuthKeyIdentityBinder = edgecontrol.RawAuthKeyIdentityBinder
+type RawAuthKeyMetadataProvider = edgecontrol.RawAuthKeyMetadataProvider
+type ImmediateSessionPusher = edgecontrol.ImmediateSessionPusher
+type SessionUpdatesStateProvider = edgecontrol.SessionUpdatesStateProvider
+type ClientLayerBinder = edgecontrol.ClientLayerBinder
+type AuthKeyLayerBinder = edgecontrol.AuthKeyLayerBinder
+type BusinessAuthKeyLayerBinder = edgecontrol.BusinessAuthKeyLayerBinder
+type AuthKeyLayerRefresher = edgecontrol.AuthKeyLayerRefresher
+type AuthKeyInheritedLayerClearer = edgecontrol.AuthKeyInheritedLayerClearer
+type ActiveSessionLayerEvidenceProvider = edgecontrol.ActiveSessionLayerEvidenceProvider
+type SessionTerminator = edgecontrol.SessionTerminator
+type RawSessionTerminator = edgecontrol.RawSessionTerminator
+type TransientSessionPusher = edgecontrol.TransientSessionPusher
+type AuthKeyTargetedSessionPusher = edgecontrol.AuthKeyTargetedSessionPusher
+type LayerAwareTransientPusher = edgecontrol.LayerAwareTransientPusher
+type OnlineUserProvider = edgecontrol.OnlineUserProvider
+type ChannelSubscriptionProvider = edgecontrol.ChannelSubscriptionProvider
+type ChannelNudgeProvider = edgecontrol.ChannelNudgeProvider
+type ChannelFanoutRecoverySessionProvider = edgecontrol.ChannelFanoutRecoverySessionProvider
+type EdgeLocationRecord = edgecontrol.LocationRecord
+type UserLocationBatchProvider = edgecontrol.UserLocationBatchProvider
+type ChannelDeliveryKind = edgecontrol.ChannelDeliveryKind
+type ChannelDeliveryWatermark = edgecontrol.ChannelDeliveryWatermark
+type LocationTargetedUserPush = edgecontrol.LocationTargetedUserPush
+type BatchLocationTargetedSessionPusher = edgecontrol.BatchLocationTargetedSessionPusher
 
-// RawAuthKeySessionBinder 在 auth.bindTempAuthKey 成功后，把同一 raw temporary key
-// 已建立的所有 session 一次性切到 canonical permanent identity。只更新当前 session
-// 会让并发启动的其它连接永久粘在 raw identity。
-type RawAuthKeySessionBinder interface {
-	BindAuthKeyForRawAuthKey(rawAuthKeyID [8]byte, authKeyID [8]byte) int
-}
-
-// RawAuthKeyMetadataProvider 暴露握手时确定的 raw key protocol expiry。0 表示
-// permanent key；正值表示 temporary key。Router 只用它判断 cached==raw 是否可作为
-// permanent 快路径，协议过期的实际拒绝仍由 mtprotoedge 完成。
-type RawAuthKeyMetadataProvider interface {
-	AuthKeyExpiresAtForSession(rawAuthKeyID [8]byte, sessionID int64) (expiresAt int, found bool)
-}
-
-// ImmediateSessionPusher 是可选的登录前信号直推能力。
-// 它绕过登录后 updates-ready 队列，只能用于会解锁登录流程本身的握手消息，
-// 例如 updateLoginToken。
-type ImmediateSessionPusher interface {
-	PushToSessionForAuthKeyImmediate(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg tg.UpdatesClass) error
-}
-
-// SessionUpdatesStateProvider 暴露连接当前的 updates 接收状态（可选能力）。
-// 用于按 RPC 置位 receivesUpdates 时的幂等短路；不实现时每次都走完整置位（幂等，仅多余开销）。
-type SessionUpdatesStateProvider interface {
-	ReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64) bool
-}
-
-// ClientLayerBinder 把协商 TL layer 即时下推到连接（可选能力）。
-// invokeWithLayer 在 Dispatch 入口被观测到时立即调用，使同一请求 handler 执行期间
-// 触发的 pending flush / 并发 push 就已按正确 layer 降级；不实现时连接层只能靠
-// Dispatch 返回后的兜底刷新，重连老客户端首条 RPC 期间的推送会漏降级。
-type ClientLayerBinder interface {
-	SetClientLayerForAuthKey(rawAuthKeyID [8]byte, sessionID int64, layer int)
-}
-
-// AuthKeyLayerBinder seeds an inherited auth-key default into every live
-// session that still has no explicit invokeWithLayer observation. Implementors
-// must not overwrite an explicit per-session profile; the returned count is
-// diagnostic only.
-//
-// Router uses this optional capability after auth.bindTempAuthKey normalizes a
-// raw temporary key to its permanent identity. Keeping it separate from
-// ClientLayerBinder makes the source distinction explicit: inherited defaults
-// are mutable initialization state, while an explicit session observation is a
-// correction for exactly one logical session.
-type AuthKeyLayerBinder interface {
-	SeedInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte, layer int) int
-}
-
-// BusinessAuthKeyLayerBinder seeds unknown live sessions across every raw PFS
-// key currently normalized to the same permanent/business auth key.
-type BusinessAuthKeyLayerBinder interface {
-	SeedInheritedLayerForBusinessAuthKey(authKeyID [8]byte, layer int) int
-}
-
-// AuthKeyLayerRefresher is the identity-normalization variant used after
-// auth.bindTempAuthKey. It may replace an inherited raw-key shadow with the
-// permanent key's default, but must still preserve every explicit session
-// profile.
-type AuthKeyLayerRefresher interface {
-	RefreshInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte, layer int) int
-}
-
-// AuthKeyInheritedLayerClearer removes only the mutable inherited default for
-// a physical/raw key. Explicit per-session invokeWithLayer profiles are wire
-// evidence and must survive. Router uses this when a temp key binds to a
-// permanent key whose durable Layer is authoritative but unsupported by this
-// binary; retaining the raw key's older inherited default would silently
-// downgrade naked RPCs instead of asking the client to correct explicitly.
-type AuthKeyInheritedLayerClearer interface {
-	ClearInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte) int
-}
-
-// ActiveSessionLayerEvidenceProvider exposes the live connection's explicit
-// profile when auth.bindTempAuthKey runs after the Router's bounded exact-
-// profile retention window. It is deliberately session-scoped and must never
-// report an inherited profile as explicit evidence.
-type ActiveSessionLayerEvidenceProvider interface {
-	ExplicitLayerEvidenceForAuthKey(rawAuthKeyID [8]byte, sessionID int64) (layer int, msgID int64, ok bool)
-}
-
-// SessionTerminator 暴露按业务 auth_key 强制断开活跃连接的能力（可选）。
-// 授权撤销（被踢设备）必须断开连接：出站推送用连接持有的密钥加密、不回查授权，
-// perm-key 连接的授权缓存也只有断开重连才会重新回查授权表。
-type SessionTerminator interface {
-	CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int
-}
-
-// RawSessionTerminator 暴露按连接实际 raw auth_key 强制断开的能力（可选）。
-// temp auth key 被撤销时，Router 会先从 temp→perm 缓存里找出同一授权的 raw temp key，
-// 再用这个接口踢掉仍未完全解析到业务 key 的活跃连接，避免等缓存 TTL 或下一帧才失效。
-type RawSessionTerminator interface {
-	CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int
-}
-
-// BestEffortSessionBinder 是带 raw auth_key_id 精确排除当前设备的短超时推送接口；
-// 不用于 RPC result/ack。
-type BestEffortSessionBinder interface {
-	PushToUserExceptAuthKeySessionBestEffort(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-}
-
-// TransientSessionBinder 推送短命、不写 durable log 的 update（typing / presence）。
-// 与普通推送的关键区别：目标 session 未就绪时直接跳过、不进 pending——transient 数据
-// getDifference 无法补，就绪后由 getState 快照/下次状态变化重建，囤积过期 transient 无意义。
-type TransientSessionBinder interface {
-	PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-}
-
-// AuthKeyTargetedSessionBinder 把 update 定向投递给某用户【绑定到具体 business auth_key
-// 这台设备】的就绪连接（密聊设备级投递）。SessionManager 实现；密聊启用时必须装配，
-// 缺失时 fail-closed，严禁回退账号级推送。未就绪连接跳过、不进 pending（离线靠 difference 补）。
-type AuthKeyTargetedSessionBinder interface {
-	PushToUserAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass) (int, error)
-	PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-	PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-}
-
-// ExactLayerTransientSessionBinder is the admission boundary for updates whose
-// constructors do not exist in older profiles. Implementations must filter the
-// live session index before encoding, skip unknown/not-ready profiles, and must
-// never queue the transient payload for later delivery.
-type ExactLayerTransientSessionBinder interface {
-	PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-	PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-}
-
-// OnlineUserProvider exposes a bounded runtime snapshot for best-effort fanout.
-type OnlineUserProvider interface {
-	IsUserOnline(userID int64) bool
-	OnlineUserIDsForCandidates(candidateUserIDs []int64, limit int) []int64
-	TrackChannelInterest(rawAuthKeyID [8]byte, sessionID, userID int64, channelIDs []int64)
-	ClearChannelInterest(rawAuthKeyID [8]byte, sessionID, userID int64)
-	OnlineChannelUserIDs(channelID int64, limit int) []int64
-	// ChannelMembershipGeneration / SetSessionChannelMemberships 配对使用：调用方在读取
-	// 持久成员列表前采样修订号，落地时带回；期间发生增量 Add/Remove 时 Set 走合并路径
-	// 并保持未就绪，由下一条 RPC 重试全量同步（防全量替换覆盖窗口内的增量 join/leave）。
-	ChannelMembershipGeneration(rawAuthKeyID [8]byte, sessionID int64) int64
-	SetSessionChannelMemberships(rawAuthKeyID [8]byte, sessionID, userID int64, channelIDs []int64, expectedGen int64)
-	AddUserChannelMembership(userID, channelID int64)
-	RemoveUserChannelMembership(userID, channelID int64)
-	OnlineChannelMemberUserIDs(channelID int64, limit int) []int64
-}
-
-// ChannelSubscriptionProvider is the bounded process-local implementation of
-// Telegram's public-channel short-poll subscription. A successful
-// updates.getChannelDifference refresh from one session enables passive channel
-// updates for the whole user account until the subscription expires.
-type ChannelSubscriptionProvider interface {
-	RefreshChannelSubscription(rawAuthKeyID [8]byte, sessionID, userID, channelID int64, ttl time.Duration)
-	OnlineChannelSubscriberUserIDs(channelID int64, limit int) []int64
-	OnlineChannelSubscriberUserIDsExcluding(channelID int64, exclude map[int64]struct{}, limit int) []int64
-}
-
-// ChannelNudgeProvider 暴露「频道在线成员中排除已投递集合后的剩余 user id」，用于 >cap
-// 在线成员的 UpdateChannelTooLong nudge（P0-8）。SessionManager 实现；测试/未装配 fake 可不实现
-// （type-assert 失败时跳过 nudge，不影响完整 payload 投递）。
-type ChannelNudgeProvider interface {
-	OnlineChannelMemberUserIDsExcluding(channelID int64, exclude map[int64]struct{}, limit int) []int64
-}
-
-// ChannelFanoutRecoverySessionProvider snapshots the process-local online joined-channel index in
-// stable channel-id order. It is used only after every keyed fan-out mailbox is saturated. The
-// fixed recovery actor accepts the temporary 8*C id slice so one sweep never repeatedly scans the
-// SessionManager index or holds its global lock while sorting/database work runs.
-type ChannelFanoutRecoverySessionProvider interface {
-	OnlineChannelIDsSnapshot() []int64
-}
+const (
+	ChannelDeliveryPayload = edgecontrol.ChannelDeliveryPayload
+	ChannelDeliveryNudge   = edgecontrol.ChannelDeliveryNudge
+)
 
 // ChannelFanoutRecoveryPtsProvider reloads the authoritative channel pts after in-memory fan-out
 // saturation. Production channels.Service implements it through the channel store; keeping this
@@ -285,10 +134,18 @@ type TelegramLoginService interface {
 
 // BatchViewerUsersResolver 是 UsersService 的可选能力：跨多个 viewer 一次性投影同一组 user
 // （fan-out 模板化，把 per-recipient 的 ByIDs(=ForViewer) 折叠成 O(owner) 查询）。结果按 viewer
-// 与 ByIDs(viewer, ids) 字节等价（personal photo overlay 除外，见 users.ByIDsForViewers）。
-// 未实现时 fan-out 预热静默跳过，回退逐 viewer 解析（行为不变，仅退化为旧的 O(viewer) 成本）。
+// 与 ByIDs(viewer, ids) 字节等价，包含 viewer-specific personal photo overlay。
+// 声明需要 fan-out 预热的路径必须具备该能力；缺失或失败时在线 fan-out fail-closed，不得
+// 在同一请求里改走逐 recipient 查询。
 type BatchViewerUsersResolver interface {
 	ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error)
+}
+
+// SparseBatchViewerUsersResolver projects only the explicitly supplied
+// viewer->user edges. Durable private-message outbox projection uses this
+// instead of widening a claim into viewers x union(users).
+type SparseBatchViewerUsersResolver interface {
+	ByIDsForViewerUserIDs(ctx context.Context, userIDsByViewer map[int64][]int64) (map[int64][]domain.User, error)
 }
 
 // BotsService 抽象 bot 元数据查询与管理（bots.* RPC + userFull.bot_info hydrate）。
@@ -372,6 +229,17 @@ type UserIdentityService interface {
 	ResolvePhone(ctx context.Context, currentUserID int64, phone string) (domain.User, bool, error)
 }
 
+// UserProfileDeliveryService is the durable non-PTS write boundary for profile
+// mutations whose wire notifications carry no pts/pts_count. Production Core
+// must commit the user row and edge_delivery_outbox payload as one aggregate;
+// there is no online-only session push fallback.
+type UserProfileDeliveryService interface {
+	UpdateProfileWithDelivery(ctx context.Context, userID int64, update domain.UserProfileUpdate, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+}
+
 // UserPremiumService 是 UsersService 的会员扩展能力：授予/续期、到期清理
 // （PremiumSweeper）与 emoji status（premium 专属）。设计见 docs/premium-module.md。
 type UserPremiumService interface {
@@ -385,12 +253,6 @@ type UserPremiumService interface {
 // require the RPC Updates service to append the event separately.
 type UserEmojiStatusDurableService interface {
 	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, bool, error)
-}
-
-// UserColorService 是 UsersService 的个人色板扩展能力。用于 account.updateColor
-// 持久化当前账号的消息气泡 accent 或资料页背景色。
-type UserColorService interface {
-	UpdateColor(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error)
 }
 
 // UserPremiumStatusService 暴露轻量会员判断（基础用户缓存路径，不做 viewer
@@ -464,6 +326,10 @@ type PrivacyService interface {
 	SetRules(ctx context.Context, ownerUserID int64, key domain.PrivacyKey, rules []domain.PrivacyRule) (domain.PrivacyRules, error)
 	AddAllowUser(ctx context.Context, ownerUserID int64, key domain.PrivacyKey, targetUserID int64) (domain.PrivacyRules, bool, error)
 	CanSee(ctx context.Context, ownerUserID, viewerUserID int64, key domain.PrivacyKey) (bool, error)
+}
+
+type PrivacyDeliveryService interface {
+	SetRulesWithDelivery(ctx context.Context, ownerUserID int64, key domain.PrivacyKey, rules []domain.PrivacyRule, build store.PrivacyDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.PrivacyRules, error)
 }
 
 // HelpService 抽象启动配置与国家区号目录。
@@ -859,6 +725,7 @@ type FilesService interface {
 	SaveFilePart(ctx context.Context, ownerUserID, fileID int64, part int, bytes []byte) (bool, error)
 	SaveBigFilePart(ctx context.Context, ownerUserID, fileID int64, part, totalParts int, bytes []byte) (bool, error)
 	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
+	GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error)
 	// CreateEncryptedFileFromUpload 把密聊上传分片组装成盲 blob 并铸造 EncryptedFile 快照（P2）。
 	CreateEncryptedFileFromUpload(ctx context.Context, file domain.UploadedFileRef, keyFingerprint int) (domain.EncryptedFileRef, error)
 	// GeoMapTile 渲染 geo 消息地图缩略占位图（upload.getWebFile），确定性、无外部依赖。
@@ -1048,6 +915,7 @@ type BotVerificationService interface {
 // Deps 按业务域注入服务接口。各域的 handler 注册见对应文件（auth.go / users.go / updates.go）。
 type Deps struct {
 	Auth                AuthService
+	AuthInvalidations   store.AuthInvalidationBroker
 	AuthDeliveryReports AuthDeliveryReportService
 	ClientTelemetry     ClientTelemetryService
 	// AuthKeySessionLayers is the protocol-only durable ordering boundary for
@@ -1070,9 +938,11 @@ type Deps struct {
 	BotVerifications        BotVerificationService
 	TelegramLogin           TelegramLoginService
 	Updates                 UpdatesService
+	DeliveryOutbox          store.DeliveryOutboxStore
 	BootstrapUpdates        store.BootstrapUpdateJobStore
 	BotAPIUpdates           store.BotAPIUpdateStore
 	BotCallbacks            store.BotCallbackRegistryStore
+	LoginTokens             store.LoginTokenRegistryStore
 	Contacts                ContactsService
 	Dialogs                 DialogsService
 	Chatlists               ChatlistsService
@@ -1094,7 +964,7 @@ type Deps struct {
 	SFU                     sfu.Service
 	TURN                    turnsrv.Service
 	LangPack                LangPackService
-	Sessions                SessionBinder
+	Sessions                EdgeController
 	Inline                  store.InlineRegistryStore
 	Limiter                 RateLimiter
 	Metrics                 Metrics
@@ -1217,17 +1087,16 @@ type PremiumService interface {
 // （rpc 层经 secretChatErr 映射为 ENCRYPTION_* / CHAT_ID_INVALID / DH_G_A_INVALID）。
 type SecretChatService interface {
 	RequestEncryption(ctx context.Context, req domain.SecretChatRequest) (domain.SecretChat, error)
-	AcceptEncryption(ctx context.Context, chatID int, viewerUserID, participantAuthKeyID, accessHash int64, gb []byte, keyFingerprint int64) (domain.SecretChat, error)
-	DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool) (domain.SecretChat, bool, error)
+	AcceptEncryption(ctx context.Context, chatID int, viewerUserID, participantAuthKeyID, accessHash int64, gb []byte, keyFingerprint int64, date int) (domain.SecretChat, error)
+	DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool, date int) (domain.SecretChat, bool, error)
 	// DiscardForAuthKey 级联 discard 绑定该 perm auth_key 的全部活跃密聊（设备登出/授权撤销），
 	// 返回实际迁移到 discarded 的密聊供通知对端。
-	DiscardForAuthKey(ctx context.Context, authKeyID int64) ([]domain.SecretChat, error)
+	DiscardForAuthKey(ctx context.Context, authKeyID, ownerUserID int64, date int) ([]domain.SecretChat, error)
 	GetSecretChat(ctx context.Context, chatID int) (domain.SecretChat, bool, error)
 	SendEncrypted(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID, accessHash int64, delivery domain.SecretMessageDelivery) (domain.SecretChat, domain.SecretChatMessage, error)
 	ListNewMessages(ctx context.Context, deviceAuthKeyID int64, sinceQts, limit int) ([]domain.SecretChatMessage, error)
 	DeviceReservedQts(ctx context.Context, deviceAuthKeyID int64) (int, error)
 	AckQueue(ctx context.Context, deviceAuthKeyID int64, maxQts int) error
-	RecordEncryptionEvent(ctx context.Context, chatID int, targetUserID, targetAuthKeyID int64, date int) error
 	RecordReadEvent(ctx context.Context, chatID int, targetUserID, targetAuthKeyID int64, maxDate, date int) error
 	ListStateEvents(ctx context.Context, userID, deviceAuthKeyID int64, limit int) ([]domain.EncryptedStateEvent, error)
 	MarkStateEventsDelivered(ctx context.Context, deviceAuthKeyID int64, eventIDs []int64) error
@@ -1278,7 +1147,7 @@ type GroupCallsService interface {
 	SetJoinMuted(ctx context.Context, callID int64, joinMuted bool) (domain.GroupCall, bool, error)
 	SetStartedMessageID(ctx context.Context, callID int64, msgID int) error
 	SweepStale(ctx context.Context, checkOlderThan, now, limit int) ([]domain.GroupCallMutation, error)
-	ResetAllParticipants(ctx context.Context, now int) ([]domain.GroupCall, error)
+	ResetParticipantsForCalls(ctx context.Context, callIDs []int64, now int) ([]domain.GroupCall, error)
 	NextRaiseHandRating(ctx context.Context, callID int64) (int64, error)
 	SetParticipantOverride(ctx context.Context, callID, setterUserID, targetUserID int64, override domain.GroupCallParticipantOverride, clear bool) error
 	ParticipantOverride(ctx context.Context, callID, setterUserID, targetUserID int64) (domain.GroupCallParticipantOverride, bool, error)

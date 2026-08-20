@@ -188,9 +188,43 @@ func (r *Router) onUploadGetGroupCallStream(ctx context.Context, loc *tg.InputGr
 	}, nil
 }
 
-// onUploadGetFileHashes 返回空 hash 列表：本阶段不做 CDN/分片完整性校验，客户端据空列表直接信任数据。
 func (r *Router) onUploadGetFileHashes(ctx context.Context, req *tg.UploadGetFileHashesRequest) ([]tg.FileHash, error) {
-	return []tg.FileHash{}, nil
+	if req.Offset < 0 {
+		return nil, offsetInvalidErr()
+	}
+	if r.deps.Files == nil {
+		return nil, notImplementedErr()
+	}
+	key, ok, err := r.authorizedFileLocationKey(ctx, req.Location)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, locationInvalidErr()
+	}
+	hashes, found, err := r.deps.Files.GetFileHashes(ctx, domain.FileHashRequest{
+		LocationKey: key,
+		Offset:      req.Offset,
+	})
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !found {
+		return nil, locationInvalidErr()
+	}
+	return tgFileHashes(hashes), nil
+}
+
+func tgFileHashes(hashes []domain.FileHash) []tg.FileHash {
+	out := make([]tg.FileHash, 0, len(hashes))
+	for _, hash := range hashes {
+		out = append(out, tg.FileHash{
+			Offset: hash.Offset,
+			Limit:  hash.Limit,
+			Hash:   append([]byte(nil), hash.Hash...),
+		})
+	}
+	return out
 }
 
 // fileLocationKey 把 tg.InputFileLocation 推导为 file_blobs 的 location_key。

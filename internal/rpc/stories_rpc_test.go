@@ -443,6 +443,10 @@ func TestStoriesReadStoriesRecordsDifferenceUpdate(t *testing.T) {
 		t.Fatalf("upsert story: %v", err)
 	}
 	r := New(Config{}, Deps{
+		Users: mapUsersService{users: map[int64]domain.User{
+			owner.ID:   {ID: owner.ID, FirstName: "Owner"},
+			1000000002: {ID: 1000000002, FirstName: "Viewer"},
+		}},
 		Stories: appstories.NewService(storyStore),
 		Updates: appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
@@ -615,6 +619,10 @@ func TestStoriesReadStoriesClampsFutureMaxID(t *testing.T) {
 		}
 	}
 	r := New(Config{}, Deps{
+		Users: mapUsersService{users: map[int64]domain.User{
+			owner.ID:   {ID: owner.ID, FirstName: "Owner"},
+			1000000002: {ID: 1000000002, FirstName: "Viewer"},
+		}},
 		Stories: appstories.NewService(storyStore),
 		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
@@ -6248,6 +6256,7 @@ func TestStoriesMediaAreasRoundTripSendEditClearAndDifference(t *testing.T) {
 		Stories: appstories.NewService(storyStore),
 		Updates: appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
 		Files:   &fakeFiles{photos: map[int64]domain.Photo{}},
+		Inline:  newTestInlineRegistryStore(),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000520, 0)})
 	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, user.ID), authKeyID), 71)
 
@@ -6510,6 +6519,7 @@ func TestStoriesInputChannelPostMediaAreaResolvesToConcrete(t *testing.T) {
 		Channels: channelService,
 		Stories:  appstories.NewService(storyStore),
 		Files:    &fakeFiles{photos: map[int64]domain.Photo{}},
+		Inline:   newTestInlineRegistryStore(),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000523, 0)})
 	reqCtx := WithUserID(ctx, user.ID)
 
@@ -6594,6 +6604,7 @@ func TestStoriesMediaAreasRejectInvalidInputWithoutMutation(t *testing.T) {
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
 		Files:   &fakeFiles{photos: map[int64]domain.Photo{}},
+		Inline:  newTestInlineRegistryStore(),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000530, 0)})
 	reqCtx := WithUserID(ctx, user.ID)
 

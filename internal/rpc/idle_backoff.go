@@ -44,6 +44,10 @@ func (b *idleBackoff) IdleDelay() time.Duration {
 }
 
 func runIdleBackoffLoop(ctx context.Context, interval, maxIdleInterval time.Duration, dispatch func(context.Context) bool) {
+	runIdleBackoffLoopWithWake(ctx, interval, maxIdleInterval, nil, dispatch)
+}
+
+func runIdleBackoffLoopWithWake(ctx context.Context, interval, maxIdleInterval time.Duration, wake <-chan struct{}, dispatch func(context.Context) bool) {
 	if dispatch == nil {
 		return
 	}
@@ -55,14 +59,29 @@ func runIdleBackoffLoop(ctx context.Context, interval, maxIdleInterval time.Dura
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		case _, ok := <-wake:
+			if !ok {
+				wake = nil
+				continue
+			}
 		}
 		if dispatch(ctx) {
 			// 有积压时立即继续 drain；interval 只用于空闲轮询。旧逻辑每个非空
 			// batch 也固定等待 base，形成 batch/base 的人工吞吐上限。
 			_ = backoff.ActiveDelay()
-			timer.Reset(0)
+			resetIdleBackoffTimer(timer, 0)
 			continue
 		}
-		timer.Reset(backoff.IdleDelay())
+		resetIdleBackoffTimer(timer, backoff.IdleDelay())
 	}
+}
+
+func resetIdleBackoffTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
 }

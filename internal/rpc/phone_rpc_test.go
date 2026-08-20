@@ -31,7 +31,7 @@ type phonePushRecord struct {
 	msg            bin.Encoder
 }
 
-// phoneCaptureSessions 是带完整推送日志的 SessionBinder fake（captureSessions 只留最后一条）。
+// phoneCaptureSessions 是带完整推送日志的 EdgeController fake（captureSessions 只留最后一条）。
 type phoneCaptureSessions struct {
 	mu      sync.Mutex
 	log     []phonePushRecord
@@ -141,6 +141,19 @@ var (
 	phoneOtherCalleeRawAuthKey = [8]byte{0x33, 0x03}
 )
 
+func newRPCPhoneService(t *testing.T, clk clock.Clock) *appphone.Service {
+	t.Helper()
+	opts := []appphone.Option{}
+	if clk != nil {
+		opts = append(opts, appphone.WithClock(clk))
+	}
+	svc, err := appphone.NewService(appphone.Config{}, appphone.NewInMemoryActiveCallStoreForTest(), opts...)
+	if err != nil {
+		t.Fatalf("new phone service: %v", err)
+	}
+	return svc
+}
+
 func newPhoneFixture(t *testing.T, privacy PrivacyService) *phoneFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -149,7 +162,7 @@ func newPhoneFixture(t *testing.T, privacy PrivacyService) *phoneFixture {
 	router := New(Config{CallSignalingMaxBytes: 1024}, Deps{
 		Users:    appusers.NewService(userStore),
 		Privacy:  privacy,
-		Phone:    appphone.NewService(appphone.Config{}),
+		Phone:    newRPCPhoneService(t, nil),
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 	f := &phoneFixture{t: t, ctx: ctx, router: router, sessions: sessions}
@@ -678,7 +691,7 @@ func newPhoneFixtureFull(t *testing.T, clk clock.Clock, messages *phoneCaptureMe
 	deps := Deps{
 		Users:    appusers.NewService(userStore),
 		Privacy:  stubPrivacy{},
-		Phone:    appphone.NewService(appphone.Config{}, appphone.WithClock(clk)),
+		Phone:    newRPCPhoneService(t, clk),
 		Sessions: sessions,
 	}
 	if messages != nil {
@@ -873,7 +886,7 @@ func TestPhoneCallHistoryThroughRealPipeline(t *testing.T) {
 	router := New(Config{CallSignalingMaxBytes: 1024}, Deps{
 		Users:    appusers.NewService(userStore),
 		Privacy:  stubPrivacy{},
-		Phone:    appphone.NewService(appphone.Config{}, appphone.WithClock(clk)),
+		Phone:    newRPCPhoneService(t, clk),
 		Messages: appmessages.NewService(messageStore, dialogs),
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clk)

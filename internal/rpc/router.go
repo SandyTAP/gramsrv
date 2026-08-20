@@ -99,6 +99,10 @@ type Config struct {
 	TempKeyResolveCacheTTL time.Duration
 	// TempKeyResolveCacheMaxEntries 是 temp→perm 解析缓存容量；<=0 用内置默认。
 	TempKeyResolveCacheMaxEntries int
+	// AuthUserCacheTTL 是 positive auth_key->user authorization 缓存的安全兜底 TTL。
+	// 写侧 invalidation 仍是主路径；>0 时 TTL 到期会重新读取 durable authorization，
+	// 防止跨 Core pub/sub/control 丢失后被撤销设备永久沿用旧进程缓存。
+	AuthUserCacheTTL time.Duration
 }
 
 // Router 把解密后的 RPC 请求按 semantic method 路由到 typed handler（tlprofile.Dispatcher）。
@@ -146,7 +150,7 @@ type Router struct {
 	instanceID                 string
 	channelFanout              *channelFanoutDispatcher
 	// botAPIEnqueueQueue 把 user→bot 私聊消息的 bot_api_updates 写入移出发送者 RPC 同步
-	// 路径（性能审计 H2）；队列满同步回退，绝不丢（队列行是 Bot API 投递真值）。
+	// 路径（性能审计 H2）；队列满在调用方路径完成 durable insert，绝不丢（队列行是 Bot API 投递真值）。
 	botAPIEnqueueQueue *botAPIEnqueueDispatcher
 
 	// presenceCandidateCache 缓存 presence fan-out 的候选 peer 集合（联系人 ∪ 私聊对端，
@@ -240,8 +244,9 @@ type authLayerDefaultEvidence struct {
 }
 
 type authUserCacheEntry struct {
-	userID int64
-	found  bool
+	userID    int64
+	found     bool
+	expiresAt time.Time
 }
 
 // New 创建 Router，由各业务域自行注册其 RPC handler（registerHelp/Auth/Users/Updates）。
@@ -255,7 +260,7 @@ func New(cfg Config, deps Deps, log *zap.Logger, clk clock.Clock) *Router {
 	if instanceID == "" {
 		instanceID = fmt.Sprintf("%016x", randomNonZeroInt64())
 	}
-	r := &Router{cfg: cfg, appLinks: appLinks, log: log, clock: clk, deps: deps, exactProfiles: make(map[clientInfoSessionKey]exactSessionProfileEntry), authLayerEvidence: make(map[[8]byte]authLayerDefaultEvidence), presence: newPresenceTracker(), callbacks: newCallbackRegistry(deps.BotCallbacks), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(), botAPIUpdates: newBotAPIUpdateNotifier(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), accountFreezeWake: make(chan struct{}, 1), instanceID: instanceID}
+	r := &Router{cfg: cfg, appLinks: appLinks, log: log, clock: clk, deps: deps, exactProfiles: make(map[clientInfoSessionKey]exactSessionProfileEntry), authLayerEvidence: make(map[[8]byte]authLayerDefaultEvidence), presence: newPresenceTracker(), callbacks: newCallbackRegistry(deps.BotCallbacks), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(deps.LoginTokens), botAPIUpdates: newBotAPIUpdateNotifier(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), accountFreezeWake: make(chan struct{}, 1), instanceID: instanceID}
 	r.channelFanout = newChannelFanoutDispatcher(r, defaultChannelFanoutShards, defaultChannelFanoutBuffer)
 	r.botAPIEnqueueQueue = newBotAPIEnqueueDispatcher(log, defaultBotAPIEnqueueBuffer)
 	r.webPageResolveSem = make(chan struct{}, webPageResolveConcurrency)
@@ -373,6 +378,12 @@ func (r *Router) DispatchWithMethod(ctx context.Context, authKeyID [8]byte, sess
 }
 
 func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) ([8]byte, error) {
+	if hinted, ok := r.permanentAuthKeyIDFromIdentityHint(ctx, rawAuthKeyID, sessionID); ok {
+		return hinted, nil
+	}
+	if hinted, ok := r.cachedTempAuthKeyIDFromIdentityHint(ctx, rawAuthKeyID, sessionID); ok {
+		return hinted, nil
+	}
 	var (
 		cached    [8]byte
 		hasCached bool
@@ -401,7 +412,7 @@ func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, s
 			}
 			// Missing metadata and a session lookup miss both fail closed to the
 			// durable resolver. Treating either as proof of permanence recreates the
-			// raw-temp identity split when an alternate SessionBinder is installed.
+			// raw-temp identity split when an alternate EdgeController is installed.
 		}
 		// temp→perm 解析缓存：PFS 连接每帧都要解析一次 temp key（ResolveAuthKey 打 PG）。TTL 内复用
 		// 上次解析、跳过 DB。仅当缓存的 perm 仍等于 session binder 当前 perm 才用（rebind 会改 binder
@@ -473,16 +484,27 @@ func (r *Router) effectiveUserID(ctx context.Context, rawAuthKeyID, authKeyID [8
 		}
 		return userID, true, nil
 	}
+	if userID, ok := r.userIDFromIdentityHint(ctx, rawAuthKeyID, authKeyID, sessionID); ok {
+		return userID, true, nil
+	}
+	revalidateSessionUser := false
 	if r.deps.Sessions != nil {
 		if userID, resolved := r.deps.Sessions.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
-			if userID == 0 {
+			if userID != 0 && r.deps.Auth != nil && r.authUserCacheTTL() > 0 {
+				if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok && cachedUserID == userID {
+					return userID, true, nil
+				}
+				revalidateSessionUser = true
+			} else if userID == 0 {
 				if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok {
 					r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, cachedUserID)
 					r.announceSessionOnline(ctx, cachedUserID)
 					return cachedUserID, true, nil
 				}
+				return 0, false, nil
+			} else {
+				return userID, true, nil
 			}
-			return userID, userID != 0, nil
 		}
 	}
 	if r.deps.Auth == nil {
@@ -499,7 +521,7 @@ func (r *Router) effectiveUserID(ctx context.Context, rawAuthKeyID, authKeyID [8
 	}
 	if r.deps.Sessions != nil {
 		if cachedUserID, resolved := r.deps.Sessions.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
-			if cachedUserID != 0 || !found {
+			if !revalidateSessionUser && (cachedUserID != 0 || !found) {
 				return cachedUserID, cachedUserID != 0, nil
 			}
 		}
@@ -537,12 +559,23 @@ func (r *Router) lookupAuthUser(ctx context.Context, authKeyID [8]byte) (int64, 
 }
 
 func (r *Router) cachedAuthUser(authKeyID [8]byte) (int64, bool, bool) {
+	now := r.clock.Now()
 	r.authUserMu.RLock()
-	defer r.authUserMu.RUnlock()
 	entry, ok := r.authUsers[authKeyID]
 	if !ok {
+		r.authUserMu.RUnlock()
 		return 0, false, false
 	}
+	if authUserCacheEntryExpired(entry, now) {
+		r.authUserMu.RUnlock()
+		r.authUserMu.Lock()
+		if current, ok := r.authUsers[authKeyID]; ok && authUserCacheEntryExpired(current, now) {
+			delete(r.authUsers, authKeyID)
+		}
+		r.authUserMu.Unlock()
+		return 0, false, false
+	}
+	r.authUserMu.RUnlock()
 	return entry.userID, entry.found, true
 }
 
@@ -555,6 +588,13 @@ func (r *Router) positiveCachedAuthUser(authKeyID [8]byte) (int64, bool) {
 }
 
 func (r *Router) setAuthUserCache(authKeyID [8]byte, userID int64, found bool) {
+	if !found || userID == 0 {
+		return
+	}
+	var expiresAt time.Time
+	if ttl := r.authUserCacheTTL(); ttl > 0 {
+		expiresAt = r.clock.Now().Add(ttl)
+	}
 	r.authUserMu.Lock()
 	defer r.authUserMu.Unlock()
 	if r.authUsers == nil {
@@ -563,7 +603,21 @@ func (r *Router) setAuthUserCache(authKeyID [8]byte, userID int64, found bool) {
 	if _, exists := r.authUsers[authKeyID]; !exists {
 		evictMapEntryIfFullLocked(r.authUsers, maxAuthUsersCached)
 	}
-	r.authUsers[authKeyID] = authUserCacheEntry{userID: userID, found: found}
+	r.authUsers[authKeyID] = authUserCacheEntry{userID: userID, found: found, expiresAt: expiresAt}
+}
+
+func (r *Router) authUserCacheTTL() time.Duration {
+	if r == nil {
+		return 0
+	}
+	if r.cfg.AuthUserCacheTTL <= 0 {
+		return 0
+	}
+	return r.cfg.AuthUserCacheTTL
+}
+
+func authUserCacheEntryExpired(entry authUserCacheEntry, now time.Time) bool {
+	return !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)
 }
 
 func (r *Router) invalidateAuthUserCache(authKeyID [8]byte) {

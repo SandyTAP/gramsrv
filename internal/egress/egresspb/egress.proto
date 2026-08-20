@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package telesrv.egress.v1;
+
+option go_package = "telesrv/internal/egress/egresspb;egresspb";
+
+service EgressAckService {
+  rpc GetInfo(EgressInfoRequest) returns (EgressInfoResponse);
+  rpc AckOutboxDelivery(OutboxClientAckRequest) returns (ErrorResponse);
+}
+
+message EgressInfoRequest {
+  uint32 protocol_version = 1;
+  uint32 min_supported_protocol_version = 2;
+  repeated string capabilities = 3;
+}
+
+message EgressInfoResponse {
+  uint32 protocol_version = 1;
+  uint32 min_supported_protocol_version = 2;
+  repeated string capabilities = 3;
+  string implementation = 4;
+  string instance_id = 5;
+  string error = 6;
+}
+
+message OutboxClientAckRequest {
+  int64 outbox_id = 1;
+  int64 target_user_id = 2;
+  int32 pts = 3;
+  int32 attempt = 4;
+  bytes auth_key_id = 5;
+  int64 session_id = 6;
+  int64 server_msg_id = 7;
+  int64 acked_at_unix_nano = 8;
+}
+
+message ErrorResponse {
+  string error = 1;
+}

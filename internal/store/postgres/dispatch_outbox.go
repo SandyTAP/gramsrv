@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
@@ -36,6 +38,7 @@ func enqueueDispatch(ctx context.Context, q *sqlcgen.Queries, arg sqlcgen.Enqueu
 
 // DispatchOutboxStore 用 PostgreSQL 实现 transactional outbox。
 type DispatchOutboxStore struct {
+	db           sqlcgen.DBTX
 	q            *sqlcgen.Queries
 	leaseSeconds int32
 }
@@ -58,6 +61,7 @@ func WithLeaseTimeout(d time.Duration) DispatchOutboxOption {
 // NewDispatchOutboxStore 基于 pgx 连接池（或事务）创建 DispatchOutboxStore。
 func NewDispatchOutboxStore(db sqlcgen.DBTX, opts ...DispatchOutboxOption) *DispatchOutboxStore {
 	s := &DispatchOutboxStore{
+		db:           db,
 		q:            sqlcgen.New(db),
 		leaseSeconds: int32(defaultDispatchLease / time.Second),
 	}
@@ -156,7 +160,8 @@ func dispatchItemsFromClaimRows(rows []sqlcgen.ClaimDispatchOutboxRow) []store.D
 	return out
 }
 
-// MarkDeliveredBatch 一次性删除一批已投递的 outbox 行（方案 A：投递成功即删），取代逐条 MarkDelivered。
+// MarkDeliveredBatch 一次性删除一批在线 outbox 行。业务事实仍保留在
+// user_update_events，客户端漏掉实时推送时通过 updates.getDifference 恢复。
 func (s *DispatchOutboxStore) MarkDeliveredBatch(ctx context.Context, items []store.DispatchOutboxItem) error {
 	if len(items) == 0 {
 		return nil
@@ -194,6 +199,82 @@ func (s *DispatchOutboxStore) MarkDelivered(ctx context.Context, item store.Disp
 	}
 	if rows != 1 {
 		return fmt.Errorf("mark dispatch delivered: %w", store.ErrDispatchLeaseLost)
+	}
+	return nil
+}
+
+// MarkAbandoned deletes an exhausted online-delivery task while leaving the
+// durable user_update_events fact intact for updates.getDifference recovery.
+func (s *DispatchOutboxStore) MarkAbandoned(ctx context.Context, item store.DispatchOutboxItem, lastError string) error {
+	tag, err := s.db.Exec(ctx, `
+WITH locked_head AS MATERIALIZED (
+  SELECT h.target_user_id
+  FROM dispatch_outbox_user_heads h
+  WHERE h.target_user_id = $1
+  FOR UPDATE
+)
+DELETE FROM dispatch_outbox d
+USING locked_head h
+WHERE d.target_user_id = h.target_user_id
+  AND d.id = $2
+  AND d.status = 'dispatching'
+  AND d.attempts = $3`,
+		item.TargetUserID,
+		item.ID,
+		int32(item.Attempts),
+	)
+	if err != nil {
+		return fmt.Errorf("mark dispatch abandoned: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mark dispatch abandoned: %w", store.ErrDispatchLeaseLost)
+	}
+	return nil
+}
+
+func (s *DispatchOutboxStore) MarkClientAcked(ctx context.Context, ack store.DispatchOutboxClientAck) error {
+	tag, err := s.db.Exec(ctx, `
+WITH locked_head AS MATERIALIZED (
+  SELECT h.target_user_id
+  FROM dispatch_outbox_user_heads h
+  WHERE h.target_user_id = $1
+  FOR UPDATE
+)
+DELETE FROM dispatch_outbox d
+USING locked_head h
+WHERE d.target_user_id = h.target_user_id
+  AND d.id = $2
+  AND d.pts = $3
+  AND d.status = 'dispatching'
+  AND d.attempts = $4`,
+		ack.TargetUserID,
+		ack.OutboxID,
+		int32(ack.Pts),
+		int32(ack.Attempt),
+	)
+	if err != nil {
+		return fmt.Errorf("mark dispatch client acked: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		var status string
+		var attempts int
+		err := s.db.QueryRow(ctx, `
+SELECT status, attempts
+FROM dispatch_outbox
+WHERE target_user_id = $1
+  AND id = $2
+  AND pts = $3`,
+			ack.TargetUserID,
+			ack.OutboxID,
+			int32(ack.Pts),
+		).Scan(&status, &attempts)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("mark dispatch client acked inspect current row: %w", err)
+		}
+		return fmt.Errorf("mark dispatch client acked: %w: current status=%s attempts=%d ack_attempt=%d", store.ErrDispatchLeaseLost, status, attempts, ack.Attempt)
 	}
 	return nil
 }

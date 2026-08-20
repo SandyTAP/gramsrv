@@ -224,8 +224,8 @@ func (s *Service) SweepStale(ctx context.Context, checkOlderThan, now, limit int
 	return s.store.SweepStaleParticipants(ctx, checkOlderThan, now, limit)
 }
 
-func (s *Service) ResetAllParticipants(ctx context.Context, now int) ([]domain.GroupCall, error) {
-	return s.store.ResetAllParticipants(ctx, now)
+func (s *Service) ResetParticipantsForCalls(ctx context.Context, callIDs []int64, now int) ([]domain.GroupCall, error) {
+	return s.store.ResetParticipantsForCalls(ctx, callIDs, now)
 }
 
 func (s *Service) NextRaiseHandRating(ctx context.Context, callID int64) (int64, error) {

@@ -51,7 +51,7 @@ func (r *Router) onChannelsToggleViewForumAsMessages(ctx context.Context, req *t
 	if out == nil {
 		out = tgEmptyUpdates(event.Date)
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, out)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }
 

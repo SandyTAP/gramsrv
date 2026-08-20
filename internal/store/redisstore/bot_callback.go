@@ -3,6 +3,7 @@ package redisstore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -13,7 +14,7 @@ import (
 	"telesrv/internal/store"
 )
 
-const botCallbackAnswerChannel = "telesrv:bot_callback:answers"
+const botCallbackWakeTTL = 30 * time.Second
 
 type BotCallbackRegistryStore struct {
 	c redis.UniversalClient
@@ -25,6 +26,10 @@ func NewBotCallbackRegistryStore(c redis.UniversalClient) *BotCallbackRegistrySt
 
 func botCallbackKey(queryID int64) string {
 	return fmt.Sprintf("telesrv:bot_callback:%d", queryID)
+}
+
+func botCallbackWakeKey(queryID int64) string {
+	return fmt.Sprintf("telesrv:bot_callback:%d:wake", queryID)
 }
 
 var putBotCallbackScript = redis.NewScript(`
@@ -63,7 +68,8 @@ if redis.call('HEXISTS', KEYS[1], 'answer') ~= 0 then
   return 0
 end
 redis.call('HSET', KEYS[1], 'answer', ARGV[2])
-redis.call('PUBLISH', ARGV[3], ARGV[4])
+redis.call('LPUSH', KEYS[2], '1')
+redis.call('PEXPIRE', KEYS[2], ARGV[3])
 return 1
 `)
 
@@ -75,12 +81,8 @@ func (s *BotCallbackRegistryStore) ResolveBotCallback(ctx context.Context, botUs
 	if err != nil {
 		return false, fmt.Errorf("marshal bot callback answer: %w", err)
 	}
-	pushJSON, err := json.Marshal(store.BotCallbackAnswerPush{QueryID: queryID, BotUserID: botUserID, Answer: answer})
-	if err != nil {
-		return false, fmt.Errorf("marshal bot callback answer push: %w", err)
-	}
-	result, err := resolveBotCallbackScript.Run(ctx, s.c, []string{botCallbackKey(queryID)},
-		strconv.FormatInt(botUserID, 10), answerJSON, botCallbackAnswerChannel, pushJSON).Int64()
+	result, err := resolveBotCallbackScript.Run(ctx, s.c, []string{botCallbackKey(queryID), botCallbackWakeKey(queryID)},
+		strconv.FormatInt(botUserID, 10), answerJSON, botCallbackWakeTTL.Milliseconds()).Int64()
 	if err != nil {
 		return false, fmt.Errorf("resolve bot callback: %w", err)
 	}
@@ -105,46 +107,42 @@ func (s *BotCallbackRegistryStore) GetBotCallbackAnswer(ctx context.Context, bot
 	return answer, true, nil
 }
 
+func (s *BotCallbackRegistryStore) WaitBotCallbackAnswer(ctx context.Context, botUserID, queryID int64) (domain.BotCallbackAnswer, bool, error) {
+	if s == nil || s.c == nil || botUserID <= 0 || queryID == 0 {
+		return domain.BotCallbackAnswer{}, false, nil
+	}
+	for {
+		answer, found, err := s.GetBotCallbackAnswer(ctx, botUserID, queryID)
+		if err != nil || found {
+			return answer, found, err
+		}
+		_, err = s.c.BLPop(ctx, 0, botCallbackWakeKey(queryID)).Result()
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return domain.BotCallbackAnswer{}, false, nil
+		}
+		if err == redis.Nil {
+			continue
+		}
+		return domain.BotCallbackAnswer{}, false, fmt.Errorf("wait bot callback answer: %w", err)
+	}
+}
+
 var deleteBotCallbackScript = redis.NewScript(`
 if redis.call('HGET', KEYS[1], 'bot_user_id') ~= ARGV[1] then
   return 0
 end
-return redis.call('DEL', KEYS[1])
+return redis.call('DEL', KEYS[1], KEYS[2])
 `)
 
 func (s *BotCallbackRegistryStore) DeleteBotCallbackPending(ctx context.Context, botUserID, queryID int64) error {
 	if s == nil || s.c == nil || botUserID <= 0 || queryID == 0 {
 		return nil
 	}
-	if _, err := deleteBotCallbackScript.Run(ctx, s.c, []string{botCallbackKey(queryID)}, strconv.FormatInt(botUserID, 10)).Result(); err != nil && err != redis.Nil {
+	if _, err := deleteBotCallbackScript.Run(ctx, s.c, []string{botCallbackKey(queryID), botCallbackWakeKey(queryID)}, strconv.FormatInt(botUserID, 10)).Result(); err != nil && err != redis.Nil {
 		return fmt.Errorf("delete bot callback pending: %w", err)
 	}
 	return nil
-}
-
-func (s *BotCallbackRegistryStore) SubscribeBotCallbackAnswers(ctx context.Context, handle func(context.Context, store.BotCallbackAnswerPush)) error {
-	if s == nil || s.c == nil || handle == nil {
-		return nil
-	}
-	pubsub := s.c.Subscribe(ctx, botCallbackAnswerChannel)
-	defer pubsub.Close()
-	if _, err := pubsub.Receive(ctx); err != nil {
-		return fmt.Errorf("subscribe bot callback answers: %w", err)
-	}
-	channel := pubsub.Channel(redis.WithChannelSize(256))
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case message, ok := <-channel:
-			if !ok {
-				return nil
-			}
-			var push store.BotCallbackAnswerPush
-			if err := json.Unmarshal([]byte(message.Payload), &push); err != nil || push.QueryID == 0 || push.BotUserID <= 0 {
-				continue
-			}
-			handle(ctx, push)
-		}
-	}
 }

@@ -59,12 +59,13 @@ func (r *Router) onMessagesSaveDraft(ctx context.Context, req *tg.MessagesSaveDr
 		Seq:     0,
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	return true, nil
 }
 
 // recordDraftMessageEvent 记录 draft_message durable 事件（占账号 pts，无 wire pts），
-// 经 outbox dispatcher 推给其它在线 session；Updates 服务缺席时返回零值（退化为直推）。
+// 经 transactional outbox + 独立 Egress 推给其它在线 session；Updates 服务缺席时
+// fail-closed，不再从 Core/RPC 直推 session。
 func (r *Router) recordDraftMessageEvent(ctx context.Context, userID int64, peer domain.Peer, topMsgID int, date *int) domain.UpdateEvent {
 	if r.deps.Updates == nil {
 		return domain.UpdateEvent{}
@@ -142,7 +143,7 @@ func (r *Router) onMessagesClearAllDrafts(ctx context.Context) (bool, error) {
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, events...)
 	users, chats := r.peerObjectsForDrafts(ctx, userID, drafts)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: updates,
 		Users:   users,
 		Chats:   chats,
@@ -408,7 +409,7 @@ func (r *Router) clearDraftAfterSendWithOptionalPeerObjects(ctx context.Context,
 	if !peerObjectsReady {
 		users, chats = r.peerObjectsForDraftUpdate(ctx, userID, peer)
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
 		Users:   users,
 		Chats:   chats,
@@ -478,7 +479,7 @@ func (r *Router) onMessagesUpdateDialogFilter(ctx context.Context, req *tg.Messa
 		}
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, tgUpdateForOutboxEvent(event))
+	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -510,7 +511,7 @@ func (r *Router) onMessagesUpdateDialogFiltersOrder(ctx context.Context, order [
 		}
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, tgUpdateForOutboxEvent(event))
+	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -538,7 +539,7 @@ func (r *Router) onMessagesToggleDialogFilterTags(ctx context.Context, enabled b
 		}
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, tgUpdateForOutboxEvent(event))
+	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -644,7 +645,7 @@ func (r *Router) onMessagesToggleDialogPin(ctx context.Context, req *tg.Messages
 			date, recorded = state.Date, event
 		}
 		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogPinned{Pinned: pinned, Peer: tgDialogPeer(peer)}}, recorded),
 			Chats:   []tg.ChatClass{tgCommunityChat(community)}, Date: date,
 		})
@@ -713,7 +714,7 @@ func (r *Router) onMessagesToggleDialogPin(ctx context.Context, req *tg.Messages
 			update.SetFolderID(folderID)
 		}
 		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
 			Date:    date,
 			Seq:     0,
@@ -753,7 +754,7 @@ func (r *Router) toggleArchiveFolderPin(ctx context.Context, userID int64, folde
 		recorded = event
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogPinned{
 			Pinned: pinned,
 			Peer:   &tg.DialogPeerFolder{FolderID: folderID},
@@ -832,7 +833,7 @@ func (r *Router) onMessagesReorderPinnedDialogs(ctx context.Context, req *tg.Mes
 		update.SetFolderID(req.FolderID)
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
 		Date:    date,
 		Seq:     0,
@@ -887,7 +888,7 @@ func (r *Router) onMessagesMarkDialogUnread(ctx context.Context, req *tg.Message
 			recorded = event
 		}
 		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogUnreadMark{
 				Unread: unread,
 				Peer:   tgDialogPeer(peers[0]),
@@ -965,7 +966,7 @@ func (r *Router) onMessagesHidePeerSettingsBar(ctx context.Context, input tg.Inp
 		recorded = event
 	}
 	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
+	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
 		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdatePeerSettings{
 			Peer:     tgPeer(peer),
 			Settings: tg.PeerSettings{},

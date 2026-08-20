@@ -15,6 +15,8 @@ import (
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
+
+	"telesrv/internal/edgecontrol"
 )
 
 // ErrSessionNotFound 表示目标 session 当前无活跃连接。
@@ -23,6 +25,7 @@ var ErrSessionNotFound = errors.New("session not found")
 var (
 	ErrSessionActivationSuperseded = errors.New("session activation superseded")
 	ErrSessionActivationFence      = errors.New("session activation could not fence previous writer")
+	errChannelDeliverySkipped      = errors.New("channel delivery skipped by session waterline")
 )
 
 const (
@@ -52,15 +55,22 @@ const (
 	// 它只防「单 auth_key 累积海量连接」的病态（使 CloseSessionsForRawAuthKey/pushToUser 遍历
 	// 退化 O(N)），超限驱逐的也只是同一设备凭据自身的连接，不会误伤别的账号。
 	maxSessionsPerAuthKey = 256
-	// maxChannelIndexPerSession：单 session 在 channel 路由索引（interest / membership）中
-	// 登记的 channel 数上限。membership 源于真实成员关系（大账号可能很多），interest 受客户端
-	// 直接控制；两者都设一个宽松上界防内存放大，超出即截断并记日志。
-	maxChannelIndexPerSession = 8192
+	// maxChannelInterestPerSession bounds the client-controlled active-viewer
+	// index. Durable memberships are server-owned and paged without truncation.
+	maxChannelInterestPerSession = 8192
+	// Delivery watermarks are a dedupe optimization, not an admission gate.
+	// Evicting one old channel at the cap may permit a duplicate later; rejecting
+	// the new channel would silently drop a real update for large accounts.
+	maxChannelDeliveryWatermarksPerSession = 8192
 	// Official clients short-poll at most ten opened channels per session. Keep the
 	// server-side passive subscription index at the same hard bound.
 	maxChannelSubscriptionsPerSession = 10
 	defaultChannelSubscriptionTTL     = 75 * time.Second
 	maxChannelSubscriptionTTL         = 2 * time.Minute
+	// One post-response action is bounded to five seconds. Keep ownership long
+	// enough for a healthy paged scan while still allowing a later RPC to take
+	// over a Core process that disappeared without sending Abort.
+	channelMembershipSyncOwnershipTTL = 15 * time.Second
 )
 
 // forceCloseBatchTimeout is one deadline for a whole revoke/replace/eviction batch. Conn.Close
@@ -75,11 +85,29 @@ const forceCloseBatchTimeout = rpcCloseWaitTimeout
 // memory while the bounded workers continue draining physical sockets in the background.
 const maxForceCloseParallelism = 64
 
+const defaultLocationRegistryOperationTimeout = 5 * time.Second
+
 type queuedPush struct {
-	t           proto.MessageType
-	updates     *layerUpdatesFanout
-	reservation *pendingPushReservation
-	at          time.Time
+	t                 proto.MessageType
+	updates           *layerUpdatesFanout
+	reservation       *pendingPushReservation
+	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
+	channelDelivery   edgecontrol.ChannelDeliveryWatermark
+	at                time.Time
+}
+
+type channelMembershipSync struct {
+	id                 int64
+	userID             int64
+	expectedGeneration int64
+	channelIDs         map[int64]struct{}
+	expiresAt          time.Time
+	committing         bool
+}
+
+type publishedChannelMembership struct {
+	active     bool
+	channelIDs []int64
 }
 
 type pendingPushReservation struct {
@@ -141,6 +169,13 @@ type sessionKey struct {
 	sessionID int64
 }
 
+type rawAuthKeyIdentity struct {
+	businessAuthKeyID       [8]byte
+	businessAuthKeyResolved bool
+	userID                  int64
+	userIDResolved          bool
+}
+
 type channelSubscription struct {
 	userID    int64
 	expiresAt int64
@@ -178,21 +213,31 @@ type SessionManager struct {
 	// claims owns the provisional -> active gap. A claimant is intentionally
 	// absent from every push/online index until its required session control frame
 	// is on the wire and PublishActivation validates the same owner.
-	claims                 map[sessionKey]*Conn
-	claimsByAuth           map[[8]byte]map[int64]*Conn // raw authKeyID -> sessionID -> provisional claim
-	byAuthKey              map[[8]byte]map[int64]*Conn // raw authKeyID → sessionID → Conn
-	byBusinessAuthKey      map[[8]byte]map[sessionKey]*Conn
-	byUser                 map[int64]map[sessionKey]*Conn
-	byChannel              map[int64]map[sessionKey]int64 // channelID → session → userID，用于频道 active-viewer 临时推送
-	bySessionChannels      map[sessionKey]map[int64]struct{}
-	bySubscribedChannel    map[int64]map[sessionKey]channelSubscription
-	bySessionSubscriptions map[sessionKey]map[int64]int64
-	byMemberChannel        map[int64]map[sessionKey]int64 // channelID → session → userID，用于已上线成员持久 update 推送
-	bySessionMembers       map[sessionKey]map[int64]struct{}
-	pending                map[sessionKey][]queuedPush // updates-ready 前暂存的主动推送
-	flushing               map[sessionKey]bool         // 置位时暂存正在排空的 session；排空完成前推送继续进 pending 保序
-	pendingBudget          *outboundTrackedBudget      // 未就绪 session 暂存 encoded body 的进程级上限
-	logicalSessionReleased func(sessionKey)
+	claims                      map[sessionKey]*Conn
+	claimsByAuth                map[[8]byte]map[int64]*Conn // raw authKeyID -> sessionID -> provisional claim
+	byAuthKey                   map[[8]byte]map[int64]*Conn // raw authKeyID → sessionID → Conn
+	rawAuthKeyIdentity          map[[8]byte]rawAuthKeyIdentity
+	byBusinessAuthKey           map[[8]byte]map[sessionKey]*Conn
+	byUser                      map[int64]map[sessionKey]*Conn
+	byChannel                   map[int64]map[sessionKey]int64 // channelID → session → userID，用于频道 active-viewer 临时推送
+	bySessionChannels           map[sessionKey]map[int64]struct{}
+	bySubscribedChannel         map[int64]map[sessionKey]channelSubscription
+	bySessionSubscriptions      map[sessionKey]map[int64]int64
+	byMemberChannel             map[int64]map[sessionKey]int64 // channelID → session → userID，用于已上线成员持久 update 推送
+	bySessionMembers            map[sessionKey]map[int64]struct{}
+	pending                     map[sessionKey][]queuedPush // updates-ready 前暂存的主动推送
+	flushing                    map[sessionKey]bool         // 置位时暂存正在排空的 session；排空完成前推送继续进 pending 保序
+	pendingBudget               *outboundTrackedBudget      // 未就绪 session 暂存 encoded body 的进程级上限
+	logicalSessionReleased      func(sessionKey)
+	locationDirty               map[sessionKey]uint64
+	locationVersion             uint64
+	locationMembershipDirty     map[int64]uint64
+	locationMembershipVersion   uint64
+	locationMembershipPublished map[int64]publishedChannelMembership
+	locationState               atomic.Pointer[locationRegistryState]
+	locationFatal               chan error
+	membershipSyncs             map[sessionKey]*channelMembershipSync
+	membershipSyncVersion       int64
 
 	lifecycle SessionLifecycleObserver
 	log       *zap.Logger
@@ -204,24 +249,40 @@ func NewSessionManager(log *zap.Logger) *SessionManager {
 		log = zap.NewNop()
 	}
 	return &SessionManager{
-		bySession:              make(map[sessionKey]*Conn),
-		logicalSessions:        make(map[sessionKey]*logicalSession),
-		claims:                 make(map[sessionKey]*Conn),
-		claimsByAuth:           make(map[[8]byte]map[int64]*Conn),
-		byAuthKey:              make(map[[8]byte]map[int64]*Conn),
-		byBusinessAuthKey:      make(map[[8]byte]map[sessionKey]*Conn),
-		byUser:                 make(map[int64]map[sessionKey]*Conn),
-		byChannel:              make(map[int64]map[sessionKey]int64),
-		bySessionChannels:      make(map[sessionKey]map[int64]struct{}),
-		bySubscribedChannel:    make(map[int64]map[sessionKey]channelSubscription),
-		bySessionSubscriptions: make(map[sessionKey]map[int64]int64),
-		byMemberChannel:        make(map[int64]map[sessionKey]int64),
-		bySessionMembers:       make(map[sessionKey]map[int64]struct{}),
-		pending:                make(map[sessionKey][]queuedPush),
-		flushing:               make(map[sessionKey]bool),
-		pendingBudget:          newOutboundTrackedBudget(defaultPendingPushMaxBytes),
-		log:                    log,
+		bySession:                   make(map[sessionKey]*Conn),
+		logicalSessions:             make(map[sessionKey]*logicalSession),
+		claims:                      make(map[sessionKey]*Conn),
+		claimsByAuth:                make(map[[8]byte]map[int64]*Conn),
+		byAuthKey:                   make(map[[8]byte]map[int64]*Conn),
+		rawAuthKeyIdentity:          make(map[[8]byte]rawAuthKeyIdentity),
+		byBusinessAuthKey:           make(map[[8]byte]map[sessionKey]*Conn),
+		byUser:                      make(map[int64]map[sessionKey]*Conn),
+		byChannel:                   make(map[int64]map[sessionKey]int64),
+		bySessionChannels:           make(map[sessionKey]map[int64]struct{}),
+		bySubscribedChannel:         make(map[int64]map[sessionKey]channelSubscription),
+		bySessionSubscriptions:      make(map[sessionKey]map[int64]int64),
+		byMemberChannel:             make(map[int64]map[sessionKey]int64),
+		bySessionMembers:            make(map[sessionKey]map[int64]struct{}),
+		pending:                     make(map[sessionKey][]queuedPush),
+		flushing:                    make(map[sessionKey]bool),
+		pendingBudget:               newOutboundTrackedBudget(defaultPendingPushMaxBytes),
+		locationDirty:               make(map[sessionKey]uint64),
+		locationMembershipDirty:     make(map[int64]uint64),
+		locationMembershipPublished: make(map[int64]publishedChannelMembership),
+		locationFatal:               make(chan error, 1),
+		membershipSyncs:             make(map[sessionKey]*channelMembershipSync),
+		log:                         log,
 	}
+}
+
+// LocationRegistryFatal reports the first process-terminal location lease
+// failure. The channel is buffered so a loss between registry startup and the
+// public listener entering its serve loop cannot be missed by the Edge runtime.
+func (m *SessionManager) LocationRegistryFatal() <-chan error {
+	if m == nil {
+		return nil
+	}
+	return m.locationFatal
 }
 
 // SetLifecycleObserver installs a best-effort active session lifecycle observer.
@@ -229,6 +290,54 @@ func (m *SessionManager) SetLifecycleObserver(observer SessionLifecycleObserver)
 	m.mu.Lock()
 	m.lifecycle = observer
 	m.mu.Unlock()
+}
+
+// ActiveLocationRecords returns a bounded snapshot of active Edge-owned
+// sessions. It does not touch external stores. Production location renewal no
+// longer calls this method; the instance lease is O(1) and records are updated
+// incrementally from the dirty-session set.
+func (m *SessionManager) ActiveLocationRecords(instanceID string) []edgecontrol.LocationRecord {
+	if m == nil || instanceID == "" {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	m.mu.RLock()
+	records := make([]edgecontrol.LocationRecord, 0, len(m.bySession))
+	for key := range m.bySession {
+		if record, ok := m.locationRecordLocked(instanceID, key, now); ok {
+			records = append(records, record)
+		}
+	}
+	m.mu.RUnlock()
+	return records
+}
+
+func snapshotChannelIDSet(channels map[int64]struct{}) []int64 {
+	if len(channels) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(channels))
+	for channelID := range channels {
+		if channelID != 0 {
+			out = append(out, channelID)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func snapshotChannelSubscriptions(channels map[int64]int64, now int64) []edgecontrol.ChannelSubscriptionLocation {
+	if len(channels) == 0 {
+		return nil
+	}
+	out := make([]edgecontrol.ChannelSubscriptionLocation, 0, len(channels))
+	for channelID, expiresAt := range channels {
+		if channelID != 0 && expiresAt > now {
+			out = append(out, edgecontrol.ChannelSubscriptionLocation{ChannelID: channelID, ExpiresAtUnixNano: expiresAt})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ChannelID < out[j].ChannelID })
+	return out
 }
 
 func (m *SessionManager) setLogicalSessionReleaseHook(hook func(sessionKey)) {
@@ -282,13 +391,18 @@ func (m *SessionManager) ClearInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte) 
 	m.mu.RUnlock()
 
 	cleared := 0
+	changedKeys := make([]sessionKey, 0, len(conns))
 	for _, c := range conns {
 		if c.isRetired() {
 			continue
 		}
 		if changed, err := c.clearInheritedLayerProfileState(); err == nil && changed {
 			cleared++
+			changedKeys = append(changedKeys, connSessionKey(c))
 		}
+	}
+	if len(changedKeys) > 0 {
+		_ = m.triggerLocationRefresh(changedKeys...)
 	}
 	return cleared
 }
@@ -322,6 +436,7 @@ func (m *SessionManager) SeedInheritedLayerForBusinessAuthKey(businessAuthKeyID 
 	m.mu.RUnlock()
 
 	seeded := 0
+	changedKeys := make([]sessionKey, 0, len(conns))
 	for _, c := range conns {
 		if c.isRetired() {
 			continue
@@ -331,7 +446,11 @@ func (m *SessionManager) SeedInheritedLayerForBusinessAuthKey(businessAuthKeyID 
 		}
 		if changed, err := c.setLayerProfile(profile, LayerProfileInherited, false); err == nil && changed {
 			seeded++
+			changedKeys = append(changedKeys, connSessionKey(c))
 		}
+	}
+	if len(changedKeys) > 0 {
+		_ = m.triggerLocationRefresh(changedKeys...)
 	}
 	return seeded
 }
@@ -362,6 +481,7 @@ func (m *SessionManager) applyInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte, 
 	m.mu.RUnlock()
 
 	seeded := 0
+	changedKeys := make([]sessionKey, 0, len(conns))
 	for _, c := range conns {
 		if c.isRetired() {
 			continue
@@ -377,7 +497,11 @@ func (m *SessionManager) applyInheritedLayerForRawAuthKey(rawAuthKeyID [8]byte, 
 		}
 		if err == nil && changed {
 			seeded++
+			changedKeys = append(changedKeys, connSessionKey(c))
 		}
+	}
+	if len(changedKeys) > 0 {
+		_ = m.triggerLocationRefresh(changedKeys...)
 	}
 	return seeded
 }
@@ -439,6 +563,7 @@ func (m *SessionManager) ApplyOrderedRawLayerForSession(
 	}
 
 	applied := 0
+	changedKeys := make([]sessionKey, 0, len(conns))
 	for _, c := range conns {
 		if c == nil || c.isRetired() {
 			continue
@@ -449,7 +574,11 @@ func (m *SessionManager) ApplyOrderedRawLayerForSession(
 		}
 		if changed {
 			applied++
+			changedKeys = append(changedKeys, connSessionKey(c))
 		}
+	}
+	if len(changedKeys) > 0 {
+		_ = m.triggerLocationRefresh(changedKeys...)
 	}
 	return applied, nil
 }
@@ -523,6 +652,9 @@ func (m *SessionManager) SetClientLayerForAuthKey(rawAuthKeyID [8]byte, sessionI
 		seen[c] = struct{}{}
 		_, _ = c.setLayerProfile(profile, LayerProfileInherited, false)
 	}
+	if len(seen) > 0 {
+		_ = m.triggerLocationRefresh(key)
+	}
 }
 
 // BeginActivation atomically claims auth_key_id + session_id without publishing the
@@ -593,12 +725,13 @@ func (m *SessionManager) PublishActivation(c *Conn) error {
 	}
 	key := connSessionKey(c)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.claims[key] != c {
+		m.mu.Unlock()
 		return ErrSessionActivationSuperseded
 	}
 	if c.lifecycleState() != connLifecycleClaiming {
 		m.removeClaimLocked(key, c)
+		m.mu.Unlock()
 		return ErrConnClosed
 	}
 	if old := m.bySession[key]; old != nil && old != c {
@@ -606,12 +739,15 @@ func (m *SessionManager) PublishActivation(c *Conn) error {
 		// Never reverse-replace it from here; the caller must reconnect and claim again.
 		m.removeClaimLocked(key, c)
 		c.beginTerminalShutdown()
+		m.mu.Unlock()
 		return ErrSessionActivationSuperseded
 	}
 	if !c.publishActivation() {
 		m.removeClaimLocked(key, c)
+		m.mu.Unlock()
 		return ErrConnClosed
 	}
+	m.applyRawAuthKeyIdentityLocked(c, key)
 	m.removeClaimLocked(key, c)
 	m.bySession[key] = c
 	addConnIndex(m.byAuthKey, c.authKeyID, c.sessionID, c)
@@ -627,6 +763,12 @@ func (m *SessionManager) PublishActivation(c *Conn) error {
 		zap.Int64("session_id", c.sessionID),
 		zap.Int("online", len(m.bySession)),
 	)
+	m.markLocationDirtyLocked(key)
+	m.mu.Unlock()
+	if err := m.triggerLocationRefresh(key); err != nil {
+		m.Unregister(c)
+		return fmt.Errorf("publish active session location: %w", err)
+	}
 	return nil
 }
 
@@ -647,10 +789,12 @@ func (m *SessionManager) AbortActivation(c *Conn) {
 			delete(m.flushing, key)
 		}
 		m.markLogicalSessionOfflineLocked(key, time.Now())
+		m.deleteRawAuthKeyIdentityIfUnusedLocked(key.authKeyID)
 		owned = true
 	}
 	m.mu.Unlock()
 	if owned {
+		_ = m.triggerLocationRefresh(key)
 		_ = closeConnBatch([]*Conn{c}, forceCloseBatchTimeout, false)
 	}
 }
@@ -691,7 +835,9 @@ func (m *SessionManager) Unregister(c *Conn) {
 		)
 	}
 	m.markLogicalSessionOfflineLocked(key, time.Now())
+	m.deleteRawAuthKeyIdentityIfUnusedLocked(key.authKeyID)
 	m.mu.Unlock()
+	_ = m.triggerLocationRefresh(key)
 	if observer != nil {
 		observer.SessionOffline(c.authKeyID, c.sessionID, offlineUser, lastForUser)
 	}
@@ -706,8 +852,10 @@ func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID i
 	if !ok {
 		if claim := m.claims[key]; claim != nil {
 			m.retireClaimLocked(key, claim, true)
+			m.deleteRawAuthKeyIdentityIfUnusedLocked(authKeyID)
 			outbound := m.destroyLogicalSessionLocked(key)
 			m.mu.Unlock()
+			_ = m.triggerLocationRefresh(key)
 			if !forceCloseConnBatch([]*Conn{claim}, forceCloseBatchTimeout) {
 				m.log.Warn("Claimed session close exceeded shared deadline",
 					zap.String("auth_key_id", sessionKeyLog(authKeyID)),
@@ -723,6 +871,7 @@ func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID i
 		m.deletePendingLocked(key)
 		outbound := m.destroyLogicalSessionLocked(key)
 		m.mu.Unlock()
+		_ = m.triggerLocationRefresh(key)
 		if outbound != nil {
 			m.releaseLogicalSession(key, outbound)
 		}
@@ -738,6 +887,7 @@ func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID i
 		zap.Int("online", len(m.bySession)),
 	)
 	m.mu.Unlock()
+	_ = m.triggerLocationRefresh(key)
 	if !forceCloseConnBatch([]*Conn{c}, forceCloseBatchTimeout) {
 		m.log.Warn("Destroyed session close exceeded shared deadline",
 			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
@@ -754,23 +904,32 @@ func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID i
 	return true
 }
 
-// BindUserForAuthKey 缓存指定 raw auth_key_id + session_id 的授权用户。
+// BindUserForAuthKey 缓存指定 raw auth_key_id 的授权用户。
 func (m *SessionManager) BindUserForAuthKey(authKeyID [8]byte, sessionID, userID int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
-	c, ok := m.bySession[key]
-	if !ok {
-		return
+	affected := 0
+	for key, c := range m.rawAuthKeyCandidatesLocked(authKeyID) {
+		m.bindUserLocked(c, key, userID)
+		affected++
 	}
-	m.bindUserLocked(c, key, userID)
+	if affected == 0 && authKeyID != ([8]byte{}) && userID > 0 {
+		m.setRawAuthKeyUserIdentityLocked(authKeyID, userID)
+	}
+	m.mu.Unlock()
+	if affected > 0 {
+		m.triggerLocationRefresh()
+	}
 }
 
 func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
+	defer m.markLocationDirtyLocked(key)
+	m.setRawAuthKeyUserIdentityLocked(key.authKeyID, userID)
 	if old := c.userID.Swap(userID); old != 0 {
 		removeUserIndex(m.byUser, old, key)
 		if old != userID {
+			m.markChannelMembershipDirtyLocked(old)
 			m.clearSessionChannelIndexesLocked(c, key)
+			c.clearChannelDeliveryWatermarks()
 			c.membershipsSynced.Store(false)
 			// 身份变化即丢弃暂存推送：它们属于前一个账号，flush 给新账号是跨账号泄露。
 			// 同时取消进行中的排空（runFlush 还另有 owner 校验做批内兜底）。
@@ -783,6 +942,7 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 		addUserIndex(m.byUser, userID, key, c)
 	} else {
 		m.clearSessionChannelIndexesLocked(c, key)
+		c.clearChannelDeliveryWatermarks()
 		c.membershipsSynced.Store(false)
 		m.deletePendingLocked(key)
 		delete(m.flushing, key)
@@ -793,23 +953,40 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 func (m *SessionManager) UserIDResolvedForAuthKey(authKeyID [8]byte, sessionID int64) (int64, bool) {
 	m.mu.RLock()
 	c, ok := m.bySession[sessionKey{authKeyID: authKeyID, sessionID: sessionID}]
+	if !ok {
+		c = m.claims[sessionKey{authKeyID: authKeyID, sessionID: sessionID}]
+	}
+	identity, hasIdentity := m.rawAuthKeyIdentity[authKeyID]
 	m.mu.RUnlock()
 	if !ok {
-		return 0, false
+		if c == nil {
+			return 0, false
+		}
 	}
-	return c.UserIDResolved()
+	if userID, resolved := c.UserIDResolved(); resolved {
+		return userID, true
+	}
+	if hasIdentity && identity.userIDResolved && identity.userID != 0 {
+		return identity.userID, true
+	}
+	return 0, false
 }
 
-// BindAuthKeyForSession 缓存指定 raw auth_key_id + session_id 的业务 auth_key_id。
+// BindAuthKeyForSession 缓存指定 raw auth_key_id 的业务 auth_key_id。
 func (m *SessionManager) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
-	c, ok := m.bySession[key]
-	if !ok {
-		return
+	affected := 0
+	for key, c := range m.rawAuthKeyCandidatesLocked(rawAuthKeyID) {
+		m.bindAuthKeyLocked(c, key, authKeyID)
+		affected++
 	}
-	m.bindAuthKeyLocked(c, key, authKeyID)
+	if affected == 0 && rawAuthKeyID != ([8]byte{}) && authKeyID != ([8]byte{}) {
+		m.setRawAuthKeyBusinessIdentityLocked(rawAuthKeyID, authKeyID)
+	}
+	m.mu.Unlock()
+	if affected > 0 {
+		m.triggerLocationRefresh()
+	}
 }
 
 // BindAuthKeyForRawAuthKey 把同一 raw temporary key 的全部活跃 session 绑定到
@@ -817,23 +994,24 @@ func (m *SessionManager) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID i
 // session；bind 只发生在其中一个 session，其他 session 不能继续把 raw temp 当业务 key。
 func (m *SessionManager) BindAuthKeyForRawAuthKey(rawAuthKeyID [8]byte, authKeyID [8]byte) int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	bound := 0
-	for sessionID, c := range m.byAuthKey[rawAuthKeyID] {
-		if c == nil {
-			continue
-		}
-		key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
-		if m.bySession[key] != c {
-			continue
-		}
+	for key, c := range m.rawAuthKeyCandidatesLocked(rawAuthKeyID) {
 		m.bindAuthKeyLocked(c, key, authKeyID)
 		bound++
+	}
+	if bound == 0 && rawAuthKeyID != ([8]byte{}) && authKeyID != ([8]byte{}) {
+		m.setRawAuthKeyBusinessIdentityLocked(rawAuthKeyID, authKeyID)
+	}
+	m.mu.Unlock()
+	if bound > 0 {
+		m.triggerLocationRefresh()
 	}
 	return bound
 }
 
 func (m *SessionManager) bindAuthKeyLocked(c *Conn, key sessionKey, authKeyID [8]byte) {
+	defer m.markLocationDirtyLocked(key)
+	m.setRawAuthKeyBusinessIdentityLocked(key.authKeyID, authKeyID)
 	oldAuthKeyID, resolved := c.BusinessAuthKeyID()
 	changed := !resolved || oldAuthKeyID != authKeyID
 	oldUserID := c.userID.Load()
@@ -860,11 +1038,21 @@ func (m *SessionManager) bindAuthKeyLocked(c *Conn, key sessionKey, authKeyID [8
 func (m *SessionManager) AuthKeyIDForSession(rawAuthKeyID [8]byte, sessionID int64) ([8]byte, bool) {
 	m.mu.RLock()
 	c, ok := m.bySession[sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}]
-	m.mu.RUnlock()
 	if !ok {
+		c = m.claims[sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}]
+	}
+	identity, hasIdentity := m.rawAuthKeyIdentity[rawAuthKeyID]
+	m.mu.RUnlock()
+	if !ok && c == nil {
 		return [8]byte{}, false
 	}
-	return c.BusinessAuthKeyID()
+	if id, resolved := c.BusinessAuthKeyID(); resolved {
+		return id, true
+	}
+	if hasIdentity && identity.businessAuthKeyResolved {
+		return identity.businessAuthKeyID, true
+	}
+	return [8]byte{}, false
 }
 
 // AuthKeyExpiresAtForSession 返回 raw key 的握手协议失效时间；0 表示 permanent。
@@ -923,7 +1111,9 @@ func (m *SessionManager) CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int 
 			zap.Int("closed", len(conns)),
 		)
 	}
+	m.deleteRawAuthKeyIdentityForBusinessLocked(authKeyID)
 	m.mu.Unlock()
+	_ = m.triggerLocationRefresh()
 	if !forceCloseConnBatch(conns, forceCloseBatchTimeout) {
 		m.log.Warn("Revoked auth-key session close exceeded shared deadline",
 			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
@@ -986,8 +1176,10 @@ func (m *SessionManager) closeSessionsForRawAuthKey(authKeyID [8]byte, skip func
 		m.retireClaimLocked(key, c, true)
 		conns = append(conns, c)
 	}
+	delete(m.rawAuthKeyIdentity, authKeyID)
 	observer := m.lifecycle
 	m.mu.Unlock()
+	_ = m.triggerLocationRefresh()
 	if !forceCloseConnBatch(conns, forceCloseBatchTimeout) {
 		m.log.Warn("Raw auth-key session close exceeded shared deadline",
 			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
@@ -1106,14 +1298,15 @@ func closeConnBatch(conns []*Conn, timeout time.Duration, waitInbound bool) bool
 // UnbindAuthKey 清理某业务 auth_key 下所有活跃连接的登录用户缓存。
 func (m *SessionManager) UnbindAuthKey(authKeyID [8]byte) int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	count := 0
+	m.clearRawAuthKeyUserIdentityForBusinessLocked(authKeyID)
 	for key, c := range m.businessAuthKeyCandidatesLocked(authKeyID) {
 		if !connUsesBusinessAuthKey(c, authKeyID) {
 			continue
 		}
 		if old := c.userID.Swap(0); old != 0 {
 			removeUserIndex(m.byUser, old, key)
+			m.markChannelMembershipDirtyLocked(old)
 		}
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
@@ -1121,7 +1314,12 @@ func (m *SessionManager) UnbindAuthKey(authKeyID [8]byte) int {
 		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 		c.userIDResolved.Store(true)
+		m.markLocationDirtyLocked(key)
 		count++
+	}
+	m.mu.Unlock()
+	if count > 0 {
+		_ = m.triggerLocationRefresh()
 	}
 	return count
 }
@@ -1190,7 +1388,9 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 		if len(batch) == 0 {
 			c.receivesUpdates.Store(true)
 			delete(m.flushing, key)
+			m.markLocationDirtyLocked(key)
 			m.mu.Unlock()
+			_ = m.triggerLocationRefresh(key)
 			return
 		}
 		m.mu.Unlock()
@@ -1204,6 +1404,11 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				m.mu.Unlock()
 				releaseQueuedPushes(batch[i:])
 				return
+			}
+			claim, ok := c.reserveChannelDeliveryWatermark(item.channelDelivery)
+			if !ok {
+				item.release()
+				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			// Pending entries are durable account updates. Shared body-budget pressure is not
@@ -1219,13 +1424,16 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				}
 			}
 			if err == nil {
+				encoded.outboxDeliveryRef = item.outboxDeliveryRef
 				err = c.SendBestEffortEncoded(ctx, item.t, encoded, 5*time.Second)
 			}
 			cancel()
 			if err == nil {
+				claim.commit()
 				item.release()
 				continue
 			}
+			claim.rollback()
 			if isOutboundStaleLayerEpoch(err) {
 				// This durable online accelerator was prepared before a client layer
 				// correction. Drop only the stale item; difference remains authoritative.
@@ -1267,7 +1475,9 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				c.receivesUpdates.Store(true)
 				m.deletePendingLocked(key)
 				delete(m.flushing, key)
+				m.markLocationDirtyLocked(key)
 				m.mu.Unlock()
+				_ = m.triggerLocationRefresh(key)
 				m.log.Debug("Flush gave up after retries; activated with getDifference fallback",
 					zap.String("auth_key_id", sessionKeyLog(key.authKeyID)),
 					zap.Int64("session_id", key.sessionID),
@@ -1317,11 +1527,13 @@ func (m *SessionManager) SetReceivesUpdatesForAuthKey(authKeyID [8]byte, session
 		return
 	}
 	owner, start := m.setReceivesUpdatesLocked(c, key, receives)
+	m.markLocationDirtyLocked(key)
 	m.mu.Unlock()
 
 	if start {
 		go m.runFlush(c, key, owner, 0)
 	}
+	m.triggerLocationRefresh()
 }
 
 // PushToSessionForAuthKey 向指定 raw auth_key_id + session_id 推送一条消息。
@@ -1364,7 +1576,7 @@ func (m *SessionManager) queueOrSendPrepared(ctx context.Context, key sessionKey
 		return ErrSessionNotFound
 	}
 	if !c.receivesUpdates.Load() {
-		_ = m.queuePreparedLocked(key, t, updates, reservation)
+		_ = m.queuePreparedLocked(key, t, updates, reservation, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{})
 		m.mu.Unlock()
 		return nil
 	}
@@ -1405,6 +1617,69 @@ func (m *SessionManager) PushToUserExceptAuthKeySession(ctx context.Context, use
 	return m.pushToUser(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg)
 }
 
+func (m *SessionManager) PushChannelUpdateToUserExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, delivery edgecontrol.ChannelDeliveryWatermark) (int, error) {
+	if !delivery.Valid() {
+		return 0, fmt.Errorf("invalid channel delivery watermark")
+	}
+	getUpdates := onceLayerUpdatesFanout(ctx, msg)
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, edgecontrol.OutboxDeliveryRef{}, delivery, func(c *Conn) error {
+		claim, ok := c.reserveChannelDeliveryWatermark(delivery)
+		if !ok {
+			return errChannelDeliverySkipped
+		}
+		if c.outbound == nil || c.outboundControl == nil {
+			claim.rollback()
+			return ErrConnClosed
+		}
+		updates, err := getUpdates()
+		if err != nil {
+			claim.rollback()
+			return err
+		}
+		encoded, err := updates.prepareForConn(ctx, c)
+		if err != nil {
+			claim.rollback()
+			return err
+		}
+		if err := c.SendEncoded(ctx, t, encoded); err != nil {
+			claim.rollback()
+			return err
+		}
+		claim.commit()
+		return nil
+	})
+}
+
+// PushOutboxUpdate implements the Edge-local outbox delivery confirmation
+// contract. The caller already selected this Edge instance through the shared
+// online location registry, so sent=0 means this Edge has no eligible target
+// sessions for the request.
+func (m *SessionManager) PushOutboxUpdate(ctx context.Context, req edgecontrol.OutboxPushRequest) (edgecontrol.OutboxPushResult, error) {
+	if m == nil {
+		return edgecontrol.OutboxPushResult{Status: edgecontrol.OutboxDeliveryNoKnownOnlineTargets}, nil
+	}
+	update, err := edgecontrol.DecodeOutboxUpdate(req.UpdateBytes)
+	if err != nil {
+		return edgecontrol.OutboxPushResult{Status: edgecontrol.OutboxDeliveryIndeterminate}, err
+	}
+	var (
+		sent int
+	)
+	if req.DeliveryTimeout > 0 {
+		sent, err = m.pushToUserBoundedAtLeastLayer(ctx, req.TargetUserID, &req.ExcludeAuthKeyID, req.ExcludeSessionID, 0, req.MessageType, update, req.DeliveryTimeout, req.DeliveryRef)
+	} else {
+		sent, err = m.pushToUserWithOutboxRef(ctx, req.TargetUserID, &req.ExcludeAuthKeyID, req.ExcludeSessionID, req.MessageType, update, req.DeliveryRef)
+	}
+	if err != nil {
+		return edgecontrol.OutboxPushResult{Sent: sent, Status: edgecontrol.OutboxDeliveryUnknown}, err
+	}
+	status := edgecontrol.OutboxDeliveryNoKnownOnlineTargets
+	if sent > 0 {
+		status = edgecontrol.OutboxDeliveryDelivered
+	}
+	return edgecontrol.OutboxPushResult{Sent: sent, Status: status}, nil
+}
+
 // PushToUserAuthKey 把 msg 定向投递给【绑定到 businessAuthKeyID 这台具体设备】且属于
 // userID 的就绪连接（密聊设备级投递的锚点）。索引走 byBusinessAuthKey（经
 // businessAuthKeyCandidatesLocked，兼容 temp-key/PFS 连接），不是 byAuthKey（raw 索引会
@@ -1430,7 +1705,7 @@ func (m *SessionManager) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Cont
 // discarded，同时保证获胜设备的其它连接不会误删刚建立的密聊。
 func (m *SessionManager) PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, t, getUpdates, false, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1518,6 +1793,9 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 			continue
 		}
 		if err := send(c); err != nil {
+			if errors.Is(err, errChannelDeliverySkipped) {
+				continue
+			}
 			if isOutboundStaleLayerEpoch(err) {
 				// A concurrent correction invalidated this prepared push, not the
 				// connection. Durable qts/difference remains the source of truth.
@@ -1550,8 +1828,12 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 }
 
 func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass) (int, error) {
+	return m.pushToUserWithOutboxRef(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg, edgecontrol.OutboxDeliveryRef{})
+}
+
+func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, outboxRef edgecontrol.OutboxDeliveryRef) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1563,6 +1845,7 @@ func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAu
 		if err != nil {
 			return err
 		}
+		encoded.outboxDeliveryRef = outboxRef
 		return c.SendEncoded(ctx, t, encoded)
 	})
 }
@@ -1574,7 +1857,7 @@ func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAu
 // 「durable 兜底」丢弃。走 best-effort 发送，不阻塞调用方。
 func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, false, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1592,7 +1875,7 @@ func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Con
 
 func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, t, getUpdates, false, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1608,15 +1891,15 @@ func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, us
 	})
 }
 
-func (m *SessionManager) PushToUserExceptAuthKeySessionBestEffort(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return m.pushToUserBestEffort(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg, timeout)
+func (m *SessionManager) PushToUserExceptAuthKeySessionBounded(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return m.pushToUserBounded(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg, timeout)
 }
 
-func (m *SessionManager) pushToUserBestEffort(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return m.pushToUserBestEffortAtLeastLayer(ctx, userID, excludeAuthKeyID, excludeSessionID, 0, t, msg, timeout)
+func (m *SessionManager) pushToUserBounded(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return m.pushToUserBoundedAtLeastLayer(ctx, userID, excludeAuthKeyID, excludeSessionID, 0, t, msg, timeout, edgecontrol.OutboxDeliveryRef{})
 }
 
-func (m *SessionManager) pushToUserBestEffortAtLeastLayer(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration, outboxRef edgecontrol.OutboxDeliveryRef) (int, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -1642,7 +1925,7 @@ func (m *SessionManager) pushToUserBestEffortAtLeastLayer(ctx context.Context, u
 		defer cancel()
 	}
 	getUpdates := onceLayerUpdatesFanout(sendCtx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, t, getUpdates, true, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1654,6 +1937,7 @@ func (m *SessionManager) pushToUserBestEffortAtLeastLayer(ctx context.Context, u
 		if err != nil {
 			return err
 		}
+		encoded.outboxDeliveryRef = outboxRef
 		remaining := timeout
 		if !deadline.IsZero() {
 			remaining = time.Until(deadline)
@@ -1689,7 +1973,7 @@ func onceLayerUpdatesFanout(ctx context.Context, msg tg.UpdatesClass) func() (*l
 	}
 }
 
-func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark, send func(*Conn) error) (int, error) {
 	// push fan-out 是连接层最热路径之一：debug 日志的字段构造（含 auth_key hex 格式化）
 	// 在关闭 debug 时也会求值，先查级别一次、按需记日志。
 	debug := m.log.Core().Enabled(zapcore.DebugLevel)
@@ -1750,7 +2034,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 					skipped++
 					continue
 				}
-				if pendingErr == nil && m.queuePreparedLocked(key, t, pendingUpdates, pendingReservation) {
+				if pendingErr == nil && m.queuePreparedLocked(key, t, pendingUpdates, pendingReservation, outboxRef, channelDelivery) {
 					queued++
 					if debug {
 						m.log.Debug("Push queued (session not updates-ready)",
@@ -1798,6 +2082,10 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 			continue
 		}
 		if err := send(c); err != nil {
+			if errors.Is(err, errChannelDeliverySkipped) {
+				skipped++
+				continue
+			}
 			if isOutboundStaleLayerEpoch(err) {
 				// Do not classify profile correction as slow-consumer evidence.
 				dropped++
@@ -1937,16 +2225,20 @@ func (m *SessionManager) TrackChannelInterest(rawAuthKeyID [8]byte, sessionID, u
 	}
 	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	c, ok := m.bySession[key]
 	if !ok || c.userID.Load() != userID {
+		m.mu.Unlock()
 		return
 	}
 	m.clearChannelInterestsLocked(key)
 	if len(channelIDs) == 0 {
+		m.mu.Unlock()
+		m.triggerLocationRefresh()
 		return
 	}
 	m.trackChannelIndexLocked(m.byChannel, m.bySessionChannels, key, userID, channelIDs)
+	m.mu.Unlock()
+	m.triggerLocationRefresh()
 }
 
 // ClearChannelInterest removes the active-viewer channel set for one live
@@ -1957,12 +2249,14 @@ func (m *SessionManager) ClearChannelInterest(rawAuthKeyID [8]byte, sessionID, u
 	}
 	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	c, ok := m.bySession[key]
 	if !ok || c.userID.Load() != userID {
+		m.mu.Unlock()
 		return
 	}
 	m.clearChannelInterestsLocked(key)
+	m.mu.Unlock()
+	m.triggerLocationRefresh()
 }
 
 // OnlineChannelUserIDs returns users with active sessions that have recently
@@ -1987,9 +2281,9 @@ func (m *SessionManager) RefreshChannelSubscription(rawAuthKeyID [8]byte, sessio
 	now := time.Now().UnixNano()
 	expiresAt := now + int64(ttl)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	c, ok := m.bySession[key]
 	if !ok || c.userID.Load() != userID {
+		m.mu.Unlock()
 		return
 	}
 	m.pruneSessionSubscriptionsLocked(key, now)
@@ -2004,6 +2298,7 @@ func (m *SessionManager) RefreshChannelSubscription(rawAuthKeyID [8]byte, sessio
 			zap.Int64("session_id", sessionID),
 			zap.Int64("channel_id", channelID),
 			zap.Int("cap", maxChannelSubscriptionsPerSession))
+		m.mu.Unlock()
 		return
 	}
 	channels[channelID] = expiresAt
@@ -2013,6 +2308,9 @@ func (m *SessionManager) RefreshChannelSubscription(rawAuthKeyID [8]byte, sessio
 		m.bySubscribedChannel[channelID] = sessions
 	}
 	sessions[key] = channelSubscription{userID: userID, expiresAt: expiresAt}
+	m.markLocationDirtyLocked(key)
+	m.mu.Unlock()
+	m.triggerLocationRefresh()
 }
 
 // OnlineChannelSubscriberUserIDs returns users for which at least one live
@@ -2067,54 +2365,243 @@ func (m *SessionManager) onlineChannelSubscriberUserIDsExcluding(channelID int64
 	return out
 }
 
-// ChannelMembershipGeneration 返回该 session 的 membership 索引修订号。
-// 全量同步方必须在读取持久成员列表【之前】采样，并经 SetSessionChannelMemberships
-// 带回比对；session 不在线时返回 0（后续 Set 也会因查不到连接而放弃）。
-func (m *SessionManager) ChannelMembershipGeneration(rawAuthKeyID [8]byte, sessionID int64) int64 {
-	m.mu.RLock()
-	c, ok := m.bySession[sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}]
-	m.mu.RUnlock()
-	if !ok {
-		return 0
+// BeginSessionChannelMembershipSync is the Edge-owned singleflight boundary
+// for a bounded-page membership rebuild. Only Acquired owns the staging ID.
+// InProgress callers return without scanning PostgreSQL. Prepared means this
+// session already has a published baseline (possibly copied from another local
+// session); activation is attempted here once an exact Layer profile exists.
+func (m *SessionManager) BeginSessionChannelMembershipSync(ctx context.Context, rawAuthKeyID [8]byte, sessionID, userID int64) (int64, edgecontrol.ChannelMembershipSyncDisposition, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
 	}
-	return c.membershipGen.Load()
+	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	c, ok := m.bySession[key]
+	if !ok {
+		m.mu.Unlock()
+		return 0, "", ErrSessionNotFound
+	}
+	if userID <= 0 || c.userID.Load() != userID {
+		m.mu.Unlock()
+		return 0, "", fmt.Errorf("channel membership sync user mismatch")
+	}
+	now := time.Now()
+	if state := m.membershipSyncs[key]; state != nil {
+		if state.userID == userID && now.Before(state.expiresAt) {
+			syncID := state.id
+			m.mu.Unlock()
+			return syncID, edgecontrol.ChannelMembershipSyncInProgress, nil
+		}
+		delete(m.membershipSyncs, key)
+		// A timed-out commit may have installed a provisional local snapshot
+		// before blocking on the shared projection. Fence it from activation;
+		// the takeover (or a safe snapshot from another session) must publish
+		// current state again before this session can become ready.
+		c.membershipsSynced.Store(false)
+		c.receivesUpdates.Store(false)
+		delete(m.flushing, key)
+		m.markChannelMembershipDirtyLocked(userID)
+		m.markLocationDirtyLocked(key)
+	}
+	if c.membershipsSynced.Load() {
+		owner, start, publish := m.prepareMembershipActivationLocked(c, key)
+		m.mu.Unlock()
+		if err := m.finishMembershipActivation(c, key, userID, owner, start, publish); err != nil {
+			return 0, "", err
+		}
+		return 0, edgecontrol.ChannelMembershipSyncPrepared, nil
+	}
+	for otherKey, other := range m.byUser[userID] {
+		if otherKey == key || other == nil || !other.membershipsSynced.Load() {
+			continue
+		}
+		delete(m.membershipSyncs, key)
+		c.membershipGen.Add(1)
+		m.clearChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key)
+		m.trackMemberChannelIndexLocked(key, userID, snapshotChannelIDSet(m.bySessionMembers[otherKey]))
+		c.membershipsSynced.Store(true)
+		owner, start, publish := m.prepareMembershipActivationLocked(c, key)
+		m.mu.Unlock()
+		if err := m.finishMembershipActivation(c, key, userID, owner, start, publish); err != nil {
+			return 0, "", err
+		}
+		return 0, edgecontrol.ChannelMembershipSyncPrepared, nil
+	}
+	m.membershipSyncVersion++
+	if m.membershipSyncVersion == 0 {
+		m.membershipSyncVersion++
+	}
+	syncID := m.membershipSyncVersion
+	m.membershipSyncs[key] = &channelMembershipSync{
+		id:                 syncID,
+		userID:             userID,
+		expectedGeneration: c.membershipGen.Load(),
+		channelIDs:         make(map[int64]struct{}),
+		expiresAt:          now.Add(channelMembershipSyncOwnershipTTL),
+	}
+	c.membershipsSynced.Store(false)
+	wasReceiving := c.receivesUpdates.Swap(false)
+	wasFlushing := m.flushing[key]
+	delete(m.flushing, key)
+	m.markChannelMembershipDirtyLocked(userID)
+	if wasReceiving || wasFlushing {
+		m.markLocationDirtyLocked(key)
+	}
+	m.mu.Unlock()
+	if err := m.triggerLocationRefresh(key); err != nil {
+		m.AbortSessionChannelMembershipSync(context.Background(), rawAuthKeyID, sessionID, userID, syncID)
+		return 0, "", fmt.Errorf("publish session not-ready state: %w", err)
+	}
+	return syncID, edgecontrol.ChannelMembershipSyncAcquired, nil
 }
 
-// SetSessionChannelMemberships replaces the joined-channel index for one
-// updates-ready session. This index is broader than TrackChannelInterest and is
-// used for durable channel updates such as new/edit/delete message.
-//
-// expectedGen 是调用方在读取持久成员列表前经 ChannelMembershipGeneration 采样的
-// 修订号。若落地时修订号已变（读取窗口内发生了 join/leave/kick 的增量修订或整体
-// 清除），全量替换会覆盖掉窗口内的增量——此时改走并集合并（保留增量 Add；合并回的
-// stale 条目由 fan-out 前的 PG active 复核兜底），并保持 membershipsSynced=false，
-// 让下一条 RPC 重新走全量同步收敛。
-func (m *SessionManager) SetSessionChannelMemberships(rawAuthKeyID [8]byte, sessionID, userID int64, channelIDs []int64, expectedGen int64) {
+func (m *SessionManager) AppendSessionChannelMembershipSync(ctx context.Context, rawAuthKeyID [8]byte, sessionID, userID, syncID int64, channelIDs []int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(channelIDs) > edgecontrol.MaxChannelMembershipSyncPage {
+		return fmt.Errorf("channel membership sync page has %d ids, max %d", len(channelIDs), edgecontrol.MaxChannelMembershipSyncPage)
+	}
 	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c, ok := m.bySession[key]
-	if !ok {
-		return
+	state := m.membershipSyncs[key]
+	c := m.bySession[key]
+	if state == nil || c == nil || state.id != syncID || state.userID != userID || state.committing || c.userID.Load() != userID {
+		return fmt.Errorf("stale channel membership sync")
 	}
-	if userID == 0 || c.userID.Load() != userID {
-		m.clearChannelMembershipsLocked(c, key)
-		c.membershipsSynced.Store(false)
-		return
+	for _, channelID := range channelIDs {
+		if channelID > 0 {
+			state.channelIDs[channelID] = struct{}{}
+		}
 	}
-	if c.membershipGen.Load() != expectedGen {
+	state.expiresAt = time.Now().Add(channelMembershipSyncOwnershipTTL)
+	return nil
+}
+
+func (m *SessionManager) CommitSessionChannelMembershipSync(ctx context.Context, rawAuthKeyID [8]byte, sessionID, userID, syncID int64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	state := m.membershipSyncs[key]
+	c := m.bySession[key]
+	if state == nil || c == nil || state.id != syncID || state.userID != userID || c.userID.Load() != userID {
+		m.mu.Unlock()
+		return false, fmt.Errorf("stale channel membership sync")
+	}
+	if state.committing {
+		m.mu.Unlock()
+		return false, fmt.Errorf("channel membership sync already committing")
+	}
+	state.committing = true
+	state.expiresAt = time.Now().Add(channelMembershipSyncOwnershipTTL)
+	channelIDs := make([]int64, 0, len(state.channelIDs))
+	for channelID := range state.channelIDs {
+		channelIDs = append(channelIDs, channelID)
+	}
+	if c.membershipGen.Load() != state.expectedGeneration {
+		delete(m.membershipSyncs, key)
+		m.trackMemberChannelIndexLocked(key, userID, channelIDs)
 		c.membershipsSynced.Store(false)
-		m.trackChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key, userID, channelIDs)
+		m.markChannelMembershipDirtyLocked(userID)
 		m.log.Debug("Channel membership sync raced with incremental updates; merged and kept unsynced",
 			zap.String("auth_key_id", sessionKeyLog(rawAuthKeyID)),
 			zap.Int64("session_id", sessionID),
 		)
-		return
+		m.mu.Unlock()
+		return false, nil
 	}
-	m.clearChannelMembershipsLocked(c, key)
-	c.membershipsSynced.Store(false)
-	m.trackChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key, userID, channelIDs)
+	c.membershipGen.Add(1)
+	m.clearChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key)
+	m.trackMemberChannelIndexLocked(key, userID, channelIDs)
 	c.membershipsSynced.Store(true)
+	state.expectedGeneration = c.membershipGen.Load()
+	m.markChannelMembershipDirtyLocked(userID)
+	m.mu.Unlock()
+	if err := m.triggerChannelMembershipRefresh(); err != nil {
+		m.mu.Lock()
+		if current := m.bySession[key]; current == c && current.userID.Load() == userID && m.membershipSyncs[key] == state {
+			current.membershipsSynced.Store(false)
+			delete(m.membershipSyncs, key)
+			m.markChannelMembershipDirtyLocked(userID)
+		}
+		m.mu.Unlock()
+		return false, err
+	}
+	m.mu.Lock()
+	current := m.bySession[key]
+	currentState := m.membershipSyncs[key]
+	if current != c || current == nil || current.userID.Load() != userID || currentState != state || c.membershipGen.Load() != state.expectedGeneration {
+		if currentState == state && current == c && current != nil && current.userID.Load() == userID {
+			current.membershipsSynced.Store(false)
+			delete(m.membershipSyncs, key)
+		}
+		// If a newer owner replaced state, never delete or mutate it. Publishing
+		// one more current snapshot fences any delayed write from this owner.
+		m.markChannelMembershipDirtyLocked(userID)
+		m.mu.Unlock()
+		if err := m.triggerChannelMembershipRefresh(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	delete(m.membershipSyncs, key)
+	owner, start, publish := m.prepareMembershipActivationLocked(c, key)
+	m.mu.Unlock()
+	if err := m.finishMembershipActivation(c, key, userID, owner, start, publish); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// prepareMembershipActivationLocked advances only the connection-local half of
+// readiness. The shared membership projection has already been published.
+// Pending updates remain fenced behind runFlush until their FIFO is drained.
+func (m *SessionManager) prepareMembershipActivationLocked(c *Conn, key sessionKey) (owner int64, start, publish bool) {
+	if c == nil || !c.membershipsSynced.Load() {
+		return 0, false, false
+	}
+	if _, hasProfile := c.LayerProfile(); !hasProfile {
+		return 0, false, false
+	}
+	if c.receivesUpdates.Load() || m.flushing[key] {
+		return 0, false, false
+	}
+	owner, start = m.setReceivesUpdatesLocked(c, key, true)
+	m.markLocationDirtyLocked(key)
+	return owner, start, true
+}
+
+func (m *SessionManager) finishMembershipActivation(c *Conn, key sessionKey, userID, owner int64, start, publish bool) error {
+	if !publish {
+		return nil
+	}
+	if err := m.triggerLocationRefresh(key); err != nil {
+		m.mu.Lock()
+		if current := m.bySession[key]; current == c && current.userID.Load() == userID {
+			current.receivesUpdates.Store(false)
+			delete(m.flushing, key)
+			m.markLocationDirtyLocked(key)
+		}
+		m.mu.Unlock()
+		return err
+	}
+	if start {
+		go m.runFlush(c, key, owner, 0)
+	}
+	return nil
+}
+
+func (m *SessionManager) AbortSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, userID, syncID int64) {
+	key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	state := m.membershipSyncs[key]
+	if state != nil && state.id == syncID && state.userID == userID {
+		delete(m.membershipSyncs, key)
+	}
+	m.mu.Unlock()
 }
 
 // AddUserChannelMembership adds channelID to every live session for userID.
@@ -2124,13 +2611,21 @@ func (m *SessionManager) AddUserChannelMembership(userID, channelID int64) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	changed := false
 	for key, c := range m.byUser[userID] {
 		if c == nil || c.userID.Load() != userID {
 			continue
 		}
 		c.membershipGen.Add(1)
-		m.trackChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key, userID, []int64{channelID})
+		m.trackMemberChannelIndexLocked(key, userID, []int64{channelID})
+		changed = true
+	}
+	if changed {
+		m.markChannelMembershipDirtyLocked(userID)
+	}
+	m.mu.Unlock()
+	if changed {
+		_ = m.triggerChannelMembershipRefresh()
 	}
 }
 
@@ -2141,12 +2636,20 @@ func (m *SessionManager) RemoveUserChannelMembership(userID, channelID int64) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	changed := false
 	for key, c := range m.byUser[userID] {
 		if c != nil {
 			c.membershipGen.Add(1)
+			changed = true
 		}
 		m.removeChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key, channelID)
+	}
+	if changed {
+		m.markChannelMembershipDirtyLocked(userID)
+	}
+	m.mu.Unlock()
+	if changed {
+		_ = m.triggerChannelMembershipRefresh()
 	}
 }
 
@@ -2292,6 +2795,7 @@ func (m *SessionManager) removeLocked(c *Conn, dropPending bool) int64 {
 	if m.bySession[key] != c {
 		return 0
 	}
+	m.markLocationDirtyLocked(key)
 	delete(m.bySession, key)
 	removeConnIndex(m.byAuthKey, c.authKeyID, c.sessionID)
 	if businessAuthKeyID, resolved := c.BusinessAuthKeyID(); resolved {
@@ -2306,6 +2810,7 @@ func (m *SessionManager) removeLocked(c *Conn, dropPending bool) int64 {
 		m.deletePendingLocked(key)
 	}
 	delete(m.flushing, key)
+	m.deleteRawAuthKeyIdentityIfUnusedLocked(key.authKeyID)
 	return uid
 }
 
@@ -2394,11 +2899,121 @@ func (m *SessionManager) businessAuthKeyCandidatesLocked(authKeyID [8]byte) map[
 	return out
 }
 
+func (m *SessionManager) rawAuthKeyCandidatesLocked(rawAuthKeyID [8]byte) map[sessionKey]*Conn {
+	out := make(map[sessionKey]*Conn, len(m.byAuthKey[rawAuthKeyID])+len(m.claimsByAuth[rawAuthKeyID]))
+	for sessionID, c := range m.byAuthKey[rawAuthKeyID] {
+		key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
+		if cur := m.bySession[key]; cur == c && c != nil {
+			out[key] = c
+		}
+	}
+	for sessionID, c := range m.claimsByAuth[rawAuthKeyID] {
+		key := sessionKey{authKeyID: rawAuthKeyID, sessionID: sessionID}
+		if cur := m.claims[key]; cur == c && c != nil {
+			out[key] = c
+		}
+	}
+	return out
+}
+
+func (m *SessionManager) applyRawAuthKeyIdentityLocked(c *Conn, key sessionKey) {
+	if c == nil {
+		return
+	}
+	identity, ok := m.rawAuthKeyIdentity[key.authKeyID]
+	if !ok {
+		return
+	}
+	if identity.businessAuthKeyResolved {
+		if current, resolved := c.BusinessAuthKeyID(); !resolved || current != identity.businessAuthKeyID {
+			m.bindAuthKeyLocked(c, key, identity.businessAuthKeyID)
+		}
+	}
+	if identity.userIDResolved && identity.userID != 0 {
+		if current, resolved := c.UserIDResolved(); !resolved || current != identity.userID {
+			m.bindUserLocked(c, key, identity.userID)
+		}
+	}
+}
+
+func (m *SessionManager) setRawAuthKeyBusinessIdentityLocked(rawAuthKeyID [8]byte, authKeyID [8]byte) {
+	if rawAuthKeyID == ([8]byte{}) || authKeyID == ([8]byte{}) {
+		return
+	}
+	identity := m.rawAuthKeyIdentity[rawAuthKeyID]
+	if identity.businessAuthKeyResolved && identity.businessAuthKeyID != authKeyID {
+		identity.userID = 0
+		identity.userIDResolved = false
+	}
+	identity.businessAuthKeyID = authKeyID
+	identity.businessAuthKeyResolved = true
+	m.rawAuthKeyIdentity[rawAuthKeyID] = identity
+}
+
+func (m *SessionManager) setRawAuthKeyUserIdentityLocked(rawAuthKeyID [8]byte, userID int64) {
+	if rawAuthKeyID == ([8]byte{}) {
+		return
+	}
+	identity := m.rawAuthKeyIdentity[rawAuthKeyID]
+	if userID <= 0 {
+		identity.userID = 0
+		identity.userIDResolved = false
+		if identity.businessAuthKeyResolved {
+			m.rawAuthKeyIdentity[rawAuthKeyID] = identity
+		} else {
+			delete(m.rawAuthKeyIdentity, rawAuthKeyID)
+		}
+		return
+	}
+	identity.userID = userID
+	identity.userIDResolved = true
+	m.rawAuthKeyIdentity[rawAuthKeyID] = identity
+}
+
+func (m *SessionManager) clearRawAuthKeyUserIdentityForBusinessLocked(authKeyID [8]byte) {
+	if authKeyID == ([8]byte{}) {
+		return
+	}
+	for rawAuthKeyID, identity := range m.rawAuthKeyIdentity {
+		if rawAuthKeyID != authKeyID && (!identity.businessAuthKeyResolved || identity.businessAuthKeyID != authKeyID) {
+			continue
+		}
+		identity.userID = 0
+		identity.userIDResolved = false
+		if identity.businessAuthKeyResolved {
+			m.rawAuthKeyIdentity[rawAuthKeyID] = identity
+		} else {
+			delete(m.rawAuthKeyIdentity, rawAuthKeyID)
+		}
+	}
+}
+
+func (m *SessionManager) deleteRawAuthKeyIdentityForBusinessLocked(authKeyID [8]byte) {
+	if authKeyID == ([8]byte{}) {
+		return
+	}
+	for rawAuthKeyID, identity := range m.rawAuthKeyIdentity {
+		if rawAuthKeyID == authKeyID || (identity.businessAuthKeyResolved && identity.businessAuthKeyID == authKeyID) {
+			delete(m.rawAuthKeyIdentity, rawAuthKeyID)
+		}
+	}
+}
+
+func (m *SessionManager) deleteRawAuthKeyIdentityIfUnusedLocked(rawAuthKeyID [8]byte) {
+	if rawAuthKeyID == ([8]byte{}) {
+		return
+	}
+	if len(m.byAuthKey[rawAuthKeyID]) == 0 && len(m.claimsByAuth[rawAuthKeyID]) == 0 {
+		delete(m.rawAuthKeyIdentity, rawAuthKeyID)
+	}
+}
+
 func (m *SessionManager) clearChannelInterestsLocked(key sessionKey) {
 	m.clearChannelIndexLocked(m.byChannel, m.bySessionChannels, key)
 }
 
 func (m *SessionManager) clearChannelSubscriptionsLocked(key sessionKey) {
+	m.markLocationDirtyLocked(key)
 	channels := m.bySessionSubscriptions[key]
 	if len(channels) == 0 {
 		delete(m.bySessionSubscriptions, key)
@@ -2424,6 +3039,7 @@ func (m *SessionManager) pruneSessionSubscriptionsLocked(key sessionKey, now int
 }
 
 func (m *SessionManager) removeChannelSubscriptionLocked(key sessionKey, channelID int64) {
+	m.markLocationDirtyLocked(key)
 	channels := m.bySessionSubscriptions[key]
 	delete(channels, channelID)
 	if len(channels) == 0 {
@@ -2443,13 +3059,38 @@ func (m *SessionManager) clearSessionChannelIndexesLocked(c *Conn, key sessionKe
 }
 
 // clearChannelMembershipsLocked 整体清除某连接的 membership 索引并递增其修订号，
-// 使在飞的全量同步（SetSessionChannelMemberships）能检测到清除并放弃过期替换。
+// 使在飞的分页全量同步能检测到清除并放弃过期替换。
 func (m *SessionManager) clearChannelMembershipsLocked(c *Conn, key sessionKey) {
+	if userID := c.userID.Load(); userID > 0 {
+		m.markChannelMembershipDirtyLocked(userID)
+	}
+	delete(m.membershipSyncs, key)
 	c.membershipGen.Add(1)
 	m.clearChannelIndexLocked(m.byMemberChannel, m.bySessionMembers, key)
 }
 
+func (m *SessionManager) trackMemberChannelIndexLocked(key sessionKey, userID int64, channelIDs []int64) {
+	channels := m.bySessionMembers[key]
+	if channels == nil {
+		channels = make(map[int64]struct{}, len(channelIDs))
+		m.bySessionMembers[key] = channels
+	}
+	for _, channelID := range channelIDs {
+		if channelID <= 0 {
+			continue
+		}
+		channels[channelID] = struct{}{}
+		sessions := m.byMemberChannel[channelID]
+		if sessions == nil {
+			sessions = make(map[sessionKey]int64)
+			m.byMemberChannel[channelID] = sessions
+		}
+		sessions[key] = userID
+	}
+}
+
 func (m *SessionManager) trackChannelIndexLocked(index map[int64]map[sessionKey]int64, reverse map[sessionKey]map[int64]struct{}, key sessionKey, userID int64, channelIDs []int64) {
+	m.markLocationDirtyLocked(key)
 	channels := reverse[key]
 	if channels == nil {
 		channels = make(map[int64]struct{}, len(channelIDs))
@@ -2460,7 +3101,7 @@ func (m *SessionManager) trackChannelIndexLocked(index map[int64]map[sessionKey]
 		if channelID == 0 {
 			continue
 		}
-		if _, exists := channels[channelID]; !exists && len(channels) >= maxChannelIndexPerSession {
+		if _, exists := channels[channelID]; !exists && len(channels) >= maxChannelInterestPerSession {
 			// 达 per-session 上限：丢弃多出的 channel 登记（仅影响该 channel 的实时/成员
 			// 推送路由，durable update 仍由 getDifference/getChannelDifference 兜底）。
 			truncated++
@@ -2478,13 +3119,14 @@ func (m *SessionManager) trackChannelIndexLocked(index map[int64]map[sessionKey]
 		m.log.Warn("Channel index truncated for session at per-session cap",
 			zap.String("auth_key_id", sessionKeyLog(key.authKeyID)),
 			zap.Int64("session_id", key.sessionID),
-			zap.Int("cap", maxChannelIndexPerSession),
+			zap.Int("cap", maxChannelInterestPerSession),
 			zap.Int("truncated", truncated),
 		)
 	}
 }
 
 func (m *SessionManager) clearChannelIndexLocked(index map[int64]map[sessionKey]int64, reverse map[sessionKey]map[int64]struct{}, key sessionKey) {
+	m.markLocationDirtyLocked(key)
 	channels := reverse[key]
 	if len(channels) == 0 {
 		delete(reverse, key)
@@ -2501,6 +3143,7 @@ func (m *SessionManager) clearChannelIndexLocked(index map[int64]map[sessionKey]
 }
 
 func (m *SessionManager) removeChannelIndexLocked(index map[int64]map[sessionKey]int64, reverse map[sessionKey]map[int64]struct{}, key sessionKey, channelID int64) {
+	m.markLocationDirtyLocked(key)
 	channels := reverse[key]
 	delete(channels, channelID)
 	if len(channels) == 0 {
@@ -2579,7 +3222,7 @@ func (m *SessionManager) preparePendingPush(getUpdates func() (*layerUpdatesFano
 
 // queuePreparedLocked 暂存一条已冻结的主动推送，返回是否实际入队。
 // 调用方必须在锁外保持 reservation 的 producer ref，并在全部入队完成后 release。
-func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType, updates *layerUpdatesFanout, reservation *pendingPushReservation) bool {
+func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType, updates *layerUpdatesFanout, reservation *pendingPushReservation, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark) bool {
 	q := m.pending[key]
 	// 过期保护：最早一条暂存已超过 pendingPushMaxAge（session 迟迟未 ready）时，丢整批并
 	// 不再囤这条，记 trace。避免「登录后从不 getState」的连接长期占用 pending 内存。
@@ -2597,10 +3240,12 @@ func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType
 	}
 	reservation.retain()
 	push := queuedPush{
-		t:           t,
-		updates:     updates,
-		reservation: reservation,
-		at:          time.Now(),
+		t:                 t,
+		updates:           updates,
+		reservation:       reservation,
+		outboxDeliveryRef: outboxRef,
+		channelDelivery:   channelDelivery,
+		at:                time.Now(),
 	}
 	if len(q) >= maxPendingPushesPerSession {
 		q[0].release()

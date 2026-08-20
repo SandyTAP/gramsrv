@@ -3,6 +3,7 @@ package files
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"testing"
 
 	"telesrv/internal/domain"
@@ -197,6 +198,116 @@ func TestGetFileDoesNotByteCacheLargeBlob(t *testing.T) {
 	}
 	if blobs.getRangeCalls != 2 {
 		t.Errorf("getRangeCalls = %d, want 2 (large blob is not byte cached)", blobs.getRangeCalls)
+	}
+}
+
+func TestGetFileHashesUsesBatchedSHA256Ranges(t *testing.T) {
+	ctx := context.Background()
+	local, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	content := make([]byte, DefaultFileHashPartSize*11+5)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	objectKey, size, sum, err := local.PutReader(ctx, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	media := newFakeMediaStore()
+	if err := media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: "doc:hashes",
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   objectKey,
+		Size:        size,
+		SHA256:      sum,
+		MimeType:    "application/octet-stream",
+	}); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	blobs := &countingBlobBackend{BlobBackend: local}
+	svc := NewService(media, blobs, 2)
+
+	first, found, err := svc.GetFileHashes(ctx, domain.FileHashRequest{LocationKey: "doc:hashes", Offset: 0})
+	if err != nil || !found {
+		t.Fatalf("first hashes found=%v err=%v", found, err)
+	}
+	if len(first) != DefaultFileHashRangeSize {
+		t.Fatalf("first hashes = %d, want %d", len(first), DefaultFileHashRangeSize)
+	}
+	wantFirst := sha256.Sum256(content[:DefaultFileHashPartSize])
+	if first[0].Offset != 0 || first[0].Limit != DefaultFileHashPartSize || !bytes.Equal(first[0].Hash, wantFirst[:]) {
+		t.Fatalf("first hash = %+v, want offset 0 limit %d sha256(first part)", first[0], DefaultFileHashPartSize)
+	}
+	if first[len(first)-1].Offset != int64((DefaultFileHashRangeSize-1)*DefaultFileHashPartSize) {
+		t.Fatalf("last first-batch offset = %d", first[len(first)-1].Offset)
+	}
+
+	second, found, err := svc.GetFileHashes(ctx, domain.FileHashRequest{
+		LocationKey: "doc:hashes",
+		Offset:      int64(DefaultFileHashRangeSize * DefaultFileHashPartSize),
+	})
+	if err != nil || !found {
+		t.Fatalf("second hashes found=%v err=%v", found, err)
+	}
+	if len(second) != 2 {
+		t.Fatalf("second hashes = %d, want 2", len(second))
+	}
+	if second[0].Offset != int64(DefaultFileHashRangeSize*DefaultFileHashPartSize) || second[0].Limit != DefaultFileHashPartSize {
+		t.Fatalf("second[0] = %+v", second[0])
+	}
+	tail := content[DefaultFileHashPartSize*11:]
+	wantTail := sha256.Sum256(tail)
+	if second[1].Limit != len(tail) || !bytes.Equal(second[1].Hash, wantTail[:]) {
+		t.Fatalf("tail hash = %+v, want len %d sha256(tail)", second[1], len(tail))
+	}
+
+	empty, found, err := svc.GetFileHashes(ctx, domain.FileHashRequest{
+		LocationKey: "doc:hashes",
+		Offset:      int64(len(content)),
+	})
+	if err != nil || !found || len(empty) != 0 {
+		t.Fatalf("eof hashes len=%d found=%v err=%v", len(empty), found, err)
+	}
+	if blobs.getRangeCalls != 2 {
+		t.Fatalf("GetRange calls = %d, want 2", blobs.getRangeCalls)
+	}
+}
+
+func TestGetFileHashesUsesStoredWholeSHAForSinglePartBlob(t *testing.T) {
+	ctx := context.Background()
+	local, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	content := []byte("tiny file")
+	objectKey, _, sum, err := local.PutReader(ctx, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	media := newFakeMediaStore()
+	if err := media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: "doc:tiny",
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   objectKey,
+		Size:        int64(len(content)),
+		SHA256:      sum,
+	}); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	blobs := &countingBlobBackend{BlobBackend: local}
+	svc := NewService(media, blobs, 2)
+
+	hashes, found, err := svc.GetFileHashes(ctx, domain.FileHashRequest{LocationKey: "doc:tiny"})
+	if err != nil || !found {
+		t.Fatalf("hashes found=%v err=%v", found, err)
+	}
+	if len(hashes) != 1 || hashes[0].Limit != len(content) || !bytes.Equal(hashes[0].Hash, sum) {
+		t.Fatalf("hashes = %+v, want stored whole sha", hashes)
+	}
+	if blobs.getRangeCalls != 0 {
+		t.Fatalf("GetRange calls = %d, want 0", blobs.getRangeCalls)
 	}
 }
 

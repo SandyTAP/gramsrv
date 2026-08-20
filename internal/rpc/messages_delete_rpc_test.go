@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"time"
+
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
@@ -46,6 +48,8 @@ func TestMessagesDeleteHistoryChannelLocalClearReturnsAccountStateWithoutPTS(t *
 		Updates:  updateSvc,
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	affected, err := r.onMessagesDeleteHistory(WithUserID(ctx, 7), &tg.MessagesDeleteHistoryRequest{
 		Peer:  &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
@@ -64,7 +68,15 @@ func TestMessagesDeleteHistoryChannelLocalClearReturnsAccountStateWithoutPTS(t *
 	if stateAfter.Pts != stateBefore.Pts {
 		t.Fatalf("local channel clear advanced account pts: before=%d after=%d", stateBefore.Pts, stateAfter.Pts)
 	}
-	pushed := sessions.snapshot()
+	var pushed captureSessionsSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pushed = sessions.snapshot()
+		if pushed.message != nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	updates, ok := pushed.message.(*tg.Updates)
 	if !ok || len(updates.Updates) != 1 {
 		t.Fatalf("pushed local clear = %T %+v, want one available update", pushed.message, pushed.message)
@@ -108,6 +120,8 @@ func TestMessagesDeleteHistoryChannelReturnsOffsetForBoundedPage(t *testing.T) {
 		Channels: appchannels.NewService(channelStore),
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	req := &tg.MessagesDeleteHistoryRequest{
 		Peer:  &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
@@ -121,7 +135,15 @@ func TestMessagesDeleteHistoryChannelReturnsOffsetForBoundedPage(t *testing.T) {
 	if affected.Offset != 1 || affected.PtsCount != domain.MaxDeleteHistoryBatch {
 		t.Fatalf("affected history = %+v, want offset=1 pts_count=%d", affected, domain.MaxDeleteHistoryBatch)
 	}
-	pushed := sessions.snapshot()
+	var pushed captureSessionsSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pushed = sessions.snapshot()
+		if pushed.message != nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	updates, ok := pushed.message.(*tg.Updates)
 	if !ok || len(updates.Updates) != 1 {
 		t.Fatalf("pushed update = %T %+v, want one bounded delete update", pushed.message, pushed.message)

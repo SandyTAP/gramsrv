@@ -117,7 +117,12 @@ func (r *Router) onMessagesSendMessage(ctx context.Context, req *tg.MessagesSend
 			if req.ClearDraft {
 				r.clearDraftAfterSend(ctx, userID, peer, replyTo)
 			}
-			return r.monoforumSendUpdates(ctx, userID, replay.channel.Channel, savedPeer, replay.channel), nil
+			updates, projectionErr := r.monoforumSendUpdatesStrict(ctx, userID, replay.channel.Channel, savedPeer, replay.channel)
+			if projectionErr != nil {
+				sendErr = projectionErr
+				return nil, projectionErr
+			}
+			return updates, nil
 		}
 		if err := r.checkSendRateLimit(ctx, userID, 1); err != nil {
 			sendErr = err

@@ -60,7 +60,7 @@ func (r *Router) onMessagesRequestWebView(ctx context.Context, req *tg.MessagesR
 		return nil, err
 	}
 	now := r.clock.Now()
-	session := r.webviews.registerContext(ctx, now, store.WebViewSession{
+	session, err := r.webviews.registerContext(ctx, now, store.WebViewSession{
 		BotUserID:  bot.ID,
 		UserID:     userID,
 		Peer:       peer,
@@ -70,6 +70,9 @@ func (r *Router) onMessagesRequestWebView(ctx context.Context, req *tg.MessagesR
 		ReplyTo:    replyTo,
 		SendAs:     sendAs,
 	})
+	if err != nil {
+		return nil, internalErr()
+	}
 	signedURL, err := webViewURLWithInitData(rawURL, session.BotQueryID, profile, user, startParam, req.Platform, now)
 	if err != nil {
 		return nil, internalErr()
@@ -180,7 +183,7 @@ func (r *Router) onMessagesRequestAppWebView(ctx context.Context, req *tg.Messag
 		}
 	}
 	now := r.clock.Now()
-	session := r.webviews.registerContext(ctx, now, store.WebViewSession{
+	session, err := r.webviews.registerContext(ctx, now, store.WebViewSession{
 		BotUserID:    bot.ID,
 		UserID:       userID,
 		Peer:         peer,
@@ -189,6 +192,9 @@ func (r *Router) onMessagesRequestAppWebView(ctx context.Context, req *tg.Messag
 		StartParam:   startParam,
 		WriteAllowed: req.WriteAllowed,
 	})
+	if err != nil {
+		return nil, internalErr()
+	}
 	signedURL, err := webViewURLWithInitData(rawURL, session.BotQueryID, profile, user, startParam, req.Platform, now)
 	if err != nil {
 		return nil, internalErr()
@@ -252,7 +258,7 @@ func (r *Router) onMessagesRequestMainWebView(ctx context.Context, req *tg.Messa
 		return nil, err
 	}
 	now := r.clock.Now()
-	session := r.webviews.registerContext(ctx, now, store.WebViewSession{
+	session, err := r.webviews.registerContext(ctx, now, store.WebViewSession{
 		BotUserID:  bot.ID,
 		UserID:     userID,
 		Peer:       peer,
@@ -260,6 +266,9 @@ func (r *Router) onMessagesRequestMainWebView(ctx context.Context, req *tg.Messa
 		Source:     "main",
 		StartParam: startParam,
 	})
+	if err != nil {
+		return nil, internalErr()
+	}
 	signedURL, err := webViewURLWithInitData(rawURL, session.BotQueryID, profile, user, startParam, req.Platform, now)
 	if err != nil {
 		return nil, internalErr()
@@ -371,7 +380,10 @@ func (r *Router) SavePreparedInlineMessageFromBotAPI(ctx context.Context, botID,
 	if err := r.prepareTelegramLoginMarkup(ctx, botID, result.ReplyMarkup); err != nil {
 		return "", 0, replyMarkupErr(err)
 	}
-	id, expireDate := r.inlines.savePreparedInlineContext(ctx, r.clock.Now(), botID, userID, result, peerTypes)
+	id, expireDate, err := r.inlines.savePreparedInlineContext(ctx, r.clock.Now(), botID, userID, result, peerTypes)
+	if err != nil {
+		return "", 0, internalErr()
+	}
 	return id, expireDate, nil
 }
 
@@ -387,7 +399,9 @@ func (r *Router) sendWebViewDomainResultMessage(ctx context.Context, botID int64
 	media := cloneInlineMedia(result.Media)
 	if result.MediaAuto {
 		if result.Content != nil {
-			r.inlines.registerWebDocumentContext(ctx, now, *result.Content, webViewSessionTTL)
+			if err := r.inlines.registerWebDocumentContext(ctx, now, *result.Content, webViewSessionTTL); err != nil {
+				return err
+			}
 		}
 		var err error
 		media, err = r.domainInlineExternalContentMedia(ctx, result)

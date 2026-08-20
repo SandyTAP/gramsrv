@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -202,6 +203,30 @@ func (s *UserStore) UpdateProfile(ctx context.Context, userID int64, firstName, 
 	return userFromModel(row), nil
 }
 
+func (s *UserStore) UpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	var row sqlcgen.User
+	err := withTx(ctx, s.db, "update user profile with delivery", func(tx pgx.Tx) error {
+		var err error
+		row, err = sqlcgen.New(tx).UpdateUserProfile(ctx, sqlcgen.UpdateUserProfileParams{
+			ID:        userID,
+			FirstName: firstName,
+			LastName:  lastName,
+			About:     about,
+		})
+		if err != nil {
+			return err
+		}
+		return enqueueUserDeliveryTx(ctx, tx, userFromModel(row), build, excludeAuthKeyID, excludeSessionID)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrFirstNameInvalid
+		}
+		return domain.User{}, fmt.Errorf("update user profile with delivery: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
 func (s *UserStore) UpdateUsername(ctx context.Context, userID int64, username string) (domain.User, error) {
 	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
 	usernameLower := strings.ToLower(username)
@@ -248,6 +273,58 @@ func (s *UserStore) UpdateUsername(ctx context.Context, userID int64, username s
 	}
 	committed = true
 	return userFromModel(row), nil
+}
+
+func (s *UserStore) UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
+	usernameLower := strings.ToLower(username)
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.User{}, fmt.Errorf("update user username with delivery: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("begin update user username with delivery: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := s.q.WithTx(tx)
+	var lockedUserID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUsernameNotOccupied
+		}
+		return domain.User{}, fmt.Errorf("lock user for username update with delivery: %w", err)
+	}
+	if err := replacePeerUsernameTx(ctx, tx, peerUsernameTypeUser, userID, username, usernameLower); err != nil {
+		return domain.User{}, err
+	}
+	row, err := qtx.UpdateUserUsername(ctx, sqlcgen.UpdateUserUsernameParams{
+		ID:       userID,
+		Username: username,
+	})
+	if err != nil {
+		if isUniqueConstraint(err, "users_username_lower_unique_idx") {
+			return domain.User{}, domain.ErrUsernameOccupied
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUsernameNotOccupied
+		}
+		return domain.User{}, fmt.Errorf("update user username with delivery: %w", err)
+	}
+	u := userFromModel(row)
+	if err := enqueueUserDeliveryTx(ctx, tx, u, build, excludeAuthKeyID, excludeSessionID); err != nil {
+		return domain.User{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, fmt.Errorf("commit update user username with delivery: %w", err)
+	}
+	committed = true
+	return u, nil
 }
 
 // UpdatePhone is the non-PTS admin profile write. updateUserPhone has no
@@ -630,6 +707,30 @@ func (s *UserStore) UpdateBirthday(ctx context.Context, userID int64, birthday d
 	return userFromModel(row), nil
 }
 
+func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	var row sqlcgen.User
+	err := withTx(ctx, s.db, "update user birthday with delivery", func(tx pgx.Tx) error {
+		var err error
+		row, err = sqlcgen.New(tx).UpdateUserBirthday(ctx, sqlcgen.UpdateUserBirthdayParams{
+			ID:            userID,
+			BirthdayDay:   int32(birthday.Day),
+			BirthdayMonth: int32(birthday.Month),
+			BirthdayYear:  int32(birthday.Year),
+		})
+		if err != nil {
+			return err
+		}
+		return enqueueUserDeliveryTx(ctx, tx, userFromModel(row), build, excludeAuthKeyID, excludeSessionID)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user birthday with delivery: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
 // UpdatePersonalChannel 设置/清除资料页个人频道（channelID=0 表示清除）。
 func (s *UserStore) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
 	row, err := s.q.UpdateUserPersonalChannel(ctx, sqlcgen.UpdateUserPersonalChannelParams{
@@ -674,6 +775,77 @@ func (s *UserStore) UpdateColor(ctx context.Context, userID int64, forProfile bo
 		return domain.User{}, fmt.Errorf("update user color: %w", err)
 	}
 	return userFromModel(row), nil
+}
+
+func (s *UserStore) UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	var row sqlcgen.User
+	err := withTx(ctx, s.db, "update user color with delivery", func(tx pgx.Tx) error {
+		qtx := sqlcgen.New(tx)
+		var err error
+		if forProfile {
+			row, err = qtx.UpdateUserProfileColor(ctx, sqlcgen.UpdateUserProfileColorParams{
+				ID:                userID,
+				ColorSet:          color.HasColor,
+				Color:             int32(color.Color),
+				BackgroundEmojiID: color.BackgroundEmojiID,
+			})
+		} else {
+			row, err = qtx.UpdateUserColor(ctx, sqlcgen.UpdateUserColorParams{
+				ID:                userID,
+				ColorSet:          color.HasColor,
+				Color:             int32(color.Color),
+				BackgroundEmojiID: color.BackgroundEmojiID,
+			})
+		}
+		if err != nil {
+			return err
+		}
+		return enqueueUserDeliveryTx(ctx, tx, userFromModel(row), build, excludeAuthKeyID, excludeSessionID)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user color with delivery: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+func enqueueUserDeliveryTx(ctx context.Context, tx pgx.Tx, u domain.User, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
+	if build == nil {
+		return fmt.Errorf("delivery payload builder is required")
+	}
+	snapshot, err := userDeliverySnapshotTx(ctx, tx, u)
+	if err != nil {
+		return err
+	}
+	payload, err := build(snapshot)
+	if err != nil {
+		return err
+	}
+	if _, err := NewDeliveryOutboxStore(tx).Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID:     u.ID,
+		ExcludeAuthKeyID: excludeAuthKeyID,
+		ExcludeSessionID: excludeSessionID,
+		Payload:          payload,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func userDeliverySnapshotTx(ctx context.Context, tx pgx.Tx, u domain.User) (store.UserDeliverySnapshot, error) {
+	snapshot := store.UserDeliverySnapshot{User: u}
+	if u.ID == 0 {
+		return snapshot, nil
+	}
+	usernames, err := listPeerUsernames(ctx, tx, domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
+	if err != nil {
+		return store.UserDeliverySnapshot{}, err
+	}
+	snapshot.Usernames = usernames
+	snapshot.UsernamesLoaded = true
+	return snapshot, nil
 }
 
 // premiumUntilFromModel 把可空 timestamptz 转为 Unix 秒（NULL → 0）。

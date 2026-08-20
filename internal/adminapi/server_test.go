@@ -25,6 +25,16 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	}
 }
 
+func TestAdminAPIStartRejectsEmptyTokenWhenEnabled(t *testing.T) {
+	srv, err := Start(context.Background(), Config{Addr: "127.0.0.1:0", Token: " "}, fakeService{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "TELESRV_ADMIN_API_TOKEN") {
+		t.Fatalf("Start err = %v, want TELESRV_ADMIN_API_TOKEN", err)
+	}
+	if srv != nil {
+		t.Fatalf("Start returned server %+v with empty token", srv)
+	}
+}
+
 type gifCatalogReadService struct{ fakeService }
 
 func (gifCatalogReadService) GifCatalog(context.Context) ([]domain.GifCatalogEntry, error) {

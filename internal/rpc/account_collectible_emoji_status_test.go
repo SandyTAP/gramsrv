@@ -10,6 +10,7 @@ import (
 	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
+	appupdates "telesrv/internal/app/updates"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
@@ -68,7 +69,8 @@ func TestAccountCollectibleEmojiStatusListSetAndRejectNonOwner(t *testing.T) {
 	}
 	gift := collectibleEmojiTestGift(owner.ID)
 	gifts := &collectibleEmojiGiftService{gifts: map[int64]domain.UniqueStarGift{gift.ID: gift}}
-	r := New(Config{}, Deps{Users: users, Gifts: gifts}, zaptest.NewLogger(t), clock.System)
+	updates := appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore())
+	r := New(Config{}, Deps{Users: users, Updates: updates, Gifts: gifts}, zaptest.NewLogger(t), clock.System)
 	ownerCtx := WithUserID(ctx, owner.ID)
 
 	listed, err := r.onAccountGetCollectibleEmojiStatuses(ownerCtx, 0)
@@ -113,6 +115,32 @@ func TestAccountCollectibleEmojiStatusListSetAndRejectNonOwner(t *testing.T) {
 	gifts.gifts[gift.ID] = stolen
 	if ok, err := r.onAccountUpdateEmojiStatus(ownerCtx, &tg.InputEmojiStatusCollectible{CollectibleID: gift.ID}); ok || !tgerr.Is(err, "COLLECTIBLE_INVALID") {
 		t.Fatalf("set non-owned collectible: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAccountUpdateEmojiStatusRequiresDurableEventBoundary(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 3, Phone: "15550009103", FirstName: "Owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := appusers.NewService(userStore)
+	if _, err := users.GrantPremium(ctx, owner.ID, 1); err != nil {
+		t.Fatalf("grant premium: %v", err)
+	}
+	r := New(Config{}, Deps{Users: users}, zaptest.NewLogger(t), clock.System)
+
+	ok, err := r.onAccountUpdateEmojiStatus(WithUserID(ctx, owner.ID), &tg.EmojiStatus{DocumentID: 42})
+	if ok || err == nil {
+		t.Fatalf("update emoji status without durable event boundary = ok %v err %v, want failure", ok, err)
+	}
+	self, err := users.Self(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !self.EmojiStatus().Empty() {
+		t.Fatalf("emoji status mutated despite missing durable event boundary: %+v", self.EmojiStatus())
 	}
 }
 

@@ -188,6 +188,7 @@ func TestContactsEditCloseFriendsFanoutsCloseFriendStories(t *testing.T) {
 		}
 	}
 	r := New(Config{}, Deps{
+		Users:    appusers.NewService(users),
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(stateStore, updateStore),
@@ -322,6 +323,7 @@ func TestContactsBlockUnblockFanoutsStoryVisibilityChanges(t *testing.T) {
 		}
 	}
 	r := New(Config{}, Deps{
+		Users:    appusers.NewService(users),
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
@@ -476,6 +478,7 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 		t.Fatalf("upsert story: %v", err)
 	}
 	r := New(Config{}, Deps{
+		Users:    appusers.NewService(users),
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
@@ -681,6 +684,7 @@ func TestContactsSearchFindsPublicChannels(t *testing.T) {
 func TestUsernameRPCLifecycle(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
@@ -689,7 +693,10 @@ func TestUsernameRPCLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create other: %v", err)
 	}
-	r := New(Config{}, Deps{Users: appusers.NewService(userStore)}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{
+		Users:          appusers.NewService(userStore),
+		DeliveryOutbox: delivery,
+	}, zaptest.NewLogger(t), clock.System)
 	reqCtx := WithUserID(ctx, owner.ID)
 
 	ok, err := r.onAccountCheckUsername(reqCtx, "taken_name")
@@ -727,11 +734,15 @@ func TestUsernameRPCLifecycle(t *testing.T) {
 func TestAccountUpdateProfileRPC(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	delivery := attachDeliveryOutbox(userStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	r := New(Config{}, Deps{Users: appusers.NewService(userStore)}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{
+		Users:          appusers.NewService(userStore),
+		DeliveryOutbox: delivery,
+	}, zaptest.NewLogger(t), clock.System)
 	req := &tg.AccountUpdateProfileRequest{}
 	req.SetFirstName("Updated")
 	req.SetLastName("User")
@@ -774,7 +785,12 @@ func TestUsersGetFullUserProjectsOwnerScopedContactNoteAcrossCacheUpdates(t *tes
 	contactsService := appcontacts.NewService(cachedContacts, userStore)
 	usersService := appusers.NewService(userStore, appusers.WithContactStore(cachedContacts))
 	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Users: usersService, Contacts: contactsService, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{
+		Users:    usersService,
+		Contacts: contactsService,
+		Sessions: sessions,
+		Updates:  &captureUpdates{},
+	}, zaptest.NewLogger(t), clock.System)
 	hasUserRefresh := func(updates *tg.Updates, userID int64) bool {
 		t.Helper()
 		if updates == nil {
@@ -886,8 +902,8 @@ func TestUsersGetFullUserProjectsOwnerScopedContactNoteAcrossCacheUpdates(t *tes
 			hasReset = true
 		}
 	}
-	if !hasReset {
-		t.Fatalf("update contact note push = %+v, want contactsReset for non-reliable dispatch", pushed)
+	if hasReset {
+		t.Fatalf("update contact note push = %+v, want no contactsReset because Egress owns durable reset delivery", pushed)
 	}
 	note, ok = getNote(owner)
 	if !ok || note.Text != "fresh note" || len(note.Entities) != 1 {
@@ -928,11 +944,11 @@ func TestContactNoteReliableDispatchPushesOnlyTransientUserRefresh(t *testing.T)
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
 		Sessions: sessions,
-		Updates:  &captureUpdates{reliableDispatch: true},
+		Updates:  &captureUpdates{},
 	}, zaptest.NewLogger(t), clock.System)
 	peer := domain.User{ID: 1000000002, AccessHash: 22, FirstName: "Friend", Contact: true}
 
-	r.pushContactNoteRefreshIfReliableDispatch(WithUserID(context.Background(), 1000000001), 1000000001, peer)
+	r.pushContactNoteRefreshAfterDurableReset(WithUserID(context.Background(), 1000000001), 1000000001, peer)
 
 	pushed, ok := sessions.lastUserPush().(*tg.Updates)
 	if !ok {

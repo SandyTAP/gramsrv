@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 
 	"telesrv/internal/domain"
 )
+
+var ErrSecretChatStateEventStoreMissing = errors.New("secretchat: state event store missing")
 
 // SecretChatStore 持久化私聊密聊握手状态机真值（memory/postgres 双实现，行为契约由
 // storetest 钉死）。服务端是盲中继：g_a/g_b/key_fingerprint 原样不透明存储。
@@ -27,6 +30,15 @@ type SecretChatStore interface {
 	// 接受方 participant）且未终态的密聊，按 chat_id 升序。设备登出 / 授权撤销时用于级联
 	// discard 并通知对端（避免对端继续往死 auth_key 投递的静默死链）。authKeyID==0 返回 nil。
 	ListActiveSecretChatsByAuthKey(ctx context.Context, authKeyID int64) ([]domain.SecretChat, error)
+}
+
+// SecretChatStateEventStore 是握手态 durable updateEncryption 的聚合写入边界。
+// 实现必须把 secret_chats 状态变更与 encrypted_state_events 写入作为一个成功条件；
+// 生产 PostgreSQL 路径在同一事务内提交，测试 memory 路径必须显式绑定事件队列。
+type SecretChatStateEventStore interface {
+	CreateSecretChatWithStateEvent(ctx context.Context, chat domain.SecretChat, ev domain.EncryptedStateEvent) error
+	AcceptSecretChatWithStateEvents(ctx context.Context, chatID int, participantAuthKeyID int64, gb []byte, keyFingerprint int64, events []domain.EncryptedStateEvent) (domain.SecretChat, error)
+	DiscardSecretChatWithStateEvent(ctx context.Context, chatID int, historyDeleted bool, ev domain.EncryptedStateEvent) (chat domain.SecretChat, already bool, err error)
 }
 
 // EncryptedQueueStore 持久化密聊 qts 投递队列（设备级，memory/postgres 双实现）。

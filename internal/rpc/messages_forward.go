@@ -265,10 +265,14 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 		updates := r.channelMessagesUpdatesWithPeerCache(ctx, userID, results, req.RandomID, true, extraUserIDs, echoCache)
 		if n := len(fanoutResults); n > 0 {
 			fanoutPts := fanoutResults[n-1].Event.Pts
-			r.enqueueChannelMessagesFanout(ctx, userID, toPeer.ID, fanoutPts, recipients, fanoutResults, fanoutExtraUserIDs)
+			if err := r.enqueueChannelMessagesFanout(ctx, userID, toPeer.ID, fanoutPts, recipients, fanoutResults, fanoutExtraUserIDs); err != nil {
+				return nil, internalErr()
+			}
 		}
 		for _, res := range fanoutResults {
-			r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion)
+			if err := r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
+				return nil, internalErr()
+			}
 		}
 		return updates, nil
 	}
@@ -326,7 +330,9 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 				return nil, messageForwardErr(err)
 			}
 			if !sent.Duplicate {
-				r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent)
+				if err := r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent); err != nil {
+					return nil, internalErr()
+				}
 			}
 			res.SenderMessages = append(res.SenderMessages, sent.SenderMessage)
 			res.RecipientMessages = append(res.RecipientMessages, sent.RecipientMessage)
@@ -392,7 +398,11 @@ func (r *Router) forwardMessagesToMonoforum(
 	if len(absentIndexes) == 0 {
 		results := make([]tg.UpdatesClass, 0, len(replays))
 		for _, replay := range replays {
-			results = append(results, r.monoforumSendUpdates(ctx, userID, mono, savedPeer, replay.channel))
+			updates, err := r.monoforumSendUpdatesStrict(ctx, userID, mono, savedPeer, replay.channel)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, updates)
 		}
 		return combineSendUpdates(results), nil
 	}
@@ -436,7 +446,11 @@ func (r *Router) forwardMessagesToMonoforum(
 	results := make([]tg.UpdatesClass, 0, len(req.ID))
 	for i, source := range sources {
 		if replays[i].found {
-			results = append(results, r.monoforumSendUpdates(ctx, userID, mono, savedPeer, replays[i].channel))
+			updates, err := r.monoforumSendUpdatesStrict(ctx, userID, mono, savedPeer, replays[i].channel)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, updates)
 			continue
 		}
 		forward := source.forward

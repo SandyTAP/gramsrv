@@ -12,7 +12,9 @@ import (
 )
 
 // 超级群语音聊天（group call）核心 RPC。信令真值在 GroupCallStore（version 单调），
-// 媒体面经 deps.SFU（M0 为 Disabled：纯信令，客户端停留在 Connecting 属预期）。
+// 媒体面必须显式注入 deps.SFU；生产 Core 注入 standalone SFU owner wrapper。
+
+var errGroupCallSFUMissing = errors.New("rpc: group call sfu dependency missing")
 
 // groupCallErr 把 domain 群通话错误映射为 RPC_ERROR。
 func groupCallErr(err error) error {
@@ -32,6 +34,13 @@ func groupCallErr(err error) error {
 	default:
 		return internalErr()
 	}
+}
+
+func (r *Router) requireGroupCallSFU() (sfu.Service, error) {
+	if r == nil || r.deps.SFU == nil {
+		return nil, errGroupCallSFUMissing
+	}
+	return r.deps.SFU, nil
 }
 
 // groupCallScope 是群通话 handler 的通用前置解析结果。
@@ -309,6 +318,11 @@ func (r *Router) onPhoneJoinGroupCall(ctx context.Context, req *tg.PhoneJoinGrou
 		SourceGroups: groupCallSsrcGroupsFromOffer(offer),
 		Active:       !req.VideoStopped && len(offer.SsrcGroups) > 0,
 	}
+	sfuService, err := r.requireGroupCallSFU()
+	if err != nil {
+		r.log.Error("group call sfu dependency missing", zap.Error(err))
+		return nil, internalErr()
+	}
 	mut, err := r.deps.GroupCalls.Join(ctx, domain.JoinGroupCallRequest{
 		CallID:          scope.call.ID,
 		UserID:          scope.userID,
@@ -324,12 +338,7 @@ func (r *Router) onPhoneJoinGroupCall(ctx context.Context, req *tg.PhoneJoinGrou
 	if err != nil {
 		return nil, groupCallErr(err)
 	}
-	// 媒体面：SFU 分配 endpoint（M0 Disabled：语法完备空 candidates，客户端保持
-	// Connecting 并以 4s checkGroupCall 心跳维持保活——M0 sweeper 判据依赖该行为）。
-	sfuService := r.deps.SFU
-	if sfuService == nil {
-		sfuService = sfu.Disabled()
-	}
+	// 媒体面：SFU 分配 endpoint。依赖缺失已在写信令前 fail-fast。
 	answer, err := sfuService.Join(ctx, scope.call.ID, scope.userID, sfu.EndpointMain, offer)
 	if err != nil {
 		// 媒体面失败回滚信令侧（保持两面一致），返回 500。

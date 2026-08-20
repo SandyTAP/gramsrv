@@ -68,9 +68,13 @@ WHERE id = ANY($1::bigint[])
 	return count, nil
 }
 
-func (s *BroadcastStore) CreateBroadcast(ctx context.Context, message string, mode domain.BroadcastTargetMode, selectedUserIDs []int64, createdBy string) (domain.Broadcast, error) {
+func (s *BroadcastStore) CreateBroadcast(ctx context.Context, message string, entities []domain.MessageEntity, mode domain.BroadcastTargetMode, selectedUserIDs []int64, createdBy string) (domain.Broadcast, error) {
+	entitiesJSON, err := encodeMessageEntities(entities)
+	if err != nil {
+		return domain.Broadcast{}, fmt.Errorf("encode broadcast entities: %w", err)
+	}
 	var out domain.Broadcast
-	err := withTx(ctx, s.db, "create broadcast", func(tx pgx.Tx) error {
+	err = withTx(ctx, s.db, "create broadcast", func(tx pgx.Tx) error {
 		switch mode {
 		case domain.BroadcastTargetAll:
 			var maxUserID, count int64
@@ -81,16 +85,15 @@ SELECT COALESCE(max(id), 0), count(*) `+eligibleBroadcastUsersSQL, domain.System
 			if count == 0 {
 				return domain.ErrBroadcastNoRecipients
 			}
-			if err := tx.QueryRow(ctx, `
+			row := tx.QueryRow(ctx, `
 INSERT INTO broadcasts (
-  message, target_mode, snapshot_max_user_id, enumeration_done,
+  message, entities, target_mode, snapshot_max_user_id, enumeration_done,
   target_count, created_by
-) VALUES ($1, 'all', $2, false, $3, $4)
-RETURNING id, message, target_mode, target_count, materialized_count,
-          sent_count, failed_count, enumeration_done, created_by, created_at`,
-				message, maxUserID, count, createdBy,
-			).Scan(&out.ID, &out.Message, &out.TargetMode, &out.TargetCount, &out.MaterializedCount,
-				&out.SentCount, &out.FailedCount, &out.EnumerationDone, &out.CreatedBy, &out.CreatedAt); err != nil {
+) VALUES ($1, $2::jsonb, 'all', $3, false, $4, $5)
+RETURNING `+broadcastColumns,
+				message, string(entitiesJSON), maxUserID, count, createdBy,
+			)
+			if err := scanBroadcast(row, &out); err != nil {
 				return fmt.Errorf("insert all-user broadcast: %w", err)
 			}
 		case domain.BroadcastTargetSelected:
@@ -98,16 +101,15 @@ RETURNING id, message, target_mode, target_count, materialized_count,
 			if err != nil {
 				return err
 			}
-			if err := tx.QueryRow(ctx, `
+			row := tx.QueryRow(ctx, `
 INSERT INTO broadcasts (
-  message, target_mode, enumeration_done, target_count,
+  message, entities, target_mode, enumeration_done, target_count,
   materialized_count, created_by
-) VALUES ($1, 'selected', true, $2, $2, $3)
-RETURNING id, message, target_mode, target_count, materialized_count,
-          sent_count, failed_count, enumeration_done, created_by, created_at`,
-				message, count, createdBy,
-			).Scan(&out.ID, &out.Message, &out.TargetMode, &out.TargetCount, &out.MaterializedCount,
-				&out.SentCount, &out.FailedCount, &out.EnumerationDone, &out.CreatedBy, &out.CreatedAt); err != nil {
+) VALUES ($1, $2::jsonb, 'selected', true, $3, $3, $4)
+RETURNING `+broadcastColumns,
+				message, string(entitiesJSON), count, createdBy,
+			)
+			if err := scanBroadcast(row, &out); err != nil {
 				return fmt.Errorf("insert selected broadcast: %w", err)
 			}
 			if _, err := tx.Exec(ctx, `
@@ -218,9 +220,8 @@ WITH candidates AS (
   WHERE r.id = c.id
   RETURNING r.id, r.broadcast_id, r.user_id, r.attempts
 )
-SELECT c.id, c.broadcast_id, c.user_id, c.attempts, b.message
+SELECT c.id, c.broadcast_id, c.user_id, c.attempts
 FROM claimed c
-JOIN broadcasts b ON b.id = c.broadcast_id
 ORDER BY c.id`, limit, leaseToken, leaseSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("claim broadcast recipients: %w", err)
@@ -230,7 +231,7 @@ ORDER BY c.id`, limit, leaseToken, leaseSeconds)
 	for rows.Next() {
 		var item store.BroadcastRecipientClaim
 		item.LeaseToken = leaseToken
-		if err := rows.Scan(&item.RecipientID, &item.BroadcastID, &item.UserID, &item.Attempts, &item.Message); err != nil {
+		if err := rows.Scan(&item.RecipientID, &item.BroadcastID, &item.UserID, &item.Attempts); err != nil {
 			return nil, fmt.Errorf("scan broadcast recipient claim: %w", err)
 		}
 		out = append(out, item)
@@ -273,12 +274,21 @@ WHERE b.id = c.broadcast_id AND c.status = 'failed'`, claim.RecipientID, claim.L
 }
 
 const broadcastColumns = `
-id, message, target_mode, target_count, materialized_count,
+id, message, entities::text, target_mode, target_count, materialized_count,
 sent_count, failed_count, enumeration_done, created_by, created_at`
 
 func scanBroadcast(row interface{ Scan(...any) error }, item *domain.Broadcast) error {
-	return row.Scan(&item.ID, &item.Message, &item.TargetMode, &item.TargetCount, &item.MaterializedCount,
-		&item.SentCount, &item.FailedCount, &item.EnumerationDone, &item.CreatedBy, &item.CreatedAt)
+	var entitiesJSON string
+	if err := row.Scan(&item.ID, &item.Message, &entitiesJSON, &item.TargetMode, &item.TargetCount, &item.MaterializedCount,
+		&item.SentCount, &item.FailedCount, &item.EnumerationDone, &item.CreatedBy, &item.CreatedAt); err != nil {
+		return err
+	}
+	entities, err := decodeMessageEntities(entitiesJSON)
+	if err != nil {
+		return fmt.Errorf("decode broadcast entities: %w", err)
+	}
+	item.Entities = entities
+	return nil
 }
 
 func (s *BroadcastStore) ListBroadcasts(ctx context.Context, beforeID int64, limit int) ([]domain.Broadcast, bool, error) {

@@ -26,6 +26,8 @@ import (
 	"github.com/iamxvbaba/td/transport"
 
 	"github.com/iamxvbaba/td/tlprofile"
+	"telesrv/internal/edgecontrol"
+	"telesrv/internal/rpcidentity"
 	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
@@ -209,6 +211,14 @@ type LayerRPCProfileEvidenceContext interface {
 	WithLayerRPCProfileEvidenceFresh(ctx context.Context, fresh bool) context.Context
 }
 
+type LayerRPCIdentityHint = rpcidentity.LayerRPCIdentityHint
+
+// LayerRPCIdentityHintContext lets Edge attach connection-local identity cache
+// state without importing CoreExec/RPC packages.
+type LayerRPCIdentityHintContext interface {
+	WithLayerRPCIdentityHint(ctx context.Context, hint LayerRPCIdentityHint) context.Context
+}
+
 // LayerRPCAdmissionProfilePublisher advances the auth-key-wide inherited
 // default for fresh explicit evidence. admissionSeq is allocated once by the
 // edge's exact flight owner and globally orders different MTProto sessions;
@@ -236,6 +246,16 @@ type RPCInitConnectionObserver interface {
 		layer, apiID int,
 		deviceModel, systemVersion, appVersion, systemLangCode, langPack, langCode string,
 	) error
+}
+
+// OutboxClientAck is emitted by Edge after a Telegram client msgs_ack resolves
+// to a tracked server frame carrying a durable outbox delivery ref.
+type OutboxClientAck struct {
+	Ref         edgecontrol.OutboxDeliveryRef
+	AuthKeyID   [8]byte
+	SessionID   int64
+	ServerMsgID int64
+	AckedAt     time.Time
 }
 
 // Options 配置 Server。
@@ -347,6 +367,9 @@ type Options struct {
 	LayerRPC LayerRPCHandler
 	// Metrics 接收连接层指标。默认 NopMetrics。
 	Metrics Metrics
+	// OutboxClientAcked observes client msgs_ack for durable outbox pushes. It is
+	// a production wiring point for Egress ACK writeback, not a topology mode.
+	OutboxClientAcked func(OutboxClientAck)
 	// OnServing is called after the connection intake loops have been installed.
 	// It is a platform-neutral observation hook; all slow initialization must
 	// finish before ListenAndServe is entered.
@@ -490,20 +513,21 @@ type Server struct {
 	outboundControlBudget    *outboundTrackedBudget
 	outboundScratchPool      *outboundScratchPool
 
-	dc        int
-	strictDC  bool
-	key       exchange.PrivateKey
-	authKeys  store.AuthKeyStore
-	conns     *SessionManager
-	rpc       legacyRPCHandler
-	layerRPC  LayerRPCHandler
-	metrics   Metrics
-	onServing func(net.Addr)
-	cipher    crypto.Cipher
-	clock     clock.Clock
-	rand      io.Reader
-	types     *tmap.Map
-	admission *admissionController
+	dc                int
+	strictDC          bool
+	key               exchange.PrivateKey
+	authKeys          store.AuthKeyStore
+	conns             *SessionManager
+	rpc               legacyRPCHandler
+	layerRPC          LayerRPCHandler
+	metrics           Metrics
+	onServing         func(net.Addr)
+	cipher            crypto.Cipher
+	clock             clock.Clock
+	rand              io.Reader
+	types             *tmap.Map
+	admission         *admissionController
+	outboxClientAcked func(OutboxClientAck)
 
 	rpcResults *rpcExecutionLedger
 	rpcRewrap  *rpcRewrapRegistry
@@ -551,6 +575,7 @@ func New(opts Options) *Server {
 		layerRPC:                 opts.LayerRPC,
 		metrics:                  opts.Metrics,
 		onServing:                opts.OnServing,
+		outboxClientAcked:        opts.OutboxClientAcked,
 		cipher:                   crypto.NewServerCipher(opts.Rand),
 		clock:                    opts.Clock,
 		rand:                     opts.Rand,
@@ -638,6 +663,18 @@ func (s *Server) buildConn(tc transport.Conn, lease *physicalTransportLease, key
 			// retire any init-rewrap bookkeeping.
 			s.rpcResults.Acknowledge(conn.authKeyID, conn.sessionID, reqMsgID)
 			s.rpcRewrap.acknowledge(conn, reqMsgID)
+		},
+		outboxClientAcked: func(conn *Conn, ref edgecontrol.OutboxDeliveryRef, serverMsgID int64) {
+			if s.outboxClientAcked == nil {
+				return
+			}
+			s.outboxClientAcked(OutboxClientAck{
+				Ref:         ref,
+				AuthKeyID:   conn.authKeyID,
+				SessionID:   conn.sessionID,
+				ServerMsgID: serverMsgID,
+				AckedAt:     s.clock.Now(),
+			})
 		},
 	}
 	s.conns.attachLogicalSession(c, s.outboundTrackedBudget)

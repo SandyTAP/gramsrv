@@ -64,7 +64,10 @@ func validPhone(phone string) bool {
 }
 
 func systemUserLoginForbidden(u domain.User) bool {
-	return domain.IsSystemUserID(u.ID)
+	// Login-facing callers deliberately use the same non-enumerating error for
+	// reserved identities and irreversible tombstones. The durable authorization
+	// store repeats the deleted check under the user lock to close the TOCTOU gap.
+	return u.Deleted || domain.IsSystemUserID(u.ID)
 }
 
 func systemLoginPhoneForbidden(phone string) bool {
@@ -280,7 +283,7 @@ func (s *Service) ResolveAuthKey(ctx context.Context, authKeyID [8]byte) ([8]byt
 
 // UserID 返回 auth_key 当前绑定的用户。未登录、或两步验证未完成时 found=false。
 func (s *Service) UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error) {
-	if s == nil || s.auths == nil {
+	if s == nil || s.auths == nil || s.users == nil {
 		return 0, false, nil
 	}
 	a, found, err := s.auths.ByAuthKey(ctx, authKeyID)
@@ -291,7 +294,13 @@ func (s *Service) UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, e
 		// 两步验证未完成：业务鉴权视为未登录，仅允许 auth.checkPassword 继续。
 		return 0, false, nil
 	}
-	if domain.IsSystemUserID(a.UserID) {
+	u, userFound, err := s.users.ByID(ctx, a.UserID)
+	if err != nil {
+		return 0, false, err
+	}
+	if !userFound || systemUserLoginForbidden(u) {
+		// A stale row can exist only after an interrupted/legacy path. Fail closed
+		// before it reaches the Router auth cache and retire it opportunistically.
 		_ = s.auths.Delete(ctx, authKeyID)
 		return 0, false, nil
 	}
@@ -301,14 +310,18 @@ func (s *Service) UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, e
 // PendingPasswordUserID 返回处于"待两步验证"状态的 auth_key 对应的用户。
 // UserID 对 password_pending 的 auth_key 返回未登录，auth.checkPassword 借此仍能定位待验证用户。
 func (s *Service) PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error) {
-	if s == nil || s.auths == nil {
+	if s == nil || s.auths == nil || s.users == nil {
 		return 0, false, nil
 	}
 	a, found, err := s.auths.ByAuthKey(ctx, authKeyID)
 	if err != nil || !found || !a.PasswordPending {
 		return 0, false, err
 	}
-	if domain.IsSystemUserID(a.UserID) {
+	u, userFound, err := s.users.ByID(ctx, a.UserID)
+	if err != nil {
+		return 0, false, err
+	}
+	if !userFound || systemUserLoginForbidden(u) {
 		_ = s.auths.Delete(ctx, authKeyID)
 		return 0, false, nil
 	}
@@ -320,7 +333,19 @@ func (s *Service) CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte)
 	if s == nil || s.auths == nil {
 		return nil
 	}
-	return s.auths.MarkPasswordPassed(ctx, authKeyID)
+	if err := s.auths.MarkPasswordPassed(ctx, authKeyID); err != nil {
+		return err
+	}
+	// MarkPasswordPassed historically treats a missing row as an idempotent
+	// no-op. Account deletion can revoke the pending authorization between the
+	// password check and this write, so never let the Router cache/bind a session
+	// until the promoted authorization and its active user are revalidated.
+	if _, found, err := s.UserID(ctx, authKeyID); err != nil {
+		return err
+	} else if !found {
+		return ErrSystemUserLoginForbidden
+	}
+	return nil
 }
 
 // SendCode 为 phone 生成 phone_code_hash，按配置选择开发 app code、登录邮箱 code
@@ -1355,6 +1380,16 @@ func (s *Service) ResetAuthorizations(ctx context.Context, userID int64, keepAut
 }
 
 func (s *Service) bind(ctx context.Context, auth domain.Authorization, userID int64) error {
+	if s == nil || s.users == nil || s.auths == nil || userID == 0 {
+		return ErrSystemUserLoginForbidden
+	}
+	u, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !found || systemUserLoginForbidden(u) {
+		return ErrSystemUserLoginForbidden
+	}
 	if s.authKeys != nil {
 		key, found, err := s.authKeys.Get(ctx, auth.AuthKeyID)
 		if err != nil {
@@ -1374,6 +1409,9 @@ func (s *Service) bind(ctx context.Context, auth domain.Authorization, userID in
 	if err := s.auths.Bind(ctx, auth); err != nil {
 		if errors.Is(err, store.ErrAuthKeyNotPermanent) {
 			return ErrAuthKeyPermEmpty
+		}
+		if errors.Is(err, domain.ErrAccountDeleted) || errors.Is(err, domain.ErrUserNotFound) {
+			return ErrSystemUserLoginForbidden
 		}
 		return err
 	}

@@ -3,6 +3,7 @@ package users
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -16,6 +17,10 @@ import (
 var (
 	ErrNotAuthorized       = errors.New("not authorized")
 	ErrSystemUserImmutable = errors.New("system user identity is immutable")
+	ErrDeliveryRequired    = errors.New("user delivery aggregate store is required")
+	ErrBatchUsersLimit     = errors.New("batch users limit exceeded")
+	ErrBatchViewerCells    = errors.New("batch viewer projection cell limit exceeded")
+	ErrBatchUserMissing    = errors.New("batch user projection source is incomplete")
 )
 
 // ProfilePhotoProvider 批量返回用户当前头像（用于把 PhotoID/DCID/Stripped 富化到 domain.User）。
@@ -84,6 +89,10 @@ const (
 	maxProfileAboutRunes        = 70
 	maxProfileAboutRunesPremium = 140
 	maxBatchUsers               = 1000
+	// A dense fan-out materializes one complete domain.User per viewer/owner
+	// cell in both the result and the batch cache. Bound the retained graph;
+	// callers with durable recovery fail closed and send a channel-too-long nudge.
+	maxBatchViewerProjectionCells = 131072
 )
 
 // NewService 创建用户服务。
@@ -178,11 +187,11 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 		if _, ok := seen[id]; ok {
 			continue
 		}
+		if len(ids) >= maxBatchUsers {
+			return nil, fmt.Errorf("%w: more than %d unique owners", ErrBatchUsersLimit, maxBatchUsers)
+		}
 		seen[id] = struct{}{}
 		ids = append(ids, id)
-		if len(ids) >= maxBatchUsers {
-			break
-		}
 	}
 	users, err := s.loadBaseUsersByIDs(ctx, ids)
 	if err != nil {
@@ -192,22 +201,68 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 }
 
 // ByIDsForViewers 跨多个 viewer 批量投影同一组 user（fan-out 模板化）：base user 只加载一次，
-// 隐私/改名/头像投影经 userprojection.ForViewers 压成 O(owner) 查询。返回 map[viewerID][]User，
-// 每个切片与 ByIDs(viewer, ids) 字节等价——**唯一例外是 personal photo overlay**（ForViewers v1
-// 跳过，客户端下次 getChannelDifference/getHistory 自愈）。供 channel fan-out 预热每 viewer 投影，
+// 隐私/改名/头像投影经 userprojection.ForViewers 收敛成批量查询。返回 map[viewerID][]User，
+// 每个切片与 ByIDs(viewer, ids) 字节等价，包含 viewer-specific personal photo overlay。
+// 供 channel fan-out 预热每 viewer 投影，
 // 把 per-recipient 的 ByIDs(=ForViewer) 折叠成一次跨 viewer 投影。不做 ByIDs 的单 caller 鉴权
 // （viewer 是 fan-out 收件人集合，非 RPC 调用方）。
 func (s *Service) ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error) {
 	if len(viewerUserIDs) == 0 || len(userIDs) == 0 {
 		return map[int64][]domain.User{}, nil
 	}
-	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	ids := uniqueUserIDs(userIDs, 0)
+	if len(ids) > maxBatchUsers {
+		return nil, fmt.Errorf("%w: got %d unique owners, maximum %d", ErrBatchUsersLimit, len(ids), maxBatchUsers)
+	}
+	viewers := uniqueUserIDs(viewerUserIDs, 0)
+	if !batchViewerProjectionCellsAllowed(len(viewers), len(ids)) {
+		return nil, fmt.Errorf("%w: got %d viewers x %d owners, maximum %d cells", ErrBatchViewerCells, len(viewers), len(ids), maxBatchViewerProjectionCells)
+	}
 	base, err := s.loadBaseUsersByIDs(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
+	base, err = requireBatchBaseUsers(ids, base)
+	if err != nil {
+		return nil, err
+	}
 	// projector 为 nil 时 ForViewers 返回各 viewer 的原始 base 副本（与 projectUsers 的 nil 分支一致）。
-	return s.projector.ForViewers(ctx, viewerUserIDs, base)
+	return s.projector.ForViewers(ctx, viewers, base)
+}
+
+func batchViewerProjectionCellsAllowed(viewers, owners int) bool {
+	if viewers <= 0 || owners <= 0 {
+		return true
+	}
+	// Division avoids overflow from viewers*owners on hostile inputs.
+	return viewers <= maxBatchViewerProjectionCells/owners
+}
+
+// requireBatchBaseUsers turns the fan-out projection API into a complete
+// envelope contract. Deleted users remain durable tombstones and therefore
+// still appear in base; a truly missing referenced user must fail closed rather
+// than produce a message whose sender cannot be resolved. System users are
+// protocol-local constants and do not require a backing users row.
+func requireBatchBaseUsers(ids []int64, base []domain.User) ([]domain.User, error) {
+	byID := make(map[int64]domain.User, len(base))
+	for _, user := range base {
+		if user.ID != 0 {
+			byID[user.ID] = user
+		}
+	}
+	out := make([]domain.User, 0, len(ids))
+	for _, id := range ids {
+		if user, ok := byID[id]; ok {
+			out = append(out, user)
+			continue
+		}
+		if system, ok := domain.SystemUserByID(id); ok {
+			out = append(out, system)
+			continue
+		}
+		return nil, fmt.Errorf("%w: user_id=%d", ErrBatchUserMissing, id)
+	}
+	return out, nil
 }
 
 // CheckUsername 校验当前用户是否可以占用 username。
@@ -264,6 +319,42 @@ func (s *Service) UpdateUsername(ctx context.Context, userID int64, username str
 	return u, nil
 }
 
+func (s *Service) UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	if build == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	username = normalizeUsername(username)
+	if username != "" {
+		if !validUsername(username) {
+			return domain.User{}, domain.ErrUsernameInvalid
+		}
+		ok, err := s.checkUsernameAvailable(ctx, self.ID, username)
+		if err != nil {
+			return domain.User{}, err
+		}
+		if !ok {
+			return domain.User{}, domain.ErrUsernameOccupied
+		}
+	}
+	if self.Username == username {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.UpdateUsernameWithDelivery(ctx, self.ID, username, build, excludeAuthKeyID, excludeSessionID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
 // UpdateProfile 修改当前用户的基础资料。未设置的字段保持原值。
 func (s *Service) UpdateProfile(ctx context.Context, userID int64, update domain.UserProfileUpdate) (domain.User, error) {
 	self, err := s.loadSelf(ctx, userID)
@@ -296,6 +387,51 @@ func (s *Service) UpdateProfile(ctx context.Context, userID int64, update domain
 		return self, nil
 	}
 	u, err := s.users.UpdateProfile(ctx, self.ID, firstName, lastName, about)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+func (s *Service) UpdateProfileWithDelivery(ctx context.Context, userID int64, update domain.UserProfileUpdate, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	if build == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	firstName := self.FirstName
+	lastName := self.LastName
+	about := self.About
+	if update.HasFirstName {
+		firstName = strings.TrimSpace(update.FirstName)
+	}
+	if update.HasLastName {
+		lastName = strings.TrimSpace(update.LastName)
+	}
+	if update.HasAbout {
+		about = strings.TrimSpace(update.About)
+	}
+	if firstName == "" || utf8.RuneCountInString(firstName) > maxProfileNameRunes || utf8.RuneCountInString(lastName) > maxProfileNameRunes {
+		return domain.User{}, domain.ErrFirstNameInvalid
+	}
+	aboutLimit := maxProfileAboutRunes
+	if self.PremiumActiveAt(time.Now().Unix()) {
+		aboutLimit = maxProfileAboutRunesPremium
+	}
+	if utf8.RuneCountInString(about) > aboutLimit {
+		return domain.User{}, domain.ErrAboutTooLong
+	}
+	if firstName == self.FirstName && lastName == self.LastName && about == self.About {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.UpdateProfileWithDelivery(ctx, self.ID, firstName, lastName, about, build, excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -522,8 +658,9 @@ func (s *Service) UpdateEmojiStatus(ctx context.Context, userID int64, status do
 
 // UpdateEmojiStatusWithEvent uses the store's aggregate transaction when it
 // is available. The bool reports whether the returned event was durably
-// appended with dispatch; lightweight memory/test wiring falls back to the
-// ordinary state write and lets the RPC's Updates service append the event.
+// appended with dispatch; lightweight memory/test wiring reports false before
+// any state write so the caller can choose an explicit durable Updates path or
+// fail closed without exposing an online-only mutation.
 func (s *Service) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, bool, error) {
 	self, err := s.validateEmojiStatusUpdate(ctx, userID, status)
 	if err != nil {
@@ -531,11 +668,7 @@ func (s *Service) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, 
 	}
 	writer, ok := s.users.(store.UserEmojiStatusEventStore)
 	if !ok {
-		u, err := s.users.UpdateEmojiStatus(ctx, self.ID, status)
-		if err == nil {
-			s.refreshCachedUsers(ctx, u)
-		}
-		return u, domain.UpdateEvent{}, false, err
+		return self, domain.UpdateEvent{}, false, nil
 	}
 	event := domain.UpdateEvent{
 		Type:        domain.UpdateEventUserEmojiStatus,
@@ -587,6 +720,36 @@ func (s *Service) UpdateBirthday(ctx context.Context, userID int64, birthday dom
 	return u, nil
 }
 
+func (s *Service) UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	if build == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if birthday.IsSet() {
+		if !domain.ValidBirthday(birthday) {
+			return domain.User{}, domain.ErrBirthdayInvalid
+		}
+	} else {
+		birthday = domain.Birthday{}
+	}
+	if self.Birthday == birthday {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.UpdateBirthdayWithDelivery(ctx, self.ID, birthday, build, excludeAuthKeyID, excludeSessionID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
 // UpdatePersonalChannel 设置/清除资料页个人频道（account.updatePersonalChannel）；
 // channelID=0 表示清除。频道存在性与「调用者是其成员」由 RPC 层在调用前校验。
 func (s *Service) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
@@ -609,6 +772,29 @@ func (s *Service) UpdateColor(ctx context.Context, userID int64, forProfile bool
 		return domain.User{}, err
 	}
 	u, err := s.users.UpdateColor(ctx, self.ID, forProfile, color)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+func (s *Service) UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build store.UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error) {
+	if build == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if (!forProfile && self.Color == color) || (forProfile && self.ProfileColor == color) {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.UpdateColorWithDelivery(ctx, self.ID, forProfile, color, build, excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -719,7 +905,10 @@ func (s *Service) loadBaseUserByID(ctx context.Context, userID int64) (domain.Us
 }
 
 func (s *Service) loadBaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
-	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	ids := uniqueUserIDs(userIDs, maxBatchUsers+1)
+	if len(ids) > maxBatchUsers {
+		return nil, fmt.Errorf("%w: more than %d unique owners", ErrBatchUsersLimit, maxBatchUsers)
+	}
 	if len(ids) == 0 {
 		return nil, nil
 	}

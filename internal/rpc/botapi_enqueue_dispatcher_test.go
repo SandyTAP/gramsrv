@@ -9,14 +9,14 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-// TestBotAPIEnqueueDispatcherSynchronousBeforeRun 锁定未启动时的同步回退：
-// 测试/未装配场景下 enqueue 行为与旧版完全一致（job 在调用方 goroutine 内即时执行）。
-func TestBotAPIEnqueueDispatcherSynchronousBeforeRun(t *testing.T) {
+// TestBotAPIEnqueueDispatcherCallerPathBeforeRun 锁定未启动 worker 时的 caller-path
+// durable insert：bot_api_updates 是投递真值，不能因为后台 worker 未开始而丢行。
+func TestBotAPIEnqueueDispatcherCallerPathBeforeRun(t *testing.T) {
 	d := newBotAPIEnqueueDispatcher(zaptest.NewLogger(t), 4)
 	ran := false
 	d.Enqueue(context.Background(), func(context.Context) { ran = true })
 	if !ran {
-		t.Fatal("job must run synchronously before Run is called")
+		t.Fatal("job must run on caller path before Run is called")
 	}
 }
 
@@ -59,9 +59,9 @@ func TestBotAPIEnqueueDispatcherFIFOOrder(t *testing.T) {
 	}
 }
 
-// TestBotAPIEnqueueDispatcherFallsBackWhenFull 锁定队列满时的同步回退：Bot API 队列行
-// 是投递真值（无 getDifference 类兜底），满时发送者多等一次 INSERT，绝不丢。
-func TestBotAPIEnqueueDispatcherFallsBackWhenFull(t *testing.T) {
+// TestBotAPIEnqueueDispatcherUsesCallerPathWhenFull 锁定队列满时的 caller-path durable
+// insert：Bot API 队列行是投递真值，满时发送者多等一次 INSERT，绝不丢。
+func TestBotAPIEnqueueDispatcherUsesCallerPathWhenFull(t *testing.T) {
 	d := newBotAPIEnqueueDispatcher(zaptest.NewLogger(t), 1)
 	d.started.Store(true) // 模拟已启动但 worker 不消费（阻塞场景）
 
@@ -71,6 +71,6 @@ func TestBotAPIEnqueueDispatcherFallsBackWhenFull(t *testing.T) {
 	ran := false
 	d.Enqueue(context.Background(), func(context.Context) { ran = true })
 	if !ran {
-		t.Fatal("job must fall back to synchronous execution when queue is full")
+		t.Fatal("job must execute on caller path when queue is full")
 	}
 }

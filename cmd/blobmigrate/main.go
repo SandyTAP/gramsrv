@@ -31,6 +31,7 @@ func main() {
 }
 
 func run() error {
+	flag.String("config", "", "File role YAML config path (default configs/file.yaml)")
 	fromFlag := flag.String("from", "", "source permanent backend: localfs or s3")
 	toFlag := flag.String("to", "", "destination permanent backend: localfs or s3")
 	batchFlag := flag.Int("batch", 250, "distinct object keys per PostgreSQL keyset page (1..10000)")
@@ -45,13 +46,13 @@ func run() error {
 	if *batchFlag <= 0 || *batchFlag > 10000 {
 		return fmt.Errorf("-batch must be 1..10000")
 	}
-	cfg, err := config.Load()
+	cfg, err := config.LoadFile()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 	if cfg.BlobBackendKind != string(from) {
 		return fmt.Errorf(
-			"TELESRV_BLOB_BACKEND=%s must name the current source backend %s",
+			"storage.blob_backend=%s must name the current source backend %s",
 			cfg.BlobBackendKind, from,
 		)
 	}
@@ -131,7 +132,7 @@ func validPermanentBackend(backend domain.MediaBackend) bool {
 
 func newMigrationBackend(
 	ctx context.Context,
-	cfg config.Config,
+	cfg config.FileConfig,
 	kind domain.MediaBackend,
 	destination bool,
 ) (filesapp.BlobBackend, error) {

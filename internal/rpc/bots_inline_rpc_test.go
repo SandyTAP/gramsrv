@@ -52,7 +52,12 @@ func TestBuiltinGifInlineQueryAcceptsGlobalEmptyPeerAndRegistersQuery(t *testing
 	}
 	doc := domain.Document{ID: 901, AccessHash: 902, DCID: 2, MimeType: "video/mp4", Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrAnimated}, {Kind: domain.DocAttrVideo, W: 320, H: 240, Duration: 1}}}
 	bots := botsapp.NewService(users, botStore, memory.NewMessageStore(memory.NewDialogStore()), botsapp.WithGifCatalog(builtinGifCatalogRPCSource{doc: doc}))
-	router := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{Users: appusers.NewService(users), Bots: bots, ServiceBotInlineResults: bots}, zaptest.NewLogger(t), clock.System)
+	router := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
+		Users:                   appusers.NewService(users),
+		Bots:                    bots,
+		ServiceBotInlineResults: bots,
+		Inline:                  newTestInlineRegistryStore(),
+	}, zaptest.NewLogger(t), clock.System)
 	got, err := router.onMessagesGetInlineBotResults(WithUserID(ctx, owner.ID), &tg.MessagesGetInlineBotResultsRequest{Bot: inputUser(domain.GifBotUser()), Peer: &tg.InputPeerEmpty{}, Query: "wave"})
 	if err != nil {
 		t.Fatalf("global @gif query: %v", err)
@@ -117,11 +122,13 @@ func newInlineBotRPCTestFixture(t *testing.T) inlineBotRPCTestFixture {
 		t.Fatalf("set inline placeholder: %v", err)
 	}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(users),
-		Bots:     bots,
-		Messages: messages,
-		Channels: channels,
-		Files:    files,
+		Users:         appusers.NewService(users),
+		Bots:          bots,
+		Messages:      messages,
+		Channels:      channels,
+		Files:         files,
+		Inline:        newTestInlineRegistryStore(),
+		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
 	}, zaptest.NewLogger(t), clock.System)
 	return inlineBotRPCTestFixture{router: r, bots: bots, channels: channels, files: files, owner: owner, peer: peer, bot: bot, photo: photo, document: document}
 }
@@ -1990,7 +1997,10 @@ func TestInlineBotValidation(t *testing.T) {
 	if ok, err := f.router.onMessagesSetInlineBotResults(WithUserID(ctx, f.bot.ID), webviewReq); err != nil || !ok {
 		t.Fatalf("switch_webview set = %v,%v, want true,nil", ok, err)
 	}
-	results, ok := f.router.inlines.resultsForQueryContext(ctx, time.Now(), f.owner.ID, webviewQueryID)
+	results, ok, err := f.router.inlines.resultsForQueryContext(ctx, time.Now(), f.owner.ID, webviewQueryID)
+	if err != nil {
+		t.Fatalf("switch_webview results lookup: %v", err)
+	}
 	if !ok || results.SwitchWeb == nil || results.SwitchWeb.Text != "Open" || results.SwitchWeb.URL != "https://example.test/app" {
 		t.Fatalf("switch_webview results = %+v ok=%v", results.SwitchWeb, ok)
 	}

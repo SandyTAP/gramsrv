@@ -146,8 +146,7 @@ func (r *Router) resolvePendingWebPage(ctx context.Context, job webPageResolveJo
 			return err
 		}
 		// 复用频道编辑扇出（投影 updateChannelWebPage）触达成员；difference 走通用回放。
-		r.enqueueChannelEditMessageFanout(ctx, job.senderID, res)
-		return nil
+		return r.enqueueChannelEditMessageFanout(ctx, job.senderID, res)
 	case domain.PeerTypeUser:
 		if r.deps.Messages == nil {
 			return nil

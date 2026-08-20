@@ -36,23 +36,9 @@ func TestBootstrapUpdateJobRetriesBeforeFailed(t *testing.T) {
 	}
 	retry, err := store.ClaimReady(ctx, 10, time.Second)
 	if err != nil {
-		t.Fatalf("claim retry before backoff: %v", err)
-	}
-	if len(retry) != 0 {
-		t.Fatalf("retry before backoff = %+v, want none", retry)
-	}
-
-	store.mu.Lock()
-	job = store.jobs[claimed[0].ID]
-	job.ReadyAt = time.Now().Add(-time.Second)
-	store.jobs[claimed[0].ID] = job
-	store.mu.Unlock()
-
-	retry, err = store.ClaimReady(ctx, 10, time.Second)
-	if err != nil {
-		t.Fatalf("claim retry after backoff: %v", err)
+		t.Fatalf("claim retry: %v", err)
 	}
 	if len(retry) != 1 || retry[0].Attempts != 2 {
-		t.Fatalf("retry after backoff = %+v, want second attempt", retry)
+		t.Fatalf("retry = %+v, want second attempt", retry)
 	}
 }

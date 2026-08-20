@@ -89,6 +89,67 @@ func TestServiceUsernameLifecycle(t *testing.T) {
 	}
 }
 
+func TestByIDsForViewersRejectsOwnerSetAboveBound(t *testing.T) {
+	svc := NewService(memory.NewUserStore())
+	ids := make([]int64, maxBatchUsers+1)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	if _, err := svc.ByIDsForViewers(context.Background(), []int64{1}, ids); !errors.Is(err, ErrBatchUsersLimit) {
+		t.Fatalf("ByIDsForViewers err = %v, want ErrBatchUsersLimit", err)
+	}
+}
+
+func TestByIDsRejectsOwnerSetAboveBoundInsteadOfTruncating(t *testing.T) {
+	svc := NewService(memory.NewUserStore())
+	ids := make([]int64, maxBatchUsers+1)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	if _, err := svc.ByIDs(context.Background(), 1, ids); !errors.Is(err, ErrBatchUsersLimit) {
+		t.Fatalf("ByIDs err = %v, want ErrBatchUsersLimit", err)
+	}
+}
+
+func TestPrivacyBaseUsersRejectsViewerSetAboveBoundInsteadOfNegativeCachingTruncation(t *testing.T) {
+	svc := NewService(memory.NewUserStore())
+	ids := make([]int64, maxBatchUsers+1)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	if _, err := svc.PrivacyBaseUsers(context.Background(), ids); !errors.Is(err, ErrBatchUsersLimit) {
+		t.Fatalf("PrivacyBaseUsers err = %v, want ErrBatchUsersLimit", err)
+	}
+}
+
+func TestByIDsForViewersRejectsDenseCellSetAboveBound(t *testing.T) {
+	svc := NewService(memory.NewUserStore())
+	owners := make([]int64, maxBatchUsers)
+	for i := range owners {
+		owners[i] = int64(i + 1)
+	}
+	viewers := make([]int64, maxBatchViewerProjectionCells/maxBatchUsers+1)
+	for i := range viewers {
+		viewers[i] = int64(10_000 + i)
+	}
+	if _, err := svc.ByIDsForViewers(context.Background(), viewers, owners); !errors.Is(err, ErrBatchViewerCells) {
+		t.Fatalf("ByIDsForViewers err = %v, want ErrBatchViewerCells", err)
+	}
+	if !batchViewerProjectionCellsAllowed(1, maxBatchViewerProjectionCells) {
+		t.Fatal("cell limit rejected exact boundary")
+	}
+	if batchViewerProjectionCellsAllowed(2, maxBatchViewerProjectionCells) {
+		t.Fatal("cell limit accepted overflow boundary")
+	}
+}
+
+func TestByIDsForViewersRejectsMissingReferencedUser(t *testing.T) {
+	svc := NewService(memory.NewUserStore())
+	if _, err := svc.ByIDsForViewers(context.Background(), []int64{1001}, []int64{2001}); !errors.Is(err, ErrBatchUserMissing) {
+		t.Fatalf("ByIDsForViewers err = %v, want ErrBatchUserMissing", err)
+	}
+}
+
 func TestResolvePhoneHonorsAddedByPhone(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()

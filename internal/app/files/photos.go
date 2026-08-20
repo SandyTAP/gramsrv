@@ -366,29 +366,29 @@ func (s *Service) CreateDocumentFromUpload(ctx context.Context, file domain.Uplo
 	return doc, nil
 }
 
-func (s *Service) normalizeUploadedGIF(ctx context.Context, body assembledUploadBlob, spec domain.DocumentSpec) (assembledUploadBlob, domain.DocumentSpec, error) {
+func (s *Service) normalizeUploadedGIF(ctx context.Context, body AssembledUploadBlob, spec domain.DocumentSpec) (AssembledUploadBlob, domain.DocumentSpec, error) {
 	if !strings.EqualFold(strings.TrimSpace(spec.MimeType), "image/gif") || spec.ForceFile {
 		return body, spec, nil
 	}
 	if s.gifs == nil || body.Size <= 0 || body.Size > gifTranscodeMaxInputBytes {
-		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+		return AssembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
 	}
 	data, total, err := s.blobs.GetRange(ctx, body.ObjectKey, 0, gifTranscodeMaxInputBytes+1)
 	if err != nil || total != body.Size || int64(len(data)) != body.Size {
-		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+		return AssembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
 	}
 	started := time.Now()
 	converted, err := s.gifs.Transcode(ctx, data)
 	if err != nil || len(converted.Data) == 0 || converted.Width <= 0 || converted.Height <= 0 || converted.Duration <= 0 {
 		s.log.Warn("GIF to MP4 conversion failed", zap.Int64("input_bytes", body.Size), zap.Error(err))
-		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+		return AssembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
 	}
 	objectKey, err := s.blobs.Put(ctx, converted.Data)
 	if err != nil {
-		return assembledUploadBlob{}, domain.DocumentSpec{}, err
+		return AssembledUploadBlob{}, domain.DocumentSpec{}, err
 	}
 	sum := sha256.Sum256(converted.Data)
-	body = assembledUploadBlob{ObjectKey: objectKey, Size: int64(len(converted.Data)), SHA256: append([]byte(nil), sum[:]...)}
+	body = AssembledUploadBlob{ObjectKey: objectKey, Size: int64(len(converted.Data)), SHA256: append([]byte(nil), sum[:]...)}
 	spec.MimeType = "video/mp4"
 	spec.Attributes = canonicalGIFVideoAttributes(spec.Attributes, converted, spec.NosoundVideo)
 	s.log.Info("GIF normalized to MP4",
@@ -434,7 +434,7 @@ var faststartVideoMimes = map[string]bool{
 //     不把整段视频 2× 驻留内存。moov 非末尾的罕见排布回退到全量重排。
 //
 // 任何不适用/失败都返回原 body，绝不让上传失败或损坏数据。
-func (s *Service) maybeFaststartVideoBlob(ctx context.Context, mimeType string, body assembledUploadBlob) assembledUploadBlob {
+func (s *Service) maybeFaststartVideoBlob(ctx context.Context, mimeType string, body AssembledUploadBlob) AssembledUploadBlob {
 	if !faststartVideoMimes[strings.ToLower(strings.TrimSpace(mimeType))] {
 		return body
 	}
@@ -491,7 +491,7 @@ func (s *Service) maybeFaststartVideoBlob(ctx context.Context, mimeType string, 
 	}
 	s.log.Info("faststart applied to uploaded video",
 		zap.String("mime", mimeType), zap.Int64("size", size))
-	return assembledUploadBlob{ObjectKey: key, Size: size, SHA256: sum}
+	return AssembledUploadBlob{ObjectKey: key, Size: size, SHA256: sum}
 }
 
 // blobRangeReader 把 blob 的 [pos, end) 区段按 io.Reader 调用方给的缓冲大小分块流式读出，
@@ -929,7 +929,7 @@ const (
 // avatarVideoStill 生成动画头像的静态尺寸字节。emoji/sticker markup 能解析到
 // 服务端缩略图时优先合成：DrKLO 生成的 MP4 第一帧可能只有背景渐变，直接抽第一帧
 // 会让静态头像永久缺少 emoji。普通视频或 markup 资源不可用时才回退 ffmpeg 首帧。
-func (s *Service) avatarVideoStill(ctx context.Context, body assembledUploadBlob, extraSizes []domain.PhotoSize) []byte {
+func (s *Service) avatarVideoStill(ctx context.Context, body AssembledUploadBlob, extraSizes []domain.PhotoSize) []byte {
 	markup := avatarStillMarkup(extraSizes)
 	if still, ok := s.generatedAvatarMarkupStill(ctx, markup); ok {
 		return still

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -21,9 +22,16 @@ func validGA() []byte {
 	return b
 }
 
-func newTestService() (*Service, *memory.SecretChatStore) {
+func newTestServiceWithQueue() (*Service, *memory.SecretChatStore, *memory.EncryptedQueueStore) {
 	st := memory.NewSecretChatStore()
-	return NewService(st, memory.NewEncryptedQueueStore()), st
+	queue := memory.NewEncryptedQueueStore()
+	st.AttachEncryptedStateEvents(queue)
+	return NewService(st, queue), st, queue
+}
+
+func newTestService() (*Service, *memory.SecretChatStore) {
+	svc, st, _ := newTestServiceWithQueue()
+	return svc, st
 }
 
 const (
@@ -33,6 +41,7 @@ const (
 	partAuthKey  = int64(0x2222)
 	otherAuthKey = int64(0x3333)
 	keyFP        = int64(0x0123456789abcdef)
+	eventDate    = 1700000100
 )
 
 func requestFixture() domain.SecretChatRequest {
@@ -70,6 +79,38 @@ func TestRequestEncryption(t *testing.T) {
 	}
 	if chat.ParticipantAuthKeyID != 0 {
 		t.Fatalf("participant auth key must be unbound before accept, got %d", chat.ParticipantAuthKeyID)
+	}
+}
+
+func TestRequestEncryptionRequiresStateEventStore(t *testing.T) {
+	st := memory.NewSecretChatStore()
+	svc := NewService(st, memory.NewEncryptedQueueStore())
+	ctx := context.Background()
+	if _, err := svc.RequestEncryption(ctx, requestFixture()); !errors.Is(err, store.ErrSecretChatStateEventStoreMissing) {
+		t.Fatalf("request err = %v, want ErrSecretChatStateEventStoreMissing", err)
+	}
+	if _, ok, err := st.GetSecretChat(ctx, int(requestFixture().RandomID)); err != nil || ok {
+		t.Fatalf("chat persisted despite missing state-event store: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRequestEncryptionWritesStateEvent(t *testing.T) {
+	svc, _, queue := newTestServiceWithQueue()
+	ctx := context.Background()
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	evs, err := queue.ListUndeliveredStateEvents(ctx, partUser, otherAuthKey, 0)
+	if err != nil {
+		t.Fatalf("list state events: %v", err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("state events = %d, want 1", len(evs))
+	}
+	if evs[0].ChatID != chat.ID || evs[0].TargetUserID != partUser || evs[0].TargetAuthKeyID != 0 ||
+		evs[0].Type != domain.EncryptedStateEventEncryption || evs[0].Date != requestFixture().Date {
+		t.Fatalf("request state event = %+v", evs[0])
 	}
 }
 
@@ -169,7 +210,7 @@ func TestRequestEncryptionRejectsZeroAndDiscardedReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true); err != nil {
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true, eventDate); err != nil {
 		t.Fatalf("discard: %v", err)
 	}
 	if _, err := svc.RequestEncryption(ctx, requestFixture()); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
@@ -187,13 +228,13 @@ func TestRequestEncryptionInvalidGA(t *testing.T) {
 }
 
 func TestAcceptEncryption(t *testing.T) {
-	svc, _ := newTestService()
+	svc, _, queue := newTestServiceWithQueue()
 	ctx := context.Background()
 	chat, err := svc.RequestEncryption(ctx, requestFixture())
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP, eventDate)
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
@@ -209,13 +250,29 @@ func TestAcceptEncryption(t *testing.T) {
 	if len(accepted.GB) != dhPubSize {
 		t.Fatalf("g_b length = %d, want %d", len(accepted.GB), dhPubSize)
 	}
+	adminEvents, err := queue.ListUndeliveredStateEvents(ctx, adminUser, adminAuthKey, 0)
+	if err != nil {
+		t.Fatalf("admin state events: %v", err)
+	}
+	if len(adminEvents) != 1 || adminEvents[0].ChatID != chat.ID ||
+		adminEvents[0].TargetAuthKeyID != adminAuthKey || adminEvents[0].Date != eventDate {
+		t.Fatalf("admin accept state events = %+v", adminEvents)
+	}
+	participantEvents, err := queue.ListUndeliveredStateEvents(ctx, partUser, otherAuthKey, 0)
+	if err != nil {
+		t.Fatalf("participant state events: %v", err)
+	}
+	if len(participantEvents) != 2 || participantEvents[1].ChatID != chat.ID ||
+		participantEvents[1].TargetAuthKeyID != 0 || participantEvents[1].Date != eventDate {
+		t.Fatalf("participant accept state events = %+v", participantEvents)
+	}
 }
 
 func TestAcceptEncryptionWrongAccessHash(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash+1, validGA(), keyFP)
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash+1, validGA(), keyFP, eventDate)
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
 	}
@@ -226,7 +283,7 @@ func TestAcceptEncryptionWrongUser(t *testing.T) {
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
 	// admin 自己冒充接受方。
-	_, err := svc.AcceptEncryption(ctx, chat.ID, adminUser, adminAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	_, err := svc.AcceptEncryption(ctx, chat.ID, adminUser, adminAuthKey, chat.ParticipantAccessHash, validGA(), keyFP, eventDate)
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
 	}
@@ -236,11 +293,11 @@ func TestAcceptEncryptionDoubleAccept(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	if _, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP); err != nil {
+	if _, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP, eventDate); err != nil {
 		t.Fatalf("first accept: %v", err)
 	}
 	// 第二台设备 accept：CAS 落空 → ENCRYPTION_ALREADY_ACCEPTED。
-	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, int64(0x3333), chat.ParticipantAccessHash, validGA(), keyFP)
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, int64(0x3333), chat.ParticipantAccessHash, validGA(), keyFP, eventDate)
 	if !errors.Is(err, domain.ErrSecretChatAlreadyAccepted) {
 		t.Fatalf("err = %v, want ErrSecretChatAlreadyAccepted", err)
 	}
@@ -261,7 +318,7 @@ func TestAcceptEncryptionConcurrentDevicesSingleWinner(t *testing.T) {
 		wg.Add(1)
 		go func(i int, authKeyID int64) {
 			defer wg.Done()
-			_, errs[i] = svc.AcceptEncryption(ctx, chat.ID, partUser, authKeyID, chat.ParticipantAccessHash, validGA(), keyFP)
+			_, errs[i] = svc.AcceptEncryption(ctx, chat.ID, partUser, authKeyID, chat.ParticipantAccessHash, validGA(), keyFP, eventDate)
 		}(i, authKeyID)
 	}
 	wg.Wait()
@@ -294,7 +351,7 @@ func TestAcceptEncryptionConcurrentDevicesSingleWinner(t *testing.T) {
 	if stored.ParticipantAuthKeyID == partAuthKey {
 		loserAuthKeyID = otherAuthKey
 	}
-	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, loserAuthKeyID, true); !errors.Is(err, domain.ErrSecretChatNotFound) {
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, loserAuthKeyID, true, eventDate); !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("loser discard err = %v, want ErrSecretChatNotFound", err)
 	}
 	stored, ok, err = st.GetSecretChat(ctx, chat.ID)
@@ -307,7 +364,7 @@ func TestAcceptEncryptionInvalidGB(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, []byte{0x01}, keyFP)
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, []byte{0x01}, keyFP, eventDate)
 	if !errors.Is(err, ErrGAInvalid) {
 		t.Fatalf("err = %v, want ErrGAInvalid", err)
 	}
@@ -317,7 +374,7 @@ func TestDiscardEncryption(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	got, already, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true)
+	got, already, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true, eventDate)
 	if err != nil {
 		t.Fatalf("discard: %v", err)
 	}
@@ -328,7 +385,7 @@ func TestDiscardEncryption(t *testing.T) {
 		t.Fatalf("discarded chat = %+v", got)
 	}
 	// 幂等：再 discard 返回 already=true。
-	_, already, err = svc.DiscardEncryption(ctx, chat.ID, partUser, partAuthKey, false)
+	_, already, err = svc.DiscardEncryption(ctx, chat.ID, partUser, partAuthKey, false, eventDate)
 	if err != nil || !already {
 		t.Fatalf("idempotent discard: already=%v err=%v", already, err)
 	}
@@ -338,7 +395,7 @@ func TestDiscardEncryptionNonParticipant(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	_, _, err := svc.DiscardEncryption(ctx, chat.ID, int64(9999), int64(9999), false)
+	_, _, err := svc.DiscardEncryption(ctx, chat.ID, int64(9999), int64(9999), false, eventDate)
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
 	}
@@ -352,7 +409,7 @@ func acceptedChat(t *testing.T, svc *Service) domain.SecretChat {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, dhParamGB(), keyFP)
+	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, dhParamGB(), keyFP, eventDate)
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
@@ -444,7 +501,7 @@ func TestDiscardEncryptionRejectsUnboundAccountDeviceAfterAccept(t *testing.T) {
 	ctx := context.Background()
 	chat := acceptedChat(t, svc)
 
-	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, otherAuthKey, true); !errors.Is(err, domain.ErrSecretChatNotFound) {
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, otherAuthKey, true, eventDate); !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("unbound discard err = %v, want ErrSecretChatNotFound", err)
 	}
 	stored, ok, err := st.GetSecretChat(ctx, chat.ID)
@@ -503,10 +560,10 @@ func TestAcceptAfterDiscard(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, false); err != nil {
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, false, eventDate); err != nil {
 		t.Fatalf("discard: %v", err)
 	}
-	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP, eventDate)
 	if !errors.Is(err, domain.ErrSecretChatAlreadyDeclined) {
 		t.Fatalf("err = %v, want ErrSecretChatAlreadyDeclined", err)
 	}

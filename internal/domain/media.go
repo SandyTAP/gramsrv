@@ -124,11 +124,24 @@ type FileDownloadRequest struct {
 	Limit       int
 }
 
+// FileHashRequest 是 upload.getFileHashes 解析后的校验哈希请求。
+type FileHashRequest struct {
+	LocationKey string
+	Offset      int64
+}
+
 // FileChunk 是 upload.getFile 返回的一段内容。
 type FileChunk struct {
 	Bytes    []byte
 	MimeType string
 	Total    int64
+}
+
+// FileHash 描述 upload.getFileHashes 返回的一个可校验 byte range。
+type FileHash struct {
+	Offset int64
+	Limit  int
+	Hash   []byte
 }
 
 // PhotoSizeKind 标识 PhotoSize 的 TL 变体。

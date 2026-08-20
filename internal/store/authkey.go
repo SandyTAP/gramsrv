@@ -70,6 +70,34 @@ type AuthKeyClientInfo struct {
 	AppVersion    string
 }
 
+type authKeyDeleteOriginContextKey struct{}
+
+// AuthKeyDeleteOrigin carries wire-level destroy_auth_key origin metadata across
+// the AuthKeyStore boundary. It is intentionally optional: stores ignore it, but
+// remote CoreExec stores use it to keep the requester writable long enough to
+// receive destroy_auth_key_ok while every other Edge/session is fenced.
+type AuthKeyDeleteOrigin struct {
+	ExceptSessionID int64
+}
+
+func WithAuthKeyDeleteOrigin(ctx context.Context, origin AuthKeyDeleteOrigin) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if origin.ExceptSessionID == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, authKeyDeleteOriginContextKey{}, origin)
+}
+
+func AuthKeyDeleteOriginFrom(ctx context.Context) (AuthKeyDeleteOrigin, bool) {
+	if ctx == nil {
+		return AuthKeyDeleteOrigin{}, false
+	}
+	origin, ok := ctx.Value(authKeyDeleteOriginContextKey{}).(AuthKeyDeleteOrigin)
+	return origin, ok && origin.ExceptSessionID != 0
+}
+
 // MergeAuthKeyLayerObservations resolves the inherited default when a raw
 // temporary key is bound to its permanent identity. Positive observation IDs
 // are globally ordered durable evidence. Equal positive IDs must describe the

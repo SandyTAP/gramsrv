@@ -210,3 +210,99 @@ func TestSecretChatListActiveByAuthKeyPostgres(t *testing.T) {
 		t.Fatalf("zero key = %v (err=%v), want nil", got, err)
 	}
 }
+
+// TestSecretChatStateEventAggregatePostgres 验证握手状态迁移与 updateEncryption
+// state event 通过同一 PostgreSQL 聚合边界提交，而不是由 RPC 层 mutation 后 best-effort 补写。
+func TestSecretChatStateEventAggregatePostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	secretStore := NewSecretChatStore(pool)
+	queueStore := NewEncryptedQueueStore(pool)
+
+	const (
+		adminUser = int64(770201)
+		partUser  = int64(770202)
+		adminKey  = int64(0xAA201)
+		partKey   = int64(0xBB202)
+		otherKey  = int64(0xCC203)
+		chatID    = 7702001
+	)
+	cleanup := func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM encrypted_state_events WHERE target_user_id IN ($1, $2)`, adminUser, partUser)
+		_, _ = pool.Exec(ctx, `DELETE FROM secret_chats WHERE chat_id = $1`, chatID)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	chat := domain.SecretChat{
+		ID:                    chatID,
+		AdminAccessHash:       101,
+		ParticipantAccessHash: 202,
+		AdminUserID:           adminUser,
+		AdminAuthKeyID:        adminKey,
+		ParticipantUserID:     partUser,
+		State:                 domain.SecretChatStateRequested,
+		GA:                    []byte{0x01, 0x02},
+		RandomID:              int32(chatID),
+		Date:                  1700000100,
+	}
+	if err := secretStore.CreateSecretChatWithStateEvent(ctx, chat, domain.EncryptedStateEvent{
+		TargetUserID:    partUser,
+		TargetAuthKeyID: 0,
+		ChatID:          chatID,
+		Type:            domain.EncryptedStateEventEncryption,
+		Date:            chat.Date,
+	}); err != nil {
+		t.Fatalf("create aggregate: %v", err)
+	}
+	partEvents, err := queueStore.ListUndeliveredStateEvents(ctx, partUser, otherKey, 0)
+	if err != nil || len(partEvents) != 1 || partEvents[0].ChatID != chatID || partEvents[0].TargetAuthKeyID != 0 {
+		t.Fatalf("participant request events = %+v err=%v", partEvents, err)
+	}
+
+	accepted, err := secretStore.AcceptSecretChatWithStateEvents(ctx, chatID, partKey, []byte{0x03, 0x04}, 0x99, []domain.EncryptedStateEvent{
+		{
+			TargetUserID:    adminUser,
+			TargetAuthKeyID: adminKey,
+			ChatID:          chatID,
+			Type:            domain.EncryptedStateEventEncryption,
+			Date:            1700000200,
+		},
+		{
+			TargetUserID:    partUser,
+			TargetAuthKeyID: 0,
+			ChatID:          chatID,
+			Type:            domain.EncryptedStateEventEncryption,
+			Date:            1700000200,
+		},
+	})
+	if err != nil {
+		t.Fatalf("accept aggregate: %v", err)
+	}
+	if accepted.State != domain.SecretChatStateNormal || accepted.ParticipantAuthKeyID != partKey {
+		t.Fatalf("accepted chat = %+v", accepted)
+	}
+	adminEvents, err := queueStore.ListUndeliveredStateEvents(ctx, adminUser, adminKey, 0)
+	if err != nil || len(adminEvents) != 1 || adminEvents[0].TargetAuthKeyID != adminKey {
+		t.Fatalf("admin accept events = %+v err=%v", adminEvents, err)
+	}
+	partEvents, err = queueStore.ListUndeliveredStateEvents(ctx, partUser, otherKey, 0)
+	if err != nil || len(partEvents) != 2 || partEvents[1].Date != 1700000200 {
+		t.Fatalf("participant accept events = %+v err=%v", partEvents, err)
+	}
+
+	discarded, already, err := secretStore.DiscardSecretChatWithStateEvent(ctx, chatID, false, domain.EncryptedStateEvent{
+		TargetUserID:    adminUser,
+		TargetAuthKeyID: adminKey,
+		ChatID:          chatID,
+		Type:            domain.EncryptedStateEventEncryption,
+		Date:            1700000300,
+	})
+	if err != nil || already || discarded.State != domain.SecretChatStateDiscarded {
+		t.Fatalf("discard aggregate: chat=%+v already=%v err=%v", discarded, already, err)
+	}
+	adminEvents, err = queueStore.ListUndeliveredStateEvents(ctx, adminUser, adminKey, 0)
+	if err != nil || len(adminEvents) != 2 || adminEvents[1].Date != 1700000300 {
+		t.Fatalf("admin discard events = %+v err=%v", adminEvents, err)
+	}
+}

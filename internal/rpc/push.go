@@ -13,17 +13,6 @@ func (r *Router) pushUserMessage(ctx context.Context, userID int64, logMessage s
 		return 0
 	}
 	sessionID, _ := SessionIDFrom(ctx)
-	if timeout := r.cfg.OutboundPushTimeout; timeout > 0 {
-		authKeyID := rawAuthKeyIDForOrigin(ctx)
-		if bestEffort, ok := r.deps.Sessions.(BestEffortSessionBinder); ok {
-			if sent, err := bestEffort.PushToUserExceptAuthKeySessionBestEffort(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg, timeout); err != nil {
-				r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Duration("timeout", timeout), zap.Error(err))
-				return sent
-			} else {
-				return sent
-			}
-		}
-	}
 	authKeyID := rawAuthKeyIDForOrigin(ctx)
 	if sent, err := r.deps.Sessions.PushToUserExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg); err != nil {
 		r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Error(err))
@@ -33,14 +22,14 @@ func (r *Router) pushUserMessage(ctx context.Context, userID int64, logMessage s
 	}
 }
 
-// pushUserMessageTransient 推送 transient（typing/presence）update：未就绪的 session 直接
-// 跳过、不进 pending。实现未提供 TransientSessionBinder 能力时回退到普通 pushUserMessage
-// （退化为旧行为：会进 pending，但仍不影响 durable 正确性）。
+// pushUserMessageTransient 推送 transient（typing/presence）update：未就绪的
+// session 直接跳过、不进 pending。生产 Edge control 必须显式实现该能力；缺失时
+// fail closed，避免退回普通 durable/pending push 语义。
 func (r *Router) pushUserMessageTransient(ctx context.Context, userID int64, logMessage string, msg tg.UpdatesClass) int {
 	if r.deps.Sessions == nil || userID == 0 || msg == nil {
 		return 0
 	}
-	if transient, ok := r.deps.Sessions.(TransientSessionBinder); ok {
+	if transient, ok := r.deps.Sessions.(TransientSessionPusher); ok {
 		sessionID, _ := SessionIDFrom(ctx)
 		authKeyID := rawAuthKeyIDForOrigin(ctx)
 		sent, err := transient.PushToUserTransientExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg, r.cfg.OutboundPushTimeout)
@@ -49,7 +38,8 @@ func (r *Router) pushUserMessageTransient(ctx context.Context, userID int64, log
 		}
 		return sent
 	}
-	return r.pushUserMessage(ctx, userID, logMessage, msg)
+	r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.String("outcome", "transient_pusher_unavailable"))
+	return 0
 }
 
 func (r *Router) pushCurrentSessionMessage(ctx context.Context, logMessage string, msg tg.UpdatesClass) {

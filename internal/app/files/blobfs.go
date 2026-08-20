@@ -32,14 +32,14 @@ type BlobBackend interface {
 // UploadPartBackend 保存 upload.saveFilePart/saveBigFilePart 的临时分片字节。
 // 与正式 blob 不同，上传分片 key 唯一且可删除，成功组装/覆盖重传/GC 后必须清理。
 type UploadPartBackend interface {
-	PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (uploadPartObject, error)
+	PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (UploadPartObject, error)
 	GetUploadPart(ctx context.Context, objectKey string) ([]byte, error)
 	OpenUploadPart(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	DeleteUploadPart(ctx context.Context, objectKey string) error
 	DeleteExpiredUploadParts(ctx context.Context, before time.Time, limit int) (int64, error)
 }
 
-type uploadPartObject struct {
+type UploadPartObject struct {
 	Backend   domain.MediaBackend
 	ObjectKey string
 	Size      int64
@@ -243,11 +243,11 @@ func (l *LocalFS) releaseBlobFile(blobFile *sharedBlobFile) {
 	_ = blobFile.file.Close()
 }
 
-func (l *LocalFS) PutUploadPart(_ context.Context, ownerUserID, fileID int64, part int, data []byte) (uploadPartObject, error) {
+func (l *LocalFS) PutUploadPart(_ context.Context, ownerUserID, fileID int64, part int, data []byte) (UploadPartObject, error) {
 	sum := sha256.Sum256(data)
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return uploadPartObject{}, fmt.Errorf("generate upload part key: %w", err)
+		return UploadPartObject{}, fmt.Errorf("generate upload part key: %w", err)
 	}
 	key := filepath.ToSlash(filepath.Join(
 		"upload_parts",
@@ -257,20 +257,20 @@ func (l *LocalFS) PutUploadPart(_ context.Context, ownerUserID, fileID int64, pa
 	))
 	path, err := l.uploadPartPath(key)
 	if err != nil {
-		return uploadPartObject{}, err
+		return UploadPartObject{}, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return uploadPartObject{}, fmt.Errorf("create upload part dir: %w", err)
+		return UploadPartObject{}, fmt.Errorf("create upload part dir: %w", err)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return uploadPartObject{}, fmt.Errorf("write upload part: %w", err)
+		return UploadPartObject{}, fmt.Errorf("write upload part: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return uploadPartObject{}, fmt.Errorf("commit upload part: %w", err)
+		return UploadPartObject{}, fmt.Errorf("commit upload part: %w", err)
 	}
-	return uploadPartObject{
+	return UploadPartObject{
 		Backend:   domain.MediaBackend(l.Name()),
 		ObjectKey: key,
 		Size:      int64(len(data)),

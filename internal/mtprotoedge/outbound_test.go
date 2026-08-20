@@ -18,6 +18,8 @@ import (
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
 	"github.com/iamxvbaba/td/transport"
+
+	"telesrv/internal/edgecontrol"
 )
 
 type failAfterTransport struct {
@@ -1111,6 +1113,48 @@ func TestOutboundResendAndAckState(t *testing.T) {
 		t.Fatalf("after ack type = %#x, want msgs_state_info without resend", ackedStateType)
 	}
 	assertStateInfo(t, ackedStateBuf, ackedResendReqID, []byte{msgStateReceived})
+}
+
+func TestOutboundClientAckReportsOutboxDeliveryRef(t *testing.T) {
+	budget := newOutboundTrackedBudget(64)
+	tr := &failAfterTransport{}
+	c := newOutboundTestConn(t, tr, budget)
+	defer c.Close()
+
+	ref := edgecontrol.OutboxDeliveryRef{OutboxID: 1234, TargetUserID: 42, Pts: 77, Attempt: 3}
+	type ackEvent struct {
+		ref   edgecontrol.OutboxDeliveryRef
+		msgID int64
+	}
+	acks := make(chan ackEvent, 1)
+	c.outboxClientAcked = func(_ *Conn, got edgecontrol.OutboxDeliveryRef, serverMsgID int64) {
+		acks <- ackEvent{ref: got, msgID: serverMsgID}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	body := exactTestUpdatesEncoded(t, c, make([]byte, 12))
+	body.outboxDeliveryRef = ref
+	if err := c.SendEncoded(ctx, proto.MessageFromServer, body); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	data, err := crypto.NewClientCipher(rand.Reader).DecryptFromBuffer(c.key, &bin.Buffer{Buf: tr.lastFrame()})
+	if err != nil {
+		t.Fatalf("decrypt frame: %v", err)
+	}
+
+	c.AckServerMessages([]int64{data.MessageID})
+	select {
+	case got := <-acks:
+		if got.ref != ref {
+			t.Fatalf("outbox ack ref = %+v, want %+v", got.ref, ref)
+		}
+		if got.msgID != data.MessageID {
+			t.Fatalf("outbox ack msg_id = %d, want %d", got.msgID, data.MessageID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for outbox client ACK callback")
+	}
 }
 
 func assertStateInfo(t *testing.T, b *bin.Buffer, reqMsgID int64, want []byte) {

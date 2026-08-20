@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
+	"telesrv/internal/store/storetest"
 )
 
 func TestBotAPICallbackQueryPrivatePollingAndAnswer(t *testing.T) {
@@ -119,6 +121,16 @@ func TestBotAPIInlineCallbackDoesNotHydrateNonexistentChatMessage(t *testing.T) 
 	}
 }
 
+func TestBotAPIUpdatesRequiresDurableQueue(t *testing.T) {
+	router := New(Config{}, Deps{}, zaptest.NewLogger(t), clock.System)
+	if _, err := router.BotAPIUpdates(context.Background(), 1001, 0); !errors.Is(err, errBotAPIUpdateStoreRequired) {
+		t.Fatalf("BotAPIUpdates err = %v, want queue required", err)
+	}
+	if ok, err := router.AcquireBotAPIPollLease(context.Background(), 1001, "poller", time.Second); ok || !errors.Is(err, errBotAPIUpdateStoreRequired) {
+		t.Fatalf("AcquireBotAPIPollLease = ok %v err %v, want queue required", ok, err)
+	}
+}
+
 func TestBotAPICallbackQuerySupergroupPollingAndAnswer(t *testing.T) {
 	fixture := newBotAPIReceiveFixture(t, false)
 	data := []byte("group-confirm")
@@ -214,6 +226,8 @@ func TestBotAPISendMessageToSupergroupChatID(t *testing.T) {
 		Channels: channelService,
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
+	cancelFanout := startChannelFanoutForTest(t, r)
+	defer cancelFanout()
 
 	chatID := -botAPIChannelChatIDBase - created.Channel.ID
 	replyKeyboard := &domain.MessageReplyMarkup{
@@ -244,7 +258,7 @@ func TestBotAPISendMessageToSupergroupChatID(t *testing.T) {
 		history.Messages[0].ReplyMarkup.Keyboard[0][0].Text != "Help" {
 		t.Fatalf("history messages = %+v, want bot channel message", history.Messages)
 	}
-	if pushed := sessions.pushedUserIDs(); !fanoutHasID(pushed, owner.ID) {
+	if pushed := waitForPushedUserIDs(t, sessions, 1); !fanoutHasID(pushed, owner.ID) {
 		t.Fatalf("fanout pushed = %v, want owner %d to receive online channel update", pushed, owner.ID)
 	}
 }
@@ -388,7 +402,9 @@ func TestBotAPIGetUpdatesReceivesVisibleSupergroupMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
-	fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil)
+	if err := fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil); err != nil {
+		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
 	if err != nil {
@@ -433,7 +449,9 @@ func TestBotAPIGetUpdatesSkipsHiddenPrivacySupergroupMessage(t *testing.T) {
 	if len(res.SkipDeliveryUserIDs) == 0 {
 		t.Fatalf("SkipDeliveryUserIDs empty, want privacy bot excluded")
 	}
-	fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil)
+	if err := fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil); err != nil {
+		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
 	if err != nil {
@@ -456,7 +474,9 @@ func TestBotAPIGetUpdatesReceivesPrivateBotMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendPrivateText: %v", err)
 	}
-	fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res)
+	if err := fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res); err != nil {
+		t.Fatalf("enqueue bot api private message update: %v", err)
+	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
 	if err != nil {
@@ -482,7 +502,9 @@ func TestBotAPIGetUpdatesBatchesPrivateMessageProjection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendPrivateText %d: %v", i, err)
 		}
-		fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res)
+		if err := fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res); err != nil {
+			t.Fatalf("enqueue bot api private message update %d: %v", i, err)
+		}
 	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
@@ -514,7 +536,9 @@ func TestBotAPIUpdateWaiterWakesOnPrivateEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendPrivateText: %v", err)
 	}
-	fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res)
+	if err := fixture.router.enqueueBotAPIPrivateMessageUpdate(fixture.ctx, res); err != nil {
+		t.Fatalf("enqueue bot api private message update: %v", err)
+	}
 	select {
 	case ok := <-woke:
 		if !ok {
@@ -552,7 +576,9 @@ func TestBotAPIChannelBatchEnqueueLoadsBotCandidatesOnce(t *testing.T) {
 		t.Fatalf("SendMessage second: %v", err)
 	}
 
-	fixture.router.enqueueBotAPIChannelMessagesUpdate(fixture.ctx, fixture.owner.ID, []domain.SendChannelMessageResult{first, second})
+	if err := fixture.router.enqueueBotAPIChannelMessagesUpdate(fixture.ctx, fixture.owner.ID, []domain.SendChannelMessageResult{first, second}); err != nil {
+		t.Fatalf("enqueueBotAPIChannelMessagesUpdate: %v", err)
+	}
 	if counting.activeBotMemberIDsCalls != 1 {
 		t.Fatalf("ActiveBotMemberIDs calls = %d, want 1 for same-channel batch", counting.activeBotMemberIDsCalls)
 	}
@@ -653,6 +679,7 @@ func newBotAPIReceiveFixture(t *testing.T, botChatHistory bool) botAPIReceiveFix
 		Channels:      channelsService,
 		Bots:          botsService,
 		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
+		BotCallbacks:  storetest.NewBotCallbackRegistryStore(),
 		Sessions:      &captureSessions{channelMembers: map[int64][]int64{created.Channel.ID: {owner.ID, bot.ID}}},
 	}, zaptest.NewLogger(t), clock.System)
 	return botAPIReceiveFixture{

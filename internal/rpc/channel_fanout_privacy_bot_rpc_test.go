@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/iamxvbaba/td/clock"
 	"go.uber.org/zap/zaptest"
@@ -61,7 +62,14 @@ func TestChannelMessageFanoutSkipsPrivacyBotOnlinePush(t *testing.T) {
 	sessions := &captureSessions{
 		channelMembers: map[int64][]int64{created.Channel.ID: {1002, 1003}},
 	}
-	r := New(Config{}, Deps{Channels: channelService, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	users := mapUsersService{users: map[int64]domain.User{
+		1001: {ID: 1001, FirstName: "Sender"},
+		1002: {ID: 1002, FirstName: "Human"},
+		1003: {ID: 1003, FirstName: "PrivacyBot", Bot: true},
+	}}
+	r := New(Config{}, Deps{Channels: channelService, Sessions: sessions, Users: users}, zaptest.NewLogger(t), clock.System)
+	cancel := startChannelFanoutForTest(t, r)
+	defer cancel()
 
 	// 复核前置:修复前后 channelFanoutRecipients 都会把 1003 列进 recipients(在线活跃成员),
 	// 漏洞/修复的差异在 build 是否对它返回 nil。
@@ -70,7 +78,16 @@ func TestChannelMessageFanoutSkipsPrivacyBotOnlinePush(t *testing.T) {
 		t.Fatalf("channelFanoutRecipients = %v, 期望在线活跃成员 1003 仍被列入(否则测不到 build 跳过)", got)
 	}
 
-	r.enqueueChannelMessageFanout(ctx, 1001, res, nil)
+	if err := r.enqueueChannelMessageFanout(ctx, 1001, res, nil); err != nil {
+		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fanoutHasID(sessions.pushedUserIDs(), 1002) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	pushed := sessions.pushedUserIDs()
 	if !fanoutHasID(pushed, 1002) {
 		t.Fatalf("fanout pushed = %v, want human member 1002 to receive online push", pushed)

@@ -8,26 +8,29 @@ import (
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
+
+	"telesrv/internal/edgecontrol"
 )
 
 type captureSessions struct {
-	mu                 sync.Mutex
-	rawAuthKeyID       [8]byte
-	sessionID          int64
-	userID             int64
-	userResolved       bool
-	authKeyID          [8]byte
-	authKeyResolved    bool
-	receives           bool
-	receivesCalls      int
-	messageType        proto.MessageType
-	message            bin.Encoder
-	userMessage        bin.Encoder // 最近一次 PushToUser* 的消息（与 message 区分：message 也被 PushToSession 覆盖）
-	pushUserIDs        []int64
-	onlineUserIDs      []int64
-	channelViewers     map[int64][]int64
-	channelMembers     map[int64][]int64
-	channelSubscribers map[int64][]int64
+	mu                     sync.Mutex
+	rawAuthKeyID           [8]byte
+	sessionID              int64
+	userID                 int64
+	userResolved           bool
+	authKeyID              [8]byte
+	authKeyResolved        bool
+	receives               bool
+	receivesCalls          int
+	messageType            proto.MessageType
+	message                bin.Encoder
+	userMessage            bin.Encoder // 最近一次 PushToUser* 的消息（与 message 区分：message 也被 PushToSession 覆盖）
+	pushUserIDs            []int64
+	onlineUserIDs          []int64
+	channelViewers         map[int64][]int64
+	channelMembers         map[int64][]int64
+	channelSubscribers     map[int64][]int64
+	membershipSyncAcquired bool
 	// channelViewersLimit 记录最近一次 OnlineChannelUserIDs 收到的 limit，验证 fan-out 封顶传参。
 	channelViewersLimit int
 }
@@ -172,6 +175,58 @@ func (s *captureSessions) PushToUserExceptAuthKeySession(_ context.Context, user
 	return 1, nil
 }
 
+func (s *captureSessions) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, _ time.Duration) (int, error) {
+	return s.PushToUserExceptAuthKeySession(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg)
+}
+
+func (s *captureSessions) UserLocationRecordsForUsers(_ context.Context, userIDs []int64) (map[int64][]EdgeLocationRecord, error) {
+	out := make(map[int64][]EdgeLocationRecord, len(userIDs))
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		out[userID] = []EdgeLocationRecord{{
+			InstanceID:      "edge-test",
+			UserID:          userID,
+			ReceivesUpdates: true,
+		}}
+	}
+	return out, nil
+}
+
+func (s *captureSessions) PushToUserLocationBatches(ctx context.Context, pushes []LocationTargetedUserPush) (int, error) {
+	sent := 0
+	var firstErr error
+	for _, push := range pushes {
+		select {
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return sent, firstErr
+		default:
+		}
+		if push.TargetUserID == 0 || len(push.Locations) == 0 || push.Update == nil {
+			continue
+		}
+		messageType := push.MessageType
+		if messageType == proto.MessageUnknown {
+			messageType = proto.MessageFromServer
+		}
+		n, err := s.PushToUserExceptAuthKeySession(ctx, push.TargetUserID, push.ExcludeAuthKeyID, push.ExcludeSessionID, messageType, push.Update)
+		sent += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return sent, firstErr
+}
+
 func (s *captureSessions) IsUserOnline(userID int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -296,9 +351,17 @@ func (s *captureSessions) OnlineChannelSubscriberUserIDsExcluding(channelID int6
 	return out
 }
 
-func (s *captureSessions) ChannelMembershipGeneration(_ [8]byte, _ int64) int64 { return 0 }
+func (s *captureSessions) BeginSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, _ int64) (int64, edgecontrol.ChannelMembershipSyncDisposition, error) {
+	if s.membershipSyncAcquired {
+		return 1, edgecontrol.ChannelMembershipSyncAcquired, nil
+	}
+	// Generic router tests do not model a durable channel authority. Treat their
+	// explicit fake baseline as already prepared and mirror Edge activation.
+	s.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, true)
+	return 0, edgecontrol.ChannelMembershipSyncPrepared, nil
+}
 
-func (s *captureSessions) SetSessionChannelMemberships(_ [8]byte, _ int64, userID int64, channelIDs []int64, _ int64) {
+func (s *captureSessions) AppendSessionChannelMembershipSync(_ context.Context, _ [8]byte, _ int64, userID, _ int64, channelIDs []int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.channelMembers == nil {
@@ -310,6 +373,15 @@ func (s *captureSessions) SetSessionChannelMemberships(_ [8]byte, _ int64, userI
 		}
 		s.channelMembers[channelID] = append(s.channelMembers[channelID], userID)
 	}
+	return nil
+}
+
+func (s *captureSessions) CommitSessionChannelMembershipSync(_ context.Context, rawAuthKeyID [8]byte, sessionID, _ int64, _ int64) (bool, error) {
+	s.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, true)
+	return true, nil
+}
+
+func (s *captureSessions) AbortSessionChannelMembershipSync(context.Context, [8]byte, int64, int64, int64) {
 }
 
 func (s *captureSessions) AddUserChannelMembership(userID, channelID int64) {

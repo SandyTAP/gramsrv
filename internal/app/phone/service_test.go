@@ -78,7 +78,11 @@ func newTestService(clk clock.Clock, mutate ...func(*Config)) *Service {
 	for _, fn := range mutate {
 		fn(&cfg)
 	}
-	return NewService(cfg, WithClock(clk))
+	svc, err := NewService(cfg, NewInMemoryActiveCallStoreForTest(), WithClock(clk))
+	if err != nil {
+		panic(err)
+	}
+	return svc
 }
 
 func mustRequest(t *testing.T, s *Service, caller, callee int64, gaHash []byte) domain.PhoneCall {

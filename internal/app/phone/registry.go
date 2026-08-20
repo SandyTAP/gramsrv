@@ -9,12 +9,9 @@ import (
 	"telesrv/internal/domain"
 )
 
-// registry 是 active call 的进程内权威存储：单实现、不进 store 双实现体系。
-//
-// 论证（设计已确认，勿改回双 store）：active call 是秒级短命状态，服务端重启后
-// 客户端侧媒体连接早已断开，「重启恢复半截通话」不是有效需求；单一实现让测试与
-// 生产共用同一份代码，从构造上消灭 memory/postgres 行为漂移。多实例化时以同样的
-// 窄接口换 Redis 实现，信令层零改动。
+// registry 是单测专用的进程内 active call backing store。生产 Core 必须使用
+// RedisActiveCallStore，确保 request/accept/confirm/discard/signaling 在多 Core 间
+// 共享同一份短命状态。
 type registry struct {
 	mu       sync.Mutex
 	byID     map[int64]*entry
@@ -50,7 +47,7 @@ func newRegistry() *registry {
 //
 // 非终态绝不能在 GC 中按 Date 直接删除：Requested/Ringing/Accepted 的超时必须由
 // Service.ExpireDue 完成状态迁移、双端推送和历史落库；Confirmed 没有服务端时长
-// 上限，必须一直可供 signaling/discard 寻址，直到显式挂断或进程重启。
+// 上限，必须一直可供 signaling/discard 寻址，直到显式挂断。
 func (r *registry) sweepTombstonesLocked(nowUnix, tombstoneTTLSec int64) {
 	for id, e := range r.byID {
 		if e.call.Terminal() && nowUnix-int64(e.call.DiscardedAt) > tombstoneTTLSec {

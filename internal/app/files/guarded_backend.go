@@ -48,9 +48,9 @@ func NewGuardedUploadPartBackend(backend UploadPartBackend, guard SpaceGuard) *G
 	return &GuardedUploadPartBackend{backend: backend, guard: guard}
 }
 
-func (g *GuardedUploadPartBackend) PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (uploadPartObject, error) {
+func (g *GuardedUploadPartBackend) PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (UploadPartObject, error) {
 	if err := requireSpace(g.guard, int64(len(data))); err != nil {
-		return uploadPartObject{}, err
+		return UploadPartObject{}, err
 	}
 	return g.backend.PutUploadPart(ctx, ownerUserID, fileID, part, data)
 }

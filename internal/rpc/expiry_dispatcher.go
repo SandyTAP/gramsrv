@@ -61,18 +61,9 @@ func (d *ExpiryDispatcher) dispatchPrivate(ctx context.Context, now int) bool {
 		return false
 	}
 	for _, req := range requests {
-		res, err := d.router.deps.Messages.DeleteMessages(ctx, req.OwnerUserID, req)
-		if err != nil {
+		if _, err := d.router.deps.Messages.DeleteMessages(ctx, req.OwnerUserID, req); err != nil {
 			d.log.Warn("delete expired private messages", zap.Int64("owner_user_id", req.OwnerUserID), zap.Ints("ids", req.IDs), zap.Error(err))
 			continue
-		}
-		if d.router.hasReliableUpdateDispatch() {
-			continue
-		}
-		for _, deleted := range res.Deleted {
-			if deleted.Event.Type != "" {
-				d.router.pushUserUpdates(ctx, deleted.UserID, tgUpdateForOutboxEvent(deleted.Event))
-			}
 		}
 	}
 	return len(requests) > 0

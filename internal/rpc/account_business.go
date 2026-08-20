@@ -502,7 +502,7 @@ func (r *Router) recordConnectedBusinessPeerSettings(ctx context.Context, userID
 	if sessionID != 0 {
 		r.bookkeepAuxPtsForCurrentSession(ctx, event)
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, tgUpdateForOutboxEvent(event))
+	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return nil
 }
 

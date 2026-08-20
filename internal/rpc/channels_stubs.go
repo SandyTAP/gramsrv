@@ -101,7 +101,9 @@ func (r *Router) onChannelsDeleteChannel(ctx context.Context, input tg.InputChan
 			return nil, communityErr(err)
 		}
 		for _, serviceMessage := range view.ServiceMessages {
-			r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil)
+			if err := r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil); err != nil {
+				return nil, internalErr()
+			}
 		}
 		return r.communityMutationUpdates(ctx, userID, view, true), nil
 	}

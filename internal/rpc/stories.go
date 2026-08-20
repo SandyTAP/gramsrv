@@ -1966,7 +1966,10 @@ func (r *Router) domainStoryVenueMediaAreaFromInput(ctx context.Context, userID 
 		len(area.ResultID) > domain.MaxBotInlineResultIDLen {
 		return domain.StoryMediaArea{}, mediaInvalidErr()
 	}
-	results, result, ok := r.inlines.resultForSendContext(ctx, r.clock.Now(), userID, area.QueryID, area.ResultID)
+	results, result, ok, err := r.inlines.resultForSendContext(ctx, r.clock.Now(), userID, area.QueryID, area.ResultID)
+	if err != nil {
+		return domain.StoryMediaArea{}, internalErr()
+	}
 	if !ok || !r.inlineResultsAllowPeer(ctx, userID, results, peer) ||
 		result.Media == nil ||
 		result.Media.Kind != domain.MessageMediaKindVenue ||
@@ -2796,15 +2799,8 @@ func (r *Router) onStoriesSendReaction(ctx context.Context, req *tg.StoriesSendR
 			return nil, internalErr()
 		}
 		if ownerUserID, ok := ownerStoryReactionNotificationUserID(res, userID); ok && res.Reaction != nil {
-			event, _, err := r.deps.Updates.RecordNewStoryReaction(ctx, [8]byte{}, ownerUserID, res, [8]byte{}, 0)
-			if err != nil {
+			if _, _, err := r.deps.Updates.RecordNewStoryReaction(ctx, [8]byte{}, ownerUserID, res, [8]byte{}, 0); err != nil {
 				return nil, internalErr()
-			}
-			if updates := r.BuildOutboxUpdates(ctx, []OutboxUpdateRequest{{
-				TargetUserID: ownerUserID,
-				Event:        event,
-			}}); len(updates) == 1 && updates[0] != nil {
-				r.pushUserUpdatesIfNoReliableDispatch(ctx, ownerUserID, updates[0])
 			}
 		}
 	}

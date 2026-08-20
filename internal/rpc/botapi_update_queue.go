@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	"go.uber.org/zap"
+
 	"telesrv/internal/domain"
 )
 
@@ -18,8 +20,11 @@ type botAPIChannelBotMemberProvider interface {
 }
 
 func (r *Router) botAPIQueuedUpdates(ctx context.Context, botID int64, offset int64) ([]domain.UpdateEvent, error) {
-	if r == nil || r.deps.BotAPIUpdates == nil || botID == 0 {
+	if r == nil || botID == 0 {
 		return nil, nil
+	}
+	if r.deps.BotAPIUpdates == nil {
+		return nil, errBotAPIUpdateStoreRequired
 	}
 	fromID := int64(1)
 	var items []domain.BotAPIUpdate
@@ -349,39 +354,66 @@ func botAPIUpdateEventType(kind domain.BotAPIUpdateKind) (domain.UpdateEventType
 }
 
 // enqueueBotAPIPrivateMessageUpdateAsync 把私聊消息的 Bot API 队列写入投给后台
-// dispatcher（性能审计 H2）：发送者 RPC 不再为 bot 判定 miss / INSERT 多等 PG 往返。
-// dispatcher 未启动（测试/未装配）时同步执行，行为不变。
-func (r *Router) enqueueBotAPIPrivateMessageUpdateAsync(ctx context.Context, res domain.SendPrivateTextResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil || res.Duplicate || res.RecipientMessage.ID <= 0 {
-		return
+// dispatcher（性能审计 H2）。若收件人是 bot，BotAPIUpdateStore 是必需 durable
+// producer 边界；缺失时 fail-fast，禁止把 bot 收件降级为可选副作用。
+func (r *Router) enqueueBotAPIPrivateMessageUpdateAsync(ctx context.Context, res domain.SendPrivateTextResult) error {
+	botID, required, err := r.botAPIPrivateMessageUpdateTarget(ctx, res)
+	if err != nil || !required {
+		return err
 	}
 	r.botAPIEnqueueQueue.Enqueue(ctx, func(jobCtx context.Context) {
-		r.enqueueBotAPIPrivateMessageUpdate(jobCtx, res)
+		if err := r.enqueueBotAPIPrivateMessageUpdateForBot(jobCtx, res, botID); err != nil {
+			r.log.Warn("enqueue bot api private message update",
+				zap.Int64("bot_user_id", botID), zap.Int("message_id", res.RecipientMessage.ID), zap.Error(err))
+		}
 	})
+	return nil
 }
 
 // enqueueBotAPIPrivateEditUpdatesAsync 同上，覆盖私聊编辑的 edited_message 队列写入。
-func (r *Router) enqueueBotAPIPrivateEditUpdatesAsync(ctx context.Context, res domain.EditMessageResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil || len(res.Edited) == 0 {
-		return
+func (r *Router) enqueueBotAPIPrivateEditUpdatesAsync(ctx context.Context, res domain.EditMessageResult) error {
+	required, err := r.botAPIPrivateEditUpdatesRequired(ctx, res)
+	if err != nil || !required {
+		return err
 	}
 	r.botAPIEnqueueQueue.Enqueue(ctx, func(jobCtx context.Context) {
-		r.enqueueBotAPIPrivateEditUpdates(jobCtx, res)
+		if err := r.enqueueBotAPIPrivateEditUpdates(jobCtx, res); err != nil {
+			r.log.Warn("enqueue bot api private edit updates", zap.Int64("owner_user_id", res.OwnerUserID), zap.Error(err))
+		}
 	})
+	return nil
 }
 
-func (r *Router) enqueueBotAPIPrivateMessageUpdate(ctx context.Context, res domain.SendPrivateTextResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil || res.Duplicate || res.RecipientMessage.ID <= 0 || res.RecipientMessage.Out {
-		return
+func (r *Router) enqueueBotAPIPrivateMessageUpdate(ctx context.Context, res domain.SendPrivateTextResult) error {
+	botID, required, err := r.botAPIPrivateMessageUpdateTarget(ctx, res)
+	if err != nil || !required {
+		return err
+	}
+	return r.enqueueBotAPIPrivateMessageUpdateForBot(ctx, res, botID)
+}
+
+func (r *Router) botAPIPrivateMessageUpdateTarget(ctx context.Context, res domain.SendPrivateTextResult) (int64, bool, error) {
+	if r == nil {
+		return 0, false, errBotAPIUpdateStoreRequired
+	}
+	if res.Duplicate || res.RecipientMessage.ID <= 0 || res.RecipientMessage.Out {
+		return 0, false, nil
 	}
 	botID := res.RecipientMessage.OwnerUserID
 	if botID == 0 || !botAPIMessageProjectable(res.RecipientMessage) {
-		return
+		return 0, false, nil
 	}
 	isBot, err := r.botAPIKnownBot(ctx, botID)
 	if err != nil || !isBot {
-		return
+		return 0, false, err
 	}
+	if r.deps.BotAPIUpdates == nil {
+		return botID, true, errBotAPIUpdateStoreRequired
+	}
+	return botID, true, nil
+}
+
+func (r *Router) enqueueBotAPIPrivateMessageUpdateForBot(ctx context.Context, res domain.SendPrivateTextResult, botID int64) error {
 	if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
 		BotUserID: botID,
 		Kind:      domain.BotAPIUpdateMessage,
@@ -391,12 +423,43 @@ func (r *Router) enqueueBotAPIPrivateMessageUpdate(ctx context.Context, res doma
 		Date:      res.RecipientMessage.Date,
 	}); err == nil && created {
 		r.notifyBotAPIUpdate(botID)
+	} else if err != nil {
+		return err
 	}
+	return nil
 }
 
-func (r *Router) enqueueBotAPIPrivateEditUpdates(ctx context.Context, res domain.EditMessageResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil {
-		return
+func (r *Router) botAPIPrivateEditUpdatesRequired(ctx context.Context, res domain.EditMessageResult) (bool, error) {
+	if r == nil {
+		return false, errBotAPIUpdateStoreRequired
+	}
+	if len(res.Edited) == 0 {
+		return false, nil
+	}
+	required := false
+	for _, item := range res.Edited {
+		if item.UserID == 0 || item.Message.ID <= 0 || item.Message.Out || !botAPIMessageProjectable(item.Message) {
+			continue
+		}
+		isBot, err := r.botAPIKnownBot(ctx, item.UserID)
+		if err != nil {
+			return false, err
+		}
+		if isBot {
+			required = true
+			break
+		}
+	}
+	if required && r.deps.BotAPIUpdates == nil {
+		return true, errBotAPIUpdateStoreRequired
+	}
+	return required, nil
+}
+
+func (r *Router) enqueueBotAPIPrivateEditUpdates(ctx context.Context, res domain.EditMessageResult) error {
+	required, err := r.botAPIPrivateEditUpdatesRequired(ctx, res)
+	if err != nil || !required {
+		return err
 	}
 	for _, item := range res.Edited {
 		if item.UserID == 0 || item.Message.ID <= 0 || item.Message.Out || !botAPIMessageProjectable(item.Message) {
@@ -415,26 +478,30 @@ func (r *Router) enqueueBotAPIPrivateEditUpdates(ctx context.Context, res domain
 			Date:      item.Message.EditDate,
 		}); err == nil && created {
 			r.notifyBotAPIUpdate(item.UserID)
+		} else if err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func (r *Router) enqueueBotAPIChannelMessageUpdate(ctx context.Context, originUserID int64, res domain.SendChannelMessageResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil || r.deps.Channels == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 {
-		return
+func (r *Router) enqueueBotAPIChannelMessageUpdate(ctx context.Context, originUserID int64, res domain.SendChannelMessageResult) error {
+	if r == nil || r.deps.Channels == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 {
+		return nil
 	}
 	botIDs, err := r.botAPIChannelBotCandidates(ctx, originUserID, res.Message.ChannelID)
 	if err != nil {
-		return
+		return err
 	}
-	r.enqueueBotAPIChannelMessageUpdateForBots(ctx, res, botIDs)
+	return r.enqueueBotAPIChannelMessageUpdateForBots(ctx, res, botIDs)
 }
 
-func (r *Router) enqueueBotAPIChannelMessageUpdateForBots(ctx context.Context, res domain.SendChannelMessageResult, botIDs []int64) {
-	if r == nil || r.deps.BotAPIUpdates == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 || len(botIDs) == 0 {
-		return
+func (r *Router) enqueueBotAPIChannelMessageUpdateForBots(ctx context.Context, res domain.SendChannelMessageResult, botIDs []int64) error {
+	if r == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 || len(botIDs) == 0 {
+		return nil
 	}
 	skip := skipDeliverySet(res.SkipDeliveryUserIDs)
+	targets := make([]int64, 0, len(botIDs))
 	for _, botID := range botIDs {
 		if botID == 0 || botID == res.Message.SenderUserID {
 			continue
@@ -442,6 +509,15 @@ func (r *Router) enqueueBotAPIChannelMessageUpdateForBots(ctx context.Context, r
 		if _, skipped := skip[botID]; skipped {
 			continue
 		}
+		targets = append(targets, botID)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	if r.deps.BotAPIUpdates == nil {
+		return errBotAPIUpdateStoreRequired
+	}
+	for _, botID := range targets {
 		if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
 			BotUserID: botID,
 			Kind:      domain.BotAPIUpdateMessage,
@@ -451,14 +527,20 @@ func (r *Router) enqueueBotAPIChannelMessageUpdateForBots(ctx context.Context, r
 			Date:      res.Message.Date,
 		}); err == nil && created {
 			r.notifyBotAPIUpdate(botID)
+		} else if err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func (r *Router) enqueueBotAPIChannelMessagesUpdate(ctx context.Context, originUserID int64, results []domain.SendChannelMessageResult) {
+func (r *Router) enqueueBotAPIChannelMessagesUpdate(ctx context.Context, originUserID int64, results []domain.SendChannelMessageResult) error {
+	if r == nil || r.deps.Channels == nil {
+		return nil
+	}
 	candidates := make(map[int64][]int64)
 	for _, res := range results {
-		if r == nil || r.deps.BotAPIUpdates == nil || r.deps.Channels == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 {
+		if res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 {
 			continue
 		}
 		botIDs, ok := candidates[res.Message.ChannelID]
@@ -466,31 +548,44 @@ func (r *Router) enqueueBotAPIChannelMessagesUpdate(ctx context.Context, originU
 			loaded, err := r.botAPIChannelBotCandidates(ctx, originUserID, res.Message.ChannelID)
 			if err != nil {
 				candidates[res.Message.ChannelID] = nil
-				continue
+				return err
 			}
 			botIDs = loaded
 			candidates[res.Message.ChannelID] = botIDs
 		}
-		r.enqueueBotAPIChannelMessageUpdateForBots(ctx, res, botIDs)
+		if err := r.enqueueBotAPIChannelMessageUpdateForBots(ctx, res, botIDs); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (r *Router) enqueueBotAPIChannelEditMessageUpdate(ctx context.Context, originUserID int64, res domain.EditChannelMessageResult) {
-	if r == nil || r.deps.BotAPIUpdates == nil || r.deps.Channels == nil || res.Message.ID <= 0 || res.Message.ChannelID == 0 || res.Event.Pts == 0 {
-		return
+func (r *Router) enqueueBotAPIChannelEditMessageUpdate(ctx context.Context, originUserID int64, res domain.EditChannelMessageResult) error {
+	if r == nil || r.deps.Channels == nil || res.Message.ID <= 0 || res.Message.ChannelID == 0 || res.Event.Pts == 0 {
+		return nil
 	}
 	botIDs, err := r.botAPIChannelBotCandidates(ctx, originUserID, res.Message.ChannelID)
 	if err != nil {
-		return
+		return err
 	}
 	date := res.Message.EditDate
 	if date == 0 {
 		date = res.Message.Date
 	}
+	targets := make([]int64, 0, len(botIDs))
 	for _, botID := range botIDs {
 		if botID == 0 || botID == res.Message.SenderUserID {
 			continue
 		}
+		targets = append(targets, botID)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	if r.deps.BotAPIUpdates == nil {
+		return errBotAPIUpdateStoreRequired
+	}
+	for _, botID := range targets {
 		if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
 			BotUserID: botID,
 			Kind:      domain.BotAPIUpdateEditedMessage,
@@ -500,8 +595,11 @@ func (r *Router) enqueueBotAPIChannelEditMessageUpdate(ctx context.Context, orig
 			Date:      date,
 		}); err == nil && created {
 			r.notifyBotAPIUpdate(botID)
+		} else if err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func (r *Router) botAPIChannelBotCandidates(ctx context.Context, viewerUserID, channelID int64) ([]int64, error) {

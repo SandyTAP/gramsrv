@@ -33,6 +33,10 @@ func inlineResultKey(queryID int64) string {
 	return fmt.Sprintf("inline:result:%d", queryID)
 }
 
+func inlineResultWakeKey(queryID int64) string {
+	return fmt.Sprintf("inline:result:%d:wake", queryID)
+}
+
 func inlineCacheKey(key store.InlineCacheKey) (string, error) {
 	raw, err := json.Marshal(key)
 	if err != nil {
@@ -61,13 +65,30 @@ func webViewBotQueryKey(botQueryID string) string {
 	return "webview:bot_query:" + hex.EncodeToString(sum[:])
 }
 
+var reserveWebViewSessionScript = redis.NewScript(`
+local exists = redis.call("EXISTS", KEYS[1], KEYS[2])
+if exists ~= 0 then
+	return 0
+end
+redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
+redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+return 1
+`)
+
 func (s *InlineRegistryStore) PutInlinePending(ctx context.Context, pending store.InlinePending, ttl time.Duration) error {
+	if s == nil || s.c == nil || pending.QueryID == 0 || pending.BotUserID <= 0 || pending.UserID <= 0 || ttl <= 0 {
+		return fmt.Errorf("invalid inline pending")
+	}
 	raw, err := json.Marshal(pending)
 	if err != nil {
 		return fmt.Errorf("marshal inline pending: %w", err)
 	}
-	if err := s.c.Set(ctx, inlinePendingKey(pending.QueryID), raw, ttl).Err(); err != nil {
+	created, err := s.c.SetNX(ctx, inlinePendingKey(pending.QueryID), raw, ttl).Result()
+	if err != nil {
 		return fmt.Errorf("redis set inline pending: %w", err)
+	}
+	if !created {
+		return fmt.Errorf("inline pending query id already exists")
 	}
 	return nil
 }
@@ -94,15 +115,26 @@ func (s *InlineRegistryStore) DeleteInlinePending(ctx context.Context, queryID i
 }
 
 func (s *InlineRegistryStore) PutInlineResult(ctx context.Context, results domain.BotInlineResults, ttl time.Duration) error {
+	if s == nil || s.c == nil || results.QueryID == 0 || results.BotUserID <= 0 || results.UserID <= 0 || ttl <= 0 {
+		return fmt.Errorf("invalid inline result")
+	}
 	raw, err := json.Marshal(results)
 	if err != nil {
 		return fmt.Errorf("marshal inline result: %w", err)
 	}
-	if err := s.c.Set(ctx, inlineResultKey(results.QueryID), raw, ttl).Err(); err != nil {
+	if err := putInlineResultScript.Run(ctx, s.c, []string{inlineResultKey(results.QueryID), inlineResultWakeKey(results.QueryID)},
+		raw, ttl.Milliseconds()).Err(); err != nil {
 		return fmt.Errorf("redis set inline result: %w", err)
 	}
 	return nil
 }
+
+var putInlineResultScript = redis.NewScript(`
+redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
+redis.call("LPUSH", KEYS[2], "1")
+redis.call("PEXPIRE", KEYS[2], ARGV[2])
+return 1
+`)
 
 func (s *InlineRegistryStore) GetInlineResult(ctx context.Context, queryID int64) (domain.BotInlineResults, bool, error) {
 	key := inlineResultKey(queryID)
@@ -118,8 +150,40 @@ func (s *InlineRegistryStore) GetInlineResult(ctx context.Context, queryID int64
 	return results, true, nil
 }
 
+func (s *InlineRegistryStore) WaitInlineResult(ctx context.Context, userID, queryID int64) (domain.BotInlineResults, bool, error) {
+	if s == nil || s.c == nil || userID <= 0 || queryID == 0 {
+		return domain.BotInlineResults{}, false, nil
+	}
+	for {
+		results, found, err := s.GetInlineResult(ctx, queryID)
+		if err != nil {
+			return domain.BotInlineResults{}, false, err
+		}
+		if found {
+			if results.UserID != userID {
+				return domain.BotInlineResults{}, false, nil
+			}
+			return results, true, nil
+		}
+		_, err = s.c.BLPop(ctx, 0, inlineResultWakeKey(queryID)).Result()
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return domain.BotInlineResults{}, false, nil
+		}
+		if err == redis.Nil {
+			continue
+		}
+		return domain.BotInlineResults{}, false, fmt.Errorf("wait inline result: %w", err)
+	}
+}
+
 func (s *InlineRegistryStore) DeleteInlineResult(ctx context.Context, queryID int64) error {
-	if err := s.c.Del(ctx, inlineResultKey(queryID)).Err(); err != nil {
+	if s == nil || s.c == nil || queryID == 0 {
+		return nil
+	}
+	if err := s.c.Del(ctx, inlineResultKey(queryID), inlineResultWakeKey(queryID)).Err(); err != nil {
 		return fmt.Errorf("redis delete inline result: %w", err)
 	}
 	return nil
@@ -251,6 +315,23 @@ func (s *InlineRegistryStore) GetPreparedInlineMessage(ctx context.Context, id s
 	}
 	msg.Results.Results = append([]domain.BotInlineResult(nil), msg.Results.Results...)
 	return msg, true, nil
+}
+
+func (s *InlineRegistryStore) ReserveWebViewSession(ctx context.Context, session store.WebViewSession, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("webview session ttl must be positive")
+	}
+	raw, err := json.Marshal(session)
+	if err != nil {
+		return false, fmt.Errorf("marshal webview session: %w", err)
+	}
+	result, err := reserveWebViewSessionScript.Run(ctx, s.c,
+		[]string{webViewSessionKey(session.QueryID), webViewBotQueryKey(session.BotQueryID)},
+		raw, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, fmt.Errorf("redis reserve webview session: %w", err)
+	}
+	return result == 1, nil
 }
 
 func (s *InlineRegistryStore) PutWebViewSession(ctx context.Context, session store.WebViewSession, ttl time.Duration) error {

@@ -31,16 +31,23 @@ func (r *Router) currentUserID(ctx context.Context) (int64, bool, error) {
 		if sessionID, ok := SessionIDFrom(ctx); ok {
 			rawAuthKeyID := rawAuthKeyIDForOrigin(ctx)
 			if userID, resolved := r.deps.Sessions.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
-				if userID == 0 {
-					if authKeyID, ok := AuthKeyIDFrom(ctx); ok {
+				authKeyID, hasAuthKeyID := AuthKeyIDFrom(ctx)
+				if userID != 0 && r.deps.Auth != nil && r.authUserCacheTTL() > 0 && hasAuthKeyID {
+					if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok && cachedUserID == userID {
+						return userID, true, nil
+					}
+				} else if userID == 0 {
+					if hasAuthKeyID {
 						if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok {
 							r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, cachedUserID)
 							r.announceSessionOnline(ctx, cachedUserID)
 							return cachedUserID, true, nil
 						}
 					}
+					return 0, false, nil
+				} else {
+					return userID, true, nil
 				}
-				return userID, userID != 0, nil
 			}
 		}
 	}

@@ -104,6 +104,9 @@ func TestServiceProjectsMessageUsersForViewerContacts(t *testing.T) {
 		friendID:   {PhotoID: 9101, DCID: 2, Stripped: []byte{5, 6}},
 		strangerID: {PhotoID: 9102, DCID: 4},
 	}))
+	if svc.ProjectsMessageUsersForViewer() {
+		t.Fatal("partially configured message projector must not claim a complete viewer envelope")
+	}
 
 	list, err := svc.GetHistory(ctx, ownerID, domain.MessageFilter{Limit: 10})
 	if err != nil {
@@ -126,6 +129,29 @@ func TestServiceProjectsMessageUsersForViewerContacts(t *testing.T) {
 	self := findUser(t, list.Users, ownerID)
 	if self.Phone != "15550000001" {
 		t.Fatalf("self phone = %q, want preserved", self.Phone)
+	}
+
+	media, err := svc.SearchPrivateMedia(ctx, ownerID, friendID, domain.MediaSearchRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchPrivateMedia: %v", err)
+	}
+	mediaFriend := findUser(t, media.Users, friendID)
+	if !mediaFriend.Contact || mediaFriend.FirstName != "Remark" || mediaFriend.Phone != "15550000002" || mediaFriend.PhotoID != 9101 {
+		t.Fatalf("shared-media friend projection = %+v, want the same viewer projection as history", mediaFriend)
+	}
+}
+
+func TestServiceMarksOnlyFullyConfiguredViewerProjectionComplete(t *testing.T) {
+	store := projectionMessageStore{}
+	svc := NewService(store, nil,
+		WithContactStore(memory.NewContactStore()),
+		WithPhotoProvider(messageProfilePhotos{}),
+		WithPrivacyEvaluator(messageProjectionPrivacy{}),
+		WithAccountFreezeProvider(messageProjectionFreezes{}),
+		WithCollectiblePhoneProvider(messageProjectionPhones{}),
+	)
+	if !svc.ProjectsMessageUsersForViewer() {
+		t.Fatal("fully configured message projector must advertise a complete viewer envelope")
 	}
 }
 
@@ -815,9 +841,27 @@ func (s projectionMessageStore) ListByUser(context.Context, int64, domain.Messag
 }
 
 func (s projectionMessageStore) SearchPrivateMedia(context.Context, int64, int64, domain.MediaSearchRequest) (domain.MessageList, error) {
-	return domain.MessageList{}, nil
+	return s.list, nil
 }
 
 func (s projectionMessageStore) CountPrivateMediaCategories(context.Context, int64, int64) (domain.MediaCategoryCounts, error) {
 	return domain.MediaCategoryCounts{}, nil
+}
+
+type messageProjectionPrivacy struct{}
+
+func (messageProjectionPrivacy) CanSee(context.Context, int64, int64, domain.PrivacyKey) (bool, error) {
+	return true, nil
+}
+
+type messageProjectionFreezes struct{}
+
+func (messageProjectionFreezes) AccountFreezes(context.Context, []int64) (map[int64]domain.AccountFreeze, error) {
+	return map[int64]domain.AccountFreeze{}, nil
+}
+
+type messageProjectionPhones struct{}
+
+func (messageProjectionPhones) OwnedCollectiblePhones(context.Context, []int64) (map[int64]domain.CollectiblePhone, error) {
+	return map[int64]domain.CollectiblePhone{}, nil
 }

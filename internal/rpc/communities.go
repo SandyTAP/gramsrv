@@ -220,16 +220,18 @@ func (r *Router) onCommunitiesCreate(ctx context.Context, req *tg.CommunitiesCre
 		return nil, communityErr(err)
 	}
 	for _, serviceMessage := range view.ServiceMessages {
-		r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil)
+		if err := r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil); err != nil {
+			return nil, internalErr()
+		}
 	}
 	return r.communityUpdates(view), nil
 }
 
-func (r *Router) emitCommunityLinkService(ctx context.Context, actorUserID int64, result domain.CommunityTogglePeerLinkResult) {
+func (r *Router) emitCommunityLinkService(ctx context.Context, actorUserID int64, result domain.CommunityTogglePeerLinkResult) error {
 	if result.ServiceMessage == nil {
-		return
+		return nil
 	}
-	r.enqueueChannelMessageFanout(ctx, actorUserID, *result.ServiceMessage, nil)
+	return r.enqueueChannelMessageFanout(ctx, actorUserID, *result.ServiceMessage, nil)
 }
 
 func (r *Router) onCommunitiesTogglePeerLink(ctx context.Context, req *tg.CommunitiesTogglePeerLinkRequest) (bool, error) {
@@ -272,7 +274,9 @@ func (r *Router) onCommunitiesTogglePeerLink(ctx context.Context, req *tg.Commun
 	if result.RequestCreated {
 		return false, tgerr400("COMMUNITY_REQUEST_CREATED")
 	}
-	r.emitCommunityLinkService(ctx, userID, result)
+	if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+		return false, internalErr()
+	}
 	r.refreshAndPushCommunityState(ctx, userID, view.Community.ID, result.Community)
 	return true, nil
 }
@@ -367,7 +371,9 @@ func (r *Router) onCommunitiesTogglePeerLinkRequestApproval(ctx context.Context,
 		return false, communityErr(err)
 	}
 	if !req.Reject {
-		r.emitCommunityLinkService(ctx, userID, result)
+		if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+			return false, internalErr()
+		}
 		r.refreshAndPushCommunityState(ctx, userID, view.Community.ID, result.Community)
 		if result.RequestedBy != userID {
 			r.refreshAndPushCommunityState(ctx, result.RequestedBy, view.Community.ID, result.Community)
@@ -395,7 +401,9 @@ func (r *Router) onCommunitiesToggleAllPeerLinkRequestApproval(ctx context.Conte
 	if !req.Reject {
 		requesters := map[int64]struct{}{}
 		for _, result := range results {
-			r.emitCommunityLinkService(ctx, userID, result)
+			if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+				return false, internalErr()
+			}
 			if result.RequestedBy != 0 && result.RequestedBy != userID {
 				requesters[result.RequestedBy] = struct{}{}
 			}
@@ -431,7 +439,9 @@ func (r *Router) onCommunitiesToggleParticipantBanned(ctx context.Context, req *
 		return false, communityErr(err)
 	}
 	for _, removed := range result.RemovedLinks {
-		r.emitCommunityLinkService(ctx, userID, removed)
+		if err := r.emitCommunityLinkService(ctx, userID, removed); err != nil {
+			return false, internalErr()
+		}
 	}
 	for _, ban := range result.ChannelBans {
 		r.invalidateChannelFullBotInfoCacheForChannel(ban.Channel.ID)

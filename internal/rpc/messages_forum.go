@@ -59,7 +59,9 @@ func (r *Router) onMessagesCreateForumTopic(ctx context.Context, req *tg.Message
 	echoCache := newViewerPeerCache(r)
 	updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, sendRes, req.RandomID, echoCache)
 	if !res.Duplicate {
-		r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil)
+		if err := r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil); err != nil {
+			return nil, internalErr()
+		}
 	}
 	return updates, nil
 }
@@ -114,7 +116,9 @@ func (r *Router) onMessagesEditForumTopic(ctx context.Context, req *tg.MessagesE
 	}
 	echoCache := newViewerPeerCache(r)
 	updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, sendRes, 0, echoCache)
-	r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil)
+	if err := r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil); err != nil {
+		return nil, internalErr()
+	}
 	return updates, nil
 }
 

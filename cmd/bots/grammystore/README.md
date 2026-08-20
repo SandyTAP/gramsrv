@@ -2,7 +2,7 @@
 
 This service replaces the former JSON/Python bot with one grammY process and a
 transactional SQLite database. It deliberately runs independently from
-`cmd/telesrv`; a bot outage cannot stop MTProto.
+`cmd/telesrv-core` and `cmd/telesrv-edge`; a bot outage cannot stop MTProto.
 
 ## Included functionality
 

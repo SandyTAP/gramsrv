@@ -12,6 +12,7 @@ import (
 	appgroupcalls "telesrv/internal/app/groupcalls"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/sfu"
 	"telesrv/internal/store/memory"
 )
 
@@ -70,6 +71,7 @@ func newRtmpFixture(t *testing.T) *rtmpFixture {
 		Channels:    appchannels.NewService(channelStore),
 		GroupCalls:  appgroupcalls.NewService(memory.NewGroupCallStore()),
 		LiveStreams: live,
+		SFU:         sfu.Disabled(),
 		Sessions:    sessions,
 	}, zaptest.NewLogger(t), clk)
 	f := &groupCallFixture{t: t, ctx: ctx, router: router, sessions: sessions, clk: clk}

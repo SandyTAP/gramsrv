@@ -30,6 +30,8 @@ const (
 	DefaultUploadInFlightMaxBytes = int64(MaxUploadPartBytes) * int64(MaxUploadParts)
 	DefaultUploadInFlightMaxParts = MaxUploadParts
 	DefaultUploadInFlightMaxFiles = 64
+	DefaultFileHashPartSize       = 128 << 10
+	DefaultFileHashRangeSize      = 10
 )
 
 // blobMetaCacheCapacity 是 location_key→FileBlob 元数据 LRU 容量（每项约百字节，约 13MB）。
@@ -50,6 +52,7 @@ type Service struct {
 	gifCatalog  store.GifCatalogStore
 	blobs       BlobBackend
 	uploadParts UploadPartBackend
+	assembler   UploadBlobAssembler
 	dc          int
 	log         *zap.Logger
 	thumbs      VideoThumbnailer
@@ -129,6 +132,21 @@ func WithUploadPartQuota(quota domain.UploadPartQuota) Option {
 func WithUploadPartBackend(backend UploadPartBackend) Option {
 	return func(s *Service) {
 		s.uploadParts = backend
+	}
+}
+
+// UploadBlobAssembler allows Core to ask the standalone FileData role to
+// materialize uploaded parts without pulling large media bytes through Core.
+type UploadBlobAssembler interface {
+	AssembleUploadBlob(ctx context.Context, ownerUserID, fileID int64, expectedParts int) (AssembledUploadBlob, error)
+}
+
+// WithUploadBlobAssembler delegates upload part materialization to an explicit
+// data-plane dependency. A nil dependency leaves the service-local assembler in
+// place for the standalone file role and focused tests.
+func WithUploadBlobAssembler(assembler UploadBlobAssembler) Option {
+	return func(s *Service) {
+		s.assembler = assembler
 	}
 }
 
@@ -339,37 +357,18 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		s.logGetFileCache(req, blob, found, chunk, cacheLog, err)
 	}()
 
-	blob, ok := s.blobCache.get(req.LocationKey)
-	if ok {
-		cacheLog.metaCacheHit = true
-	} else {
-		// 同一 location_key 的并发首访合并成一次 PG GetFileBlob。
-		v, err, shared := s.blobMetaSF.Do(req.LocationKey, func() (any, error) {
-			if cached, ok := s.blobCache.get(req.LocationKey); ok {
-				return blobMetaResult{blob: cached, found: true, cacheHit: true}, nil
-			}
-			b, found, err := s.media.GetFileBlob(ctx, req.LocationKey)
-			if err != nil {
-				return blobMetaResult{}, err
-			}
-			if found {
-				s.blobCache.put(req.LocationKey, b)
-			}
-			return blobMetaResult{blob: b, found: found, cacheFilled: found}, nil
-		})
-		cacheLog.metaSingleflight = shared
-		if err != nil {
-			return domain.FileChunk{}, false, err
-		}
-		res := v.(blobMetaResult)
-		cacheLog.metaCacheHit = res.cacheHit
-		cacheLog.metaCacheFilled = res.cacheFilled
-		if !res.found {
-			cacheLog.source = "metadata_miss"
-			return domain.FileChunk{}, false, nil
-		}
-		blob = res.blob
+	res, shared, err := s.lookupFileBlob(ctx, req.LocationKey)
+	cacheLog.metaSingleflight = shared
+	cacheLog.metaCacheHit = res.cacheHit
+	cacheLog.metaCacheFilled = res.cacheFilled
+	if err != nil {
+		return domain.FileChunk{}, false, err
 	}
+	if !res.found {
+		cacheLog.source = "metadata_miss"
+		return domain.FileChunk{}, false, nil
+	}
+	blob = res.blob
 	if blob.Backend != domain.MediaBackend(s.blobs.Name()) {
 		return domain.FileChunk{}, false, fmt.Errorf(
 			"blob backend mismatch for %q: stored=%q configured=%q",
@@ -438,6 +437,108 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		MimeType: blob.MimeType,
 		Total:    total,
 	}, true, nil
+}
+
+func (s *Service) GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error) {
+	if req.Offset < 0 {
+		return nil, false, fmt.Errorf("file hash offset is negative")
+	}
+	res, _, err := s.lookupFileBlob(ctx, req.LocationKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if !res.found {
+		return nil, false, nil
+	}
+	blob := res.blob
+	if blob.Backend != domain.MediaBackend(s.blobs.Name()) {
+		return nil, false, fmt.Errorf(
+			"blob backend mismatch for %q: stored=%q configured=%q",
+			blob.LocationKey, blob.Backend, s.blobs.Name(),
+		)
+	}
+	if req.Offset >= blob.Size {
+		return []domain.FileHash{}, true, nil
+	}
+	start, limit := fileHashBatchRange(req.Offset, blob.Size)
+	if limit <= 0 {
+		return []domain.FileHash{}, true, nil
+	}
+	if start == 0 && blob.Size <= DefaultFileHashPartSize && len(blob.SHA256) == sha256.Size {
+		return []domain.FileHash{{
+			Offset: 0,
+			Limit:  int(blob.Size),
+			Hash:   append([]byte(nil), blob.SHA256...),
+		}}, true, nil
+	}
+	data, total, err := s.blobs.GetRange(ctx, blob.ObjectKey, start, limit)
+	if err != nil {
+		return nil, false, fmt.Errorf("read blob hash range %q: %w", blob.LocationKey, err)
+	}
+	if total != blob.Size {
+		return nil, false, fmt.Errorf("blob size mismatch for %q: stored=%d backend=%d", blob.LocationKey, blob.Size, total)
+	}
+	if int64(len(data)) != limit {
+		return nil, false, fmt.Errorf("short blob hash range for %q: offset=%d limit=%d read=%d", blob.LocationKey, start, limit, len(data))
+	}
+	return fileHashesForRange(data, start), true, nil
+}
+
+func (s *Service) lookupFileBlob(ctx context.Context, locationKey string) (blobMetaResult, bool, error) {
+	if cached, ok := s.blobCache.get(locationKey); ok {
+		return blobMetaResult{blob: cached, found: true, cacheHit: true}, false, nil
+	}
+	v, err, shared := s.blobMetaSF.Do(locationKey, func() (any, error) {
+		if cached, ok := s.blobCache.get(locationKey); ok {
+			return blobMetaResult{blob: cached, found: true, cacheHit: true}, nil
+		}
+		b, found, err := s.media.GetFileBlob(ctx, locationKey)
+		if err != nil {
+			return blobMetaResult{}, err
+		}
+		if found {
+			s.blobCache.put(locationKey, b)
+		}
+		return blobMetaResult{blob: b, found: found, cacheFilled: found}, nil
+	})
+	if err != nil {
+		return blobMetaResult{}, shared, err
+	}
+	return v.(blobMetaResult), shared, nil
+}
+
+func fileHashBatchRange(offset, size int64) (int64, int64) {
+	if offset < 0 || offset >= size {
+		return 0, 0
+	}
+	partSize := int64(DefaultFileHashPartSize)
+	rangeSize := int64(DefaultFileHashRangeSize)
+	start := (offset / partSize / rangeSize) * rangeSize * partSize
+	end := start + rangeSize*partSize
+	if end > size {
+		end = size
+	}
+	return start, end - start
+}
+
+func fileHashesForRange(data []byte, start int64) []domain.FileHash {
+	if len(data) == 0 {
+		return nil
+	}
+	hashes := make([]domain.FileHash, 0, (len(data)+DefaultFileHashPartSize-1)/DefaultFileHashPartSize)
+	for pos := 0; pos < len(data); pos += DefaultFileHashPartSize {
+		end := pos + DefaultFileHashPartSize
+		if end > len(data) {
+			end = len(data)
+		}
+		sum := sha256.Sum256(data[pos:end])
+		hashes = append(hashes, domain.FileHash{
+			Offset: start + int64(pos),
+			Limit:  end - pos,
+			Hash:   append([]byte(nil), sum[:]...),
+		})
+	}
+	return hashes
 }
 
 func (s *Service) logGetFileCache(req domain.FileDownloadRequest, blob domain.FileBlob, found bool, chunk domain.FileChunk, cacheLog getFileCacheLog, err error) {
@@ -597,7 +698,7 @@ func (s *Service) readUploadBytes(ctx context.Context, ownerUserID, fileID int64
 	return buf, nil
 }
 
-type assembledUploadBlob struct {
+type AssembledUploadBlob struct {
 	ObjectKey string
 	Size      int64
 	SHA256    []byte
@@ -605,13 +706,23 @@ type assembledUploadBlob struct {
 
 // assembleUploadBlob 把上传分片流式写入正式 blob。调用方应在 durable media 元数据
 // 成功提交后调用 cleanupUploadParts，避免 metadata 写失败时丢失可重试的上传分片。
-func (s *Service) assembleUploadBlob(ctx context.Context, ownerUserID, fileID int64, expectedParts int) (assembledUploadBlob, error) {
+func (s *Service) assembleUploadBlob(ctx context.Context, ownerUserID, fileID int64, expectedParts int) (AssembledUploadBlob, error) {
+	if s.assembler != nil {
+		return s.assembler.AssembleUploadBlob(ctx, ownerUserID, fileID, expectedParts)
+	}
+	return s.AssembleUploadBlob(ctx, ownerUserID, fileID, expectedParts)
+}
+
+// AssembleUploadBlob materializes uploaded parts into the permanent blob backend
+// owned by this service instance. It deliberately does not delete upload parts;
+// callers remove transient state only after durable media metadata commits.
+func (s *Service) AssembleUploadBlob(ctx context.Context, ownerUserID, fileID int64, expectedParts int) (AssembledUploadBlob, error) {
 	parts, _, err := s.loadAndValidateUploadParts(ctx, ownerUserID, fileID, expectedParts)
 	if err != nil {
-		return assembledUploadBlob{}, err
+		return AssembledUploadBlob{}, err
 	}
 	if s.uploadParts == nil {
-		return assembledUploadBlob{}, fmt.Errorf("upload part backend not configured")
+		return AssembledUploadBlob{}, fmt.Errorf("upload part backend not configured")
 	}
 	reader := &uploadPartsReader{
 		ctx:     ctx,
@@ -621,9 +732,9 @@ func (s *Service) assembleUploadBlob(ctx context.Context, ownerUserID, fileID in
 	defer reader.Close()
 	objectKey, size, sum, err := s.blobs.PutReader(ctx, reader)
 	if err != nil {
-		return assembledUploadBlob{}, err
+		return AssembledUploadBlob{}, err
 	}
-	return assembledUploadBlob{
+	return AssembledUploadBlob{
 		ObjectKey: objectKey,
 		Size:      size,
 		SHA256:    sum,

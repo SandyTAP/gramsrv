@@ -90,22 +90,24 @@ func (r *Router) onMessagesGetBotCallbackAnswer(ctx context.Context, req *tg.Mes
 	callback.ID = queryID
 
 	// Bot API callback_query shares the dedicated durable update_id queue with message and
-	// edited_message. The callback answer waiter itself remains ephemeral/process-local.
-	if r.deps.BotAPIUpdates != nil {
-		if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
-			BotUserID: botUserID,
-			Kind:      domain.BotAPIUpdateCallbackQuery,
-			Peer:      callback.Peer,
-			MessageID: callback.MessageID,
-			Date:      int(r.clock.Now().Unix()),
-			Callback:  &callback,
-		}); err != nil {
-			r.log.Warn("enqueue bot api callback query",
-				zap.Int64("bot_user_id", botUserID), zap.Int64("query_id", queryID), zap.Error(err))
-			return nil, internalErr()
-		} else if created {
-			r.notifyBotAPIUpdate(botUserID)
-		}
+	// edited_message. The synchronous answer waiter is coordinated by the shared
+	// callback registry; the local channel only wakes this RPC when the answer lands here.
+	if r.deps.BotAPIUpdates == nil {
+		return nil, internalErr()
+	}
+	if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
+		BotUserID: botUserID,
+		Kind:      domain.BotAPIUpdateCallbackQuery,
+		Peer:      callback.Peer,
+		MessageID: callback.MessageID,
+		Date:      int(r.clock.Now().Unix()),
+		Callback:  &callback,
+	}); err != nil {
+		r.log.Warn("enqueue bot api callback query",
+			zap.Int64("bot_user_id", botUserID), zap.Int64("query_id", queryID), zap.Error(err))
+		return nil, internalErr()
+	} else if created {
+		r.notifyBotAPIUpdate(botUserID)
 	}
 
 	// updateBotCallbackQuery 是 ephemeral（无 pts/qts，不进 getDifference）；私聊 MessageID
@@ -137,25 +139,20 @@ func (r *Router) onMessagesGetBotCallbackAnswer(ctx context.Context, req *tg.Mes
 func (r *Router) waitBotCallbackAnswer(ctx context.Context, botUserID, queryID int64, pending *pendingCallback) (*tg.MessagesBotCallbackAnswer, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, botCallbackTimeout)
 	defer cancel()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case ans := <-pending.ch:
-			return tgBotCallbackAnswer(ans), nil
-		case <-ticker.C:
-			ans, found, err := r.callbacks.sharedAnswer(waitCtx, botUserID, queryID)
-			if err != nil {
-				r.log.Warn("read shared bot callback answer", zap.Int64("bot_user_id", botUserID), zap.Int64("query_id", queryID), zap.Error(err))
-				continue
-			}
-			if found {
-				return tgBotCallbackAnswer(ans), nil
-			}
-		case <-waitCtx.Done():
-			return nil, botResponseTimeoutErr()
-		}
+	select {
+	case ans := <-pending.ch:
+		return tgBotCallbackAnswer(ans), nil
+	default:
 	}
+	ans, found, err := r.callbacks.waitSharedAnswer(waitCtx, botUserID, queryID)
+	if err != nil {
+		r.log.Warn("wait shared bot callback answer", zap.Int64("bot_user_id", botUserID), zap.Int64("query_id", queryID), zap.Error(err))
+		return nil, internalErr()
+	}
+	if found {
+		return tgBotCallbackAnswer(ans), nil
+	}
+	return nil, botResponseTimeoutErr()
 }
 
 // resolveBotCallbackQuery validates the clicked message and resolves the bot-visible message

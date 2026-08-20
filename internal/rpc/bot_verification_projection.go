@@ -103,7 +103,7 @@ func (r *Router) applyBotVerificationIconsToPeerObjects(ctx context.Context, use
 		peers = append(peers, peer)
 	}
 	for _, item := range users {
-		if u, ok := item.(*tg.User); ok && u != nil {
+		if u, ok := item.(*tg.User); ok && u != nil && !u.Deleted {
 			addPeer(domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
 		}
 	}
@@ -121,7 +121,7 @@ func (r *Router) applyBotVerificationIconsToPeerObjects(ctx context.Context, use
 	}
 	for _, item := range users {
 		u, ok := item.(*tg.User)
-		if !ok || u == nil {
+		if !ok || u == nil || u.Deleted {
 			continue
 		}
 		mark, ok := byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: u.ID}]
@@ -189,7 +189,7 @@ func applyBotVerificationIconToUsers(users []tg.UserClass, userID, icon int64) {
 		return
 	}
 	for _, item := range users {
-		if u, ok := item.(*tg.User); ok && u != nil && u.ID == userID {
+		if u, ok := item.(*tg.User); ok && u != nil && !u.Deleted && u.ID == userID {
 			u.SetBotVerificationIcon(icon)
 		}
 	}

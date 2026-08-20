@@ -29,6 +29,22 @@ func (s *bootstrapOrderUpdates) PublishNewMessage(ctx context.Context, userID in
 	return s.captureUpdates.PublishNewMessage(ctx, userID, msg)
 }
 
+type wakeBootstrapUpdates struct {
+	*captureUpdates
+	published chan struct{}
+}
+
+func (s *wakeBootstrapUpdates) PublishNewMessage(ctx context.Context, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error) {
+	event, state, err := s.captureUpdates.PublishNewMessage(ctx, userID, msg)
+	if err == nil {
+		select {
+		case s.published <- struct{}{}:
+		default:
+		}
+	}
+	return event, state, err
+}
+
 func TestSignUpBootstrapLoginMessagePublishesNewMessageAfterReady(t *testing.T) {
 	bootstrap := memory.NewBootstrapUpdateJobStore()
 	updates := &captureUpdates{state: domain.UpdateState{Pts: 3, Date: 1700000000}}
@@ -79,6 +95,65 @@ func TestSignUpBootstrapLoginMessagePublishesNewMessageAfterReady(t *testing.T) 
 	event := updates.events[0]
 	if event.Type != domain.UpdateEventNewMessage || event.Message.ID != msg.ID || event.Pts != 4 {
 		t.Fatalf("event = %+v, want login message pts 4", event)
+	}
+}
+
+func TestBootstrapUpdateDispatcherRunsOnlyWhenWoken(t *testing.T) {
+	bootstrap := memory.NewBootstrapUpdateJobStore()
+	updates := &wakeBootstrapUpdates{
+		captureUpdates: &captureUpdates{state: domain.UpdateState{Pts: 3, Date: 1700000000}},
+		published:      make(chan struct{}, 1),
+	}
+	msg := domain.Message{
+		ID:          100,
+		OwnerUserID: 1000000001,
+		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},
+		From:        domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},
+		Date:        1700000101,
+		Body:        "Login code: 12345",
+	}
+	r := New(Config{}, Deps{
+		BootstrapUpdates: bootstrap,
+		Updates:          updates,
+		Messages:         &captureMessages{list: domain.MessageList{Messages: []domain.Message{msg}}},
+	}, zaptest.NewLogger(t), clock.System)
+	authKeyID := [8]byte{7, 8, 9}
+	sessionID := int64(66)
+	r.enqueueLoginMessageBootstrap(
+		WithSessionID(WithAuthKeyID(context.Background(), authKeyID), sessionID),
+		msg,
+	)
+	if ready, err := bootstrap.MarkReadyForSession(context.Background(), msg.OwnerUserID, authKeyID, sessionID); err != nil || ready != 1 {
+		t.Fatalf("mark ready = %d, %v; want 1 nil", ready, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wake := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		NewBootstrapUpdateDispatcher(r, zaptest.NewLogger(t), WithBootstrapUpdateBatch(10), WithBootstrapUpdateLease(time.Second)).RunWithWake(ctx, wake)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("bootstrap dispatcher did not stop")
+		}
+	}()
+
+	select {
+	case <-updates.published:
+		t.Fatal("bootstrap dispatcher published before wake")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	wake <- struct{}{}
+	select {
+	case <-updates.published:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap dispatcher did not publish after wake")
 	}
 }
 
@@ -231,10 +306,12 @@ func TestLogOutClearsSessionAndUpdateState(t *testing.T) {
 	auth := &captureAuthService{}
 	updates := &captureUpdates{}
 	sessions := &captureSessions{authKeyID: authKeyID, authKeyResolved: true, userID: 1000000001, userResolved: true}
+	broker := &captureAuthInvalidationBroker{}
 	r := New(Config{}, Deps{
-		Auth:     auth,
-		Updates:  updates,
-		Sessions: sessions,
+		Auth:              auth,
+		Updates:           updates,
+		Sessions:          sessions,
+		AuthInvalidations: broker,
 	}, zaptest.NewLogger(t), clock.System)
 
 	_, err := r.onAuthLogOut(WithAuthKeyID(context.Background(), authKeyID))
@@ -246,6 +323,9 @@ func TestLogOutClearsSessionAndUpdateState(t *testing.T) {
 	}
 	if updates.clearedAuthKeyID != authKeyID || !updates.cleared {
 		t.Fatalf("cleared auth key = %x cleared=%v, want %x", updates.clearedAuthKeyID, updates.cleared, authKeyID)
+	}
+	if !authRevocationEventsContain(broker.events, authKeyID) {
+		t.Fatalf("auth invalidation events = %+v, want %x", broker.events, authKeyID)
 	}
 	gotSession := sessions.snapshot()
 	if gotSession.userID != 0 || !gotSession.userResolved {
@@ -286,7 +366,10 @@ func TestUpdatesGetStateMarksSessionReadyForPush(t *testing.T) {
 		Updates:  &captureUpdates{state: domain.UpdateState{Pts: 3, Date: 1700000000, Seq: 2}},
 	}, zaptest.NewLogger(t), clock.System)
 
-	ctx := postresponse.WithCallbacks(WithClientInfo(WithUserID(WithSessionID(context.Background(), 77), 1000000001), ClientInfo{Type: ClientTypeTDesktop}))
+	ctx := postresponse.WithCallbacks(WithClientInfo(
+		WithRawAuthKeyID(WithUserID(WithSessionID(context.Background(), 77), 1000000001), [8]byte{7}),
+		ClientInfo{Type: ClientTypeTDesktop},
+	))
 	got, err := r.onUpdatesGetState(ctx)
 	if err != nil {
 		t.Fatalf("updates.getState: %v", err)
@@ -434,7 +517,9 @@ func TestUpdatesGetStateUnknownClientDoesNotAdvanceObservedBaseline(t *testing.T
 	}
 	r := New(Config{}, Deps{Sessions: sessions, Updates: updates}, zaptest.NewLogger(t), clock.System)
 
-	ctx := postresponse.WithCallbacks(WithUserID(WithSessionID(context.Background(), 78), 1000000001))
+	ctx := postresponse.WithCallbacks(
+		WithRawAuthKeyID(WithUserID(WithSessionID(context.Background(), 78), 1000000001), [8]byte{7, 8}),
+	)
 	got, err := r.onUpdatesGetState(ctx)
 	if err != nil {
 		t.Fatalf("updates.getState unknown client: %v", err)

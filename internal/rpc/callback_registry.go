@@ -4,17 +4,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"go.uber.org/zap"
-
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+var errBotCallbackRegistryStoreRequired = errors.New("bot callback shared registry store is required")
 
 // callbackRegistry keeps local waiter channels and mirrors ownership/answers to
 // a short-lived shared store. The shared CAS is the source of truth when wired:
@@ -49,6 +50,9 @@ func (c *callbackRegistry) register(botUserID, userID int64) (int64, *pendingCal
 }
 
 func (c *callbackRegistry) registerContext(ctx context.Context, now time.Time, botUserID, userID int64, ttl time.Duration) (int64, *pendingCallback, error) {
+	if c == nil || c.shared == nil {
+		return 0, nil, errBotCallbackRegistryStoreRequired
+	}
 	for attempts := 0; attempts < 32; attempts++ {
 		p := &pendingCallback{
 			ch:        make(chan domain.BotCallbackAnswer, 1),
@@ -64,9 +68,6 @@ func (c *callbackRegistry) registerContext(ctx context.Context, now time.Time, b
 		}
 		c.pending[queryID] = p
 		c.mu.Unlock()
-		if c.shared == nil {
-			return queryID, p, nil
-		}
 		created, err := c.shared.PutBotCallbackPending(ctx, store.BotCallbackPending{
 			QueryID: queryID, BotUserID: botUserID, UserID: userID, CreatedAt: now,
 		}, ttl)
@@ -127,15 +128,15 @@ func (c *callbackRegistry) resolve(callerBotID, queryID int64, ans domain.BotCal
 }
 
 func (c *callbackRegistry) resolveContext(ctx context.Context, callerBotID, queryID int64, ans domain.BotCallbackAnswer) (bool, error) {
-	if c.shared != nil {
-		resolved, err := c.shared.ResolveBotCallback(ctx, callerBotID, queryID, ans)
-		if err != nil || !resolved {
-			return resolved, err
-		}
-		c.deliver(callerBotID, queryID, ans)
-		return true, nil
+	if c == nil || c.shared == nil {
+		return false, errBotCallbackRegistryStoreRequired
 	}
-	return c.deliver(callerBotID, queryID, ans), nil
+	resolved, err := c.shared.ResolveBotCallback(ctx, callerBotID, queryID, ans)
+	if err != nil || !resolved {
+		return resolved, err
+	}
+	c.deliver(callerBotID, queryID, ans)
+	return true, nil
 }
 
 func (c *callbackRegistry) deliver(callerBotID, queryID int64, ans domain.BotCallbackAnswer) bool {
@@ -155,35 +156,11 @@ func (c *callbackRegistry) deliver(callerBotID, queryID int64, ans domain.BotCal
 	return true
 }
 
-func (c *callbackRegistry) sharedAnswer(ctx context.Context, botUserID, queryID int64) (domain.BotCallbackAnswer, bool, error) {
-	if c.shared == nil {
-		return domain.BotCallbackAnswer{}, false, nil
+func (c *callbackRegistry) waitSharedAnswer(ctx context.Context, botUserID, queryID int64) (domain.BotCallbackAnswer, bool, error) {
+	if c == nil || c.shared == nil {
+		return domain.BotCallbackAnswer{}, false, errBotCallbackRegistryStoreRequired
 	}
-	return c.shared.GetBotCallbackAnswer(ctx, botUserID, queryID)
-}
-
-func (r *Router) RunBotCallbackAnswerSubscriber(ctx context.Context) {
-	if r == nil || r.callbacks == nil || r.callbacks.shared == nil {
-		return
-	}
-	for ctx.Err() == nil {
-		err := r.callbacks.shared.SubscribeBotCallbackAnswers(ctx, func(_ context.Context, push store.BotCallbackAnswerPush) {
-			r.callbacks.deliver(push.BotUserID, push.QueryID, push.Answer)
-		})
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil && r.log != nil {
-			r.log.Warn("bot callback answer subscriber disconnected", zap.Error(err))
-		}
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
+	return c.shared.WaitBotCallbackAnswer(ctx, botUserID, queryID)
 }
 
 // randomNonZeroInt64 取密码学随机非零 int64。register 在持锁下调用，故此处禁止

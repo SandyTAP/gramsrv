@@ -78,7 +78,7 @@ type PhoneCallRequest struct {
 }
 
 // PhoneCall 是一通私聊通话的服务端权威态。密钥材料（GAHash/GB/GA）只存活于
-// 进程内 registry，随 tombstone 回收销毁，绝不落任何持久化存储。
+// active-call 短命共享状态，随 tombstone 回收销毁，绝不落 PG 等持久化存储。
 type PhoneCall struct {
 	ID         int64
 	AccessHash int64

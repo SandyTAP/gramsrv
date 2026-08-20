@@ -171,12 +171,44 @@ WHERE target_user_id = $1
 		t.Fatalf("deliver unblocked: %v", err)
 	}
 
-	pts5 := appendEvent()
+	pts5, pts6 := appendEvent(), appendEvent()
+	abandonHead, err := outbox.ClaimPendingShards(ctx, storepkg.DispatchOutboxLogicalShards, []int{shard}, 100)
+	if err != nil {
+		t.Fatalf("claim abandon head: %v", err)
+	}
+	if len(abandonHead) != 1 || abandonHead[0].Pts != pts5 {
+		t.Fatalf("abandon head = %+v, want pts %d", abandonHead, pts5)
+	}
+	staleAbandon := abandonHead[0]
+	staleAbandon.Attempts--
+	if err := outbox.MarkAbandoned(ctx, staleAbandon, "stale worker"); !errors.Is(err, storepkg.ErrDispatchLeaseLost) {
+		t.Fatalf("old lease abandoned err = %v, want ErrDispatchLeaseLost", err)
+	}
+	if err := outbox.MarkAbandoned(ctx, abandonHead[0], "online delivery attempts exhausted"); err != nil {
+		t.Fatalf("abandon exhausted online head: %v", err)
+	}
+	var durableAbandonedEvent int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM user_update_events WHERE user_id = $1 AND pts = $2`, owner.ID, pts5).Scan(&durableAbandonedEvent); err != nil || durableAbandonedEvent != 1 {
+		t.Fatalf("durable abandoned event count = %d err=%v, want 1 for difference recovery", durableAbandonedEvent, err)
+	}
+	assertDispatchHead(pts6)
+	nextAfterAbandon, err := outbox.ClaimPendingShards(ctx, storepkg.DispatchOutboxLogicalShards, []int{shard}, 100)
+	if err != nil {
+		t.Fatalf("claim after abandon: %v", err)
+	}
+	if len(nextAfterAbandon) != 1 || nextAfterAbandon[0].Pts != pts6 {
+		t.Fatalf("claim after abandon = %+v, want pts %d", nextAfterAbandon, pts6)
+	}
+	if err := outbox.MarkDelivered(ctx, nextAfterAbandon[0]); err != nil {
+		t.Fatalf("deliver after abandon: %v", err)
+	}
+
+	pts7 := appendEvent()
 	tag, err := tx.Exec(ctx, `
 INSERT INTO dispatch_outbox (target_user_id, pts, event_type)
 VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING
-`, owner.ID, pts5, string(domain.UpdateEventDialogPinned))
+`, owner.ID, pts7, string(domain.UpdateEventDialogPinned))
 	if err != nil {
 		t.Fatalf("duplicate enqueue: %v", err)
 	}
@@ -184,11 +216,98 @@ ON CONFLICT DO NOTHING
 		t.Fatalf("duplicate enqueue rows = %d, want 0 from (user,pts) unique key", tag.RowsAffected())
 	}
 	var taskCount int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM dispatch_outbox WHERE target_user_id = $1 AND pts = $2`, owner.ID, pts5).Scan(&taskCount); err != nil || taskCount != 1 {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM dispatch_outbox WHERE target_user_id = $1 AND pts = $2`, owner.ID, pts7).Scan(&taskCount); err != nil || taskCount != 1 {
 		t.Fatalf("duplicate task count = %d err=%v, want 1", taskCount, err)
 	}
 	if _, err := outbox.ClaimPendingShards(ctx, storepkg.DispatchOutboxLogicalShards-1, []int{shard}, 1); err == nil {
 		t.Fatal("unstable shard count accepted")
+	}
+}
+
+func TestDispatchOutboxClientAckIsIdempotentButFencesReclaimedAttemptPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	owner := createTestUser(t, ctx, NewUserStore(pool), "+1884"+suffix+"02", "OutboxAck", "")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
+	})
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM dispatch_outbox`); err != nil {
+		t.Fatalf("isolate dispatch outbox: %v", err)
+	}
+
+	events := NewUpdateEventStore(tx)
+	outbox := NewDispatchOutboxStore(tx, WithLeaseTimeout(time.Second))
+	appendEvent := func(date int) int {
+		t.Helper()
+		event, err := events.AppendAllocatedWithDispatch(ctx, owner.ID, domain.UpdateEvent{
+			Type:     domain.UpdateEventDialogPinned,
+			PtsCount: 1,
+			Date:     date,
+			Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID},
+			Bool:     true,
+		}, [8]byte{}, 0)
+		if err != nil {
+			t.Fatalf("append event: %v", err)
+		}
+		return event.Pts
+	}
+	claimOne := func(wantPts int) storepkg.DispatchOutboxItem {
+		t.Helper()
+		claimed, err := outbox.ClaimPending(ctx, 1)
+		if err != nil {
+			t.Fatalf("claim outbox: %v", err)
+		}
+		if len(claimed) != 1 || claimed[0].TargetUserID != owner.ID || claimed[0].Pts != wantPts {
+			t.Fatalf("claimed = %+v, want one pts %d", claimed, wantPts)
+		}
+		return claimed[0]
+	}
+	ackFor := func(item storepkg.DispatchOutboxItem, serverMsgID int64) storepkg.DispatchOutboxClientAck {
+		return storepkg.DispatchOutboxClientAck{
+			OutboxID:     item.ID,
+			TargetUserID: item.TargetUserID,
+			Pts:          item.Pts,
+			Attempt:      item.Attempts,
+			AuthKeyID:    [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			SessionID:    9901,
+			ServerMsgID:  serverMsgID,
+			AckedAt:      time.Unix(1700002200, serverMsgID),
+		}
+	}
+
+	pts1 := appendEvent(1700002201)
+	first := claimOne(pts1)
+	firstAck := ackFor(first, 9001)
+	if err := outbox.MarkClientAcked(ctx, firstAck); err != nil {
+		t.Fatalf("first ack: %v", err)
+	}
+	if err := outbox.MarkClientAcked(ctx, firstAck); err != nil {
+		t.Fatalf("duplicate ack should be idempotent: %v", err)
+	}
+
+	pts2 := appendEvent(1700002202)
+	second := claimOne(pts2)
+	if _, err := tx.Exec(ctx, `UPDATE dispatch_outbox SET updated_at = now() - interval '2 hours' WHERE target_user_id = $1 AND id = $2`, owner.ID, second.ID); err != nil {
+		t.Fatalf("age dispatch lease: %v", err)
+	}
+	reclaimed := claimOne(pts2)
+	if reclaimed.ID != second.ID || reclaimed.Attempts != second.Attempts+1 {
+		t.Fatalf("reclaimed = %+v, want same id %d attempts %d", reclaimed, second.ID, second.Attempts+1)
+	}
+	staleAck := ackFor(second, 9002)
+	if err := outbox.MarkClientAcked(ctx, staleAck); !errors.Is(err, storepkg.ErrDispatchLeaseLost) {
+		t.Fatalf("stale ack err = %v, want ErrDispatchLeaseLost", err)
+	}
+	currentAck := ackFor(reclaimed, 9003)
+	if err := outbox.MarkClientAcked(ctx, currentAck); err != nil {
+		t.Fatalf("current ack: %v", err)
 	}
 }
 

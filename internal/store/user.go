@@ -49,6 +49,25 @@ type UserEmojiStatusEventStore interface {
 	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, error)
 }
 
+type UserDeliverySnapshot struct {
+	User            domain.User
+	Usernames       []domain.Username
+	UsernamesLoaded bool
+}
+
+type UserDeliveryPayloadBuilder func(UserDeliverySnapshot) ([]byte, error)
+
+// UserDeliveryStore is the aggregate write boundary for non-PTS profile
+// refreshes. The user row and edge_delivery_outbox row must commit or roll back
+// together; the payload builder receives the updated user snapshot while the
+// transaction is still open.
+type UserDeliveryStore interface {
+	UpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+	UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+}
+
 // UserCache 缓存 viewer 无关的 users 表基础资料。
 // 联系人备注、隐私裁剪、头像选择和 presence 不应写入该缓存。
 type UserCache interface {

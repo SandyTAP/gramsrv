@@ -6,7 +6,7 @@
 
 协议栈基于已发布的
 [`github.com/iamxvbaba/td`](https://github.com/iamxvbaba/td) module
-（`v1.1.0`），使用 canonical Layer 228 schema，并通过 sparse `tlprofile`
+（`v1.2.1`），使用 canonical Layer 228 schema，并通过 sparse `tlprofile`
 提供 exact Layer 225-228 compatibility profiles。
 
 如果你正在搜索 **Telegram server 实现**、**MTProto server 实现**、
@@ -43,7 +43,7 @@ Telegram-compatible server 的用户。
 
 | 状态 | 特性 | 说明 |
 |---|---|---|
-| ✅ | 一个程序直接启动 | 一个 Go 二进制完成 RSA key、数据库迁移、内置数据导入、MTProto 监听、RPC handlers、updates 分发和后台 worker。 |
+| ✅ | 生产运行时拆分 | Edge 持有 MTProto 长连接，Core 执行业务 RPC，Egress 投递 durable updates，FileData 提供媒体字节，独立 SFU 持有实时媒体房间。 |
 | ✅ | 所有 server 功能开源 | 协议接入、业务服务、存储层、兼容 handlers、媒体链路、updates、管理后台和实验模块都在本仓库。 |
 
 ## 功能清单
@@ -67,7 +67,7 @@ Telegram-compatible server 的用户。
 | ✅ | Gifts 与 Stars | 动态 star gift catalog、后台导入、收藏品/唯一礼物升级流程、预付升级跟踪，以及本地 stars ledger 基础。 |
 | ✅ | Stars 购买 Premium | 内置 `@premiumbot`、Layer 228 自购/赠送 invoice、原子 Stars 结算、到期 entitlement、退款，以及 Bot API `giftPremiumSubscription`。详见 [docs/premium-stars.md](docs/premium-stars.md)。 |
 | ✅ | Bots 与 Mini Apps | bot 服务基础、callbacks、inline helpers、webview/mini-app 路径、适配 `python-telegram-bot` 等库的最小 Bot API gateway、持久化 `getUpdates` 投递队列和 demo 工具。 |
-| ✅ | 通话与直播 | 私聊通话信令基础、group call 状态、RTMP live stream、定时视频通话、频道 `join_as` 身份、SFU/TURN building blocks、liveness 与 expiry worker。 |
+| ✅ | 通话与直播 | 私聊通话信令基础、group call 状态、RTMP live stream、定时视频通话、频道 `join_as` 身份、独立 SFU owner、liveness 与 expiry worker。 |
 | ✅ | 管理与运维 | Admin API/UI backend、PostgreSQL migrations、Redis 易失态、retention workers、pprof/debug hooks、load-test helpers。 |
 | ✅ | Desktop、Android、iOS 与 Web 兼容 | Telegram Desktop 是第一目标，Android、iOS 与 Web 兼容路径也由同一套 server 持续覆盖。 |
 
@@ -87,65 +87,55 @@ Telegram-compatible server 的用户。
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-编译并启动唯一的 server 程序：
-
-Windows (PowerShell)：
+编译拆分后的运行入口：
 
 ```powershell
-go build -o bin/gramsrv.exe ./cmd/telesrv
-.\bin\gramsrv.exe
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin/gramsrv-file.exe ./cmd/telesrv-file
+go build -o bin/gramsrv-core.exe ./cmd/telesrv-core
+go build -o bin/gramsrv-egress.exe ./cmd/telesrv-egress
+go build -o bin/gramsrv-sfu.exe ./cmd/telesrv-sfu
+go build -o bin/gramsrv-edge.exe ./cmd/telesrv-edge
 ```
 
-Linux / macOS：
+仓库内的本地 YAML 示例使用前面 Compose 启动的 PostgreSQL 和 Redis。先设置
+这些 YAML 引用的 secret：
 
-```bash
-go build -o bin/gramsrv ./cmd/telesrv
-./bin/gramsrv
+```powershell
+$env:TELESRV_POSTGRES_DSN="postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable"
+$env:TELESRV_CORE_EXEC_TOKEN="dev-coreexec-token"
+$env:TELESRV_FILE_TOKEN="dev-file-token"
+$env:TELESRV_EGRESS_ACK_TOKEN="dev-egress-ack-token"
+$env:TELESRV_GROUPCALL_CONTROL_TOKEN="dev-groupcall-control-token"
+$env:TELESRV_SFU_CONTROL_TOKEN="dev-sfu-control-token"
 ```
 
-第一次启动时，`gramsrv` 会创建 `data/server_rsa.pem`，自动执行数据库 migrations，导入内置语言包，准备可选媒体资源，在 `0.0.0.0:2398` 监听 MTProto，并在同一进程里启动 updates、media、后台调度等 worker。
+在不同终端使用相同环境变量，依次启动 FileData、Core、Egress、SFU 和 Edge：
 
-常用本地环境变量：
+```powershell
+.\bin\gramsrv-file.exe --config configs\examples\file.local.yaml
+.\bin\gramsrv-core.exe --config configs\examples\core.local.yaml
+.\bin\gramsrv-egress.exe --config configs\examples\egress.local.yaml
+.\bin\gramsrv-sfu.exe --config configs\examples\sfu.local.yaml
+.\bin\gramsrv-edge.exe --config configs\examples\edge.local.yaml
+```
 
-完整说明见[中文配置参数手册](docs/configuration.zh-CN.md)和
-[英文配置参数手册](docs/configuration.en.md)。`.env.example` 只作为可直接复制的开发模板，
-不再承担完整参数字典的职责。
+Core 第一次启动时会创建 `data/server_rsa.pem`、执行数据库 migrations，并导入
+内置语言包。FileData 持有上传分片和 blob range read，Edge 持有 MTProto 监听
+（本地示例为 `0.0.0.0:2398`），Egress 持有 durable PTS 与 non-PTS 投递队列，
+SFU 持有群通话媒体房间。v2 不提供单进程业务 fallback。
 
-| 变量 | 默认值 | 说明 |
-|---|---:|---|
-| `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto 监听地址 |
-| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | 媒体与通话使用的客户端可达回退 IP |
-| `TELESRV_DC` | `2` | 自建 DC id |
-| `TELESRV_DEV_AUTH_CODE` | `12345` | 本地开发固定登录验证码 |
-| `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | `5` | 同一验证码 hash 允许的错误次数，达到后删除并要求重发 |
-| `TELESRV_LOGIN_EMAIL_ENABLE` | `false` | 已绑定登录邮箱的账号通过 SMTP 接收登录验证码 |
-| `TELESRV_LOGIN_EMAIL_REQUIRE_SETUP` | `false` | 登录/注册时强制先设置登录邮箱 |
-| `TELESRV_SMTP_HOST` | 空 | 开启登录邮箱验证时使用的 SMTP host |
-| `TELESRV_PUBLIC_BASE_URL` | `https://telesrv.net` | username、sticker、emoji、chatlist 公开链接使用的外部 canonical base URL |
-| `TELESRV_PUBLIC_APP_SCHEME` | `telesrv` | 公开落地页唤起客户端使用的自定义 URL scheme |
-| `TELESRV_PUBLIC_WEB_BASE_URL` | `https://web.telesrv.net` | 公开落地页展示的 Web 客户端根地址 |
-| `TELESRV_PUBLIC_APP_NAME` | `telesrv` | 公开落地页展示的产品名 |
-| `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL 连接串 |
-| `TELESRV_REDIS_ADDR` | `127.0.0.1:6399` | Redis 地址 |
-| `TELESRV_LANGPACK_SEED_DIR` | `data/langpack` | 内置语言包种子目录 |
-| `TELESRV_BLOB_DIR` | `data/blobs` | 本地媒体 blob 目录 |
-| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | 可选 sticker/reaction 种子目录 |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | 空 | 可选的公开链接落地页监听地址，例如 `127.0.0.1:2401` |
-| `TELESRV_BOT_API_ADDR` | 空 | 可选 HTTP Bot API gateway 监听地址，例如 `127.0.0.1:8081` |
-| `TELESRV_BOT_API_UPDATE_RETENTION` | `24h` | 未确认 Bot API `getUpdates` 队列记录的保留窗口 |
-| `TELESRV_AI_ENABLED` | `true` | 启用 AI compose 入口 |
-| `TELESRV_AI_PROVIDERS` | `local` | AI provider 调用链，例如 `local` 或 `kimi,local` |
-| `TELESRV_AI_TIMEOUT` | `15s` | 单次 AI provider 调用超时 |
-| `TELESRV_AI_RATE_LIMIT` | `20` | 每个账号的 AI compose 请求额度 |
-| `TELESRV_AI_RATE_WINDOW` | `1m` | AI compose 限流窗口 |
-| `TELESRV_AI_LOG_CONTENT` | `false` | 日志是否允许记录 prompt/生成文本 |
-| `TELESRV_TRANSLATION_ENABLED` | `true` | 启用 Telegram 消息翻译 RPC |
-| `TELESRV_TRANSLATION_PROVIDERS` | 空 | 可选指定用于翻译的远程 AI provider 子集 |
-| `TELESRV_TRANSLATION_RATE_LIMIT` | `60` | 每个账号的翻译文本条数额度 |
-| `TELESRV_BUSINESS_AI_PROVIDER` | `echo` | Business automation 回复 provider |
+Windows 下也可以使用本地编排脚本构建并启动全部五个角色：
 
-如果 sticker seed 目录不存在，启动时会自动跳过。
-可选的 OpenAI-compatible、Kimi/Moonshot、Gemini、Anthropic provider 变量见 `.env.example`。
+```powershell
+.\scripts\restart-local-microservices.ps1 -AdvertiseIP 127.0.0.1
+```
+
+生产入口为每个进程使用一份 YAML，通过 `--config <path>` 或
+`TELESRV_CONFIG=<path>` 指定。环境变量只用于展开 YAML 中类似
+`${TELESRV_POSTGRES_DSN}` 的字符串，并不是所有字段的通用覆盖机制。完整说明见
+[中文配置参数手册](docs/configuration.zh-CN.md)和
+[英文配置参数手册](docs/configuration.en.md)。
 
 ## 最小公网部署端口清单
 
@@ -161,7 +151,7 @@ go build -o bin/gramsrv ./cmd/telesrv
 
 | 端口 | 协议 | 用途 | 说明 |
 |---|---|---|---|
-| 2399 | TCP | Admin REST API | 建议限制可访问 IP 或放在 VPN 后 |
+| 2599 | TCP | Admin REST API | 建议限制可访问 IP 或放在 VPN 后 |
 | 2600 | TCP | Admin Web UI | 生产环境建议前面加 Nginx/反向代理 + HTTPS |
 
 ### 可选功能端口
@@ -179,7 +169,12 @@ go build -o bin/gramsrv ./cmd/telesrv
 
 | 端口 | 默认监听 | 用途 |
 |---|---|---|
-| 6060 | `127.0.0.1:6060` | pprof 调试端点 |
+| 2420 | `127.0.0.1:2420` | Core group-call control callback |
+| 2440 | `127.0.0.1:2440` | CoreExec gRPC |
+| 2450 | `127.0.0.1:2450` | SFU control gRPC |
+| 2510 | `127.0.0.1:2510` | Egress ACK gRPC |
+| 2520 | `127.0.0.1:2520` | FileData gRPC |
+| 6060-6064 | loopback | 各角色 pprof/debug 端点 |
 | 5432 | `127.0.0.1:5432` | PostgreSQL |
 | 6399 | `127.0.0.1:6399` | Redis |
 
@@ -259,8 +254,13 @@ Start-Process $tdesktop -ArgumentList @("-workdir", "$PWD\.tdata-bob")
 ## 仓库结构
 
 ```text
-cmd/telesrv/              server 启动入口
+cmd/telesrv-edge/         MTProto 长连接 Edge
+cmd/telesrv-core/         业务 RPC 与 CoreExec gRPC
+cmd/telesrv-egress/       durable update 投递
+cmd/telesrv-file/         文件数据面服务
+cmd/telesrv-sfu/          独立实时媒体 owner
 cmd/telesrv-admin/        管理后台 backend 与 web UI
+configs/examples/         本地按角色拆分的 YAML 示例
 deploy/                   docker-compose、migrations、部署辅助
 data/                     内置语言包与可选种子数据
 internal/mtprotoedge/     MTProto transport、auth key、session、ack/resend
@@ -269,7 +269,7 @@ internal/app/             domain services
 internal/domain/          不依赖协议生成类型的 domain models
 internal/store/           memory/postgres/redis 存储后端
 internal/seed/            内置 seed catalog 加载器
-internal/sfu/             SFU 实验模块
+internal/sfu/             独立 SFU control 与 ownership
 internal/turnsrv/         TURN/STUN building blocks
 ```
 
@@ -287,7 +287,7 @@ internal/turnsrv/         TURN/STUN building blocks
 - 围绕已实现路径的小而准的 bug fix。
 - 在线/离线 updates、多端 session、read state、媒体、频道行为的测试。
 - fan-out、分页、存储查询、媒体上传/下载、连接层等热点路径的性能优化。
-- 让“一个程序直接启动”的本地体验更顺滑的改进。
+- 让拆分后的本地运行拓扑更容易启动和排查的改进。
 
 如果改动会影响客户端可见行为，请说明客户端版本/commit、验证过的 RPC 路径，以及 server 日志是否没有新增 `NOT_IMPLEMENTED`、`Unhandled RPC`、`bad_msg`、panic 或 internal error。
 

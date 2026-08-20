@@ -18,6 +18,8 @@ import (
 	"github.com/iamxvbaba/td/crypto"
 	"github.com/iamxvbaba/td/mt"
 	"github.com/iamxvbaba/td/proto"
+
+	"telesrv/internal/edgecontrol"
 )
 
 var (
@@ -214,6 +216,7 @@ type encodedOutboundMessage struct {
 	layer             *outboundLayerBinding
 	compressed        bool
 	uncompressedBytes int
+	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
 	// replayMsgID/replaySeqNo identify an existing logical-session frame. They
 	// are populated only by the receipt ledger's outbox lookup, never by a newly
 	// encoded result. A replay writes that exact frame instead of allocating a
@@ -739,6 +742,7 @@ func cloneRPCResultForRequest(encoded *encodedOutboundMessage, reqMsgID int64, s
 		priority: encoded.priority, delivery: delivery, compressed: encoded.compressed,
 		layer: encoded.layer, layerInvariant: encoded.layerInvariant,
 		uncompressedBytes: encoded.uncompressedBytes,
+		outboxDeliveryRef: encoded.outboxDeliveryRef,
 		replayMsgID:       replayMsgID, replaySeqNo: replaySeqNo,
 	}, nil
 }
@@ -793,6 +797,7 @@ type outboundFrame struct {
 	delivery          *rpcResultDelivery
 	compressed        bool
 	uncompressedBytes int
+	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
 	// layer is retained only for proactive session-bound frames so a later
 	// msg_resend_req cannot replay bytes from an obsolete profile epoch.
 	layer          *outboundLayerBinding
@@ -1863,6 +1868,9 @@ func (c *Conn) handleOutboundOp(state *outboundState, op outboundOp) {
 		if ack.reqMsgID != 0 && c.rpcResultAcked != nil {
 			c.rpcResultAcked(c, ack.reqMsgID)
 		}
+		if !ack.outboxDeliveryRef.Empty() && c.outboxClientAcked != nil {
+			c.outboxClientAcked(c, ack.outboxDeliveryRef, ack.msgID)
+		}
 	}
 	op.finish(result)
 }
@@ -2250,6 +2258,7 @@ func (c *Conn) buildFrameWithState(
 		delivery:          encoded.delivery,
 		compressed:        encoded.compressed,
 		uncompressedBytes: encoded.uncompressedBytes,
+		outboxDeliveryRef: encoded.outboxDeliveryRef,
 	}, nil
 }
 
@@ -2672,9 +2681,11 @@ func (s *outboundState) addReserved(frame *outboundFrame) int {
 }
 
 type outboundAcknowledgement struct {
-	reqMsgID int64
-	bytes    int
-	sentAt   time.Time
+	msgID             int64
+	reqMsgID          int64
+	bytes             int
+	sentAt            time.Time
+	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
 }
 
 func (s *outboundState) ack(ids []int64) []int64 {
@@ -2696,9 +2707,11 @@ func (s *outboundState) ackWithDetails(ids []int64) []outboundAcknowledgement {
 			continue
 		}
 		detail := outboundAcknowledgement{
-			reqMsgID: frame.reqMsgID,
-			bytes:    len(frame.body),
-			sentAt:   frame.sentAt,
+			msgID:             id,
+			reqMsgID:          frame.reqMsgID,
+			bytes:             len(frame.body),
+			sentAt:            frame.sentAt,
+			outboxDeliveryRef: frame.outboxDeliveryRef,
 		}
 		if !s.removePending(id) {
 			continue

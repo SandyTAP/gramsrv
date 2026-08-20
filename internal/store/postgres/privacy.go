@@ -13,7 +13,10 @@ import (
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-var _ store.PrivacyStore = (*PrivacyStore)(nil)
+var (
+	_ store.PrivacyStore         = (*PrivacyStore)(nil)
+	_ store.PrivacyDeliveryStore = (*PrivacyStore)(nil)
+)
 
 // PrivacyStore persists account privacy rules in PostgreSQL.
 type PrivacyStore struct {
@@ -47,6 +50,30 @@ WHERE owner_user_id = $1
 
 func (s *PrivacyStore) SetPrivacyRules(ctx context.Context, rules domain.PrivacyRules) error {
 	return setPrivacyRules(ctx, s.db, rules)
+}
+
+func (s *PrivacyStore) SetPrivacyRulesWithDelivery(ctx context.Context, rules domain.PrivacyRules, build store.PrivacyDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
+	if build == nil {
+		return store.ErrPrivacyDeliveryStoreMissing
+	}
+	return withTx(ctx, s.db, "set privacy rules with delivery", func(tx pgx.Tx) error {
+		if err := setPrivacyRules(ctx, tx, rules); err != nil {
+			return err
+		}
+		payload, err := build(rules)
+		if err != nil {
+			return err
+		}
+		if _, err := NewDeliveryOutboxStore(tx).Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID:     rules.OwnerUserID,
+			ExcludeAuthKeyID: excludeAuthKeyID,
+			ExcludeSessionID: excludeSessionID,
+			Payload:          payload,
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func setPrivacyRules(ctx context.Context, db sqlcgen.DBTX, rules domain.PrivacyRules) error {

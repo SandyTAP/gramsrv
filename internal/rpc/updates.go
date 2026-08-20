@@ -141,10 +141,23 @@ func (r *Router) onUpdatesGetDifference(ctx context.Context, req *tg.UpdatesGetD
 		r.stageUpdatesBaselineAfterDelivery(ctx, userID, &emptyCursor, domain.UpdateStateCommitDeliveredOnly, stateEventIDs, true)
 		return &tg.UpdatesDifferenceEmpty{Date: st.State.Date, Seq: st.State.Seq}, nil
 	}
-	st.Events = r.enrichUpdateEvents(ctx, userID, st.Events)
+	peerCache := newViewerPeerCache(r)
+	st.Events, err = r.enrichUpdateEventsWithPeerCacheStrict(ctx, userID, st.Events, peerCache)
+	if err != nil {
+		r.log.Error("project durable account difference users",
+			zap.Int64("viewer_user_id", userID),
+			zap.Error(err))
+		return nil, internalErr()
+	}
 	diff := r.tgUpdatesDifference(ctx, userID, st)
 	diff = injectEncryptedMessages(diff, encMsgs, newQts)
-	diff = r.injectEncryptedOtherUpdates(ctx, userID, diff, stateUpdates, statePeerUserIDs)
+	diff, err = r.injectEncryptedOtherUpdatesStrict(ctx, userID, diff, stateUpdates, statePeerUserIDs, peerCache)
+	if err != nil {
+		r.log.Error("project durable encrypted difference users",
+			zap.Int64("viewer_user_id", userID),
+			zap.Error(err))
+		return nil, internalErr()
+	}
 	returnedCursor := st.State
 	returnedCursor.Qts = newQts
 	r.stageUpdatesBaselineAfterDelivery(ctx, userID, &returnedCursor, domain.UpdateStateCommitDeliveredOnly, stateEventIDs, true)
@@ -213,7 +226,7 @@ func (r *Router) accountChannelDifferenceNudges(ctx context.Context, userID int6
 // maybeMarkSessionReceivesUpdates 把已登录连接发出的裸 RPC（未包 invokeWithoutUpdates）
 // 视为该 session 的 updates 接收声明，对齐官方语义：客户端只在主连接上发裸请求，
 // media/temp 连接一律带 invokeWithoutUpdates 包装。这里只登记交付计划；membership
-// sync、SetReceivesUpdates 与 pending flush 必须等成功 rpc_result 物理交付后才执行。
+// sync、共享投影发布、session 激活与 pending flush 必须等成功 rpc_result 物理交付后才执行。
 // 已在接收的 session 直接短路，避免每条 RPC 重复同步 channel membership。
 func (r *Router) maybeMarkSessionReceivesUpdates(ctx context.Context) {
 	if invokeWithoutUpdatesFrom(ctx) {
@@ -223,10 +236,16 @@ func (r *Router) maybeMarkSessionReceivesUpdates(ctx context.Context) {
 	if !ok {
 		return
 	}
-	if provider, ok := r.deps.Sessions.(SessionUpdatesStateProvider); ok {
-		rawAuthKeyID, okRaw := RawAuthKeyIDFrom(ctx)
-		sessionID, okSess := SessionIDFrom(ctx)
-		if okRaw && okSess && provider.ReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID) {
+	rawAuthKeyID, okRaw := RawAuthKeyIDFrom(ctx)
+	sessionID, okSess := SessionIDFrom(ctx)
+	if okRaw && okSess {
+		if hint, hinted := layerRPCIdentityHintFromContext(ctx, rawAuthKeyID, sessionID); hinted {
+			if hint.SessionUpdatesReady {
+				return
+			}
+		} else if provider, ok := r.deps.Sessions.(SessionUpdatesStateProvider); ok && provider.ReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID) {
+			// Local/fake routers have no Edge-supplied hint and keep the direct
+			// state check. Split Core must never consult NoLocalController here.
 			return
 		}
 	}
@@ -234,15 +253,18 @@ func (r *Router) maybeMarkSessionReceivesUpdates(ctx context.Context) {
 }
 
 func (r *Router) markSessionReceivesUpdatesNow(ctx context.Context, userID int64) {
-	if r.deps.Sessions == nil {
-		return
-	}
-	r.syncSessionChannelMemberships(ctx, userID)
 	sessionID, ok := SessionIDFrom(ctx)
 	if !ok {
 		return
 	}
-	r.deps.Sessions.SetReceivesUpdatesForAuthKey(rawAuthKeyIDForOrigin(ctx), sessionID, true)
+	r.markSessionReceivesUpdatesNowExplicit(ctx, userID, rawAuthKeyIDForOrigin(ctx), sessionID)
+}
+
+func (r *Router) markSessionReceivesUpdatesNowExplicit(ctx context.Context, userID int64, rawAuthKeyID [8]byte, sessionID int64) {
+	if r.deps.Sessions == nil {
+		return
+	}
+	r.syncSessionChannelMembershipsForSession(ctx, userID, rawAuthKeyID, sessionID)
 }
 
 func ptr[T any](v T) *T { return &v }

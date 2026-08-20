@@ -87,6 +87,19 @@ func (c *CachedPrivacyStore) SetPrivacyRules(ctx context.Context, rules domain.P
 	return nil
 }
 
+func (c *CachedPrivacyStore) SetPrivacyRulesWithDelivery(ctx context.Context, rules domain.PrivacyRules, build store.PrivacyDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
+	delivery, ok := c.inner.(store.PrivacyDeliveryStore)
+	if !ok {
+		return store.ErrPrivacyDeliveryStoreMissing
+	}
+	if err := delivery.SetPrivacyRulesWithDelivery(ctx, rules, build, excludeAuthKeyID, excludeSessionID); err != nil {
+		return err
+	}
+	c.InvalidateOwners(rules.OwnerUserID)
+	_ = c.WarmOwners(ctx, rules.OwnerUserID)
+	return nil
+}
+
 // WarmOwners 在低频写/变更通知路径一次性装入 owner 的完整规则集。调用方必须先
 // InvalidateOwners；epoch 保证预热期间若又发生失效，不会把旧快照写回。
 func (c *CachedPrivacyStore) WarmOwners(ctx context.Context, ownerUserIDs ...int64) error {

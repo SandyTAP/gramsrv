@@ -67,6 +67,6 @@ func (r *Router) onFoldersEditPeerFolders(ctx context.Context, folderPeers []tg.
 	if out == nil {
 		out = &tg.Updates{Date: event.Date, Seq: 0}
 	}
-	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, out)
+	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }

@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,10 @@ func TestInlineRegistrySharedResolveUnblocksRemoteWaitAndSend(t *testing.T) {
 
 	waitingRegistry := newInlineRegistry(botInlineQueryTTL, shared)
 	answeringRegistry := newInlineRegistry(botInlineQueryTTL, shared)
-	queryID, pending := waitingRegistry.registerWithCacheKeyContext(ctx, now, 1001, 2001, peer, cacheKey)
+	queryID, pending, err := waitingRegistry.registerWithCacheKeyContext(ctx, now, 1001, 2001, peer, cacheKey)
+	if err != nil {
+		t.Fatalf("register shared pending: %v", err)
+	}
 	router := &Router{clock: clock.System, inlines: waitingRegistry}
 
 	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
@@ -39,10 +43,13 @@ func TestInlineRegistrySharedResolveUnblocksRemoteWaitAndSend(t *testing.T) {
 		}{results: results, err: err}
 	}()
 
-	ok := answeringRegistry.resolveContext(ctx, now, 1001, queryID, domain.BotInlineResults{
+	ok, err := answeringRegistry.resolveContext(ctx, now, 1001, queryID, domain.BotInlineResults{
 		CacheTime: 60,
 		Results:   []domain.BotInlineResult{{ID: "article-1", Type: "article", Message: "hello"}},
 	})
+	if err != nil {
+		t.Fatalf("remote resolve: %v", err)
+	}
 	if !ok {
 		t.Fatal("remote resolve = false, want true")
 	}
@@ -59,7 +66,10 @@ func TestInlineRegistrySharedResolveUnblocksRemoteWaitAndSend(t *testing.T) {
 		t.Fatal("remote wait did not resolve")
 	}
 
-	results, item, ok := answeringRegistry.resultForSendContext(ctx, now, 2001, queryID, "article-1")
+	results, item, ok, err := answeringRegistry.resultForSendContext(ctx, now, 2001, queryID, "article-1")
+	if err != nil {
+		t.Fatalf("remote resultForSend: %v", err)
+	}
 	if !ok {
 		t.Fatal("remote resultForSend = false, want true")
 	}
@@ -76,11 +86,18 @@ func TestInlineRegistrySharedCacheHitCreatesFreshSendableQuery(t *testing.T) {
 	cacheKey := inlineCacheKey{botUserID: 1002, userID: 2002, peer: peer, query: "cached", offset: "p1"}
 
 	ownerRegistry := newInlineRegistry(botInlineQueryTTL, shared)
-	queryID, _ := ownerRegistry.registerWithCacheKeyContext(ctx, now, 1002, 2002, peer, cacheKey)
-	if !ownerRegistry.resolveContext(ctx, now, 1002, queryID, domain.BotInlineResults{
+	queryID, _, err := ownerRegistry.registerWithCacheKeyContext(ctx, now, 1002, 2002, peer, cacheKey)
+	if err != nil {
+		t.Fatalf("register cached pending: %v", err)
+	}
+	resolved, err := ownerRegistry.resolveContext(ctx, now, 1002, queryID, domain.BotInlineResults{
 		CacheTime: 60,
 		Results:   []domain.BotInlineResult{{ID: "cached-1", Type: "article", Message: "cached hello"}},
-	}) {
+	})
+	if err != nil {
+		t.Fatalf("resolve cached result: %v", err)
+	}
+	if !resolved {
 		t.Fatal("resolve cached result = false, want true")
 	}
 
@@ -92,11 +109,14 @@ func TestInlineRegistrySharedCacheHitCreatesFreshSendableQuery(t *testing.T) {
 	if cached.QueryID != 0 || cached.CacheTime <= 0 || cached.CacheTime > 60 {
 		t.Fatalf("shared cached metadata = %+v", cached)
 	}
-	fresh := cacheRegistry.registerCachedContext(ctx, now.Add(time.Second), 1002, 2002, peer, cached)
+	fresh, err := cacheRegistry.registerCachedContext(ctx, now.Add(time.Second), 1002, 2002, peer, cached)
+	if err != nil {
+		t.Fatalf("register fresh cached result: %v", err)
+	}
 	if fresh.QueryID == 0 || fresh.QueryID == queryID {
 		t.Fatalf("fresh query_id = %d, old %d", fresh.QueryID, queryID)
 	}
-	_, item, ok := ownerRegistry.resultForSendContext(ctx, now.Add(time.Second), 2002, fresh.QueryID, "cached-1")
+	_, item, ok := mustInlineResultForSend(t, ownerRegistry, ctx, now.Add(time.Second), 2002, fresh.QueryID, "cached-1")
 	if !ok || item.Message != "cached hello" {
 		t.Fatalf("fresh shared resultForSend ok=%v item=%+v", ok, item)
 	}
@@ -115,8 +135,11 @@ func TestInlineRegistrySharedWebDocumentAndBytes(t *testing.T) {
 	}
 
 	writerRegistry := newInlineRegistry(botInlineQueryTTL, shared)
-	queryID, _ := writerRegistry.registerWithCacheKeyContext(ctx, now, 1003, 2003, peer, inlineCacheKey{botUserID: 1003, userID: 2003, peer: peer, query: "web"})
-	if !writerRegistry.resolveContext(ctx, now, 1003, queryID, domain.BotInlineResults{
+	queryID, _, err := writerRegistry.registerWithCacheKeyContext(ctx, now, 1003, 2003, peer, inlineCacheKey{botUserID: 1003, userID: 2003, peer: peer, query: "web"})
+	if err != nil {
+		t.Fatalf("register web pending: %v", err)
+	}
+	resolved, err := writerRegistry.resolveContext(ctx, now, 1003, queryID, domain.BotInlineResults{
 		CacheTime: 60,
 		Results: []domain.BotInlineResult{{
 			ID:        "web-1",
@@ -124,28 +147,38 @@ func TestInlineRegistrySharedWebDocumentAndBytes(t *testing.T) {
 			Content:   &document,
 			MediaAuto: true,
 		}},
-	}) {
+	})
+	if err != nil {
+		t.Fatalf("resolve web document result: %v", err)
+	}
+	if !resolved {
 		t.Fatal("resolve web document result = false, want true")
 	}
 
 	readerRegistry := newInlineRegistry(botInlineQueryTTL, shared)
-	gotDoc, data, mime, ok := readerRegistry.webDocumentForDownloadContext(ctx, now.Add(time.Second), document.URL, document.AccessHash)
+	gotDoc, data, mime, ok, err := readerRegistry.webDocumentForDownloadContext(ctx, now.Add(time.Second), document.URL, document.AccessHash)
+	if err != nil {
+		t.Fatalf("shared web document lookup: %v", err)
+	}
 	if !ok {
 		t.Fatal("shared web document miss, want hit")
 	}
 	if gotDoc.URL != document.URL || gotDoc.AccessHash != document.AccessHash || len(data) != 0 || mime != "" {
 		t.Fatalf("shared web document = %+v bytes=%q mime=%q", gotDoc, data, mime)
 	}
-	if ok := readerRegistry.cacheWebDocumentBytesContext(ctx, now.Add(time.Second), document.URL, document.AccessHash, []byte("abcdef"), "image/png"); !ok {
+	if ok, err := readerRegistry.cacheWebDocumentBytesContext(ctx, now.Add(time.Second), document.URL, document.AccessHash, []byte("abcdef"), "image/png"); err != nil || !ok {
 		t.Fatal("shared web document byte cache = false, want true")
 	}
 
 	thirdRegistry := newInlineRegistry(botInlineQueryTTL, shared)
-	_, data, mime, ok = thirdRegistry.webDocumentForDownloadContext(ctx, now.Add(2*time.Second), document.URL, document.AccessHash)
+	_, data, mime, ok, err = thirdRegistry.webDocumentForDownloadContext(ctx, now.Add(2*time.Second), document.URL, document.AccessHash)
+	if err != nil {
+		t.Fatalf("shared web document cached bytes lookup: %v", err)
+	}
 	if !ok || string(data) != "abcdef" || mime != "image/png" {
 		t.Fatalf("shared web document cached bytes ok=%v bytes=%q mime=%q", ok, data, mime)
 	}
-	if _, _, _, ok := thirdRegistry.webDocumentForDownloadContext(ctx, now.Add(2*time.Second), document.URL, document.AccessHash+1); ok {
+	if _, _, _, ok, err := thirdRegistry.webDocumentForDownloadContext(ctx, now.Add(2*time.Second), document.URL, document.AccessHash+1); err != nil || ok {
 		t.Fatal("shared web document hash mismatch hit, want miss")
 	}
 }
@@ -158,20 +191,57 @@ func TestInlineRegistrySharedPreparedInlineMessage(t *testing.T) {
 	reader := newInlineRegistry(botInlineQueryTTL, shared)
 	result := domain.BotInlineResult{ID: "prepared-shared", Type: "article", Message: "shared prepared"}
 
-	id, expireDate := writer.savePreparedInlineContext(ctx, now, 1001, 2001, result, []string{store.InlineQueryPeerTypePM})
+	id, expireDate, err := writer.savePreparedInlineContext(ctx, now, 1001, 2001, result, []string{store.InlineQueryPeerTypePM})
+	if err != nil {
+		t.Fatalf("prepared save: %v", err)
+	}
 	if id == "" || expireDate <= int(now.Unix()) {
 		t.Fatalf("prepared save = id %q expire %d", id, expireDate)
 	}
-	got, ok := reader.preparedInlineContext(ctx, now.Add(time.Second), 2001, 1001, id)
+	got, ok, err := reader.preparedInlineContext(ctx, now.Add(time.Second), 2001, 1001, id)
+	if err != nil {
+		t.Fatalf("shared prepared inline lookup: %v", err)
+	}
 	if !ok {
 		t.Fatal("shared prepared inline not found")
 	}
 	if got.QueryID == 0 || got.UserID != 2001 || got.BotUserID != 1001 || len(got.PeerTypes) != 1 || got.PeerTypes[0] != store.InlineQueryPeerTypePM {
 		t.Fatalf("shared prepared results = %+v", got)
 	}
-	_, item, ok := reader.resultForSendContext(ctx, now.Add(time.Second), 2001, got.QueryID, "prepared-shared")
+	_, item, ok := mustInlineResultForSend(t, reader, ctx, now.Add(time.Second), 2001, got.QueryID, "prepared-shared")
 	if !ok || item.Message != "shared prepared" {
 		t.Fatalf("shared prepared send lookup ok=%v item=%+v", ok, item)
+	}
+}
+
+func TestInlineRegistryRequiresSharedStore(t *testing.T) {
+	registry := newInlineRegistry(botInlineQueryTTL)
+	if _, _, err := registry.registerWithCacheKeyContext(context.Background(), time.Now(), 1001, 2001, domain.Peer{}, inlineCacheKey{}); !errors.Is(err, errInlineRegistryStoreRequired) {
+		t.Fatalf("register without shared store err = %v, want required", err)
+	}
+	if _, _, err := registry.savePreparedInlineContext(context.Background(), time.Now(), 1001, 2001, domain.BotInlineResult{ID: "x"}, nil); !errors.Is(err, errInlineRegistryStoreRequired) {
+		t.Fatalf("save prepared without shared store err = %v, want required", err)
+	}
+}
+
+func mustInlineResultForSend(t *testing.T, registry *inlineRegistry, ctx context.Context, now time.Time, userID, queryID int64, id string) (domain.BotInlineResults, domain.BotInlineResult, bool) {
+	t.Helper()
+	results, item, ok, err := registry.resultForSendContext(ctx, now, userID, queryID, id)
+	if err != nil {
+		t.Fatalf("resultForSend: %v", err)
+	}
+	return results, item, ok
+}
+
+func TestWebViewRegistryRequiresSharedStore(t *testing.T) {
+	registry := newWebViewRegistry(webViewSessionTTL)
+	if _, err := registry.registerContext(context.Background(), time.Now(), store.WebViewSession{
+		BotUserID: 1001,
+		UserID:    2001,
+		Peer:      domain.Peer{Type: domain.PeerTypeUser, ID: 3001},
+		Source:    "webview",
+	}); err == nil || !strings.Contains(err.Error(), "shared store is required") {
+		t.Fatalf("register webview without shared store err = %v, want required", err)
 	}
 }
 
@@ -184,6 +254,7 @@ type testInlineRegistryStore struct {
 	web               map[store.InlineWebDocumentKey]testInlineValue[store.InlineWebDocumentEntry]
 	webview           map[int64]testInlineValue[store.WebViewSession]
 	webviewByBotQuery map[string]int64
+	waiters           map[int64][]chan struct{}
 }
 
 type testInlineValue[T any] struct {
@@ -200,6 +271,7 @@ func newTestInlineRegistryStore() *testInlineRegistryStore {
 		web:               make(map[store.InlineWebDocumentKey]testInlineValue[store.InlineWebDocumentEntry]),
 		webview:           make(map[int64]testInlineValue[store.WebViewSession]),
 		webviewByBotQuery: make(map[string]int64),
+		waiters:           make(map[int64][]chan struct{}),
 	}
 }
 
@@ -215,8 +287,14 @@ func testInlineExpired(expiresAt time.Time) bool {
 }
 
 func (s *testInlineRegistryStore) PutInlinePending(_ context.Context, pending store.InlinePending, ttl time.Duration) error {
+	if pending.QueryID == 0 || pending.BotUserID <= 0 || pending.UserID <= 0 || ttl <= 0 {
+		return errors.New("invalid inline pending")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing, ok := s.pending[pending.QueryID]; ok && !testInlineExpired(existing.expiresAt) {
+		return errors.New("inline pending query id already exists")
+	}
 	s.pending[pending.QueryID] = testInlineValue[store.InlinePending]{value: pending, expiresAt: testInlineExpires(ttl)}
 	return nil
 }
@@ -243,6 +321,7 @@ func (s *testInlineRegistryStore) PutInlineResult(_ context.Context, results dom
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.results[results.QueryID] = testInlineValue[domain.BotInlineResults]{value: cloneInlineResults(results), expiresAt: testInlineExpires(ttl)}
+	s.wakeLocked(results.QueryID)
 	return nil
 }
 
@@ -257,9 +336,40 @@ func (s *testInlineRegistryStore) GetInlineResult(_ context.Context, queryID int
 	return cloneInlineResults(v.value), true, nil
 }
 
+func (s *testInlineRegistryStore) WaitInlineResult(ctx context.Context, userID, queryID int64) (domain.BotInlineResults, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		s.mu.Lock()
+		v, ok := s.results[queryID]
+		if !ok || testInlineExpired(v.expiresAt) {
+			delete(s.results, queryID)
+		} else if v.value.UserID != userID {
+			s.mu.Unlock()
+			return domain.BotInlineResults{}, false, nil
+		} else {
+			results := cloneInlineResults(v.value)
+			s.mu.Unlock()
+			return results, true, nil
+		}
+		ch := make(chan struct{})
+		s.waiters[queryID] = append(s.waiters[queryID], ch)
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			s.removeWaiter(queryID, ch)
+			return domain.BotInlineResults{}, false, nil
+		case <-ch:
+		}
+	}
+}
+
 func (s *testInlineRegistryStore) DeleteInlineResult(_ context.Context, queryID int64) error {
 	s.mu.Lock()
 	delete(s.results, queryID)
+	s.wakeLocked(queryID)
 	s.mu.Unlock()
 	return nil
 }
@@ -352,6 +462,23 @@ func (s *testInlineRegistryStore) GetPreparedInlineMessage(_ context.Context, id
 	return msg, true, nil
 }
 
+func (s *testInlineRegistryStore) ReserveWebViewSession(_ context.Context, session store.WebViewSession, ttl time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.webview[session.QueryID]; ok && !testInlineExpired(existing.expiresAt) {
+		return false, nil
+	}
+	if queryID, ok := s.webviewByBotQuery[session.BotQueryID]; ok {
+		if existing, found := s.webview[queryID]; found && !testInlineExpired(existing.expiresAt) {
+			return false, nil
+		}
+	}
+	expiresAt := testInlineExpires(ttl)
+	s.webview[session.QueryID] = testInlineValue[store.WebViewSession]{value: cloneWebViewSession(session), expiresAt: expiresAt}
+	s.webviewByBotQuery[session.BotQueryID] = session.QueryID
+	return true, nil
+}
+
 func (s *testInlineRegistryStore) PutWebViewSession(_ context.Context, session store.WebViewSession, ttl time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -393,4 +520,28 @@ func (s *testInlineRegistryStore) DeleteWebViewSession(_ context.Context, queryI
 	delete(s.webviewByBotQuery, botQueryID)
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *testInlineRegistryStore) wakeLocked(queryID int64) {
+	for _, ch := range s.waiters[queryID] {
+		close(ch)
+	}
+	delete(s.waiters, queryID)
+}
+
+func (s *testInlineRegistryStore) removeWaiter(queryID int64, ch chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	waiters := s.waiters[queryID]
+	for i, waiter := range waiters {
+		if waiter == ch {
+			waiters = append(waiters[:i], waiters[i+1:]...)
+			break
+		}
+	}
+	if len(waiters) == 0 {
+		delete(s.waiters, queryID)
+		return
+	}
+	s.waiters[queryID] = waiters
 }

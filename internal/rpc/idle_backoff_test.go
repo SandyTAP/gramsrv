@@ -58,6 +58,34 @@ func TestIdleBackoffLoopDrainsActiveWorkImmediately(t *testing.T) {
 	}
 }
 
+func TestIdleBackoffLoopWakesImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	calls := make(chan time.Time, 2)
+	go runIdleBackoffLoopWithWake(ctx, time.Hour, time.Hour, wake, func(context.Context) bool {
+		calls <- time.Now()
+		return false
+	})
+
+	select {
+	case <-calls:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("initial dispatch did not run")
+	}
+
+	started := time.Now()
+	wake <- struct{}{}
+	select {
+	case <-calls:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("dispatch did not wake before idle interval")
+	}
+	if elapsed := time.Since(started); elapsed >= 300*time.Millisecond {
+		t.Fatalf("wake dispatch elapsed = %v, want no idle interval wait", elapsed)
+	}
+}
+
 func TestIdleBackoffSanitizesMaxBelowBase(t *testing.T) {
 	backoff := newIdleBackoff(2*time.Second, time.Second)
 	if got := backoff.IdleDelay(); got != 2*time.Second {

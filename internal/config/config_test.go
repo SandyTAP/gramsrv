@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,16 +8,18 @@ import (
 )
 
 func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_ADVERTISE_IP", "")
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.AdvertiseIP != "127.0.0.1" {
 		t.Fatalf("AdvertiseIP = %q, want loopback default", cfg.AdvertiseIP)
+	}
+	if cfg.AdvertisePort != 2398 {
+		t.Fatalf("AdvertisePort = %d, want listen port 2398", cfg.AdvertisePort)
 	}
 	if cfg.PublicBaseURL != "https://telesrv.net" {
 		t.Fatalf("PublicBaseURL = %q, want https://telesrv.net", cfg.PublicBaseURL)
@@ -58,8 +58,40 @@ func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	}
 }
 
+func TestLoadUsesListenPortAsAdvertisePort(t *testing.T) {
+	t.Setenv("TELESRV_LISTEN", "127.0.0.1:2444")
+
+	cfg, err := loadProcessEnvConfig()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AdvertisePort != 2444 {
+		t.Fatalf("AdvertisePort = %d, want listen port 2444", cfg.AdvertisePort)
+	}
+}
+
+func TestLoadUsesExplicitAdvertisePort(t *testing.T) {
+	t.Setenv("TELESRV_LISTEN", "127.0.0.1:2397")
+	t.Setenv("TELESRV_ADVERTISE_PORT", "2398")
+
+	cfg, err := loadProcessEnvConfig()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AdvertisePort != 2398 {
+		t.Fatalf("AdvertisePort = %d, want explicit port 2398", cfg.AdvertisePort)
+	}
+}
+
+func TestLoadRejectsInvalidAdvertisePort(t *testing.T) {
+	t.Setenv("TELESRV_ADVERTISE_PORT", "70000")
+
+	if _, err := loadProcessEnvConfig(); err == nil {
+		t.Fatal("Load accepted invalid advertise port")
+	}
+}
+
 func TestLoadS3BlobStorageConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_BLOB_BACKEND", "s3")
 	t.Setenv("TELESRV_BLOB_STAGING_DIR", `D:\staging\telesrv`)
 	t.Setenv("TELESRV_S3_ENDPOINT", "minio.example.test:9000")
@@ -70,7 +102,7 @@ func TestLoadS3BlobStorageConfig(t *testing.T) {
 	t.Setenv("TELESRV_S3_PATH_STYLE", "true")
 	t.Setenv("TELESRV_S3_CREATE_BUCKET", "true")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -99,13 +131,12 @@ func TestLoadRejectsInvalidBlobStorageConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_BLOB_BACKEND", tt.backend)
 			t.Setenv("TELESRV_S3_ENDPOINT", tt.endpoint)
 			t.Setenv("TELESRV_S3_BUCKET", tt.bucket)
 			t.Setenv("TELESRV_S3_ACCESS_KEY_ID", tt.access)
 			t.Setenv("TELESRV_S3_SECRET_ACCESS_KEY", tt.secret)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatal("invalid blob storage config accepted")
 			}
 		})
@@ -120,9 +151,8 @@ func TestLoadRejectsInvalidStorageCapacityConfig(t *testing.T) {
 		{"TELESRV_STORAGE_USAGE_REFRESH_INTERVAL", "-1s"},
 	} {
 		t.Run(item.key+"="+item.value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(item.key, item.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted invalid %s=%s", item.key, item.value)
 			}
 		})
@@ -130,12 +160,11 @@ func TestLoadRejectsInvalidStorageCapacityConfig(t *testing.T) {
 }
 
 func TestLoadUpdateServiceConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_UPDATE_PUBLIC_URL", "https://updates.example.test/root/")
 	t.Setenv("TELESRV_UPDATE_SERVICE_URL", "http://127.0.0.1:2402/")
 	t.Setenv("TELESRV_UPDATE_REQUEST_TIMEOUT", "3s")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -148,10 +177,9 @@ func TestLoadUpdateServiceConfig(t *testing.T) {
 }
 
 func TestLoadUpdateServiceDefaultsInternalURLToPublic(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_UPDATE_PUBLIC_URL", "https://updates.example.test")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -161,18 +189,16 @@ func TestLoadUpdateServiceDefaultsInternalURLToPublic(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidUpdateServiceConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_UPDATE_PUBLIC_URL", "file:///updates")
-	if _, err := Load(); err == nil {
+	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("invalid update public URL accepted")
 	}
 }
 
 func TestLoadPremiumPromoSeedDirOverride(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PREMIUM_PROMO_SEED_DIR", `D:\seed\premium-promo`)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -182,12 +208,11 @@ func TestLoadPremiumPromoSeedDirOverride(t *testing.T) {
 }
 
 func TestLoadPremiumBotAndPlans(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PREMIUM_BOT_USERNAME", "@premium_store_bot")
 	t.Setenv("TELESRV_PREMIUM_BOT_USER_ID", "1250000999")
 	t.Setenv("TELESRV_PREMIUM_PLANS", "1:30:250,12:365:2400")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -202,7 +227,6 @@ func TestLoadPremiumBotAndPlans(t *testing.T) {
 }
 
 func TestLoadBrandingConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://links.example.test/root/")
 	t.Setenv("TELESRV_BRAND_PRODUCT_NAME", " Example Chat ")
 	t.Setenv("TELESRV_BRAND_PRODUCT_USERNAME", "@Example_Chat")
@@ -215,7 +239,7 @@ func TestLoadBrandingConfig(t *testing.T) {
 	t.Setenv("TELESRV_BRAND_PREMIUM_NAME", "Example Plus")
 	t.Setenv("TELESRV_BRAND_STARS_NAME", "Example Credits")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -244,9 +268,8 @@ func TestLoadRejectsInvalidBrandingConfig(t *testing.T) {
 		{"TELESRV_BRAND_STARS_NAME", "bad\u007fname"},
 	} {
 		t.Run(item.key, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(item.key, item.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted %s=%q", item.key, item.value)
 			}
 		})
@@ -262,9 +285,8 @@ func TestLoadRejectsInvalidPremiumCatalog(t *testing.T) {
 		"3:90:1000000000000001",
 	} {
 		t.Run(value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_PREMIUM_PLANS", value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted TELESRV_PREMIUM_PLANS=%q", value)
 			}
 		})
@@ -272,10 +294,9 @@ func TestLoadRejectsInvalidPremiumCatalog(t *testing.T) {
 }
 
 func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_ADVERTISE_IP", "203.0.113.10")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -285,10 +306,9 @@ func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
 }
 
 func TestLoadCanonicalizesAdvertiseIP(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_ADVERTISE_IP", " 2001:0db8::1 ")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -300,10 +320,9 @@ func TestLoadCanonicalizesAdvertiseIP(t *testing.T) {
 func TestLoadRejectsUnusableAdvertiseIP(t *testing.T) {
 	for _, value := range []string{"example.com", "0.0.0.0", "::", "224.0.0.1", "fe80::1%eth0"} {
 		t.Run(value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_ADVERTISE_IP", value)
 
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted TELESRV_ADVERTISE_IP=%q", value)
 			}
 		})
@@ -312,10 +331,9 @@ func TestLoadRejectsUnusableAdvertiseIP(t *testing.T) {
 
 func TestLoadDefaultCountryCode(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
-		disableDefaultConfigFile(t)
 		t.Setenv("TELESRV_DEFAULT_COUNTRY_CODE", "")
 
-		cfg, err := Load()
+		cfg, err := loadProcessEnvConfig()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -325,10 +343,9 @@ func TestLoadDefaultCountryCode(t *testing.T) {
 	})
 
 	t.Run("normalized override", func(t *testing.T) {
-		disableDefaultConfigFile(t)
 		t.Setenv("TELESRV_DEFAULT_COUNTRY_CODE", " us ")
 
-		cfg, err := Load()
+		cfg, err := loadProcessEnvConfig()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -341,10 +358,9 @@ func TestLoadDefaultCountryCode(t *testing.T) {
 func TestLoadRejectsInvalidDefaultCountryCode(t *testing.T) {
 	for _, value := range []string{"+86", "CHN", "C1", "中", "ZZ"} {
 		t.Run(value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_DEFAULT_COUNTRY_CODE", value)
 
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted TELESRV_DEFAULT_COUNTRY_CODE=%q", value)
 			}
 		})
@@ -353,10 +369,9 @@ func TestLoadRejectsInvalidDefaultCountryCode(t *testing.T) {
 
 func TestLoadStrictDCCheck(t *testing.T) {
 	t.Run("defaults off", func(t *testing.T) {
-		disableDefaultConfigFile(t)
 		t.Setenv("TELESRV_STRICT_DC_CHECK", "")
 
-		cfg, err := Load()
+		cfg, err := loadProcessEnvConfig()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -366,10 +381,9 @@ func TestLoadStrictDCCheck(t *testing.T) {
 	})
 
 	t.Run("explicitly enabled", func(t *testing.T) {
-		disableDefaultConfigFile(t)
 		t.Setenv("TELESRV_STRICT_DC_CHECK", "true")
 
-		cfg, err := Load()
+		cfg, err := loadProcessEnvConfig()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -382,9 +396,8 @@ func TestLoadStrictDCCheck(t *testing.T) {
 func TestLoadRejectsNonPositiveCanonicalDC(t *testing.T) {
 	for _, value := range []string{"0", "-2", "2147483648"} {
 		t.Run(value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_DC", value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted TELESRV_DC=%s", value)
 			}
 		})
@@ -392,7 +405,6 @@ func TestLoadRejectsNonPositiveCanonicalDC(t *testing.T) {
 }
 
 func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_MTPROTO_MAX_CONNECTIONS", "12345")
 	t.Setenv("TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP", "234")
 	t.Setenv("TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES", "45")
@@ -413,9 +425,12 @@ func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
 	t.Setenv("TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES", "999999")
 	t.Setenv("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", "666")
 	t.Setenv("TELESRV_TEMP_KEY_CACHE_TTL", "17m")
+	t.Setenv("TELESRV_AUTH_USER_CACHE_TTL", "23s")
+	t.Setenv("TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES", "777")
+	t.Setenv("TELESRV_AUTH_KEY_CACHE_TTL", "19m")
 	t.Setenv("TELESRV_ORPHAN_AUTH_KEY_RETENTION", "36h")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -442,14 +457,436 @@ func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
 	if cfg.MTProtoOutboundQueueSize != 88 || cfg.MTProtoOutboundControlQueueSize != 22 || cfg.MTProtoOutboundTrackedGlobalMaxBytes != 888888 || cfg.MTProtoOutboundWriteGlobalMaxBytes != 999999 {
 		t.Fatalf("outbound config = %d/%d/%d/%d", cfg.MTProtoOutboundQueueSize, cfg.MTProtoOutboundControlQueueSize, cfg.MTProtoOutboundTrackedGlobalMaxBytes, cfg.MTProtoOutboundWriteGlobalMaxBytes)
 	}
-	if cfg.TempKeyResolveCacheMaxEntries != 666 || cfg.TempKeyResolveCacheTTL != 17*time.Minute || cfg.OrphanAuthKeyRetention != 36*time.Hour {
-		t.Fatalf("auth key resource config = %d/%v/%v", cfg.TempKeyResolveCacheMaxEntries, cfg.TempKeyResolveCacheTTL, cfg.OrphanAuthKeyRetention)
+	if cfg.TempKeyResolveCacheMaxEntries != 666 || cfg.TempKeyResolveCacheTTL != 17*time.Minute || cfg.AuthUserCacheTTL != 23*time.Second ||
+		cfg.AuthKeyCacheMaxEntries != 777 || cfg.AuthKeyCacheTTL != 19*time.Minute || cfg.OrphanAuthKeyRetention != 36*time.Hour {
+		t.Fatalf("auth key resource config = temp:%d/%v auth_user:%v auth_key:%d/%v orphan:%v",
+			cfg.TempKeyResolveCacheMaxEntries, cfg.TempKeyResolveCacheTTL, cfg.AuthUserCacheTTL,
+			cfg.AuthKeyCacheMaxEntries, cfg.AuthKeyCacheTTL, cfg.OrphanAuthKeyRetention)
+	}
+}
+
+func TestLoadEdgeLocationConfig(t *testing.T) {
+	t.Setenv("TELESRV_INSTANCE_ID", " edge-a ")
+	t.Setenv("TELESRV_EDGE_LOCATION_TTL", "2m")
+	t.Setenv("TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL", "20s")
+	t.Setenv("TELESRV_SFU_OWNER_TTL", "3m")
+	t.Setenv("TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL", "25s")
+	t.Setenv("TELESRV_SFU_INSTANCE_TTL", "4m")
+	t.Setenv("TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL", "40s")
+	t.Setenv("TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT", "1500ms")
+	t.Setenv("TELESRV_SFU_INSTANCE_MAX_ACTIVE_CALLS", "128")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_ADDR", "127.0.0.1:2411")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_URL", "grpc://sfu-a:2411")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT", "6s")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE", `D:\certs\sfu.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_KEY_FILE", `D:\certs\sfu-key.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\core-ca.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_CA_FILE", `D:\certs\sfu-ca.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_SERVER_NAME", "sfu.internal")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\core.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\core-key.pem`)
+	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
+	t.Setenv("TELESRV_GROUPCALL_CONTROL_ADDR", "127.0.0.1:2420")
+	t.Setenv("TELESRV_GROUPCALL_CONTROL_URL", "http://127.0.0.1:2420")
+	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "core-secret")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_ADDR", "127.0.0.1:2440")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_RESOLVER", "static")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TARGETS", "127.0.0.1:2440,127.0.0.1:2441")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT", "7s")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE", `D:\certs\core.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_KEY_FILE", `D:\certs\core-key.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\edge-ca.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_CA_FILE", `D:\certs\core-ca.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_SERVER_NAME", "core.internal")
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
+	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "exec-secret")
+	t.Setenv("TELESRV_FILE_GRPC_ADDR", "127.0.0.1:2460")
+	t.Setenv("TELESRV_FILE_GRPC_RESOLVER", "static")
+	t.Setenv("TELESRV_FILE_GRPC_TARGETS", "127.0.0.1:2460,127.0.0.1:2461")
+	t.Setenv("TELESRV_FILE_GRPC_REQUEST_TIMEOUT", "9s")
+	t.Setenv("TELESRV_FILE_GRPC_TLS_CERT_FILE", `D:\certs\file.pem`)
+	t.Setenv("TELESRV_FILE_GRPC_TLS_KEY_FILE", `D:\certs\file-key.pem`)
+	t.Setenv("TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\edge-ca.pem`)
+	t.Setenv("TELESRV_FILE_GRPC_TLS_CA_FILE", `D:\certs\file-ca.pem`)
+	t.Setenv("TELESRV_FILE_GRPC_TLS_SERVER_NAME", "file.internal")
+	t.Setenv("TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
+	t.Setenv("TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
+	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_ADDR", "127.0.0.1:2450")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "static")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TARGETS", "127.0.0.1:2450,127.0.0.1:2451")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", "8s")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE", `D:\certs\egress.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE", `D:\certs\egress-key.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\edge-ca.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE", `D:\certs\egress-ca.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME", "egress.internal")
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
+	t.Setenv("TELESRV_EGRESS_ACK_TOKEN", "egress-secret")
+
+	cfg, err := loadProcessEnvConfig()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.InstanceID != "edge-a" {
+		t.Fatalf("InstanceID = %q, want edge-a", cfg.InstanceID)
+	}
+	if cfg.EdgeLocationTTL != 2*time.Minute || cfg.EdgeLocationHeartbeatInterval != 20*time.Second {
+		t.Fatalf("edge location config = %v/%v, want 2m/20s", cfg.EdgeLocationTTL, cfg.EdgeLocationHeartbeatInterval)
+	}
+	if cfg.SFUOwnerTTL != 3*time.Minute || cfg.SFUOwnerHeartbeatInterval != 25*time.Second {
+		t.Fatalf("sfu owner config = %v/%v, want 3m/25s", cfg.SFUOwnerTTL, cfg.SFUOwnerHeartbeatInterval)
+	}
+	if cfg.SFUInstanceTTL != 4*time.Minute || cfg.SFUInstanceHeartbeatInterval != 40*time.Second {
+		t.Fatalf("sfu instance config = %v/%v, want 4m/40s", cfg.SFUInstanceTTL, cfg.SFUInstanceHeartbeatInterval)
+	}
+	if cfg.SFUInstanceHealthTimeout != 1500*time.Millisecond {
+		t.Fatalf("SFUInstanceHealthTimeout = %v, want 1500ms", cfg.SFUInstanceHealthTimeout)
+	}
+	if cfg.SFUInstanceMaxActiveCalls != 128 {
+		t.Fatalf("SFUInstanceMaxActiveCalls = %d, want 128", cfg.SFUInstanceMaxActiveCalls)
+	}
+	if cfg.SFUControlGRPCAddr != "127.0.0.1:2411" ||
+		cfg.SFUControlGRPCURL != "grpc://sfu-a:2411" ||
+		cfg.SFUControlGRPCRequestTimeout != 6*time.Second ||
+		cfg.SFUControlGRPCTLSCertFile != `D:\certs\sfu.pem` ||
+		cfg.SFUControlGRPCTLSKeyFile != `D:\certs\sfu-key.pem` ||
+		cfg.SFUControlGRPCTLSClientCAFile != `D:\certs\core-ca.pem` ||
+		cfg.SFUControlGRPCTLSCAFile != `D:\certs\sfu-ca.pem` ||
+		cfg.SFUControlGRPCTLSServerName != "sfu.internal" ||
+		cfg.SFUControlGRPCTLSClientCertFile != `D:\certs\core.pem` ||
+		cfg.SFUControlGRPCTLSClientKeyFile != `D:\certs\core-key.pem` ||
+		cfg.SFUControlToken != "sfu-secret" {
+		t.Fatalf("sfu control config = grpc:%q/%q timeout:%v tls:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q token:%q",
+			cfg.SFUControlGRPCAddr,
+			cfg.SFUControlGRPCURL,
+			cfg.SFUControlGRPCRequestTimeout,
+			cfg.SFUControlGRPCTLSCertFile,
+			cfg.SFUControlGRPCTLSKeyFile,
+			cfg.SFUControlGRPCTLSClientCAFile,
+			cfg.SFUControlGRPCTLSCAFile,
+			cfg.SFUControlGRPCTLSServerName,
+			cfg.SFUControlGRPCTLSClientCertFile,
+			cfg.SFUControlGRPCTLSClientKeyFile,
+			cfg.SFUControlToken)
+	}
+	if cfg.GroupCallControlAddr != "127.0.0.1:2420" || cfg.GroupCallControlURL != "http://127.0.0.1:2420" || cfg.GroupCallControlToken != "core-secret" {
+		t.Fatalf("groupcall control config = %q/%q/%q", cfg.GroupCallControlAddr, cfg.GroupCallControlURL, cfg.GroupCallControlToken)
+	}
+	if cfg.CoreExecToken != "exec-secret" {
+		t.Fatalf("CoreExecToken = %q, want exec-secret", cfg.CoreExecToken)
+	}
+	if cfg.CoreExecGRPCAddr != "127.0.0.1:2440" || cfg.CoreExecGRPCTargets != "127.0.0.1:2440,127.0.0.1:2441" {
+		t.Fatalf("core exec grpc config = %q/%q", cfg.CoreExecGRPCAddr, cfg.CoreExecGRPCTargets)
+	}
+	if cfg.CoreExecGRPCResolver != "static" {
+		t.Fatalf("CoreExecGRPCResolver = %q, want static", cfg.CoreExecGRPCResolver)
+	}
+	if cfg.CoreExecGRPCRequestTimeout != 7*time.Second {
+		t.Fatalf("CoreExecGRPCRequestTimeout = %v, want 7s", cfg.CoreExecGRPCRequestTimeout)
+	}
+	if cfg.CoreExecGRPCTLSCertFile != `D:\certs\core.pem` ||
+		cfg.CoreExecGRPCTLSKeyFile != `D:\certs\core-key.pem` ||
+		cfg.CoreExecGRPCTLSClientCAFile != `D:\certs\edge-ca.pem` ||
+		cfg.CoreExecGRPCTLSCAFile != `D:\certs\core-ca.pem` ||
+		cfg.CoreExecGRPCTLSServerName != "core.internal" ||
+		cfg.CoreExecGRPCTLSClientCertFile != `D:\certs\edge.pem` ||
+		cfg.CoreExecGRPCTLSClientKeyFile != `D:\certs\edge-key.pem` {
+		t.Fatalf("core exec grpc tls config = server:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q",
+			cfg.CoreExecGRPCTLSCertFile,
+			cfg.CoreExecGRPCTLSKeyFile,
+			cfg.CoreExecGRPCTLSClientCAFile,
+			cfg.CoreExecGRPCTLSCAFile,
+			cfg.CoreExecGRPCTLSServerName,
+			cfg.CoreExecGRPCTLSClientCertFile,
+			cfg.CoreExecGRPCTLSClientKeyFile)
+	}
+	if cfg.FileToken != "file-secret" {
+		t.Fatalf("FileToken = %q, want file-secret", cfg.FileToken)
+	}
+	if cfg.FileGRPCAddr != "127.0.0.1:2460" || cfg.FileGRPCTargets != "127.0.0.1:2460,127.0.0.1:2461" {
+		t.Fatalf("file grpc config = %q/%q", cfg.FileGRPCAddr, cfg.FileGRPCTargets)
+	}
+	if cfg.FileGRPCResolver != "static" {
+		t.Fatalf("FileGRPCResolver = %q, want static", cfg.FileGRPCResolver)
+	}
+	if cfg.FileGRPCRequestTimeout != 9*time.Second {
+		t.Fatalf("FileGRPCRequestTimeout = %v, want 9s", cfg.FileGRPCRequestTimeout)
+	}
+	if cfg.FileGRPCTLSCertFile != `D:\certs\file.pem` ||
+		cfg.FileGRPCTLSKeyFile != `D:\certs\file-key.pem` ||
+		cfg.FileGRPCTLSClientCAFile != `D:\certs\edge-ca.pem` ||
+		cfg.FileGRPCTLSCAFile != `D:\certs\file-ca.pem` ||
+		cfg.FileGRPCTLSServerName != "file.internal" ||
+		cfg.FileGRPCTLSClientCertFile != `D:\certs\edge.pem` ||
+		cfg.FileGRPCTLSClientKeyFile != `D:\certs\edge-key.pem` {
+		t.Fatalf("file grpc tls config = server:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q",
+			cfg.FileGRPCTLSCertFile,
+			cfg.FileGRPCTLSKeyFile,
+			cfg.FileGRPCTLSClientCAFile,
+			cfg.FileGRPCTLSCAFile,
+			cfg.FileGRPCTLSServerName,
+			cfg.FileGRPCTLSClientCertFile,
+			cfg.FileGRPCTLSClientKeyFile)
+	}
+	if cfg.EgressAckToken != "egress-secret" {
+		t.Fatalf("EgressAckToken = %q, want egress-secret", cfg.EgressAckToken)
+	}
+	if cfg.EgressAckGRPCAddr != "127.0.0.1:2450" || cfg.EgressAckGRPCTargets != "127.0.0.1:2450,127.0.0.1:2451" {
+		t.Fatalf("egress ack grpc config = %q/%q", cfg.EgressAckGRPCAddr, cfg.EgressAckGRPCTargets)
+	}
+	if cfg.EgressAckGRPCResolver != "static" {
+		t.Fatalf("EgressAckGRPCResolver = %q, want static", cfg.EgressAckGRPCResolver)
+	}
+	if cfg.EgressAckGRPCRequestTimeout != 8*time.Second {
+		t.Fatalf("EgressAckGRPCRequestTimeout = %v, want 8s", cfg.EgressAckGRPCRequestTimeout)
+	}
+	if cfg.EgressAckGRPCTLSCertFile != `D:\certs\egress.pem` ||
+		cfg.EgressAckGRPCTLSKeyFile != `D:\certs\egress-key.pem` ||
+		cfg.EgressAckGRPCTLSClientCAFile != `D:\certs\edge-ca.pem` ||
+		cfg.EgressAckGRPCTLSCAFile != `D:\certs\egress-ca.pem` ||
+		cfg.EgressAckGRPCTLSServerName != "egress.internal" ||
+		cfg.EgressAckGRPCTLSClientCertFile != `D:\certs\edge.pem` ||
+		cfg.EgressAckGRPCTLSClientKeyFile != `D:\certs\edge-key.pem` {
+		t.Fatalf("egress ack grpc tls config = server:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q",
+			cfg.EgressAckGRPCTLSCertFile,
+			cfg.EgressAckGRPCTLSKeyFile,
+			cfg.EgressAckGRPCTLSClientCAFile,
+			cfg.EgressAckGRPCTLSCAFile,
+			cfg.EgressAckGRPCTLSServerName,
+			cfg.EgressAckGRPCTLSClientCertFile,
+			cfg.EgressAckGRPCTLSClientKeyFile)
+	}
+}
+
+func TestLoadRejectsInvalidCoreExecGRPCResolver(t *testing.T) {
+	t.Setenv("TELESRV_CORE_EXEC_GRPC_RESOLVER", "consul")
+	if _, err := loadProcessEnvConfig(); err == nil {
+		t.Fatal("Load accepted invalid TELESRV_CORE_EXEC_GRPC_RESOLVER")
+	}
+}
+
+func TestLoadRejectsInvalidCoreExecGRPCRequestTimeout(t *testing.T) {
+	for _, item := range []struct{ name, value string }{
+		{name: "zero", value: "0s"},
+		{name: "negative", value: "-1s"},
+		{name: "too large", value: "61s"},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			t.Setenv("TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT", item.value)
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatalf("Load accepted TELESRV_CORE_EXEC_GRPC_REQUEST_TIMEOUT=%s", item.value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidEgressAckGRPCResolver(t *testing.T) {
+	t.Setenv("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "consul")
+	if _, err := loadProcessEnvConfig(); err == nil {
+		t.Fatal("Load accepted invalid TELESRV_EGRESS_ACK_GRPC_RESOLVER")
+	}
+}
+
+func TestLoadRejectsInvalidEgressAckGRPCRequestTimeout(t *testing.T) {
+	for _, item := range []struct{ name, value string }{
+		{name: "zero", value: "0s"},
+		{name: "negative", value: "-1s"},
+		{name: "too large", value: "61s"},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			t.Setenv("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", item.value)
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatalf("Load accepted TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT=%s", item.value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidCoreExecGRPCTLSConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "server cert without key", env: map[string]string{
+			"TELESRV_CORE_EXEC_GRPC_TLS_CERT_FILE": "core.pem",
+		}},
+		{name: "server client ca without server cert", env: map[string]string{
+			"TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CA_FILE": "edge-ca.pem",
+		}},
+		{name: "client cert without key", env: map[string]string{
+			"TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE": "edge.pem",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatal("Load accepted invalid CoreExec gRPC TLS config")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidEgressAckGRPCTLSConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "server cert without key", env: map[string]string{
+			"TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE": "egress.pem",
+		}},
+		{name: "server client ca without server cert", env: map[string]string{
+			"TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE": "edge-ca.pem",
+		}},
+		{name: "client cert without key", env: map[string]string{
+			"TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE": "edge.pem",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatal("Load accepted invalid Egress ACK gRPC TLS config")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidFileGRPCResolver(t *testing.T) {
+	t.Setenv("TELESRV_FILE_GRPC_RESOLVER", "consul")
+	if _, err := loadProcessEnvConfig(); err == nil {
+		t.Fatal("Load accepted invalid TELESRV_FILE_GRPC_RESOLVER")
+	}
+}
+
+func TestLoadRejectsInvalidFileGRPCRequestTimeout(t *testing.T) {
+	for _, item := range []struct{ name, value string }{
+		{name: "zero", value: "0s"},
+		{name: "negative", value: "-1s"},
+		{name: "too large", value: "61s"},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			t.Setenv("TELESRV_FILE_GRPC_REQUEST_TIMEOUT", item.value)
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatalf("Load accepted TELESRV_FILE_GRPC_REQUEST_TIMEOUT=%s", item.value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidFileGRPCTLSConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "server cert without key", env: map[string]string{
+			"TELESRV_FILE_GRPC_TLS_CERT_FILE": "file.pem",
+		}},
+		{name: "server client ca without server cert", env: map[string]string{
+			"TELESRV_FILE_GRPC_TLS_CLIENT_CA_FILE": "edge-ca.pem",
+		}},
+		{name: "client cert without key", env: map[string]string{
+			"TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE": "edge.pem",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatal("Load accepted invalid FileData gRPC TLS config")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidEdgeLocationConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "zero ttl", env: map[string]string{"TELESRV_EDGE_LOCATION_TTL": "0s"}},
+		{name: "negative heartbeat", env: map[string]string{"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL": "-1s"}},
+		{name: "heartbeat equals ttl", env: map[string]string{
+			"TELESRV_EDGE_LOCATION_TTL":                "30s",
+			"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL": "30s",
+		}},
+		{name: "heartbeat exceeds ttl", env: map[string]string{
+			"TELESRV_EDGE_LOCATION_TTL":                "20s",
+			"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL": "30s",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for key, value := range test.env {
+				t.Setenv(key, value)
+			}
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatalf("Load accepted edge location config %v", test.env)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidSFUOwnerConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "zero ttl", env: map[string]string{"TELESRV_SFU_OWNER_TTL": "0s"}},
+		{name: "negative heartbeat", env: map[string]string{"TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL": "-1s"}},
+		{name: "heartbeat equals ttl", env: map[string]string{
+			"TELESRV_SFU_OWNER_TTL":                "30s",
+			"TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL": "30s",
+		}},
+		{name: "heartbeat exceeds ttl", env: map[string]string{
+			"TELESRV_SFU_OWNER_TTL":                "20s",
+			"TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL": "30s",
+		}},
+		{name: "zero instance ttl", env: map[string]string{"TELESRV_SFU_INSTANCE_TTL": "0s"}},
+		{name: "instance heartbeat equals ttl", env: map[string]string{
+			"TELESRV_SFU_INSTANCE_TTL":                "30s",
+			"TELESRV_SFU_INSTANCE_HEARTBEAT_INTERVAL": "30s",
+		}},
+		{name: "zero instance health timeout", env: map[string]string{"TELESRV_SFU_INSTANCE_HEALTH_TIMEOUT": "0s"}},
+		{name: "zero grpc request timeout", env: map[string]string{"TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT": "0s"}},
+		{name: "too large grpc request timeout", env: map[string]string{"TELESRV_SFU_CONTROL_GRPC_REQUEST_TIMEOUT": "90s"}},
+		{name: "sfu grpc server cert without key", env: map[string]string{
+			"TELESRV_SFU_CONTROL_GRPC_TLS_CERT_FILE": "sfu.pem",
+		}},
+		{name: "sfu grpc client ca without server cert", env: map[string]string{
+			"TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CA_FILE": "core-ca.pem",
+		}},
+		{name: "sfu grpc client cert without key", env: map[string]string{
+			"TELESRV_SFU_CONTROL_GRPC_TLS_CLIENT_CERT_FILE": "core.pem",
+		}},
+		{name: "token newline", env: map[string]string{"TELESRV_SFU_CONTROL_TOKEN": "bad\nsecret"}},
+		{name: "groupcall token newline", env: map[string]string{"TELESRV_GROUPCALL_CONTROL_TOKEN": "bad\nsecret"}},
+		{name: "coreexec token newline", env: map[string]string{"TELESRV_CORE_EXEC_TOKEN": "bad\nsecret"}},
+		{name: "egress ack token newline", env: map[string]string{"TELESRV_EGRESS_ACK_TOKEN": "bad\nsecret"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for key, value := range test.env {
+				t.Setenv(key, value)
+			}
+			if _, err := loadProcessEnvConfig(); err == nil {
+				t.Fatalf("Load accepted sfu owner config %v", test.env)
+			}
+		})
 	}
 }
 
 func TestLoadRPCExecutionFairBudgetDefaults(t *testing.T) {
-	disableDefaultConfigFile(t)
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -476,9 +913,8 @@ func TestLoadRejectsInvalidRPCExecutionFairBudgets(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted invalid %s=%s", test.key, test.value)
 			}
 		})
@@ -497,9 +933,8 @@ func TestLoadRejectsMalformedMTProtoCapacity(t *testing.T) {
 		{name: "outbound queue malformed", key: "TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE", value: "many"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted %s=%q", test.key, test.value)
 			}
 		})
@@ -507,11 +942,10 @@ func TestLoadRejectsMalformedMTProtoCapacity(t *testing.T) {
 }
 
 func TestLoadOutboxPoisonPolicy(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_OUTBOX_POISON_RETENTION", "2m")
 	t.Setenv("TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL", "7s")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -521,10 +955,9 @@ func TestLoadOutboxPoisonPolicy(t *testing.T) {
 }
 
 func TestLoadBusinessAIProvider(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_BUSINESS_AI_PROVIDER", "echo")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -534,10 +967,9 @@ func TestLoadBusinessAIProvider(t *testing.T) {
 }
 
 func TestLoadBusinessAIProviderDefaultsToEcho(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_BUSINESS_AI_PROVIDER", "")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -547,9 +979,8 @@ func TestLoadBusinessAIProviderDefaultsToEcho(t *testing.T) {
 }
 
 func TestLoadLoginEmailDefaultsDisabled(t *testing.T) {
-	disableDefaultConfigFile(t)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -569,7 +1000,6 @@ func TestLoadLoginEmailDefaultsDisabled(t *testing.T) {
 }
 
 func TestLoadLoginEmailSMTPConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_LOGIN_EMAIL_ENABLE", "true")
 	t.Setenv("TELESRV_LOGIN_EMAIL_REQUIRE_SETUP", "true")
 	t.Setenv("TELESRV_AUTH_CODE_TTL", "3m")
@@ -586,7 +1016,7 @@ func TestLoadLoginEmailSMTPConfig(t *testing.T) {
 	t.Setenv("TELESRV_SMTP_TLS", "none")
 	t.Setenv("TELESRV_SMTP_TIMEOUT", "2s")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -605,16 +1035,14 @@ func TestLoadLoginEmailSMTPConfig(t *testing.T) {
 }
 
 func TestLoadLoginEmailRequiresSMTPWhenEnabled(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_LOGIN_EMAIL_ENABLE", "true")
 
-	if _, err := Load(); err == nil {
+	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("Load succeeded with login email enabled but no SMTP host")
 	}
 }
 
 func TestLoadLoginEmailWebhookDoesNotRequireSMTP(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_LOGIN_EMAIL_ENABLE", "true")
 	t.Setenv("TELESRV_EMAIL_CODE_DELIVERY_PROVIDER", "webhook")
 	t.Setenv("TELESRV_OTP_WEBHOOK_URL", "https://otp.example.test/v1/deliveries")
@@ -622,7 +1050,7 @@ func TestLoadLoginEmailWebhookDoesNotRequireSMTP(t *testing.T) {
 	t.Setenv("TELESRV_OTP_WEBHOOK_TIMEOUT", "3s")
 	t.Setenv("TELESRV_SMTP_HOST", "")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -633,22 +1061,20 @@ func TestLoadLoginEmailWebhookDoesNotRequireSMTP(t *testing.T) {
 }
 
 func TestLoadPhoneWebhookRequiresValidURL(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "webhook")
 	t.Setenv("TELESRV_OTP_WEBHOOK_URL", "relative/path")
 
-	if _, err := Load(); err == nil {
+	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("Load succeeded with relative OTP webhook URL")
 	}
 }
 
 func TestLoadPhoneWebhookConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "webhook")
 	t.Setenv("TELESRV_PHONE_CODE_LENGTH", "7")
 	t.Setenv("TELESRV_OTP_WEBHOOK_URL", "http://127.0.0.1:8080/otp")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -658,11 +1084,10 @@ func TestLoadPhoneWebhookConfig(t *testing.T) {
 }
 
 func TestLoadKeepsAdminAndRtmpDefaultPortsSeparate(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_ADMIN_UI_ADDR", "")
 	t.Setenv("TELESRV_LIVESTREAM_RTMP_ADDR", "")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -678,7 +1103,6 @@ func TestLoadKeepsAdminAndRtmpDefaultPortsSeparate(t *testing.T) {
 }
 
 func TestLoadAIProviders(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_AI_PROVIDERS", "local,openai,gemini")
 	t.Setenv("TELESRV_AI_OPENAI_API_KEY", "openai-key")
 	t.Setenv("TELESRV_AI_OPENAI_MODEL", "gpt-test")
@@ -691,7 +1115,7 @@ func TestLoadAIProviders(t *testing.T) {
 	t.Setenv("TELESRV_AI_RATE_LIMIT", "7")
 	t.Setenv("TELESRV_AI_RATE_WINDOW", "30s")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -713,13 +1137,12 @@ func TestLoadAIProviders(t *testing.T) {
 }
 
 func TestLoadTranslationConfig(t *testing.T) {
-	t.Setenv("TELESRV_CONFIG", "")
 	t.Setenv("TELESRV_TRANSLATION_ENABLED", "true")
 	t.Setenv("TELESRV_TRANSLATION_PROVIDERS", "openai,gemini")
 	t.Setenv("TELESRV_TRANSLATION_TIMEOUT", "9s")
 	t.Setenv("TELESRV_TRANSLATION_RATE_LIMIT", "17")
 	t.Setenv("TELESRV_TRANSLATION_RATE_WINDOW", "2m")
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -731,70 +1154,10 @@ func TestLoadTranslationConfig(t *testing.T) {
 	}
 }
 
-func TestLoadReadsEnvStyleConfigFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "telesrv.env")
-	writeConfigFile(t, path, `
-TELESRV_MAPBOX_TOKEN="file-token"
-TELESRV_POSTGRES_MAX_CONNS=77
-TELESRV_WEBSOCKET_ALLOWED_ORIGINS=https://one.example, https://two.example
-TELESRV_CALL_RING_TIMEOUT=2m
-TELESRV_PUBLIC_BASE_URL=links.example.test/root
-TELESRV_BRAND_PRODUCT_NAME=File Chat
-TELESRV_BRAND_PRODUCT_USERNAME=@File_Chat
-TELESRV_BRAND_DESKTOP_APP_NAME=File Workstation
-TELESRV_PUBLIC_APP_SCHEME=example-chat
-TELESRV_PUBLIC_APP_LINK_BASE=OWPG://Tenant.Example.Test/
-TELESRV_PUBLIC_WEB_BASE_URL=web.example.test/client
-TELESRV_PUBLIC_APP_NAME=Example Chat
-TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
-`)
-	t.Setenv("TELESRV_CONFIG", path)
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.MapboxToken != "file-token" {
-		t.Fatalf("MapboxToken = %q, want file-token", cfg.MapboxToken)
-	}
-	if cfg.PostgresMaxConns != 77 {
-		t.Fatalf("PostgresMaxConns = %d, want 77", cfg.PostgresMaxConns)
-	}
-	if got, want := cfg.WebSocketAllowedOrigins, []string{"https://one.example", "https://two.example"}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("WebSocketAllowedOrigins = %#v, want %#v", got, want)
-	}
-	if cfg.CallRingTimeout != 2*time.Minute {
-		t.Fatalf("CallRingTimeout = %v, want 2m", cfg.CallRingTimeout)
-	}
-	if cfg.PublicLinkWebAddr != "127.0.0.1:2401" {
-		t.Fatalf("PublicLinkWebAddr = %q, want 127.0.0.1:2401", cfg.PublicLinkWebAddr)
-	}
-	if cfg.PublicBaseURL != "https://links.example.test/root" {
-		t.Fatalf("PublicBaseURL = %q, want https://links.example.test/root", cfg.PublicBaseURL)
-	}
-	if cfg.Branding.ProductName != "File Chat" || cfg.Branding.ProductUsername != "file_chat" ||
-		cfg.Branding.DesktopAppName != "File Workstation" || cfg.Branding.PublicBaseURL != cfg.PublicBaseURL {
-		t.Fatalf("Branding = %+v", cfg.Branding)
-	}
-	if cfg.PublicAppScheme != "example-chat" {
-		t.Fatalf("PublicAppScheme = %q, want example-chat", cfg.PublicAppScheme)
-	}
-	if cfg.PublicAppLinkBase != "owpg://tenant.example.test" {
-		t.Fatalf("PublicAppLinkBase = %q, want owpg://tenant.example.test", cfg.PublicAppLinkBase)
-	}
-	if cfg.PublicWebBaseURL != "https://web.example.test/client" {
-		t.Fatalf("PublicWebBaseURL = %q, want https://web.example.test/client", cfg.PublicWebBaseURL)
-	}
-	if cfg.PublicAppName != "Example Chat" {
-		t.Fatalf("PublicAppName = %q, want Example Chat", cfg.PublicAppName)
-	}
-}
-
 func TestLoadNormalizesLocalPublicBaseURL(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "http://127.0.0.1:2401/")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -804,7 +1167,6 @@ func TestLoadNormalizesLocalPublicBaseURL(t *testing.T) {
 }
 
 func TestLoadTelegramLoginConfig(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PUBLIC_LINK_WEB_ADDR", "127.0.0.1:2401")
 	t.Setenv("TELESRV_TELEGRAM_LOGIN_ENABLE", "true")
 	t.Setenv("TELESRV_TELEGRAM_LOGIN_ISSUER", "http://192.0.2.25:2401/")
@@ -820,7 +1182,7 @@ func TestLoadTelegramLoginConfig(t *testing.T) {
 	t.Setenv("TELESRV_TELEGRAM_LOGIN_SWEEP_INTERVAL", "30s")
 	t.Setenv("TELESRV_TELEGRAM_LOGIN_SWEEP_BATCH", "73")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -893,10 +1255,9 @@ func TestValidateTelegramLoginConfigAcceptsHTTPHostAndIPWhenEnabled(t *testing.T
 }
 
 func TestLoadRejectsInvalidPublicBaseURL(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://links.example.test/root?tenant=one")
 
-	if _, err := Load(); err == nil {
+	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("Load succeeded with a query-bearing public base URL")
 	}
 }
@@ -919,68 +1280,11 @@ func TestLoadRejectsInvalidPublicLinkClientConfig(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(tc.key, tc.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load succeeded with %s=%q", tc.key, tc.value)
 			}
 		})
-	}
-}
-
-func TestLoadExplicitEmptyEnvironmentDisablesNullableListeners(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "telesrv.env")
-	writeConfigFile(t, path, `
-TELESRV_DEBUG_ADDR=127.0.0.1:6060
-TELESRV_BOT_API_ADDR=127.0.0.1:8081
-TELESRV_ADMIN_API_ADDR=127.0.0.1:2599
-TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
-`)
-	t.Setenv("TELESRV_CONFIG", path)
-	t.Setenv("TELESRV_DEBUG_ADDR", "")
-	t.Setenv("TELESRV_BOT_API_ADDR", "")
-	t.Setenv("TELESRV_ADMIN_API_ADDR", "")
-	t.Setenv("TELESRV_PUBLIC_LINK_WEB_ADDR", "")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.DebugAddr != "" || cfg.BotAPIAddr != "" || cfg.AdminAPIAddr != "" || cfg.PublicLinkWebAddr != "" {
-		t.Fatalf("nullable listeners were not disabled: debug=%q bot=%q admin=%q public=%q", cfg.DebugAddr, cfg.BotAPIAddr, cfg.AdminAPIAddr, cfg.PublicLinkWebAddr)
-	}
-}
-
-func TestLoadEnvironmentOverridesConfigFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "telesrv.env")
-	writeConfigFile(t, path, `TELESRV_MAPBOX_TOKEN=file-token`)
-	t.Setenv("TELESRV_CONFIG", path)
-	t.Setenv("TELESRV_MAPBOX_TOKEN", "env-token")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.MapboxToken != "env-token" {
-		t.Fatalf("MapboxToken = %q, want env-token", cfg.MapboxToken)
-	}
-}
-
-func TestLoadExplicitMissingConfigFileErrors(t *testing.T) {
-	t.Setenv("TELESRV_CONFIG", filepath.Join(t.TempDir(), "missing.env"))
-
-	if _, err := Load(); err == nil {
-		t.Fatal("Load succeeded with explicit missing config file, want error")
-	}
-}
-
-func TestLoadRejectsNonTelesrvConfigKeys(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "telesrv.env")
-	writeConfigFile(t, path, `MAPBOX_TOKEN=file-token`)
-	t.Setenv("TELESRV_CONFIG", path)
-
-	if _, err := Load(); err == nil {
-		t.Fatal("Load succeeded with unsupported config key, want error")
 	}
 }
 
@@ -998,9 +1302,8 @@ func TestValidateStarGiftConfigRejectsNegativeInternalTONGrant(t *testing.T) {
 }
 
 func TestLoadAccountRatingDefaults(t *testing.T) {
-	disableDefaultConfigFile(t)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1022,7 +1325,6 @@ func TestLoadAccountRatingDefaults(t *testing.T) {
 }
 
 func TestLoadAccountRatingOverrides(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_RATING_ENABLED", "false")
 	t.Setenv("TELESRV_RATING_PENDING_DELAY", "1h")
 	t.Setenv("TELESRV_RATING_RECOMPUTE_INTERVAL", "90s")
@@ -1032,7 +1334,7 @@ func TestLoadAccountRatingOverrides(t *testing.T) {
 	t.Setenv("TELESRV_RATING_WEIGHT_MESSAGE_SENT", "0")
 	t.Setenv("TELESRV_RATING_ACTIVITY_CAP", "0")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1071,9 +1373,8 @@ func TestLoadRejectsInvalidAccountRatingConfig(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted invalid %s=%s", test.key, test.value)
 			}
 		})
@@ -1082,10 +1383,9 @@ func TestLoadRejectsInvalidAccountRatingConfig(t *testing.T) {
 
 func TestLoadCollectibleUsernameURLTemplate(t *testing.T) {
 	t.Run("absolute template accepted", func(t *testing.T) {
-		disableDefaultConfigFile(t)
 		t.Setenv("TELESRV_COLLECTIBLE_USERNAME_URL_TEMPLATE", " https://frag.example/u/{username} ")
 
-		cfg, err := Load()
+		cfg, err := loadProcessEnvConfig()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -1096,9 +1396,8 @@ func TestLoadCollectibleUsernameURLTemplate(t *testing.T) {
 
 	for _, invalid := range []string{"/nft/{username}", "ftp://frag.example/{username}", "https://user:pass@frag.example/{username}"} {
 		t.Run("rejects "+invalid, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv("TELESRV_COLLECTIBLE_USERNAME_URL_TEMPLATE", invalid)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted template %q", invalid)
 			}
 		})
@@ -1106,9 +1405,8 @@ func TestLoadCollectibleUsernameURLTemplate(t *testing.T) {
 }
 
 func TestLoadVerificationDefaults(t *testing.T) {
-	disableDefaultConfigFile(t)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1136,7 +1434,6 @@ func TestLoadVerificationDefaults(t *testing.T) {
 }
 
 func TestLoadVerificationOverrides(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_VERIFICATION_ENABLED", "false")
 	t.Setenv("TELESRV_VERIFICATION_ALLOW_USER_TARGETS", "true")
 	t.Setenv("TELESRV_VERIFICATION_REJECT_COOLDOWN", "48h")
@@ -1148,7 +1445,7 @@ func TestLoadVerificationOverrides(t *testing.T) {
 	t.Setenv("TELESRV_VERIFICATION_NOTIFY_BATCH", "200")
 	t.Setenv("TELESRV_VERIFICATION_MAX_ACTIVE_PER_USER", "0")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1192,9 +1489,8 @@ func TestLoadRejectsInvalidVerificationConfig(t *testing.T) {
 		{"TELESRV_VERIFICATION_MAX_ACTIVE_PER_USER", "51"},
 	} {
 		t.Run(test.key+"="+test.value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted invalid %s=%s", test.key, test.value)
 			}
 		})
@@ -1202,9 +1498,8 @@ func TestLoadRejectsInvalidVerificationConfig(t *testing.T) {
 }
 
 func TestLoadBotVerificationDefaults(t *testing.T) {
-	disableDefaultConfigFile(t)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1222,13 +1517,12 @@ func TestLoadBotVerificationDefaults(t *testing.T) {
 }
 
 func TestLoadBotVerificationOverrides(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_BOT_VERIFICATION_ENABLED", "false")
 	t.Setenv("TELESRV_BOT_VERIFICATION_MAX_PER_VERIFIER", "0")
 	t.Setenv("TELESRV_BOT_VERIFICATION_REQUEST_RATE_LIMIT", "0")
 	t.Setenv("TELESRV_BOT_VERIFICATION_REQUEST_RATE_WINDOW", "0s")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1257,9 +1551,8 @@ func TestLoadRejectsInvalidBotVerificationConfig(t *testing.T) {
 		{"TELESRV_BOT_VERIFICATION_REQUEST_RATE_WINDOW", "0s"},
 	} {
 		t.Run(test.key+"="+test.value, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted invalid %s=%s", test.key, test.value)
 			}
 		})
@@ -1270,19 +1563,17 @@ func TestLoadRejectsInvalidBotVerificationConfig(t *testing.T) {
 // even with the feature off, so switching it on later is not the moment a typo is
 // discovered.
 func TestLoadValidatesBotVerificationWhileDisabled(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_BOT_VERIFICATION_ENABLED", "false")
 	t.Setenv("TELESRV_BOT_VERIFICATION_MAX_PER_VERIFIER", "-3")
 
-	if _, err := Load(); err == nil {
+	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("Load accepted a negative per-verifier bound while the feature was disabled")
 	}
 }
 
 func TestLoadAdminRBACDefaults(t *testing.T) {
-	disableDefaultConfigFile(t)
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1295,11 +1586,10 @@ func TestLoadAdminRBACDefaults(t *testing.T) {
 }
 
 func TestLoadAdminScopedTokens(t *testing.T) {
-	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_ADMIN_UI_PERMISSIONS", "users.read, verification:decide")
 	t.Setenv("TELESRV_ADMIN_SCOPED_TOKENS", "ops:tok-ops-1:users.read,users.write; audit:tok-audit-2:verification.*")
 
-	cfg, err := Load()
+	cfg, err := loadProcessEnvConfig()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -1339,25 +1629,16 @@ func TestLoadRejectsInvalidAdminRBACConfig(t *testing.T) {
 		"invalid ui permission": {"TELESRV_ADMIN_UI_PERMISSIONS": "users/read"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			disableDefaultConfigFile(t)
 			for key, value := range env {
 				t.Setenv(key, value)
 			}
-			if _, err := Load(); err == nil {
+			if _, err := loadProcessEnvConfig(); err == nil {
 				t.Fatalf("Load accepted %v", env)
 			}
 		})
 	}
 }
 
-func writeConfigFile(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write config file: %v", err)
-	}
-}
-
-func disableDefaultConfigFile(t *testing.T) {
-	t.Helper()
-	t.Setenv("TELESRV_CONFIG", "")
+func loadProcessEnvConfig() (Config, error) {
+	return loadFromEnv(newEnvSource(nil, true))
 }

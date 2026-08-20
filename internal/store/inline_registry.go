@@ -92,6 +92,7 @@ type InlineRegistryStore interface {
 
 	PutInlineResult(ctx context.Context, results domain.BotInlineResults, ttl time.Duration) error
 	GetInlineResult(ctx context.Context, queryID int64) (domain.BotInlineResults, bool, error)
+	WaitInlineResult(ctx context.Context, userID, queryID int64) (domain.BotInlineResults, bool, error)
 	DeleteInlineResult(ctx context.Context, queryID int64) error
 
 	PutInlineCache(ctx context.Context, key InlineCacheKey, results domain.BotInlineResults, ttl time.Duration) error
@@ -104,6 +105,7 @@ type InlineRegistryStore interface {
 	PutPreparedInlineMessage(ctx context.Context, msg PreparedInlineMessage, ttl time.Duration) error
 	GetPreparedInlineMessage(ctx context.Context, id string) (PreparedInlineMessage, bool, error)
 
+	ReserveWebViewSession(ctx context.Context, session WebViewSession, ttl time.Duration) (bool, error)
 	PutWebViewSession(ctx context.Context, session WebViewSession, ttl time.Duration) error
 	GetWebViewSession(ctx context.Context, queryID int64) (WebViewSession, bool, error)
 	GetWebViewSessionByBotQuery(ctx context.Context, botQueryID string) (WebViewSession, bool, error)

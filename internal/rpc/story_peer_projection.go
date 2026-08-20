@@ -253,10 +253,14 @@ func (r *Router) withStoryUpdatePeerObjects(ctx context.Context, viewerUserID in
 // BuildOutboxUpdates' claim-wide pass. This avoids turning story events into an
 // extra username-registry query per event before the final batch projection.
 func (r *Router) withStoryUpdatePeerObjectsForOutbox(ctx context.Context, viewerUserID int64, updates *tg.Updates, peers ...domain.Peer) *tg.Updates {
+	return r.withStoryUpdatePeerObjectsForOutboxWithCache(ctx, viewerUserID, updates, newViewerPeerCache(r), peers...)
+}
+
+func (r *Router) withStoryUpdatePeerObjectsForOutboxWithCache(ctx context.Context, viewerUserID int64, updates *tg.Updates, cache *viewerPeerCache, peers ...domain.Peer) *tg.Updates {
 	if updates == nil {
 		return nil
 	}
-	users, channels := r.storyPeerObjects(ctx, viewerUserID, peers)
+	users, channels := r.storyPeerObjectsWithCache(ctx, viewerUserID, cache, peers)
 	if len(users) > 0 {
 		projected := tgUsersForViewer(viewerUserID, r.withUsersPresence(users))
 		updates.Users = appendUniqueTGUsers(updates.Users, projected...)
@@ -396,6 +400,10 @@ func storyViewPeers(views []domain.StoryView) []domain.Peer {
 }
 
 func (r *Router) storyPeerObjects(ctx context.Context, viewerUserID int64, peers []domain.Peer) ([]domain.User, []domain.Channel) {
+	return r.storyPeerObjectsWithCache(ctx, viewerUserID, newViewerPeerCache(r), peers)
+}
+
+func (r *Router) storyPeerObjectsWithCache(ctx context.Context, viewerUserID int64, cache *viewerPeerCache, peers []domain.Peer) ([]domain.User, []domain.Channel) {
 	if viewerUserID == 0 || len(peers) == 0 {
 		return nil, nil
 	}
@@ -413,7 +421,9 @@ func (r *Router) storyPeerObjects(ctx context.Context, viewerUserID int64, peers
 			}
 		}
 	}
-	cache := newViewerPeerCache(r)
+	if cache == nil {
+		cache = newViewerPeerCache(r)
+	}
 	return cache.usersForIDs(ctx, viewerUserID, mapKeys(userIDs)),
 		cache.channelsForIDs(ctx, viewerUserID, mapKeys(channelIDs))
 }
@@ -571,7 +581,7 @@ func (r *Router) applyStoryMaxIDsToPeerObjects(ctx context.Context, viewerUserID
 		peers = append(peers, peer)
 	}
 	for _, item := range users {
-		if u, ok := item.(*tg.User); ok {
+		if u, ok := item.(*tg.User); ok && u != nil && !u.Deleted {
 			addPeer(domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
 		}
 	}
@@ -583,7 +593,7 @@ func (r *Router) applyStoryMaxIDsToPeerObjects(ctx context.Context, viewerUserID
 	recent, hidden := r.storyProjectionMaps(ctx, viewerUserID, peers)
 	for _, item := range users {
 		u, ok := item.(*tg.User)
-		if !ok {
+		if !ok || u == nil || u.Deleted {
 			continue
 		}
 		peer := domain.Peer{Type: domain.PeerTypeUser, ID: u.ID}

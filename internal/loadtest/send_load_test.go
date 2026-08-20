@@ -14,14 +14,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iamxvbaba/td/tg"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	messageapp "telesrv/internal/app/messages"
 	"telesrv/internal/domain"
+	"telesrv/internal/edgecontrol"
+	"telesrv/internal/egress"
 	"telesrv/internal/mtprotoedge"
-	"telesrv/internal/rpc"
 	"telesrv/internal/store/postgres"
 	"telesrv/internal/store/redisstore"
 )
@@ -37,7 +39,7 @@ const (
 )
 
 // TestMessageSendBaseline 用真实 PostgreSQL + Redis 压测私聊文本发送热路径，
-// 并发跑 outbox dispatcher 排空在线推送，最后采样 getDifference 读路径。
+// 并发跑 Durable Egress runtime 排空在线推送，最后采样 getDifference 读路径。
 //
 // 这是 closed-loop 饱和压测：concurrency 个 worker 各自不停发，直到发满 messages 条。
 // 吞吐 = messages / wallclock，延迟分位反映该并发下的饱和延迟。
@@ -66,7 +68,6 @@ func TestMessageSendBaseline(t *testing.T) {
 	poolConns := envInt("TELESRV_LOAD_POOL_CONNS", 64)
 	workers := envInt("TELESRV_OUTBOX_WORKERS", 8)
 	outboxBatch := envInt("TELESRV_OUTBOX_BATCH", 100)
-	outboxInterval := envDuration("TELESRV_OUTBOX_INTERVAL", 50*time.Millisecond)
 	leaseTimeout := envDuration("TELESRV_OUTBOX_LEASE_TIMEOUT", 30*time.Second)
 	enforceSLO := os.Getenv("TELESRV_LOAD_ENFORCE_SLO") == "1"
 	deferDispatch := os.Getenv("TELESRV_LOAD_DEFER_DISPATCH") == "1"
@@ -101,27 +102,52 @@ func TestMessageSendBaseline(t *testing.T) {
 	t.Cleanup(func() { cleanup(t, pool, rdb, ids) })
 
 	// 在线推送 binder 用真实 SessionManager（零连接），PushToUserExceptSession 返回 0，
-	// 让 outbox 走完整 claim→ListAfter→MarkDelivered 的 PG 往返，测排空而非网络 fanout。
+	// 让 Egress 走完整 claim→ListAfter→MarkDelivered 的 PG 往返，测排空而非网络 fanout。
 	binder := mtprotoedge.NewSessionManager(zap.NewNop())
 	metrics := &loadMetrics{}
-	dispatcher := rpc.NewOutboxDispatcher(updateEventStore, dispatchOutboxStore, binder, zap.NewNop(),
-		rpc.WithOutboxWorkers(workers),
-		rpc.WithOutboxBatch(outboxBatch),
-		rpc.WithOutboxInterval(outboxInterval),
-		rpc.WithOutboxMetrics(metrics),
-	)
-	dispCtx, stopDispatcher := context.WithCancel(ctx)
-	dispDone := make(chan struct{})
-	startDispatcher := func() {
+	updateBuilder := func(_ context.Context, requests []egress.OutboxUpdateRequest) ([][]byte, error) {
+		out := make([][]byte, len(requests))
+		for i := range out {
+			raw, err := edgecontrol.EncodeOutboxUpdate(&tg.Updates{})
+			if err != nil {
+				t.Fatalf("encode loadtest outbox update: %v", err)
+			}
+			out[i] = raw
+		}
+		return out, nil
+	}
+	egressService, err := egress.NewService(updateEventStore, dispatchOutboxStore, binder, updateBuilder, metrics, zap.NewNop(), egress.Config{
+		Workers: workers,
+		Batch:   outboxBatch,
+	})
+	if err != nil {
+		t.Fatalf("new egress service: %v", err)
+	}
+	egressCtx, stopEgress := context.WithCancel(ctx)
+	egressDone := make(chan struct{})
+	listenerDone := make(chan struct{})
+	outboxWake := make(chan struct{}, 1)
+	wakeOutbox := func() {
+		select {
+		case outboxWake <- struct{}{}:
+		default:
+		}
+	}
+	startEgress := func() {
+		outboxReadyListener := postgres.NewDispatchOutboxReadyListener(dsn, zap.NewNop())
 		go func() {
-			dispatcher.Run(dispCtx)
-			close(dispDone)
+			defer close(listenerDone)
+			outboxReadyListener.Run(egressCtx, wakeOutbox)
+		}()
+		go func() {
+			egressService.RunWithWake(egressCtx, outboxWake)
+			close(egressDone)
 		}()
 	}
-	// deferDispatch=1 时先不投递，让发送把积压攒满，再在发送结束后启动 dispatcher，
-	// 以隔离测量「纯排空上限」（否则 dispatcher 实时跟上发送、积压近 0 量不出天花板）。
+	// deferDispatch=1 时先不投递，让发送把积压攒满，再在发送结束后启动 Egress，
+	// 以隔离测量「纯排空上限」（否则 Egress 实时跟上发送、积压近 0 量不出天花板）。
 	if !deferDispatch {
-		startDispatcher()
+		startEgress()
 	}
 
 	// 后台采样 outbox 积压（pending+dispatching），记录运行期峰值。
@@ -223,20 +249,21 @@ func TestMessageSendBaseline(t *testing.T) {
 	sendWall := time.Since(start)
 	deliveredAtSendEnd := metrics.delivered.Load()
 	if deferDispatch {
-		// 发送已把全部积压攒满，此刻才启动 dispatcher：drain 阶段即纯排空，drainRate 反映排空上限。
-		startDispatcher()
+		// 发送已把全部积压攒满，此刻才启动 Egress：drain 阶段即纯排空，drainRate 反映排空上限。
+		startEgress()
 	}
 
-	// 等 outbox 排空（积压回 0），记录排空耗时，再停采样和 dispatcher。
-	// 用「发送结束后」单独排空的速率隔离 dispatcher 吞吐，去掉发送期对 PG 的争用。
+	// 等 outbox 排空（积压回 0），记录排空耗时，再停采样和 Egress。
+	// 用「发送结束后」单独排空的速率隔离 Egress 吞吐，去掉发送期对 PG 的争用。
 	drainStart := time.Now()
 	drained := waitDrain(ctx, pool, ids, drainTimeout)
 	drainWall := time.Since(drainStart)
 	drainRate := float64(metrics.delivered.Load()-deliveredAtSendEnd) / drainWall.Seconds()
 	stopSampler()
 	<-sampleDone
-	stopDispatcher()
-	<-dispDone
+	stopEgress()
+	<-egressDone
+	<-listenerDone
 
 	// 合并发送延迟样本并排序。
 	latencies := make([]time.Duration, 0, totalMsgs)
@@ -255,8 +282,8 @@ func TestMessageSendBaseline(t *testing.T) {
 	diffP99 := percentile(diffLat, 99)
 
 	t.Logf("==== message module load baseline ====")
-	t.Logf("config:  users=%d concurrency=%d messages=%d pool=%d outbox(workers=%d batch=%d interval=%s lease=%s)",
-		users, concurrency, totalMsgs, poolConns, workers, outboxBatch, outboxInterval, leaseTimeout)
+	t.Logf("config:  users=%d concurrency=%d messages=%d pool=%d outbox(workers=%d batch=%d lease=%s)",
+		users, concurrency, totalMsgs, poolConns, workers, outboxBatch, leaseTimeout)
 	t.Logf("send:    %d ok, %d dup, %d err in %s -> %.0f msg/s",
 		okSent, dup.Load(), sendErr.Load(), sendWall.Round(time.Millisecond), throughput)
 	t.Logf("send.lat p50=%s p90=%s p99=%s max=%s",
@@ -310,7 +337,7 @@ func TestMessageSendBaseline(t *testing.T) {
 	}
 }
 
-// loadMetrics 实现 rpc.Metrics，统计 outbox claim/deliver/fail。
+// loadMetrics 实现 egress.Metrics，统计 outbox claim/deliver/fail。
 type loadMetrics struct {
 	claimed   atomic.Int64
 	delivered atomic.Int64

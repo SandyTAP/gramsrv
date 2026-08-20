@@ -54,8 +54,9 @@ type AccountSettingsReadModelWarmer interface {
 	WarmAccountSettingsReadModel(context.Context, int64) error
 }
 
-// BaseUserCache 是跨进程共享的 user:base 缓存(Redis)。user_base read-model 事件必须删除
-// 对应 user 键，否则 RPC 投影失效后会从陈旧的 user:base 重建(失效被未失效的源自我抵消)。
+// BaseUserCache 是跨进程共享的 user:base 缓存(Redis)。user_base/user_deleted
+// read-model 事件必须删除对应 user 键，否则 RPC 投影失效后会从陈旧的
+// user:base 重建(失效被未失效的源自我抵消)。
 // 不参与重连 flush：Redis 是跨实例共享的，整库清空是错的，漏掉的通知靠其自身 TTL 兜底。
 type BaseUserCache interface {
 	Delete(ctx context.Context, ids []int64) error
@@ -377,6 +378,22 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 	case "star_gift_catalog":
 		if l.caches.StarGifts != nil {
 			l.caches.StarGifts.InvalidateStarGiftCatalog()
+		}
+	case "user_deleted":
+		if evt.PeerType == "user" && evt.PeerID != 0 {
+			// Logical account deletion changes the target User for every viewer but
+			// deliberately keeps contacts, dialogs and memberships intact.  A coarse
+			// projection flush is bounded (the first event empties the caches; a batch
+			// of later events is O(1)) and avoids four full-map scans per deleted user.
+			if l.caches.RPCProjections != nil {
+				l.caches.RPCProjections.FlushRPCProjectionReadModel()
+			}
+			if l.caches.BaseUsers != nil {
+				if err := l.caches.BaseUsers.Delete(context.Background(), []int64{evt.PeerID}); err != nil {
+					l.log.Warn("invalidate base user cache on user_deleted event",
+						zap.Int64("user_id", evt.PeerID), zap.Error(err))
+				}
+			}
 		}
 	case "user_base":
 		if evt.PeerType == "user" && evt.PeerID != 0 {

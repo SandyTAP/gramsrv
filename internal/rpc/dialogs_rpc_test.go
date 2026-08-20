@@ -412,7 +412,7 @@ func TestDialogSettingRPCsSkipManualPushWhenReliableDispatch(t *testing.T) {
 	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), 1000000001), authKeyID), 55)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 1000000002}
 	dialogs := &captureDialogs{}
-	updates := &captureUpdates{state: domain.UpdateState{Pts: 11, Date: 1700000400, Seq: 0}, reliableDispatch: true}
+	updates := &captureUpdates{state: domain.UpdateState{Pts: 11, Date: 1700000400, Seq: 0}}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{Dialogs: dialogs, Updates: updates, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
 
@@ -440,14 +440,18 @@ func TestDialogSettingRPCsSkipManualPushWhenReliableDispatch(t *testing.T) {
 	}
 }
 
-func TestMessagesSaveDraftPushesDraftUpdateToOtherSessions(t *testing.T) {
+func TestMessagesSaveDraftRecordsDurableEventAndBookkeepsCurrentSession(t *testing.T) {
 	const (
 		userID = int64(1000000001)
 		peerID = int64(1000000002)
 	)
 	sessions := &captureScopedSessions{captureSessions: &captureSessions{}}
+	updateStore := &captureUpdates{state: domain.UpdateState{Pts: 17, Date: 1700000700}}
+	dialogs := &captureDialogs{}
 	r := New(Config{}, Deps{
+		Dialogs:  dialogs,
 		Sessions: sessions,
+		Updates:  updateStore,
 		Users: mapUsersService{users: map[int64]domain.User{
 			userID: {ID: userID, FirstName: "Alice"},
 			peerID: {ID: peerID, FirstName: "Bob"},
@@ -470,35 +474,36 @@ func TestMessagesSaveDraftPushesDraftUpdateToOtherSessions(t *testing.T) {
 	if !ok {
 		t.Fatalf("save draft = false, want true")
 	}
+	if len(updateStore.events) != 1 || updateStore.events[0].Type != domain.UpdateEventDraftMessage {
+		t.Fatalf("events = %+v, want durable draft event", updateStore.events)
+	}
+	if dialogs.savedDraft.Message != "1111" || len(dialogs.savedDraft.Entities) != 1 {
+		t.Fatalf("saved draft = %+v, want persisted message and entities", dialogs.savedDraft)
+	}
+	if updateStore.excludeSessionID != 66 {
+		t.Fatalf("exclude session = %d, want current session", updateStore.excludeSessionID)
+	}
+	if msg := sessions.lastUserPush(); msg != nil {
+		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
+	}
 
 	got := sessions.snapshot()
-	if got.userID != userID || got.sessionID != 66 || got.messageType != proto.MessageFromServer {
-		t.Fatalf("push = user %d exclude session %d type %v, want self/exclude/from_server", got.userID, got.sessionID, got.messageType)
+	if got.sessionID != 66 || got.messageType != proto.MessageFromServer {
+		t.Fatalf("current-session push = session %d type %v, want current/from_server", got.sessionID, got.messageType)
 	}
 	if gotAuthKeyID := sessions.scopedAuthKey(); gotAuthKeyID != authKeyID {
-		t.Fatalf("exclude auth_key_id = %x, want %x", gotAuthKeyID, authKeyID)
+		t.Fatalf("current auth_key_id = %x, want %x", gotAuthKeyID, authKeyID)
 	}
-	updates, ok := got.message.(*tg.Updates)
+	bookkeeping, ok := got.message.(*tg.Updates)
 	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", got.message)
+		t.Fatalf("bookkeeping message = %T, want *tg.Updates", got.message)
 	}
-	if len(updates.Updates) != 1 {
-		t.Fatalf("updates = %+v, want one update", updates.Updates)
+	if len(bookkeeping.Updates) != 1 {
+		t.Fatalf("bookkeeping updates = %+v, want one update", bookkeeping.Updates)
 	}
-	update, ok := updates.Updates[0].(*tg.UpdateDraftMessage)
-	if !ok {
-		t.Fatalf("update = %T, want *tg.UpdateDraftMessage", updates.Updates[0])
-	}
-	peer, ok := update.Peer.(*tg.PeerUser)
-	if !ok || peer.UserID != peerID {
-		t.Fatalf("draft peer = %#v, want peer user %d", update.Peer, peerID)
-	}
-	draft, ok := update.Draft.(*tg.DraftMessage)
-	if !ok || draft.Message != "1111" || len(draft.Entities) != 1 {
-		t.Fatalf("draft = %#v, want message and entities", update.Draft)
-	}
-	if len(updates.Users) != 2 {
-		t.Fatalf("users = %+v, want self and peer", updates.Users)
+	deleteUpdate, ok := bookkeeping.Updates[0].(*tg.UpdateDeleteMessages)
+	if !ok || len(deleteUpdate.Messages) != 0 || deleteUpdate.Pts != 17 || deleteUpdate.PtsCount != 1 {
+		t.Fatalf("bookkeeping update = %#v, want empty updateDeleteMessages pts=17", bookkeeping.Updates[0])
 	}
 }
 
@@ -741,7 +746,7 @@ func TestMessagesGetDialogsIncludesCloudDraft(t *testing.T) {
 	}
 }
 
-func TestMessagesClearAllDraftsClearsAndPushesEmptyUpdates(t *testing.T) {
+func TestMessagesClearAllDraftsRecordsDurableEventsAndBookkeepsCurrentSession(t *testing.T) {
 	const (
 		userID = int64(1000000001)
 		peerID = int64(1000000002)
@@ -752,9 +757,11 @@ func TestMessagesClearAllDraftsClearsAndPushesEmptyUpdates(t *testing.T) {
 		Message: "draft",
 	}}}
 	sessions := &captureScopedSessions{captureSessions: &captureSessions{}}
+	updateStore := &captureUpdates{state: domain.UpdateState{Pts: 21, Date: 1700000800}}
 	r := New(Config{}, Deps{
 		Dialogs:  dialogs,
 		Sessions: sessions,
+		Updates:  updateStore,
 		Users: mapUsersService{users: map[int64]domain.User{
 			userID: {ID: userID, FirstName: "Alice"},
 			peerID: {ID: peerID, FirstName: "Bob"},
@@ -764,17 +771,20 @@ func TestMessagesClearAllDraftsClearsAndPushesEmptyUpdates(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("clear all drafts = %v, %v", ok, err)
 	}
+	if len(updateStore.events) != 1 || updateStore.events[0].Type != domain.UpdateEventDraftMessage {
+		t.Fatalf("events = %+v, want durable draft clear event", updateStore.events)
+	}
+	if msg := sessions.lastUserPush(); msg != nil {
+		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
+	}
 	got := sessions.snapshot()
-	updates, ok := got.message.(*tg.Updates)
-	if !ok || len(updates.Updates) != 1 {
+	bookkeeping, ok := got.message.(*tg.Updates)
+	if !ok || len(bookkeeping.Updates) != 1 {
 		t.Fatalf("pushed = %T %+v, want one update", got.message, got.message)
 	}
-	update, ok := updates.Updates[0].(*tg.UpdateDraftMessage)
-	if !ok {
-		t.Fatalf("update = %T", updates.Updates[0])
-	}
-	if _, ok := update.Draft.(*tg.DraftMessageEmpty); !ok {
-		t.Fatalf("draft = %#v, want draftMessageEmpty", update.Draft)
+	deleteUpdate, ok := bookkeeping.Updates[0].(*tg.UpdateDeleteMessages)
+	if !ok || len(deleteUpdate.Messages) != 0 || deleteUpdate.Pts != 21 || deleteUpdate.PtsCount != 1 {
+		t.Fatalf("bookkeeping update = %#v, want empty updateDeleteMessages pts=21", bookkeeping.Updates[0])
 	}
 	if len(dialogs.drafts) != 0 {
 		t.Fatalf("capture drafts = %+v, want cleared", dialogs.drafts)

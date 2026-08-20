@@ -42,7 +42,10 @@ func (r *Router) onMessagesSavePreparedInlineMessage(ctx context.Context, req *t
 	if err != nil {
 		return nil, err
 	}
-	id, expireDate := r.inlines.savePreparedInlineContext(ctx, r.clock.Now(), botID, target.ID, result, peerTypes)
+	id, expireDate, err := r.inlines.savePreparedInlineContext(ctx, r.clock.Now(), botID, target.ID, result, peerTypes)
+	if err != nil {
+		return nil, internalErr()
+	}
 	return &tg.MessagesBotPreparedInlineMessage{
 		ID:         id,
 		ExpireDate: expireDate,
@@ -277,7 +280,9 @@ func (r *Router) editChannelInlineBotMessage(ctx context.Context, botID int64, t
 	if err != nil {
 		return false, channelEditErr(err)
 	}
-	r.enqueueChannelEditMessageFanout(ctx, target.SenderUserID, res)
+	if err := r.enqueueChannelEditMessageFanout(ctx, target.SenderUserID, res); err != nil {
+		return false, internalErr()
+	}
 	return true, nil
 }
 

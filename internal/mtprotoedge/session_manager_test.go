@@ -16,6 +16,8 @@ import (
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
+
+	"telesrv/internal/edgecontrol"
 )
 
 type closeCountingTransport struct {
@@ -30,6 +32,97 @@ func (*sessionDestructionRecorder) SessionOffline([8]byte, int64, int64, bool) {
 
 func (r *sessionDestructionRecorder) SessionDestroyed(authKeyID [8]byte, sessionID int64) {
 	r.destroyed = append(r.destroyed, sessionKey{authKeyID: authKeyID, sessionID: sessionID})
+}
+
+func TestConnChannelDeliveryWatermarkSkipsDuplicatesAndOverlaps(t *testing.T) {
+	c := &Conn{}
+	payload5 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 5, MaxPts: 5}
+	if !c.claimChannelDeliveryWatermark(payload5) {
+		t.Fatal("first payload watermark claim rejected")
+	}
+	if c.claimChannelDeliveryWatermark(payload5) {
+		t.Fatal("duplicate payload watermark accepted")
+	}
+
+	nudge5 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryNudge, ChannelID: 1001, MinPts: 5, MaxPts: 5}
+	if !c.claimChannelDeliveryWatermark(nudge5) {
+		t.Fatal("first nudge watermark claim rejected")
+	}
+	if c.claimChannelDeliveryWatermark(nudge5) {
+		t.Fatal("duplicate nudge watermark accepted")
+	}
+
+	payload6to7 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 6, MaxPts: 7}
+	if !c.claimChannelDeliveryWatermark(payload6to7) {
+		t.Fatal("next non-overlapping payload range rejected")
+	}
+	overlap7to8 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 7, MaxPts: 8}
+	if c.claimChannelDeliveryWatermark(overlap7to8) {
+		t.Fatal("overlapping payload range accepted without splitting")
+	}
+
+	c.clearChannelDeliveryWatermarks()
+	if !c.claimChannelDeliveryWatermark(payload5) {
+		t.Fatal("payload watermark rejected after clear")
+	}
+}
+
+func TestConnChannelDeliveryWatermarkReservationRollback(t *testing.T) {
+	c := &Conn{}
+	payload5 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 5, MaxPts: 5}
+	claim, ok := c.reserveChannelDeliveryWatermark(payload5)
+	if !ok {
+		t.Fatal("reserve payload watermark rejected")
+	}
+	claim.rollback()
+	if !c.claimChannelDeliveryWatermark(payload5) {
+		t.Fatal("payload watermark was not restored after rollback")
+	}
+
+	payload6to7 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 6, MaxPts: 7}
+	claim, ok = c.reserveChannelDeliveryWatermark(payload6to7)
+	if !ok {
+		t.Fatal("reserve next payload range rejected")
+	}
+	payload8 := edgecontrol.ChannelDeliveryWatermark{Kind: edgecontrol.ChannelDeliveryPayload, ChannelID: 1001, MinPts: 8, MaxPts: 8}
+	next, ok := c.reserveChannelDeliveryWatermark(payload8)
+	if !ok {
+		t.Fatal("reserve higher payload range rejected")
+	}
+	next.commit()
+	claim.rollback()
+	if c.claimChannelDeliveryWatermark(payload8) {
+		t.Fatal("stale rollback clobbered higher committed watermark")
+	}
+}
+
+func TestConnChannelDeliveryWatermarkEvictsInsteadOfDroppingNewChannel(t *testing.T) {
+	c := &Conn{}
+	for channelID := int64(1); channelID <= maxChannelDeliveryWatermarksPerSession; channelID++ {
+		if !c.claimChannelDeliveryWatermark(edgecontrol.ChannelDeliveryWatermark{
+			Kind:      edgecontrol.ChannelDeliveryPayload,
+			ChannelID: channelID,
+			MinPts:    1,
+			MaxPts:    1,
+		}) {
+			t.Fatalf("initial watermark rejected for channel %d", channelID)
+		}
+	}
+	newChannelID := int64(maxChannelDeliveryWatermarksPerSession + 1)
+	if !c.claimChannelDeliveryWatermark(edgecontrol.ChannelDeliveryWatermark{
+		Kind:      edgecontrol.ChannelDeliveryPayload,
+		ChannelID: newChannelID,
+		MinPts:    1,
+		MaxPts:    1,
+	}) {
+		t.Fatal("new channel watermark was dropped when the bounded table was full")
+	}
+	if got := len(c.channelPayloadPts); got != maxChannelDeliveryWatermarksPerSession {
+		t.Fatalf("watermark table size = %d, want %d", got, maxChannelDeliveryWatermarksPerSession)
+	}
+	if got := c.channelPayloadPts[newChannelID]; got != 1 {
+		t.Fatalf("new channel watermark = %d, want 1", got)
+	}
 }
 
 type slowCloseTransport struct {
@@ -74,6 +167,185 @@ func (t *closeCountingTransport) Close() error {
 	return nil
 }
 
+type captureLocationRegistry struct {
+	mu sync.Mutex
+
+	records           map[sessionKey]edgecontrol.LocationRecord
+	batches           [][]edgecontrol.LocationMutation
+	memberships       map[int64]edgecontrol.ChannelMembershipRecord
+	membershipBatches [][]edgecontrol.ChannelMembershipMutation
+
+	leaseID      string
+	acquireErr   error
+	renewErr     error
+	applyErr     error
+	acquireCalls int
+	renewCalls   int
+	applyCalls   int
+	releaseCalls int
+	called       chan struct{}
+}
+
+func newCaptureLocationRegistry() *captureLocationRegistry {
+	return &captureLocationRegistry{
+		records:     make(map[sessionKey]edgecontrol.LocationRecord),
+		memberships: make(map[int64]edgecontrol.ChannelMembershipRecord),
+		called:      make(chan struct{}, 32),
+	}
+}
+
+func (r *captureLocationRegistry) AcquireInstanceLease(_ context.Context, _, leaseID string, _ time.Duration) error {
+	r.mu.Lock()
+	r.acquireCalls++
+	err := r.acquireErr
+	if err == nil {
+		r.leaseID = leaseID
+	}
+	r.mu.Unlock()
+	r.signal()
+	return err
+}
+
+func (r *captureLocationRegistry) RenewInstanceLease(_ context.Context, _, leaseID string, _ time.Duration) error {
+	r.mu.Lock()
+	r.renewCalls++
+	err := r.renewErr
+	if err == nil && r.leaseID != leaseID {
+		err = edgecontrol.ErrLocationLeaseLost
+	}
+	r.mu.Unlock()
+	r.signal()
+	return err
+}
+
+func (r *captureLocationRegistry) ApplyLocationMutations(_ context.Context, _, leaseID string, mutations []edgecontrol.LocationMutation) error {
+	r.mu.Lock()
+	r.applyCalls++
+	err := r.applyErr
+	if err == nil && r.leaseID != leaseID {
+		err = edgecontrol.ErrLocationLeaseLost
+	}
+	batch := append([]edgecontrol.LocationMutation(nil), mutations...)
+	r.batches = append(r.batches, batch)
+	if err == nil {
+		for _, mutation := range mutations {
+			key := sessionKey{authKeyID: mutation.Record.RawAuthKeyID, sessionID: mutation.Record.SessionID}
+			if mutation.Deleted {
+				delete(r.records, key)
+			} else {
+				r.records[key] = mutation.Record
+			}
+		}
+	}
+	r.mu.Unlock()
+	r.signal()
+	return err
+}
+
+func (r *captureLocationRegistry) ApplyChannelMembershipMutations(_ context.Context, _, leaseID string, mutations []edgecontrol.ChannelMembershipMutation) error {
+	r.mu.Lock()
+	err := r.applyErr
+	if err == nil && r.leaseID != leaseID {
+		err = edgecontrol.ErrLocationLeaseLost
+	}
+	batch := append([]edgecontrol.ChannelMembershipMutation(nil), mutations...)
+	r.membershipBatches = append(r.membershipBatches, batch)
+	if err == nil {
+		for _, mutation := range mutations {
+			if mutation.Deleted {
+				delete(r.memberships, mutation.Record.UserID)
+			} else {
+				r.memberships[mutation.Record.UserID] = mutation.Record
+			}
+		}
+	}
+	r.mu.Unlock()
+	r.signal()
+	return err
+}
+
+func (r *captureLocationRegistry) ReleaseInstanceLease(_ context.Context, _, leaseID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseCalls++
+	if r.leaseID != leaseID {
+		return edgecontrol.ErrLocationLeaseLost
+	}
+	r.leaseID = ""
+	clear(r.records)
+	clear(r.memberships)
+	return nil
+}
+
+func (r *captureLocationRegistry) ListUser(context.Context, int64) ([]edgecontrol.LocationRecord, error) {
+	return nil, nil
+}
+
+func (r *captureLocationRegistry) ListBusinessAuthKey(context.Context, [8]byte) ([]edgecontrol.LocationRecord, error) {
+	return nil, nil
+}
+
+func (r *captureLocationRegistry) ListInstance(context.Context, string) ([]edgecontrol.LocationRecord, error) {
+	return nil, nil
+}
+
+func (r *captureLocationRegistry) snapshot() ([]edgecontrol.LocationRecord, int, int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	records := make([]edgecontrol.LocationRecord, 0, len(r.records))
+	for _, record := range r.records {
+		records = append(records, record)
+	}
+	return records, r.acquireCalls, r.renewCalls, r.applyCalls
+}
+
+func (r *captureLocationRegistry) setApplyErr(err error) {
+	r.mu.Lock()
+	r.applyErr = err
+	r.mu.Unlock()
+}
+
+func (r *captureLocationRegistry) setRenewErr(err error) {
+	r.mu.Lock()
+	r.renewErr = err
+	r.mu.Unlock()
+}
+
+func (r *captureLocationRegistry) resetBatches() {
+	r.mu.Lock()
+	r.batches = nil
+	r.membershipBatches = nil
+	r.applyCalls = 0
+	r.mu.Unlock()
+}
+
+func (r *captureLocationRegistry) membershipSnapshot() (map[int64]edgecontrol.ChannelMembershipRecord, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	records := make(map[int64]edgecontrol.ChannelMembershipRecord, len(r.memberships))
+	for userID, record := range r.memberships {
+		record.ChannelIDs = append([]int64(nil), record.ChannelIDs...)
+		records[userID] = record
+	}
+	return records, len(r.membershipBatches)
+}
+
+func (r *captureLocationRegistry) lastBatch() []edgecontrol.LocationMutation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.batches) == 0 {
+		return nil
+	}
+	return append([]edgecontrol.LocationMutation(nil), r.batches[len(r.batches)-1]...)
+}
+
+func (r *captureLocationRegistry) signal() {
+	select {
+	case r.called <- struct{}{}:
+	default:
+	}
+}
+
 // TestSessionManagerRegistry 验证注册表的注册/注销/查找语义（不涉及网络发送）。
 func TestSessionManagerRegistry(t *testing.T) {
 	sm := NewSessionManager(zaptest.NewLogger(t))
@@ -112,6 +384,289 @@ func TestSessionManagerRegistry(t *testing.T) {
 	}
 }
 
+func TestSessionManagerActiveLocationRecords(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	rawAuthKeyID := [8]byte{1, 2, 3}
+	businessAuthKeyID := [8]byte{9, 8, 7}
+	const sessionID = int64(42)
+	const userID = int64(1000000002)
+	c := &Conn{sessionID: sessionID, authKeyID: rawAuthKeyID}
+	if err := sm.Register(c); err != nil {
+		t.Fatalf("Register err = %v", err)
+	}
+	sm.BindAuthKeyForSession(rawAuthKeyID, sessionID, businessAuthKeyID)
+	sm.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
+	sm.SetClientLayerForAuthKey(rawAuthKeyID, sessionID, 228)
+	sm.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, true)
+
+	records := sm.ActiveLocationRecords("edge-a")
+	if len(records) != 1 {
+		t.Fatalf("location records = %+v, want one", records)
+	}
+	got := records[0]
+	if got.InstanceID != "edge-a" ||
+		got.RawAuthKeyID != rawAuthKeyID ||
+		got.BusinessAuthKeyID != businessAuthKeyID ||
+		got.SessionID != sessionID ||
+		got.UserID != userID ||
+		!got.ReceivesUpdates ||
+		got.Layer != 228 {
+		t.Fatalf("location record = %+v, want active session identity/layer", got)
+	}
+
+	sm.Unregister(c)
+	if records := sm.ActiveLocationRecords("edge-a"); len(records) != 0 {
+		t.Fatalf("records after unregister = %+v, want empty", records)
+	}
+}
+
+func TestSessionManagerLocationRegistryPublishesSnapshotAndRenewsOneInstanceLease(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	const sessions = 64
+	for i := 0; i < sessions; i++ {
+		c := &Conn{sessionID: int64(i + 1), authKeyID: [8]byte{byte(i + 1)}}
+		if err := sm.Register(c); err != nil {
+			t.Fatalf("Register(%d) err = %v", i, err)
+		}
+	}
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-b", time.Second, 20*time.Millisecond); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	records, acquireCalls, _, applyCalls := registry.snapshot()
+	if len(records) != sessions || acquireCalls != 1 || applyCalls != 1 {
+		t.Fatalf("initial locations=%d acquire=%d apply=%d, want %d/1/1", len(records), acquireCalls, applyCalls, sessions)
+	}
+	deadline := time.After(time.Second)
+	for {
+		_, _, renewCalls, currentApplyCalls := registry.snapshot()
+		if renewCalls >= 2 {
+			if currentApplyCalls != 1 {
+				t.Fatalf("lease renew rewrote session snapshots: apply calls = %d, want 1", currentApplyCalls)
+			}
+			return
+		}
+		select {
+		case <-registry.called:
+		case <-deadline:
+			t.Fatal("instance lease was not renewed")
+		}
+	}
+}
+
+func TestSessionManagerLocationRegistryStartFailsWithoutLease(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	registry := newCaptureLocationRegistry()
+	registry.acquireErr = errors.New("redis unavailable")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-down", time.Minute, 20*time.Second); err == nil {
+		t.Fatal("StartLocationRegistry err = nil, want lease acquisition failure")
+	}
+}
+
+func TestSessionManagerLocationMutationFailureKeepsLeasedSessions(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-lease", time.Minute, 20*time.Second); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	firstTransport := newSlowCloseTransport(0, nil)
+	first := &Conn{sessionID: 44, authKeyID: [8]byte{4, 4, 4}, transport: firstTransport}
+	if err := sm.Register(first); err != nil {
+		t.Fatalf("register leased session: %v", err)
+	}
+	registry.setApplyErr(errors.New("redis unavailable"))
+	second := &Conn{sessionID: 55, authKeyID: [8]byte{5, 5, 5}, transport: newSlowCloseTransport(0, nil)}
+	if err := sm.Register(second); err == nil {
+		t.Fatal("register unpublished session err = nil")
+	}
+	if got := sm.Online(); got != 1 {
+		t.Fatalf("online after one location mutation failure = %d, want existing session only", got)
+	}
+	if got := firstTransport.closes.Load(); got != 0 {
+		t.Fatalf("leased transport closes = %d, want 0", got)
+	}
+}
+
+func TestSessionManagerTransientLocationLeaseRenewFailureKeepsSessions(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-transient", time.Minute, 20*time.Second); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	transports := []*slowCloseTransport{newSlowCloseTransport(0, nil), newSlowCloseTransport(0, nil)}
+	for i, transport := range transports {
+		if err := sm.Register(&Conn{sessionID: int64(i + 1), authKeyID: [8]byte{byte(i + 1)}, transport: transport}); err != nil {
+			t.Fatalf("register session %d: %v", i, err)
+		}
+	}
+
+	state := sm.locationState.Load()
+	registry.setRenewErr(errors.New("redis temporarily unavailable"))
+	if state.renew(sm) {
+		t.Fatal("transient failed renewal reported success")
+	}
+	select {
+	case err := <-sm.LocationRegistryFatal():
+		t.Fatalf("transient renewal failure reported fatal error: %v", err)
+	default:
+	}
+	if got := sm.Online(); got != len(transports) {
+		t.Fatalf("online after transient renewal failure = %d, want %d", got, len(transports))
+	}
+	for i, transport := range transports {
+		if got := transport.closes.Load(); got != 0 {
+			t.Fatalf("transport %d closes after transient renewal failure = %d, want 0", i, got)
+		}
+	}
+
+	registry.setRenewErr(nil)
+	if !state.renew(sm) {
+		t.Fatal("renewal did not recover after transient failure")
+	}
+}
+
+func TestSessionManagerLocationLeaseLossFailsClosed(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-lost", time.Minute, 20*time.Second); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	transports := []*slowCloseTransport{newSlowCloseTransport(0, nil), newSlowCloseTransport(0, nil)}
+	for i, transport := range transports {
+		if err := sm.Register(&Conn{sessionID: int64(i + 1), authKeyID: [8]byte{byte(i + 1)}, transport: transport}); err != nil {
+			t.Fatalf("register session %d: %v", i, err)
+		}
+	}
+	registry.setRenewErr(errors.New("redis unavailable"))
+	state := sm.locationState.Load()
+	state.setLeaseExpiry(time.Now().Add(-time.Second))
+	state.renew(sm)
+	select {
+	case err := <-sm.LocationRegistryFatal():
+		if !errors.Is(err, edgecontrol.ErrLocationLeaseLost) {
+			t.Fatalf("location fatal error = %v, want ErrLocationLeaseLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("location lease loss did not notify Edge runtime")
+	}
+	for i, transport := range transports {
+		select {
+		case <-transport.done:
+		case <-time.After(time.Second):
+			t.Fatalf("transport %d was not closed after lease loss", i)
+		}
+	}
+}
+
+func TestSessionManagerLocationRegistryPublishesOnlyChangedSession(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	firstRaw := [8]byte{6, 6, 6}
+	secondRaw := [8]byte{8, 8, 8}
+	businessAuthKeyID := [8]byte{7, 7, 7}
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-c", time.Minute, 20*time.Second); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	first := &Conn{sessionID: 88, authKeyID: firstRaw}
+	second := &Conn{sessionID: 99, authKeyID: secondRaw}
+	for _, conn := range []*Conn{first, second} {
+		if err := sm.Register(conn); err != nil {
+			t.Fatalf("Register err = %v", err)
+		}
+	}
+	registry.resetBatches()
+	sm.BindAuthKeyForSession(firstRaw, 88, businessAuthKeyID)
+	sm.BindUserForAuthKey(firstRaw, 88, 1000000004)
+	batch := registry.lastBatch()
+	if len(batch) != 1 {
+		t.Fatalf("identity refresh mutations = %+v, want one changed session", batch)
+	}
+	got := batch[0].Record
+	if got.RawAuthKeyID != firstRaw || got.SessionID != 88 || got.BusinessAuthKeyID != businessAuthKeyID || got.UserID != 1000000004 {
+		t.Fatalf("identity refresh record = %+v", got)
+	}
+	registry.resetBatches()
+	sm.Unregister(second)
+	batch = registry.lastBatch()
+	if len(batch) != 1 || !batch[0].Deleted || batch[0].Record.RawAuthKeyID != secondRaw || batch[0].Record.SessionID != 99 {
+		t.Fatalf("unregister mutations = %+v, want one deleted session", batch)
+	}
+}
+
+func TestSessionManagerChannelMembershipProjectionIsUserScopedAndIndependent(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	registry := newCaptureLocationRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sm.StartLocationRegistry(ctx, registry, "edge-membership", time.Minute, 20*time.Second); err != nil {
+		t.Fatalf("StartLocationRegistry err = %v", err)
+	}
+	const userID = int64(1000000042)
+	firstRaw := [8]byte{0x41}
+	first := &Conn{sessionID: 41, authKeyID: firstRaw}
+	if err := sm.Register(first); err != nil {
+		t.Fatal(err)
+	}
+	sm.BindUserForAuthKey(firstRaw, first.sessionID, userID)
+	channelIDs := make([]int64, 9000)
+	for i := range channelIDs {
+		channelIDs[i] = int64(i + 1)
+	}
+	if !syncTestSessionChannelMemberships(t, sm, firstRaw, first.sessionID, userID, channelIDs) {
+		t.Fatal("large membership sync did not commit")
+	}
+	memberships, batches := registry.membershipSnapshot()
+	if got := memberships[userID]; len(got.ChannelIDs) != len(channelIDs) || batches != 1 {
+		t.Fatalf("published membership channels=%d batches=%d, want %d/1", len(got.ChannelIDs), batches, len(channelIDs))
+	}
+
+	// A session-only interest mutation must not reindex the 9000 memberships.
+	registry.resetBatches()
+	sm.TrackChannelInterest(firstRaw, first.sessionID, userID, []int64{99999})
+	if _, batches := registry.membershipSnapshot(); batches != 0 {
+		t.Fatalf("session location mutation rewrote membership batches=%d", batches)
+	}
+
+	// A second session on the same Edge reuses the first session's baseline and
+	// must not publish another (instance,user) membership record.
+	secondRaw := [8]byte{0x42}
+	second := &Conn{sessionID: 42, authKeyID: secondRaw}
+	if err := sm.Register(second); err != nil {
+		t.Fatal(err)
+	}
+	sm.BindUserForAuthKey(secondRaw, second.sessionID, userID)
+	if !syncTestSessionChannelMemberships(t, sm, secondRaw, second.sessionID, userID, nil) {
+		t.Fatal("second session did not reuse membership baseline")
+	}
+	if _, batches := registry.membershipSnapshot(); batches != 0 {
+		t.Fatalf("second session duplicated membership batches=%d", batches)
+	}
+
+	// Removing one of two equivalent sessions is a projection no-op. Removing
+	// the last session deletes the single user-level membership projection.
+	sm.Unregister(first)
+	if _, batches := registry.membershipSnapshot(); batches != 0 {
+		t.Fatalf("first session removal rewrote membership batches=%d", batches)
+	}
+	sm.Unregister(second)
+	memberships, batches = registry.membershipSnapshot()
+	if len(memberships) != 0 || batches != 1 {
+		t.Fatalf("last session removal memberships=%v batches=%d, want empty/1", memberships, batches)
+	}
+}
+
 func TestBindAuthKeyForRawAuthKeyUpdatesEveryTemporarySession(t *testing.T) {
 	sm := NewSessionManager(zaptest.NewLogger(t))
 	raw := [8]byte{0x71}
@@ -143,6 +698,56 @@ func TestBindAuthKeyForRawAuthKeyUpdatesEveryTemporarySession(t *testing.T) {
 		if got, found := sm.AuthKeyExpiresAtForSession(raw, sessionID); !found || got != expiresAt {
 			t.Fatalf("session %d raw expiry = %d/%v, want %d", sessionID, got, found, expiresAt)
 		}
+	}
+}
+
+func TestRawAuthKeyIdentityUpdatesAndInheritsAcrossSessions(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	raw := [8]byte{0x72}
+	perm := [8]byte{0x32}
+	const userID = int64(1001)
+	first := &Conn{sessionID: 201, authKeyID: raw}
+	second := &Conn{sessionID: 202, authKeyID: raw}
+	if err := sm.Register(first); err != nil {
+		t.Fatalf("register first: %v", err)
+	}
+	if err := sm.Register(second); err != nil {
+		t.Fatalf("register second: %v", err)
+	}
+
+	sm.BindAuthKeyForSession(raw, first.sessionID, perm)
+	if got, ok := sm.AuthKeyIDForSession(raw, second.sessionID); !ok || got != perm {
+		t.Fatalf("second session business key = %x/%v, want %x/true", got, ok, perm)
+	}
+
+	sm.BindUserForAuthKey(raw, first.sessionID, userID)
+	if got, ok := sm.UserIDResolvedForAuthKey(raw, second.sessionID); !ok || got != userID {
+		t.Fatalf("second session user = %d/%v, want %d/true", got, ok, userID)
+	}
+
+	third := &Conn{sessionID: 203, authKeyID: raw}
+	if err := sm.Register(third); err != nil {
+		t.Fatalf("register third: %v", err)
+	}
+	if got, ok := sm.AuthKeyIDForSession(raw, third.sessionID); !ok || got != perm {
+		t.Fatalf("third session inherited business key = %x/%v, want %x/true", got, ok, perm)
+	}
+	if got, ok := sm.UserIDResolvedForAuthKey(raw, third.sessionID); !ok || got != userID {
+		t.Fatalf("third session inherited user = %d/%v, want %d/true", got, ok, userID)
+	}
+
+	if got := sm.UnbindAuthKey(perm); got != 3 {
+		t.Fatalf("unbind affected = %d, want 3", got)
+	}
+	afterUnbind := &Conn{sessionID: 204, authKeyID: raw}
+	if err := sm.Register(afterUnbind); err != nil {
+		t.Fatalf("register after unbind: %v", err)
+	}
+	if got, ok := sm.AuthKeyIDForSession(raw, afterUnbind.sessionID); !ok || got != perm {
+		t.Fatalf("post-unbind session business key = %x/%v, want %x/true", got, ok, perm)
+	}
+	if got, ok := sm.UserIDResolvedForAuthKey(raw, afterUnbind.sessionID); ok || got != 0 {
+		t.Fatalf("post-unbind session user = %d/%v, want unresolved", got, ok)
 	}
 }
 
@@ -814,7 +1419,7 @@ func TestSessionManagerChannelInterestIndex(t *testing.T) {
 	if got := sm.OnlineChannelMemberUserIDs(10, 10); len(got) != 0 {
 		t.Fatalf("channel 10 online members before membership sync = %v, want empty", got)
 	}
-	sm.SetSessionChannelMemberships(raw, 42, 100, []int64{10, 30}, sm.ChannelMembershipGeneration(raw, 42))
+	syncTestSessionChannelMemberships(t, sm, raw, 42, 100, []int64{10, 30})
 	if got := sm.OnlineChannelMemberUserIDs(10, 10); len(got) != 1 || got[0] != 100 {
 		t.Fatalf("channel 10 online members = %v, want [100]", got)
 	}
@@ -915,7 +1520,7 @@ func TestSessionManagerClearsChannelIndexesOnAuthAndReadinessChanges(t *testing.
 	track := func() {
 		sm.TrackChannelInterest(raw, 42, 100, []int64{10})
 		sm.RefreshChannelSubscription(raw, 42, 100, 10, time.Second)
-		sm.SetSessionChannelMemberships(raw, 42, 100, []int64{10}, sm.ChannelMembershipGeneration(raw, 42))
+		syncTestSessionChannelMemberships(t, sm, raw, 42, 100, []int64{10})
 		if got := sm.OnlineChannelUserIDs(10, 10); len(got) != 1 || got[0] != 100 {
 			t.Fatalf("channel viewers before cleanup = %v, want [100]", got)
 		}

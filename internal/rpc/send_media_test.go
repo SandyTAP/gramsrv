@@ -43,6 +43,10 @@ type fakeFiles struct {
 	getFileChunk       domain.FileChunk
 	getFileFound       bool
 	getFileCalls       int
+	getFileHashRequest domain.FileHashRequest
+	getFileHashes      []domain.FileHash
+	getFileHashesFound bool
+	getFileHashCalls   int
 }
 
 type fakeProfilePhotoKey struct {
@@ -69,6 +73,11 @@ func (f *fakeFiles) GetFile(_ context.Context, req domain.FileDownloadRequest) (
 	f.getFileCalls++
 	f.getFileRequest = req
 	return f.getFileChunk, f.getFileFound, nil
+}
+func (f *fakeFiles) GetFileHashes(_ context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error) {
+	f.getFileHashCalls++
+	f.getFileHashRequest = req
+	return append([]domain.FileHash(nil), f.getFileHashes...), f.getFileHashesFound, nil
 }
 func (f *fakeFiles) CreateEncryptedFileFromUpload(context.Context, domain.UploadedFileRef, int) (domain.EncryptedFileRef, error) {
 	return domain.EncryptedFileRef{ID: 9001, AccessHash: 9002, Size: 16, DCID: 2, KeyFingerprint: 7}, nil

@@ -74,7 +74,10 @@ func (r *Router) onEphemeralSendMessage(ctx context.Context, request *tg.Ephemer
 	if err != nil {
 		return nil, ephemeralRPCError(err)
 	}
-	if fresh && r.deps.BotAPIUpdates != nil {
+	if fresh {
+		if r.deps.BotAPIUpdates == nil {
+			return nil, internalErr()
+		}
 		if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
 			BotUserID: receiver.ID,
 			Kind:      domain.BotAPIUpdateMessage,
@@ -149,21 +152,22 @@ func (r *Router) onEphemeralGetCallbackAnswer(ctx context.Context, request *tg.E
 		Peer: peer, MessageID: request.ID, ChatInstance: chatInstanceForPeer(callback.BotUserID, peer),
 		Data: append([]byte(nil), data...),
 	}
-	if r.deps.BotAPIUpdates != nil {
-		if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
-			BotUserID: callback.BotUserID,
-			Kind:      domain.BotAPIUpdateCallbackQuery,
-			Peer:      peer,
-			MessageID: request.ID,
-			Date:      int(callback.OccurredAt.Unix()),
-			Callback:  &botCallback,
-			Ephemeral: domain.NewBotAPIEphemeralPayload(callback.Message),
-		}); err != nil {
-			r.log.Warn("enqueue bot api ephemeral callback query", zap.Int64("bot_user_id", callback.BotUserID), zap.Int64("query_id", queryID), zap.Error(err))
-			return nil, internalErr()
-		} else if created {
-			r.notifyBotAPIUpdate(callback.BotUserID)
-		}
+	if r.deps.BotAPIUpdates == nil {
+		return nil, internalErr()
+	}
+	if _, created, err := r.deps.BotAPIUpdates.EnqueueBotAPIUpdate(ctx, domain.EnqueueBotAPIUpdateRequest{
+		BotUserID: callback.BotUserID,
+		Kind:      domain.BotAPIUpdateCallbackQuery,
+		Peer:      peer,
+		MessageID: request.ID,
+		Date:      int(callback.OccurredAt.Unix()),
+		Callback:  &botCallback,
+		Ephemeral: domain.NewBotAPIEphemeralPayload(callback.Message),
+	}); err != nil {
+		r.log.Warn("enqueue bot api ephemeral callback query", zap.Int64("bot_user_id", callback.BotUserID), zap.Int64("query_id", queryID), zap.Error(err))
+		return nil, internalErr()
+	} else if created {
+		r.notifyBotAPIUpdate(callback.BotUserID)
 	}
 
 	r.publishEphemeralPush(ctx, store.EphemeralPush{

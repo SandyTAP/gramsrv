@@ -53,10 +53,12 @@ func (r *Router) onPhoneJoinGroupCallPresentation(ctx context.Context, req *tg.P
 		AudioSource:  ssrc,
 	}
 	// 媒体面先行：独立第二 endpoint（重复 join 替换式幂等——rejoinPresentation
-	// 会带同一套 ufrag/ssrc 重发）。
-	sfuService := r.deps.SFU
-	if sfuService == nil {
-		sfuService = sfu.Disabled()
+	// 会带同一套 ufrag/ssrc 重发）。依赖缺失必须 fail-fast，不能自动降级为
+	// Disabled 纯信令 fallback。
+	sfuService, err := r.requireGroupCallSFU()
+	if err != nil {
+		r.log.Error("group call presentation sfu dependency missing", zap.Error(err))
+		return nil, internalErr()
 	}
 	answer, err := sfuService.Join(ctx, scope.call.ID, scope.userID, sfu.EndpointPresentation, offer)
 	if err != nil {

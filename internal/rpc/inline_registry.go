@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+var errInlineRegistryStoreRequired = errors.New("INLINE_REGISTRY_STORE_REQUIRED")
 
 type inlineRegistry struct {
 	mu              sync.Mutex
@@ -91,14 +94,19 @@ func newInlineRegistry(ttl time.Duration, shared ...store.InlineRegistryStore) *
 }
 
 func (r *inlineRegistry) register(now time.Time, botUserID, userID int64, peer domain.Peer) (int64, *pendingInlineQuery) {
-	return r.registerWithCacheKeyContext(context.Background(), now, botUserID, userID, peer, inlineCacheKey{})
+	queryID, pending, _ := r.registerWithCacheKeyContext(context.Background(), now, botUserID, userID, peer, inlineCacheKey{})
+	return queryID, pending
 }
 
 func (r *inlineRegistry) registerWithCacheKey(now time.Time, botUserID, userID int64, peer domain.Peer, key inlineCacheKey) (int64, *pendingInlineQuery) {
-	return r.registerWithCacheKeyContext(context.Background(), now, botUserID, userID, peer, key)
+	queryID, pending, _ := r.registerWithCacheKeyContext(context.Background(), now, botUserID, userID, peer, key)
+	return queryID, pending
 }
 
-func (r *inlineRegistry) registerWithCacheKeyContext(ctx context.Context, now time.Time, botUserID, userID int64, peer domain.Peer, key inlineCacheKey) (int64, *pendingInlineQuery) {
+func (r *inlineRegistry) registerWithCacheKeyContext(ctx context.Context, now time.Time, botUserID, userID int64, peer domain.Peer, key inlineCacheKey) (int64, *pendingInlineQuery, error) {
+	if r == nil || r.shared == nil {
+		return 0, nil, errInlineRegistryStoreRequired
+	}
 	p := &pendingInlineQuery{
 		ch:        make(chan domain.BotInlineResults, 1),
 		botUserID: botUserID,
@@ -118,8 +126,11 @@ func (r *inlineRegistry) registerWithCacheKeyContext(ctx context.Context, now ti
 	}
 	r.pending[queryID] = p
 	r.mu.Unlock()
-	r.putSharedPending(ctx, queryID, p)
-	return queryID, p
+	if err := r.putSharedPending(ctx, queryID, p); err != nil {
+		r.removePending(queryID, p)
+		return 0, nil, err
+	}
+	return queryID, p, nil
 }
 
 func (r *inlineRegistry) cachedContext(ctx context.Context, now time.Time, key inlineCacheKey) (domain.BotInlineResults, bool) {
@@ -152,7 +163,10 @@ func (r *inlineRegistry) cachedContext(ctx context.Context, now time.Time, key i
 	return out, true
 }
 
-func (r *inlineRegistry) registerCachedContext(ctx context.Context, now time.Time, botUserID, userID int64, peer domain.Peer, results domain.BotInlineResults) domain.BotInlineResults {
+func (r *inlineRegistry) registerCachedContext(ctx context.Context, now time.Time, botUserID, userID int64, peer domain.Peer, results domain.BotInlineResults) (domain.BotInlineResults, error) {
+	if r == nil || r.shared == nil {
+		return domain.BotInlineResults{}, errInlineRegistryStoreRequired
+	}
 	clone := cloneInlineResults(results)
 	clone.BotUserID = botUserID
 	clone.UserID = userID
@@ -178,9 +192,15 @@ func (r *inlineRegistry) registerCachedContext(ctx context.Context, now time.Tim
 	r.pending[queryID] = p
 	r.storeWebDocumentsLocked(now, clone)
 	r.mu.Unlock()
-	r.putSharedResult(ctx, clone, r.ttl)
-	r.putSharedWebDocuments(ctx, now, clone)
-	return clone
+	if err := r.putSharedWebDocuments(ctx, now, clone); err != nil {
+		r.removePending(queryID, p)
+		return domain.BotInlineResults{}, err
+	}
+	if err := r.putSharedResult(ctx, clone, r.ttl); err != nil {
+		r.removePending(queryID, p)
+		return domain.BotInlineResults{}, err
+	}
+	return clone, nil
 }
 
 func (r *inlineRegistry) deregisterIfUnansweredContext(ctx context.Context, queryID int64) {
@@ -197,10 +217,14 @@ func (r *inlineRegistry) deregisterIfUnansweredContext(ctx context.Context, quer
 }
 
 func (r *inlineRegistry) resolve(now time.Time, callerBotID, queryID int64, results domain.BotInlineResults) bool {
-	return r.resolveContext(context.Background(), now, callerBotID, queryID, results)
+	resolved, _ := r.resolveContext(context.Background(), now, callerBotID, queryID, results)
+	return resolved
 }
 
-func (r *inlineRegistry) resolveContext(ctx context.Context, now time.Time, callerBotID, queryID int64, results domain.BotInlineResults) bool {
+func (r *inlineRegistry) resolveContext(ctx context.Context, now time.Time, callerBotID, queryID int64, results domain.BotInlineResults) (bool, error) {
+	if r == nil || r.shared == nil {
+		return false, errInlineRegistryStoreRequired
+	}
 	r.mu.Lock()
 	r.pruneLocked(now)
 	p, ok := r.pending[queryID]
@@ -210,6 +234,7 @@ func (r *inlineRegistry) resolveContext(ctx context.Context, now time.Time, call
 		results.UserID = p.userID
 		results.Peer = p.peer
 		results.Query = p.cacheKey.query
+		cacheKey := p.cacheKey
 		if p.cacheKey.hasGeo {
 			results.Geo = &domain.MessageGeoPoint{
 				Lat:            p.cacheKey.geoLat,
@@ -218,24 +243,27 @@ func (r *inlineRegistry) resolveContext(ctx context.Context, now time.Time, call
 			}
 		}
 		clone := cloneInlineResults(results)
-		p.results = &clone
-		r.storeWebDocumentsLocked(now, clone)
-		r.storeCacheLocked(now, p.cacheKey, clone)
 		r.mu.Unlock()
-		r.putSharedResolved(ctx, now, p.cacheKey, clone)
+		if err := r.putSharedResolved(ctx, now, cacheKey, clone); err != nil {
+			return false, err
+		}
+		r.mu.Lock()
+		if current, exists := r.pending[queryID]; exists && current == p {
+			current.results = &clone
+			r.storeWebDocumentsLocked(now, clone)
+			r.storeCacheLocked(now, cacheKey, clone)
+		}
+		r.mu.Unlock()
 		select {
 		case p.ch <- clone:
 		default:
 		}
-		return true
+		return true, nil
 	}
 	r.mu.Unlock()
-	if r.shared == nil {
-		return false
-	}
 	sharedPending, found, err := r.shared.GetInlinePending(ctx, queryID)
 	if err != nil || !found || sharedPending.BotUserID != callerBotID {
-		return false
+		return false, err
 	}
 	results.QueryID = queryID
 	results.BotUserID = sharedPending.BotUserID
@@ -250,51 +278,72 @@ func (r *inlineRegistry) resolveContext(ctx context.Context, now time.Time, call
 		}
 	}
 	clone := cloneInlineResults(results)
-	r.putSharedResolved(ctx, now, inlineCacheKeyFromStore(sharedPending.CacheKey), clone)
-	return true
+	if err := r.putSharedResolved(ctx, now, inlineCacheKeyFromStore(sharedPending.CacheKey), clone); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func (r *inlineRegistry) resultsForQueryContext(ctx context.Context, now time.Time, userID, queryID int64) (domain.BotInlineResults, bool) {
+func (r *inlineRegistry) resultsForQueryContext(ctx context.Context, now time.Time, userID, queryID int64) (domain.BotInlineResults, bool, error) {
+	if r == nil || r.shared == nil {
+		return domain.BotInlineResults{}, false, errInlineRegistryStoreRequired
+	}
 	r.mu.Lock()
 	r.pruneLocked(now)
 	p, ok := r.pending[queryID]
 	if ok && p.userID == userID && p.results != nil {
 		results := cloneInlineResults(*p.results)
 		r.mu.Unlock()
-		return results, true
+		return results, true, nil
 	}
 	r.mu.Unlock()
-	if r.shared == nil {
-		return domain.BotInlineResults{}, false
-	}
 	results, found, err := r.shared.GetInlineResult(ctx, queryID)
 	if err != nil || !found || results.UserID != userID {
-		return domain.BotInlineResults{}, false
+		return domain.BotInlineResults{}, false, err
 	}
-	return cloneInlineResults(results), true
+	return cloneInlineResults(results), true, nil
 }
 
-func (r *inlineRegistry) resultForSendContext(ctx context.Context, now time.Time, userID, queryID int64, id string) (domain.BotInlineResults, domain.BotInlineResult, bool) {
+func (r *inlineRegistry) waitResultsContext(ctx context.Context, now time.Time, userID, queryID int64) (domain.BotInlineResults, bool, error) {
+	results, found, err := r.resultsForQueryContext(ctx, now, userID, queryID)
+	if err != nil || found {
+		return results, found, err
+	}
+	if r == nil || r.shared == nil {
+		return domain.BotInlineResults{}, false, errInlineRegistryStoreRequired
+	}
+	results, found, err = r.shared.WaitInlineResult(ctx, userID, queryID)
+	if err != nil || !found {
+		return domain.BotInlineResults{}, found, err
+	}
+	return cloneInlineResults(results), true, nil
+}
+
+func (r *inlineRegistry) resultForSendContext(ctx context.Context, now time.Time, userID, queryID int64, id string) (domain.BotInlineResults, domain.BotInlineResult, bool, error) {
+	if r == nil || r.shared == nil {
+		return domain.BotInlineResults{}, domain.BotInlineResult{}, false, errInlineRegistryStoreRequired
+	}
 	r.mu.Lock()
 	r.pruneLocked(now)
 	p, ok := r.pending[queryID]
 	if ok && p.userID == userID && p.results != nil {
 		results, result, found := inlineResultByID(*p.results, id)
 		r.mu.Unlock()
-		return results, result, found
+		return results, result, found, nil
 	}
 	r.mu.Unlock()
-	if r.shared == nil {
-		return domain.BotInlineResults{}, domain.BotInlineResult{}, false
-	}
 	results, found, err := r.shared.GetInlineResult(ctx, queryID)
 	if err != nil || !found || results.UserID != userID {
-		return domain.BotInlineResults{}, domain.BotInlineResult{}, false
+		return domain.BotInlineResults{}, domain.BotInlineResult{}, false, err
 	}
-	return inlineResultByID(results, id)
+	results, result, ok := inlineResultByID(results, id)
+	return results, result, ok, nil
 }
 
-func (r *inlineRegistry) savePreparedInlineContext(ctx context.Context, now time.Time, botUserID, userID int64, result domain.BotInlineResult, peerTypes []string) (string, int) {
+func (r *inlineRegistry) savePreparedInlineContext(ctx context.Context, now time.Time, botUserID, userID int64, result domain.BotInlineResult, peerTypes []string) (string, int, error) {
+	if r == nil || r.shared == nil {
+		return "", 0, errInlineRegistryStoreRequired
+	}
 	ttl := r.ttl
 	if ttl <= 0 {
 		ttl = botInlineQueryTTL
@@ -330,12 +379,21 @@ func (r *inlineRegistry) savePreparedInlineContext(ctx context.Context, now time
 	r.prepared[id] = msg
 	r.storeWebDocumentsLocked(now, msg.results)
 	r.mu.Unlock()
-	r.putSharedPrepared(ctx, msg, ttl)
-	r.putSharedWebDocuments(ctx, now, msg.results)
-	return id, int(expiresAt.Unix())
+	if err := r.putSharedWebDocuments(ctx, now, msg.results); err != nil {
+		r.removePrepared(id)
+		return "", 0, err
+	}
+	if err := r.putSharedPrepared(ctx, msg, ttl); err != nil {
+		r.removePrepared(id)
+		return "", 0, err
+	}
+	return id, int(expiresAt.Unix()), nil
 }
 
-func (r *inlineRegistry) preparedInlineContext(ctx context.Context, now time.Time, userID, botUserID int64, id string) (domain.BotInlineResults, bool) {
+func (r *inlineRegistry) preparedInlineContext(ctx context.Context, now time.Time, userID, botUserID int64, id string) (domain.BotInlineResults, bool, error) {
+	if r == nil || r.shared == nil {
+		return domain.BotInlineResults{}, false, errInlineRegistryStoreRequired
+	}
 	var results domain.BotInlineResults
 	found := false
 	r.mu.Lock()
@@ -348,17 +406,16 @@ func (r *inlineRegistry) preparedInlineContext(ctx context.Context, now time.Tim
 	}
 	r.mu.Unlock()
 	if found {
-		return r.registerCachedContext(ctx, now, botUserID, userID, domain.Peer{}, results), true
-	}
-	if r.shared == nil {
-		return domain.BotInlineResults{}, false
+		registered, err := r.registerCachedContext(ctx, now, botUserID, userID, domain.Peer{}, results)
+		return registered, err == nil, err
 	}
 	shared, ok, err := r.shared.GetPreparedInlineMessage(ctx, id)
 	if err != nil || !ok || shared.UserID != userID || shared.BotUserID != botUserID || !shared.ExpiresAt.After(now) {
-		return domain.BotInlineResults{}, false
+		return domain.BotInlineResults{}, false, err
 	}
 	results = cloneInlineResults(shared.Results)
-	return r.registerCachedContext(ctx, now, botUserID, userID, domain.Peer{}, results), true
+	registered, err := r.registerCachedContext(ctx, now, botUserID, userID, domain.Peer{}, results)
+	return registered, err == nil, err
 }
 
 func (r *inlineRegistry) consume(queryID int64) {
@@ -373,6 +430,20 @@ func (r *inlineRegistry) consumeContext(ctx context.Context, queryID int64) {
 		_ = r.shared.DeleteInlinePending(ctx, queryID)
 		_ = r.shared.DeleteInlineResult(ctx, queryID)
 	}
+}
+
+func (r *inlineRegistry) removePending(queryID int64, pending *pendingInlineQuery) {
+	r.mu.Lock()
+	if current, ok := r.pending[queryID]; ok && (pending == nil || current == pending) {
+		delete(r.pending, queryID)
+	}
+	r.mu.Unlock()
+}
+
+func (r *inlineRegistry) removePrepared(id string) {
+	r.mu.Lock()
+	delete(r.prepared, id)
+	r.mu.Unlock()
 }
 
 func (r *inlineRegistry) unansweredSize() int {
@@ -475,28 +546,31 @@ func (r *inlineRegistry) storeWebDocumentLocked(document *domain.BotInlineWebDoc
 	}
 }
 
-func (r *inlineRegistry) webDocumentForDownloadContext(ctx context.Context, now time.Time, url string, accessHash int64) (domain.BotInlineWebDocument, []byte, string, bool) {
+func (r *inlineRegistry) webDocumentForDownloadContext(ctx context.Context, now time.Time, url string, accessHash int64) (domain.BotInlineWebDocument, []byte, string, bool, error) {
+	if r == nil || r.shared == nil {
+		return domain.BotInlineWebDocument{}, nil, "", false, errInlineRegistryStoreRequired
+	}
 	r.mu.Lock()
 	r.pruneLocked(now)
 	registered, ok := r.webDocuments[inlineWebDocumentKey{url: url, accessHash: accessHash}]
 	if ok {
 		r.mu.Unlock()
-		return cloneInlineWebDocument(registered.document), append([]byte(nil), registered.bytes...), registered.mimeType, true
+		return cloneInlineWebDocument(registered.document), append([]byte(nil), registered.bytes...), registered.mimeType, true, nil
 	}
 	r.mu.Unlock()
-	if r.shared == nil {
-		return domain.BotInlineWebDocument{}, nil, "", false
-	}
 	shared, ok, err := r.shared.GetInlineWebDocument(ctx, store.InlineWebDocumentKey{URL: url, AccessHash: accessHash})
 	if err != nil || !ok {
-		return domain.BotInlineWebDocument{}, nil, "", false
+		return domain.BotInlineWebDocument{}, nil, "", false, err
 	}
-	return cloneInlineWebDocument(shared.Document), append([]byte(nil), shared.Bytes...), shared.MimeType, true
+	return cloneInlineWebDocument(shared.Document), append([]byte(nil), shared.Bytes...), shared.MimeType, true, nil
 }
 
-func (r *inlineRegistry) cacheWebDocumentBytesContext(ctx context.Context, now time.Time, url string, accessHash int64, data []byte, mimeType string) bool {
+func (r *inlineRegistry) cacheWebDocumentBytesContext(ctx context.Context, now time.Time, url string, accessHash int64, data []byte, mimeType string) (bool, error) {
+	if r == nil || r.shared == nil {
+		return false, errInlineRegistryStoreRequired
+	}
 	if len(data) > domain.MaxBotInlineWebSize {
-		return false
+		return false, nil
 	}
 	localUpdated := false
 	r.mu.Lock()
@@ -510,16 +584,16 @@ func (r *inlineRegistry) cacheWebDocumentBytesContext(ctx context.Context, now t
 		localUpdated = true
 	}
 	r.mu.Unlock()
-	if r.shared == nil {
-		return localUpdated
-	}
 	err := r.shared.PutInlineWebDocumentBytes(ctx, store.InlineWebDocumentKey{URL: url, AccessHash: accessHash}, append([]byte(nil), data...), mimeType, r.ttl)
-	return localUpdated || err == nil
+	return localUpdated || err == nil, err
 }
 
-func (r *inlineRegistry) registerWebDocumentContext(ctx context.Context, now time.Time, document domain.BotInlineWebDocument, ttl time.Duration) {
+func (r *inlineRegistry) registerWebDocumentContext(ctx context.Context, now time.Time, document domain.BotInlineWebDocument, ttl time.Duration) error {
+	if r == nil || r.shared == nil {
+		return errInlineRegistryStoreRequired
+	}
 	if document.URL == "" || document.AccessHash == 0 {
-		return
+		return nil
 	}
 	if ttl <= 0 {
 		ttl = r.ttl
@@ -528,14 +602,14 @@ func (r *inlineRegistry) registerWebDocumentContext(ctx context.Context, now tim
 	r.pruneLocked(now)
 	r.storeWebDocumentLocked(&document, now.Add(ttl))
 	r.mu.Unlock()
-	r.putSharedWebDocument(ctx, &document, ttl)
+	return r.putSharedWebDocument(ctx, &document, ttl)
 }
 
-func (r *inlineRegistry) putSharedPending(ctx context.Context, queryID int64, p *pendingInlineQuery) {
+func (r *inlineRegistry) putSharedPending(ctx context.Context, queryID int64, p *pendingInlineQuery) error {
 	if r.shared == nil {
-		return
+		return errInlineRegistryStoreRequired
 	}
-	_ = r.shared.PutInlinePending(ctx, store.InlinePending{
+	return r.shared.PutInlinePending(ctx, store.InlinePending{
 		QueryID:   queryID,
 		BotUserID: p.botUserID,
 		UserID:    p.userID,
@@ -545,59 +619,80 @@ func (r *inlineRegistry) putSharedPending(ctx context.Context, queryID int64, p 
 	}, r.ttl)
 }
 
-func (r *inlineRegistry) putSharedResolved(ctx context.Context, now time.Time, key inlineCacheKey, results domain.BotInlineResults) {
-	r.putSharedResult(ctx, results, r.ttl)
-	r.putSharedCache(ctx, key, results)
-	r.putSharedWebDocuments(ctx, now, results)
-}
-
-func (r *inlineRegistry) putSharedResult(ctx context.Context, results domain.BotInlineResults, ttl time.Duration) {
-	if r.shared == nil || ttl <= 0 {
-		return
+func (r *inlineRegistry) putSharedResolved(ctx context.Context, now time.Time, key inlineCacheKey, results domain.BotInlineResults) error {
+	if err := r.putSharedWebDocuments(ctx, now, results); err != nil {
+		return err
 	}
-	_ = r.shared.PutInlineResult(ctx, cloneInlineResults(results), ttl)
+	if err := r.putSharedCache(ctx, key, results); err != nil {
+		return err
+	}
+	return r.putSharedResult(ctx, results, r.ttl)
 }
 
-func (r *inlineRegistry) putSharedCache(ctx context.Context, key inlineCacheKey, results domain.BotInlineResults) {
-	if r.shared == nil || key.botUserID == 0 {
-		return
+func (r *inlineRegistry) putSharedResult(ctx context.Context, results domain.BotInlineResults, ttl time.Duration) error {
+	if r.shared == nil {
+		return errInlineRegistryStoreRequired
+	}
+	if ttl <= 0 {
+		return nil
+	}
+	return r.shared.PutInlineResult(ctx, cloneInlineResults(results), ttl)
+}
+
+func (r *inlineRegistry) putSharedCache(ctx context.Context, key inlineCacheKey, results domain.BotInlineResults) error {
+	if r.shared == nil {
+		return errInlineRegistryStoreRequired
+	}
+	if key.botUserID == 0 {
+		return nil
 	}
 	ttl, ok := r.cacheTTL(results)
 	if !ok {
-		return
+		return nil
 	}
 	cached := cloneInlineResults(results)
 	cached.QueryID = 0
-	_ = r.shared.PutInlineCache(ctx, storeInlineCacheKey(key), cached, ttl)
+	return r.shared.PutInlineCache(ctx, storeInlineCacheKey(key), cached, ttl)
 }
 
-func (r *inlineRegistry) putSharedWebDocuments(ctx context.Context, now time.Time, results domain.BotInlineResults) {
+func (r *inlineRegistry) putSharedWebDocuments(ctx context.Context, now time.Time, results domain.BotInlineResults) error {
 	if r.shared == nil {
-		return
+		return errInlineRegistryStoreRequired
 	}
 	ttl := r.webDocumentTTL(results)
 	if ttl <= 0 {
-		return
+		return nil
 	}
 	for _, item := range results.Results {
-		r.putSharedWebDocument(ctx, item.Thumb, ttl)
-		r.putSharedWebDocument(ctx, item.Content, ttl)
+		if err := r.putSharedWebDocument(ctx, item.Thumb, ttl); err != nil {
+			return err
+		}
+		if err := r.putSharedWebDocument(ctx, item.Content, ttl); err != nil {
+			return err
+		}
 	}
 	_ = now
+	return nil
 }
 
-func (r *inlineRegistry) putSharedWebDocument(ctx context.Context, document *domain.BotInlineWebDocument, ttl time.Duration) {
-	if r.shared == nil || document == nil || document.URL == "" || document.AccessHash == 0 || ttl <= 0 {
-		return
+func (r *inlineRegistry) putSharedWebDocument(ctx context.Context, document *domain.BotInlineWebDocument, ttl time.Duration) error {
+	if r.shared == nil {
+		return errInlineRegistryStoreRequired
 	}
-	_ = r.shared.PutInlineWebDocument(ctx, cloneInlineWebDocument(*document), ttl)
+	if document == nil || document.URL == "" || document.AccessHash == 0 || ttl <= 0 {
+		return nil
+	}
+	return r.shared.PutInlineWebDocument(ctx, cloneInlineWebDocument(*document), ttl)
 }
 
-func (r *inlineRegistry) putSharedPrepared(ctx context.Context, msg preparedInlineMessage, ttl time.Duration) {
-	if r.shared == nil || ttl <= 0 {
-		return
+func (r *inlineRegistry) putSharedPrepared(ctx context.Context, msg preparedInlineMessage, ttl time.Duration) error {
+	if r.shared == nil {
+		return errInlineRegistryStoreRequired
 	}
-	_ = r.shared.PutPreparedInlineMessage(ctx, store.PreparedInlineMessage{
+	if ttl <= 0 {
+		return nil
+	}
+	return r.shared.PutPreparedInlineMessage(ctx, store.PreparedInlineMessage{
 		ID:        msg.id,
 		BotUserID: msg.botUserID,
 		UserID:    msg.userID,

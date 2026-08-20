@@ -131,7 +131,10 @@ func (r *Router) onUploadGetRegisteredWebFile(ctx context.Context, loc *tg.Input
 }
 
 func (r *Router) registeredInlineWebDocumentBytes(ctx context.Context, url string, accessHash int64) (domain.BotInlineWebDocument, []byte, string, error) {
-	document, data, mime, ok := r.inlines.webDocumentForDownloadContext(ctx, r.clock.Now(), url, accessHash)
+	document, data, mime, ok, err := r.inlines.webDocumentForDownloadContext(ctx, r.clock.Now(), url, accessHash)
+	if err != nil {
+		return domain.BotInlineWebDocument{}, nil, "", internalErr()
+	}
 	if !ok {
 		return domain.BotInlineWebDocument{}, nil, "", locationInvalidErr()
 	}
@@ -145,7 +148,9 @@ func (r *Router) registeredInlineWebDocumentBytes(ctx context.Context, url strin
 		}
 		data = fetched
 		mime = normalizeInlineWebFileMime(fetchedMime, data, document.MimeType)
-		r.inlines.cacheWebDocumentBytesContext(ctx, r.clock.Now(), document.URL, document.AccessHash, data, mime)
+		if _, err := r.inlines.cacheWebDocumentBytesContext(ctx, r.clock.Now(), document.URL, document.AccessHash, data, mime); err != nil {
+			return domain.BotInlineWebDocument{}, nil, "", internalErr()
+		}
 	}
 	if mime == "" {
 		mime = document.MimeType
