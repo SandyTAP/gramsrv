@@ -1,5 +1,9 @@
 # telesrv 配置参数手册
 
+> Status: operation.
+> Scope: Configuration reference.
+
+
 英文版：[configuration.en.md](configuration.en.md)
 
 本文覆盖 `internal/config` 实际读取的全部配置。默认值和校验行为以 `internal/config/config.go` 为权威来源。所有配置修改都需要重启进程；telesrv 当前不支持配置热加载。

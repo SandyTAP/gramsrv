@@ -1,5 +1,9 @@
 # telesrv configuration reference
 
+> Status: operation.
+> Scope: Configuration reference.
+
+
 Chinese version: [configuration.zh-CN.md](configuration.zh-CN.md)
 
 This document describes every setting loaded by `internal/config`. Defaults and validation behavior in `internal/config/config.go` are authoritative. All settings require a process restart; telesrv does not hot-reload configuration.
