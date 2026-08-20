@@ -1471,7 +1471,9 @@ func run(logger *zap.Logger) error {
 		MaterializeBatch: cfg.BroadcastMaterializeBatch,
 		DeliveryBatch:    cfg.BroadcastDeliveryBatch,
 	}, logger.Named("broadcast").Named("delivery")).Run(ctx)
-	moderationActionOptions := []moderationapp.ActionExecutorOption{}
+	moderationActionOptions := []moderationapp.ActionExecutorOption{
+		moderationapp.WithAccountDeletionNotifier(router),
+	}
 	if cfg.PublicLinkWebAddr != "" {
 		moderationActionOptions = append(
 			moderationActionOptions,

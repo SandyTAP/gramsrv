@@ -581,7 +581,7 @@ func (r *Router) applyStoryMaxIDsToPeerObjects(ctx context.Context, viewerUserID
 		peers = append(peers, peer)
 	}
 	for _, item := range users {
-		if u, ok := item.(*tg.User); ok {
+		if u, ok := item.(*tg.User); ok && u != nil && !u.Deleted {
 			addPeer(domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
 		}
 	}
@@ -593,7 +593,7 @@ func (r *Router) applyStoryMaxIDsToPeerObjects(ctx context.Context, viewerUserID
 	recent, hidden := r.storyProjectionMaps(ctx, viewerUserID, peers)
 	for _, item := range users {
 		u, ok := item.(*tg.User)
-		if !ok {
+		if !ok || u == nil || u.Deleted {
 			continue
 		}
 		peer := domain.Peer{Type: domain.PeerTypeUser, ID: u.ID}

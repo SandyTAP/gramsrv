@@ -258,9 +258,10 @@ func TestAuthorizationStoreRevokeByHashSkipsKeyTransferredAfterCandidateReadPost
 		t.Fatalf("save temp binding before owner transfer: %v", err)
 	}
 
-	// Bind B performs the auth_keys-first ownership change inside an open
-	// transaction. Its uncommitted row is invisible to A's candidate lookup, but
-	// the parent FOR UPDATE lock is the deterministic barrier for revocation.
+	// Bind B locks its target user before performing the auth-key ownership change
+	// inside an open transaction. Its uncommitted row is invisible to A's candidate
+	// lookup, while the parent auth-key FOR UPDATE lock remains the deterministic
+	// barrier for revocation.
 	bindB, err := pool.Begin(testCtx)
 	if err != nil {
 		t.Fatalf("begin B bind transaction: %v", err)

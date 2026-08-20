@@ -151,6 +151,12 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 	if _, ok := id.(*tg.InputUserSelf); ok || u.ID == currentUserID {
 		user = r.tgSelfUser(u)
 	}
+	// A deleted account is a durable peer tombstone. Its retained rows keep
+	// message and membership references resolvable, but none of those private
+	// read models belong in users.getFullUser after deletion.
+	if u.Deleted {
+		return deletedUserFull(u.ID, user), nil
+	}
 	if err := r.applyBotCanEditToUser(ctx, currentUserID, u, user); err != nil {
 		return nil, err
 	}
@@ -954,6 +960,14 @@ func emptyUserFull() *tg.UsersUserFull {
 			NotifySettings: *tdesktop.NotifySettings(),
 		},
 	}
+}
+
+func deletedUserFull(userID int64, user tg.UserClass) *tg.UsersUserFull {
+	out := emptyUserFull()
+	out.FullUser.ID = userID
+	out.Users = []tg.UserClass{user}
+	out.Chats = []tg.ChatClass{}
+	return out
 }
 
 func (r *Router) userFromInput(ctx context.Context, currentUserID int64, id tg.InputUserClass) (domain.User, bool, error) {

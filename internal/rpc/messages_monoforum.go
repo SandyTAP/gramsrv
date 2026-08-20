@@ -261,7 +261,7 @@ func applyMonoforumPeerOverlays(users []tg.UserClass, chats []tg.ChatClass, over
 	applyUsernamesFromRegistry(users, chats, overlays.usernames)
 	for _, item := range users {
 		u, ok := item.(*tg.User)
-		if !ok || u == nil {
+		if !ok || u == nil || u.Deleted {
 			continue
 		}
 		if u.Bot {

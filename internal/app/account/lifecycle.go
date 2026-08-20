@@ -345,17 +345,3 @@ func (s *Service) SweepDueAccountDeletions(ctx context.Context, now time.Time, l
 	}
 	return out, nil
 }
-
-func (s *Service) ClaimAccountDeletionNotifications(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]domain.AccountDeletionNotification, error) {
-	if s == nil || s.lifecycle == nil {
-		return nil, nil
-	}
-	return s.lifecycle.ClaimAccountDeletionNotifications(ctx, now, limit, lease)
-}
-
-func (s *Service) CompleteAccountDeletionNotification(ctx context.Context, id int64, now time.Time) error {
-	if s == nil || s.lifecycle == nil {
-		return nil
-	}
-	return s.lifecycle.CompleteAccountDeletionNotification(ctx, id, now)
-}

@@ -354,7 +354,7 @@ func appendUsernameProjectionPeers(peers []domain.Peer, seen map[domain.Peer]str
 		peers = append(peers, peer)
 	}
 	for _, item := range users {
-		if u, ok := item.(*tg.User); ok && u != nil {
+		if u, ok := item.(*tg.User); ok && u != nil && !u.Deleted {
 			addPeer(domain.Peer{Type: domain.PeerTypeUser, ID: u.ID})
 		}
 	}
@@ -375,7 +375,7 @@ func applyUsernamesFromRegistry(users []tg.UserClass, chats []tg.ChatClass, byPe
 	}
 	for _, item := range users {
 		u, ok := item.(*tg.User)
-		if !ok || u == nil {
+		if !ok || u == nil || u.Deleted {
 			continue
 		}
 		list, ok := byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: u.ID}]

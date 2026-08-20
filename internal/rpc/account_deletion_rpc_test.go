@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
@@ -45,9 +44,15 @@ func TestAccountDeleteRPCDeliversResultBeforeClosingCurrentSession(t *testing.T)
 	if !sessions.wasClosed(other) {
 		t.Fatal("other auth key was not revoked immediately")
 	}
+	if accountSvc.sweepCalls != 0 {
+		t.Fatalf("account lifecycle sweeps before rpc_result delivery = %d, want 0", accountSvc.sweepCalls)
+	}
 	postresponse.Run(ctx)
 	if !sessions.wasClosed(current) {
 		t.Fatal("current auth key not closed after rpc_result delivery")
+	}
+	if accountSvc.sweepCalls != 0 {
+		t.Fatalf("account lifecycle sweeps after rpc_result delivery = %d, want 0", accountSvc.sweepCalls)
 	}
 }
 
@@ -73,18 +78,6 @@ func TestDeleteAccountAllowedWithoutFullAuthorization(t *testing.T) {
 	}
 }
 
-func TestAccountDeletionNotificationCompletesForOfflineTarget(t *testing.T) {
-	sessions := &offlineDeletionSessions{}
-	svc := &deletionWorkerService{}
-	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
-	r.dispatchAccountDeletionNotification(context.Background(), svc, domain.AccountDeletionNotification{
-		ID: 9, TargetUserID: 42, DeletedUserID: 77, Attempts: 1,
-	})
-	if len(svc.completed) != 1 || svc.completed[0] != 9 {
-		t.Fatalf("completed notifications = %v, want [9]", svc.completed)
-	}
-}
-
 func TestAccountLifecyclePartialSweepFinishesCommittedDeletion(t *testing.T) {
 	revoked := [8]byte{3}
 	svc := &rpcDeletionAccountService{
@@ -104,12 +97,27 @@ func TestAccountLifecyclePartialSweepFinishesCommittedDeletion(t *testing.T) {
 	}
 }
 
+func TestModerationAccountDeletionClosesRevokedSessions(t *testing.T) {
+	revoked := [8]byte{4}
+	sessions := &deletionCaptureSessions{}
+	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	r.NotifyModerationAccountDeletion(context.Background(), domain.AccountDeletionResult{
+		Changed:               true,
+		User:                  domain.User{ID: 42, Deleted: true},
+		RevokedAuthorizations: []domain.Authorization{{AuthKeyID: revoked, UserID: 42}},
+	})
+	if !sessions.wasClosed(revoked) {
+		t.Fatal("moderation-deleted authorization session was not closed")
+	}
+}
+
 type rpcDeletionAccountService struct {
 	*appaccount.Service
 	outcome      domain.AccountDeleteOutcome
 	err          error
 	sweepResults []domain.AccountDeletionResult
 	sweepErr     error
+	sweepCalls   int
 }
 
 func (s *rpcDeletionAccountService) DeleteAccount(context.Context, int64, [8]byte, string, *domain.PasswordCheck, time.Time) (domain.AccountDeleteOutcome, error) {
@@ -133,33 +141,13 @@ func (*rpcDeletionAccountService) CancelConfirmPhoneCode(context.Context, int64,
 }
 
 func (s *rpcDeletionAccountService) SweepDueAccountDeletions(context.Context, time.Time, int) ([]domain.AccountDeletionResult, error) {
+	s.sweepCalls++
 	return s.sweepResults, s.sweepErr
 }
 
 type deletionCaptureSessions struct {
 	captureSessions
 	closed [][8]byte
-}
-
-type offlineDeletionSessions struct{ captureSessions }
-
-func (*offlineDeletionSessions) PushToUserExceptAuthKeySession(context.Context, int64, [8]byte, int64, proto.MessageType, tg.UpdatesClass) (int, error) {
-	return 0, nil
-}
-
-type deletionWorkerService struct{ completed []int64 }
-
-func (*deletionWorkerService) SweepDueAccountDeletions(context.Context, time.Time, int) ([]domain.AccountDeletionResult, error) {
-	return nil, nil
-}
-
-func (*deletionWorkerService) ClaimAccountDeletionNotifications(context.Context, time.Time, int, time.Duration) ([]domain.AccountDeletionNotification, error) {
-	return nil, nil
-}
-
-func (s *deletionWorkerService) CompleteAccountDeletionNotification(_ context.Context, id int64, _ time.Time) error {
-	s.completed = append(s.completed, id)
-	return nil
 }
 
 func (s *deletionCaptureSessions) CloseSessionsForBusinessAuthKey(id [8]byte) int {
