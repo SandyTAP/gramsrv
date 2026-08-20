@@ -11,18 +11,23 @@ import (
 
 // Service 提供消息历史、搜索与已读业务。
 type Service struct {
-	messages     store.MessageStore
-	dialogs      store.DialogStore
-	contacts     store.ContactStore
-	photos       userprojection.ProfilePhotoProvider
-	privacy      userprojection.PrivacyEvaluator
-	freezes      userprojection.AccountFreezeProvider
-	phones       userprojection.CollectiblePhoneProvider
-	versions     store.ReadModelVersionStore
-	projector    *userprojection.Projector
-	botResponder BotResponder
-	sendGate     SendPermissionChecker
-	business     *businessAutomationConfig
+	messages  store.MessageStore
+	dialogs   store.DialogStore
+	contacts  store.ContactStore
+	photos    userprojection.ProfilePhotoProvider
+	privacy   userprojection.PrivacyEvaluator
+	freezes   userprojection.AccountFreezeProvider
+	phones    userprojection.CollectiblePhoneProvider
+	versions  store.ReadModelVersionStore
+	projector *userprojection.Projector
+	// viewerProjectionComplete is true only when every viewer-scoped user
+	// overlay used by the shared RPC Users service is configured here too.
+	// A partially configured service may still project the dependencies it has,
+	// but RPC must not trust that partial envelope as authoritative.
+	viewerProjectionComplete bool
+	botResponder             BotResponder
+	sendGate                 SendPermissionChecker
+	business                 *businessAutomationConfig
 
 	privateMediaCountCache *privateMediaCountReadModelCache
 }
@@ -98,7 +103,16 @@ func NewService(messages store.MessageStore, dialogs store.DialogStore, opts ...
 		userprojection.WithAccountFreezeProvider(s.freezes),
 		userprojection.WithCollectiblePhoneProvider(s.phones),
 	)
+	s.viewerProjectionComplete = s.contacts != nil && s.photos != nil && s.privacy != nil && s.freezes != nil && s.phones != nil
 	return s
+}
+
+// ProjectsMessageUsersForViewer reports that history/search results returned by
+// this service have already passed through the viewer-specific user projection
+// boundary. RPC may reuse that envelope and resolve only nested message refs;
+// raw stores and test doubles do not implicitly gain this trust marker.
+func (s *Service) ProjectsMessageUsersForViewer() bool {
+	return s != nil && s.viewerProjectionComplete
 }
 
 // SendPrivateText 发送一条私聊文本消息。
@@ -355,7 +369,11 @@ func (s *Service) SearchPrivateMedia(ctx context.Context, userID, peerID int64, 
 	if s == nil || s.messages == nil || userID == 0 || peerID == 0 {
 		return domain.MessageList{}, nil
 	}
-	return s.messages.SearchPrivateMedia(ctx, userID, peerID, req)
+	list, err := s.messages.SearchPrivateMedia(ctx, userID, peerID, req)
+	if err != nil {
+		return domain.MessageList{}, err
+	}
+	return s.projectMessageUsers(ctx, userID, list)
 }
 
 // CountPrivateMediaCategories 返回某私聊会话按基础媒体类别聚合的精确计数。

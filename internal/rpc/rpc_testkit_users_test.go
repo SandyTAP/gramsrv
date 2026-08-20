@@ -15,10 +15,11 @@ type mapUsersService struct {
 
 type countingMapUsersService struct {
 	mapUsersService
-	selfCalls  int
-	byIDCalls  int
-	byIDsCalls int
-	lastByIDs  []int64
+	selfCalls    int
+	byIDCalls    int
+	byIDsCalls   int
+	lastByIDs    []int64
+	byIDsBatches [][]int64
 }
 
 func (s staticUsersService) Self(context.Context, int64) (domain.User, error) {
@@ -89,6 +90,7 @@ func (s *countingMapUsersService) Self(ctx context.Context, userID int64) (domai
 func (s *countingMapUsersService) ByIDs(ctx context.Context, currentUserID int64, userIDs []int64) ([]domain.User, error) {
 	s.byIDsCalls++
 	s.lastByIDs = append([]int64(nil), userIDs...)
+	s.byIDsBatches = append(s.byIDsBatches, append([]int64(nil), userIDs...))
 	return s.mapUsersService.ByIDs(ctx, currentUserID, userIDs)
 }
 

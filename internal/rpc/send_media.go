@@ -340,7 +340,7 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 			if req.ClearDraft {
 				r.clearDraftAfterSend(ctx, userID, peer, replyTo)
 			}
-			return r.monoforumSendUpdates(ctx, userID, replay.channel.Channel, savedPeer, replay.channel), nil
+			return r.monoforumSendUpdatesStrict(ctx, userID, replay.channel.Channel, savedPeer, replay.channel)
 		}
 		if r.messageEffectInvalid(ctx, req.Effect) {
 			return nil, effectIDInvalidErr()

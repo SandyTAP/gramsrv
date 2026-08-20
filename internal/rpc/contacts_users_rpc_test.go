@@ -191,6 +191,7 @@ func TestContactsEditCloseFriendsFanoutsCloseFriendStories(t *testing.T) {
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(stateStore, updateStore),
+		Users:    appusers.NewService(users),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 
 	ownerAuth := [8]byte{1, 2, 3}
@@ -325,6 +326,7 @@ func TestContactsBlockUnblockFanoutsStoryVisibilityChanges(t *testing.T) {
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
+		Users:    appusers.NewService(users),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 
 	ownerAuth := [8]byte{7, 7, 1}
@@ -479,6 +481,7 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 		Contacts: appcontacts.NewService(contactsStore, users),
 		Stories:  appstories.NewService(storyStore),
 		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
+		Users:    appusers.NewService(users),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 
 	ownerAuth := [8]byte{8, 8, 1}

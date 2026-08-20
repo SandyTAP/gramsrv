@@ -21,10 +21,17 @@ const (
 
 	contactSnapshotMaxViewers       = 4096
 	contactReversePairMaxEntries    = 262144
-	contactPersonalPhotoSnapshotCap = 4096
+	contactProjectionPairMaxEntries = 262144
+	// One dense request must not monopolize the pair LRU or hold the global
+	// cache lock while inserting and evicting hundreds of thousands of cells.
+	// Larger results are still returned; they simply are not admitted per pair.
+	contactProjectionDenseAdmissionMaxCells = contactProjectionPairMaxEntries / 16
+	contactPersonalPhotoSnapshotCap         = 4096
 )
 
 type contactAccountSnapshot struct {
+	// contacts and ordered are immutable after the snapshot is published in
+	// CachedContactStore.contacts. Readers intentionally retain shallow copies.
 	contacts map[int64]domain.Contact
 	ordered  []domain.Contact
 	hash     int64
@@ -32,6 +39,7 @@ type contactAccountSnapshot struct {
 }
 
 type personalPhotoSnapshot struct {
+	// refs is immutable after the snapshot is published in personalPhotos.
 	refs     map[int64]domain.ProfilePhotoRef
 	expireAt time.Time
 }
@@ -42,14 +50,87 @@ type reverseContactKey struct {
 }
 
 type reverseContactSnapshot struct {
-	contact  domain.Contact
-	found    bool
+	// contact is an immutable cached clone. nil is the negative-cache value.
+	contact  *domain.Contact
 	expireAt time.Time
 }
 
 type reverseContactEntry struct {
 	key      reverseContactKey
 	snapshot reverseContactSnapshot
+}
+
+type contactProjectionKey struct {
+	viewerUserID  int64
+	contactUserID int64
+}
+
+// cachedContactProjectionOverlay is the viewer-owned part of a contact row.
+// Base user data is loaded and cached independently, so retaining domain.User
+// here would multiply a large, viewer-independent value across every pair.
+// Values are immutable after publication; noteEntities is cloned on both sides
+// of the cache boundary.
+type cachedContactProjectionOverlay struct {
+	firstName    string
+	lastName     string
+	phone        string
+	note         string
+	noteEntities []domain.MessageEntity
+	mutual       bool
+	closeFriend  bool
+}
+
+func newCachedContactProjectionOverlay(contact domain.Contact) *cachedContactProjectionOverlay {
+	return &cachedContactProjectionOverlay{
+		firstName:    contact.FirstName,
+		lastName:     contact.LastName,
+		phone:        contact.Phone,
+		note:         contact.Note,
+		noteEntities: append([]domain.MessageEntity(nil), contact.NoteEntities...),
+		mutual:       contact.Mutual || contact.User.Mutual,
+		closeFriend:  contact.CloseFriend || contact.User.CloseFriend,
+	}
+}
+
+func (o *cachedContactProjectionOverlay) domainContact(contactUserID int64) domain.Contact {
+	if o == nil {
+		return domain.Contact{}
+	}
+	return domain.Contact{
+		User:         domain.User{ID: contactUserID},
+		FirstName:    o.firstName,
+		LastName:     o.lastName,
+		Phone:        o.phone,
+		Note:         o.note,
+		NoteEntities: append([]domain.MessageEntity(nil), o.noteEntities...),
+		Mutual:       o.mutual,
+		CloseFriend:  o.closeFriend,
+	}
+}
+
+type contactProjectionSnapshot struct {
+	// Positive values point at immutable cached clones; nil is negative. Keeping
+	// the compact viewer-owned overlay outside the entry makes negative pairs
+	// consume only two pointers plus their expiry and avoids duplicating a full
+	// base User for every positive pair.
+	contact       *cachedContactProjectionOverlay
+	personalPhoto *domain.ProfilePhotoRef
+	expireAt      time.Time
+}
+
+// contactProjectionLookup is a transient, caller-owned copy. It deliberately
+// retains the old value+found shape so no mutable slice from a cached pointer is
+// exposed after the cache lock is released.
+type contactProjectionLookup struct {
+	contact            domain.Contact
+	contactFound       bool
+	personalPhoto      domain.ProfilePhotoRef
+	personalPhotoFound bool
+}
+
+type contactProjectionEntry struct {
+	key      contactProjectionKey
+	snapshot contactProjectionSnapshot
 }
 
 type contactSnapshotLoadResult struct {
@@ -67,6 +148,11 @@ type personalPhotoSnapshotLoadResult struct {
 	stored bool
 }
 
+type contactProjectionLoadResult struct {
+	batch   domain.ContactProjectionBatch
+	current bool
+}
+
 // CachedContactStore wraps ContactStore with account-level read model snapshots.
 //
 // Contact data is low-churn and high-read: TDesktop repeatedly asks for the same
@@ -79,15 +165,20 @@ type CachedContactStore struct {
 	ttl   time.Duration
 	now   func() time.Time
 
-	mu             sync.RWMutex
-	contacts       map[int64]contactAccountSnapshot
-	personalPhotos map[int64]personalPhotoSnapshot
-	reverse        map[reverseContactKey]*list.Element
-	reverseLRU     *list.List
-	reverseByOwner map[int64]map[int64]struct{}
-	reverseCap     int
-	epoch          uint64
-	sf             singleflight.Group
+	mu                 sync.RWMutex
+	contacts           map[int64]contactAccountSnapshot
+	personalPhotos     map[int64]personalPhotoSnapshot
+	reverse            map[reverseContactKey]*list.Element
+	reverseLRU         *list.List
+	reverseByOwner     map[int64]map[int64]struct{}
+	reverseCap         int
+	projection         map[contactProjectionKey]*list.Element
+	projectionLRU      *list.List
+	projectionByViewer map[int64]map[int64]struct{}
+	projectionByTarget map[int64]map[int64]struct{}
+	projectionCap      int
+	epoch              uint64
+	sf                 singleflight.Group
 }
 
 func NewCachedContactStore(inner store.ContactStore, ttl time.Duration) *CachedContactStore {
@@ -98,15 +189,20 @@ func NewCachedContactStore(inner store.ContactStore, ttl time.Duration) *CachedC
 		ttl = DefaultContactProjectionCacheTTL
 	}
 	return &CachedContactStore{
-		inner:          inner,
-		ttl:            ttl,
-		now:            time.Now,
-		contacts:       make(map[int64]contactAccountSnapshot, 1024),
-		personalPhotos: make(map[int64]personalPhotoSnapshot, 1024),
-		reverse:        make(map[reverseContactKey]*list.Element, 4096),
-		reverseLRU:     list.New(),
-		reverseByOwner: make(map[int64]map[int64]struct{}, 1024),
-		reverseCap:     contactReversePairMaxEntries,
+		inner:              inner,
+		ttl:                ttl,
+		now:                time.Now,
+		contacts:           make(map[int64]contactAccountSnapshot, 1024),
+		personalPhotos:     make(map[int64]personalPhotoSnapshot, 1024),
+		reverse:            make(map[reverseContactKey]*list.Element, 4096),
+		reverseLRU:         list.New(),
+		reverseByOwner:     make(map[int64]map[int64]struct{}, 1024),
+		reverseCap:         contactReversePairMaxEntries,
+		projection:         make(map[contactProjectionKey]*list.Element, 4096),
+		projectionLRU:      list.New(),
+		projectionByViewer: make(map[int64]map[int64]struct{}, 1024),
+		projectionByTarget: make(map[int64]map[int64]struct{}, 1024),
+		projectionCap:      contactProjectionPairMaxEntries,
 	}
 }
 
@@ -197,6 +293,157 @@ func (c *CachedContactStore) GetReverseContacts(ctx context.Context, userID int6
 	return out, nil
 }
 
+func (c *CachedContactStore) ContactProjectionForViewers(ctx context.Context, viewerUserIDs, contactUserIDs []int64) (domain.ContactProjectionBatch, error) {
+	viewers := dedupContactIDs(viewerUserIDs)
+	targets := dedupContactIDs(contactUserIDs)
+	if len(viewers) == 0 || len(targets) == 0 {
+		return domain.ContactProjectionBatch{
+			Contacts:       map[int64]map[int64]domain.Contact{},
+			PersonalPhotos: map[int64]map[int64]domain.ProfilePhotoRef{},
+		}, nil
+	}
+
+	for {
+		out := domain.ContactProjectionBatch{
+			Contacts:       make(map[int64]map[int64]domain.Contact, len(viewers)),
+			PersonalPhotos: make(map[int64]map[int64]domain.ProfilePhotoRef, len(viewers)),
+		}
+		readEpoch := c.cacheEpoch()
+		now := c.now()
+		coldViewers := make(map[int64]struct{}, len(viewers))
+		coldTargets := make(map[int64]struct{}, len(targets))
+		for _, viewerID := range viewers {
+			var contactSnap contactAccountSnapshot
+			contactsWarm := false
+			if snap, ok := c.lookupContactSnapshot(viewerID, now); ok {
+				contactsWarm = true
+				contactSnap = snap
+				for _, targetID := range targets {
+					if contact, found := snap.contacts[targetID]; found {
+						putContactProjectionContact(&out, viewerID, targetID, contact)
+					}
+				}
+			}
+			personalPhotosWarm := false
+			if snap, ok := c.lookupPersonalPhotoSnapshot(viewerID, now); ok {
+				personalPhotosWarm = true
+				for _, targetID := range targets {
+					if ref, found := snap.refs[targetID]; found {
+						putContactProjectionPersonalPhoto(&out, viewerID, targetID, ref)
+					}
+				}
+			}
+			for _, targetID := range targets {
+				if contactsWarm && personalPhotosWarm {
+					continue
+				}
+				if contactsWarm {
+					if _, found := contactSnap.contacts[targetID]; !found {
+						continue
+					}
+				}
+				if snap, ok := c.lookupContactProjectionPair(viewerID, targetID, now); ok {
+					if !contactsWarm && snap.contactFound {
+						putContactProjectionContact(&out, viewerID, targetID, snap.contact)
+					}
+					if !personalPhotosWarm && snap.personalPhotoFound {
+						putContactProjectionPersonalPhoto(&out, viewerID, targetID, snap.personalPhoto)
+					}
+					continue
+				}
+				coldViewers[viewerID] = struct{}{}
+				coldTargets[targetID] = struct{}{}
+			}
+		}
+		if c.cacheEpoch() != readEpoch {
+			if err := ctx.Err(); err != nil {
+				return domain.ContactProjectionBatch{}, err
+			}
+			continue
+		}
+		if len(coldViewers) == 0 || len(coldTargets) == 0 {
+			return out, nil
+		}
+		cold := make([]int64, 0, len(coldViewers))
+		for viewerID := range coldViewers {
+			cold = append(cold, viewerID)
+		}
+		coldIDs := make([]int64, 0, len(coldTargets))
+		for targetID := range coldTargets {
+			coldIDs = append(coldIDs, targetID)
+		}
+		loaded, err := c.loadContactProjectionForViewers(ctx, cold, coldIDs)
+		if err != nil {
+			return domain.ContactProjectionBatch{}, err
+		}
+		if c.cacheEpoch() != readEpoch {
+			if err := ctx.Err(); err != nil {
+				return domain.ContactProjectionBatch{}, err
+			}
+			continue
+		}
+		mergeContactProjectionBatch(&out, loaded)
+		return out, nil
+	}
+}
+
+func (c *CachedContactStore) loadContactProjectionForViewers(ctx context.Context, viewerUserIDs, contactUserIDs []int64) (domain.ContactProjectionBatch, error) {
+	viewers := append([]int64(nil), viewerUserIDs...)
+	targets := append([]int64(nil), contactUserIDs...)
+	sort.Slice(viewers, func(i, j int) bool { return viewers[i] < viewers[j] })
+	sort.Slice(targets, func(i, j int) bool { return targets[i] < targets[j] })
+	sfKey := fmt.Sprintf("contact-projection:%v:%v", viewers, targets)
+	for {
+		v, err, _ := c.sf.Do(sfKey, func() (any, error) {
+			loadEpoch := c.cacheEpoch()
+			batch, err := c.inner.ContactProjectionForViewers(ctx, viewers, targets)
+			if err != nil {
+				return contactProjectionLoadResult{}, err
+			}
+			now := c.now()
+			expireAt := now.Add(c.ttl)
+			admitPairs := admitDenseContactProjectionPairs(len(viewers), len(targets))
+			c.mu.Lock()
+			current := c.epoch == loadEpoch
+			if current && admitPairs {
+				for _, viewerID := range viewers {
+					for _, targetID := range targets {
+						contact, contactFound := batch.Contacts[viewerID][targetID]
+						ref, personalPhotoFound := batch.PersonalPhotos[viewerID][targetID]
+						c.storeContactProjectionPairLocked(
+							contactProjectionKey{viewerUserID: viewerID, contactUserID: targetID},
+							contact, contactFound, ref, personalPhotoFound, expireAt,
+						)
+					}
+				}
+			}
+			c.mu.Unlock()
+			return contactProjectionLoadResult{
+				batch:   cloneContactProjectionBatch(batch),
+				current: current,
+			}, nil
+		})
+		if err != nil {
+			return domain.ContactProjectionBatch{}, err
+		}
+		result := v.(contactProjectionLoadResult)
+		if result.current {
+			return result.batch, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return domain.ContactProjectionBatch{}, err
+		}
+	}
+}
+
+func admitDenseContactProjectionPairs(viewerCount, targetCount int) bool {
+	if viewerCount <= 0 || targetCount <= 0 || targetCount > contactProjectionDenseAdmissionMaxCells {
+		return false
+	}
+	// Division avoids overflowing int for attacker-controlled vector lengths.
+	return viewerCount <= contactProjectionDenseAdmissionMaxCells/targetCount
+}
+
 // loadReverseContacts performs at most one batched cold-store read for all
 // missing owner→viewer pairs, then caches both hits and misses. Privacy
 // projection therefore stays memory-only after warm-up instead of repeating a
@@ -220,11 +467,7 @@ func (c *CachedContactStore) loadReverseContacts(ctx context.Context, userID int
 				for _, ownerID := range owners {
 					key := reverseContactKey{ownerUserID: ownerID, contactUserID: userID}
 					contact, found := contacts[ownerID]
-					c.storeReverseContactLocked(key, reverseContactSnapshot{
-						contact:  cloneCachedContact(contact),
-						found:    found,
-						expireAt: expireAt,
-					})
+					c.storeReverseContactLocked(key, contact, found, expireAt)
 				}
 			}
 			c.mu.Unlock()
@@ -249,6 +492,9 @@ func (c *CachedContactStore) loadReverseContacts(ctx context.Context, userID int
 func (c *CachedContactStore) Upsert(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error) {
 	contact, err := c.inner.Upsert(ctx, userID, input)
 	if err == nil {
+		// Published account snapshots are immutable. Invalidate instead of
+		// modifying their inner maps/slices in place or publishing a mutation
+		// payload whose cache-write order may differ from its DB commit order.
 		c.InvalidateViewers(userID, input.ContactUserID)
 	}
 	return contact, err
@@ -257,12 +503,11 @@ func (c *CachedContactStore) Upsert(ctx context.Context, userID int64, input dom
 func (c *CachedContactStore) UpsertMany(ctx context.Context, userID int64, inputs []domain.ContactInput) ([]domain.Contact, error) {
 	contacts, err := c.inner.UpsertMany(ctx, userID, inputs)
 	if err == nil {
-		ids := make([]int64, 0, len(inputs)+1)
-		ids = append(ids, userID)
+		ids := make([]int64, 0, len(inputs))
 		for _, input := range inputs {
 			ids = append(ids, input.ContactUserID)
 		}
-		c.InvalidateViewers(ids...)
+		c.InvalidateViewers(append([]int64{userID}, ids...)...)
 	}
 	return contacts, err
 }
@@ -270,7 +515,9 @@ func (c *CachedContactStore) UpsertMany(ctx context.Context, userID int64, input
 func (c *CachedContactStore) UpdateNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, bool, error) {
 	contact, found, err := c.inner.UpdateNote(ctx, userID, contactUserID, note, entities)
 	if err == nil {
-		c.InvalidateViewers(userID)
+		if found {
+			c.InvalidateViewers(userID)
+		}
 	}
 	return contact, found, err
 }
@@ -285,7 +532,10 @@ func (c *CachedContactStore) SetCloseFriends(ctx context.Context, userID int64, 
 
 func (c *CachedContactStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
 	contact, found, err := c.inner.SetPersonalPhoto(ctx, userID, contactUserID, photoID, date)
-	if err == nil {
+	if err == nil && found {
+		// Do not perform a post-commit read followed by write-through: two
+		// concurrent mutations can complete their cache writes in the opposite
+		// order and reinsert a stale pair after a newer NOTIFY invalidation.
 		c.InvalidateViewers(userID)
 	}
 	return contact, found, err
@@ -314,10 +564,7 @@ func (c *CachedContactStore) PersonalPhotos(ctx context.Context, userID int64, c
 func (c *CachedContactStore) Delete(ctx context.Context, userID int64, contactUserIDs []int64) (int, error) {
 	count, err := c.inner.Delete(ctx, userID, contactUserIDs)
 	if err == nil {
-		ids := make([]int64, 0, len(contactUserIDs)+1)
-		ids = append(ids, userID)
-		ids = append(ids, contactUserIDs...)
-		c.InvalidateViewers(ids...)
+		c.InvalidateViewers(append([]int64{userID}, contactUserIDs...)...)
 	}
 	return count, err
 }
@@ -481,10 +728,19 @@ func (c *CachedContactStore) lookupReverseContact(ownerUserID, contactUserID int
 	}
 	c.reverseLRU.MoveToFront(element)
 	c.mu.Unlock()
-	return cloneCachedContact(snap.contact), snap.found, true
+	if snap.contact == nil {
+		return domain.Contact{}, false, true
+	}
+	return cloneCachedContact(*snap.contact), true, true
 }
 
-func (c *CachedContactStore) storeReverseContactLocked(key reverseContactKey, snapshot reverseContactSnapshot) {
+func (c *CachedContactStore) storeReverseContactLocked(key reverseContactKey, contact domain.Contact, found bool, expireAt time.Time) {
+	var cached *domain.Contact
+	if found {
+		clone := cloneCachedContact(contact)
+		cached = &clone
+	}
+	snapshot := reverseContactSnapshot{contact: cached, expireAt: expireAt}
 	if element, ok := c.reverse[key]; ok {
 		entry := element.Value.(*reverseContactEntry)
 		entry.snapshot = snapshot
@@ -517,6 +773,99 @@ func (c *CachedContactStore) removeReverseElementLocked(element *list.Element) {
 	c.reverseLRU.Remove(element)
 }
 
+func (c *CachedContactStore) lookupContactProjectionPair(viewerUserID, contactUserID int64, now time.Time) (contactProjectionLookup, bool) {
+	key := contactProjectionKey{viewerUserID: viewerUserID, contactUserID: contactUserID}
+	c.mu.Lock()
+	element, ok := c.projection[key]
+	if !ok {
+		c.mu.Unlock()
+		return contactProjectionLookup{}, false
+	}
+	entry := element.Value.(*contactProjectionEntry)
+	snap := entry.snapshot
+	if !snap.expireAt.After(now) {
+		c.removeContactProjectionElementLocked(element)
+		c.mu.Unlock()
+		return contactProjectionLookup{}, false
+	}
+	c.projectionLRU.MoveToFront(element)
+	c.mu.Unlock()
+	result := contactProjectionLookup{}
+	if snap.contact != nil {
+		result.contact = snap.contact.domainContact(contactUserID)
+		result.contactFound = true
+	}
+	if snap.personalPhoto != nil {
+		result.personalPhoto = cloneCachedProfilePhotoRef(*snap.personalPhoto)
+		result.personalPhotoFound = true
+	}
+	return result, true
+}
+
+func (c *CachedContactStore) storeContactProjectionPairLocked(
+	key contactProjectionKey,
+	contact domain.Contact,
+	contactFound bool,
+	personalPhoto domain.ProfilePhotoRef,
+	personalPhotoFound bool,
+	expireAt time.Time,
+) {
+	var cachedContact *cachedContactProjectionOverlay
+	if contactFound {
+		cachedContact = newCachedContactProjectionOverlay(contact)
+	}
+	var cachedPersonalPhoto *domain.ProfilePhotoRef
+	if personalPhotoFound {
+		clone := cloneCachedProfilePhotoRef(personalPhoto)
+		cachedPersonalPhoto = &clone
+	}
+	snapshot := contactProjectionSnapshot{
+		contact:       cachedContact,
+		personalPhoto: cachedPersonalPhoto,
+		expireAt:      expireAt,
+	}
+	if element, ok := c.projection[key]; ok {
+		entry := element.Value.(*contactProjectionEntry)
+		entry.snapshot = snapshot
+		c.projectionLRU.MoveToFront(element)
+		return
+	}
+	element := c.projectionLRU.PushFront(&contactProjectionEntry{key: key, snapshot: snapshot})
+	c.projection[key] = element
+	if c.projectionByViewer[key.viewerUserID] == nil {
+		c.projectionByViewer[key.viewerUserID] = make(map[int64]struct{})
+	}
+	c.projectionByViewer[key.viewerUserID][key.contactUserID] = struct{}{}
+	if c.projectionByTarget[key.contactUserID] == nil {
+		c.projectionByTarget[key.contactUserID] = make(map[int64]struct{})
+	}
+	c.projectionByTarget[key.contactUserID][key.viewerUserID] = struct{}{}
+	for c.projectionLRU.Len() > c.projectionCap {
+		c.removeContactProjectionElementLocked(c.projectionLRU.Back())
+	}
+}
+
+func (c *CachedContactStore) removeContactProjectionElementLocked(element *list.Element) {
+	if element == nil {
+		return
+	}
+	entry := element.Value.(*contactProjectionEntry)
+	delete(c.projection, entry.key)
+	if targets := c.projectionByViewer[entry.key.viewerUserID]; targets != nil {
+		delete(targets, entry.key.contactUserID)
+		if len(targets) == 0 {
+			delete(c.projectionByViewer, entry.key.viewerUserID)
+		}
+	}
+	if viewers := c.projectionByTarget[entry.key.contactUserID]; viewers != nil {
+		delete(viewers, entry.key.viewerUserID)
+		if len(viewers) == 0 {
+			delete(c.projectionByTarget, entry.key.contactUserID)
+		}
+	}
+	c.projectionLRU.Remove(element)
+}
+
 func (c *CachedContactStore) InvalidateViewers(ids ...int64) {
 	if c == nil || len(ids) == 0 {
 		return
@@ -527,15 +876,35 @@ func (c *CachedContactStore) InvalidateViewers(ids ...int64) {
 		if id == 0 {
 			continue
 		}
-		delete(c.contacts, id)
-		delete(c.personalPhotos, id)
-		for contactUserID := range c.reverseByOwner[id] {
-			if element, ok := c.reverse[reverseContactKey{ownerUserID: id, contactUserID: contactUserID}]; ok {
-				c.removeReverseElementLocked(element)
-			}
-		}
+		c.invalidateViewerLocked(id)
 	}
 	c.mu.Unlock()
+}
+
+func (c *CachedContactStore) invalidateViewerLocked(id int64) {
+	delete(c.contacts, id)
+	delete(c.personalPhotos, id)
+	for contactUserID := range c.reverseByOwner[id] {
+		c.removeReverseKeyLocked(reverseContactKey{ownerUserID: id, contactUserID: contactUserID})
+	}
+	for contactUserID := range c.projectionByViewer[id] {
+		c.removeContactProjectionKeyLocked(contactProjectionKey{viewerUserID: id, contactUserID: contactUserID})
+	}
+	for viewerUserID := range c.projectionByTarget[id] {
+		c.removeContactProjectionKeyLocked(contactProjectionKey{viewerUserID: viewerUserID, contactUserID: id})
+	}
+}
+
+func (c *CachedContactStore) removeReverseKeyLocked(key reverseContactKey) {
+	if element, ok := c.reverse[key]; ok {
+		c.removeReverseElementLocked(element)
+	}
+}
+
+func (c *CachedContactStore) removeContactProjectionKeyLocked(key contactProjectionKey) {
+	if element, ok := c.projection[key]; ok {
+		c.removeContactProjectionElementLocked(element)
+	}
 }
 
 func (c *CachedContactStore) FlushReadModelCache() {
@@ -549,6 +918,10 @@ func (c *CachedContactStore) FlushReadModelCache() {
 	c.reverse = make(map[reverseContactKey]*list.Element, 4096)
 	c.reverseLRU.Init()
 	c.reverseByOwner = make(map[int64]map[int64]struct{}, 1024)
+	c.projection = make(map[contactProjectionKey]*list.Element, 4096)
+	c.projectionLRU.Init()
+	c.projectionByViewer = make(map[int64]map[int64]struct{}, 1024)
+	c.projectionByTarget = make(map[int64]map[int64]struct{}, 1024)
 	c.mu.Unlock()
 }
 
@@ -579,6 +952,48 @@ func cloneCachedContactMap(in map[int64]domain.Contact) map[int64]domain.Contact
 		out[id] = cloneCachedContact(contact)
 	}
 	return out
+}
+
+func cloneContactProjectionBatch(in domain.ContactProjectionBatch) domain.ContactProjectionBatch {
+	out := domain.ContactProjectionBatch{
+		Contacts:       make(map[int64]map[int64]domain.Contact, len(in.Contacts)),
+		PersonalPhotos: make(map[int64]map[int64]domain.ProfilePhotoRef, len(in.PersonalPhotos)),
+	}
+	mergeContactProjectionBatch(&out, in)
+	return out
+}
+
+func mergeContactProjectionBatch(dst *domain.ContactProjectionBatch, src domain.ContactProjectionBatch) {
+	for viewerID, contacts := range src.Contacts {
+		for targetID, contact := range contacts {
+			putContactProjectionContact(dst, viewerID, targetID, contact)
+		}
+	}
+	for viewerID, refs := range src.PersonalPhotos {
+		for targetID, ref := range refs {
+			putContactProjectionPersonalPhoto(dst, viewerID, targetID, ref)
+		}
+	}
+}
+
+func putContactProjectionContact(batch *domain.ContactProjectionBatch, viewerID, targetID int64, contact domain.Contact) {
+	if batch.Contacts == nil {
+		batch.Contacts = map[int64]map[int64]domain.Contact{}
+	}
+	if batch.Contacts[viewerID] == nil {
+		batch.Contacts[viewerID] = map[int64]domain.Contact{}
+	}
+	batch.Contacts[viewerID][targetID] = cloneCachedContact(contact)
+}
+
+func putContactProjectionPersonalPhoto(batch *domain.ContactProjectionBatch, viewerID, targetID int64, ref domain.ProfilePhotoRef) {
+	if batch.PersonalPhotos == nil {
+		batch.PersonalPhotos = map[int64]map[int64]domain.ProfilePhotoRef{}
+	}
+	if batch.PersonalPhotos[viewerID] == nil {
+		batch.PersonalPhotos[viewerID] = map[int64]domain.ProfilePhotoRef{}
+	}
+	batch.PersonalPhotos[viewerID][targetID] = cloneCachedProfilePhotoRef(ref)
 }
 
 func dedupContactIDs(ids []int64) []int64 {

@@ -258,6 +258,24 @@ func (r *Router) injectEncryptedOtherUpdates(ctx context.Context, viewerUserID i
 		return diff
 	}
 	users := r.tgUsersForIDs(ctx, viewerUserID, peerUserIDs)
+	return appendEncryptedOtherUpdates(diff, updates, users)
+}
+
+func (r *Router) injectEncryptedOtherUpdatesStrict(ctx context.Context, viewerUserID int64, diff tg.UpdatesDifferenceClass, updates []tg.UpdateClass, peerUserIDs []int64, cache *viewerPeerCache) (tg.UpdatesDifferenceClass, error) {
+	if len(updates) == 0 {
+		return diff, nil
+	}
+	if cache == nil {
+		cache = newViewerPeerCache(r)
+	}
+	users, err := cache.usersForIDsStrict(ctx, viewerUserID, peerUserIDs)
+	if err != nil {
+		return nil, err
+	}
+	return appendEncryptedOtherUpdates(diff, updates, r.tgUsersForViewer(viewerUserID, users)), nil
+}
+
+func appendEncryptedOtherUpdates(diff tg.UpdatesDifferenceClass, updates []tg.UpdateClass, users []tg.UserClass) tg.UpdatesDifferenceClass {
 	switch v := diff.(type) {
 	case *tg.UpdatesDifference:
 		v.OtherUpdates = append(v.OtherUpdates, updates...)

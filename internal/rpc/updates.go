@@ -141,10 +141,23 @@ func (r *Router) onUpdatesGetDifference(ctx context.Context, req *tg.UpdatesGetD
 		r.stageUpdatesBaselineAfterDelivery(ctx, userID, &emptyCursor, domain.UpdateStateCommitDeliveredOnly, stateEventIDs, true)
 		return &tg.UpdatesDifferenceEmpty{Date: st.State.Date, Seq: st.State.Seq}, nil
 	}
-	st.Events = r.enrichUpdateEvents(ctx, userID, st.Events)
+	peerCache := newViewerPeerCache(r)
+	st.Events, err = r.enrichUpdateEventsWithPeerCacheStrict(ctx, userID, st.Events, peerCache)
+	if err != nil {
+		r.log.Error("project durable account difference users",
+			zap.Int64("viewer_user_id", userID),
+			zap.Error(err))
+		return nil, internalErr()
+	}
 	diff := r.tgUpdatesDifference(ctx, userID, st)
 	diff = injectEncryptedMessages(diff, encMsgs, newQts)
-	diff = r.injectEncryptedOtherUpdates(ctx, userID, diff, stateUpdates, statePeerUserIDs)
+	diff, err = r.injectEncryptedOtherUpdatesStrict(ctx, userID, diff, stateUpdates, statePeerUserIDs, peerCache)
+	if err != nil {
+		r.log.Error("project durable encrypted difference users",
+			zap.Int64("viewer_user_id", userID),
+			zap.Error(err))
+		return nil, internalErr()
+	}
 	returnedCursor := st.State
 	returnedCursor.Qts = newQts
 	r.stageUpdatesBaselineAfterDelivery(ctx, userID, &returnedCursor, domain.UpdateStateCommitDeliveredOnly, stateEventIDs, true)

@@ -3,6 +3,7 @@ package users
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -16,6 +17,9 @@ import (
 var (
 	ErrNotAuthorized       = errors.New("not authorized")
 	ErrSystemUserImmutable = errors.New("system user identity is immutable")
+	ErrBatchUsersLimit     = errors.New("batch users limit exceeded")
+	ErrBatchViewerCells    = errors.New("batch viewer projection cell limit exceeded")
+	ErrBatchUserMissing    = errors.New("batch user projection source is incomplete")
 )
 
 // ProfilePhotoProvider 批量返回用户当前头像（用于把 PhotoID/DCID/Stripped 富化到 domain.User）。
@@ -84,6 +88,9 @@ const (
 	maxProfileAboutRunes        = 70
 	maxProfileAboutRunesPremium = 140
 	maxBatchUsers               = 1000
+	// A dense fan-out materializes one complete domain.User per viewer/owner
+	// cell in both the result and the batch cache. Bound the retained graph.
+	maxBatchViewerProjectionCells = 131072
 )
 
 // NewService 创建用户服务。
@@ -178,11 +185,11 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 		if _, ok := seen[id]; ok {
 			continue
 		}
+		if len(ids) >= maxBatchUsers {
+			return nil, fmt.Errorf("%w: more than %d unique owners", ErrBatchUsersLimit, maxBatchUsers)
+		}
 		seen[id] = struct{}{}
 		ids = append(ids, id)
-		if len(ids) >= maxBatchUsers {
-			break
-		}
 	}
 	users, err := s.loadBaseUsersByIDs(ctx, ids)
 	if err != nil {
@@ -192,22 +199,68 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 }
 
 // ByIDsForViewers 跨多个 viewer 批量投影同一组 user（fan-out 模板化）：base user 只加载一次，
-// 隐私/改名/头像投影经 userprojection.ForViewers 压成 O(owner) 查询。返回 map[viewerID][]User，
-// 每个切片与 ByIDs(viewer, ids) 字节等价——**唯一例外是 personal photo overlay**（ForViewers v1
-// 跳过，客户端下次 getChannelDifference/getHistory 自愈）。供 channel fan-out 预热每 viewer 投影，
+// 隐私/改名/头像投影经 userprojection.ForViewers 收敛成批量查询。返回 map[viewerID][]User，
+// 每个切片与 ByIDs(viewer, ids) 字节等价，包含 viewer-specific personal photo overlay。
+// 供 channel fan-out 预热每 viewer 投影，
 // 把 per-recipient 的 ByIDs(=ForViewer) 折叠成一次跨 viewer 投影。不做 ByIDs 的单 caller 鉴权
 // （viewer 是 fan-out 收件人集合，非 RPC 调用方）。
 func (s *Service) ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error) {
 	if len(viewerUserIDs) == 0 || len(userIDs) == 0 {
 		return map[int64][]domain.User{}, nil
 	}
-	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	ids := uniqueUserIDs(userIDs, 0)
+	if len(ids) > maxBatchUsers {
+		return nil, fmt.Errorf("%w: got %d unique owners, maximum %d", ErrBatchUsersLimit, len(ids), maxBatchUsers)
+	}
+	viewers := uniqueUserIDs(viewerUserIDs, 0)
+	if !batchViewerProjectionCellsAllowed(len(viewers), len(ids)) {
+		return nil, fmt.Errorf("%w: got %d viewers x %d owners, maximum %d cells", ErrBatchViewerCells, len(viewers), len(ids), maxBatchViewerProjectionCells)
+	}
 	base, err := s.loadBaseUsersByIDs(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
+	base, err = requireBatchBaseUsers(ids, base)
+	if err != nil {
+		return nil, err
+	}
 	// projector 为 nil 时 ForViewers 返回各 viewer 的原始 base 副本（与 projectUsers 的 nil 分支一致）。
-	return s.projector.ForViewers(ctx, viewerUserIDs, base)
+	return s.projector.ForViewers(ctx, viewers, base)
+}
+
+func batchViewerProjectionCellsAllowed(viewers, owners int) bool {
+	if viewers <= 0 || owners <= 0 {
+		return true
+	}
+	// Division avoids overflow from viewers*owners on hostile inputs.
+	return viewers <= maxBatchViewerProjectionCells/owners
+}
+
+// requireBatchBaseUsers turns the fan-out projection API into a complete
+// envelope contract. Deleted users remain durable tombstones and therefore
+// still appear in base; a truly missing referenced user must fail closed rather
+// than produce a message whose sender cannot be resolved. System users are
+// protocol-local constants and do not require a backing users row.
+func requireBatchBaseUsers(ids []int64, base []domain.User) ([]domain.User, error) {
+	byID := make(map[int64]domain.User, len(base))
+	for _, user := range base {
+		if user.ID != 0 {
+			byID[user.ID] = user
+		}
+	}
+	out := make([]domain.User, 0, len(ids))
+	for _, id := range ids {
+		if user, ok := byID[id]; ok {
+			out = append(out, user)
+			continue
+		}
+		if system, ok := domain.SystemUserByID(id); ok {
+			out = append(out, system)
+			continue
+		}
+		return nil, fmt.Errorf("%w: user_id=%d", ErrBatchUserMissing, id)
+	}
+	return out, nil
 }
 
 // CheckUsername 校验当前用户是否可以占用 username。
@@ -719,7 +772,10 @@ func (s *Service) loadBaseUserByID(ctx context.Context, userID int64) (domain.Us
 }
 
 func (s *Service) loadBaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
-	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	ids := uniqueUserIDs(userIDs, maxBatchUsers+1)
+	if len(ids) > maxBatchUsers {
+		return nil, fmt.Errorf("%w: more than %d unique owners", ErrBatchUsersLimit, maxBatchUsers)
+	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
