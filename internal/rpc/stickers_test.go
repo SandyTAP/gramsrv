@@ -173,8 +173,8 @@ func TestAccountGetDefaultEmojiStatusesFallsBackWhenUnseeded(t *testing.T) {
 func TestMessagesGetStickerSetAndroidPlaceholderUsesSeededSet(t *testing.T) {
 	ctx := context.Background()
 	docs := make(map[int64]domain.Document)
-	documentIDs := make([]int64, 0, androidPlaceholderStickerMinDocuments)
-	for i := 0; i < androidPlaceholderStickerMinDocuments; i++ {
+	documentIDs := make([]int64, 0, androidPlaceholderStickerDocumentLimit+3)
+	for i := 0; i < androidPlaceholderStickerDocumentLimit+3; i++ {
 		id := int64(100 + i)
 		documentIDs = append(documentIDs, id)
 		docs[id] = domain.Document{ID: id, AccessHash: id + 1000, DCID: 2}
@@ -194,6 +194,11 @@ func TestMessagesGetStickerSetAndroidPlaceholderUsesSeededSet(t *testing.T) {
 					Count:       len(documentIDs),
 					Hash:        12345,
 					DocumentIDs: documentIDs,
+					Packs: []domain.StickerPack{{
+						Emoticon:    "🙂",
+						DocumentIDs: append([]int64(nil), documentIDs...),
+					}},
+					Keywords: []domain.StickerKeyword{{DocumentID: documentIDs[0], Keywords: []string{"placeholder"}}},
 				},
 			},
 		},
@@ -210,15 +215,41 @@ func TestMessagesGetStickerSetAndroidPlaceholderUsesSeededSet(t *testing.T) {
 	if !ok {
 		t.Fatalf("getStickerSet placeholder = %T, want *tg.MessagesStickerSet", res)
 	}
-	if full.Set.ID != 77 {
-		t.Fatalf("placeholder fallback set id = %d, want 77", full.Set.ID)
+	if full.Set.ID == 77 || full.Set.ShortName != "tg_placeholders_android" {
+		t.Fatalf("placeholder projection identity = %d/%q, want independent tg_placeholders_android", full.Set.ID, full.Set.ShortName)
 	}
-	if len(full.Documents) < androidPlaceholderStickerMinDocuments {
-		t.Fatalf("placeholder fallback documents = %d, want >= %d", len(full.Documents), androidPlaceholderStickerMinDocuments)
+	if len(full.Documents) != androidPlaceholderStickerDocumentLimit || full.Set.Count != androidPlaceholderStickerDocumentLimit {
+		t.Fatalf("placeholder projection documents/count = %d/%d, want exactly %d", len(full.Documents), full.Set.Count, androidPlaceholderStickerDocumentLimit)
+	}
+	if full.Set.Hash == 0 || len(full.Packs) != 1 || len(full.Packs[0].Documents) != androidPlaceholderStickerDocumentLimit {
+		t.Fatalf("placeholder projection hash/packs = %d/%+v", full.Set.Hash, full.Packs)
+	}
+	if got := files.sets[domain.StickerSetKindSystem][0]; len(got.DocumentIDs) != androidPlaceholderStickerDocumentLimit+3 || got.ID != 77 {
+		t.Fatalf("source set mutated by projection: id=%d docs=%d", got.ID, len(got.DocumentIDs))
+	}
+
+	// 投影有独立 identity：客户端后续按返回的 id/access_hash 请求仍能解析，不会
+	// 与真正的 AnimatedEmoji set id/hash 缓存互相覆盖。
+	byID, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
+		Stickerset: &tg.InputStickerSetID{ID: full.Set.ID, AccessHash: full.Set.AccessHash},
+	})
+	if err != nil {
+		t.Fatalf("get placeholder projection by id: %v", err)
+	}
+	if byIDFull, ok := byID.(*tg.MessagesStickerSet); !ok || byIDFull.Set.ID != full.Set.ID || len(byIDFull.Documents) != androidPlaceholderStickerDocumentLimit {
+		t.Fatalf("placeholder projection by id = %T %+v", byID, byID)
+	}
+	if cached, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
+		Stickerset: &tg.InputStickerSetShortName{ShortName: "tg_placeholders_android"},
+		Hash:       full.Set.Hash,
+	}); err != nil {
+		t.Fatalf("get placeholder projection matching hash: %v", err)
+	} else if _, ok := cached.(*tg.MessagesStickerSetNotModified); !ok {
+		t.Fatalf("placeholder matching hash = %T, want NotModified", cached)
 	}
 }
 
-func TestMessagesGetStickerSetReturnsFullOnMatchingHash(t *testing.T) {
+func TestMessagesGetStickerSetHonorsNonZeroHash(t *testing.T) {
 	ctx := context.Background()
 	files := &fakeFiles{
 		docs: map[int64]domain.Document{
@@ -248,12 +279,21 @@ func TestMessagesGetStickerSetReturnsFullOnMatchingHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getStickerSet matching hash: %v", err)
 	}
-	full, ok := res.(*tg.MessagesStickerSet)
-	if !ok {
-		t.Fatalf("getStickerSet matching hash = %T, want *tg.MessagesStickerSet", res)
+	if _, ok := res.(*tg.MessagesStickerSetNotModified); !ok {
+		t.Fatalf("getStickerSet matching hash = %T, want *tg.MessagesStickerSetNotModified", res)
 	}
-	if full.Set.ID != 10 || len(full.Documents) != 1 {
-		t.Fatalf("getStickerSet matching hash returned set %d docs %d, want set 10 with one doc", full.Set.ID, len(full.Documents))
+
+	// hash=0 是强制完整响应，不能因为任何默认值或兼容 stub 返回 NotModified。
+	fullResult, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
+		Stickerset: &tg.InputStickerSetID{ID: 10, AccessHash: 100},
+		Hash:       0,
+	})
+	if err != nil {
+		t.Fatalf("getStickerSet hash=0: %v", err)
+	}
+	full, ok := fullResult.(*tg.MessagesStickerSet)
+	if !ok || full.Set.ID != 10 || len(full.Documents) != 1 {
+		t.Fatalf("getStickerSet hash=0 = %T %+v, want set 10 with one doc", fullResult, fullResult)
 	}
 }
 
