@@ -634,12 +634,112 @@ func TestDeletePrivateHistoryLoopsUntilOffsetClears(t *testing.T) {
 	}
 }
 
+func TestStickerSetUploadsFailPreflightBeforeMaterialization(t *testing.T) {
+	ctx := context.Background()
+	ports := &fakeStickerSetsService{addValidationErr: domain.ErrStickerSetTooMuch}
+	repo := newMemoryCommandRepo()
+	svc := NewService(Dependencies{Commands: repo, StickerSets: ports, Now: fixedNow})
+
+	_, err := svc.AddStickerToSet(ctx, AddStickerToSetRequest{
+		CommandMeta: CommandMeta{CommandID: "add-full-pack", Actor: "ops", Reason: "test"},
+		SetID:       10,
+		Emoji:       "🙂",
+		FileName:    "emoji.json",
+		Data:        []byte(`{"w":512}`),
+	})
+	if !errors.Is(err, domain.ErrStickerSetTooMuch) {
+		t.Fatalf("add full pack err = %v, want ErrStickerSetTooMuch", err)
+	}
+	if ports.addValidationCalls != 1 || ports.uploadCalls != 0 || ports.addCalls != 0 || len(repo.items) != 1 {
+		t.Fatalf("add preflight calls validation/upload/add/commands = %d/%d/%d/%d, want 1/0/0/1",
+			ports.addValidationCalls, ports.uploadCalls, ports.addCalls, len(repo.items))
+	}
+
+	ports.addValidationErr = nil
+	ports.createValidationErr = domain.ErrStickerSetShortNameOccupied
+	_, err = svc.CreateStickerSet(ctx, CreateStickerSetRequest{
+		CommandMeta: CommandMeta{CommandID: "create-occupied-pack", Actor: "ops", Reason: "test"},
+		Title:       "Emoji Pack",
+		ShortName:   "occupied_pack",
+		Kind:        string(domain.StickerSetKindEmoji),
+		Emoji:       "🙂",
+		FileName:    "emoji.json",
+		Data:        []byte(`{"w":512}`),
+	})
+	if !errors.Is(err, domain.ErrStickerSetShortNameOccupied) {
+		t.Fatalf("create occupied pack err = %v, want ErrStickerSetShortNameOccupied", err)
+	}
+	if ports.createValidationCalls != 1 || ports.uploadCalls != 0 || ports.createCalls != 0 || len(repo.items) != 2 {
+		t.Fatalf("create preflight calls validation/upload/create/commands = %d/%d/%d/%d, want 1/0/0/2",
+			ports.createValidationCalls, ports.uploadCalls, ports.createCalls, len(repo.items))
+	}
+}
+
 func fixedNow() time.Time {
 	return time.Unix(1_700_000_000, 0).UTC()
 }
 
 type memoryCommandRepo struct {
 	items map[string]domain.AdminCommand
+}
+
+type fakeStickerSetsService struct {
+	createValidationErr   error
+	addValidationErr      error
+	createValidationCalls int
+	addValidationCalls    int
+	uploadCalls           int
+	createCalls           int
+	addCalls              int
+}
+
+func (f *fakeStickerSetsService) AdminSetStickerSetArchived(context.Context, int64, bool) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStickerSetsService) AdminSetStickerSetSortOrder(context.Context, int64, int) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStickerSetsService) AdminRenameStickerSet(context.Context, int64, string) (domain.StickerSet, error) {
+	return domain.StickerSet{}, nil
+}
+
+func (f *fakeStickerSetsService) AdminDeleteStickerSet(context.Context, int64) (domain.StickerSetKind, error) {
+	return domain.StickerSetKindStickers, nil
+}
+
+func (f *fakeStickerSetsService) ValidateStickerMaterialUpload(string, []byte) (string, bool) {
+	return "application/json", true
+}
+
+func (f *fakeStickerSetsService) ValidateAdminCreateStickerSet(context.Context, string, string, string, domain.StickerSetKind) error {
+	f.createValidationCalls++
+	return f.createValidationErr
+}
+
+func (f *fakeStickerSetsService) ValidateAdminAddStickerToSet(context.Context, int64, string) error {
+	f.addValidationCalls++
+	return f.addValidationErr
+}
+
+func (f *fakeStickerSetsService) AdminUploadStickerMaterial(context.Context, string, []byte) (domain.Document, error) {
+	f.uploadCalls++
+	return domain.Document{ID: 100, AccessHash: 200}, nil
+}
+
+func (f *fakeStickerSetsService) AdminCreateStickerSet(context.Context, domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+	f.createCalls++
+	return domain.StickerSet{ID: 10}, nil, nil
+}
+
+func (f *fakeStickerSetsService) AdminAddStickerToSet(context.Context, int64, domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+	f.addCalls++
+	return domain.StickerSet{ID: 10}, nil, nil
+}
+
+func (f *fakeStickerSetsService) AdminRemoveStickerFromSet(context.Context, int64, int64) (domain.StickerSet, []domain.Document, error) {
+	return domain.StickerSet{}, nil, nil
 }
 
 func newMemoryCommandRepo() *memoryCommandRepo {

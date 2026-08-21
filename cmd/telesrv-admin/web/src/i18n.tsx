@@ -346,6 +346,8 @@ const translations: Record<Language, Record<string, string>> = {
     "emoji.copyID": "Copy document ID",
     "emoji.noSet": "No set",
     "emoji.hint": "Document IDs here can be pasted into the Emoji status field on account, bot and channel profiles.",
+    "emoji.packCatalog": "Emoji packs",
+    "emoji.documentCatalog": "All documents",
     "messages.privateTitle": "Private Messages",
     "messages.privateEyebrow": "Private message boxes",
     "messages.groupTitle": "Group Messages",
@@ -1191,6 +1193,7 @@ const translations: Record<Language, Record<string, string>> = {
     "stickers.chooseStickerFirst": "Choose a sticker file first.",
     "stickers.emojiValueRequired": "An emoji is required.",
     "stickers.addEmoji": "Add emoji",
+    "stickers.packFull": "This pack already has {count} items. The current limit is {max}; create another pack to add more.",
     "stickers.addSticker": "Add sticker",
     "action.oneTimeSecret": "One-time secret — copy it now; it will not be shown again."
   },
@@ -1533,6 +1536,8 @@ const translations: Record<Language, Record<string, string>> = {
     "emoji.copyID": "复制文档 ID",
     "emoji.noSet": "无所属集合",
     "emoji.hint": "这里的文档 ID 可直接填入账号、机器人和频道资料的 Emoji 状态字段。",
+    "emoji.packCatalog": "Emoji 包",
+    "emoji.documentCatalog": "全部文档",
     "messages.privateTitle": "私聊消息",
     "messages.privateEyebrow": "私聊消息盒",
     "messages.groupTitle": "群聊消息",
@@ -2378,6 +2383,7 @@ const translations: Record<Language, Record<string, string>> = {
     "stickers.chooseStickerFirst": "请先选择贴纸文件。",
     "stickers.emojiValueRequired": "必须填写 Emoji。",
     "stickers.addEmoji": "添加 Emoji",
+    "stickers.packFull": "此包已有 {count} 项，当前上限为 {max}；请创建新的 Emoji 包后继续添加。",
     "stickers.addSticker": "添加贴纸",
     "action.oneTimeSecret": "这是一次性密钥——请立即复制，之后将不再显示。"
   },
@@ -2720,6 +2726,8 @@ const translations: Record<Language, Record<string, string>> = {
   "emoji.copyID": "Скопировать ID документа",
   "emoji.noSet": "Без набора",
   "emoji.hint": "ID документов отсюда можно вставлять в поле Emoji-статуса в профилях аккаунтов, ботов и каналов.",
+  "emoji.packCatalog": "Наборы эмодзи",
+  "emoji.documentCatalog": "Все документы",
   "messages.privateTitle": "Личные сообщения",
   "messages.privateEyebrow": "Личные ящики сообщений",
   "messages.groupTitle": "Групповые сообщения",
@@ -3565,6 +3573,7 @@ const translations: Record<Language, Record<string, string>> = {
   "stickers.chooseStickerFirst": "Сначала выберите файл стикера.",
   "stickers.emojiValueRequired": "Укажите эмодзи.",
   "stickers.addEmoji": "Добавить эмодзи",
+  "stickers.packFull": "В этом наборе уже {count} элементов. Текущий лимит — {max}; создайте новый набор, чтобы добавить ещё.",
   "stickers.addSticker": "Добавить стикер",
   "action.oneTimeSecret": "Одноразовый секрет — скопируйте его сейчас, повторно он не отобразится."
   }

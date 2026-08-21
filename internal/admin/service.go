@@ -348,6 +348,8 @@ type StickerSetsService interface {
 	AdminRenameStickerSet(ctx context.Context, setID int64, title string) (domain.StickerSet, error)
 	AdminDeleteStickerSet(ctx context.Context, setID int64) (domain.StickerSetKind, error)
 	ValidateStickerMaterialUpload(fileName string, data []byte) (mimeType string, ok bool)
+	ValidateAdminCreateStickerSet(ctx context.Context, title, shortName, emoji string, kind domain.StickerSetKind) error
+	ValidateAdminAddStickerToSet(ctx context.Context, setID int64, emoji string) error
 	AdminUploadStickerMaterial(ctx context.Context, fileName string, data []byte) (domain.Document, error)
 	AdminCreateStickerSet(ctx context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error)
 	AdminAddStickerToSet(ctx context.Context, setID int64, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error)
@@ -3981,16 +3983,19 @@ func (s *Service) CreateStickerSet(ctx context.Context, req CreateStickerSetRequ
 	if !ok {
 		return CommandResult{}, domain.ErrStickerSetFileInvalid
 	}
-	digest := sha256.Sum256(req.Data)
-	req.ContentSHA256 = hex.EncodeToString(digest[:])
 	kind := domain.StickerSetKindStickers
 	if req.Kind == string(domain.StickerSetKindEmoji) {
 		kind = domain.StickerSetKindEmoji
 	}
+	digest := sha256.Sum256(req.Data)
+	req.ContentSHA256 = hex.EncodeToString(digest[:])
 	return s.runCommand(ctx, req.CommandMeta, ActionCreateStickerSet, 0, domain.Peer{}, req, func() (CommandResult, error) {
 		details := map[string]any{
 			"title": req.Title, "short_name": req.ShortName, "kind": string(kind),
 			"file_name": req.FileName, "mime_type": mimeType, "bytes": len(req.Data),
+		}
+		if err := s.stickerSets.ValidateAdminCreateStickerSet(ctx, req.Title, req.ShortName, req.Emoji, kind); err != nil {
+			return CommandResult{Details: details}, err
 		}
 		if req.DryRun {
 			return CommandResult{Message: "sticker pack validated", Details: details}, nil
@@ -4036,6 +4041,12 @@ func (s *Service) AddStickerToSet(ctx context.Context, req AddStickerToSetReques
 		details := map[string]any{
 			"set_id": strconv.FormatInt(req.SetID, 10), "emoji": req.Emoji,
 			"file_name": req.FileName, "mime_type": mimeType, "bytes": len(req.Data),
+		}
+		// Validate the target and item before materializing a loose
+		// document/blob. Keeping this inside runCommand preserves replay of a
+		// previously completed command even if the pack has since changed.
+		if err := s.stickerSets.ValidateAdminAddStickerToSet(ctx, req.SetID, req.Emoji); err != nil {
+			return CommandResult{Details: details}, err
 		}
 		if req.DryRun {
 			return CommandResult{Message: "sticker upload validated", Details: details}, nil

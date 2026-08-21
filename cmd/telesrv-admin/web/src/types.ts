@@ -843,7 +843,7 @@ export type StickerSetRow = {
   CoverDocumentID: string;
 };
 
-export type StickerSetListResponse = { rows: StickerSetRow[] };
+export type StickerSetListResponse = { rows: StickerSetRow[]; max_items: number };
 
 export type AccountListResponse = {
   query: string;

@@ -131,11 +131,14 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
   if (route.path === "/moderation") {
     return <ModerationCasesPage navigate={navigate} />;
   }
+  if (route.path === "/emoji/documents") {
+    return <EmojiPage navigate={navigate} />;
+  }
   if (route.path === "/emoji") {
-    return <EmojiPage />;
+    return <StickerSetsPage kind="emoji" navigate={navigate} />;
   }
   if (route.path === "/stickers") {
-    return <StickerSetsPage kind="stickers" />;
+    return <StickerSetsPage kind="stickers" navigate={navigate} />;
   }
 	if (route.path === "/gif-catalog") {
 		return <GifCatalogPage />;

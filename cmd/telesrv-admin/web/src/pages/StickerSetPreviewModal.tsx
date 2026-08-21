@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Loader2, Plus, Trash2, X } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Copy, Loader2, Plus, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { api, errorMessage } from "../api";
@@ -10,7 +10,7 @@ import type { StickerSetRow } from "../types";
 
 const pageSize = 24;
 
-export function StickerSetPreviewModal({ set, onClose }: { set: StickerSetRow; onClose: () => void }) {
+export function StickerSetPreviewModal({ set, maxItems, onClose }: { set: StickerSetRow; maxItems: number; onClose: () => void }) {
   const { t } = useI18n();
   const [documentIDs, setDocumentIDs] = useState<string[] | null>(null);
   const [error, setError] = useState("");
@@ -46,6 +46,8 @@ export function StickerSetPreviewModal({ set, onClose }: { set: StickerSetRow; o
   const pageItems = documentIDs?.slice(pageStart, pageStart + pageSize) ?? [];
   const rangeStart = pageItems.length === 0 ? 0 : pageStart + 1;
   const rangeEnd = rangeStart === 0 ? 0 : rangeStart + pageItems.length - 1;
+  const currentCount = documentIDs?.length ?? set.Count;
+  const atCapacity = maxItems > 0 && currentCount >= maxItems;
 
   return createPortal(
     <div className="modal-backdrop" role="presentation">
@@ -60,7 +62,11 @@ export function StickerSetPreviewModal({ set, onClose }: { set: StickerSetRow; o
           </button>
         </div>
         <div className="command-body">
-          <AddStickerForm setID={set.ID} kind={set.Kind === "emoji" ? "emoji" : "stickers"} onAdded={load} />
+          {atCapacity ? (
+            <Alert>{t("stickers.packFull", { count: currentCount, max: maxItems })}</Alert>
+          ) : (
+            <AddStickerForm setID={set.ID} kind={set.Kind === "emoji" ? "emoji" : "stickers"} onAdded={load} />
+          )}
           {error && <Alert>{error}</Alert>}
           {!error && documentIDs === null && (
             <div className="loading-line">
@@ -73,6 +79,7 @@ export function StickerSetPreviewModal({ set, onClose }: { set: StickerSetRow; o
               {pageItems.map((documentID) => (
                 <div className="sticker-doc-grid-cell" key={documentID}>
                   <StickerDocumentPreview documentID={documentID} />
+                  <CopyDocumentID documentID={documentID} />
                   <ActionButton
                     compact
                     tone="danger"
@@ -109,6 +116,28 @@ export function StickerSetPreviewModal({ set, onClose }: { set: StickerSetRow; o
       </section>
     </div>,
     document.body
+  );
+}
+
+function CopyDocumentID({ documentID }: { documentID: string }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(documentID);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard is best-effort.
+    }
+  }
+
+  return (
+    <button className="emoji-id" type="button" onClick={copy} title={t("emoji.copyID")}>
+      <span className="mono">{documentID}</span>
+      {copied ? <Check size={12} /> : <Copy size={12} />}
+    </button>
   );
 }
 

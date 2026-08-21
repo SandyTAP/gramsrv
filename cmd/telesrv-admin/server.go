@@ -423,7 +423,10 @@ func (s *server) handleStickerSetsAPI(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rows": rows})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":      rows,
+		"max_items": domain.MaxStickerSetItems,
+	})
 }
 
 func (s *server) handleStickerSetDocumentsAPI(w http.ResponseWriter, r *http.Request) {
