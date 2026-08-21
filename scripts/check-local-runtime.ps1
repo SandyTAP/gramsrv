@@ -14,7 +14,7 @@ param(
     [string]$AndroidPackage = "org.telegram.messenger.beta",
     [string]$DeviceSerial,
     [string]$PostgresContainer = "telesrv-postgres",
-    [string]$Database = "telesrv",
+    [string]$Database,
     [string]$DbUser = "telesrv",
     [int]$RecentLogLines = 1200,
     [switch]$SkipAdb
@@ -144,6 +144,18 @@ try {
 } finally {
     Pop-Location
 }
+
+if ([string]::IsNullOrWhiteSpace($Database)) {
+    switch ($branch) {
+        "main" { $Database = "telesrv_main" }
+        "v2" { $Database = "telesrv_v2" }
+        default {
+            Add-Failure "branch '$branch' has no implicit local PostgreSQL database; pass -Database"
+            $Database = "telesrv"
+        }
+    }
+}
+Write-Host "database=$Database"
 
 Write-Step "Process and Port"
 $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)

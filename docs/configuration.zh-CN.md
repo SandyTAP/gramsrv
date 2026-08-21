@@ -385,7 +385,7 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
-| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable` | 主业务持久库；生产必须替换开发凭证与 TLS 策略。 |
+| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_main?sslmode=disable` | 主业务持久库；本地 `main` / `v2` 因迁移历史不同，分别使用 `telesrv_main` / `telesrv_v2`；生产必须替换开发凭证与 TLS 策略。 |
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | pgxpool 最大连接数；`<=0` 使用 pgx 默认值，该默认通常不足以覆盖生产 outbox/RPC 并发。 |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool 预热最小连接数。 |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | 验证码、限流、共享更新/缓存易失态使用的 Redis。 |

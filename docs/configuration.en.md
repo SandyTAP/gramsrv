@@ -402,7 +402,7 @@ key rings independently on different instances.
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
-| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable` | Primary durable business database. Production must replace the development credentials and TLS policy. |
+| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_main?sslmode=disable` | Primary durable business database. Local `main` and `v2` use separate `telesrv_main` / `telesrv_v2` databases because their migration histories differ. Production must replace the development credentials and TLS policy. |
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | pgxpool maximum connections. `<=0` delegates to pgx defaults, which are usually too small for production outbox/RPC concurrency. |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool pre-warmed minimum connections. |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | Redis used for volatile codes, limits, and shared update/cache state. |
