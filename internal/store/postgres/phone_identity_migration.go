@@ -21,8 +21,10 @@ type phoneIdentityCandidate struct {
 // canonicalizeStoredPhoneIdentities is the data half of migration 0182. SQL
 // alone cannot correctly distinguish a removable national trunk prefix from a
 // significant leading zero, so the application numbering-plan metadata builds
-// a complete plan first. No users row is changed until every ordinary account
-// is parseable and no two rows converge on the same E.164 identity.
+// a complete plan first. Legacy values that do not describe any valid phone
+// identity are left untouched and therefore remain unreachable through the
+// canonical login path. No users row is changed until no two parseable rows
+// converge on the same E.164 identity.
 func canonicalizeStoredPhoneIdentities(ctx context.Context, conn *pgx.Conn) error {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -69,8 +71,10 @@ LIMIT $2`, usersTable.Sanitize()), lastID, phoneIdentityMigrationBatchSize)
 		if err != nil {
 			return fmt.Errorf("scan stored phone identities: %w", err)
 		}
+		rowsRead := 0
 		candidates := make([]phoneIdentityCandidate, 0, phoneIdentityMigrationBatchSize)
 		for rows.Next() {
+			rowsRead++
 			var userID int64
 			var rawPhone string
 			if err := rows.Scan(&userID, &rawPhone); err != nil {
@@ -82,8 +86,7 @@ LIMIT $2`, usersTable.Sanitize()), lastID, phoneIdentityMigrationBatchSize)
 			if !domain.IsSystemUserID(userID) {
 				canonical = domain.NormalizePhone(rawPhone)
 				if canonical == "" {
-					rows.Close()
-					return fmt.Errorf("user %d has a non-canonicalizable phone", userID)
+					continue
 				}
 			}
 			candidates = append(candidates, phoneIdentityCandidate{
@@ -97,21 +100,20 @@ LIMIT $2`, usersTable.Sanitize()), lastID, phoneIdentityMigrationBatchSize)
 			return fmt.Errorf("iterate stored phone identities: %w", err)
 		}
 		rows.Close()
-		if len(candidates) == 0 {
-			break
+		if len(candidates) > 0 {
+			copyRows := make([][]any, 0, len(candidates))
+			for _, candidate := range candidates {
+				copyRows = append(copyRows, []any{candidate.userID, candidate.canonicalPhone, candidate.needsUpdate})
+			}
+			if _, err := tx.CopyFrom(ctx,
+				pgx.Identifier{"phone_identity_0182"},
+				[]string{"user_id", "canonical_phone", "needs_update"},
+				pgx.CopyFromRows(copyRows),
+			); err != nil {
+				return fmt.Errorf("stage phone identity plan: %w", err)
+			}
 		}
-		copyRows := make([][]any, 0, len(candidates))
-		for _, candidate := range candidates {
-			copyRows = append(copyRows, []any{candidate.userID, candidate.canonicalPhone, candidate.needsUpdate})
-		}
-		if _, err := tx.CopyFrom(ctx,
-			pgx.Identifier{"phone_identity_0182"},
-			[]string{"user_id", "canonical_phone", "needs_update"},
-			pgx.CopyFromRows(copyRows),
-		); err != nil {
-			return fmt.Errorf("stage phone identity plan: %w", err)
-		}
-		if len(candidates) < phoneIdentityMigrationBatchSize {
+		if rowsRead < phoneIdentityMigrationBatchSize {
 			break
 		}
 	}

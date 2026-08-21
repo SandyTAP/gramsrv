@@ -51,22 +51,22 @@ INSERT INTO users(id, phone) VALUES
 		assertFixturePhone(t, ctx, tx, 2002, "989981679461")
 	})
 
-	t.Run("invalid ordinary identity fails without exposing phone", func(t *testing.T) {
+	t.Run("invalid ordinary identity remains unreachable without blocking valid rows", func(t *testing.T) {
 		tx := beginPhoneIdentityFixtureTx(t, ctx, pool)
 		defer func() { _ = tx.Rollback(context.Background()) }()
 		const invalidPhone = "legacy-not-a-phone"
-		if _, err := tx.Exec(ctx, `INSERT INTO users(id, phone) VALUES (3001, $1)`, invalidPhone); err != nil {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO users(id, phone) VALUES
+    (3001, $1),
+    (3002, '9809981679461')`, invalidPhone); err != nil {
 			t.Fatalf("insert invalid fixture: %v", err)
 		}
 
-		err := canonicalizeStoredPhoneIdentitiesInTableTx(ctx, tx, pgx.Identifier{"users"})
-		if err == nil || !strings.Contains(err.Error(), "user 3001 has a non-canonicalizable phone") {
-			t.Fatalf("canonicalize err = %v, want invalid user ID", err)
-		}
-		if strings.Contains(err.Error(), invalidPhone) {
-			t.Fatalf("migration error leaked phone: %v", err)
+		if err := canonicalizeStoredPhoneIdentitiesInTableTx(ctx, tx, pgx.Identifier{"users"}); err != nil {
+			t.Fatalf("canonicalizeStoredPhoneIdentitiesInTableTx: %v", err)
 		}
 		assertFixturePhone(t, ctx, tx, 3001, invalidPhone)
+		assertFixturePhone(t, ctx, tx, 3002, "989981679461")
 	})
 }
 
