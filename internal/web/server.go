@@ -22,20 +22,24 @@ import (
 )
 
 type Config struct {
-	Addr              string
-	PublicBaseURL     string
-	AppScheme         string
-	AppLinkBase       string
-	WebBaseURL        string
-	AppName           string
-	StickerSets       StickerSetResolver
-	Users             UsernameResolver
-	Channels          PublicChannelResolver
-	Privacy           AnonymousPrivacyResolver
-	Photos            ProfilePhotoResolver
-	UniqueGifts       UniqueStarGiftResolver
-	GiftWithdrawals   StarGiftWithdrawalResolver
-	ModerationAppeals ModerationAppealResolver
+	Addr               string
+	PublicBaseURL      string
+	AppScheme          string
+	AppLinkBase        string
+	WebBaseURL         string
+	AppName            string
+	StickerSets        StickerSetResolver
+	Users              UsernameResolver
+	Channels           PublicChannelResolver
+	Privacy            AnonymousPrivacyResolver
+	Photos             ProfilePhotoResolver
+	UniqueGifts        UniqueStarGiftResolver
+	GiftWithdrawals    StarGiftWithdrawalResolver
+	RevenueWithdrawals ChannelRevenueWithdrawalResolver
+	TONGiftExports     TONGiftExportResolver
+	TONGiftClaims      TONGiftClaimResolver
+	TONGiftFiles       PublicFileResolver
+	ModerationAppeals  ModerationAppealResolver
 	// TelegramLogin is the optional OIDC/Login HTTP adapter. Public Web owns
 	// the listener so discovery/auth/token and public links share the exact
 	// externally registered origin behind one reverse proxy.
@@ -73,6 +77,11 @@ type UniqueStarGiftResolver interface {
 type StarGiftWithdrawalResolver interface {
 	ResolveWithdrawal(ctx context.Context, providerRequestID string) (domain.StarGiftWithdrawal, bool, error)
 	CompleteWithdrawal(ctx context.Context, providerRequestID string, date int) (domain.StarGiftWithdrawal, error)
+}
+
+type ChannelRevenueWithdrawalResolver interface {
+	ResolveRevenueWithdrawal(ctx context.Context, token string) (domain.ChannelRevenueWithdrawal, bool, error)
+	CompleteRevenueWithdrawal(ctx context.Context, token string, date int) (domain.ChannelRevenueWithdrawal, error)
 }
 
 type ModerationAppealResolver interface {
@@ -135,6 +144,12 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	if cfg.StickerSets == nil {
 		return nil, fmt.Errorf("public Web sticker set resolver is nil")
 	}
+	if cfg.TONGiftExports != nil && cfg.TONGiftFiles == nil {
+		return nil, fmt.Errorf("TON gift public file resolver is nil")
+	}
+	if cfg.TONGiftClaims != nil && cfg.TONGiftExports == nil {
+		return nil, fmt.Errorf("TON gift claim requires the export resolver")
+	}
 	if strings.TrimSpace(cfg.WebBaseURL) == "" {
 		cfg.WebBaseURL = links.DefaultWebBaseURL
 	}
@@ -143,6 +158,10 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	}
 	if cfg.PublicBaseURL, err = links.ValidateBaseURL(cfg.PublicBaseURL); err != nil {
 		return nil, fmt.Errorf("public base URL: %w", err)
+	}
+	publicRoutePrefix, err := publicBaseRoutePrefix(cfg.PublicBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("public base URL route prefix: %w", err)
 	}
 	appLinks, err := links.NewAppLinkBuilder(cfg.AppScheme, cfg.AppLinkBase)
 	if err != nil {
@@ -158,19 +177,23 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 		logger = zap.NewNop()
 	}
 	h := &handler{
-		stickerSets:     cfg.StickerSets,
-		users:           cfg.Users,
-		channels:        cfg.Channels,
-		privacy:         cfg.Privacy,
-		photos:          cfg.Photos,
-		uniqueGifts:     cfg.UniqueGifts,
-		giftWithdrawals: cfg.GiftWithdrawals,
-		appeals:         cfg.ModerationAppeals,
-		publicBaseURL:   cfg.PublicBaseURL,
-		appLinks:        appLinks,
-		webBaseURL:      cfg.WebBaseURL,
-		appName:         cfg.AppName,
-		logger:          logger,
+		stickerSets:        cfg.StickerSets,
+		users:              cfg.Users,
+		channels:           cfg.Channels,
+		privacy:            cfg.Privacy,
+		photos:             cfg.Photos,
+		uniqueGifts:        cfg.UniqueGifts,
+		giftWithdrawals:    cfg.GiftWithdrawals,
+		revenueWithdrawals: cfg.RevenueWithdrawals,
+		tonGiftExports:     cfg.TONGiftExports,
+		tonGiftClaims:      cfg.TONGiftClaims,
+		tonGiftFiles:       cfg.TONGiftFiles,
+		appeals:            cfg.ModerationAppeals,
+		publicBaseURL:      cfg.PublicBaseURL,
+		appLinks:           appLinks,
+		webBaseURL:         cfg.WebBaseURL,
+		appName:            cfg.AppName,
+		logger:             logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
@@ -181,8 +204,16 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	mux.HandleFunc("GET /addlist/{slug}", h.addList)
 	mux.HandleFunc("GET /nft/{slug}", h.uniqueGift)
 	mux.HandleFunc("GET /nft/{slug}/{$}", h.uniqueGift)
-	mux.HandleFunc("GET /gift-withdrawal/{requestID}", h.starGiftWithdrawal)
-	mux.HandleFunc("POST /gift-withdrawal/{requestID}", h.completeStarGiftWithdrawal)
+	registerBearerCapabilityRoute(mux, "GET", publicRoutePrefix+"/gift-withdrawal/{requestID}", h.starGiftWithdrawal)
+	registerBearerCapabilityRoute(mux, "POST", publicRoutePrefix+"/gift-withdrawal/{requestID}", h.completeStarGiftWithdrawal)
+	registerBearerCapabilityRoute(mux, "GET", publicRoutePrefix+"/revenue-withdrawal/{requestID}", h.channelRevenueWithdrawal)
+	registerBearerCapabilityRoute(mux, "POST", publicRoutePrefix+"/revenue-withdrawal/{requestID}", h.completeChannelRevenueWithdrawal)
+	if cfg.TONGiftExports != nil {
+		registerTONGiftRoutes(mux, publicRoutePrefix, h)
+	}
+	if cfg.TONGiftClaims != nil {
+		registerTONGiftClaimRoutes(mux, publicRoutePrefix, h)
+	}
 	if cfg.ModerationAppeals != nil {
 		mux.HandleFunc("GET /appeal/{token}", h.moderationAppeal)
 		mux.HandleFunc("POST /appeal/{token}", h.moderationAppeal)
@@ -203,20 +234,56 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	return publicSecurityHeaders(mux), nil
 }
 
+// publicBaseRoutePrefix returns the escaped path used by net/http patterns.
+// links.ValidateBaseURL has already rejected credentials, query and fragment;
+// keeping the escaped path here makes the listener consume the exact path root
+// used by provider-generated bearer URLs.
+func publicBaseRoutePrefix(publicBaseURL string) (string, error) {
+	parsed, err := url.Parse(publicBaseURL)
+	if err != nil {
+		return "", err
+	}
+	prefix := strings.TrimRight(parsed.EscapedPath(), "/")
+	if prefix == "/" {
+		return "", nil
+	}
+	if prefix != "" && !strings.HasPrefix(prefix, "/") {
+		return "", fmt.Errorf("path must be absolute")
+	}
+	return prefix, nil
+}
+
+func registerBearerCapabilityRoute(mux *http.ServeMux, method, pattern string, handler http.HandlerFunc) {
+	mux.Handle(method+" "+pattern, bearerCapabilitySecurityHeaders(handler))
+}
+
+func bearerCapabilitySecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 type handler struct {
-	stickerSets     StickerSetResolver
-	users           UsernameResolver
-	channels        PublicChannelResolver
-	privacy         AnonymousPrivacyResolver
-	photos          ProfilePhotoResolver
-	uniqueGifts     UniqueStarGiftResolver
-	giftWithdrawals StarGiftWithdrawalResolver
-	appeals         ModerationAppealResolver
-	publicBaseURL   string
-	appLinks        links.AppLinkBuilder
-	webBaseURL      string
-	appName         string
-	logger          *zap.Logger
+	stickerSets        StickerSetResolver
+	users              UsernameResolver
+	channels           PublicChannelResolver
+	privacy            AnonymousPrivacyResolver
+	photos             ProfilePhotoResolver
+	uniqueGifts        UniqueStarGiftResolver
+	giftWithdrawals    StarGiftWithdrawalResolver
+	revenueWithdrawals ChannelRevenueWithdrawalResolver
+	tonGiftExports     TONGiftExportResolver
+	tonGiftClaims      TONGiftClaimResolver
+	tonGiftFiles       PublicFileResolver
+	appeals            ModerationAppealResolver
+	publicBaseURL      string
+	appLinks           links.AppLinkBuilder
+	webBaseURL         string
+	appName            string
+	logger             *zap.Logger
 }
 
 type moderationAppealPage struct {
@@ -365,6 +432,7 @@ type starGiftWithdrawalPage struct {
 
 var starGiftWithdrawalTemplate = template.Must(template.New("star-gift-withdrawal").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow">
 <title>{{.Title}} · {{.AppName}}</title><style>
 body{font:16px/1.5 system-ui,sans-serif;background:#f4f6f8;color:#17212b;margin:0;padding:32px}.card{max-width:560px;margin:8vh auto;background:#fff;border-radius:16px;padding:28px;box-shadow:0 8px 32px #0002}h1{margin-top:0}.meta{overflow-wrap:anywhere;color:#53606d}button{border:0;border-radius:10px;padding:12px 18px;background:#2481cc;color:#fff;font-weight:600;cursor:pointer}.done{color:#18864b;font-weight:600}
 </style></head><body><main class="card"><h1>{{.Title}}</h1><p class="meta">Collectible: {{.Slug}}</p>
@@ -408,6 +476,93 @@ func (h *handler) renderStarGiftWithdrawal(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := starGiftWithdrawalTemplate.Execute(w, page); err != nil {
 		h.logger.Warn("render star gift withdrawal", zap.Error(err))
+	}
+}
+
+type channelRevenueWithdrawalPage struct {
+	AppName     string
+	ChannelID   int64
+	Amount      int64
+	Unit        string
+	Status      string
+	ExpiresAt   string
+	CanComplete bool
+	Error       string
+}
+
+var channelRevenueWithdrawalTemplate = template.Must(template.New("channel-revenue-withdrawal").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow">
+<title>Channel revenue claim · {{.AppName}}</title><style>
+body{font:16px/1.5 system-ui,sans-serif;background:#f4f6f8;color:#17212b;margin:0;padding:32px}.card{max-width:560px;margin:8vh auto;background:#fff;border-radius:16px;padding:28px;box-shadow:0 8px 32px #0002}h1{margin-top:0}.meta{overflow-wrap:anywhere;color:#53606d}.error{color:#b42318}button{border:0;border-radius:10px;padding:12px 18px;background:#2481cc;color:#fff;font-weight:600;cursor:pointer}.done{color:#18864b;font-weight:600}
+</style></head><body><main class="card"><h1>Channel revenue claim</h1>
+<p>Channel: {{.ChannelID}}</p><p>Amount: {{.Amount}} {{.Unit}}</p>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+{{if .CanComplete}}<p>This transfers the channel's local revenue to its creator's personal {{.Unit}} balance. No external wallet or blockchain is contacted.</p><form method="post"><button type="submit">Claim revenue</button></form><p class="meta">Expires: {{.ExpiresAt}}</p>{{else}}<p class="done">Status: {{.Status}}</p>{{end}}
+</main></body></html>`))
+
+func (h *handler) channelRevenueWithdrawal(w http.ResponseWriter, r *http.Request) {
+	h.renderChannelRevenueWithdrawal(w, r, false)
+}
+
+func (h *handler) completeChannelRevenueWithdrawal(w http.ResponseWriter, r *http.Request) {
+	h.renderChannelRevenueWithdrawal(w, r, true)
+}
+
+func (h *handler) renderChannelRevenueWithdrawal(w http.ResponseWriter, r *http.Request, complete bool) {
+	token := strings.TrimSpace(r.PathValue("requestID"))
+	if h.revenueWithdrawals == nil || token == "" || len(token) > 256 {
+		http.NotFound(w, r)
+		return
+	}
+	now := int(time.Now().Unix())
+	var (
+		withdrawal domain.ChannelRevenueWithdrawal
+		found      bool
+		err        error
+	)
+	if complete {
+		withdrawal, err = h.revenueWithdrawals.CompleteRevenueWithdrawal(r.Context(), token, now)
+		found = err == nil
+	} else {
+		withdrawal, found, err = h.revenueWithdrawals.ResolveRevenueWithdrawal(r.Context(), token)
+	}
+	if !found && err == nil {
+		http.NotFound(w, r)
+		return
+	}
+	page := channelRevenueWithdrawalPage{AppName: h.appName, ChannelID: withdrawal.ChannelID,
+		Amount: withdrawal.Amount, Unit: "Stars", Status: withdrawal.Status}
+	if withdrawal.Currency == domain.ChannelRevenueTON {
+		page.Unit = "nanoton"
+	}
+	status := http.StatusOK
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrChannelRevenueWithdrawalExpired):
+			page.Status, page.Error, status = "expired", "This claim link has expired.", http.StatusGone
+		case errors.Is(err, domain.ErrChannelRevenueInsufficient):
+			page.Status, page.Error, status = "pending", "The channel no longer has enough available revenue for this claim.", http.StatusConflict
+		case errors.Is(err, domain.ErrChannelRevenueWithdrawalInvalid):
+			http.NotFound(w, r)
+			return
+		default:
+			h.logger.Warn("complete channel revenue withdrawal", zap.Error(err))
+			page.Status, page.Error, status = "pending", "The claim could not be completed. Please retry.", http.StatusInternalServerError
+		}
+	}
+	if withdrawal.ExpiresAt > 0 {
+		page.ExpiresAt = time.Unix(int64(withdrawal.ExpiresAt), 0).UTC().Format(time.RFC3339)
+	}
+	if page.Status == "pending" && withdrawal.ExpiresAt <= now {
+		page.Status = "expired"
+	}
+	page.CanComplete = err == nil && page.Status == "pending" && withdrawal.ExpiresAt > now
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if renderErr := channelRevenueWithdrawalTemplate.Execute(w, page); renderErr != nil {
+		h.logger.Warn("render channel revenue withdrawal", zap.Error(renderErr))
 	}
 }
 

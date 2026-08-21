@@ -498,15 +498,24 @@ func (s *StarGiftStore) ListByOwnerFiltered(ctx context.Context, filter domain.S
 	}
 	joins := `
 JOIN star_gift_catalog c ON c.gift_id = p.gift_id
+LEFT JOIN unique_star_gifts ug ON ug.id=p.unique_gift_id
+LEFT JOIN star_gift_ton_profile_links hp ON hp.unique_gift_id=p.unique_gift_id
 LEFT JOIN star_gift_collectible_revisions acr
   ON acr.id = c.collectible_revision_id AND acr.status = 'published'`
-	conditions := []string{"p.owner_peer_type = $1", "p.owner_peer_id = $2", "p.lifecycle_status = 'active'"}
+	conditions := []string{`((p.lifecycle_status='active' AND p.owner_peer_type=$1 AND p.owner_peer_id=$2)
+ OR ($1='user' AND p.lifecycle_status='exported' AND hp.host_user_id=$2
+     AND ug.host_peer_type='user' AND ug.host_peer_id=$2 AND ug.owner_address<>'' AND NOT ug.burned))`}
 	args := []any{string(owner.Type), owner.ID}
+	effectiveUnsaved := "CASE WHEN p.lifecycle_status='exported' THEN hp.unsaved ELSE p.unsaved END"
+	effectivePinned := "CASE WHEN p.lifecycle_status='exported' THEN hp.pinned_order ELSE p.pinned_order END"
 	if filter.ExcludeUnsaved {
-		conditions = append(conditions, "NOT p.unsaved")
+		conditions = append(conditions, "NOT ("+effectiveUnsaved+")")
 	}
 	if filter.ExcludeSaved {
-		conditions = append(conditions, "p.unsaved")
+		conditions = append(conditions, effectiveUnsaved)
+	}
+	if filter.ExcludeHosted {
+		conditions = append(conditions, "p.lifecycle_status='active'")
 	}
 	if filter.ExcludeUnique {
 		conditions = append(conditions, "p.unique_gift_id IS NULL")
@@ -529,7 +538,7 @@ LEFT JOIN star_gift_collectible_revisions acr
 SELECT 1 FROM star_gift_collection_items ci
 JOIN star_gift_collections cc ON cc.collection_id = ci.collection_id
 WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
-  AND cc.owner_peer_type = p.owner_peer_type AND cc.owner_peer_id = p.owner_peer_id)`, len(args)))
+  AND cc.owner_peer_type = $1 AND cc.owner_peer_id = $2)`, len(args)))
 	}
 	where := strings.Join(conditions, " AND ")
 	countQuery := `SELECT COUNT(*) FROM peer_star_gifts p ` + joins + ` WHERE ` + where
@@ -544,14 +553,14 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 		if profileOrder && cursor.PinnedOrder > 0 {
 			args = append(args, cursor.PinnedOrder, cursor.ID)
 			where += fmt.Sprintf(` AND (
-    p.pinned_order = 0
-    OR p.pinned_order > $%d
-    OR (p.pinned_order = $%d AND p.id < $%d)
-)`, len(args)-1, len(args)-1, len(args))
+    (%s) = 0
+    OR (%s) > $%d
+    OR ((%s) = $%d AND p.id < $%d)
+)`, effectivePinned, effectivePinned, len(args)-1, effectivePinned, len(args)-1, len(args))
 		} else {
 			args = append(args, cursor.ID)
 			if profileOrder {
-				where += fmt.Sprintf(" AND p.pinned_order = 0 AND p.id < $%d", len(args))
+				where += fmt.Sprintf(" AND (%s) = 0 AND p.id < $%d", effectivePinned, len(args))
 			} else {
 				where += fmt.Sprintf(" AND p.id < $%d", len(args))
 			}
@@ -559,16 +568,18 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 	}
 	orderBy := "ORDER BY p.id DESC"
 	if profileOrder {
-		orderBy = "ORDER BY (p.pinned_order = 0), p.pinned_order, p.id DESC"
+		orderBy = "ORDER BY ((" + effectivePinned + ") = 0), (" + effectivePinned + "), p.id DESC"
 	}
 	args = append(args, limit+1)
 	limitPlaceholder := len(args)
 	rows, err := s.db.Query(ctx, `
-SELECT p.id, p.owner_peer_type, p.owner_peer_id, p.from_user_id, p.gift_id, p.catalog_revision_id,
-       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, p.unsaved, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
+SELECT p.id, CASE WHEN p.lifecycle_status='exported' THEN 'user' ELSE p.owner_peer_type END,
+       CASE WHEN p.lifecycle_status='exported' THEN hp.host_user_id ELSE p.owner_peer_id END,
+       p.from_user_id, p.gift_id, p.catalog_revision_id,
+       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, `+effectiveUnsaved+`, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
        p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
        p.drop_original_details_stars, p.can_craft_at,
-	   p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, p.pinned_order,
+	   p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, `+effectivePinned+`,
        COALESCE((SELECT array_agg(i.collection_id ORDER BY c.sort_order, i.collection_id)
                  FROM star_gift_collection_items i
                  JOIN star_gift_collections c ON c.collection_id=i.collection_id
@@ -656,14 +667,17 @@ WHERE p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active
 		query = `SELECT ref.msg_id, COALESCE(u.slug, ''), p.id
 FROM peer_star_gifts p
 LEFT JOIN unique_star_gifts u ON u.id=p.unique_gift_id
+LEFT JOIN star_gift_ton_profile_links l ON l.unique_gift_id=p.unique_gift_id
 CROSS JOIN LATERAL (
     SELECT p.msg_id::bigint AS msg_id
     UNION ALL
     SELECT r.msg_id::bigint FROM star_gift_user_message_refs r
     WHERE r.saved_gift_id=p.id AND r.owner_user_id=p.owner_peer_id
 ) ref
-WHERE p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active'
-	  AND (ref.msg_id=ANY($3::bigint[])
+WHERE ((p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active')
+    OR (p.lifecycle_status='exported' AND l.host_user_id=$2 AND u.host_peer_type='user'
+        AND u.host_peer_id=$2 AND u.owner_address<>'' AND NOT u.burned))
+	  AND ((p.lifecycle_status='active' AND ref.msg_id=ANY($3::bigint[]))
 	   OR u.slug=ANY($4::text[]))`
 	}
 	rows, err := s.db.Query(ctx, query, string(owner.Type), owner.ID, values, slugs)
@@ -718,17 +732,25 @@ func (s *StarGiftStore) GetByRef(ctx context.Context, ref domain.SavedStarGiftRe
 	}
 	where, args := savedStarGiftRefWhere(ref)
 	row := s.db.QueryRow(ctx, `
-SELECT p.id, p.owner_peer_type, p.owner_peer_id, p.from_user_id, p.gift_id, p.catalog_revision_id,
-       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, p.unsaved, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
+SELECT p.id, CASE WHEN p.lifecycle_status='exported' THEN 'user' ELSE p.owner_peer_type END,
+       CASE WHEN p.lifecycle_status='exported' THEN hp.host_user_id ELSE p.owner_peer_id END,
+       p.from_user_id, p.gift_id, p.catalog_revision_id,
+	   p.msg_id, p.saved_id, p.gift_date, p.name_hidden,
+       CASE WHEN p.lifecycle_status='exported' THEN hp.unsaved ELSE p.unsaved END,
+       p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
 	   p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
 	   p.drop_original_details_stars, p.can_craft_at,
-	       p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, p.pinned_order,
+	       p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id,
+       CASE WHEN p.lifecycle_status='exported' THEN hp.pinned_order ELSE p.pinned_order END,
        COALESCE((SELECT array_agg(i.collection_id ORDER BY c.sort_order, i.collection_id)
                  FROM star_gift_collection_items i
                  JOIN star_gift_collections c ON c.collection_id=i.collection_id
                  WHERE i.saved_gift_id=p.id), ARRAY[]::integer[])
 FROM peer_star_gifts p
-WHERE `+where, args...)
+LEFT JOIN unique_star_gifts ug ON ug.id=p.unique_gift_id
+LEFT JOIN star_gift_ton_profile_links hp ON hp.unique_gift_id=p.unique_gift_id
+WHERE `+where+` AND (p.lifecycle_status<>'exported' OR
+ (hp.host_user_id=$2 AND ug.host_peer_type='user' AND ug.host_peer_id=$2 AND ug.owner_address<>'' AND NOT ug.burned))`, args...)
 	g, err := scanSavedStarGift(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -799,7 +821,12 @@ func (s *StarGiftStore) CountByOwner(ctx context.Context, owner domain.Peer) (in
 		return 0, nil
 	}
 	var n int
-	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM peer_star_gifts WHERE owner_peer_type = $1 AND owner_peer_id = $2 AND lifecycle_status='active' AND NOT unsaved`, string(owner.Type), owner.ID).Scan(&n); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM peer_star_gifts p
+LEFT JOIN unique_star_gifts u ON u.id=p.unique_gift_id
+LEFT JOIN star_gift_ton_profile_links l ON l.unique_gift_id=p.unique_gift_id
+WHERE (p.lifecycle_status='active' AND p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND NOT p.unsaved)
+   OR ($1='user' AND p.lifecycle_status='exported' AND l.host_user_id=$2 AND NOT l.unsaved
+       AND u.host_peer_type='user' AND u.host_peer_id=$2 AND u.owner_address<>'' AND NOT u.burned)`, string(owner.Type), owner.ID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count star gifts: %w", err)
 	}
 	return n, nil
@@ -817,8 +844,36 @@ func (s *StarGiftStore) SetUnsaved(ctx context.Context, ref domain.SavedStarGift
 		where, args := savedStarGiftRefWhere(ref)
 		var savedID int64
 		var pinnedOrder int
-		err := tx.QueryRow(ctx, `SELECT id,pinned_order FROM peer_star_gifts WHERE `+where+` AND lifecycle_status='active' FOR UPDATE`, args...).Scan(&savedID, &pinnedOrder)
+		err := tx.QueryRow(ctx, `SELECT p.id,p.pinned_order FROM peer_star_gifts p WHERE `+where+` AND p.lifecycle_status='active' FOR UPDATE`, args...).Scan(&savedID, &pinnedOrder)
 		if errors.Is(err, pgx.ErrNoRows) {
+			if ref.Owner.Type != domain.PeerTypeUser || ref.Slug == "" {
+				return nil
+			}
+			var exportID int64
+			err = tx.QueryRow(ctx, `SELECT l.export_id,p.id,l.pinned_order
+FROM star_gift_ton_profile_links l
+JOIN unique_star_gifts u ON u.id=l.unique_gift_id
+JOIN peer_star_gifts p ON p.unique_gift_id=u.id
+WHERE l.host_user_id=$1 AND u.host_peer_type='user' AND u.host_peer_id=$1
+  AND u.owner_address<>'' AND NOT u.burned AND lower(u.slug)=lower($2)
+FOR UPDATE OF l,p`, ref.Owner.ID, ref.Slug).Scan(&exportID, &savedID, &pinnedOrder)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE star_gift_ton_profile_links
+SET unsaved=$2,pinned_order=CASE WHEN $2 THEN 0 ELSE pinned_order END,updated_at=now()
+WHERE export_id=$1`, exportID, unsaved); err != nil {
+				return err
+			}
+			if unsaved && pinnedOrder > 0 {
+				if err := compactStarGiftProfilePins(ctx, tx, ref.Owner, pinnedOrder); err != nil {
+					return err
+				}
+			}
+			changed = true
 			return nil
 		}
 		if err != nil {
@@ -828,14 +883,8 @@ func (s *StarGiftStore) SetUnsaved(ctx context.Context, ref domain.SavedStarGift
 			return err
 		}
 		if unsaved && pinnedOrder > 0 {
-			// The positive-order unique index is immediate. Move the bounded
-			// vector one vacant slot at a time so no transient duplicate order
-			// can be observed by PostgreSQL.
-			for order := pinnedOrder + 1; order <= domain.MaxPinnedStarGifts; order++ {
-				if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET pinned_order=$4
-WHERE owner_peer_type=$1 AND owner_peer_id=$2 AND pinned_order=$3`, string(ref.Owner.Type), ref.Owner.ID, order, order-1); err != nil {
-					return err
-				}
+			if err := compactStarGiftProfilePins(ctx, tx, ref.Owner, pinnedOrder); err != nil {
+				return err
 			}
 		}
 		changed = true
@@ -926,20 +975,40 @@ func savedStarGiftRefWhere(ref domain.SavedStarGiftRef) (string, []any) {
 	args := []any{string(ref.Owner.Type), ref.Owner.ID}
 	if ref.Slug != "" {
 		args = append(args, strings.ToLower(strings.TrimSpace(ref.Slug)))
-		return "owner_peer_type = $1 AND owner_peer_id = $2 AND unique_gift_id = (SELECT id FROM unique_star_gifts WHERE slug = $3)", args
+		return `p.unique_gift_id=(SELECT id FROM unique_star_gifts WHERE slug=$3) AND (
+(p.owner_peer_type=$1 AND p.owner_peer_id=$2) OR
+($1='user' AND EXISTS(SELECT 1 FROM star_gift_ton_profile_links l
+ WHERE l.unique_gift_id=p.unique_gift_id AND l.host_user_id=$2)))`, args
 	}
 	switch ref.Owner.Type {
 	case domain.PeerTypeChannel:
 		args = append(args, ref.SavedID)
-		return "owner_peer_type = $1 AND owner_peer_id = $2 AND saved_id = $3", args
+		return "p.owner_peer_type = $1 AND p.owner_peer_id = $2 AND p.saved_id = $3", args
 	default:
 		args = append(args, ref.MsgID)
-		return `owner_peer_type = $1 AND owner_peer_id = $2 AND (
-msg_id = $3 OR EXISTS (
+		return `p.owner_peer_type = $1 AND p.owner_peer_id = $2 AND (
+p.msg_id = $3 OR EXISTS (
     SELECT 1 FROM star_gift_user_message_refs r
-    WHERE r.saved_gift_id = id AND r.owner_user_id = $2 AND r.msg_id = $3
+    WHERE r.saved_gift_id = p.id AND r.owner_user_id = $2 AND r.msg_id = $3
 ))`, args
 	}
+}
+
+func compactStarGiftProfilePins(ctx context.Context, tx pgx.Tx, owner domain.Peer, removedOrder int) error {
+	for order := removedOrder + 1; order <= domain.MaxPinnedStarGifts; order++ {
+		if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET pinned_order=$4
+WHERE owner_peer_type=$1 AND owner_peer_id=$2 AND lifecycle_status='active' AND pinned_order=$3`,
+			string(owner.Type), owner.ID, order, order-1); err != nil {
+			return err
+		}
+		if owner.Type == domain.PeerTypeUser {
+			if _, err := tx.Exec(ctx, `UPDATE star_gift_ton_profile_links SET pinned_order=$3,updated_at=now()
+WHERE host_user_id=$1 AND pinned_order=$2`, owner.ID, order, order-1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func validSavedStarGift(g domain.SavedStarGift) bool {

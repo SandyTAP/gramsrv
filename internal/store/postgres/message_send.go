@@ -133,6 +133,7 @@ func (s *MessageStore) SendPrivateText(ctx context.Context, req domain.SendPriva
 }
 
 type privateSendTxHooks struct {
+	lockUserIDs  []int64
 	before       func(context.Context, pgx.Tx, *domain.SendPrivateTextRequest) error
 	projectMedia func(context.Context, pgx.Tx, *domain.SendPrivateTextRequest) (privateSendMediaProjection, error)
 	// afterAllocate runs after the immutable logical message and both box IDs
@@ -252,8 +253,22 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 
 	// 事务级 advisory lock 串行化涉及收发双方的并发写，在任何行锁之前获取，消除 watermark/dialog
 	// 行锁的 AB-BA 死锁（A↔B 反向并发 send/read/edit）。
-	if err := lockUsersForUpdate(ctx, tx, req.SenderUserID, req.RecipientUserID); err != nil {
+	lockUserIDs := make([]int64, 0, len(hooks.lockUserIDs)+2)
+	lockUserIDs = append(lockUserIDs, req.SenderUserID, req.RecipientUserID)
+	lockUserIDs = append(lockUserIDs, hooks.lockUserIDs...)
+	if err := lockUsersForUpdate(ctx, tx, lockUserIDs...); err != nil {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send users: %w", err)
+	}
+	if hooks.before != nil {
+		// The preflight above cannot observe another first request until it commits.
+		// Recheck after the per-user transaction lock so aggregate-backed sends
+		// replay the committed message before their hook runs a second time.
+		if duplicate, found, err := s.duplicateSendResult(ctx, qtx, req, requestFingerprint); err != nil {
+			return domain.SendPrivateTextResult{}, err
+		} else if found {
+			duplicate.Duplicate = true
+			return duplicate, nil
+		}
 	}
 	if hooks.before != nil {
 		if err := hooks.before(ctx, tx, &req); err != nil {

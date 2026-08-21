@@ -212,6 +212,7 @@ type UniqueStarGift struct {
 	ThemeAvailable          bool
 	Burned                  bool
 	Crafted                 bool
+	ExternalizationPending  bool
 	OwnerName               string
 	OwnerAddress            string
 	GiftAddress             string
@@ -433,6 +434,7 @@ type StarGiftConvertRequest struct {
 type StarGiftConvertResult struct {
 	Saved        SavedStarGift
 	OwnerBalance int64
+	SourceEdits  []EditedMessageForUser
 }
 
 type StarGiftUpgradeResult struct {
@@ -472,10 +474,11 @@ type StarGiftPrepaidUpgradeRequest struct {
 }
 
 type StarGiftPrepaidUpgradeResult struct {
-	Saved     SavedStarGift
-	Balance   StarsBalance
-	Send      SendPrivateTextResult
-	Duplicate bool
+	Saved       SavedStarGift
+	Balance     StarsBalance
+	Send        SendPrivateTextResult
+	SourceEdits []EditedMessageForUser
+	Duplicate   bool
 }
 
 type StarGiftDropOriginalDetailsRequest struct {
@@ -737,6 +740,82 @@ type StarGiftWithdrawal struct {
 	Gift              UniqueStarGift
 }
 
+// ChannelRevenueCurrency identifies the two isolated channel revenue ledgers.
+// TON here is telesrv's internal nanoton balance, not an on-chain transfer.
+type ChannelRevenueCurrency string
+
+const (
+	ChannelRevenueStars ChannelRevenueCurrency = "stars"
+	ChannelRevenueTON   ChannelRevenueCurrency = "ton"
+)
+
+func (c ChannelRevenueCurrency) Valid() bool {
+	return c == ChannelRevenueStars || c == ChannelRevenueTON
+}
+
+// ChannelRevenueWithdrawalRequest is the immutable, bearer-token-backed claim
+// command persisted when payments.getStarsRevenueWithdrawalUrl succeeds.
+// TokenDigest is SHA-256(token); plaintext bearer tokens never cross the store
+// boundary or enter the database.
+type ChannelRevenueWithdrawalRequest struct {
+	ChannelID              int64
+	CreatorUserID          int64
+	Currency               ChannelRevenueCurrency
+	Amount                 int64 // zero means bind the full balance at issuance
+	PasswordChangedAt      time.Time
+	AuthKeyID              [8]byte
+	AuthorizationCreatedAt time.Time
+	TokenDigest            []byte
+	Date                   int
+	ExpiresAt              int
+}
+
+// ChannelRevenuePasswordStateChangedError means payout admission observed a
+// different password state than the one whose SRP proof was checked. It carries
+// no password material; callers use it only to return the official freshness
+// or missing-password error while the store transaction fails closed.
+type ChannelRevenuePasswordStateChangedError struct {
+	HasPassword       bool
+	PasswordChangedAt time.Time
+}
+
+func (e *ChannelRevenuePasswordStateChangedError) Error() string {
+	return "channel revenue: password state changed during withdrawal admission"
+}
+
+// ChannelRevenueAuthorizationStateChangedError means payout admission no
+// longer observes the exact fully-authorized session whose age the RPC checked.
+// The public bearer command is not persisted when this error is returned.
+type ChannelRevenueAuthorizationStateChangedError struct {
+	HasAuthorization bool
+	OwnerMatches     bool
+	PasswordPending  bool
+	CreatedAt        time.Time
+}
+
+func (e *ChannelRevenueAuthorizationStateChangedError) Error() string {
+	return "channel revenue: authorization state changed during withdrawal admission"
+}
+
+// ChannelRevenueWithdrawal is both the confirmation-page projection and the
+// durable completion receipt. Completed requests are exact, idempotent replays.
+type ChannelRevenueWithdrawal struct {
+	ID                   int64
+	URL                  string
+	ChannelID            int64
+	CreatorUserID        int64
+	Currency             ChannelRevenueCurrency
+	Amount               int64
+	Status               string
+	ExpiresAt            int
+	CreatedAt            int
+	CompletedAt          int
+	ChannelTransactionID int64
+	UserTransactionID    int64
+	ChannelBalanceAfter  int64
+	UserBalanceAfter     int64
+}
+
 // StarGiftCollection 是 peer 资料页中的礼物集合；一份礼物可属于多个集合。
 type StarGiftCollection struct {
 	Owner        Peer
@@ -898,6 +977,7 @@ type SavedStarGiftFilter struct {
 	ExcludeSaved        bool
 	ExcludeUnlimited    bool
 	ExcludeUnique       bool
+	ExcludeHosted       bool
 	ExcludeUpgradable   bool
 	ExcludeUnupgradable bool
 	CollectionID        int
@@ -940,27 +1020,37 @@ var (
 	// ErrStarGiftNotFound 表示找不到该已收到礼物实例。
 	ErrStarGiftNotFound = errors.New("stargift: saved gift not found")
 	// ErrStarGiftAlreadyConverted 表示礼物已转换回 Stars（不可重复转换）。
-	ErrStarGiftAlreadyConverted       = errors.New("stargift: already converted")
-	ErrStarGiftFileInvalid            = errors.New("stargift: invalid animation file")
-	ErrStarGiftCatalogFull            = errors.New("stargift: catalog full")
-	ErrStarGiftCollectibleUnavailable = errors.New("stargift: collectible upgrade unavailable")
-	ErrStarGiftAlreadyUpgraded        = errors.New("stargift: already upgraded")
-	ErrStarGiftCollectibleSoldOut     = errors.New("stargift: collectible supply exhausted")
-	ErrStarGiftCollectibleInvalid     = errors.New("stargift: invalid collectible definition")
-	ErrStarGiftCollectionNotFound     = errors.New("stargift: collection not found")
-	ErrStarGiftCollectionsFull        = errors.New("stargift: collections full")
-	ErrStarGiftUnavailable            = errors.New("stargift: unavailable")
-	ErrStarGiftOwnerInvalid           = errors.New("stargift: owner invalid")
-	ErrStarGiftTransferUnavailable    = errors.New("stargift: transfer unavailable")
-	ErrStarGiftResaleUnavailable      = errors.New("stargift: resale unavailable")
-	ErrStarGiftOfferInvalid           = errors.New("stargift: offer invalid")
-	ErrStarGiftOfferExpired           = errors.New("stargift: offer expired")
-	ErrStarGiftCraftUnavailable       = errors.New("stargift: craft unavailable")
-	ErrStarGiftAuctionUnavailable     = errors.New("stargift: auction unavailable")
-	ErrStarGiftWithdrawalUnavailable  = errors.New("stargift: withdrawal provider unavailable")
-	ErrStarGiftFormExpired            = errors.New("stargift: payment form expired")
-	ErrStarGiftFormPurposeInvalid     = errors.New("stargift: payment form purpose invalid")
-	ErrStarGiftFormAmountMismatch     = errors.New("stargift: payment form amount mismatch")
+	ErrStarGiftAlreadyConverted            = errors.New("stargift: already converted")
+	ErrStarGiftFileInvalid                 = errors.New("stargift: invalid animation file")
+	ErrStarGiftCatalogFull                 = errors.New("stargift: catalog full")
+	ErrStarGiftCollectibleUnavailable      = errors.New("stargift: collectible upgrade unavailable")
+	ErrStarGiftAlreadyUpgraded             = errors.New("stargift: already upgraded")
+	ErrStarGiftCollectibleSoldOut          = errors.New("stargift: collectible supply exhausted")
+	ErrStarGiftCollectibleInvalid          = errors.New("stargift: invalid collectible definition")
+	ErrStarGiftCollectionNotFound          = errors.New("stargift: collection not found")
+	ErrStarGiftCollectionsFull             = errors.New("stargift: collections full")
+	ErrStarGiftUnavailable                 = errors.New("stargift: unavailable")
+	ErrStarGiftOwnerInvalid                = errors.New("stargift: owner invalid")
+	ErrStarGiftTransferUnavailable         = errors.New("stargift: transfer unavailable")
+	ErrStarGiftResaleUnavailable           = errors.New("stargift: resale unavailable")
+	ErrStarGiftOfferInvalid                = errors.New("stargift: offer invalid")
+	ErrStarGiftOfferExpired                = errors.New("stargift: offer expired")
+	ErrStarGiftCraftUnavailable            = errors.New("stargift: craft unavailable")
+	ErrStarGiftAuctionUnavailable          = errors.New("stargift: auction unavailable")
+	ErrStarGiftWithdrawalUnavailable       = errors.New("stargift: withdrawal provider unavailable")
+	ErrStarGiftExternalizationPending      = errors.New("stargift: externalization pending")
+	ErrStarGiftTONExportInvalid            = errors.New("stargift: TON export invalid")
+	ErrStarGiftTONExportExpired            = errors.New("stargift: TON export expired")
+	ErrStarGiftTONExportStateConflict      = errors.New("stargift: TON export state conflict")
+	ErrStarGiftTONAdmissionUnavailable     = errors.New("stargift: TON worker admission unavailable")
+	ErrStarGiftTONLeaseLost                = errors.New("stargift: TON job lease lost")
+	ErrChannelRevenueWithdrawalInvalid     = errors.New("channel revenue: withdrawal invalid")
+	ErrChannelRevenueWithdrawalExpired     = errors.New("channel revenue: withdrawal expired")
+	ErrChannelRevenueInsufficient          = errors.New("channel revenue: insufficient balance")
+	ErrChannelRevenueWithdrawalUnavailable = errors.New("channel revenue: withdrawal unavailable")
+	ErrStarGiftFormExpired                 = errors.New("stargift: payment form expired")
+	ErrStarGiftFormPurposeInvalid          = errors.New("stargift: payment form purpose invalid")
+	ErrStarGiftFormAmountMismatch          = errors.New("stargift: payment form amount mismatch")
 )
 
 var starGiftCollectibleSlugPrefix = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)

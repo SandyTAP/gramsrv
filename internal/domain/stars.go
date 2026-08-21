@@ -116,6 +116,7 @@ const (
 	StarsReasonPaidMessage   StarsTransactionReason = "paid_message" // 频道 Direct Message 花费
 	StarsReasonSuggestedPost StarsTransactionReason = "suggested_post"
 	StarsReasonPremium       StarsTransactionReason = "premium"
+	StarsReasonWithdrawal    StarsTransactionReason = "withdrawal"
 	StarsReasonAdjust        StarsTransactionReason = "adjust" // 兜底/人工调整
 )
 

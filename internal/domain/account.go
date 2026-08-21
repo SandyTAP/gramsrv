@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"strings"
+	"time"
 )
 
 var (
@@ -118,6 +119,13 @@ type PasswordSettings struct {
 	// Server-only SRP fields. They are persisted but never exposed to rpc/tg conversion.
 	SRPVerifier []byte
 	SRPBSecret  []byte
+}
+
+// RevenueWithdrawalPasswordState carries only the durable 2FA facts required
+// by high-risk payout admission. It intentionally excludes password material.
+type RevenueWithdrawalPasswordState struct {
+	HasPassword       bool
+	PasswordChangedAt time.Time
 }
 
 // ReactionNotifyFrom stores one account-level reaction notification scope.

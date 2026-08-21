@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
@@ -541,4 +542,29 @@ func (s *authRevocationMatrixSessions) wasClosed(id [8]byte) bool {
 		}
 	}
 	return false
+}
+
+type boundedFailureSessions struct {
+	authRevocationMatrixSessions
+	boundedCalls int
+	boundedErr   error
+}
+
+func (s *boundedFailureSessions) CloseSessionsForBusinessAuthKeyBounded(context.Context, [8]byte) (int, error) {
+	s.boundedCalls++
+	return 0, s.boundedErr
+}
+
+func TestAdminAuthorizationRevokeReportsBoundedEdgeCloseFailure(t *testing.T) {
+	wantErr := errors.New("edge close acknowledgement failed")
+	sessions := &boundedFailureSessions{boundedErr: wantErr}
+	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+
+	err := r.RevokeAuthorizationAuthKey(context.Background(), [8]byte{0x91}, 1000000100)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("admin revoke err=%v, want bounded Edge failure", err)
+	}
+	if sessions.boundedCalls != 1 || len(sessions.closed) != 0 {
+		t.Fatalf("bounded calls=%d legacy closes=%v, want bounded path only", sessions.boundedCalls, sessions.closed)
+	}
 }

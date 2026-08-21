@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -27,12 +28,13 @@ type BlobBackend interface {
 }
 
 type Service struct {
-	store      store.StarGiftStore
-	upgrades   store.StarGiftUpgradeStore
-	lifecycle  store.StarGiftLifecycleStore
-	withdrawal StarGiftWithdrawalProvider
-	blobs      BlobBackend
-	dc         int
+	store             store.StarGiftStore
+	upgrades          store.StarGiftUpgradeStore
+	lifecycle         store.StarGiftLifecycleStore
+	giftWithdrawal    StarGiftWithdrawalProvider
+	revenueWithdrawal ChannelRevenueWithdrawalProvider
+	blobs             BlobBackend
+	dc                int
 
 	mu    sync.RWMutex
 	built bool
@@ -71,17 +73,35 @@ type StarGiftWithdrawalProvider interface {
 
 type StarGiftWithdrawalProviderRequest struct {
 	UserID int64
+	Ref    domain.SavedStarGiftRef
+	Date   int
 	Gift   domain.UniqueStarGift
 }
 
 type StarGiftWithdrawalProviderResult struct {
-	RequestID string
-	URL       string
-	ExpiresAt int
+	RequestID  string
+	URL        string
+	ExpiresAt  int
+	Durable    bool
+	Withdrawal domain.StarGiftWithdrawal
 }
 
-func WithWithdrawalProvider(provider StarGiftWithdrawalProvider) Option {
-	return func(service *Service) { service.withdrawal = provider }
+type ChannelRevenueWithdrawalProvider interface {
+	CreateRevenueWithdrawal(ctx context.Context, req ChannelRevenueWithdrawalProviderRequest) (StarGiftWithdrawalProviderResult, error)
+}
+
+type ChannelRevenueWithdrawalProviderRequest struct {
+	ChannelID     int64
+	CreatorUserID int64
+	Currency      domain.ChannelRevenueCurrency
+}
+
+func WithGiftWithdrawalProvider(provider StarGiftWithdrawalProvider) Option {
+	return func(service *Service) { service.giftWithdrawal = provider }
+}
+
+func WithRevenueWithdrawalProvider(provider ChannelRevenueWithdrawalProvider) Option {
+	return func(service *Service) { service.revenueWithdrawal = provider }
 }
 
 func NewService(st store.StarGiftStore, blobs BlobBackend, dc int, opts ...Option) *Service {
@@ -775,7 +795,7 @@ func (s *Service) ResolveUserMessageRef(ctx context.Context, viewerUserID int64,
 }
 
 func (s *Service) Withdraw(ctx context.Context, req domain.StarGiftWithdrawalRequest) (domain.StarGiftWithdrawal, error) {
-	if s == nil || s.lifecycle == nil || s.withdrawal == nil {
+	if s == nil || s.lifecycle == nil || s.giftWithdrawal == nil {
 		return domain.StarGiftWithdrawal{}, domain.ErrStarGiftWithdrawalUnavailable
 	}
 	saved, found, err := s.store.GetByRef(ctx, req.Ref)
@@ -793,14 +813,24 @@ func (s *Service) Withdraw(ctx context.Context, req domain.StarGiftWithdrawalReq
 		}
 		return domain.StarGiftWithdrawal{}, domain.ErrStarGiftTransferUnavailable
 	}
-	providerResult, err := s.withdrawal.CreateWithdrawal(ctx, StarGiftWithdrawalProviderRequest{UserID: req.UserID, Gift: unique})
+	providerResult, err := s.giftWithdrawal.CreateWithdrawal(ctx, StarGiftWithdrawalProviderRequest{
+		UserID: req.UserID, Ref: req.Ref, Date: req.Date, Gift: unique,
+	})
 	if err != nil {
 		return domain.StarGiftWithdrawal{}, err
 	}
 	if strings.TrimSpace(providerResult.RequestID) == "" || strings.TrimSpace(providerResult.URL) == "" || providerResult.ExpiresAt <= req.Date {
 		return domain.StarGiftWithdrawal{}, domain.ErrStarGiftWithdrawalUnavailable
 	}
-	recorded, err := s.lifecycle.RecordStarGiftWithdrawal(ctx, req, s.withdrawal.Name(), providerResult.RequestID, providerResult.URL, providerResult.ExpiresAt)
+	if providerResult.Durable {
+		withdrawal := providerResult.Withdrawal
+		if withdrawal.ProviderRequestID != providerResult.RequestID || withdrawal.URL != providerResult.URL ||
+			withdrawal.ExpiresAt != providerResult.ExpiresAt || withdrawal.Gift.ID != unique.ID {
+			return domain.StarGiftWithdrawal{}, domain.ErrStarGiftWithdrawalUnavailable
+		}
+		return withdrawal, nil
+	}
+	recorded, err := s.lifecycle.RecordStarGiftWithdrawal(ctx, req, s.giftWithdrawal.Name(), providerResult.RequestID, providerResult.URL, providerResult.ExpiresAt)
 	if err != nil {
 		return domain.StarGiftWithdrawal{}, err
 	}
@@ -819,6 +849,57 @@ func (s *Service) CompleteWithdrawal(ctx context.Context, providerRequestID stri
 		return domain.StarGiftWithdrawal{}, domain.ErrStarGiftWithdrawalUnavailable
 	}
 	return s.lifecycle.CompleteStarGiftWithdrawal(ctx, providerRequestID, date)
+}
+
+// IssueChannelRevenueWithdrawal creates a short-lived same-origin bearer URL
+// and persists only its digest. Funds remain in the channel until the URL's
+// confirmation POST atomically completes the claim.
+func (s *Service) IssueChannelRevenueWithdrawal(ctx context.Context, req domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error) {
+	if s == nil || s.lifecycle == nil {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	if s.revenueWithdrawal == nil {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	provided, err := s.revenueWithdrawal.CreateRevenueWithdrawal(ctx, ChannelRevenueWithdrawalProviderRequest{
+		ChannelID: req.ChannelID, CreatorUserID: req.CreatorUserID, Currency: req.Currency,
+	})
+	if err != nil {
+		return domain.ChannelRevenueWithdrawal{}, err
+	}
+	token := strings.TrimSpace(provided.RequestID)
+	if token == "" || len(token) > 256 || strings.TrimSpace(provided.URL) == "" || provided.ExpiresAt <= req.Date {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	digest := sha256.Sum256([]byte(token))
+	req.TokenDigest = digest[:]
+	req.ExpiresAt = provided.ExpiresAt
+	out, err := s.lifecycle.IssueChannelRevenueWithdrawal(ctx, req)
+	if err != nil {
+		return domain.ChannelRevenueWithdrawal{}, err
+	}
+	out.URL = provided.URL
+	return out, nil
+}
+
+func (s *Service) ResolveRevenueWithdrawal(ctx context.Context, token string) (domain.ChannelRevenueWithdrawal, bool, error) {
+	if s == nil || s.lifecycle == nil || strings.TrimSpace(token) != token || token == "" || len(token) > 256 {
+		return domain.ChannelRevenueWithdrawal{}, false, nil
+	}
+	digest := sha256.Sum256([]byte(token))
+	return s.lifecycle.ResolveChannelRevenueWithdrawal(ctx, digest[:])
+}
+
+func (s *Service) CompleteRevenueWithdrawal(ctx context.Context, token string, date int) (domain.ChannelRevenueWithdrawal, error) {
+	if s == nil || s.lifecycle == nil || strings.TrimSpace(token) != token || token == "" || len(token) > 256 {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalInvalid
+	}
+	digest := sha256.Sum256([]byte(token))
+	return s.lifecycle.CompleteChannelRevenueWithdrawal(ctx, digest[:], date)
+}
+
+func (s *Service) ChannelRevenueWithdrawalAvailable() bool {
+	return s != nil && s.lifecycle != nil && s.revenueWithdrawal != nil
 }
 
 func (s *Service) TonBalance(ctx context.Context, userID int64) (int64, error) {
@@ -846,6 +927,13 @@ func (s *Service) ChannelStarsBalance(ctx context.Context, channelID int64) (int
 	return s.lifecycle.ChannelStarsBalance(ctx, channelID)
 }
 
+func (s *Service) ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.ChannelStarsOverallRevenue(ctx, channelID)
+}
+
 func (s *Service) ChannelStarsTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
 	if s == nil || s.lifecycle == nil {
 		return domain.StarsTransactionPage{}, nil
@@ -862,6 +950,13 @@ func (s *Service) ChannelTonBalance(ctx context.Context, channelID int64) (int64
 		return 0, nil
 	}
 	return s.lifecycle.ChannelTonBalance(ctx, channelID)
+}
+
+func (s *Service) ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.ChannelTonOverallRevenue(ctx, channelID)
 }
 
 func (s *Service) ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error) {

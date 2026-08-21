@@ -598,21 +598,87 @@ func TestDeletePrivateMessagesRejectsMissingOnExecute(t *testing.T) {
 
 func TestRevokeSessionsSpecifiedClosesRevokedAuthKey(t *testing.T) {
 	ctx := context.Background()
+	const authorizationHash = int64(2361577175213625973)
 	key := [8]byte{1, 2, 3}
 	auth := &fakeAuthService{items: []domain.Authorization{
-		{AuthKeyID: key, UserID: 1001, Hash: 555},
+		{AuthKeyID: key, UserID: 1001, Hash: authorizationHash},
 	}}
 	revoker := &fakeRevoker{}
 	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Auth: auth, Revoker: revoker, Now: fixedNow})
-	if _, err := svc.RevokeSessions(ctx, RevokeSessionsRequest{
+	res, err := svc.RevokeSessions(ctx, RevokeSessionsRequest{
 		CommandMeta: CommandMeta{CommandID: "revoke-1", Actor: "ops", Reason: "lost device"},
 		UserID:      1001,
-		Hash:        555,
-	}); err != nil {
+		Hash:        authorizationHash,
+	})
+	if err != nil {
 		t.Fatalf("revoke sessions: %v", err)
 	}
-	if auth.resetHash != 555 || len(revoker.keys) != 1 || revoker.keys[0] != key {
+	if auth.resetHash != authorizationHash || len(revoker.keys) != 1 || revoker.keys[0] != key {
 		t.Fatalf("resetHash=%d revoked=%v", auth.resetHash, revoker.keys)
+	}
+	if got, want := res.Details["revoked_hashes"], []string{"2361577175213625973"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("revoked_hashes=%#v, want %#v", got, want)
+	}
+}
+
+func TestRevokeSessionsSpecifiedRejectsUnknownAndConcurrentMissingHash(t *testing.T) {
+	ctx := context.Background()
+	const authorizationHash = int64(2361577175213625973)
+	key := [8]byte{1, 2, 3}
+
+	for _, test := range []struct {
+		name          string
+		auth          *fakeAuthService
+		wantResetHash int64
+	}{
+		{
+			name: "unknown before mutation",
+			auth: &fakeAuthService{items: []domain.Authorization{
+				{AuthKeyID: key, UserID: 1001, Hash: 123},
+			}},
+		},
+		{
+			name: "disappeared during mutation",
+			auth: &fakeAuthService{
+				items:        []domain.Authorization{{AuthKeyID: key, UserID: 1001, Hash: authorizationHash}},
+				resetMissing: true,
+			},
+			wantResetHash: authorizationHash,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			revoker := &fakeRevoker{}
+			svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Auth: test.auth, Revoker: revoker, Now: fixedNow})
+			_, err := svc.RevokeSessions(ctx, RevokeSessionsRequest{
+				CommandMeta: CommandMeta{CommandID: "revoke-missing", Actor: "ops", Reason: "lost device"},
+				UserID:      1001,
+				Hash:        authorizationHash,
+			})
+			if err == nil || !strings.Contains(err.Error(), "authorization hash not found") {
+				t.Fatalf("revoke missing err=%v, want authorization hash not found", err)
+			}
+			if test.auth.resetHash != test.wantResetHash || len(revoker.keys) != 0 {
+				t.Fatalf("resetHash=%d revoked=%v, want resetHash=%d and no revoke", test.auth.resetHash, revoker.keys, test.wantResetHash)
+			}
+		})
+	}
+}
+
+func TestRevokeSessionsRejectsAmbiguousModes(t *testing.T) {
+	svc := NewService(Dependencies{
+		Commands: newMemoryCommandRepo(),
+		Auth:     &fakeAuthService{},
+		Revoker:  &fakeRevoker{},
+		Now:      fixedNow,
+	})
+	_, err := svc.RevokeSessions(context.Background(), RevokeSessionsRequest{
+		CommandMeta: CommandMeta{CommandID: "revoke-ambiguous", Actor: "ops", Reason: "test"},
+		UserID:      1001,
+		KeepHash:    123,
+		RevokeAll:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "choose one revoke mode") {
+		t.Fatalf("ambiguous revoke modes err=%v, want choose one revoke mode", err)
 	}
 }
 
@@ -634,12 +700,112 @@ func TestDeletePrivateHistoryLoopsUntilOffsetClears(t *testing.T) {
 	}
 }
 
+func TestStickerSetUploadsFailPreflightBeforeMaterialization(t *testing.T) {
+	ctx := context.Background()
+	ports := &fakeStickerSetsService{addValidationErr: domain.ErrStickerSetTooMuch}
+	repo := newMemoryCommandRepo()
+	svc := NewService(Dependencies{Commands: repo, StickerSets: ports, Now: fixedNow})
+
+	_, err := svc.AddStickerToSet(ctx, AddStickerToSetRequest{
+		CommandMeta: CommandMeta{CommandID: "add-full-pack", Actor: "ops", Reason: "test"},
+		SetID:       10,
+		Emoji:       "🙂",
+		FileName:    "emoji.json",
+		Data:        []byte(`{"w":512}`),
+	})
+	if !errors.Is(err, domain.ErrStickerSetTooMuch) {
+		t.Fatalf("add full pack err = %v, want ErrStickerSetTooMuch", err)
+	}
+	if ports.addValidationCalls != 1 || ports.uploadCalls != 0 || ports.addCalls != 0 || len(repo.items) != 1 {
+		t.Fatalf("add preflight calls validation/upload/add/commands = %d/%d/%d/%d, want 1/0/0/1",
+			ports.addValidationCalls, ports.uploadCalls, ports.addCalls, len(repo.items))
+	}
+
+	ports.addValidationErr = nil
+	ports.createValidationErr = domain.ErrStickerSetShortNameOccupied
+	_, err = svc.CreateStickerSet(ctx, CreateStickerSetRequest{
+		CommandMeta: CommandMeta{CommandID: "create-occupied-pack", Actor: "ops", Reason: "test"},
+		Title:       "Emoji Pack",
+		ShortName:   "occupied_pack",
+		Kind:        string(domain.StickerSetKindEmoji),
+		Emoji:       "🙂",
+		FileName:    "emoji.json",
+		Data:        []byte(`{"w":512}`),
+	})
+	if !errors.Is(err, domain.ErrStickerSetShortNameOccupied) {
+		t.Fatalf("create occupied pack err = %v, want ErrStickerSetShortNameOccupied", err)
+	}
+	if ports.createValidationCalls != 1 || ports.uploadCalls != 0 || ports.createCalls != 0 || len(repo.items) != 2 {
+		t.Fatalf("create preflight calls validation/upload/create/commands = %d/%d/%d/%d, want 1/0/0/2",
+			ports.createValidationCalls, ports.uploadCalls, ports.createCalls, len(repo.items))
+	}
+}
+
 func fixedNow() time.Time {
 	return time.Unix(1_700_000_000, 0).UTC()
 }
 
 type memoryCommandRepo struct {
 	items map[string]domain.AdminCommand
+}
+
+type fakeStickerSetsService struct {
+	createValidationErr   error
+	addValidationErr      error
+	createValidationCalls int
+	addValidationCalls    int
+	uploadCalls           int
+	createCalls           int
+	addCalls              int
+}
+
+func (f *fakeStickerSetsService) AdminSetStickerSetArchived(context.Context, int64, bool) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStickerSetsService) AdminSetStickerSetSortOrder(context.Context, int64, int) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStickerSetsService) AdminRenameStickerSet(context.Context, int64, string) (domain.StickerSet, error) {
+	return domain.StickerSet{}, nil
+}
+
+func (f *fakeStickerSetsService) AdminDeleteStickerSet(context.Context, int64) (domain.StickerSetKind, error) {
+	return domain.StickerSetKindStickers, nil
+}
+
+func (f *fakeStickerSetsService) ValidateStickerMaterialUpload(string, []byte) (string, bool) {
+	return "application/json", true
+}
+
+func (f *fakeStickerSetsService) ValidateAdminCreateStickerSet(context.Context, string, string, string, domain.StickerSetKind) error {
+	f.createValidationCalls++
+	return f.createValidationErr
+}
+
+func (f *fakeStickerSetsService) ValidateAdminAddStickerToSet(context.Context, int64, string) error {
+	f.addValidationCalls++
+	return f.addValidationErr
+}
+
+func (f *fakeStickerSetsService) AdminUploadStickerMaterial(context.Context, string, []byte) (domain.Document, error) {
+	f.uploadCalls++
+	return domain.Document{ID: 100, AccessHash: 200}, nil
+}
+
+func (f *fakeStickerSetsService) AdminCreateStickerSet(context.Context, domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+	f.createCalls++
+	return domain.StickerSet{ID: 10}, nil, nil
+}
+
+func (f *fakeStickerSetsService) AdminAddStickerToSet(context.Context, int64, domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+	f.addCalls++
+	return domain.StickerSet{ID: 10}, nil, nil
+}
+
+func (f *fakeStickerSetsService) AdminRemoveStickerFromSet(context.Context, int64, int64) (domain.StickerSet, []domain.Document, error) {
+	return domain.StickerSet{}, nil, nil
 }
 
 func newMemoryCommandRepo() *memoryCommandRepo {
@@ -779,8 +945,9 @@ func (f *fakeMessagesService) DeleteHistory(_ context.Context, userID int64, _ d
 }
 
 type fakeAuthService struct {
-	items     []domain.Authorization
-	resetHash int64
+	items        []domain.Authorization
+	resetHash    int64
+	resetMissing bool
 }
 
 func (f *fakeAuthService) ListAuthorizations(context.Context, int64) ([]domain.Authorization, error) {
@@ -789,6 +956,9 @@ func (f *fakeAuthService) ListAuthorizations(context.Context, int64) ([]domain.A
 
 func (f *fakeAuthService) ResetAuthorization(_ context.Context, _ int64, hash int64) (domain.Authorization, bool, error) {
 	f.resetHash = hash
+	if f.resetMissing {
+		return domain.Authorization{}, false, nil
+	}
 	for _, a := range f.items {
 		if a.Hash == hash {
 			return a, true, nil

@@ -20,6 +20,55 @@ func (s *Service) ValidateStickerMaterialUpload(fileName string, data []byte) (s
 	return detectStickerMaterialUploadMime(fileName, data)
 }
 
+// ValidateAdminCreateStickerSet checks every non-file invariant that can be
+// rejected before an upload is materialized as a loose document/blob.
+func (s *Service) ValidateAdminCreateStickerSet(ctx context.Context, title, shortName, emoji string, kind domain.StickerSetKind) error {
+	title = strings.TrimSpace(title)
+	if err := validateStickerSetTitle(title); err != nil {
+		return err
+	}
+	if kind != domain.StickerSetKindStickers && kind != domain.StickerSetKindEmoji {
+		return domain.ErrStickerSetTypeInvalid
+	}
+	shortName = normalizeStickerSetShortName(shortName)
+	if err := validateStickerSetShortName(shortName); err != nil {
+		return err
+	}
+	if err := validateStickerEmoji(strings.TrimSpace(emoji)); err != nil {
+		return err
+	}
+	available, err := s.media.StickerSetShortNameAvailable(ctx, shortName)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return domain.ErrStickerSetShortNameOccupied
+	}
+	return nil
+}
+
+// ValidateAdminAddStickerToSet rejects invalid targets and capacity failures
+// before the admin service writes the uploaded material.
+func (s *Service) ValidateAdminAddStickerToSet(ctx context.Context, setID int64, emoji string) error {
+	if setID <= 0 {
+		return domain.ErrStickerSetInvalid
+	}
+	if err := validateStickerEmoji(strings.TrimSpace(emoji)); err != nil {
+		return err
+	}
+	set, found, err := s.media.GetStickerSetByID(ctx, setID)
+	if err != nil {
+		return err
+	}
+	if !found || set.Deleted || set.Kind == domain.StickerSetKindSystem {
+		return domain.ErrStickerSetInvalid
+	}
+	if len(set.DocumentIDs) >= domain.MaxStickerSetItems {
+		return domain.ErrStickerSetTooMuch
+	}
+	return nil
+}
+
 // AdminUploadStickerMaterial turns a raw TGS, Lottie JSON, or WebP upload into
 // a loose Document that can be attached by AdminCreateStickerSet or
 // AdminAddStickerToSet. Bytes go through the configured blob backend directly.
@@ -88,6 +137,9 @@ func isWebPData(data []byte) bool {
 // AdminAddStickerToSet appends an already materialized document to any pack,
 // with no ownership check.
 func (s *Service) AdminAddStickerToSet(ctx context.Context, setID int64, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+	if err := s.ValidateAdminAddStickerToSet(ctx, setID, item.Emoji); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
 	set, docs, found, err := s.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: setID})
 	if err != nil {
 		return domain.StickerSet{}, nil, err

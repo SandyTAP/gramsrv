@@ -68,8 +68,16 @@ func (c *controlFabricController) CloseSessionsForBusinessAuthKey(authKeyID [8]b
 	return c.fabric.CloseSessionsForBusinessAuthKey(authKeyID)
 }
 
+func (c *controlFabricController) CloseSessionsForBusinessAuthKeyBounded(ctx context.Context, authKeyID [8]byte) (int, error) {
+	return c.fabric.CloseSessionsForBusinessAuthKeyBounded(ctx, authKeyID)
+}
+
 func (c *controlFabricController) CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int {
 	return c.fabric.CloseSessionsForRawAuthKeyExcept(authKeyID, exceptSessionID)
+}
+
+func (c *controlFabricController) CloseSessionsForRawAuthKeyExceptBounded(ctx context.Context, authKeyID [8]byte, exceptSessionID int64) (int, error) {
+	return c.fabric.CloseSessionsForRawAuthKeyExceptBounded(ctx, authKeyID, exceptSessionID)
 }
 
 func (c *controlFabricController) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte) {
@@ -916,33 +924,46 @@ func (f *SessionControlFabric) onlineChannelUsersFromRegistry(channelID int64, l
 }
 
 func (f *SessionControlFabric) CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int {
-	affected := 0
-	if f == nil {
-		return affected
+	affected, _ := f.CloseSessionsForBusinessAuthKeyBounded(context.Background(), authKeyID)
+	return affected
+}
+
+func (f *SessionControlFabric) CloseSessionsForBusinessAuthKeyBounded(ctx context.Context, authKeyID [8]byte) (int, error) {
+	if f == nil || f.registry == nil || f.bus == nil {
+		return 0, ErrSessionControlFabricDependenciesRequired
 	}
-	return affected + f.sendSessionControlToTargets(SessionControlCommand{
+	if authKeyID == ([8]byte{}) {
+		return 0, nil
+	}
+	records, lookupErr := f.businessAuthKeyRecordsBounded(ctx, authKeyID)
+	affected, deliveryErr := f.sendSessionControlToTargetsBounded(ctx, SessionControlCommand{
 		Kind:      SessionControlCloseBusinessAuthKey,
 		AuthKeyID: authKeyID,
-	}, remoteControlTargets(f.instanceID, f.businessAuthKeyRecords(authKeyID)))
+	}, remoteControlTargets(f.instanceID, records))
+	return affected, errors.Join(lookupErr, deliveryErr)
 }
 
 func (f *SessionControlFabric) CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int {
-	affected := 0
-	if f == nil {
-		return affected
+	affected, _ := f.CloseSessionsForRawAuthKeyExceptBounded(context.Background(), authKeyID, exceptSessionID)
+	return affected
+}
+
+func (f *SessionControlFabric) CloseSessionsForRawAuthKeyExceptBounded(ctx context.Context, authKeyID [8]byte, exceptSessionID int64) (int, error) {
+	if f == nil || f.registry == nil || f.bus == nil {
+		return 0, ErrSessionControlFabricDependenciesRequired
 	}
-	if f.registry == nil || f.bus == nil || authKeyID == ([8]byte{}) {
-		return affected
+	if authKeyID == ([8]byte{}) {
+		return 0, nil
 	}
 	rawRegistry, ok := f.registry.(RawAuthKeyLocationRegistry)
 	if !ok {
-		return affected
+		return 0, fmt.Errorf("edgecontrol: raw auth-key location registry is required")
 	}
-	records, err := rawRegistry.ListRawAuthKey(context.Background(), authKeyID)
+	records, err := rawRegistry.ListRawAuthKey(ctx, authKeyID)
 	if err != nil {
-		return affected
+		return 0, fmt.Errorf("list raw auth-key edge locations: %w", err)
 	}
-	return affected + f.sendSessionControlToTargets(SessionControlCommand{
+	return f.sendSessionControlToTargetsBounded(ctx, SessionControlCommand{
 		Kind:            SessionControlCloseRawAuthKey,
 		AuthKeyID:       authKeyID,
 		ExceptSessionID: exceptSessionID,
@@ -1009,21 +1030,34 @@ func (f *SessionControlFabric) rawAuthKeyRecords(rawAuthKeyID [8]byte) []Locatio
 }
 
 func (f *SessionControlFabric) businessAuthKeyRecords(authKeyID [8]byte) []LocationRecord {
-	if f == nil || f.registry == nil || f.bus == nil || authKeyID == ([8]byte{}) {
-		return nil
+	records, _ := f.businessAuthKeyRecordsBounded(context.Background(), authKeyID)
+	return records
+}
+
+func (f *SessionControlFabric) businessAuthKeyRecordsBounded(ctx context.Context, authKeyID [8]byte) ([]LocationRecord, error) {
+	if f == nil || f.registry == nil || f.bus == nil {
+		return nil, ErrSessionControlFabricDependenciesRequired
+	}
+	if authKeyID == ([8]byte{}) {
+		return nil, nil
 	}
 	var records []LocationRecord
-	if businessRecords, err := f.registry.ListBusinessAuthKey(context.Background(), authKeyID); err == nil {
+	var lookupErr error
+	if businessRecords, err := f.registry.ListBusinessAuthKey(ctx, authKeyID); err == nil {
 		records = append(records, businessRecords...)
+	} else {
+		lookupErr = errors.Join(lookupErr, fmt.Errorf("list business auth-key edge locations: %w", err))
 	}
 	rawRegistry, ok := f.registry.(RawAuthKeyLocationRegistry)
 	if !ok {
-		return records
+		return records, lookupErr
 	}
-	if rawRecords, err := rawRegistry.ListRawAuthKey(context.Background(), authKeyID); err == nil {
+	if rawRecords, err := rawRegistry.ListRawAuthKey(ctx, authKeyID); err == nil {
 		records = append(records, rawRecords...)
+	} else {
+		lookupErr = errors.Join(lookupErr, fmt.Errorf("list raw auth-key edge locations: %w", err))
 	}
-	return records
+	return records, lookupErr
 }
 
 func (f *SessionControlFabric) liveUserTargets(userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) ([]string, error) {
@@ -1060,21 +1094,36 @@ func (f *SessionControlFabric) userLocationRecords(userID int64) ([]LocationReco
 }
 
 func (f *SessionControlFabric) sendSessionControlToTargets(template SessionControlCommand, targets []string) int {
+	affected, _ := f.sendSessionControlToTargetsBounded(context.Background(), template, targets)
+	return affected
+}
+
+func (f *SessionControlFabric) sendSessionControlToTargetsBounded(ctx context.Context, template SessionControlCommand, targets []string) (int, error) {
 	affected := 0
+	var firstErr error
 	for _, target := range targets {
 		cmd := template
 		cmd.CommandID = nextSessionControlCommandID(f.instanceID)
 		cmd.SourceInstanceID = f.instanceID
 		cmd.TargetInstanceID = target
-		ctx, cancel := context.WithTimeout(context.Background(), f.sessionControlTimeout())
-		ack, err := f.bus.SendSessionControl(ctx, target, cmd)
+		sendCtx, cancel := context.WithTimeout(ctx, f.sessionControlTimeout())
+		ack, err := f.bus.SendSessionControl(sendCtx, target, cmd)
 		cancel()
-		if err != nil || ack.Error != "" {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("send session control to %s: %w", target, err)
+			}
+			continue
+		}
+		if ack.Error != "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("edge %s session control: %s", target, ack.Error)
+			}
 			continue
 		}
 		affected += ack.Affected
 	}
-	return affected
+	return affected, firstErr
 }
 
 func (f *SessionControlFabric) sendLivePushToTargets(ctx context.Context, template SessionControlCommand, targets []string) (int, error) {

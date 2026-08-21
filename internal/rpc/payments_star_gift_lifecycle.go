@@ -134,7 +134,7 @@ func (r *Router) starGiftResaleTarget(ctx context.Context, userID int64, inv *tg
 	if err != nil {
 		return domain.UniqueStarGift{}, domain.Peer{}, domain.StarGiftAmount{}, internalErr()
 	}
-	if !found || gift.ResellAmount == nil || gift.Burned || gift.OwnerAddress != "" {
+	if !found || gift.ResellAmount == nil || gift.Burned || gift.ExternalizationPending || gift.OwnerAddress != "" {
 		return domain.UniqueStarGift{}, domain.Peer{}, domain.StarGiftAmount{}, starGiftInvalidErr()
 	}
 	to, err := r.checkedDomainPeerFromInputPeer(ctx, userID, inv.ToID)
@@ -283,6 +283,19 @@ func (r *Router) sendStarGiftPrepaidUpgradeForm(ctx context.Context, userID, for
 		return nil, starGiftLifecycleErr(err)
 	}
 	updates := r.starGiftSendUpdates(ctx, userID, result.Send)
+	for _, edit := range result.SourceEdits {
+		if edit.UserID != userID {
+			continue
+		}
+		if update := tgOtherUpdateFromEvent(edit.Event); update != nil {
+			updates.Updates = append(updates.Updates, update)
+			updates.Users = append(updates.Users, r.usersForMessageUpdate(ctx, userID, edit.Message)...)
+			updates.Chats = append(updates.Chats, r.chatsForMessageUpdate(ctx, userID, edit.Message)...)
+			if edit.Event.Date > updates.Date {
+				updates.Date = edit.Event.Date
+			}
+		}
+	}
 	appendStarGiftBalanceUpdate(updates, domain.StarGiftCurrencyStars, result.Balance.Balance)
 	r.invalidateStarGiftOwner(owner)
 	return &tg.PaymentsPaymentResult{Updates: updates}, nil

@@ -744,7 +744,7 @@ func (r *Router) completePendingPasswordSignIn(ctx context.Context, authKeyID [8
 	if r.deps.Auth == nil {
 		return nil
 	}
-	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID); err != nil {
+	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID, userID); err != nil {
 		return err
 	}
 	r.invalidateAuthUserCache(authKeyID)
@@ -952,14 +952,29 @@ func (r *Router) unbindAuthKey(authKeyID [8]byte) {
 // 清理、好友侧最长一个在线 TTL 仍显示其在线。Close 已把连接移出索引，随后的 unbind
 // 对未实现 SessionTerminator 的 Sessions 才有意义（生产实现走 Close 即可，unbind 是 no-op）。
 func (r *Router) revokeAuthKeySessions(authKeyID [8]byte) {
+	_ = r.revokeAuthKeySessionsBounded(context.Background(), authKeyID)
+}
+
+func (r *Router) revokeAuthKeySessionsBounded(ctx context.Context, authKeyID [8]byte) error {
 	r.invalidateAuthUserCache(authKeyID)
 	rawTempAuthKeyIDs := r.invalidateTempAuthKeyCacheForPerm(authKeyID)
 	invalidateIDs := append([][8]byte{authKeyID}, rawTempAuthKeyIDs...)
 	r.publishAuthInvalidation(context.Background(), invalidateIDs...)
-	if terminator, ok := r.deps.Sessions.(SessionTerminator); ok {
+	var closeErr error
+	if terminator, ok := r.deps.Sessions.(BoundedSessionTerminator); ok {
+		_, closeErr = terminator.CloseSessionsForBusinessAuthKeyBounded(ctx, authKeyID)
+	} else if terminator, ok := r.deps.Sessions.(SessionTerminator); ok {
 		terminator.CloseSessionsForBusinessAuthKey(authKeyID)
 	}
-	if terminator, ok := r.deps.Sessions.(RawSessionTerminator); ok {
+	if terminator, ok := r.deps.Sessions.(BoundedRawSessionTerminator); ok {
+		for _, rawAuthKeyID := range rawTempAuthKeyIDs {
+			if rawAuthKeyID == authKeyID {
+				continue
+			}
+			_, err := terminator.CloseSessionsForRawAuthKeyExceptBounded(ctx, rawAuthKeyID, 0)
+			closeErr = errors.Join(closeErr, err)
+		}
+	} else if terminator, ok := r.deps.Sessions.(RawSessionTerminator); ok {
 		for _, rawAuthKeyID := range rawTempAuthKeyIDs {
 			if rawAuthKeyID == authKeyID {
 				continue
@@ -968,6 +983,7 @@ func (r *Router) revokeAuthKeySessions(authKeyID [8]byte) {
 		}
 	}
 	r.unbindAuthKey(authKeyID)
+	return closeErr
 }
 
 func (r *Router) invalidateTempAuthKeyCacheForPerm(authKeyID [8]byte) [][8]byte {

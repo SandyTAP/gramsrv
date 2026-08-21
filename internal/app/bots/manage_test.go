@@ -128,6 +128,52 @@ func TestSetBotMenuButton(t *testing.T) {
 	}
 }
 
+func TestEnsureMenuBotAppIsIdempotent(t *testing.T) {
+	svc, users, _, _ := newTestService(t)
+	owner := newOwner(t, users, "+2003")
+	bot := makeBot(t, svc, owner, "Claim Bot", "claim_test_bot")
+	ctx := context.Background()
+	button := domain.BotMenuButton{Type: domain.BotMenuButtonWebView, Text: "Claim Gift", URL: "https://example.com/ton-gift/claim"}
+
+	if _, version, err := svc.EnsureMenuBotApp(ctx, bot.ID, button); err != nil || version == 0 {
+		t.Fatalf("first EnsureMenuBotApp version=%d err=%v", version, err)
+	}
+	afterFirst, found, err := users.ByID(ctx, bot.ID)
+	if err != nil || !found {
+		t.Fatalf("load bot after first ensure: found=%v err=%v", found, err)
+	}
+	desiredApp, err := svc.normalizeBotApp(ctx, bot.ID, domain.BotApp{
+		BotUserID: bot.ID, ShortName: defaultMainAppShortName, Title: button.Text, URL: button.URL,
+		Main: true, RequestWriteAccess: true,
+	})
+	if err != nil {
+		t.Fatalf("normalize desired app: %v", err)
+	}
+	actualApp, found, err := svc.GetBotAppByShortName(ctx, bot.ID, defaultMainAppShortName)
+	if err != nil || !found || actualApp != desiredApp {
+		t.Fatalf("stored app mismatch: actual=%+v desired=%+v found=%v err=%v", actualApp, desiredApp, found, err)
+	}
+	desiredAttach := domain.BotAttachMenuBot{
+		BotUserID: bot.ID, AppID: actualApp.ID, ShortName: actualApp.ShortName,
+		RequestWriteAccess: true, ShowInAttachMenu: true, ShowInSideMenu: true,
+		PeerTypes: []string{"pm", "chat", "megagroup", "broadcast"},
+	}
+	actualAttach, found, err := svc.GetAttachMenuBot(ctx, bot.ID)
+	if err != nil || !found || !equalAttachMenuBot(actualAttach, desiredAttach) {
+		t.Fatalf("stored attach mismatch: actual=%+v desired=%+v found=%v err=%v", actualAttach, desiredAttach, found, err)
+	}
+	if _, version, err := svc.EnsureMenuBotApp(ctx, bot.ID, button); err != nil || version != 0 {
+		t.Fatalf("second EnsureMenuBotApp version=%d err=%v, want no write", version, err)
+	}
+	afterSecond, found, err := users.ByID(ctx, bot.ID)
+	if err != nil || !found {
+		t.Fatalf("load bot after second ensure: found=%v err=%v", found, err)
+	}
+	if afterSecond.BotInfoVersion != afterFirst.BotInfoVersion {
+		t.Fatalf("bot info version changed on idempotent ensure: %d -> %d", afterFirst.BotInfoVersion, afterSecond.BotInfoVersion)
+	}
+}
+
 func TestSetInlinePlaceholder(t *testing.T) {
 	svc, users, bots, _ := newTestService(t)
 	owner := newOwner(t, users, "+2010")

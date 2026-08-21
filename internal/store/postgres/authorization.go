@@ -180,6 +180,7 @@ ON CONFLICT (auth_key_id) DO UPDATE SET
   app_version = EXCLUDED.app_version,
   ip = EXCLUDED.ip,
   password_pending = EXCLUDED.password_pending,
+	created_at = now(),
   active_at = now()`,
 		keyID, a.UserID, a.Hash, int32(authLayer), a.DeviceModel, a.Platform, a.SystemVersion, int32(a.APIID), a.AppVersion, a.IP, a.PasswordPending,
 	); err != nil {
@@ -224,11 +225,18 @@ WHERE auth_key_id = $1`,
 	return nil
 }
 
-// MarkPasswordPassed 在两步验证通过后清除 password_pending，使 auth_key 转为完全授权。
-func (s *AuthorizationStore) MarkPasswordPassed(ctx context.Context, id [8]byte) error {
-	if _, err := s.db.Exec(ctx, `
-UPDATE authorizations SET password_pending = false, active_at = now() WHERE auth_key_id = $1`, authKeyIDToInt64(id)); err != nil {
+// MarkPasswordPassed atomically promotes only the pending identity whose
+// password was just verified. A concurrent cross-user Bind must not let A's
+// proof clear B's password_pending flag.
+func (s *AuthorizationStore) MarkPasswordPassed(ctx context.Context, id [8]byte, expectedUserID int64) error {
+	tag, err := s.db.Exec(ctx, `
+	UPDATE authorizations SET password_pending = false, created_at = now(), active_at = now()
+	WHERE auth_key_id = $1 AND user_id = $2 AND password_pending`, authKeyIDToInt64(id), expectedUserID)
+	if err != nil {
 		return fmt.Errorf("mark authorization password passed: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return store.ErrAuthorizationStateChanged
 	}
 	return nil
 }

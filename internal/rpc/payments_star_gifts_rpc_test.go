@@ -735,6 +735,9 @@ func TestSavedStarGiftProjectionPreservesCollectibleLifecycle(t *testing.T) {
 	channelSaved.MsgID = 0
 	channelSaved.SavedID = 51
 	channelProjected := tgSavedStarGifts(0, []domain.SavedStarGift{channelSaved}, nil, nil)[0]
+	if _, ok := channelProjected.GetCanExportAt(); ok {
+		t.Fatal("channel can_export_at must be absent until channel export is executable")
+	}
 	if _, ok := channelProjected.GetCanCraftAt(); ok {
 		t.Fatal("channel can_craft_at must be absent until channel Craft is executable")
 	}
@@ -773,18 +776,25 @@ func TestSavedStarGiftProjectionPreservesCollectibleLifecycle(t *testing.T) {
 		if _, ok := channelDecoded.Gifts[0].GetCanCraftAt(); ok {
 			t.Fatalf("Layer %d channel saved gift exposed can_craft_at", profile)
 		}
+		if _, ok := channelDecoded.Gifts[0].GetCanExportAt(); ok {
+			t.Fatalf("Layer %d channel saved gift exposed can_export_at", profile)
+		}
 	}
 }
 
-func TestChannelUniqueActionSuppressesCraftReadinessAcrossProfiles(t *testing.T) {
+func TestChannelUniqueActionSuppressesUnavailableReadinessAcrossProfiles(t *testing.T) {
 	const readyAt = 1_780_000_123
 	unique := domain.UniqueStarGift{
 		ID: 9902, GiftID: 8002, Title: "Channel Craftable", Slug: "channel-craftable-1", Num: 1,
 		Owner: domain.Peer{Type: domain.PeerTypeChannel, ID: 8102}, CraftChancePermille: 250,
 	}
 	action := tgMessageActionStarGiftUnique(&domain.MessageStarGiftUniqueAction{
-		Gift: unique, Peer: unique.Owner, SavedID: 52, Saved: true, CanCraftAt: readyAt,
+		Gift: unique, Peer: unique.Owner, SavedID: 52, Saved: true,
+		CanExportAt: readyAt - 1, CanCraftAt: readyAt,
 	}).(*tg.MessageActionStarGiftUnique)
+	if _, ok := action.GetCanExportAt(); ok {
+		t.Fatal("channel unique action must not expose can_export_at")
+	}
 	if _, ok := action.GetCanCraftAt(); ok {
 		t.Fatal("channel unique action must not expose can_craft_at")
 	}
@@ -807,6 +817,9 @@ func TestChannelUniqueActionSuppressesCraftReadinessAcrossProfiles(t *testing.T)
 		}
 		if _, ok := decoded.GetCanCraftAt(); ok {
 			t.Fatalf("Layer %d channel unique action exposed can_craft_at", profile)
+		}
+		if _, ok := decoded.GetCanExportAt(); ok {
+			t.Fatalf("Layer %d channel unique action exposed can_export_at", profile)
 		}
 		gift, ok := decoded.Gift.(*tg.StarGiftUnique)
 		if !ok || gift.CraftChancePermille != unique.CraftChancePermille {
@@ -1029,6 +1042,76 @@ func TestStarGiftUpgradeRPCReplaysCommittedReceiptAfterTerminalTransition(t *tes
 	}
 	if service.upgradeCalls != 1 || service.previewCalls != 0 || service.lastRequest.ChargeStars != 25 || service.lastRequest.FormID != paidFormID {
 		t.Fatalf("paid replay calls=%d preview=%d req=%+v", service.upgradeCalls, service.previewCalls, service.lastRequest)
+	}
+}
+
+func TestStarGiftUpgradeRPCAcceptsChannelPrepaidGiftForPostingAdmin(t *testing.T) {
+	r, sender, owner, gift := starGiftTestRouter(t)
+	created, err := r.deps.Channels.CreateChannel(context.Background(), owner.ID, domain.CreateChannelRequest{
+		CreatorUserID: owner.ID,
+		Title:         "Channel prepaid upgrade",
+		Broadcast:     true,
+		MemberUserIDs: []int64{sender.ID},
+		Date:          1700000000,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	channelOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	saved := domain.SavedStarGift{
+		ID: 48, SavedID: 48, Owner: channelOwner, FromUserID: sender.ID,
+		GiftID: gift.ID, RevisionID: gift.RevisionID, UniqueGiftID: 9200000000000005,
+	}
+	result := domain.StarGiftUpgradeResult{
+		Saved: saved,
+		Unique: domain.UniqueStarGift{
+			ID: saved.UniqueGiftID, GiftID: gift.ID, Owner: channelOwner,
+		},
+		Balance:   domain.StarsBalance{UserID: owner.ID, Balance: 1000},
+		Duplicate: true,
+		Send: domain.SendPrivateTextResult{
+			RecipientMessage: domain.Message{
+				ID: 108, OwnerUserID: owner.ID,
+				Peer: domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID},
+				From: domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}, Date: 1700000001,
+			},
+			RecipientEvent: domain.UpdateEvent{UserID: owner.ID, Pts: 43, PtsCount: 1, Date: 1700000001},
+		},
+	}
+	service := &upgradeReplayRPCService{
+		GiftsService: r.deps.Gifts,
+		saved:        saved,
+		result:       result,
+		receipt: domain.StarGiftUpgradeReceipt{
+			UserID: owner.ID, SourceSavedGiftID: saved.ID, UniqueGiftID: saved.UniqueGiftID,
+			RequirePrepaid: true, KeepOriginalDetails: true, BalanceAfter: 1000,
+		},
+	}
+	wantRef := domain.SavedStarGiftRef{Owner: channelOwner, SavedID: saved.SavedID}
+	const notificationMsgID = 107
+	r.deps.Gifts = &starGiftMessageAliasRPCService{
+		GiftsService: service, viewerUserID: owner.ID, msgID: notificationMsgID, ref: wantRef,
+	}
+	if _, err := r.onPaymentsUpgradeStarGift(WithUserID(context.Background(), owner.ID), &tg.PaymentsUpgradeStarGiftRequest{
+		KeepOriginalDetails: true,
+		Stargift:            &tg.InputSavedStarGiftUser{MsgID: notificationMsgID},
+	}); err != nil {
+		t.Fatalf("channel prepaid upgrade from notification alias: %v", err)
+	}
+	if service.upgradeCalls != 1 || service.lastRequest.Ref != wantRef ||
+		!service.lastRequest.RequirePrepaid || service.lastRequest.ChargeStars != 0 {
+		t.Fatalf("channel prepaid upgrade calls=%d req=%+v", service.upgradeCalls, service.lastRequest)
+	}
+
+	input := &tg.InputSavedStarGiftChat{
+		Peer:    &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
+		SavedID: saved.SavedID,
+	}
+	if _, err := r.onPaymentsUpgradeStarGift(WithUserID(context.Background(), sender.ID), &tg.PaymentsUpgradeStarGiftRequest{
+		KeepOriginalDetails: true,
+		Stargift:            input,
+	}); !tgerr.Is(err, "CHAT_ADMIN_REQUIRED") {
+		t.Fatalf("non-admin channel prepaid upgrade err=%v, want CHAT_ADMIN_REQUIRED", err)
 	}
 }
 

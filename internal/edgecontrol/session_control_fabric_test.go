@@ -228,6 +228,47 @@ func TestSessionControlFabricDoesNotCountRemoteSendFailure(t *testing.T) {
 	}
 }
 
+func TestSessionControlFabricBoundedCloseReportsRemoteFailure(t *testing.T) {
+	business := [8]byte{10}
+	for _, test := range []struct {
+		name    string
+		bus     *captureSessionBus
+		wantErr string
+	}{
+		{
+			name:    "errored ack",
+			bus:     &captureSessionBus{affected: 1, ackErr: "remote close failed"},
+			wantErr: "remote close failed",
+		},
+		{
+			name:    "send failure",
+			bus:     &captureSessionBus{affected: 1, err: errors.New("redis publish timeout")},
+			wantErr: "redis publish timeout",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := &captureLocationRegistry{business: map[[8]byte][]LocationRecord{
+				business: {
+					{InstanceID: "edge-b", BusinessAuthKeyID: business, RawAuthKeyID: business, SessionID: 11},
+				},
+			}}
+			fabric := NewSessionControlFabric(SessionControlFabricConfig{
+				InstanceID: "edge-a",
+				Registry:   registry,
+				Bus:        test.bus,
+			})
+
+			affected, err := fabric.CloseSessionsForBusinessAuthKeyBounded(context.Background(), business)
+			if affected != 0 || err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("bounded close affected=%d err=%v, want affected=0 containing %q", affected, err, test.wantErr)
+			}
+			if len(test.bus.sent) != 1 {
+				t.Fatalf("remote commands=%d, want one attempted close", len(test.bus.sent))
+			}
+		})
+	}
+}
+
 func TestSessionControlFabricRoutesTransientPushToOwningRemoteEdge(t *testing.T) {
 	userID := int64(42)
 	excludeRaw := [8]byte{9}

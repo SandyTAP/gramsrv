@@ -683,7 +683,7 @@ SELECT id FROM unique_star_gifts WHERE id=$1 FOR UPDATE`, status.Collectible.Col
 		}
 		expected, valid := domain.CollectibleEmojiStatus(gift)
 		if !found || !valid || gift.Owner != (domain.Peer{Type: domain.PeerTypeUser, ID: userID}) ||
-			gift.Burned || gift.OwnerAddress != "" || expected != status.Collectible {
+			gift.Burned || gift.ExternalizationPending || gift.OwnerAddress != "" || expected != status.Collectible {
 			return sqlcgen.User{}, domain.ErrStarGiftCollectibleInvalid
 		}
 	}

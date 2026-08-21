@@ -171,32 +171,107 @@ func (s *ChannelStore) SetChannelMessageReactions(_ context.Context, req domain.
 type memoryPaidReaction struct {
 	stars     int64
 	anonymous bool
+	peer      domain.Peer
 	date      int
 }
 
-// AddChannelMessagePaidReaction 累计 viewer 对一条广播频道消息的付费 reaction 星数（内存镜像）。
+// AddChannelMessagePaidReaction is the explicit in-memory test fake for the
+// production atomic command. Its test ledger maps, command receipt and
+// reaction aggregate mutate under the same mutex.
 func (s *ChannelStore) AddChannelMessagePaidReaction(_ context.Context, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, error) {
-	if req.UserID == 0 || req.ChannelID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
+	if req.UserID == 0 || req.ChannelID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID || req.RandomID == 0 {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
 	}
 	if req.Stars <= 0 || req.Stars > domain.MaxPaidReactionStarsPerRequest {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+	}
+	privacyKind := req.Privacy.Kind
+	if privacyKind == "" {
+		privacyKind = domain.PaidReactionPrivacyDefault
+	}
+	displayPeer := req.DisplayPeer
+	switch privacyKind {
+	case domain.PaidReactionPrivacyDefault:
+		if req.Anonymous || displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyAccountDefault:
+		if req.Anonymous && displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyAnonymous:
+		if !req.Anonymous || displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyPeer:
+		if req.Anonymous || req.Privacy.Peer == nil || req.Privacy.Peer.Type != domain.PeerTypeChannel || req.Privacy.Peer.ID <= 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+		if displayPeer.ID == 0 {
+			displayPeer = *req.Privacy.Peer
+		}
+		if displayPeer != *req.Privacy.Peer {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+	default:
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+	}
+	if displayPeer.ID != 0 && (displayPeer.Type != domain.PeerTypeChannel || displayPeer.ID <= 0) {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
 	}
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for key, saved := range s.paidReactionCommands {
+		if saved.createdAt < req.Date-domain.PaidReactionReceiptRetentionSeconds {
+			delete(s.paidReactionCommands, key)
+		}
+	}
+	fingerprint := req.Fingerprint()
+	commandKey := paidReactionCommandKey{userID: req.UserID, randomID: req.RandomID}
+	receipt, duplicate := s.paidReactionCommands[commandKey]
+	if duplicate {
+		if receipt.fingerprint != fingerprint {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrMessageRandomIDDuplicate
+		}
+		result := clonePaidReactionResult(receipt.result)
+		result.PayerBalance.Balance = s.starsBalances[req.UserID]
+		result.PayerBalance.Granted = true
+		result.Duplicate = true
+		result.Recipients = []int64{req.UserID}
+		return result, nil
+	}
+	if domain.PaidReactionRandomIDExpired(req.RandomID, req.Date) {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionRandomIDExpired
+	}
 	channel, member, err := s.channelAndMemberLocked(req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.ChannelMessagePaidReactionResult{}, err
 	}
-	if !channel.Broadcast || channel.Megagroup {
+	if !channel.Broadcast || channel.Megagroup || !channel.ReactionPolicy.PaidEnabled {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrReactionInvalid
 	}
 	msg, ok := s.findMessageLocked(req.ChannelID, req.MessageID)
 	if !ok || msg.Deleted || msg.Action != nil || msg.ID <= member.AvailableMinID {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrMessageIDInvalid
+	}
+	var displayChannels []domain.Channel
+	if displayPeer.ID != 0 {
+		displayChannel, displayMember, err := s.channelAndMemberLocked(req.UserID, displayPeer.ID)
+		if err != nil || displayChannel.Deleted || !displayChannel.Broadcast ||
+			displayChannel.CreatorUserID != req.UserID || displayMember.Role != domain.ChannelRoleCreator {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+		displayChannels = []domain.Channel{cloneChannel(displayChannel)}
+	}
+	balance, ok := s.starsBalances[req.UserID]
+	if !ok {
+		balance = domain.DefaultStarsStartingGrant
+	}
+	if balance < req.Stars {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrStarsInsufficient
 	}
 	if s.paidReactions[req.ChannelID] == nil {
 		s.paidReactions[req.ChannelID] = make(map[int]map[int64]memoryPaidReaction)
@@ -205,21 +280,94 @@ func (s *ChannelStore) AddChannelMessagePaidReaction(_ context.Context, req doma
 		s.paidReactions[req.ChannelID][req.MessageID] = make(map[int64]memoryPaidReaction)
 	}
 	prev := s.paidReactions[req.ChannelID][req.MessageID][req.UserID]
+	storedDisplayPeer := domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID}
+	if displayPeer.ID != 0 {
+		storedDisplayPeer = displayPeer
+	}
 	s.paidReactions[req.ChannelID][req.MessageID][req.UserID] = memoryPaidReaction{
 		stars:     prev.stars + req.Stars,
 		anonymous: req.Anonymous,
+		peer:      storedDisplayPeer,
 		date:      req.Date,
 	}
+	balance -= req.Stars
+	s.starsBalances[req.UserID] = balance
+	s.channelStarsBalances[req.ChannelID] += req.Stars
 	paid := s.aggregatePaidReactionsLocked(req.ChannelID, req.MessageID, req.UserID)
+	displayChannels = displayChannels[:0]
+	seenDisplayChannels := make(map[int64]struct{}, len(paid.TopReactors))
+	for _, reactor := range paid.TopReactors {
+		peer := reactor.DisplayPeer()
+		if peer.Type != domain.PeerTypeChannel || peer.ID <= 0 {
+			continue
+		}
+		if _, seen := seenDisplayChannels[peer.ID]; seen {
+			continue
+		}
+		if displayChannel, ok := s.channels[peer.ID]; ok {
+			seenDisplayChannels[peer.ID] = struct{}{}
+			displayChannels = append(displayChannels, cloneChannel(displayChannel))
+		}
+	}
+	sort.Slice(displayChannels, func(i, j int) bool { return displayChannels[i].ID < displayChannels[j].ID })
 	outMsg := cloneChannelMessage(msg)
 	reactions := s.channelMessageReactionsLocked(req.UserID, channel, req.MessageID)
 	outMsg.Reactions = cloneChannelMessageReactionsPtr(&reactions)
-	return domain.ChannelMessagePaidReactionResult{
-		Channel:    cloneChannel(channel),
-		Message:    outMsg,
-		Paid:       paid,
-		Recipients: s.activeMemberIDsLocked(req.ChannelID, 0, 0),
-	}, nil
+	result := domain.ChannelMessagePaidReactionResult{
+		Channel:         cloneChannel(channel),
+		Message:         outMsg,
+		Paid:            paid,
+		PayerBalance:    domain.StarsBalance{UserID: req.UserID, Balance: balance, Granted: true},
+		ChannelBalance:  s.channelStarsBalances[req.ChannelID],
+		DisplayChannels: displayChannels,
+		Recipients:      s.activeMemberIDsLocked(req.ChannelID, 0, 0),
+	}
+	s.paidReactionCommands[commandKey] = memoryPaidReactionReceipt{
+		fingerprint: fingerprint,
+		createdAt:   req.Date,
+		result:      clonePaidReactionResult(result),
+	}
+	return result, nil
+}
+
+func clonePaidReactionResult(in domain.ChannelMessagePaidReactionResult) domain.ChannelMessagePaidReactionResult {
+	out := in
+	out.Channel = cloneChannel(in.Channel)
+	out.Message = cloneChannelMessage(in.Message)
+	out.Paid.TopReactors = append([]domain.PaidReactor(nil), in.Paid.TopReactors...)
+	out.DisplayChannels = make([]domain.Channel, len(in.DisplayChannels))
+	for i := range in.DisplayChannels {
+		out.DisplayChannels[i] = cloneChannel(in.DisplayChannels[i])
+	}
+	out.Recipients = append([]int64(nil), in.Recipients...)
+	return out
+}
+
+// ReplayChannelMessagePaidReaction is the explicit fake equivalent of the PG
+// durable receipt lookup. It intentionally ignores current channel state.
+func (s *ChannelStore) ReplayChannelMessagePaidReaction(_ context.Context, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error) {
+	if req.UserID == 0 || req.RandomID == 0 {
+		return domain.ChannelMessagePaidReactionResult{}, false, domain.ErrChannelInvalid
+	}
+	now := req.Date
+	if now <= 0 {
+		now = int(time.Now().Unix())
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	receipt, ok := s.paidReactionCommands[paidReactionCommandKey{userID: req.UserID, randomID: req.RandomID}]
+	if !ok || receipt.createdAt < now-domain.PaidReactionReceiptRetentionSeconds {
+		return domain.ChannelMessagePaidReactionResult{}, false, nil
+	}
+	if receipt.fingerprint != req.Fingerprint() {
+		return domain.ChannelMessagePaidReactionResult{}, true, domain.ErrMessageRandomIDDuplicate
+	}
+	result := clonePaidReactionResult(receipt.result)
+	result.PayerBalance.Balance = s.starsBalances[req.UserID]
+	result.PayerBalance.Granted = true
+	result.Duplicate = true
+	result.Recipients = []int64{req.UserID}
+	return result, true, nil
 }
 
 func (s *ChannelStore) aggregatePaidReactionsLocked(channelID int64, messageID int, viewerUserID int64) domain.ChannelMessagePaidReactions {
@@ -227,7 +375,7 @@ func (s *ChannelStore) aggregatePaidReactionsLocked(channelID int64, messageID i
 	reactors := make([]domain.PaidReactor, 0, len(byUser))
 	var out domain.ChannelMessagePaidReactions
 	for userID, entry := range byUser {
-		r := domain.PaidReactor{UserID: userID, Stars: entry.stars, Anonymous: entry.anonymous, My: userID == viewerUserID}
+		r := domain.PaidReactor{UserID: userID, Peer: entry.peer, Stars: entry.stars, Anonymous: entry.anonymous, My: userID == viewerUserID}
 		out.TotalStars += entry.stars
 		if r.My {
 			out.MyStars = entry.stars

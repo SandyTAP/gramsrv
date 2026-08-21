@@ -329,20 +329,22 @@ func (s *Service) PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) 
 }
 
 // CompletePasswordSignIn 在两步验证通过后清除 password_pending，使 auth_key 转为完全授权。
-func (s *Service) CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte) error {
+func (s *Service) CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64) error {
 	if s == nil || s.auths == nil {
 		return nil
 	}
-	if err := s.auths.MarkPasswordPassed(ctx, authKeyID); err != nil {
+	if expectedUserID == 0 {
+		return store.ErrAuthorizationStateChanged
+	}
+	if err := s.auths.MarkPasswordPassed(ctx, authKeyID, expectedUserID); err != nil {
 		return err
 	}
-	// MarkPasswordPassed historically treats a missing row as an idempotent
-	// no-op. Account deletion can revoke the pending authorization between the
-	// password check and this write, so never let the Router cache/bind a session
-	// until the promoted authorization and its active user are revalidated.
-	if _, found, err := s.UserID(ctx, authKeyID); err != nil {
+	// Revalidate the active account after the CAS promotion before Router caches
+	// or binds the session. Account deletion can still linearize immediately
+	// after the update and must leave the caller unauthorized.
+	if userID, found, err := s.UserID(ctx, authKeyID); err != nil {
 		return err
-	} else if !found {
+	} else if !found || userID != expectedUserID {
 		return ErrSystemUserLoginForbidden
 	}
 	return nil

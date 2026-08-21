@@ -176,11 +176,11 @@ func (s *StarGiftLifecycleStore) deliverChannelStarGiftNotification(
 	ctx context.Context,
 	job channelStarGiftNotificationJob,
 ) (int, error) {
+	action := job.Action
 	fingerprint := sha256.Sum256([]byte(fmt.Sprintf(
 		"telesrv:channel-star-gift-notification:v1:%d:%d",
 		job.SavedGiftID, job.TargetUserID,
 	)))
-	action := job.Action
 	request := domain.SendPrivateTextRequest{
 		SenderUserID:           domain.OfficialSystemUserID,
 		RecipientUserID:        job.TargetUserID,
@@ -192,10 +192,46 @@ func (s *StarGiftLifecycleStore) deliverChannelStarGiftNotification(
 			StarGift: &action,
 		}},
 	}
+	var saved domain.SavedStarGift
 	sent, err := s.messages.sendPrivateTextWithHooks(ctx, request, privateSendTxHooks{
+		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
+			current, found, err := NewStarGiftStore(tx).GetByRef(ctx, domain.SavedStarGiftRef{
+				Owner: domain.Peer{Type: domain.PeerTypeChannel, ID: job.Action.PeerChannelID}, SavedID: job.Action.SavedID,
+			})
+			if err != nil {
+				return fmt.Errorf("refresh channel star gift notification: %w", err)
+			}
+			if !found || current.ID != job.SavedGiftID || current.GiftID != job.Action.GiftID {
+				return domain.ErrStarGiftNotFound
+			}
+			action = job.Action
+			separateUpgrade := action.PrepaidUpgradeHash != "" || action.UpgradeSeparate
+			action.PrepaidUpgradeHash = current.PrepaidUpgradeHash
+			action.PrepaidUpgrade = current.PrepaidUpgradeStars > 0
+			action.UpgradeStars = current.PrepaidUpgradeStars
+			action.UpgradeSeparate = separateUpgrade && action.PrepaidUpgrade
+			action.Converted = current.Converted
+			if !current.LifecycleStatus.Live() {
+				action.Saved = false
+			}
+			if current.UniqueGiftID != 0 || !current.LifecycleStatus.Live() {
+				action.CanUpgrade = false
+				action.PrepaidUpgradeHash = ""
+				action.UpgradeStars = 0
+			}
+			send.Media = &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
+				Kind:     domain.MessageServiceActionStarGift,
+				StarGift: &action,
+			}}
+			saved = current
+			return nil
+		},
 		after: func(ctx context.Context, tx pgx.Tx, sent domain.SendPrivateTextResult) error {
 			if sent.RecipientMessage.ID <= 0 {
 				return fmt.Errorf("channel star gift notification missing recipient box")
+			}
+			if !saved.LifecycleStatus.Live() {
+				return nil
 			}
 			return registerChannelNotificationMessageRef(ctx, tx, job.TargetUserID,
 				sent.RecipientMessage.ID, job.SavedGiftID)

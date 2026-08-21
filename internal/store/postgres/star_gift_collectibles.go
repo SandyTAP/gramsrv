@@ -474,7 +474,7 @@ func uniqueStarGiftQuery(predicate string) string {
 	return fmt.Sprintf(`
 SELECT u.id, u.gift_id, u.collectible_revision_id, u.source_saved_gift_id, u.title, u.slug, u.num,
        COALESCE(u.owner_peer_type,''), COALESCE(u.owner_peer_id,0), u.keep_original_details, u.created_at,
-       u.require_premium, u.resale_ton_only, u.theme_available, u.burned, u.crafted,
+	       u.require_premium, u.resale_ton_only, u.theme_available, u.burned, u.crafted, u.externalization_pending,
        u.owner_name, u.owner_address, u.gift_address,
        COALESCE(l.currency,''), COALESCE(l.amount,0), COALESCE(l.version,0),
        COALESCE(u.released_by_peer_type,''), COALESCE(u.released_by_peer_id,0),
@@ -517,7 +517,7 @@ func scanUniqueStarGift(row rowScanner) (domain.UniqueStarGift, error) {
 	if err := row.Scan(&unique.ID, &unique.GiftID, &unique.CollectibleRevisionID, &unique.SourceSavedGiftID,
 		&unique.Title, &unique.Slug, &unique.Num, &ownerType, &unique.Owner.ID, &unique.KeepOriginalDetails,
 		&unique.CreatedAt, &unique.RequirePremium, &unique.ResaleTonOnly, &unique.ThemeAvailable,
-		&unique.Burned, &unique.Crafted, &unique.OwnerName, &unique.OwnerAddress, &unique.GiftAddress,
+		&unique.Burned, &unique.Crafted, &unique.ExternalizationPending, &unique.OwnerName, &unique.OwnerAddress, &unique.GiftAddress,
 		&listingCurrency, &listingAmount, &unique.ResellVersion, &releasedByType, &unique.ReleasedBy.ID,
 		&unique.ValueAmount, &unique.ValueCurrency, &unique.ValueUSD,
 		&themePeerType, &unique.ThemePeer.ID, &hostPeerType, &unique.Host.ID,
@@ -790,8 +790,27 @@ func (s *StarGiftStore) SetPinned(ctx context.Context, owner domain.Peer, savedG
 		if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET pinned_order=0 WHERE owner_peer_type=$1 AND owner_peer_id=$2 AND pinned_order<>0`, string(owner.Type), owner.ID); err != nil {
 			return err
 		}
+		if owner.Type == domain.PeerTypeUser {
+			if _, err := tx.Exec(ctx, `UPDATE star_gift_ton_profile_links SET pinned_order=0,updated_at=now()
+WHERE host_user_id=$1 AND pinned_order<>0`, owner.ID); err != nil {
+				return err
+			}
+		}
 		for order, id := range ids {
-			if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET pinned_order=$2,unsaved=false WHERE id=$1`, id, order+1); err != nil {
+			var hosted bool
+			if owner.Type == domain.PeerTypeUser {
+				tag, err := tx.Exec(ctx, `UPDATE star_gift_ton_profile_links l SET pinned_order=$3,unsaved=false,updated_at=now()
+FROM peer_star_gifts p WHERE p.id=$1 AND p.unique_gift_id=l.unique_gift_id AND l.host_user_id=$2`, id, owner.ID, order+1)
+				if err != nil {
+					return err
+				}
+				hosted = tag.RowsAffected() == 1
+			}
+			if hosted {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET pinned_order=$2,unsaved=false
+WHERE id=$1 AND lifecycle_status='active' AND owner_peer_type=$3 AND owner_peer_id=$4`, id, order+1, string(owner.Type), owner.ID); err != nil {
 				return err
 			}
 		}
@@ -808,9 +827,14 @@ func validatePostgresCollectionGiftIDs(ctx context.Context, db sqlcgen.DBTX, own
 		return []int64{}, nil
 	}
 	rows, err := db.Query(ctx, `
-SELECT id FROM peer_star_gifts
-WHERE owner_peer_type=$1 AND owner_peer_id=$2 AND lifecycle_status='active' AND id=ANY($3::bigint[])
-FOR UPDATE`, string(owner.Type), owner.ID, ids)
+SELECT p.id FROM peer_star_gifts p
+LEFT JOIN unique_star_gifts u ON u.id=p.unique_gift_id
+LEFT JOIN star_gift_ton_profile_links l ON l.unique_gift_id=p.unique_gift_id
+WHERE p.id=ANY($3::bigint[]) AND (
+ (p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active') OR
+ ($1='user' AND p.lifecycle_status='exported' AND l.host_user_id=$2
+  AND u.host_peer_type='user' AND u.host_peer_id=$2 AND u.owner_address<>'' AND NOT u.burned))
+FOR UPDATE OF p`, string(owner.Type), owner.ID, ids)
 	if err != nil {
 		return nil, err
 	}

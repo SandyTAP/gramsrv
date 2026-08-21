@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Eye, ImageOff, Plus, RefreshCw, Search } from "lucide-react";
+import { ChevronLeft, ChevronRight, Eye, Files, ImageOff, Plus, RefreshCw, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { ActionButton } from "../components/ActionButton";
@@ -6,12 +6,13 @@ import { StickerDocumentPreview } from "../components/StickerDocumentPreview";
 import { Alert, Badge, EmptyRow, Metric, PageFrame, QueryPanel } from "../components/ui";
 import { useI18n } from "../i18n";
 import type { StickerSetRow } from "../types";
+import type { Navigate } from "../routing";
 import { CreateStickerSetModal } from "./CreateStickerSetModal";
 import { StickerSetPreviewModal } from "./StickerSetPreviewModal";
 
 type StickerPageSize = 10 | 20 | 50 | 100 | "all";
 
-export function StickerSetsPage({ kind }: { kind: "stickers" | "emoji" }) {
+export function StickerSetsPage({ kind, navigate }: { kind: "stickers" | "emoji"; navigate: Navigate }) {
   const { t } = useI18n();
   const [sets, setSets] = useState<StickerSetRow[]>([]);
   const [query, setQuery] = useState("");
@@ -23,6 +24,7 @@ export function StickerSetsPage({ kind }: { kind: "stickers" | "emoji" }) {
   const [titleDrafts, setTitleDrafts] = useState<Record<string, string>>({});
   const [previewSet, setPreviewSet] = useState<StickerSetRow | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [maxItems, setMaxItems] = useState(0);
 
   const pageTitle = kind === "emoji" ? t("emoji.pageTitle") : t("route.stickers");
   const eyebrow =
@@ -34,7 +36,9 @@ export function StickerSetsPage({ kind }: { kind: "stickers" | "emoji" }) {
     setBusy(true);
     setError("");
     try {
-      setSets((await api.stickerSets(kind)).rows ?? []);
+      const result = await api.stickerSets(kind);
+      setSets(result.rows ?? []);
+      setMaxItems(result.max_items ?? 0);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -83,6 +87,11 @@ export function StickerSetsPage({ kind }: { kind: "stickers" | "emoji" }) {
       eyebrow={eyebrow}
       actions={
         <>
+          {kind === "emoji" && (
+            <button className="btn" type="button" onClick={() => navigate("/emoji/documents")}>
+              <Files size={15} /> {t("emoji.documentCatalog")}
+            </button>
+          )}
           <button className="btn" type="button" onClick={() => load()} disabled={busy}>
             <RefreshCw size={15} /> {t("common.refresh")}
           </button>
@@ -230,7 +239,7 @@ export function StickerSetsPage({ kind }: { kind: "stickers" | "emoji" }) {
           </div>
         </div>
       )}
-      {previewSet && <StickerSetPreviewModal set={previewSet} onClose={() => setPreviewSet(null)} />}
+      {previewSet && <StickerSetPreviewModal set={previewSet} maxItems={maxItems} onClose={() => setPreviewSet(null)} />}
       {createOpen && <CreateStickerSetModal kind={kind} onClose={() => setCreateOpen(false)} onCreated={() => void load()} />}
     </PageFrame>
   );

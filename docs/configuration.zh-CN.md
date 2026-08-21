@@ -4,12 +4,12 @@
 
 本文覆盖 `internal/config` 实际读取的配置。服务入口现在使用按角色拆分的 YAML：
 `configs/edge.yaml`、`configs/core.yaml`、`configs/egress.yaml`、`configs/file.yaml`、
-`configs/sfu.yaml`、`configs/admin.yaml`。默认值和校验行为以 `internal/config` 下对应 role config Go 文件为权威来源。
+`configs/sfu.yaml`、`configs/admin.yaml`、`configs/ton.yaml`。默认值和校验行为以 `internal/config` 下对应 role config Go 文件为权威来源。
 所有配置修改都需要重启进程；telesrv 当前不支持配置热加载。
 
 ## 1. 加载方式、语法与优先级
 
-- `cmd/telesrv-edge|core|egress|file|sfu|admin` 默认分别读取 `configs/<role>.yaml`；也可用
+- `cmd/telesrv-edge|core|egress|file|sfu|admin|ton` 默认分别读取 `configs/<role>.yaml`；也可用
   `--config <path>` 或进程环境变量 `TELESRV_CONFIG=<path>` 指向自己的 YAML 文件。
 - YAML 使用严格解析：未知字段、非法结构、非法时长都会阻止启动。环境变量不再作为普通字段覆盖
   YAML；只在 YAML 字符串中通过 `${NAME}` 展开 secret、DSN 或部署平台注入值。
@@ -20,7 +20,7 @@
 - 不要提交真实密码、token、私有 DSN 或 TURN secret。生产环境应使用受保护的 service environment 或密钥管理系统。
 
 代码边界同样按角色拆分：`internal/config/edge_config.go`、`core_config.go`、`egress_config.go`、
-`file_config.go`、`sfu_config.go`、`admin_config.go` 分别定义对应 YAML schema、`Load<Role>()` 和 runtime config
+`file_config.go`、`sfu_config.go`、`admin_config.go`、`ton_config.go` 分别定义对应 YAML schema、`Load<Role>()` 和 runtime config
 类型。生产入口和 `internal/node/<role>` 不应再接收全局 `config.Config`；仓库不再提供对外的旧 env 文件入口。
 
 ## 2. MTProto 监听、传输与资源预算
@@ -129,7 +129,7 @@ live expanded buffer 释放后会归还进程内存，但不会返还该 frame �
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / 空 | 多服务客户端可选的 host-based 根，例如 `owpg://example.com`。配置后生成 `owpg://example.com/oauth`、`owpg://example.com/<username>` 等；只允许精确 `<custom-scheme>://<host>`，禁止端口、path、query、fragment。`TELESRV_PUBLIC_APP_SCHEME` 仍作为旧链接输入兼容。 |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | username 页面 Web 客户端入口，校验规则同 `TELESRV_PUBLIC_BASE_URL`。 |
 | `TELESRV_PUBLIC_APP_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | 公开落地页产品名；trim 后非空、无控制字符、最多 64 个 Unicode 字符。 |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / 空 | 只读 username/avatar/sticker/emoji/chatlist/collectible gift 落地页监听；空值关闭。生产应 loopback + nginx 精确反代；本地可在 `configs/core.yaml` 中启用 `127.0.0.1:2401`。 |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / 空 | username/avatar/sticker/emoji/chatlist/collectible gift 落地页、hash-only 申诉，以及 unique gift / channel revenue 短期令牌确认页监听；空值关闭，并使本地 gift export 与频道收益领取 fail-closed。公开落地页保持只读，只有精确 token POST 可提交对应 aggregate。生产应 loopback + nginx 精确反代并关闭 token 路径 access log；本地可在 `configs/core.yaml` 中启用 `127.0.0.1:2401`。 |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | 在 `TELESRV_PUBLIC_LINK_WEB_ADDR` 上挂载自建 Telegram Login/OIDC Provider；启用时必须同时配置该 listener 与下列全部密钥文件。 |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | 绝对 origin URL / `TELESRV_PUBLIC_BASE_URL` | discovery 与 token 使用的精确公开 issuer；默认必须 HTTPS，禁止 path、credentials、query、fragment。开启下一项后可直接配置任意 HTTP 域名/IP。 |
 | `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP` | bool / `false` | 开启后允许任意合法 HTTP issuer、BotFather Web origin、redirect URI 和 native HTTP callback，不限制为 loopback，也不限制 IP 网段或端口。关闭时这些 Web URL 仍必须 HTTPS。 |
@@ -589,19 +589,67 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_STARS_STARTING_GRANT` | int64 / `1000` | 对所有账号幂等惰性授予的 Stars 起始余额；`0` 关闭自动赠送。 |
 | `TELESRV_PREMIUM_SWEEP_INTERVAL` | duration / `1m` | 过期 Premium 清理/推送周期；读取路径独立即时派生到期状态。 |
 | `TELESRV_PREMIUM_SWEEP_BATCH` | int / `500` | 单次 sweep 最大处理行数。 |
-| `TELESRV_STARGIFT_SWEEP_INTERVAL` | duration / `15s` | Star Gift 报价/竞拍本地生命周期清扫周期；不会连接区块链。 |
-| `TELESRV_STARGIFT_SWEEP_BATCH` | int / `1000` | 单次礼物生命周期清扫最多处理的报价、竞拍与 outbox 工作量。 |
-| `TELESRV_STARGIFT_TON_STARTING_GRANT` | int64 / `10000000000` | 每个用户首次访问 telesrv 内部 TON 账本时幂等授予的 nanoton；`0` 关闭赠送。它不是链上资产。 |
-| `TELESRV_STARGIFT_TRANSFER_STARS` | int64 / `25` | collectible 转赠费用；设为 `0` 时使用免费转赠 RPC。 |
-| `TELESRV_STARGIFT_DROP_DETAILS_STARS` | int64 / `25` | 移除 collectible 原始发送者/附言信息所需 Stars。 |
-| `TELESRV_STARGIFT_OFFER_MIN_STARS` | int / `1` | collectible 签发时固化的用户持有礼物最低 Stars 报价；`0` 不开放报价入口。 |
-| `TELESRV_STARGIFT_STARS_PROCEEDS_PERMILLE` | int / `1000` | Stars 成交时卖方实收比例（千分比）；差额作为平台佣金写入成交记录。 |
-| `TELESRV_STARGIFT_TON_PROCEEDS_PERMILLE` | int / `1000` | 内部 TON 成交时卖方实收比例（千分比）；只影响本地账本。 |
-| `TELESRV_STARGIFT_EXPORT_DELAY` | duration / `0s` | collectible 签发时固化到 `can_export_at` 的等待期。 |
-| `TELESRV_STARGIFT_TRANSFER_DELAY` | duration / `0s` | 签发时固化到 `can_transfer_at` 的等待期。 |
-| `TELESRV_STARGIFT_RESELL_DELAY` | duration / `0s` | 签发时固化到 `can_resell_at` 的等待期。 |
-| `TELESRV_STARGIFT_CRAFT_DELAY` | duration / `0s` | 签发时固化到 `can_craft_at` 的等待期；可 Craft 礼物即使为 `0s` 也写升级时间这一正数能力边界，0 只表示不具备 Craft 能力或已终结。 |
-| `TELESRV_STARGIFT_CRAFT_CHANCE_PERMILLE` | int / `250` | 每份输入礼物贡献的本地合成成功概率，累计上限 1000‰。 |
+| `star_gifts.sweep_interval` | duration / `15s` | Core 的 Star Gift 报价/竞拍本地生命周期清扫周期。 |
+| `star_gifts.sweep_batch` | int / `1000` | 单次礼物生命周期清扫最多处理的报价、竞拍与 outbox 工作量。 |
+| `star_gifts.ton_starting_grant` | int64 / `10000000000` | 每个用户首次访问 telesrv 内部 TON 账本时幂等授予的 nanoton；`0` 关闭赠送。它不是链上资产。 |
+| `star_gifts.transfer_stars` | int64 / `25` | collectible 转赠费用；设为 `0` 时使用免费转赠 RPC。 |
+| `star_gifts.drop_original_details_stars` | int64 / `25` | 移除 collectible 原始发送者/附言信息所需 Stars。 |
+| `star_gifts.offer_min_stars` | int / `1` | collectible 签发时固化的用户持有礼物最低 Stars 报价；`0` 不开放报价入口。 |
+| `star_gifts.stars_proceeds_permille` | int / `1000` | Stars 成交时卖方实收比例（千分比）；差额作为平台佣金写入成交记录。 |
+| `star_gifts.ton_proceeds_permille` | int / `1000` | 内部 TON 成交时卖方实收比例（千分比）；只影响本地账本。 |
+| `star_gifts.export_delay` | duration / `0s` | collectible 签发时固化到 `can_export_at` 的等待期。 |
+| `star_gifts.transfer_delay` | duration / `0s` | 签发时固化到 `can_transfer_at` 的等待期。 |
+| `star_gifts.resell_delay` | duration / `0s` | 签发时固化到 `can_resell_at` 的等待期。 |
+| `star_gifts.craft_delay` | duration / `0s` | 签发时固化到 `can_craft_at` 的等待期；可 Craft 礼物即使为 `0s` 也写升级时间这一正数能力边界，0 只表示不具备 Craft 能力或已终结。 |
+| `star_gifts.craft_chance_permille` | int / `250` | 每份输入礼物贡献的本地合成成功概率，累计上限 1000‰。 |
+| `star_gifts.export.mode` | `local` / `ton` / `disabled`; 默认 `local` | `local` 保持现有 same-origin 礼物导出；`disabled` 只关闭礼物导出；`ton` 交给独立 TON worker。三个模式都不改变频道 Stars/内部 TON 收益领取 provider。主网 worker 未满足 admission 时必须 fail-closed，不能回退 local。 |
+
+Core 的 `star_gifts.export.ton` 仅在 `mode: ton` 时启用正式链路：
+
+| YAML 参数 | 类型 / 代码默认值 | 说明与约束 |
+|---|---|---|
+| `network` | `mainnet` / `testnet`; 默认 `mainnet` | Core intent、TON Proof 和 worker 必须使用同一网络；生产必须显式填写。 |
+| `collection_address` | string / 必填 | 固定 TEP-62 collection 地址，必须与 worker 配置一致。 |
+| `collection_code_hash` | 32-byte hex/Base64 / 必填 | collection code hash；Core 会与 worker 链上预检后写入的 durable admission 比较。 |
+| `mint_abi` | `basic-collection-v1` / 必填 | TON reference collection 的单笔 mint ABI（opcode `0x00000001`）。TEP-62 不规定 mint opcode，其他值启动失败。 |
+| `initial_item_index` | uint64 十进制字符串 / 必填 | telesrv 分配 item index 的起点；上线后不得回退或复用。 |
+| `proof_domain` | hostname / 必填 | TON Connect proof domain；必须与公开 Claim/Export Web 域名一致。 |
+| `capability_secret_file` | path / 必填 | 文件内容为 Base64，解码后必须为 32--64 bytes；只用于 capability HMAC，不得与 bot token 或 relayer 助记词复用。 |
+| `allow_user_ids` | positive int64 sequence / 空 | 空表示允许所有合格 user 创建新 TON intent；非空是主网灰度白名单。重复、0 或负值使 Core 启动失败。它不停止已有 intent 的确认/finalize/owner sync。 |
+| `ttl` | duration / `30m` | Export capability 有效期，范围 `5m..24h`。 |
+| `challenge_ttl` | duration / `5m` | Export/Claim TON Proof challenge 有效期，范围 `1m..10m`。 |
+| `finalizer.batch` | int / `20` | Core 每轮最多领取的 finalize/sync-owner job，范围 `1..100`。 |
+| `finalizer.poll_interval` | duration / `2s` | Core finalizer 轮询周期，必须为正。 |
+| `finalizer.lease_timeout` | duration / `30s` | Core job lease，范围 `10s..1h`。 |
+| `finalizer.request_timeout` | duration / `10s` | 单 job 超时，至少 `1s` 且短于 lease。 |
+| `finalizer.retry_delay` | duration / `5s` | 可重试失败的退避，必须为正。 |
+| `claim.enabled` | bool / `false` | 启用 `/ton-gift/claim` Mini App。 |
+| `claim.bot_token_file` | path / claim 启用时必填 | 文件必须只有一个当前 active local bot token。Core 会校验 bot ID/secret，并幂等设置该 bot 的 main/side/attach menu app；不匹配则启动失败。 |
+| `claim.init_data_ttl` | duration / `15m` | Telegram Mini App `tgWebAppData` 最大年龄，范围 `1m..24h`。 |
+
+独立 worker 使用 `cmd/telesrv-ton --config configs/ton.yaml`：
+
+| YAML 参数 | 类型 / 代码默认值 | 说明与约束 |
+|---|---|---|
+| `ton.network` | `mainnet` / `testnet`; 必填 | 必须与 Core intent 网络一致。 |
+| `ton.lite_servers[]` | address + public_key; 至少 1 个 | 固定 lite endpoint 与公钥；重复或空值使启动失败。 |
+| `ton.trusted_block` | masterchain block ID | 必须提供 `workchain: -1`、非零 shard/seqno、root hash 和 file hash。 |
+| `ton.collection.address` / `code_hash` | string / 必填 | 启动 preflight 校验 collection active 和 code hash；每个 job 再校验 export collection。 |
+| `ton.collection.mint_abi` | `basic-collection-v1` / 必填 | 与 Core、export 和 durable admission 一致的固定 mint payload ABI。 |
+| `ton.collection.initial_item_index` | uint64 十进制字符串 / 必填 | 首次上线必须等于链上 `next_item_index`，之后作为不可变准入基线；实际编号只在 wallet proof 成功时分配。 |
+| `ton.relayer.mnemonic_file` | path / mint 启用时必填 | 只允许 24-word v4r2 relayer，文件不得进入仓库。read-only worker 可省略。 |
+| `ton.relayer.min_balance` | TON decimal / `1` | mint preflight 的余额保留线，必须大于 0。 |
+| `ton.relayer.message_ttl` | duration / `15m` | 签名外部消息有效期，至少为 request timeout 两倍且不超过 `1h`。 |
+| `ton.mint.enabled` | bool / `false` | `false` 撤销新 intent/proof 的 durable admission并停止 mint job；已分配 index 的 resolve、confirm 和 reconcile owner 仍可继续。这是事故停写开关。 |
+| `ton.mint.send_amount` / `forward_amount` | TON decimal / `0.05`、`0.01` | collection 消息和 item forward 金额，最多 9 位小数；send amount 必须大于 0。 |
+| `ton.mint.finality_depth` | int / `12` | masterchain finality 深度，范围 `1..1000`。 |
+| `ton.worker.batch` | int / `10` | 每轮 job 数，范围 `1..100`。 |
+| `ton.worker.poll_interval` | duration / `2s` | 范围 `100ms..1m`。 |
+| `ton.worker.lease_timeout` | duration / `2m` | 范围 `10s..1h`。 |
+| `ton.worker.request_timeout` | duration / `90s` | 至少 `1s` 且短于 lease。 |
+
+完整无密钥样例见 `configs/examples/core.ton-mainnet.yaml` 和 `configs/examples/ton.mainnet.yaml`。生产启用前必须完成
+固定 checkpoint/code hash、testnet、停写、单用户 canary、对账与回滚门禁，不能直接按样例开启 mint。
 
 ### 本地账号评分与 collectible username
 
@@ -707,4 +755,4 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 
 ## 12. 生产部署最低检查清单
 
-生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。
+生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。启用 TON Star Gift 时还必须完成固定 lite server/checkpoint/collection code hash、独立 capability/bot/relayer secret、单用户 allowlist、`mint.enabled: false` 预检，以及完整的 testnet/canary/回滚门禁。

@@ -20,6 +20,12 @@ import (
 
 const defaultCountryCode = "CN"
 
+const (
+	StarGiftExportModeLocal    = "local"
+	StarGiftExportModeTON      = "ton"
+	StarGiftExportModeDisabled = "disabled"
+)
+
 // Config 是 telesrv 的运行配置。
 type Config struct {
 	// ListenAddr 是 MTProto TCP 监听地址。
@@ -503,17 +509,35 @@ type Config struct {
 	// durable notification/delivery outboxes. It is entirely server-local.
 	StarGiftSweepInterval time.Duration
 	// StarGiftSweepBatch bounds rows/aggregates claimed by one sweep.
-	StarGiftSweepBatch               int
-	StarGiftTransferStars            int64
-	StarGiftDropOriginalDetailsStars int64
-	StarGiftOfferMinStars            int
-	StarGiftStarsProceedsPermille    int
-	StarGiftTONProceedsPermille      int
-	StarGiftExportDelay              time.Duration
-	StarGiftTransferDelay            time.Duration
-	StarGiftResellDelay              time.Duration
-	StarGiftCraftDelay               time.Duration
-	StarGiftCraftChancePermille      int
+	StarGiftSweepBatch                 int
+	StarGiftTransferStars              int64
+	StarGiftDropOriginalDetailsStars   int64
+	StarGiftOfferMinStars              int
+	StarGiftStarsProceedsPermille      int
+	StarGiftTONProceedsPermille        int
+	StarGiftExportDelay                time.Duration
+	StarGiftTransferDelay              time.Duration
+	StarGiftResellDelay                time.Duration
+	StarGiftCraftDelay                 time.Duration
+	StarGiftCraftChancePermille        int
+	StarGiftExportMode                 string
+	StarGiftTONNetwork                 string
+	StarGiftTONCollectionAddress       string
+	StarGiftTONCollectionCodeHash      string
+	StarGiftTONMintABI                 string
+	StarGiftTONInitialItemIndex        string
+	StarGiftTONProofDomain             string
+	StarGiftTONCapabilitySecretFile    string
+	StarGiftTONExportTTL               time.Duration
+	StarGiftTONChallengeTTL            time.Duration
+	StarGiftTONFinalizerBatch          int
+	StarGiftTONFinalizerPollInterval   time.Duration
+	StarGiftTONFinalizerLeaseTimeout   time.Duration
+	StarGiftTONFinalizerRequestTimeout time.Duration
+	StarGiftTONFinalizerRetryDelay     time.Duration
+	StarGiftTONClaimEnabled            bool
+	StarGiftTONClaimBotTokenFile       string
+	StarGiftTONClaimInitDataTTL        time.Duration
 
 	// RatingEnabled controls the local admin-only composite account rating.
 	// Disabled keeps every local projection empty and refuses rating writes; no
@@ -1052,27 +1076,45 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		CallSignalingRate:      envIntOr("TELESRV_CALL_SIGNALING_RATE", 50),
 		CallExpiryInterval:     envDurationOr("TELESRV_CALL_EXPIRY_INTERVAL", time.Second),
 
-		PremiumGrantMonths:               envIntOr("TELESRV_PREMIUM_GRANT_MONTHS", 3),
-		PremiumBotUsername:               premiumBotUsername,
-		PremiumBotUserID:                 premiumBotUserID,
-		PremiumPlans:                     premiumPlans,
-		PasskeyRPID:                      envOr("TELESRV_PASSKEY_RP_ID", "telesrv.net"),
-		PasskeyAllowedOrigins:            envListOr("TELESRV_PASSKEY_ALLOWED_ORIGINS", nil),
-		StarsStartingGrant:               int64(envIntOr("TELESRV_STARS_STARTING_GRANT", 1000)),
-		PremiumSweepInterval:             envDurationOr("TELESRV_PREMIUM_SWEEP_INTERVAL", time.Minute),
-		PremiumSweepBatch:                envIntOr("TELESRV_PREMIUM_SWEEP_BATCH", 500),
-		StarGiftSweepInterval:            envDurationOr("TELESRV_STARGIFT_SWEEP_INTERVAL", 15*time.Second),
-		StarGiftSweepBatch:               envIntOr("TELESRV_STARGIFT_SWEEP_BATCH", 1000),
-		StarGiftTransferStars:            int64(envIntOr("TELESRV_STARGIFT_TRANSFER_STARS", 25)),
-		StarGiftDropOriginalDetailsStars: int64(envIntOr("TELESRV_STARGIFT_DROP_DETAILS_STARS", 25)),
-		StarGiftOfferMinStars:            envIntOr("TELESRV_STARGIFT_OFFER_MIN_STARS", 1),
-		StarGiftStarsProceedsPermille:    envIntOr("TELESRV_STARGIFT_STARS_PROCEEDS_PERMILLE", 1000),
-		StarGiftTONProceedsPermille:      envIntOr("TELESRV_STARGIFT_TON_PROCEEDS_PERMILLE", 1000),
-		StarGiftExportDelay:              envDurationOr("TELESRV_STARGIFT_EXPORT_DELAY", 0),
-		StarGiftTransferDelay:            envDurationOr("TELESRV_STARGIFT_TRANSFER_DELAY", 0),
-		StarGiftResellDelay:              envDurationOr("TELESRV_STARGIFT_RESELL_DELAY", 0),
-		StarGiftCraftDelay:               envDurationOr("TELESRV_STARGIFT_CRAFT_DELAY", 0),
-		StarGiftCraftChancePermille:      envIntOr("TELESRV_STARGIFT_CRAFT_CHANCE_PERMILLE", 250),
+		PremiumGrantMonths:                 envIntOr("TELESRV_PREMIUM_GRANT_MONTHS", 3),
+		PremiumBotUsername:                 premiumBotUsername,
+		PremiumBotUserID:                   premiumBotUserID,
+		PremiumPlans:                       premiumPlans,
+		PasskeyRPID:                        envOr("TELESRV_PASSKEY_RP_ID", "telesrv.net"),
+		PasskeyAllowedOrigins:              envListOr("TELESRV_PASSKEY_ALLOWED_ORIGINS", nil),
+		StarsStartingGrant:                 int64(envIntOr("TELESRV_STARS_STARTING_GRANT", 1000)),
+		PremiumSweepInterval:               envDurationOr("TELESRV_PREMIUM_SWEEP_INTERVAL", time.Minute),
+		PremiumSweepBatch:                  envIntOr("TELESRV_PREMIUM_SWEEP_BATCH", 500),
+		StarGiftSweepInterval:              envDurationOr("TELESRV_STARGIFT_SWEEP_INTERVAL", 15*time.Second),
+		StarGiftSweepBatch:                 envIntOr("TELESRV_STARGIFT_SWEEP_BATCH", 1000),
+		StarGiftTransferStars:              int64(envIntOr("TELESRV_STARGIFT_TRANSFER_STARS", 25)),
+		StarGiftDropOriginalDetailsStars:   int64(envIntOr("TELESRV_STARGIFT_DROP_DETAILS_STARS", 25)),
+		StarGiftOfferMinStars:              envIntOr("TELESRV_STARGIFT_OFFER_MIN_STARS", 1),
+		StarGiftStarsProceedsPermille:      envIntOr("TELESRV_STARGIFT_STARS_PROCEEDS_PERMILLE", 1000),
+		StarGiftTONProceedsPermille:        envIntOr("TELESRV_STARGIFT_TON_PROCEEDS_PERMILLE", 1000),
+		StarGiftExportDelay:                envDurationOr("TELESRV_STARGIFT_EXPORT_DELAY", 0),
+		StarGiftTransferDelay:              envDurationOr("TELESRV_STARGIFT_TRANSFER_DELAY", 0),
+		StarGiftResellDelay:                envDurationOr("TELESRV_STARGIFT_RESELL_DELAY", 0),
+		StarGiftCraftDelay:                 envDurationOr("TELESRV_STARGIFT_CRAFT_DELAY", 0),
+		StarGiftCraftChancePermille:        envIntOr("TELESRV_STARGIFT_CRAFT_CHANCE_PERMILLE", 250),
+		StarGiftExportMode:                 strings.ToLower(strings.TrimSpace(envOr("TELESRV_STARGIFT_EXPORT_MODE", StarGiftExportModeLocal))),
+		StarGiftTONNetwork:                 strings.ToLower(strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_NETWORK", TONNetworkMainnet))),
+		StarGiftTONCollectionAddress:       strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_COLLECTION_ADDRESS", "")),
+		StarGiftTONCollectionCodeHash:      strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_COLLECTION_CODE_HASH", "")),
+		StarGiftTONMintABI:                 strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_MINT_ABI", "")),
+		StarGiftTONInitialItemIndex:        strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_INITIAL_ITEM_INDEX", "")),
+		StarGiftTONProofDomain:             strings.ToLower(strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_PROOF_DOMAIN", ""))),
+		StarGiftTONCapabilitySecretFile:    strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_CAPABILITY_SECRET_FILE", "")),
+		StarGiftTONExportTTL:               envDurationOr("TELESRV_STARGIFT_TON_EXPORT_TTL", 30*time.Minute),
+		StarGiftTONChallengeTTL:            envDurationOr("TELESRV_STARGIFT_TON_CHALLENGE_TTL", 5*time.Minute),
+		StarGiftTONFinalizerBatch:          envIntOr("TELESRV_STARGIFT_TON_FINALIZER_BATCH", 20),
+		StarGiftTONFinalizerPollInterval:   envDurationOr("TELESRV_STARGIFT_TON_FINALIZER_POLL_INTERVAL", 2*time.Second),
+		StarGiftTONFinalizerLeaseTimeout:   envDurationOr("TELESRV_STARGIFT_TON_FINALIZER_LEASE_TIMEOUT", 30*time.Second),
+		StarGiftTONFinalizerRequestTimeout: envDurationOr("TELESRV_STARGIFT_TON_FINALIZER_REQUEST_TIMEOUT", 10*time.Second),
+		StarGiftTONFinalizerRetryDelay:     envDurationOr("TELESRV_STARGIFT_TON_FINALIZER_RETRY_DELAY", 5*time.Second),
+		StarGiftTONClaimEnabled:            envBoolOr("TELESRV_STARGIFT_TON_CLAIM_ENABLED", false),
+		StarGiftTONClaimBotTokenFile:       strings.TrimSpace(envOr("TELESRV_STARGIFT_TON_CLAIM_BOT_TOKEN_FILE", "")),
+		StarGiftTONClaimInitDataTTL:        envDurationOr("TELESRV_STARGIFT_TON_CLAIM_INIT_DATA_TTL", 15*time.Minute),
 
 		RatingEnabled:           envBoolOr("TELESRV_RATING_ENABLED", true),
 		RatingPendingDelay:      envDurationOr("TELESRV_RATING_PENDING_DELAY", 24*time.Hour),
@@ -1545,6 +1587,40 @@ func validateTelegramLoginConfig(cfg Config) error {
 }
 
 func validateStarGiftConfig(cfg Config) error {
+	switch cfg.StarGiftExportMode {
+	case "", StarGiftExportModeLocal, StarGiftExportModeTON, StarGiftExportModeDisabled:
+	default:
+		return fmt.Errorf("TELESRV_STARGIFT_EXPORT_MODE must be local, ton or disabled")
+	}
+	if cfg.StarGiftExportMode == StarGiftExportModeTON {
+		if cfg.StarGiftTONNetwork != TONNetworkMainnet && cfg.StarGiftTONNetwork != TONNetworkTestnet {
+			return fmt.Errorf("TELESRV_STARGIFT_TON_NETWORK must be mainnet or testnet")
+		}
+		if cfg.StarGiftTONCollectionAddress == "" || cfg.StarGiftTONCollectionCodeHash == "" ||
+			cfg.StarGiftTONMintABI != "basic-collection-v1" || cfg.StarGiftTONInitialItemIndex == "" ||
+			cfg.StarGiftTONProofDomain == "" || cfg.StarGiftTONCapabilitySecretFile == "" {
+			return fmt.Errorf("TON Star Gift export collection, code hash, basic-collection-v1 mint ABI, initial item index, proof domain and capability secret file are required")
+		}
+		if !validDecimalUint64(cfg.StarGiftTONInitialItemIndex) {
+			return fmt.Errorf("TELESRV_STARGIFT_TON_INITIAL_ITEM_INDEX must be a uint64 decimal")
+		}
+		if cfg.StarGiftTONExportTTL < 5*time.Minute || cfg.StarGiftTONExportTTL > 24*time.Hour ||
+			cfg.StarGiftTONChallengeTTL < time.Minute || cfg.StarGiftTONChallengeTTL > 10*time.Minute {
+			return fmt.Errorf("TON Star Gift export/challenge TTL is outside the admitted range")
+		}
+		if cfg.StarGiftTONFinalizerBatch < 1 || cfg.StarGiftTONFinalizerBatch > 100 ||
+			cfg.StarGiftTONFinalizerPollInterval <= 0 || cfg.StarGiftTONFinalizerLeaseTimeout < 10*time.Second ||
+			cfg.StarGiftTONFinalizerLeaseTimeout > time.Hour || cfg.StarGiftTONFinalizerRequestTimeout < time.Second ||
+			cfg.StarGiftTONFinalizerRequestTimeout >= cfg.StarGiftTONFinalizerLeaseTimeout || cfg.StarGiftTONFinalizerRetryDelay <= 0 {
+			return fmt.Errorf("TON Star Gift finalizer settings are outside the admitted range")
+		}
+		if cfg.StarGiftTONClaimEnabled && cfg.StarGiftTONClaimBotTokenFile == "" {
+			return fmt.Errorf("TON Star Gift claim bot token file is required when claim is enabled")
+		}
+		if cfg.StarGiftTONClaimInitDataTTL < time.Minute || cfg.StarGiftTONClaimInitDataTTL > 24*time.Hour {
+			return fmt.Errorf("TON Star Gift claim init-data TTL must be 1m..24h")
+		}
+	}
 	if cfg.StarGiftSweepInterval <= 0 || cfg.StarGiftSweepBatch <= 0 || cfg.StarGiftSweepBatch > 10000 {
 		return fmt.Errorf("TELESRV_STARGIFT_SWEEP_INTERVAL must be positive and TELESRV_STARGIFT_SWEEP_BATCH must be 1..10000")
 	}
@@ -2103,6 +2179,15 @@ func (e envSource) envFloatOr(key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+func validDecimalUint64(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 20 {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
 }
 
 // envDurationOr 读取 time.ParseDuration 格式（如 "200ms"、"30s"）的时长配置；解析失败回退默认值。

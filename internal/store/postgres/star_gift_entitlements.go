@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store/postgres/sqlcgen"
 )
 
 func (s *StarGiftLifecycleStore) PrepaidUpgradeTarget(ctx context.Context, owner domain.Peer, hash string) (domain.SavedStarGift, int64, error) {
@@ -73,6 +74,13 @@ func (s *StarGiftLifecycleStore) PrepayStarGiftUpgrade(ctx context.Context, req 
 	if err != nil || price != req.ChargeStars {
 		return domain.StarGiftPrepaidUpgradeResult{}, domain.ErrStarGiftCollectibleUnavailable
 	}
+	var channelMutationUserIDs []int64
+	if req.Owner.Type == domain.PeerTypeChannel {
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, target.ID, req.Owner.ID)
+		if err != nil {
+			return domain.StarGiftPrepaidUpgradeResult{}, err
+		}
+	}
 	fingerprint := sha256.Sum256([]byte(fmt.Sprintf("telesrv:star-gift-prepay:v2:%d:%s:%d:%s:%d:%d", req.PayerUserID,
 		req.Owner.Type, req.Owner.ID, req.Hash, req.FormID, req.ChargeStars)))
 	placeholder := &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
@@ -86,7 +94,7 @@ func (s *StarGiftLifecycleStore) PrepayStarGiftUpgrade(ctx context.Context, req 
 		OriginAuthKeyID: req.OriginAuthKeyID, OriginSessionID: req.OriginSessionID, OriginUserID: req.PayerUserID,
 		IdempotencyFingerprint: fingerprint[:]}
 	var result domain.StarGiftPrepaidUpgradeResult
-	hooks := privateSendTxHooks{before: func(ctx context.Context, tx pgx.Tx, messageReq *domain.SendPrivateTextRequest) error {
+	hooks := privateSendTxHooks{lockUserIDs: channelMutationUserIDs, before: func(ctx context.Context, tx pgx.Tx, messageReq *domain.SendPrivateTextRequest) error {
 		locked, err := lockSavedStarGiftByPrepayHash(ctx, tx, req.Owner, req.Hash)
 		if err != nil || locked.ID != target.ID || !locked.LifecycleStatus.Live() || locked.UniqueGiftID != 0 || locked.PrepaidUpgradeStars != 0 {
 			return domain.ErrStarGiftCollectibleUnavailable
@@ -145,16 +153,45 @@ VALUES($1,$2,$3,$4,$5,$6,$7)`, req.PayerUserID, req.CommandKey, locked.ID, req.F
 			if sent.SenderMessage.OwnerUserID == req.Owner.ID {
 				ownerMessageID = sent.SenderMessage.ID
 			}
-			return registerUserStarGiftMessageRef(ctx, tx, req.Owner.ID, ownerMessageID, result.Saved.ID, 0)
+			if err := registerUserStarGiftMessageRef(ctx, tx, req.Owner.ID, ownerMessageID, result.Saved.ID, 0); err != nil {
+				return err
+			}
+			edits, err := s.consumePrivateStarGiftPrepayHashTx(ctx, tx, req, result.Saved)
+			if err != nil {
+				return err
+			}
+			result.SourceEdits = edits
+			return nil
 		}
 		notificationMessageID := sent.RecipientMessage.ID
 		if notificationMessageID <= 0 {
 			return fmt.Errorf("prepaid channel gift notification missing recipient box")
 		}
+		channelSourceRefs, err := listChannelStarGiftViewerMessageRefs(ctx, tx, result.Saved.ID, req.Owner.ID)
+		if err != nil {
+			return err
+		}
 		if err := registerViewerStarGiftMessageRef(ctx, tx, req.PayerUserID, notificationMessageID,
 			result.Saved.ID, req.Owner, 0); err != nil {
 			return err
 		}
+		edits, err := editChannelStarGiftViewerMessagesTx(ctx, tx, s.messages, channelSourceRefs,
+			result.Saved, req.Date, req.PayerUserID, req.OriginAuthKeyID, req.OriginSessionID,
+			func(action *domain.MessageStarGiftAction, _ int64) error {
+				if action.PrepaidUpgradeHash != "" && action.PrepaidUpgradeHash != req.Hash {
+					return fmt.Errorf("channel star gift viewer box has mismatched prepay hash")
+				}
+				action.PrepaidUpgradeHash = ""
+				action.PrepaidUpgrade = true
+				action.UpgradeSeparate = true
+				action.UpgradeStars = req.ChargeStars
+				action.CanUpgrade = true
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+		result.SourceEdits = edits
 		action := messageReq.Media.ServiceAction.StarGift
 		return NewChannelStore(tx).appendStarGiftAdminLogTx(ctx, tx, req.Owner.ID, req.PayerUserID,
 			result.Saved.SavedID, req.Date, domain.ChannelMessageAction{Type: domain.ChannelActionStarGift, StarGift: action})
@@ -174,6 +211,104 @@ VALUES($1,$2,$3,$4,$5,$6,$7)`, req.PayerUserID, req.CommandKey, locked.ID, req.F
 		return replay, replayErr
 	}
 	return result, nil
+}
+
+// consumePrivateStarGiftPrepayHashTx retires the one-time payment capability
+// from the original sender's box. The receiver's can_upgrade capability is a
+// separate owner projection and remains unchanged until the gift is minted.
+func (s *StarGiftLifecycleStore) consumePrivateStarGiftPrepayHashTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	req domain.StarGiftPrepaidUpgradeRequest,
+	saved domain.SavedStarGift,
+) ([]domain.EditedMessageForUser, error) {
+	if saved.Owner.Type != domain.PeerTypeUser || saved.Owner.ID <= 0 || saved.MsgID <= 0 ||
+		saved.FromUserID != req.PayerUserID || req.PayerUserID == saved.Owner.ID {
+		return nil, nil
+	}
+
+	var messageSenderID, privateMessageID int64
+	err := tx.QueryRow(ctx, `
+SELECT message_sender_id,private_message_id
+FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, saved.Owner.ID, saved.MsgID).
+		Scan(&messageSenderID, &privateMessageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load prepaid star gift source message: %w", err)
+	}
+
+	q := sqlcgen.New(tx)
+	boxes, err := q.ListVisibleMessageBoxesByPrivateMessage(ctx, sqlcgen.ListVisibleMessageBoxesByPrivateMessageParams{
+		OwnerUserIds:     privateMessageOwnerIDs(saved.Owner.ID, req.PayerUserID),
+		MessageSenderID:  messageSenderID,
+		PrivateMessageID: privateMessageID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("lock prepaid star gift source boxes: %w", err)
+	}
+	for _, box := range boxes {
+		if box.OwnerUserID != req.PayerUserID {
+			continue
+		}
+		media, err := decodeMessageMedia(box.MediaJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode prepaid star gift sender box: %w", err)
+		}
+		action := privateStarGiftAction(media)
+		if action == nil || action.GiftID != saved.GiftID || action.CanUpgrade {
+			return nil, fmt.Errorf("prepaid star gift sender box has invalid projection")
+		}
+		if action.PrepaidUpgradeHash == "" {
+			return nil, nil
+		}
+		if action.PrepaidUpgradeHash != req.Hash {
+			return nil, fmt.Errorf("prepaid star gift sender box has mismatched hash")
+		}
+		action.PrepaidUpgradeHash = ""
+		mediaJSON, err := encodeMessageMedia(media)
+		if err != nil {
+			return nil, fmt.Errorf("encode prepaid star gift sender edit: %w", err)
+		}
+		pts, err := s.messages.reservePts(ctx, tx, req.PayerUserID)
+		if err != nil {
+			return nil, fmt.Errorf("allocate prepaid star gift sender edit pts: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `
+UPDATE message_boxes SET media=$3,pts=$4
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, req.PayerUserID, box.BoxID, mediaJSON, int32(pts))
+		if err != nil {
+			return nil, fmt.Errorf("update prepaid star gift sender box: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, fmt.Errorf("update prepaid star gift sender box lost row")
+		}
+		message, err := messageFromVisibleBoxRow(box)
+		if err != nil {
+			return nil, err
+		}
+		message.Media = media
+		message.Pts = pts
+		if err := replaceMessageBoxMediaIndexTx(ctx, tx, message.OwnerUserID, message.Peer.ID,
+			message.ID, message.Date, message.Media, message.Entities); err != nil {
+			return nil, err
+		}
+		event := domain.UpdateEvent{UserID: req.PayerUserID, Type: domain.UpdateEventEditMessage,
+			Pts: pts, PtsCount: 1, Date: req.Date, Message: message}
+		if err := appendUserUpdateEvent(ctx, tx, q, req.PayerUserID, event); err != nil {
+			return nil, fmt.Errorf("append prepaid star gift sender edit event: %w", err)
+		}
+		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			TargetUserID: req.PayerUserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
+			ExcludeAuthKeyID: authKeyIDToInt64(req.OriginAuthKeyID), ExcludeSessionID: req.OriginSessionID,
+		}); err != nil {
+			return nil, fmt.Errorf("enqueue prepaid star gift sender edit: %w", err)
+		}
+		return []domain.EditedMessageForUser{{UserID: req.PayerUserID, Message: message, Event: event}}, nil
+	}
+	return nil, nil
 }
 
 func lockSavedStarGiftByPrepayHash(ctx context.Context, tx pgx.Tx, owner domain.Peer, hash string) (domain.SavedStarGift, error) {

@@ -75,14 +75,45 @@ func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain
 		return domain.StarGiftConvertResult{}, domain.ErrStarGiftOwnerInvalid
 	}
 
+	var channelMutationUserIDs []int64
+	var expectedSavedGiftID int64
+	if req.Ref.Owner.Type == domain.PeerTypeChannel {
+		saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref)
+		if err != nil {
+			return domain.StarGiftConvertResult{}, err
+		}
+		if !found {
+			return domain.StarGiftConvertResult{}, domain.ErrStarGiftNotFound
+		}
+		expectedSavedGiftID = saved.ID
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, saved.ID, req.Ref.Owner.ID)
+		if err != nil {
+			return domain.StarGiftConvertResult{}, err
+		}
+	}
+
 	var result domain.StarGiftConvertResult
 	err := withTx(ctx, s.db, "convert star gift aggregate", func(tx pgx.Tx) error {
+		if err := lockUsersForUpdate(ctx, tx, channelMutationUserIDs...); err != nil {
+			return err
+		}
+		var channelSourceRefs []starGiftViewerMessageRef
+		if req.Ref.Owner.Type == domain.PeerTypeChannel {
+			var err error
+			channelSourceRefs, err = listChannelStarGiftViewerMessageRefs(ctx, tx, expectedSavedGiftID, req.Ref.Owner.ID)
+			if err != nil {
+				return err
+			}
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, starGiftCollectionLockKey(req.Ref.Owner)); err != nil {
 			return fmt.Errorf("lock star gift owner collections: %w", err)
 		}
 		saved, err := lockSavedStarGiftForUpgrade(ctx, tx, req.Ref)
 		if err != nil {
 			return err
+		}
+		if expectedSavedGiftID != 0 && saved.ID != expectedSavedGiftID {
+			return domain.ErrStarGiftNotFound
 		}
 		if saved.Converted || saved.LifecycleStatus == domain.StarGiftLifecycleConverted {
 			return domain.ErrStarGiftAlreadyConverted
@@ -143,7 +174,23 @@ func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain
 		saved.Unsaved = true
 		saved.PinnedOrder = 0
 		saved.CollectionIDs = nil
-		result = domain.StarGiftConvertResult{Saved: saved, OwnerBalance: balanceAfter}
+		result.Saved, result.OwnerBalance = saved, balanceAfter
+		if saved.Owner.Type == domain.PeerTypeChannel {
+			edits, err := editChannelStarGiftViewerMessagesTx(ctx, tx, s.messages, channelSourceRefs,
+				saved, req.Date, 0, [8]byte{}, 0, func(action *domain.MessageStarGiftAction, _ int64) error {
+					action.Saved = false
+					action.Converted = true
+					action.CanUpgrade = false
+					action.PrepaidUpgradeHash = ""
+					action.UpgradeStars = 0
+					action.UpgradeMsgID = 0
+					return nil
+				})
+			if err != nil {
+				return err
+			}
+			result.SourceEdits = edits
+		}
 		return nil
 	})
 	if err != nil {
@@ -328,7 +375,7 @@ func (s *StarGiftLifecycleStore) SetStarGiftListing(ctx context.Context, req dom
 		if err != nil {
 			return err
 		}
-		if !found || unique.Burned || unique.Owner != saved.Owner || unique.OwnerAddress != "" {
+		if !found || unique.Burned || unique.ExternalizationPending || unique.Owner != saved.Owner || unique.OwnerAddress != "" {
 			return domain.ErrStarGiftResaleUnavailable
 		}
 		uniqueID = unique.ID
@@ -377,8 +424,33 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 		req.To == req.Ref.Owner || req.ChargeStars < 0 || req.Date <= 0 || strings.TrimSpace(req.CommandKey) == "" {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
 	}
+	transferReplay := false
+	if replay, err := s.loadTransferReplay(ctx, req, domain.SendPrivateTextResult{}); err == nil {
+		if req.To.Type != domain.PeerTypeUser {
+			return replay, nil
+		}
+		transferReplay = true
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.StarGiftTransferResult{}, err
+	}
+	var channelMutationUserIDs []int64
+	var expectedChannelSavedGiftID int64
+	if !transferReplay && req.Ref.Owner.Type == domain.PeerTypeChannel {
+		saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref)
+		if err != nil {
+			return domain.StarGiftTransferResult{}, err
+		}
+		if !found {
+			return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
+		}
+		expectedChannelSavedGiftID = saved.ID
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, saved.ID, req.Ref.Owner.ID)
+		if err != nil {
+			return domain.StarGiftTransferResult{}, err
+		}
+	}
 	if req.To.Type != domain.PeerTypeUser {
-		return s.transferStarGiftWithoutPrivateMessage(ctx, req)
+		return s.transferStarGiftWithoutPrivateMessage(ctx, req, expectedChannelSavedGiftID, channelMutationUserIDs)
 	}
 	messageReq := domain.SendPrivateTextRequest{
 		SenderUserID: req.ActorUserID, RecipientUserID: req.To.ID,
@@ -390,11 +462,22 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 	}
 	var result domain.StarGiftTransferResult
 	var sourceSaved domain.SavedStarGift
+	var channelSourceRefs []starGiftViewerMessageRef
 	hooks := privateSendTxHooks{
+		lockUserIDs: channelMutationUserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
 			saved, unique, err := lockTransferableStarGift(ctx, tx, req.ActorUserID, req.Ref, req.Date)
 			if err != nil {
 				return err
+			}
+			if expectedChannelSavedGiftID != 0 {
+				if saved.ID != expectedChannelSavedGiftID {
+					return domain.ErrStarGiftTransferUnavailable
+				}
+				channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
+				if err != nil {
+					return err
+				}
 			}
 			if saved.TransferStars != req.ChargeStars {
 				return domain.ErrStarGiftTransferUnavailable
@@ -451,6 +534,9 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 				_, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, req.Date)
 				return err
 			}
+			if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, channelSourceRefs, req.Date); err != nil {
+				return err
+			}
 			return nil
 		},
 	}
@@ -483,7 +569,8 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 		JOIN star_gift_sales s ON s.command_key=t.command_key AND s.unique_gift_id=t.unique_gift_id
 		WHERE t.actor_user_id=$1 AND t.command_key=$2`, req.BuyerUserID, strings.TrimSpace(req.CommandKey)).Scan(
 		&replayUniqueID, &replayFromType, &replayFromID, &replayToType, &replayToID, &replayCurrency, &replayAmount)
-	if replayErr == nil {
+	replaying := replayErr == nil
+	if replaying {
 		if replayUniqueID != unique.ID || replayToType != string(req.To.Type) || replayToID != req.To.ID ||
 			replayCurrency != string(req.Amount.Currency) || replayAmount != req.Amount.Amount {
 			return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
@@ -493,6 +580,22 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 		return domain.StarGiftTransferResult{}, replayErr
 	} else if !validLifecyclePeer(unique.Owner) || unique.Owner == req.To {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
+	}
+	var channelMutationUserIDs []int64
+	var expectedChannelSavedGiftID int64
+	if !replaying && seller.Type == domain.PeerTypeChannel {
+		if err := s.db.QueryRow(ctx, `SELECT id FROM peer_star_gifts
+WHERE unique_gift_id=$1 AND owner_peer_type='channel' AND owner_peer_id=$2 AND lifecycle_status='active'`,
+			unique.ID, seller.ID).Scan(&expectedChannelSavedGiftID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
+			}
+			return domain.StarGiftTransferResult{}, err
+		}
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, expectedChannelSavedGiftID, seller.ID)
+		if err != nil {
+			return domain.StarGiftTransferResult{}, err
+		}
 	}
 	messageSenderID := domain.OfficialSystemUserID
 	if seller.Type == domain.PeerTypeUser {
@@ -513,7 +616,9 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 	var result domain.StarGiftTransferResult
 	var commissionAmount int64
 	var sourceSaved domain.SavedStarGift
+	var channelSourceRefs []starGiftViewerMessageRef
 	hooks := privateSendTxHooks{
+		lockUserIDs: channelMutationUserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
 			var listingCurrency, sellerType string
 			var listingAmount, sellerID, uniqueID int64
@@ -534,8 +639,17 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 			if err != nil || !found || !saved.LifecycleStatus.Live() || saved.Owner != seller {
 				return domain.ErrStarGiftResaleUnavailable
 			}
+			if expectedChannelSavedGiftID != 0 {
+				if saved.ID != expectedChannelSavedGiftID {
+					return domain.ErrStarGiftResaleUnavailable
+				}
+				channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
+				if err != nil {
+					return err
+				}
+			}
 			gift, found, err := NewStarGiftStore(tx).UniqueByID(ctx, uniqueID)
-			if err != nil || !found || gift.Burned || gift.Owner != saved.Owner {
+			if err != nil || !found || gift.Burned || gift.ExternalizationPending || gift.Owner != saved.Owner {
 				return domain.ErrStarGiftResaleUnavailable
 			}
 			balance, err := s.debitLifecycleAmount(ctx, tx, req.BuyerUserID, req.Amount, domain.StarsReasonGiftResale,
@@ -635,6 +749,8 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 				if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, req.Date); err != nil {
 					return err
 				}
+			} else if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, channelSourceRefs, req.Date); err != nil {
+				return err
 			}
 			return updateStarGiftResaleProjection(ctx, tx, result.Unique.GiftID)
 		},
@@ -645,7 +761,8 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 	}
 	result.Send, result.Duplicate = sent, sent.Duplicate
 	if sent.Duplicate {
-		return s.loadTransferReplay(ctx, domain.StarGiftTransferRequest{ActorUserID: req.BuyerUserID, CommandKey: req.CommandKey}, sent)
+		return s.loadTransferReplay(ctx, domain.StarGiftTransferRequest{ActorUserID: req.BuyerUserID,
+			Ref: domain.SavedStarGiftRef{Owner: seller}, To: req.To, ChargeStars: 0, CommandKey: req.CommandKey}, sent)
 	}
 	return result, nil
 }
@@ -708,7 +825,7 @@ func (s *StarGiftLifecycleStore) SendStarGiftOffer(ctx context.Context, req doma
 		return domain.StarGiftOfferResult{}, err
 	}
 	unique, found, err := NewStarGiftStore(s.db).UniqueBySlug(ctx, req.Slug)
-	if err != nil || !found || unique.Owner != req.Owner || unique.Burned || unique.OwnerAddress != "" || unique.OfferMinStars <= 0 {
+	if err != nil || !found || unique.Owner != req.Owner || unique.Burned || unique.ExternalizationPending || unique.OwnerAddress != "" || unique.OfferMinStars <= 0 {
 		return domain.StarGiftOfferResult{}, domain.ErrStarGiftOfferInvalid
 	}
 	messageReq := domain.SendPrivateTextRequest{
@@ -729,7 +846,7 @@ func (s *StarGiftLifecycleStore) SendStarGiftOffer(ctx context.Context, req doma
 				return err
 			}
 			gift, found, err := NewStarGiftStore(tx).UniqueByID(ctx, unique.ID)
-			if err != nil || !found || gift.Owner != req.Owner || gift.Burned || gift.OwnerAddress != "" || gift.OfferMinStars <= 0 {
+			if err != nil || !found || gift.Owner != req.Owner || gift.Burned || gift.ExternalizationPending || gift.OwnerAddress != "" || gift.OfferMinStars <= 0 {
 				return domain.ErrStarGiftOfferInvalid
 			}
 			if req.Price.Currency == domain.StarGiftCurrencyStars && gift.OfferMinStars > 0 && req.Price.Amount < int64(gift.OfferMinStars) {
@@ -878,7 +995,7 @@ func (s *StarGiftLifecycleStore) ResolveStarGiftOffer(ctx context.Context, req d
 				return domain.ErrStarGiftOfferInvalid
 			}
 			current, found, err := NewStarGiftStore(tx).UniqueByID(ctx, locked.UniqueGiftID)
-			if err != nil || !found || current.Owner != locked.Owner || current.Burned || current.OwnerAddress != "" {
+			if err != nil || !found || current.Owner != locked.Owner || current.Burned || current.ExternalizationPending || current.OwnerAddress != "" {
 				return domain.ErrStarGiftOfferInvalid
 			}
 			if _, commission, err := s.creditPeerLifecycleAmount(ctx, tx, locked.Owner, req.OwnerUserID, locked.Price,
@@ -1103,12 +1220,30 @@ func (s *StarGiftLifecycleStore) refundPendingStarGiftOffersExcept(ctx context.C
 	return nil
 }
 
-func (s *StarGiftLifecycleStore) transferStarGiftWithoutPrivateMessage(ctx context.Context, req domain.StarGiftTransferRequest) (domain.StarGiftTransferResult, error) {
+func (s *StarGiftLifecycleStore) transferStarGiftWithoutPrivateMessage(
+	ctx context.Context,
+	req domain.StarGiftTransferRequest,
+	expectedChannelSavedGiftID int64,
+	channelMutationUserIDs []int64,
+) (domain.StarGiftTransferResult, error) {
 	var result domain.StarGiftTransferResult
 	err := withTx(ctx, s.db, "transfer star gift to channel", func(tx pgx.Tx) error {
+		if err := lockUsersForUpdate(ctx, tx, channelMutationUserIDs...); err != nil {
+			return err
+		}
 		saved, unique, err := lockTransferableStarGift(ctx, tx, req.ActorUserID, req.Ref, req.Date)
 		if err != nil {
 			return err
+		}
+		var channelSourceRefs []starGiftViewerMessageRef
+		if expectedChannelSavedGiftID != 0 {
+			if saved.ID != expectedChannelSavedGiftID {
+				return domain.ErrStarGiftTransferUnavailable
+			}
+			channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
+			if err != nil {
+				return err
+			}
 		}
 		if saved.TransferStars != req.ChargeStars {
 			return domain.ErrStarGiftTransferUnavailable
@@ -1153,6 +1288,8 @@ func (s *StarGiftLifecycleStore) transferStarGiftWithoutPrivateMessage(ctx conte
 			if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, unique, req.Date); err != nil {
 				return err
 			}
+		} else if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, unique, channelSourceRefs, req.Date); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -1183,7 +1320,7 @@ func lockOwnedUniqueStarGift(ctx context.Context, tx pgx.Tx, actorUserID int64, 
 	if err != nil {
 		return domain.SavedStarGift{}, domain.UniqueStarGift{}, err
 	}
-	if !found || unique.Burned || unique.OwnerAddress != "" || unique.Owner != saved.Owner {
+	if !found || unique.Burned || unique.ExternalizationPending || unique.OwnerAddress != "" || unique.Owner != saved.Owner {
 		return domain.SavedStarGift{}, domain.UniqueStarGift{}, domain.ErrStarGiftTransferUnavailable
 	}
 	return saved, unique, nil
@@ -1358,10 +1495,16 @@ func (s *StarGiftLifecycleStore) creditPeerLifecycleAmount(ctx context.Context, 
 }
 
 func (s *StarGiftLifecycleStore) loadTransferReplay(ctx context.Context, req domain.StarGiftTransferRequest, sent domain.SendPrivateTextResult) (domain.StarGiftTransferResult, error) {
-	var uniqueID, balance int64
-	if err := s.db.QueryRow(ctx, `SELECT unique_gift_id,balance_after FROM star_gift_transfer_commands WHERE actor_user_id=$1 AND command_key=$2`,
-		req.ActorUserID, strings.TrimSpace(req.CommandKey)).Scan(&uniqueID, &balance); err != nil {
+	var uniqueID, balance, fromID, toID, chargeStars int64
+	var fromType, toType string
+	if err := s.db.QueryRow(ctx, `SELECT unique_gift_id,balance_after,from_peer_type,from_peer_id,to_peer_type,to_peer_id,charge_stars
+FROM star_gift_transfer_commands WHERE actor_user_id=$1 AND command_key=$2`,
+		req.ActorUserID, strings.TrimSpace(req.CommandKey)).Scan(&uniqueID, &balance, &fromType, &fromID, &toType, &toID, &chargeStars); err != nil {
 		return domain.StarGiftTransferResult{}, err
+	}
+	if req.Ref.Owner != (domain.Peer{Type: domain.PeerType(fromType), ID: fromID}) ||
+		req.To != (domain.Peer{Type: domain.PeerType(toType), ID: toID}) || req.ChargeStars != chargeStars {
+		return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
 	}
 	unique, found, err := NewStarGiftStore(s.db).UniqueByID(ctx, uniqueID)
 	if err != nil || !found {
@@ -1431,6 +1574,16 @@ func (s *StarGiftLifecycleStore) RecordStarGiftWithdrawal(ctx context.Context, r
 		}
 		if saved.Owner != (domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID}) || !saved.LifecycleStatus.Live() || saved.UniqueGiftID == 0 || saved.CanExportAt > req.Date {
 			return domain.ErrStarGiftTransferUnavailable
+		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM unique_star_gifts WHERE id=$1 FOR UPDATE`, saved.UniqueGiftID); err != nil {
+			return err
+		}
+		unique, found, err := NewStarGiftStore(tx).UniqueByID(ctx, saved.UniqueGiftID)
+		if err != nil {
+			return err
+		}
+		if !found || unique.ExternalizationPending {
+			return domain.ErrStarGiftExternalizationPending
 		}
 		var existingID int64
 		var existingStatus string
@@ -1524,7 +1677,7 @@ WHERE provider_request_id=$1 FOR UPDATE`, providerRequestID).Scan(&uniqueID, &ow
 			return domain.ErrStarGiftWithdrawalUnavailable
 		}
 		unique, found, err := NewStarGiftStore(tx).UniqueByID(ctx, uniqueID)
-		if err != nil || !found || unique.Owner != saved.Owner || unique.Burned || unique.OwnerAddress != "" {
+		if err != nil || !found || unique.Owner != saved.Owner || unique.Burned || unique.ExternalizationPending || unique.OwnerAddress != "" {
 			return domain.ErrStarGiftWithdrawalUnavailable
 		}
 		if err := s.refundPendingStarGiftOffers(ctx, tx, uniqueID, date, "gift exported"); err != nil {
@@ -1666,6 +1819,16 @@ func (s *StarGiftLifecycleStore) ChannelStarsBalance(ctx context.Context, channe
 	return balance, err
 }
 
+func (s *StarGiftLifecycleStore) ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if channelID <= 0 {
+		return 0, domain.ErrStarGiftOwnerInvalid
+	}
+	var revenue int64
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(sum(amount) FILTER (WHERE amount>0),0)
+FROM channel_stars_transactions WHERE channel_id=$1`, channelID).Scan(&revenue)
+	return revenue, err
+}
+
 func (s *StarGiftLifecycleStore) ChannelStarsTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
 	if channelID <= 0 {
 		return domain.StarsTransactionPage{}, domain.ErrStarGiftOwnerInvalid
@@ -1711,6 +1874,16 @@ func (s *StarGiftLifecycleStore) ChannelTonBalance(ctx context.Context, channelI
 	var balance int64
 	err := s.db.QueryRow(ctx, `SELECT COALESCE((SELECT balance_nanoton FROM channel_ton_balances WHERE channel_id=$1),0)`, channelID).Scan(&balance)
 	return balance, err
+}
+
+func (s *StarGiftLifecycleStore) ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if channelID <= 0 {
+		return 0, domain.ErrStarGiftOwnerInvalid
+	}
+	var revenue int64
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(sum(amount_nanoton) FILTER (WHERE amount_nanoton>0),0)
+FROM channel_ton_transactions WHERE channel_id=$1`, channelID).Scan(&revenue)
+	return revenue, err
 }
 
 func (s *StarGiftLifecycleStore) ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error) {

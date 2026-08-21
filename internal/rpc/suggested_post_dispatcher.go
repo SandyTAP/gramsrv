@@ -11,19 +11,23 @@ import (
 
 // SuggestedPostDispatcher publishes scheduled suggestions and resolves paid
 // escrow after the minimum live age (or refunds it when the post is deleted).
-// Store-side row locks make multiple server instances safe.
+// Store-side per-key claims and row locks make multiple server instances safe.
 type SuggestedPostDispatcher struct {
 	router   *Router
 	log      *zap.Logger
 	interval time.Duration
 	batch    int
+	enqueue  func(context.Context, int64, domain.ToggleSuggestedPostApprovalResult) error
 }
 
 func NewSuggestedPostDispatcher(router *Router, log *zap.Logger) *SuggestedPostDispatcher {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &SuggestedPostDispatcher{router: router, log: log, interval: time.Second, batch: 50}
+	return &SuggestedPostDispatcher{
+		router: router, log: log, interval: time.Second, batch: 50,
+		enqueue: router.enqueueSuggestedPostApprovalFanout,
+	}
 }
 
 func (d *SuggestedPostDispatcher) Run(ctx context.Context) {
@@ -50,13 +54,14 @@ func (d *SuggestedPostDispatcher) DispatchOnce(ctx context.Context) bool {
 	results, err := service.ProcessSuggestedPostLifecycle(ctx, domain.SuggestedPostLifecycleRequest{Now: int(d.router.clock.Now().Unix()), Limit: d.batch})
 	if err != nil {
 		d.log.Warn("process suggested post lifecycle", zap.Error(err))
-		return false
 	}
+	enqueued := false
 	for _, result := range results {
-		if err := d.router.enqueueSuggestedPostApprovalFanout(ctx, 0, result); err != nil {
+		if err := d.enqueue(ctx, 0, result); err != nil {
 			d.log.Warn("enqueue suggested post approval fanout", zap.Error(err))
-			return false
+			continue
 		}
+		enqueued = true
 	}
-	return len(results) > 0
+	return enqueued
 }

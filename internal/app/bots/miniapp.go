@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -37,7 +38,7 @@ func (s *Service) EnsureMenuBotApp(ctx context.Context, botUserID int64, button 
 	if button.Type != domain.BotMenuButtonWebView {
 		return domain.BotApp{}, 0, nil
 	}
-	app, version, err := s.UpsertBotApp(ctx, botUserID, domain.BotApp{
+	desiredApp, err := s.normalizeBotApp(ctx, botUserID, domain.BotApp{
 		BotUserID:          botUserID,
 		ShortName:          defaultMainAppShortName,
 		Title:              button.Text,
@@ -48,17 +49,56 @@ func (s *Service) EnsureMenuBotApp(ctx context.Context, botUserID int64, button 
 	if err != nil {
 		return domain.BotApp{}, 0, err
 	}
-	if _, err := s.UpsertAttachMenuBot(ctx, botUserID, domain.BotAttachMenuBot{
+	app, found, err := s.GetBotAppByShortName(ctx, botUserID, desiredApp.ShortName)
+	if err != nil {
+		return domain.BotApp{}, 0, err
+	}
+	version := 0
+	if !found || app != desiredApp {
+		app, version, err = s.UpsertBotApp(ctx, botUserID, desiredApp)
+		if err != nil {
+			return domain.BotApp{}, 0, err
+		}
+	}
+	desiredAttach := domain.BotAttachMenuBot{
 		BotUserID:          botUserID,
 		AppID:              app.ID,
 		ShortName:          app.ShortName,
 		RequestWriteAccess: app.RequestWriteAccess,
 		ShowInAttachMenu:   true,
 		ShowInSideMenu:     true,
-	}); err != nil {
+		PeerTypes:          []string{"pm", "chat", "megagroup", "broadcast"},
+	}
+	attach, found, err := s.GetAttachMenuBot(ctx, botUserID)
+	if err != nil {
 		return domain.BotApp{}, 0, err
 	}
+	if !found || !equalAttachMenuBot(attach, desiredAttach) {
+		attachVersion, err := s.UpsertAttachMenuBot(ctx, botUserID, desiredAttach)
+		if err != nil {
+			return domain.BotApp{}, 0, err
+		}
+		if version == 0 {
+			version = attachVersion
+		}
+	}
 	return app, version, nil
+}
+
+func equalAttachMenuBot(left, right domain.BotAttachMenuBot) bool {
+	if len(left.PeerTypes) == 0 {
+		left.PeerTypes = nil
+	}
+	if len(right.PeerTypes) == 0 {
+		right.PeerTypes = nil
+	}
+	if len(left.Icons) == 0 {
+		left.Icons = nil
+	}
+	if len(right.Icons) == 0 {
+		right.Icons = nil
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func (s *Service) normalizeBotApp(ctx context.Context, botUserID int64, app domain.BotApp) (domain.BotApp, error) {

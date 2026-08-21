@@ -278,6 +278,23 @@ func (r *Router) invalidateRPCProjectionForUser(userID int64) {
 	}
 }
 
+// InvalidateStarGiftProfiles is the Core background-worker hook for hosted
+// NFT attach/detach. These changes have no wire PTS constructor, but cached
+// userFull.stargifts_count must still converge immediately in this process.
+func (r *Router) InvalidateStarGiftProfiles(peers ...domain.Peer) {
+	seen := make(map[int64]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+			continue
+		}
+		if _, ok := seen[peer.ID]; ok {
+			continue
+		}
+		seen[peer.ID] = struct{}{}
+		r.invalidateRPCProjectionForUser(peer.ID)
+	}
+}
+
 func (r *Router) invalidateRPCProjectionForPeer(ownerUserID int64, peer domain.Peer) {
 	if r.userFullProjectionCache != nil && peer.Type == domain.PeerTypeUser {
 		r.userFullProjectionCache.DeletePair(ownerUserID, peer.ID)

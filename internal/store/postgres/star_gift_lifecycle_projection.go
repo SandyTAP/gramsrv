@@ -192,5 +192,158 @@ WHERE sender_user_id=$1 AND id=$2`, target.MessageSenderID, target.PrivateMessag
 			return nil, fmt.Errorf("update retired star gift private media: %w", err)
 		}
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM star_gift_user_message_refs
+WHERE owner_user_id=$1 AND saved_gift_id=$2`, source.Owner.ID, source.ID); err != nil {
+		return nil, fmt.Errorf("delete retired user star gift aliases: %w", err)
+	}
+	return edits, nil
+}
+
+func (s *StarGiftLifecycleStore) retireChannelStarGiftMessagesTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	source domain.SavedStarGift,
+	current domain.UniqueStarGift,
+	refs []starGiftViewerMessageRef,
+	date int,
+) ([]domain.EditedMessageForUser, error) {
+	if s == nil || s.messages == nil || source.Owner.Type != domain.PeerTypeChannel || source.Owner.ID <= 0 ||
+		source.ID <= 0 || source.SavedID <= 0 || source.UniqueGiftID <= 0 || current.ID != source.UniqueGiftID || date <= 0 {
+		return nil, domain.ErrStarGiftTransferUnavailable
+	}
+	q := sqlcgen.New(tx)
+	edits := make([]domain.EditedMessageForUser, 0, len(refs))
+	for _, ref := range refs {
+		var messageSenderID, privateMessageID int64
+		err := tx.QueryRow(ctx, `
+SELECT message_sender_id,private_message_id
+FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND peer_type='user' AND NOT deleted
+FOR UPDATE`, ref.UserID, ref.MsgID).Scan(&messageSenderID, &privateMessageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lock retired channel star gift projection: %w", err)
+		}
+		boxes, err := q.ListVisibleMessageBoxesByPrivateMessage(ctx, sqlcgen.ListVisibleMessageBoxesByPrivateMessageParams{
+			OwnerUserIds: []int64{ref.UserID}, MessageSenderID: messageSenderID, PrivateMessageID: privateMessageID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("load retired channel star gift projection: %w", err)
+		}
+		if len(boxes) != 1 || int(boxes[0].BoxID) != ref.MsgID {
+			return nil, domain.ErrStarGiftTransferUnavailable
+		}
+		box := boxes[0]
+		media, err := decodeMessageMedia(box.MediaJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode retired channel star gift projection: %w", err)
+		}
+		if media == nil || media.ServiceAction == nil {
+			return nil, fmt.Errorf("retired channel star gift projection has no service action")
+		}
+		switch media.ServiceAction.Kind {
+		case domain.MessageServiceActionStarGift:
+			action := media.ServiceAction.StarGift
+			if action == nil || action.GiftID != source.GiftID || action.PeerChannelID != source.Owner.ID ||
+				action.SavedID != source.SavedID {
+				return nil, fmt.Errorf("retired channel star gift ordinary projection has invalid identity")
+			}
+			action.Saved = false
+			action.CanUpgrade = false
+			action.PrepaidUpgrade = false
+			action.PrepaidUpgradeHash = ""
+			action.UpgradeStars = 0
+			action.UpgradeMsgID = 0
+		case domain.MessageServiceActionStarGiftUnique:
+			action := media.ServiceAction.StarGiftUnique
+			if action == nil || action.Gift.ID != current.ID || action.Peer != source.Owner || action.SavedID != source.SavedID {
+				return nil, fmt.Errorf("retired channel star gift unique projection has invalid identity")
+			}
+			retiredGift := current
+			retiredGift.CraftChancePermille = 0
+			retiredGift.ResellAmount = nil
+			action.Gift = retiredGift
+			action.Peer = domain.Peer{}
+			action.SavedID = 0
+			action.Saved = false
+			action.Transferred = true
+			action.CanExportAt = 0
+			action.TransferStars = 0
+			action.ResaleAmount = nil
+			action.CanTransferAt = 0
+			action.CanResellAt = 0
+			action.DropOriginalDetailsStars = 0
+			action.CanCraftAt = 0
+		default:
+			return nil, fmt.Errorf("retired channel star gift projection has invalid action")
+		}
+		mediaJSON, err := encodeMessageMedia(media)
+		if err != nil {
+			return nil, fmt.Errorf("encode retired channel star gift projection: %w", err)
+		}
+		pts, err := s.messages.reservePts(ctx, tx, ref.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("allocate retired channel star gift pts: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `
+UPDATE message_boxes SET media=$3,pts=$4
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, ref.UserID, ref.MsgID, mediaJSON, int32(pts))
+		if err != nil {
+			return nil, fmt.Errorf("update retired channel star gift projection: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, fmt.Errorf("update retired channel star gift projection lost row")
+		}
+		sharedMediaJSON, err := encodeSharedPrivateStarGiftMedia(media)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE private_messages SET media=$3
+WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID, sharedMediaJSON); err != nil {
+			return nil, fmt.Errorf("update retired channel star gift shared media: %w", err)
+		}
+		message, err := messageFromVisibleBoxRow(box)
+		if err != nil {
+			return nil, err
+		}
+		message.Media = media
+		message.Pts = pts
+		if err := replaceMessageBoxMediaIndexTx(ctx, tx, message.OwnerUserID, message.Peer.ID,
+			message.ID, message.Date, message.Media, message.Entities); err != nil {
+			return nil, err
+		}
+		event := domain.UpdateEvent{UserID: ref.UserID, Type: domain.UpdateEventEditMessage,
+			Pts: pts, PtsCount: 1, Date: date, Message: message}
+		if err := appendUserUpdateEvent(ctx, tx, q, ref.UserID, event); err != nil {
+			return nil, fmt.Errorf("append retired channel star gift edit event: %w", err)
+		}
+		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			TargetUserID: ref.UserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
+			ExcludeAuthKeyID: 0, ExcludeSessionID: 0,
+		}); err != nil {
+			return nil, fmt.Errorf("enqueue retired channel star gift edit: %w", err)
+		}
+		edits = append(edits, domain.EditedMessageForUser{UserID: ref.UserID, Message: message, Event: event})
+	}
+	if len(refs) > 0 {
+		userIDs := make([]int64, 0, len(refs))
+		messageIDs := make([]int32, 0, len(refs))
+		for _, ref := range refs {
+			userIDs = append(userIDs, ref.UserID)
+			messageIDs = append(messageIDs, int32(ref.MsgID))
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM star_gift_user_message_refs ref
+WHERE ref.saved_gift_id=$1 AND (ref.owner_user_id,ref.msg_id) IN (
+    SELECT owner_user_id,msg_id FROM unnest($2::bigint[],$3::integer[]) AS retired(owner_user_id,msg_id)
+)`, source.ID, userIDs, messageIDs); err != nil {
+			return nil, fmt.Errorf("delete retired channel star gift aliases: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM star_gift_channel_notification_jobs
+WHERE saved_gift_id=$1 AND (action #>> '{peer_channel_id}')::bigint=$2`, source.ID, source.Owner.ID); err != nil {
+		return nil, fmt.Errorf("delete retired channel star gift notification jobs: %w", err)
+	}
 	return edits, nil
 }

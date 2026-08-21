@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,10 +80,69 @@ import (
 	"telesrv/internal/store/postgres"
 	"telesrv/internal/store/redisstore"
 	"telesrv/internal/telegramloginhttp"
+	"telesrv/internal/tonfinalizer"
 	"telesrv/internal/turnsrv"
 	"telesrv/internal/updatecdn"
 	"telesrv/internal/web"
 )
+
+func localStarGiftWithdrawalOptions(publicBaseURL, publicLinkWebAddr, exportMode string) ([]stargifts.Option, error) {
+	if strings.TrimSpace(publicLinkWebAddr) == "" {
+		return nil, nil
+	}
+	provider, err := stargifts.NewLocalWithdrawalProvider(publicBaseURL)
+	if err != nil {
+		return nil, err
+	}
+	options := []stargifts.Option{stargifts.WithRevenueWithdrawalProvider(provider)}
+	if exportMode == "" || exportMode == config.StarGiftExportModeLocal {
+		options = append(options, stargifts.WithGiftWithdrawalProvider(provider))
+	}
+	return options, nil
+}
+
+func loadTONCapabilitySecret(path string) ([]byte, error) {
+	raw, err := os.ReadFile(strings.TrimSpace(path))
+	if err != nil {
+		return nil, fmt.Errorf("read capability secret: %w", err)
+	}
+	encoded := strings.TrimSpace(string(raw))
+	var secret []byte
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		decoded, decodeErr := encoding.DecodeString(encoded)
+		if decodeErr == nil {
+			secret = decoded
+			break
+		}
+	}
+	if len(secret) < 32 || len(secret) > 64 {
+		return nil, fmt.Errorf("capability secret must decode to 32-64 bytes")
+	}
+	return secret, nil
+}
+
+func loadTONClaimBotToken(path string) (string, error) {
+	raw, err := os.ReadFile(strings.TrimSpace(path))
+	if err != nil {
+		return "", fmt.Errorf("read claim bot token: %w", err)
+	}
+	token := strings.TrimSpace(string(raw))
+	if len(token) > 512 {
+		return "", fmt.Errorf("claim bot token file is too large")
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		return "", fmt.Errorf("claim bot token file must contain one token")
+	}
+	if _, _, ok := domain.ParseBotToken(token); !ok {
+		return "", fmt.Errorf("claim bot token is invalid")
+	}
+	return token, nil
+}
 
 func newBusinessAutomationOptions(cfg config.CoreConfig, online messageapp.BusinessAutomationOnlineChecker, generator messageapp.BusinessAITextGenerator, logger *zap.Logger) []messageapp.BusinessAutomationOption {
 	opts := []messageapp.BusinessAutomationOption{
@@ -594,6 +654,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	}, nodeprojection.StoreOptions{
 		ChannelOptions: []postgres.ChannelStoreOption{
 			postgres.WithChannelAllocators(channelIDAllocator, channelMessageIDAllocator),
+			postgres.WithChannelStarsStartingGrant(cfg.StarsStartingGrant),
 		},
 		MessageOptions: []postgres.MessageStoreOption{
 			postgres.WithMessageAllocators(boxIDAllocator),
@@ -985,14 +1046,88 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 			StarsProceedsPermille: cfg.StarGiftStarsProceedsPermille,
 			TONProceedsPermille:   cfg.StarGiftTONProceedsPermille,
 		}))
-	starGiftWithdrawalProvider, err := stargifts.NewLocalWithdrawalProvider(cfg.PublicBaseURL)
+	starGiftWithdrawalOptions, err := localStarGiftWithdrawalOptions(cfg.PublicBaseURL, cfg.PublicLinkWebAddr, cfg.StarGiftExportMode)
 	if err != nil {
 		return fmt.Errorf("init local star gift withdrawal provider: %w", err)
 	}
-	giftsService := stargifts.NewService(starGiftStore, blobBackend, cfg.DC,
+	starGiftOptions := []stargifts.Option{
 		stargifts.WithUpgradeStore(starGiftUpgradeStore),
 		stargifts.WithLifecycleStore(starGiftLifecycleStore),
-		stargifts.WithWithdrawalProvider(starGiftWithdrawalProvider))
+	}
+	starGiftOptions = append(starGiftOptions, starGiftWithdrawalOptions...)
+	var tonExportService *stargifts.TONExportService
+	var tonClaimService *stargifts.TONClaimService
+	var tonFinalizerStore *postgres.StarGiftTONFinalizerStore
+	if cfg.StarGiftExportMode == config.StarGiftExportModeTON {
+		if strings.TrimSpace(cfg.PublicLinkWebAddr) == "" {
+			return fmt.Errorf("TON star gift export requires the public Web listener")
+		}
+		capabilitySecret, err := loadTONCapabilitySecret(cfg.StarGiftTONCapabilitySecretFile)
+		if err != nil {
+			return fmt.Errorf("load TON star gift capability secret: %w", err)
+		}
+		tonStore := postgres.NewStarGiftTONStore(pool)
+		tonFinalizerStore = postgres.NewStarGiftTONFinalizerStore(pool, starGiftLifecycleStore)
+		tonExportService, err = stargifts.NewTONExportService(
+			tonStore,
+			starGiftStore,
+			stargifts.TONExportConfig{
+				PublicBaseURL:      cfg.PublicBaseURL,
+				Network:            domain.TONNetwork(cfg.StarGiftTONNetwork),
+				Collection:         cfg.StarGiftTONCollectionAddress,
+				CollectionCodeHash: cfg.StarGiftTONCollectionCodeHash,
+				MintABI:            cfg.StarGiftTONMintABI,
+				InitialItemIndex:   cfg.StarGiftTONInitialItemIndex,
+				ProofDomain:        cfg.StarGiftTONProofDomain,
+				ExportTTL:          cfg.StarGiftTONExportTTL,
+				ChallengeTTL:       cfg.StarGiftTONChallengeTTL,
+				CapabilitySecret:   capabilitySecret,
+				AllowUserIDs:       cfg.StarGiftTONAllowUserIDs,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("init TON star gift export provider: %w", err)
+		}
+		starGiftOptions = append(starGiftOptions, stargifts.WithGiftWithdrawalProvider(tonExportService))
+		if cfg.StarGiftTONClaimEnabled {
+			botToken, err := loadTONClaimBotToken(cfg.StarGiftTONClaimBotTokenFile)
+			if err != nil {
+				return fmt.Errorf("load TON star gift claim bot token: %w", err)
+			}
+			claimBotID, claimBotSecret, _ := domain.ParseBotToken(botToken)
+			claimBot, found, err := botStore.GetBot(ctx, claimBotID)
+			if err != nil {
+				return fmt.Errorf("load TON star gift claim bot: %w", err)
+			}
+			if !found || claimBot.TokenSecret != claimBotSecret {
+				return fmt.Errorf("TON star gift claim bot token does not match an active local bot")
+			}
+			tonClaimService, err = stargifts.NewTONClaimService(tonFinalizerStore, stargifts.TONClaimConfig{
+				Network: domain.TONNetwork(cfg.StarGiftTONNetwork), ProofDomain: cfg.StarGiftTONProofDomain,
+				BotToken: botToken, ChallengeTTL: cfg.StarGiftTONChallengeTTL, InitDataTTL: cfg.StarGiftTONClaimInitDataTTL,
+			})
+			if err != nil {
+				return fmt.Errorf("init TON star gift claim service: %w", err)
+			}
+			claimButton := domain.BotMenuButton{
+				Type: domain.BotMenuButtonWebView, Text: "Claim Gift",
+				URL: strings.TrimRight(cfg.PublicBaseURL, "/") + "/ton-gift/claim",
+			}
+			currentButton, err := botsService.GetBotMenuButton(ctx, claimBotID)
+			if err != nil {
+				return fmt.Errorf("load TON star gift claim bot menu: %w", err)
+			}
+			if currentButton != claimButton {
+				_, err = botsService.SetBotMenuButton(ctx, claimBotID, claimButton)
+			} else {
+				_, _, err = botsService.EnsureMenuBotApp(ctx, claimBotID, claimButton)
+			}
+			if err != nil {
+				return fmt.Errorf("configure TON star gift claim Mini App: %w", err)
+			}
+		}
+	}
+	giftsService := stargifts.NewService(starGiftStore, blobBackend, cfg.DC, starGiftOptions...)
 	// Passkey:凭据持久化走 postgres;一次性挑战走进程内内存(短 TTL,与 QR 登录 token
 	// 同属进程内一次性凭据,不跨实例)。
 	passkeyStore := postgres.NewPasskeyStore(pool)
@@ -1407,6 +1542,24 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	// router 创建后注入。
 	botsService.SetRouterHooks(router)
 	botsService.SetTextDraftPusher(router)
+	if tonFinalizerStore != nil {
+		finalizer, err := tonfinalizer.New(tonFinalizerStore, tonfinalizer.Config{
+			WorkerID: instanceID + ":ton-finalizer", Batch: cfg.StarGiftTONFinalizerBatch,
+			PollInterval: cfg.StarGiftTONFinalizerPollInterval, LeaseTimeout: cfg.StarGiftTONFinalizerLeaseTimeout,
+			RequestTimeout: cfg.StarGiftTONFinalizerRequestTimeout, RetryDelay: cfg.StarGiftTONFinalizerRetryDelay,
+			OnChanged: func(result domain.StarGiftTONFinalizationResult) {
+				router.InvalidateStarGiftProfiles(result.PreviousHost, result.Gift.Host)
+			},
+		}, logger.Named("ton").Named("finalizer"))
+		if err != nil {
+			return fmt.Errorf("init TON star gift finalizer: %w", err)
+		}
+		go func() {
+			if err := finalizer.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("TON star gift finalizer exited", zap.Error(err))
+			}
+		}()
+	}
 	bootstrapWake := make(chan struct{}, 1)
 	wakeBootstrap := func() {
 		select {
@@ -1481,21 +1634,25 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		return fmt.Errorf("start admin api: %w", err)
 	}
 	if _, err := web.Start(ctx, web.Config{
-		Addr:              cfg.PublicLinkWebAddr,
-		PublicBaseURL:     cfg.PublicBaseURL,
-		AppScheme:         cfg.PublicAppScheme,
-		AppLinkBase:       cfg.PublicAppLinkBase,
-		WebBaseURL:        cfg.PublicWebBaseURL,
-		AppName:           cfg.PublicAppName,
-		StickerSets:       filesService,
-		Users:             userStore,
-		Channels:          channelStore,
-		Privacy:           privacyService,
-		Photos:            filesService,
-		UniqueGifts:       giftsService,
-		GiftWithdrawals:   giftsService,
-		ModerationAppeals: moderationService,
-		TelegramLogin:     telegramLoginHTTPHandler,
+		Addr:               cfg.PublicLinkWebAddr,
+		PublicBaseURL:      cfg.PublicBaseURL,
+		AppScheme:          cfg.PublicAppScheme,
+		AppLinkBase:        cfg.PublicAppLinkBase,
+		WebBaseURL:         cfg.PublicWebBaseURL,
+		AppName:            cfg.PublicAppName,
+		StickerSets:        filesService,
+		Users:              userStore,
+		Channels:           channelStore,
+		Privacy:            privacyService,
+		Photos:             filesService,
+		UniqueGifts:        giftsService,
+		GiftWithdrawals:    giftsService,
+		RevenueWithdrawals: giftsService,
+		TONGiftExports:     tonExportService,
+		TONGiftClaims:      tonClaimService,
+		TONGiftFiles:       filesService,
+		ModerationAppeals:  moderationService,
+		TelegramLogin:      telegramLoginHTTPHandler,
 	}, logger.Named("public-web")); err != nil {
 		return fmt.Errorf("start public Web: %w", err)
 	}

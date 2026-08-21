@@ -21,6 +21,7 @@ const (
 	roleFile   configRole = "file"
 	roleSFU    configRole = "sfu"
 	roleAdmin  configRole = "admin"
+	roleTON    configRole = "ton"
 )
 
 type CommonYAML struct {

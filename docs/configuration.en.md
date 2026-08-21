@@ -4,12 +4,12 @@ Chinese version: [configuration.zh-CN.md](configuration.zh-CN.md)
 
 This document describes settings loaded by `internal/config`. Service entrypoints now use role-specific YAML files:
 `configs/edge.yaml`, `configs/core.yaml`, `configs/egress.yaml`, `configs/file.yaml`,
-`configs/sfu.yaml`, and `configs/admin.yaml`. Defaults and validation behavior in the corresponding role config Go files under
+`configs/sfu.yaml`, `configs/admin.yaml`, and `configs/ton.yaml`. Defaults and validation behavior in the corresponding role config Go files under
 `internal/config` are authoritative. All settings require a process restart; telesrv does not hot-reload configuration.
 
 ## 1. Loading, syntax, and precedence
 
-- `cmd/telesrv-edge|core|egress|file|sfu|admin` read `configs/<role>.yaml` by default. Use
+- `cmd/telesrv-edge|core|egress|file|sfu|admin|ton` read `configs/<role>.yaml` by default. Use
   `--config <path>` or process environment `TELESRV_CONFIG=<path>` to point a process at its own YAML file.
 - YAML is parsed strictly: unknown fields, invalid structure, and invalid duration values fail startup. Environment
   variables are no longer generic field overrides for service entrypoints; they are only expanded from YAML strings
@@ -21,7 +21,7 @@ This document describes settings loaded by `internal/config`. Service entrypoint
 - Never commit real passwords, tokens, private DSNs, or TURN secrets. Prefer a secret manager or protected service environment in production.
 
 The Go configuration boundary is role-scoped too: `internal/config/edge_config.go`, `core_config.go`,
-`egress_config.go`, `file_config.go`, `sfu_config.go`, and `admin_config.go` define the matching YAML schema, `Load<Role>()`, and runtime
+`egress_config.go`, `file_config.go`, `sfu_config.go`, `admin_config.go`, and `ton_config.go` define the matching YAML schema, `Load<Role>()`, and runtime
 config type. Production entrypoints and `internal/node/<role>` should not accept the global `config.Config`; the repository no longer exposes the old env-file entrypoint.
 
 ## 2. MTProto listener, transport, and resource budgets
@@ -131,7 +131,7 @@ Retained typed graphs remain charged to the RPC scheduler budget above.
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / empty | Optional host-based root for multi-server clients, for example `owpg://example.com`. When set, links use `owpg://example.com/oauth`, `owpg://example.com/<username>`, and equivalent route paths. Only exact `<custom-scheme>://<host>` values are accepted; ports, paths, queries, and fragments are rejected. `TELESRV_PUBLIC_APP_SCHEME` remains an accepted legacy input. |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | Web-client root used by public username pages. Same URL validation as `TELESRV_PUBLIC_BASE_URL`. |
 | `TELESRV_PUBLIC_APP_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | Public landing-page product name; trimmed, non-empty, no control characters, maximum 64 Unicode characters. |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Username/avatar/sticker/emoji/chatlist/collectible-gift landing pages plus the hash-only moderation appeal form. Empty disables it. Production should bind loopback behind exact nginx routes. Moderation `freeze_account` actions fail closed when this listener is disabled because telesrv cannot issue a reachable appeal URL. Local development can enable `127.0.0.1:2401` in `configs/core.yaml`. |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Username/avatar/sticker/emoji/chatlist/collectible-gift landing pages, the hash-only moderation appeal form, and short-lived unique-gift/channel-revenue confirmation pages. Empty disables the listener; moderation appeal issuance, local gift export, and channel revenue withdrawal then fail closed because no reachable confirmation URL exists. Public landing pages remain read-only; only exact bearer-token POST routes can commit their aggregate. Production should bind loopback behind exact nginx routes with token-route access logs disabled. Local development can enable `127.0.0.1:2401` in `configs/core.yaml`. |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | Mount the self-hosted Telegram Login/OIDC provider on `TELESRV_PUBLIC_LINK_WEB_ADDR`. Enabling it requires that listener and all key files below. |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | absolute origin URL / `TELESRV_PUBLIC_BASE_URL` | Exact public issuer used in discovery and tokens. HTTPS is required by default; paths, credentials, query, and fragment are rejected. The next setting permits any HTTP host/IP. |
 | `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP` | bool / `false` | When enabled, permits any valid HTTP issuer, BotFather Web origin, redirect URI, and native HTTP callback, without loopback, subnet, or port restrictions. When disabled, those Web URLs still require HTTPS. |
@@ -616,19 +616,68 @@ path. `TELESRV_PUBLIC_BASE_URL` must resolve to that proxy for moderation freeze
 | `TELESRV_STARS_STARTING_GRANT` | int64 / `1000` | Idempotent lazy starting Stars balance for all accounts; `0` disables automatic grant. |
 | `TELESRV_PREMIUM_SWEEP_INTERVAL` | duration / `1m` | Expired-premium cleanup/push interval. Read paths derive expiry independently. |
 | `TELESRV_PREMIUM_SWEEP_BATCH` | int / `500` | Maximum expired premium rows processed per sweep. |
-| `TELESRV_STARGIFT_SWEEP_INTERVAL` | duration / `15s` | Local Star Gift offer/auction lifecycle sweep interval; no blockchain connection is made. |
-| `TELESRV_STARGIFT_SWEEP_BATCH` | int / `1000` | Maximum offer/auction/outbox work claimed per lifecycle sweep. |
-| `TELESRV_STARGIFT_TON_STARTING_GRANT` | int64 / `10000000000` | Nanoton granted idempotently on a user's first access to the internal telesrv TON ledger; `0` disables it. This is not an on-chain asset. |
-| `TELESRV_STARGIFT_TRANSFER_STARS` | int64 / `25` | Stars charged for a collectible transfer; `0` enables the free-transfer RPC. |
-| `TELESRV_STARGIFT_DROP_DETAILS_STARS` | int64 / `25` | Stars charged to remove a collectible's original sender/message details. |
-| `TELESRV_STARGIFT_OFFER_MIN_STARS` | int / `1` | Minimum Stars offer snapshotted for user-owned collectibles; `0` disables the offer entry point. |
-| `TELESRV_STARGIFT_STARS_PROCEEDS_PERMILLE` | int / `1000` | Seller share in Stars sales, in permille; the remainder is recorded as platform commission. |
-| `TELESRV_STARGIFT_TON_PROCEEDS_PERMILLE` | int / `1000` | Seller share in internal-TON sales, in permille; this affects only the local ledger. |
-| `TELESRV_STARGIFT_EXPORT_DELAY` | duration / `0s` | Delay snapshotted into `can_export_at` when a collectible is issued. |
-| `TELESRV_STARGIFT_TRANSFER_DELAY` | duration / `0s` | Delay snapshotted into `can_transfer_at`. |
-| `TELESRV_STARGIFT_RESELL_DELAY` | duration / `0s` | Delay snapshotted into `can_resell_at`. |
-| `TELESRV_STARGIFT_CRAFT_DELAY` | duration / `0s` | Delay snapshotted into `can_craft_at`. |
-| `TELESRV_STARGIFT_CRAFT_CHANCE_PERMILLE` | int / `250` | Per-input local craft success contribution, capped at 1000 permille. |
+| `star_gifts.sweep_interval` | duration / `15s` | Core's local Star Gift offer/auction lifecycle sweep interval. |
+| `star_gifts.sweep_batch` | int / `1000` | Maximum offer/auction/outbox work claimed per lifecycle sweep. |
+| `star_gifts.ton_starting_grant` | int64 / `10000000000` | Nanoton granted idempotently on a user's first access to the internal telesrv TON ledger; `0` disables it. This is not an on-chain asset. |
+| `star_gifts.transfer_stars` | int64 / `25` | Stars charged for a collectible transfer; `0` enables the free-transfer RPC. |
+| `star_gifts.drop_original_details_stars` | int64 / `25` | Stars charged to remove a collectible's original sender/message details. |
+| `star_gifts.offer_min_stars` | int / `1` | Minimum Stars offer snapshotted for user-owned collectibles; `0` disables the offer entry point. |
+| `star_gifts.stars_proceeds_permille` | int / `1000` | Seller share in Stars sales, in permille; the remainder is recorded as platform commission. |
+| `star_gifts.ton_proceeds_permille` | int / `1000` | Seller share in internal-TON sales, in permille; this affects only the local ledger. |
+| `star_gifts.export_delay` | duration / `0s` | Delay snapshotted into `can_export_at` when a collectible is issued. |
+| `star_gifts.transfer_delay` | duration / `0s` | Delay snapshotted into `can_transfer_at`. |
+| `star_gifts.resell_delay` | duration / `0s` | Delay snapshotted into `can_resell_at`. |
+| `star_gifts.craft_delay` | duration / `0s` | Delay snapshotted into `can_craft_at`. |
+| `star_gifts.craft_chance_permille` | int / `250` | Per-input local craft success contribution, capped at 1000 permille. |
+| `star_gifts.export.mode` | `local` / `ton` / `disabled`; default `local` | `local` preserves the current same-origin gift export, `disabled` disables only gift export, and `ton` delegates to the isolated TON worker. None of these modes disables channel Stars/internal-TON revenue claims. A TON worker that fails admission must fail closed instead of falling back to local export. |
+
+Core reads the following `star_gifts.export.ton` keys only when `mode: ton` activates the production chain flow:
+
+| YAML setting | Type / code default | Description and constraints |
+|---|---|---|
+| `network` | `mainnet` / `testnet`; default `mainnet` | Core intents, TON Proof, and the worker must use the same network. Set it explicitly in production. |
+| `collection_address` | string / required | Fixed TEP-62 collection address; it must match the worker. |
+| `collection_code_hash` | 32-byte hex/Base64 / required | Collection code hash. Core compares it with the durable admission written after the worker's chain preflight. |
+| `mint_abi` | `basic-collection-v1` / required | Single-item mint ABI for the TON reference collection (opcode `0x00000001`). TEP-62 does not define a mint opcode; other values fail startup. |
+| `initial_item_index` | uint64 decimal string / required | First telesrv-managed item index. Never move it backward or reuse it after rollout. |
+| `proof_domain` | hostname / required | TON Connect proof domain; it must match the public Export/Claim Web host. |
+| `capability_secret_file` | path / required | File contents are Base64 and must decode to 32--64 bytes. Never reuse the claim bot token or relayer mnemonic. |
+| `allow_user_ids` | positive int64 sequence / empty | Empty admits all otherwise eligible users; non-empty is the mainnet canary allowlist for new intents. Duplicates and non-positive IDs fail startup. Existing intent confirmation/finalization/owner sync remains active. |
+| `ttl` | duration / `30m` | Export capability lifetime, constrained to `5m..24h`. |
+| `challenge_ttl` | duration / `5m` | Export/Claim TON Proof challenge lifetime, constrained to `1m..10m`. |
+| `finalizer.batch` | int / `20` | Core finalize/sync-owner jobs claimed per cycle, constrained to `1..100`. |
+| `finalizer.poll_interval` | duration / `2s` | Positive Core finalizer polling interval. |
+| `finalizer.lease_timeout` | duration / `30s` | Core job lease, constrained to `10s..1h`. |
+| `finalizer.request_timeout` | duration / `10s` | Per-job timeout, at least `1s` and shorter than the lease. |
+| `finalizer.retry_delay` | duration / `5s` | Positive retry backoff. |
+| `claim.enabled` | bool / `false` | Enables the `/ton-gift/claim` Mini App. |
+| `claim.bot_token_file` | path / required when claim is enabled | The file must contain exactly one current active local bot token. Core verifies the bot ID/secret and idempotently configures its main/side/attach menu app; mismatch fails startup. |
+| `claim.init_data_ttl` | duration / `15m` | Maximum Telegram Mini App `tgWebAppData` age, constrained to `1m..24h`. |
+
+The isolated worker runs as `cmd/telesrv-ton --config configs/ton.yaml`:
+
+| YAML setting | Type / code default | Description and constraints |
+|---|---|---|
+| `ton.network` | `mainnet` / `testnet`; required | Must match the Core intent network. |
+| `ton.lite_servers[]` | address + public_key; at least one | Fixed lite endpoints and public keys; duplicates and empty values fail startup. |
+| `ton.trusted_block` | masterchain block ID | Requires `workchain: -1`, non-zero shard/seqno, root hash, and file hash. |
+| `ton.collection.address` / `code_hash` | string / required | Startup preflight verifies active collection code; every job rechecks the export collection. |
+| `ton.collection.mint_abi` | `basic-collection-v1` / required | Fixed mint payload ABI that must match Core, every export, and durable admission. |
+| `ton.collection.initial_item_index` | uint64 decimal string / required | Must equal the on-chain `next_item_index` at first rollout and remains the immutable admission baseline. Allocation occurs only after wallet proof succeeds. |
+| `ton.relayer.mnemonic_file` | path / required when mint is enabled | Exactly 24 words for a v4r2 relayer. A read-only worker may omit it. Never commit this file. |
+| `ton.relayer.min_balance` | TON decimal / `1` | Mint preflight reserve, greater than zero. |
+| `ton.relayer.message_ttl` | duration / `15m` | Signed external-message lifetime, at least twice request timeout and no more than `1h`. |
+| `ton.mint.enabled` | bool / `false` | `false` withdraws durable admission for new intents/proofs and stops mint jobs. Already allocated resolve-item, confirmation, and owner reconciliation can continue. This is the incident write-stop. |
+| `ton.mint.send_amount` / `forward_amount` | TON decimal / `0.05`, `0.01` | Collection send and item forward values with at most 9 decimals; send amount must be positive. |
+| `ton.mint.finality_depth` | int / `12` | Masterchain finality depth, constrained to `1..1000`. |
+| `ton.worker.batch` | int / `10` | Jobs claimed per cycle, constrained to `1..100`. |
+| `ton.worker.poll_interval` | duration / `2s` | Constrained to `100ms..1m`. |
+| `ton.worker.lease_timeout` | duration / `2m` | Constrained to `10s..1h`. |
+| `ton.worker.request_timeout` | duration / `90s` | At least `1s` and shorter than the lease. |
+
+Secret-free full examples are in `configs/examples/core.ton-mainnet.yaml` and `configs/examples/ton.mainnet.yaml`.
+Before production, complete the pinned checkpoint, code-hash, testnet, write-stop, single-user canary, reconciliation,
+and rollback gates described by these settings; do not enable minting from the examples unchanged.
 
 ### Composite account rating and collectible usernames
 
@@ -794,4 +843,4 @@ that cannot do what it says fails startup instead of being silently unreachable.
 
 ## 12. Production minimum checklist
 
-At minimum, production operators should explicitly review and override the development credentials/endpoints: PostgreSQL DSN and TLS, Redis password/network exposure, RSA key persistence, fixed development auth code exposure, Admin credentials/session key, OTP Webhook/SMTP secrets, AI/Mapbox API keys, CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS, TURN secret and firewall ports, public URLs/scheme alignment, and non-loopback SFU/TURN advertise addresses for real devices.
+At minimum, production operators should explicitly review and override the development credentials/endpoints: PostgreSQL DSN and TLS, Redis password/network exposure, RSA key persistence, fixed development auth code exposure, Admin credentials/session key, OTP Webhook/SMTP secrets, AI/Mapbox API keys, CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS, TURN secret and firewall ports, public URLs/scheme alignment, and non-loopback SFU/TURN advertise addresses for real devices. TON Star Gift rollout additionally requires pinned lite servers/checkpoint/collection code hash, separate capability/bot/relayer secrets, a one-user allowlist, a `mint.enabled: false` preflight, and complete testnet/canary/rollback gates.

@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 
 	"github.com/iamxvbaba/td/tg"
 
@@ -14,14 +15,12 @@ func (r *Router) RevokeAuthorizationAuthKey(ctx context.Context, authKeyID [8]by
 	if r == nil || authKeyID == ([8]byte{}) {
 		return nil
 	}
-	r.revokeAuthKeySessions(authKeyID)
-	if err := r.clearAuthKeyState(ctx, authKeyID); err != nil {
-		return err
-	}
+	revokeErr := r.revokeAuthKeySessionsBounded(ctx, authKeyID)
+	clearErr := r.clearAuthKeyState(ctx, authKeyID)
 	if userID != 0 {
 		r.discardSecretChatsForAuthKey(ctx, businessAuthKeyInt64(authKeyID), userID)
 	}
-	return nil
+	return errors.Join(revokeErr, clearErr)
 }
 
 // NotifyChannelChanged is the domain-only hook used by the internal Admin API

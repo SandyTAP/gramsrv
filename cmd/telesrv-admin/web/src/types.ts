@@ -38,8 +38,8 @@ export type RestrictionRow = {
 };
 
 export type AuthorizationRow = {
-  AuthKeyID: number;
-  Hash: number;
+  AuthKeyID: string;
+  Hash: string;
   Layer: number;
   DeviceModel: string;
   Platform: string;
@@ -843,7 +843,7 @@ export type StickerSetRow = {
   CoverDocumentID: string;
 };
 
-export type StickerSetListResponse = { rows: StickerSetRow[] };
+export type StickerSetListResponse = { rows: StickerSetRow[]; max_items: number };
 
 export type AccountListResponse = {
   query: string;

@@ -69,6 +69,11 @@ media:
   external_media_enable: true
   web_page_preview_enable: true
 
+star_gifts:
+  # local preserves the existing same-origin export flow; ton is opt-in.
+  export:
+    mode: local
+
 storage:
   blob_backend: localfs
   blob_dir: data/blobs

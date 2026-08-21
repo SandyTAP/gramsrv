@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type CoreConfigYAML struct {
 	TelegramLogin TelegramLoginYAML `yaml:"telegram_login"`
 	AI            AIYAML            `yaml:"ai"`
 	Translation   TranslationYAML   `yaml:"translation"`
+	StarGifts     StarGiftsYAML     `yaml:"star_gifts"`
 	Storage       StorageYAML       `yaml:"storage"`
 }
 
@@ -69,6 +71,57 @@ type MediaYAML struct {
 	WebPagePreviewEnable     *bool  `yaml:"web_page_preview_enable"`
 	WebPagePreviewMaxBytes   *int64 `yaml:"web_page_preview_max_bytes"`
 	WebPagePreviewRatePerMin *int   `yaml:"web_page_preview_rate_per_min"`
+}
+
+type StarGiftsYAML struct {
+	TONStartingGrant         *int64             `yaml:"ton_starting_grant"`
+	SweepInterval            string             `yaml:"sweep_interval"`
+	SweepBatch               *int               `yaml:"sweep_batch"`
+	TransferStars            *int64             `yaml:"transfer_stars"`
+	DropOriginalDetailsStars *int64             `yaml:"drop_original_details_stars"`
+	OfferMinStars            *int               `yaml:"offer_min_stars"`
+	StarsProceedsPermille    *int               `yaml:"stars_proceeds_permille"`
+	TONProceedsPermille      *int               `yaml:"ton_proceeds_permille"`
+	ExportDelay              string             `yaml:"export_delay"`
+	TransferDelay            string             `yaml:"transfer_delay"`
+	ResellDelay              string             `yaml:"resell_delay"`
+	CraftDelay               string             `yaml:"craft_delay"`
+	CraftChancePermille      *int               `yaml:"craft_chance_permille"`
+	Export                   StarGiftExportYAML `yaml:"export"`
+}
+
+type StarGiftExportYAML struct {
+	Mode string                `yaml:"mode"`
+	TON  StarGiftExportTONYAML `yaml:"ton"`
+}
+
+type StarGiftExportTONYAML struct {
+	Network              string                   `yaml:"network"`
+	CollectionAddress    string                   `yaml:"collection_address"`
+	CollectionCodeHash   string                   `yaml:"collection_code_hash"`
+	MintABI              string                   `yaml:"mint_abi"`
+	InitialItemIndex     string                   `yaml:"initial_item_index"`
+	ProofDomain          string                   `yaml:"proof_domain"`
+	CapabilitySecretFile string                   `yaml:"capability_secret_file"`
+	AllowUserIDs         []int64                  `yaml:"allow_user_ids"`
+	TTL                  string                   `yaml:"ttl"`
+	ChallengeTTL         string                   `yaml:"challenge_ttl"`
+	Finalizer            StarGiftTONFinalizerYAML `yaml:"finalizer"`
+	Claim                StarGiftTONClaimYAML     `yaml:"claim"`
+}
+
+type StarGiftTONFinalizerYAML struct {
+	Batch          *int   `yaml:"batch"`
+	PollInterval   string `yaml:"poll_interval"`
+	LeaseTimeout   string `yaml:"lease_timeout"`
+	RequestTimeout string `yaml:"request_timeout"`
+	RetryDelay     string `yaml:"retry_delay"`
+}
+
+type StarGiftTONClaimYAML struct {
+	Enabled      *bool  `yaml:"enabled"`
+	BotTokenFile string `yaml:"bot_token_file"`
+	InitDataTTL  string `yaml:"init_data_ttl"`
 }
 
 type SeedsYAML struct {
@@ -187,223 +240,242 @@ type LiveStreamYAML struct {
 }
 
 type CoreConfig struct {
-	AdvertiseIP                       string
-	AdvertisePort                     int
-	DC                                int
-	DefaultCountryCode                string
-	DebugAddr                         string
-	BotAPIAddr                        string
-	AdminAPIAddr                      string
-	AdminAPIToken                     string
-	GroupCallControlAddr              string
-	GroupCallControlToken             string
-	CoreExecGRPCAddr                  string
-	CoreExecGRPCTLSCertFile           string
-	CoreExecGRPCTLSKeyFile            string
-	CoreExecGRPCTLSClientCAFile       string
-	CoreExecToken                     string
-	FileGRPCTargets                   string
-	FileGRPCResolver                  string
-	FileGRPCRequestTimeout            time.Duration
-	FileGRPCTLSCAFile                 string
-	FileGRPCTLSServerName             string
-	FileGRPCTLSClientCertFile         string
-	FileGRPCTLSClientKeyFile          string
-	FileToken                         string
-	PublicBaseURL                     string
-	Branding                          branding.Config
-	UpdatePublicURL                   string
-	UpdateServiceURL                  string
-	UpdateRequestTimeout              time.Duration
-	PublicAppScheme                   string
-	PublicAppLinkBase                 string
-	PublicWebBaseURL                  string
-	PublicAppName                     string
-	PublicLinkWebAddr                 string
-	TelegramLoginEnabled              bool
-	TelegramLoginIssuer               string
-	TelegramLoginAllowHTTP            bool
-	TelegramLoginSigningKeysFile      string
-	TelegramLoginCodeKeysFile         string
-	TelegramLoginSecretPepperFile     string
-	TelegramLoginRequestTTL           time.Duration
-	TelegramLoginCodeTTL              time.Duration
-	TelegramLoginIDTokenTTL           time.Duration
-	TelegramLoginTrustedProxyCIDRs    []string
-	TelegramLoginRetention            time.Duration
-	TelegramLoginSweepInterval        time.Duration
-	TelegramLoginSweepBatch           int
-	AdminScopedTokens                 []AdminScopedToken
-	PostgresDSN                       string
-	PostgresMaxConns                  int
-	PostgresMinConns                  int
-	RedisAddr                         string
-	RedisPassword                     string
-	RedisDB                           int
-	InstanceID                        string
-	DevAuthCode                       string
-	AuthCodeTTL                       time.Duration
-	PhoneCodeLength                   int
-	AuthCodeMaxAttempts               int
-	AuthCodePhoneRateLimit            int
-	AuthCodeAuthKeyRateLimit          int
-	AuthCodeRateWindow                time.Duration
-	LoginEmailEnable                  bool
-	LoginEmailRequireSetup            bool
-	LoginEmailCodeLength              int
-	PhoneCodeDeliveryProvider         string
-	EmailCodeDeliveryProvider         string
-	OTPWebhookURL                     string
-	OTPWebhookSecret                  string
-	OTPWebhookTimeout                 time.Duration
-	SMTPHost                          string
-	SMTPPort                          int
-	SMTPUsername                      string
-	SMTPPassword                      string
-	SMTPFrom                          string
-	SMTPFromName                      string
-	SMTPTLSMode                       string
-	SMTPTimeout                       time.Duration
-	MapboxToken                       string
-	MapTileCacheDir                   string
-	ExternalMediaEnable               bool
-	ExternalMediaMaxBytes             int64
-	ExternalMediaRatePerMin           int
-	WebPagePreviewEnable              bool
-	WebPagePreviewMaxBytes            int64
-	WebPagePreviewRatePerMin          int
-	LangPackSeedDir                   string
-	OfficialGiftsDir                  string
-	StarGiftTONStartingGrant          int64
-	StickerSeedDir                    string
-	GifSeedDir                        string
-	StickerSeedMaxSets                int
-	PremiumPromoSeedDir               string
-	BusinessAIProvider                string
-	AIEnabled                         bool
-	AIProviders                       []AIProviderConfig
-	AITimeout                         time.Duration
-	AIRateLimit                       int
-	AIRateWindow                      time.Duration
-	AIPrivacyLogContent               bool
-	TranslationEnabled                bool
-	TranslationProviders              []string
-	TranslationTimeout                time.Duration
-	TranslationRateLimit              int
-	TranslationRateWindow             time.Duration
-	TempKeyResolveCacheMaxEntries     int
-	TempKeyResolveCacheTTL            time.Duration
-	AuthUserCacheTTL                  time.Duration
-	ChannelRowCacheMaxEntries         int
-	ChannelMemberCacheMaxEntries      int
-	ChannelDialogCacheMaxEntries      int
-	ChannelBoostCacheMaxEntries       int
-	ChannelBoostCacheTTL              time.Duration
-	OutboxLeaseTimeout                time.Duration
-	OutboxPoisonRetention             time.Duration
-	OutboxPoisonCleanupInterval       time.Duration
-	OutboundPushTimeout               time.Duration
-	SendRateLimit                     int
-	SendRateWindow                    time.Duration
-	CatchupRateLimit                  int
-	CatchupRateWindow                 time.Duration
-	ChannelNudgeMaxTargets            int
-	UpdateEventRetention              time.Duration
-	BotAPIUpdateRetention             time.Duration
-	OrphanAuthKeyRetention            time.Duration
-	RetentionInterval                 time.Duration
-	RetentionBatch                    int
-	UploadInFlightMaxBytes            int64
-	UploadInFlightMaxParts            int
-	UploadInFlightMaxFiles            int
-	CallRingTimeout                   time.Duration
-	CallTombstoneTTL                  time.Duration
-	CallMaxActivePerUser              int
-	CallRegistryMaxEntries            int
-	CallSignalingMaxBytes             int
-	CallSignalingRate                 int
-	CallExpiryInterval                time.Duration
-	PremiumGrantMonths                int
-	PremiumBotUsername                string
-	PremiumBotUserID                  int64
-	PremiumPlans                      []domain.PremiumPlan
-	PasskeyRPID                       string
-	PasskeyAllowedOrigins             []string
-	StarsStartingGrant                int64
-	PremiumSweepInterval              time.Duration
-	PremiumSweepBatch                 int
-	StarGiftSweepInterval             time.Duration
-	StarGiftSweepBatch                int
-	StarGiftTransferStars             int64
-	StarGiftDropOriginalDetailsStars  int64
-	StarGiftOfferMinStars             int
-	StarGiftStarsProceedsPermille     int
-	StarGiftTONProceedsPermille       int
-	StarGiftExportDelay               time.Duration
-	StarGiftTransferDelay             time.Duration
-	StarGiftResellDelay               time.Duration
-	StarGiftCraftDelay                time.Duration
-	StarGiftCraftChancePermille       int
-	RatingEnabled                     bool
-	RatingPendingDelay                time.Duration
-	RatingRecomputeInterval           time.Duration
-	RatingRecomputeBatch              int
-	RatingStaleAfter                  time.Duration
-	RatingWeightStarsReceivedPermille int64
-	RatingWeightStarsSpentPermille    int64
-	RatingWeightMessageSent           int64
-	RatingWeightAccountAgeDay         int64
-	RatingWeightGiftReceived          int64
-	RatingWeightModerationCase        int64
-	RatingWeightScamPenalty           int64
-	RatingWeightFakePenalty           int64
-	RatingActivityCap                 int64
-	VerificationEnabled               bool
-	VerificationAllowUserTargets      bool
-	VerificationRejectCooldown        time.Duration
-	VerificationApplyRateLimit        int
-	VerificationApplyRateWindow       time.Duration
-	VerificationBotRateLimit          int
-	VerificationBotRateWindow         time.Duration
-	VerificationNotifyInterval        time.Duration
-	VerificationNotifyBatch           int
-	BroadcastWorkerInterval           time.Duration
-	BroadcastWorkerLease              time.Duration
-	BroadcastMaterializeBatch         int
-	BroadcastDeliveryBatch            int
-	VerificationMaxActivePerUser      int
-	BotVerificationEnabled            bool
-	BotVerificationMaxPerVerifier     int
-	BotVerificationRequestRateLimit   int
-	BotVerificationRequestRateWindow  time.Duration
-	CollectibleUsernameURLTemplate    string
-	GroupCallCheckTTL                 time.Duration
-	GroupCallSweepInterval            time.Duration
-	GroupCallMaxParticipants          int
-	TURNEnable                        bool
-	TURNUDPPort                       int
-	TURNAdvertiseIP                   string
-	TURNSecret                        string
-	TURNRelayMinPort                  int
-	TURNRelayMaxPort                  int
-	CallTURNCredentialTTL             time.Duration
-	CallForceRelay                    bool
-	LiveStreamEnable                  bool
-	LiveStreamRtmpAddr                string
-	LiveStreamRtmpURL                 string
-	LiveStreamFFmpegPath              string
-	LiveStreamWorkDir                 string
-	LiveStreamSegmentKeep             int
-	SFUAdvertiseIP                    string
-	SFUOwnerTTL                       time.Duration
-	SFUOwnerHeartbeatInterval         time.Duration
-	SFUInstanceHealthTimeout          time.Duration
-	SFUControlGRPCRequestTimeout      time.Duration
-	SFUControlGRPCTLSCAFile           string
-	SFUControlGRPCTLSServerName       string
-	SFUControlGRPCTLSClientCertFile   string
-	SFUControlGRPCTLSClientKeyFile    string
-	SFUControlToken                   string
+	AdvertiseIP                        string
+	AdvertisePort                      int
+	DC                                 int
+	DefaultCountryCode                 string
+	DebugAddr                          string
+	BotAPIAddr                         string
+	AdminAPIAddr                       string
+	AdminAPIToken                      string
+	GroupCallControlAddr               string
+	GroupCallControlToken              string
+	CoreExecGRPCAddr                   string
+	CoreExecGRPCTLSCertFile            string
+	CoreExecGRPCTLSKeyFile             string
+	CoreExecGRPCTLSClientCAFile        string
+	CoreExecToken                      string
+	FileGRPCTargets                    string
+	FileGRPCResolver                   string
+	FileGRPCRequestTimeout             time.Duration
+	FileGRPCTLSCAFile                  string
+	FileGRPCTLSServerName              string
+	FileGRPCTLSClientCertFile          string
+	FileGRPCTLSClientKeyFile           string
+	FileToken                          string
+	PublicBaseURL                      string
+	Branding                           branding.Config
+	UpdatePublicURL                    string
+	UpdateServiceURL                   string
+	UpdateRequestTimeout               time.Duration
+	PublicAppScheme                    string
+	PublicAppLinkBase                  string
+	PublicWebBaseURL                   string
+	PublicAppName                      string
+	PublicLinkWebAddr                  string
+	TelegramLoginEnabled               bool
+	TelegramLoginIssuer                string
+	TelegramLoginAllowHTTP             bool
+	TelegramLoginSigningKeysFile       string
+	TelegramLoginCodeKeysFile          string
+	TelegramLoginSecretPepperFile      string
+	TelegramLoginRequestTTL            time.Duration
+	TelegramLoginCodeTTL               time.Duration
+	TelegramLoginIDTokenTTL            time.Duration
+	TelegramLoginTrustedProxyCIDRs     []string
+	TelegramLoginRetention             time.Duration
+	TelegramLoginSweepInterval         time.Duration
+	TelegramLoginSweepBatch            int
+	AdminScopedTokens                  []AdminScopedToken
+	PostgresDSN                        string
+	PostgresMaxConns                   int
+	PostgresMinConns                   int
+	RedisAddr                          string
+	RedisPassword                      string
+	RedisDB                            int
+	InstanceID                         string
+	DevAuthCode                        string
+	AuthCodeTTL                        time.Duration
+	PhoneCodeLength                    int
+	AuthCodeMaxAttempts                int
+	AuthCodePhoneRateLimit             int
+	AuthCodeAuthKeyRateLimit           int
+	AuthCodeRateWindow                 time.Duration
+	LoginEmailEnable                   bool
+	LoginEmailRequireSetup             bool
+	LoginEmailCodeLength               int
+	PhoneCodeDeliveryProvider          string
+	EmailCodeDeliveryProvider          string
+	OTPWebhookURL                      string
+	OTPWebhookSecret                   string
+	OTPWebhookTimeout                  time.Duration
+	SMTPHost                           string
+	SMTPPort                           int
+	SMTPUsername                       string
+	SMTPPassword                       string
+	SMTPFrom                           string
+	SMTPFromName                       string
+	SMTPTLSMode                        string
+	SMTPTimeout                        time.Duration
+	MapboxToken                        string
+	MapTileCacheDir                    string
+	ExternalMediaEnable                bool
+	ExternalMediaMaxBytes              int64
+	ExternalMediaRatePerMin            int
+	WebPagePreviewEnable               bool
+	WebPagePreviewMaxBytes             int64
+	WebPagePreviewRatePerMin           int
+	LangPackSeedDir                    string
+	OfficialGiftsDir                   string
+	StarGiftTONStartingGrant           int64
+	StickerSeedDir                     string
+	GifSeedDir                         string
+	StickerSeedMaxSets                 int
+	PremiumPromoSeedDir                string
+	BusinessAIProvider                 string
+	AIEnabled                          bool
+	AIProviders                        []AIProviderConfig
+	AITimeout                          time.Duration
+	AIRateLimit                        int
+	AIRateWindow                       time.Duration
+	AIPrivacyLogContent                bool
+	TranslationEnabled                 bool
+	TranslationProviders               []string
+	TranslationTimeout                 time.Duration
+	TranslationRateLimit               int
+	TranslationRateWindow              time.Duration
+	TempKeyResolveCacheMaxEntries      int
+	TempKeyResolveCacheTTL             time.Duration
+	AuthUserCacheTTL                   time.Duration
+	ChannelRowCacheMaxEntries          int
+	ChannelMemberCacheMaxEntries       int
+	ChannelDialogCacheMaxEntries       int
+	ChannelBoostCacheMaxEntries        int
+	ChannelBoostCacheTTL               time.Duration
+	OutboxLeaseTimeout                 time.Duration
+	OutboxPoisonRetention              time.Duration
+	OutboxPoisonCleanupInterval        time.Duration
+	OutboundPushTimeout                time.Duration
+	SendRateLimit                      int
+	SendRateWindow                     time.Duration
+	CatchupRateLimit                   int
+	CatchupRateWindow                  time.Duration
+	ChannelNudgeMaxTargets             int
+	UpdateEventRetention               time.Duration
+	BotAPIUpdateRetention              time.Duration
+	OrphanAuthKeyRetention             time.Duration
+	RetentionInterval                  time.Duration
+	RetentionBatch                     int
+	UploadInFlightMaxBytes             int64
+	UploadInFlightMaxParts             int
+	UploadInFlightMaxFiles             int
+	CallRingTimeout                    time.Duration
+	CallTombstoneTTL                   time.Duration
+	CallMaxActivePerUser               int
+	CallRegistryMaxEntries             int
+	CallSignalingMaxBytes              int
+	CallSignalingRate                  int
+	CallExpiryInterval                 time.Duration
+	PremiumGrantMonths                 int
+	PremiumBotUsername                 string
+	PremiumBotUserID                   int64
+	PremiumPlans                       []domain.PremiumPlan
+	PasskeyRPID                        string
+	PasskeyAllowedOrigins              []string
+	StarsStartingGrant                 int64
+	PremiumSweepInterval               time.Duration
+	PremiumSweepBatch                  int
+	StarGiftSweepInterval              time.Duration
+	StarGiftSweepBatch                 int
+	StarGiftTransferStars              int64
+	StarGiftDropOriginalDetailsStars   int64
+	StarGiftOfferMinStars              int
+	StarGiftStarsProceedsPermille      int
+	StarGiftTONProceedsPermille        int
+	StarGiftExportDelay                time.Duration
+	StarGiftTransferDelay              time.Duration
+	StarGiftResellDelay                time.Duration
+	StarGiftCraftDelay                 time.Duration
+	StarGiftCraftChancePermille        int
+	StarGiftExportMode                 string
+	StarGiftTONNetwork                 string
+	StarGiftTONCollectionAddress       string
+	StarGiftTONCollectionCodeHash      string
+	StarGiftTONMintABI                 string
+	StarGiftTONInitialItemIndex        string
+	StarGiftTONProofDomain             string
+	StarGiftTONCapabilitySecretFile    string
+	StarGiftTONAllowUserIDs            []int64
+	StarGiftTONExportTTL               time.Duration
+	StarGiftTONChallengeTTL            time.Duration
+	StarGiftTONFinalizerBatch          int
+	StarGiftTONFinalizerPollInterval   time.Duration
+	StarGiftTONFinalizerLeaseTimeout   time.Duration
+	StarGiftTONFinalizerRequestTimeout time.Duration
+	StarGiftTONFinalizerRetryDelay     time.Duration
+	StarGiftTONClaimEnabled            bool
+	StarGiftTONClaimBotTokenFile       string
+	StarGiftTONClaimInitDataTTL        time.Duration
+	RatingEnabled                      bool
+	RatingPendingDelay                 time.Duration
+	RatingRecomputeInterval            time.Duration
+	RatingRecomputeBatch               int
+	RatingStaleAfter                   time.Duration
+	RatingWeightStarsReceivedPermille  int64
+	RatingWeightStarsSpentPermille     int64
+	RatingWeightMessageSent            int64
+	RatingWeightAccountAgeDay          int64
+	RatingWeightGiftReceived           int64
+	RatingWeightModerationCase         int64
+	RatingWeightScamPenalty            int64
+	RatingWeightFakePenalty            int64
+	RatingActivityCap                  int64
+	VerificationEnabled                bool
+	VerificationAllowUserTargets       bool
+	VerificationRejectCooldown         time.Duration
+	VerificationApplyRateLimit         int
+	VerificationApplyRateWindow        time.Duration
+	VerificationBotRateLimit           int
+	VerificationBotRateWindow          time.Duration
+	VerificationNotifyInterval         time.Duration
+	VerificationNotifyBatch            int
+	BroadcastWorkerInterval            time.Duration
+	BroadcastWorkerLease               time.Duration
+	BroadcastMaterializeBatch          int
+	BroadcastDeliveryBatch             int
+	VerificationMaxActivePerUser       int
+	BotVerificationEnabled             bool
+	BotVerificationMaxPerVerifier      int
+	BotVerificationRequestRateLimit    int
+	BotVerificationRequestRateWindow   time.Duration
+	CollectibleUsernameURLTemplate     string
+	GroupCallCheckTTL                  time.Duration
+	GroupCallSweepInterval             time.Duration
+	GroupCallMaxParticipants           int
+	TURNEnable                         bool
+	TURNUDPPort                        int
+	TURNAdvertiseIP                    string
+	TURNSecret                         string
+	TURNRelayMinPort                   int
+	TURNRelayMaxPort                   int
+	CallTURNCredentialTTL              time.Duration
+	CallForceRelay                     bool
+	LiveStreamEnable                   bool
+	LiveStreamRtmpAddr                 string
+	LiveStreamRtmpURL                  string
+	LiveStreamFFmpegPath               string
+	LiveStreamWorkDir                  string
+	LiveStreamSegmentKeep              int
+	SFUAdvertiseIP                     string
+	SFUOwnerTTL                        time.Duration
+	SFUOwnerHeartbeatInterval          time.Duration
+	SFUInstanceHealthTimeout           time.Duration
+	SFUControlGRPCRequestTimeout       time.Duration
+	SFUControlGRPCTLSCAFile            string
+	SFUControlGRPCTLSServerName        string
+	SFUControlGRPCTLSClientCertFile    string
+	SFUControlGRPCTLSClientKeyFile     string
+	SFUControlToken                    string
 }
 
 func (c CoreConfig) ProcessGlobals() ProcessGlobals {
@@ -430,228 +502,247 @@ func (c CoreConfig) AccountRatingWeights() domain.AccountRatingWeights {
 
 func coreConfigFromConfig(c Config) CoreConfig {
 	return CoreConfig{
-		AdvertiseIP:                       c.AdvertiseIP,
-		AdvertisePort:                     c.AdvertisePort,
-		DC:                                c.DC,
-		DefaultCountryCode:                c.DefaultCountryCode,
-		DebugAddr:                         c.DebugAddr,
-		BotAPIAddr:                        c.BotAPIAddr,
-		AdminAPIAddr:                      c.AdminAPIAddr,
-		AdminAPIToken:                     c.AdminAPIToken,
-		GroupCallControlAddr:              c.GroupCallControlAddr,
-		GroupCallControlToken:             c.GroupCallControlToken,
-		CoreExecGRPCAddr:                  c.CoreExecGRPCAddr,
-		CoreExecGRPCTLSCertFile:           c.CoreExecGRPCTLSCertFile,
-		CoreExecGRPCTLSKeyFile:            c.CoreExecGRPCTLSKeyFile,
-		CoreExecGRPCTLSClientCAFile:       c.CoreExecGRPCTLSClientCAFile,
-		CoreExecToken:                     c.CoreExecToken,
-		FileGRPCTargets:                   c.FileGRPCTargets,
-		FileGRPCResolver:                  c.FileGRPCResolver,
-		FileGRPCRequestTimeout:            c.FileGRPCRequestTimeout,
-		FileGRPCTLSCAFile:                 c.FileGRPCTLSCAFile,
-		FileGRPCTLSServerName:             c.FileGRPCTLSServerName,
-		FileGRPCTLSClientCertFile:         c.FileGRPCTLSClientCertFile,
-		FileGRPCTLSClientKeyFile:          c.FileGRPCTLSClientKeyFile,
-		FileToken:                         c.FileToken,
-		PublicBaseURL:                     c.PublicBaseURL,
-		Branding:                          c.Branding,
-		UpdatePublicURL:                   c.UpdatePublicURL,
-		UpdateServiceURL:                  c.UpdateServiceURL,
-		UpdateRequestTimeout:              c.UpdateRequestTimeout,
-		PublicAppScheme:                   c.PublicAppScheme,
-		PublicAppLinkBase:                 c.PublicAppLinkBase,
-		PublicWebBaseURL:                  c.PublicWebBaseURL,
-		PublicAppName:                     c.PublicAppName,
-		PublicLinkWebAddr:                 c.PublicLinkWebAddr,
-		TelegramLoginEnabled:              c.TelegramLoginEnabled,
-		TelegramLoginIssuer:               c.TelegramLoginIssuer,
-		TelegramLoginAllowHTTP:            c.TelegramLoginAllowHTTP,
-		TelegramLoginSigningKeysFile:      c.TelegramLoginSigningKeysFile,
-		TelegramLoginCodeKeysFile:         c.TelegramLoginCodeKeysFile,
-		TelegramLoginSecretPepperFile:     c.TelegramLoginSecretPepperFile,
-		TelegramLoginRequestTTL:           c.TelegramLoginRequestTTL,
-		TelegramLoginCodeTTL:              c.TelegramLoginCodeTTL,
-		TelegramLoginIDTokenTTL:           c.TelegramLoginIDTokenTTL,
-		TelegramLoginTrustedProxyCIDRs:    append([]string(nil), c.TelegramLoginTrustedProxyCIDRs...),
-		TelegramLoginRetention:            c.TelegramLoginRetention,
-		TelegramLoginSweepInterval:        c.TelegramLoginSweepInterval,
-		TelegramLoginSweepBatch:           c.TelegramLoginSweepBatch,
-		AdminScopedTokens:                 append([]AdminScopedToken(nil), c.AdminScopedTokens...),
-		PostgresDSN:                       c.PostgresDSN,
-		PostgresMaxConns:                  c.PostgresMaxConns,
-		PostgresMinConns:                  c.PostgresMinConns,
-		RedisAddr:                         c.RedisAddr,
-		RedisPassword:                     c.RedisPassword,
-		RedisDB:                           c.RedisDB,
-		InstanceID:                        c.InstanceID,
-		DevAuthCode:                       c.DevAuthCode,
-		AuthCodeTTL:                       c.AuthCodeTTL,
-		PhoneCodeLength:                   c.PhoneCodeLength,
-		AuthCodeMaxAttempts:               c.AuthCodeMaxAttempts,
-		AuthCodePhoneRateLimit:            c.AuthCodePhoneRateLimit,
-		AuthCodeAuthKeyRateLimit:          c.AuthCodeAuthKeyRateLimit,
-		AuthCodeRateWindow:                c.AuthCodeRateWindow,
-		LoginEmailEnable:                  c.LoginEmailEnable,
-		LoginEmailRequireSetup:            c.LoginEmailRequireSetup,
-		LoginEmailCodeLength:              c.LoginEmailCodeLength,
-		PhoneCodeDeliveryProvider:         c.PhoneCodeDeliveryProvider,
-		EmailCodeDeliveryProvider:         c.EmailCodeDeliveryProvider,
-		OTPWebhookURL:                     c.OTPWebhookURL,
-		OTPWebhookSecret:                  c.OTPWebhookSecret,
-		OTPWebhookTimeout:                 c.OTPWebhookTimeout,
-		SMTPHost:                          c.SMTPHost,
-		SMTPPort:                          c.SMTPPort,
-		SMTPUsername:                      c.SMTPUsername,
-		SMTPPassword:                      c.SMTPPassword,
-		SMTPFrom:                          c.SMTPFrom,
-		SMTPFromName:                      c.SMTPFromName,
-		SMTPTLSMode:                       c.SMTPTLSMode,
-		SMTPTimeout:                       c.SMTPTimeout,
-		MapboxToken:                       c.MapboxToken,
-		MapTileCacheDir:                   c.MapTileCacheDir,
-		ExternalMediaEnable:               c.ExternalMediaEnable,
-		ExternalMediaMaxBytes:             c.ExternalMediaMaxBytes,
-		ExternalMediaRatePerMin:           c.ExternalMediaRatePerMin,
-		WebPagePreviewEnable:              c.WebPagePreviewEnable,
-		WebPagePreviewMaxBytes:            c.WebPagePreviewMaxBytes,
-		WebPagePreviewRatePerMin:          c.WebPagePreviewRatePerMin,
-		LangPackSeedDir:                   c.LangPackSeedDir,
-		OfficialGiftsDir:                  c.OfficialGiftsDir,
-		StarGiftTONStartingGrant:          c.StarGiftTONStartingGrant,
-		StickerSeedDir:                    c.StickerSeedDir,
-		GifSeedDir:                        c.GifSeedDir,
-		StickerSeedMaxSets:                c.StickerSeedMaxSets,
-		PremiumPromoSeedDir:               c.PremiumPromoSeedDir,
-		BusinessAIProvider:                c.BusinessAIProvider,
-		AIEnabled:                         c.AIEnabled,
-		AIProviders:                       append([]AIProviderConfig(nil), c.AIProviders...),
-		AITimeout:                         c.AITimeout,
-		AIRateLimit:                       c.AIRateLimit,
-		AIRateWindow:                      c.AIRateWindow,
-		AIPrivacyLogContent:               c.AIPrivacyLogContent,
-		TranslationEnabled:                c.TranslationEnabled,
-		TranslationProviders:              append([]string(nil), c.TranslationProviders...),
-		TranslationTimeout:                c.TranslationTimeout,
-		TranslationRateLimit:              c.TranslationRateLimit,
-		TranslationRateWindow:             c.TranslationRateWindow,
-		TempKeyResolveCacheMaxEntries:     c.TempKeyResolveCacheMaxEntries,
-		TempKeyResolveCacheTTL:            c.TempKeyResolveCacheTTL,
-		AuthUserCacheTTL:                  c.AuthUserCacheTTL,
-		ChannelRowCacheMaxEntries:         c.ChannelRowCacheMaxEntries,
-		ChannelMemberCacheMaxEntries:      c.ChannelMemberCacheMaxEntries,
-		ChannelDialogCacheMaxEntries:      c.ChannelDialogCacheMaxEntries,
-		ChannelBoostCacheMaxEntries:       c.ChannelBoostCacheMaxEntries,
-		ChannelBoostCacheTTL:              c.ChannelBoostCacheTTL,
-		OutboxLeaseTimeout:                c.OutboxLeaseTimeout,
-		OutboxPoisonRetention:             c.OutboxPoisonRetention,
-		OutboxPoisonCleanupInterval:       c.OutboxPoisonCleanupInterval,
-		OutboundPushTimeout:               c.OutboundPushTimeout,
-		SendRateLimit:                     c.SendRateLimit,
-		SendRateWindow:                    c.SendRateWindow,
-		CatchupRateLimit:                  c.CatchupRateLimit,
-		CatchupRateWindow:                 c.CatchupRateWindow,
-		ChannelNudgeMaxTargets:            c.ChannelNudgeMaxTargets,
-		UpdateEventRetention:              c.UpdateEventRetention,
-		BotAPIUpdateRetention:             c.BotAPIUpdateRetention,
-		OrphanAuthKeyRetention:            c.OrphanAuthKeyRetention,
-		RetentionInterval:                 c.RetentionInterval,
-		RetentionBatch:                    c.RetentionBatch,
-		UploadInFlightMaxBytes:            c.UploadInFlightMaxBytes,
-		UploadInFlightMaxParts:            c.UploadInFlightMaxParts,
-		UploadInFlightMaxFiles:            c.UploadInFlightMaxFiles,
-		CallRingTimeout:                   c.CallRingTimeout,
-		CallTombstoneTTL:                  c.CallTombstoneTTL,
-		CallMaxActivePerUser:              c.CallMaxActivePerUser,
-		CallRegistryMaxEntries:            c.CallRegistryMaxEntries,
-		CallSignalingMaxBytes:             c.CallSignalingMaxBytes,
-		CallSignalingRate:                 c.CallSignalingRate,
-		CallExpiryInterval:                c.CallExpiryInterval,
-		PremiumGrantMonths:                c.PremiumGrantMonths,
-		PremiumBotUsername:                c.PremiumBotUsername,
-		PremiumBotUserID:                  c.PremiumBotUserID,
-		PremiumPlans:                      append([]domain.PremiumPlan(nil), c.PremiumPlans...),
-		PasskeyRPID:                       c.PasskeyRPID,
-		PasskeyAllowedOrigins:             append([]string(nil), c.PasskeyAllowedOrigins...),
-		StarsStartingGrant:                c.StarsStartingGrant,
-		PremiumSweepInterval:              c.PremiumSweepInterval,
-		PremiumSweepBatch:                 c.PremiumSweepBatch,
-		StarGiftSweepInterval:             c.StarGiftSweepInterval,
-		StarGiftSweepBatch:                c.StarGiftSweepBatch,
-		StarGiftTransferStars:             c.StarGiftTransferStars,
-		StarGiftDropOriginalDetailsStars:  c.StarGiftDropOriginalDetailsStars,
-		StarGiftOfferMinStars:             c.StarGiftOfferMinStars,
-		StarGiftStarsProceedsPermille:     c.StarGiftStarsProceedsPermille,
-		StarGiftTONProceedsPermille:       c.StarGiftTONProceedsPermille,
-		StarGiftExportDelay:               c.StarGiftExportDelay,
-		StarGiftTransferDelay:             c.StarGiftTransferDelay,
-		StarGiftResellDelay:               c.StarGiftResellDelay,
-		StarGiftCraftDelay:                c.StarGiftCraftDelay,
-		StarGiftCraftChancePermille:       c.StarGiftCraftChancePermille,
-		RatingEnabled:                     c.RatingEnabled,
-		RatingPendingDelay:                c.RatingPendingDelay,
-		RatingRecomputeInterval:           c.RatingRecomputeInterval,
-		RatingRecomputeBatch:              c.RatingRecomputeBatch,
-		RatingStaleAfter:                  c.RatingStaleAfter,
-		RatingWeightStarsReceivedPermille: c.RatingWeightStarsReceivedPermille,
-		RatingWeightStarsSpentPermille:    c.RatingWeightStarsSpentPermille,
-		RatingWeightMessageSent:           c.RatingWeightMessageSent,
-		RatingWeightAccountAgeDay:         c.RatingWeightAccountAgeDay,
-		RatingWeightGiftReceived:          c.RatingWeightGiftReceived,
-		RatingWeightModerationCase:        c.RatingWeightModerationCase,
-		RatingWeightScamPenalty:           c.RatingWeightScamPenalty,
-		RatingWeightFakePenalty:           c.RatingWeightFakePenalty,
-		RatingActivityCap:                 c.RatingActivityCap,
-		VerificationEnabled:               c.VerificationEnabled,
-		VerificationAllowUserTargets:      c.VerificationAllowUserTargets,
-		VerificationRejectCooldown:        c.VerificationRejectCooldown,
-		VerificationApplyRateLimit:        c.VerificationApplyRateLimit,
-		VerificationApplyRateWindow:       c.VerificationApplyRateWindow,
-		VerificationBotRateLimit:          c.VerificationBotRateLimit,
-		VerificationBotRateWindow:         c.VerificationBotRateWindow,
-		VerificationNotifyInterval:        c.VerificationNotifyInterval,
-		VerificationNotifyBatch:           c.VerificationNotifyBatch,
-		BroadcastWorkerInterval:           c.BroadcastWorkerInterval,
-		BroadcastWorkerLease:              c.BroadcastWorkerLease,
-		BroadcastMaterializeBatch:         c.BroadcastMaterializeBatch,
-		BroadcastDeliveryBatch:            c.BroadcastDeliveryBatch,
-		VerificationMaxActivePerUser:      c.VerificationMaxActivePerUser,
-		BotVerificationEnabled:            c.BotVerificationEnabled,
-		BotVerificationMaxPerVerifier:     c.BotVerificationMaxPerVerifier,
-		BotVerificationRequestRateLimit:   c.BotVerificationRequestRateLimit,
-		BotVerificationRequestRateWindow:  c.BotVerificationRequestRateWindow,
-		CollectibleUsernameURLTemplate:    c.CollectibleUsernameURLTemplate,
-		GroupCallCheckTTL:                 c.GroupCallCheckTTL,
-		GroupCallSweepInterval:            c.GroupCallSweepInterval,
-		GroupCallMaxParticipants:          c.GroupCallMaxParticipants,
-		TURNEnable:                        c.TURNEnable,
-		TURNUDPPort:                       c.TURNUDPPort,
-		TURNAdvertiseIP:                   c.TURNAdvertiseIP,
-		TURNSecret:                        c.TURNSecret,
-		TURNRelayMinPort:                  c.TURNRelayMinPort,
-		TURNRelayMaxPort:                  c.TURNRelayMaxPort,
-		CallTURNCredentialTTL:             c.CallTURNCredentialTTL,
-		CallForceRelay:                    c.CallForceRelay,
-		LiveStreamEnable:                  c.LiveStreamEnable,
-		LiveStreamRtmpAddr:                c.LiveStreamRtmpAddr,
-		LiveStreamRtmpURL:                 c.LiveStreamRtmpURL,
-		LiveStreamFFmpegPath:              c.LiveStreamFFmpegPath,
-		LiveStreamWorkDir:                 c.LiveStreamWorkDir,
-		LiveStreamSegmentKeep:             c.LiveStreamSegmentKeep,
-		SFUAdvertiseIP:                    c.SFUAdvertiseIP,
-		SFUOwnerTTL:                       c.SFUOwnerTTL,
-		SFUOwnerHeartbeatInterval:         c.SFUOwnerHeartbeatInterval,
-		SFUInstanceHealthTimeout:          c.SFUInstanceHealthTimeout,
-		SFUControlGRPCRequestTimeout:      c.SFUControlGRPCRequestTimeout,
-		SFUControlGRPCTLSCAFile:           c.SFUControlGRPCTLSCAFile,
-		SFUControlGRPCTLSServerName:       c.SFUControlGRPCTLSServerName,
-		SFUControlGRPCTLSClientCertFile:   c.SFUControlGRPCTLSClientCertFile,
-		SFUControlGRPCTLSClientKeyFile:    c.SFUControlGRPCTLSClientKeyFile,
-		SFUControlToken:                   c.SFUControlToken,
+		AdvertiseIP:                        c.AdvertiseIP,
+		AdvertisePort:                      c.AdvertisePort,
+		DC:                                 c.DC,
+		DefaultCountryCode:                 c.DefaultCountryCode,
+		DebugAddr:                          c.DebugAddr,
+		BotAPIAddr:                         c.BotAPIAddr,
+		AdminAPIAddr:                       c.AdminAPIAddr,
+		AdminAPIToken:                      c.AdminAPIToken,
+		GroupCallControlAddr:               c.GroupCallControlAddr,
+		GroupCallControlToken:              c.GroupCallControlToken,
+		CoreExecGRPCAddr:                   c.CoreExecGRPCAddr,
+		CoreExecGRPCTLSCertFile:            c.CoreExecGRPCTLSCertFile,
+		CoreExecGRPCTLSKeyFile:             c.CoreExecGRPCTLSKeyFile,
+		CoreExecGRPCTLSClientCAFile:        c.CoreExecGRPCTLSClientCAFile,
+		CoreExecToken:                      c.CoreExecToken,
+		FileGRPCTargets:                    c.FileGRPCTargets,
+		FileGRPCResolver:                   c.FileGRPCResolver,
+		FileGRPCRequestTimeout:             c.FileGRPCRequestTimeout,
+		FileGRPCTLSCAFile:                  c.FileGRPCTLSCAFile,
+		FileGRPCTLSServerName:              c.FileGRPCTLSServerName,
+		FileGRPCTLSClientCertFile:          c.FileGRPCTLSClientCertFile,
+		FileGRPCTLSClientKeyFile:           c.FileGRPCTLSClientKeyFile,
+		FileToken:                          c.FileToken,
+		PublicBaseURL:                      c.PublicBaseURL,
+		Branding:                           c.Branding,
+		UpdatePublicURL:                    c.UpdatePublicURL,
+		UpdateServiceURL:                   c.UpdateServiceURL,
+		UpdateRequestTimeout:               c.UpdateRequestTimeout,
+		PublicAppScheme:                    c.PublicAppScheme,
+		PublicAppLinkBase:                  c.PublicAppLinkBase,
+		PublicWebBaseURL:                   c.PublicWebBaseURL,
+		PublicAppName:                      c.PublicAppName,
+		PublicLinkWebAddr:                  c.PublicLinkWebAddr,
+		TelegramLoginEnabled:               c.TelegramLoginEnabled,
+		TelegramLoginIssuer:                c.TelegramLoginIssuer,
+		TelegramLoginAllowHTTP:             c.TelegramLoginAllowHTTP,
+		TelegramLoginSigningKeysFile:       c.TelegramLoginSigningKeysFile,
+		TelegramLoginCodeKeysFile:          c.TelegramLoginCodeKeysFile,
+		TelegramLoginSecretPepperFile:      c.TelegramLoginSecretPepperFile,
+		TelegramLoginRequestTTL:            c.TelegramLoginRequestTTL,
+		TelegramLoginCodeTTL:               c.TelegramLoginCodeTTL,
+		TelegramLoginIDTokenTTL:            c.TelegramLoginIDTokenTTL,
+		TelegramLoginTrustedProxyCIDRs:     append([]string(nil), c.TelegramLoginTrustedProxyCIDRs...),
+		TelegramLoginRetention:             c.TelegramLoginRetention,
+		TelegramLoginSweepInterval:         c.TelegramLoginSweepInterval,
+		TelegramLoginSweepBatch:            c.TelegramLoginSweepBatch,
+		AdminScopedTokens:                  append([]AdminScopedToken(nil), c.AdminScopedTokens...),
+		PostgresDSN:                        c.PostgresDSN,
+		PostgresMaxConns:                   c.PostgresMaxConns,
+		PostgresMinConns:                   c.PostgresMinConns,
+		RedisAddr:                          c.RedisAddr,
+		RedisPassword:                      c.RedisPassword,
+		RedisDB:                            c.RedisDB,
+		InstanceID:                         c.InstanceID,
+		DevAuthCode:                        c.DevAuthCode,
+		AuthCodeTTL:                        c.AuthCodeTTL,
+		PhoneCodeLength:                    c.PhoneCodeLength,
+		AuthCodeMaxAttempts:                c.AuthCodeMaxAttempts,
+		AuthCodePhoneRateLimit:             c.AuthCodePhoneRateLimit,
+		AuthCodeAuthKeyRateLimit:           c.AuthCodeAuthKeyRateLimit,
+		AuthCodeRateWindow:                 c.AuthCodeRateWindow,
+		LoginEmailEnable:                   c.LoginEmailEnable,
+		LoginEmailRequireSetup:             c.LoginEmailRequireSetup,
+		LoginEmailCodeLength:               c.LoginEmailCodeLength,
+		PhoneCodeDeliveryProvider:          c.PhoneCodeDeliveryProvider,
+		EmailCodeDeliveryProvider:          c.EmailCodeDeliveryProvider,
+		OTPWebhookURL:                      c.OTPWebhookURL,
+		OTPWebhookSecret:                   c.OTPWebhookSecret,
+		OTPWebhookTimeout:                  c.OTPWebhookTimeout,
+		SMTPHost:                           c.SMTPHost,
+		SMTPPort:                           c.SMTPPort,
+		SMTPUsername:                       c.SMTPUsername,
+		SMTPPassword:                       c.SMTPPassword,
+		SMTPFrom:                           c.SMTPFrom,
+		SMTPFromName:                       c.SMTPFromName,
+		SMTPTLSMode:                        c.SMTPTLSMode,
+		SMTPTimeout:                        c.SMTPTimeout,
+		MapboxToken:                        c.MapboxToken,
+		MapTileCacheDir:                    c.MapTileCacheDir,
+		ExternalMediaEnable:                c.ExternalMediaEnable,
+		ExternalMediaMaxBytes:              c.ExternalMediaMaxBytes,
+		ExternalMediaRatePerMin:            c.ExternalMediaRatePerMin,
+		WebPagePreviewEnable:               c.WebPagePreviewEnable,
+		WebPagePreviewMaxBytes:             c.WebPagePreviewMaxBytes,
+		WebPagePreviewRatePerMin:           c.WebPagePreviewRatePerMin,
+		LangPackSeedDir:                    c.LangPackSeedDir,
+		OfficialGiftsDir:                   c.OfficialGiftsDir,
+		StarGiftTONStartingGrant:           c.StarGiftTONStartingGrant,
+		StickerSeedDir:                     c.StickerSeedDir,
+		GifSeedDir:                         c.GifSeedDir,
+		StickerSeedMaxSets:                 c.StickerSeedMaxSets,
+		PremiumPromoSeedDir:                c.PremiumPromoSeedDir,
+		BusinessAIProvider:                 c.BusinessAIProvider,
+		AIEnabled:                          c.AIEnabled,
+		AIProviders:                        append([]AIProviderConfig(nil), c.AIProviders...),
+		AITimeout:                          c.AITimeout,
+		AIRateLimit:                        c.AIRateLimit,
+		AIRateWindow:                       c.AIRateWindow,
+		AIPrivacyLogContent:                c.AIPrivacyLogContent,
+		TranslationEnabled:                 c.TranslationEnabled,
+		TranslationProviders:               append([]string(nil), c.TranslationProviders...),
+		TranslationTimeout:                 c.TranslationTimeout,
+		TranslationRateLimit:               c.TranslationRateLimit,
+		TranslationRateWindow:              c.TranslationRateWindow,
+		TempKeyResolveCacheMaxEntries:      c.TempKeyResolveCacheMaxEntries,
+		TempKeyResolveCacheTTL:             c.TempKeyResolveCacheTTL,
+		AuthUserCacheTTL:                   c.AuthUserCacheTTL,
+		ChannelRowCacheMaxEntries:          c.ChannelRowCacheMaxEntries,
+		ChannelMemberCacheMaxEntries:       c.ChannelMemberCacheMaxEntries,
+		ChannelDialogCacheMaxEntries:       c.ChannelDialogCacheMaxEntries,
+		ChannelBoostCacheMaxEntries:        c.ChannelBoostCacheMaxEntries,
+		ChannelBoostCacheTTL:               c.ChannelBoostCacheTTL,
+		OutboxLeaseTimeout:                 c.OutboxLeaseTimeout,
+		OutboxPoisonRetention:              c.OutboxPoisonRetention,
+		OutboxPoisonCleanupInterval:        c.OutboxPoisonCleanupInterval,
+		OutboundPushTimeout:                c.OutboundPushTimeout,
+		SendRateLimit:                      c.SendRateLimit,
+		SendRateWindow:                     c.SendRateWindow,
+		CatchupRateLimit:                   c.CatchupRateLimit,
+		CatchupRateWindow:                  c.CatchupRateWindow,
+		ChannelNudgeMaxTargets:             c.ChannelNudgeMaxTargets,
+		UpdateEventRetention:               c.UpdateEventRetention,
+		BotAPIUpdateRetention:              c.BotAPIUpdateRetention,
+		OrphanAuthKeyRetention:             c.OrphanAuthKeyRetention,
+		RetentionInterval:                  c.RetentionInterval,
+		RetentionBatch:                     c.RetentionBatch,
+		UploadInFlightMaxBytes:             c.UploadInFlightMaxBytes,
+		UploadInFlightMaxParts:             c.UploadInFlightMaxParts,
+		UploadInFlightMaxFiles:             c.UploadInFlightMaxFiles,
+		CallRingTimeout:                    c.CallRingTimeout,
+		CallTombstoneTTL:                   c.CallTombstoneTTL,
+		CallMaxActivePerUser:               c.CallMaxActivePerUser,
+		CallRegistryMaxEntries:             c.CallRegistryMaxEntries,
+		CallSignalingMaxBytes:              c.CallSignalingMaxBytes,
+		CallSignalingRate:                  c.CallSignalingRate,
+		CallExpiryInterval:                 c.CallExpiryInterval,
+		PremiumGrantMonths:                 c.PremiumGrantMonths,
+		PremiumBotUsername:                 c.PremiumBotUsername,
+		PremiumBotUserID:                   c.PremiumBotUserID,
+		PremiumPlans:                       append([]domain.PremiumPlan(nil), c.PremiumPlans...),
+		PasskeyRPID:                        c.PasskeyRPID,
+		PasskeyAllowedOrigins:              append([]string(nil), c.PasskeyAllowedOrigins...),
+		StarsStartingGrant:                 c.StarsStartingGrant,
+		PremiumSweepInterval:               c.PremiumSweepInterval,
+		PremiumSweepBatch:                  c.PremiumSweepBatch,
+		StarGiftSweepInterval:              c.StarGiftSweepInterval,
+		StarGiftSweepBatch:                 c.StarGiftSweepBatch,
+		StarGiftTransferStars:              c.StarGiftTransferStars,
+		StarGiftDropOriginalDetailsStars:   c.StarGiftDropOriginalDetailsStars,
+		StarGiftOfferMinStars:              c.StarGiftOfferMinStars,
+		StarGiftStarsProceedsPermille:      c.StarGiftStarsProceedsPermille,
+		StarGiftTONProceedsPermille:        c.StarGiftTONProceedsPermille,
+		StarGiftExportDelay:                c.StarGiftExportDelay,
+		StarGiftTransferDelay:              c.StarGiftTransferDelay,
+		StarGiftResellDelay:                c.StarGiftResellDelay,
+		StarGiftCraftDelay:                 c.StarGiftCraftDelay,
+		StarGiftCraftChancePermille:        c.StarGiftCraftChancePermille,
+		StarGiftExportMode:                 c.StarGiftExportMode,
+		StarGiftTONNetwork:                 c.StarGiftTONNetwork,
+		StarGiftTONCollectionAddress:       c.StarGiftTONCollectionAddress,
+		StarGiftTONCollectionCodeHash:      c.StarGiftTONCollectionCodeHash,
+		StarGiftTONMintABI:                 c.StarGiftTONMintABI,
+		StarGiftTONInitialItemIndex:        c.StarGiftTONInitialItemIndex,
+		StarGiftTONProofDomain:             c.StarGiftTONProofDomain,
+		StarGiftTONCapabilitySecretFile:    c.StarGiftTONCapabilitySecretFile,
+		StarGiftTONExportTTL:               c.StarGiftTONExportTTL,
+		StarGiftTONChallengeTTL:            c.StarGiftTONChallengeTTL,
+		StarGiftTONFinalizerBatch:          c.StarGiftTONFinalizerBatch,
+		StarGiftTONFinalizerPollInterval:   c.StarGiftTONFinalizerPollInterval,
+		StarGiftTONFinalizerLeaseTimeout:   c.StarGiftTONFinalizerLeaseTimeout,
+		StarGiftTONFinalizerRequestTimeout: c.StarGiftTONFinalizerRequestTimeout,
+		StarGiftTONFinalizerRetryDelay:     c.StarGiftTONFinalizerRetryDelay,
+		StarGiftTONClaimEnabled:            c.StarGiftTONClaimEnabled,
+		StarGiftTONClaimBotTokenFile:       c.StarGiftTONClaimBotTokenFile,
+		StarGiftTONClaimInitDataTTL:        c.StarGiftTONClaimInitDataTTL,
+		RatingEnabled:                      c.RatingEnabled,
+		RatingPendingDelay:                 c.RatingPendingDelay,
+		RatingRecomputeInterval:            c.RatingRecomputeInterval,
+		RatingRecomputeBatch:               c.RatingRecomputeBatch,
+		RatingStaleAfter:                   c.RatingStaleAfter,
+		RatingWeightStarsReceivedPermille:  c.RatingWeightStarsReceivedPermille,
+		RatingWeightStarsSpentPermille:     c.RatingWeightStarsSpentPermille,
+		RatingWeightMessageSent:            c.RatingWeightMessageSent,
+		RatingWeightAccountAgeDay:          c.RatingWeightAccountAgeDay,
+		RatingWeightGiftReceived:           c.RatingWeightGiftReceived,
+		RatingWeightModerationCase:         c.RatingWeightModerationCase,
+		RatingWeightScamPenalty:            c.RatingWeightScamPenalty,
+		RatingWeightFakePenalty:            c.RatingWeightFakePenalty,
+		RatingActivityCap:                  c.RatingActivityCap,
+		VerificationEnabled:                c.VerificationEnabled,
+		VerificationAllowUserTargets:       c.VerificationAllowUserTargets,
+		VerificationRejectCooldown:         c.VerificationRejectCooldown,
+		VerificationApplyRateLimit:         c.VerificationApplyRateLimit,
+		VerificationApplyRateWindow:        c.VerificationApplyRateWindow,
+		VerificationBotRateLimit:           c.VerificationBotRateLimit,
+		VerificationBotRateWindow:          c.VerificationBotRateWindow,
+		VerificationNotifyInterval:         c.VerificationNotifyInterval,
+		VerificationNotifyBatch:            c.VerificationNotifyBatch,
+		BroadcastWorkerInterval:            c.BroadcastWorkerInterval,
+		BroadcastWorkerLease:               c.BroadcastWorkerLease,
+		BroadcastMaterializeBatch:          c.BroadcastMaterializeBatch,
+		BroadcastDeliveryBatch:             c.BroadcastDeliveryBatch,
+		VerificationMaxActivePerUser:       c.VerificationMaxActivePerUser,
+		BotVerificationEnabled:             c.BotVerificationEnabled,
+		BotVerificationMaxPerVerifier:      c.BotVerificationMaxPerVerifier,
+		BotVerificationRequestRateLimit:    c.BotVerificationRequestRateLimit,
+		BotVerificationRequestRateWindow:   c.BotVerificationRequestRateWindow,
+		CollectibleUsernameURLTemplate:     c.CollectibleUsernameURLTemplate,
+		GroupCallCheckTTL:                  c.GroupCallCheckTTL,
+		GroupCallSweepInterval:             c.GroupCallSweepInterval,
+		GroupCallMaxParticipants:           c.GroupCallMaxParticipants,
+		TURNEnable:                         c.TURNEnable,
+		TURNUDPPort:                        c.TURNUDPPort,
+		TURNAdvertiseIP:                    c.TURNAdvertiseIP,
+		TURNSecret:                         c.TURNSecret,
+		TURNRelayMinPort:                   c.TURNRelayMinPort,
+		TURNRelayMaxPort:                   c.TURNRelayMaxPort,
+		CallTURNCredentialTTL:              c.CallTURNCredentialTTL,
+		CallForceRelay:                     c.CallForceRelay,
+		LiveStreamEnable:                   c.LiveStreamEnable,
+		LiveStreamRtmpAddr:                 c.LiveStreamRtmpAddr,
+		LiveStreamRtmpURL:                  c.LiveStreamRtmpURL,
+		LiveStreamFFmpegPath:               c.LiveStreamFFmpegPath,
+		LiveStreamWorkDir:                  c.LiveStreamWorkDir,
+		LiveStreamSegmentKeep:              c.LiveStreamSegmentKeep,
+		SFUAdvertiseIP:                     c.SFUAdvertiseIP,
+		SFUOwnerTTL:                        c.SFUOwnerTTL,
+		SFUOwnerHeartbeatInterval:          c.SFUOwnerHeartbeatInterval,
+		SFUInstanceHealthTimeout:           c.SFUInstanceHealthTimeout,
+		SFUControlGRPCRequestTimeout:       c.SFUControlGRPCRequestTimeout,
+		SFUControlGRPCTLSCAFile:            c.SFUControlGRPCTLSCAFile,
+		SFUControlGRPCTLSServerName:        c.SFUControlGRPCTLSServerName,
+		SFUControlGRPCTLSClientCertFile:    c.SFUControlGRPCTLSClientCertFile,
+		SFUControlGRPCTLSClientKeyFile:     c.SFUControlGRPCTLSClientKeyFile,
+		SFUControlToken:                    c.SFUControlToken,
 	}
 }
 
 // LoadCore reads the Core role YAML config and returns the runtime snapshot used by the Core process.
 func LoadCore() (CoreConfig, error) {
+	var starGiftTONAllowUserIDs []int64
 	cfg, err := loadRoleYAML(roleCore, func(b *envBuilder, y CoreConfigYAML) error {
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
@@ -702,12 +793,97 @@ func LoadCore() (CoreConfig, error) {
 		if err := applyTranslationYAML(b, y.Translation); err != nil {
 			return err
 		}
+		if err := applyStarGiftsYAML(b, y.StarGifts); err != nil {
+			return err
+		}
+		var err error
+		starGiftTONAllowUserIDs, err = validateTONAllowUserIDs(y.StarGifts.Export.TON.AllowUserIDs)
+		if err != nil {
+			return err
+		}
 		return applyStorageYAML(b, y.Storage)
 	})
 	if err != nil {
 		return CoreConfig{}, err
 	}
-	return coreConfigFromConfig(cfg), nil
+	result := coreConfigFromConfig(cfg)
+	result.StarGiftTONAllowUserIDs = starGiftTONAllowUserIDs
+	return result, nil
+}
+
+func validateTONAllowUserIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	result := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("star_gifts.export.ton.allow_user_ids must contain positive user IDs")
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("star_gifts.export.ton.allow_user_ids contains duplicate user ID %d", id)
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result, nil
+}
+
+func applyStarGiftsYAML(b *envBuilder, y StarGiftsYAML) error {
+	b.setInt64("TELESRV_STARGIFT_TON_STARTING_GRANT", y.TONStartingGrant)
+	if err := b.setDuration("TELESRV_STARGIFT_SWEEP_INTERVAL", y.SweepInterval); err != nil {
+		return err
+	}
+	b.setInt("TELESRV_STARGIFT_SWEEP_BATCH", y.SweepBatch)
+	b.setInt64("TELESRV_STARGIFT_TRANSFER_STARS", y.TransferStars)
+	b.setInt64("TELESRV_STARGIFT_DROP_DETAILS_STARS", y.DropOriginalDetailsStars)
+	b.setInt("TELESRV_STARGIFT_OFFER_MIN_STARS", y.OfferMinStars)
+	b.setInt("TELESRV_STARGIFT_STARS_PROCEEDS_PERMILLE", y.StarsProceedsPermille)
+	b.setInt("TELESRV_STARGIFT_TON_PROCEEDS_PERMILLE", y.TONProceedsPermille)
+	if err := b.setDuration("TELESRV_STARGIFT_EXPORT_DELAY", y.ExportDelay); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_TRANSFER_DELAY", y.TransferDelay); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_RESELL_DELAY", y.ResellDelay); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_CRAFT_DELAY", y.CraftDelay); err != nil {
+		return err
+	}
+	b.setInt("TELESRV_STARGIFT_CRAFT_CHANCE_PERMILLE", y.CraftChancePermille)
+	b.setString("TELESRV_STARGIFT_EXPORT_MODE", y.Export.Mode)
+	b.setString("TELESRV_STARGIFT_TON_NETWORK", y.Export.TON.Network)
+	b.setString("TELESRV_STARGIFT_TON_COLLECTION_ADDRESS", y.Export.TON.CollectionAddress)
+	b.setString("TELESRV_STARGIFT_TON_COLLECTION_CODE_HASH", y.Export.TON.CollectionCodeHash)
+	b.setString("TELESRV_STARGIFT_TON_MINT_ABI", y.Export.TON.MintABI)
+	b.setString("TELESRV_STARGIFT_TON_INITIAL_ITEM_INDEX", y.Export.TON.InitialItemIndex)
+	b.setString("TELESRV_STARGIFT_TON_PROOF_DOMAIN", y.Export.TON.ProofDomain)
+	b.setString("TELESRV_STARGIFT_TON_CAPABILITY_SECRET_FILE", y.Export.TON.CapabilitySecretFile)
+	if err := b.setDuration("TELESRV_STARGIFT_TON_EXPORT_TTL", y.Export.TON.TTL); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_TON_CHALLENGE_TTL", y.Export.TON.ChallengeTTL); err != nil {
+		return err
+	}
+	b.setInt("TELESRV_STARGIFT_TON_FINALIZER_BATCH", y.Export.TON.Finalizer.Batch)
+	if err := b.setDuration("TELESRV_STARGIFT_TON_FINALIZER_POLL_INTERVAL", y.Export.TON.Finalizer.PollInterval); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_TON_FINALIZER_LEASE_TIMEOUT", y.Export.TON.Finalizer.LeaseTimeout); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_TON_FINALIZER_REQUEST_TIMEOUT", y.Export.TON.Finalizer.RequestTimeout); err != nil {
+		return err
+	}
+	if err := b.setDuration("TELESRV_STARGIFT_TON_FINALIZER_RETRY_DELAY", y.Export.TON.Finalizer.RetryDelay); err != nil {
+		return err
+	}
+	b.setBool("TELESRV_STARGIFT_TON_CLAIM_ENABLED", y.Export.TON.Claim.Enabled)
+	b.setString("TELESRV_STARGIFT_TON_CLAIM_BOT_TOKEN_FILE", y.Export.TON.Claim.BotTokenFile)
+	return b.setDuration("TELESRV_STARGIFT_TON_CLAIM_INIT_DATA_TTL", y.Export.TON.Claim.InitDataTTL)
 }
 
 func applySFUOwnerYAML(b *envBuilder, y SFUOwnerYAML) error {

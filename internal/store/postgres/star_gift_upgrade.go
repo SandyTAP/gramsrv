@@ -354,6 +354,13 @@ func (s *StarGiftUpgradeStore) UpgradeStarGift(ctx context.Context, req domain.S
 	if !found || saved.FromUserID <= 0 {
 		return domain.StarGiftUpgradeResult{}, domain.ErrStarGiftNotFound
 	}
+	var channelMutationUserIDs []int64
+	if saved.Owner.Type == domain.PeerTypeChannel {
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, saved.ID, saved.Owner.ID)
+		if err != nil {
+			return domain.StarGiftUpgradeResult{}, err
+		}
+	}
 
 	commandKey := strings.TrimSpace(req.CommandKey)
 	fingerprint := sha256.Sum256([]byte(fmt.Sprintf(
@@ -386,6 +393,7 @@ func (s *StarGiftUpgradeStore) UpgradeStarGift(ctx context.Context, req domain.S
 
 	var result domain.StarGiftUpgradeResult
 	hooks := privateSendTxHooks{
+		lockUserIDs: channelMutationUserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, messageReq *domain.SendPrivateTextRequest) error {
 			locked, err := lockSavedStarGiftForUpgrade(ctx, tx, req.Ref)
 			if err != nil {
@@ -586,6 +594,26 @@ WHERE user_id=$1 AND command_key=$2`, req.UserID, commandKey, ownerEditPts)
 					}); err != nil {
 					return fmt.Errorf("append channel star gift upgrade admin log: %w", err)
 				}
+				channelSourceRefs, err := listChannelStarGiftViewerMessageRefs(ctx, tx, result.Saved.ID, result.Saved.Owner.ID)
+				if err != nil {
+					return err
+				}
+				edits, err := editChannelStarGiftViewerMessagesTx(ctx, tx, s.messages, channelSourceRefs,
+					result.Saved, req.Date, req.UserID, req.OriginAuthKeyID, req.OriginSessionID,
+					func(source *domain.MessageStarGiftAction, viewerUserID int64) error {
+						source.CanUpgrade = false
+						source.PrepaidUpgradeHash = ""
+						if viewerUserID == req.UserID {
+							source.UpgradeMsgID = ownerMessageID
+						} else {
+							source.UpgradeMsgID = 0
+						}
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+				result.SourceEdits = edits
 			}
 			return nil
 		},

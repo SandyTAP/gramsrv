@@ -430,9 +430,22 @@ type SessionTerminator interface {
 	CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int
 }
 
+// BoundedSessionTerminator closes sessions through the distributed Edge
+// control fabric and reports an indeterminate remote delivery instead of
+// silently treating it as an offline auth key.
+type BoundedSessionTerminator interface {
+	CloseSessionsForBusinessAuthKeyBounded(ctx context.Context, authKeyID [8]byte) (int, error)
+}
+
 // RawSessionTerminator closes sessions associated with a physical/raw auth key.
 type RawSessionTerminator interface {
 	CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int
+}
+
+// BoundedRawSessionTerminator is the context-aware form used when raw temp-key
+// aliases must be retired as part of a confirmed authorization revocation.
+type BoundedRawSessionTerminator interface {
+	CloseSessionsForRawAuthKeyExceptBounded(ctx context.Context, authKeyID [8]byte, exceptSessionID int64) (int, error)
 }
 
 // BoundedSessionPusher provides online push with a caller supplied delivery

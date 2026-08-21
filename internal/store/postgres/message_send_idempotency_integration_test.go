@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -243,6 +244,80 @@ func TestMessageStorePrivateRandomIDReplayUsesCurrentSnapshotAndDurableDelete(t 
 	}
 	if after := loadReplayState(); after != beforeReplay {
 		t.Fatalf("delete replay mutated durable state = %+v, want %+v", after, beforeReplay)
+	}
+}
+
+type observedBeginDB struct {
+	*pgxpool.Pool
+	beginCount  atomic.Int32
+	secondBegin chan struct{}
+}
+
+func (db *observedBeginDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	if db.beginCount.Add(1) == 2 {
+		close(db.secondBegin)
+	}
+	return db.Pool.Begin(ctx)
+}
+
+func TestMessageStoreConcurrentPrivateHookReplayRunsHookOnce(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	users := NewUserStore(pool)
+	sender := createTestUser(t, ctx, users, "+1885"+suffix+"01", "HookSender", "")
+	recipient := createTestUser(t, ctx, users, "+1885"+suffix+"02", "HookRecipient", "")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
+	})
+
+	db := &observedBeginDB{Pool: pool, secondBegin: make(chan struct{})}
+	messages := NewMessageStore(db)
+	req := domain.SendPrivateTextRequest{
+		SenderUserID: sender.ID, RecipientUserID: recipient.ID, RandomID: 775001,
+		Message: "concurrent hook replay", Date: 1700001400,
+	}
+	firstHook := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hookCalls atomic.Int32
+	hooks := privateSendTxHooks{before: func(context.Context, pgx.Tx, *domain.SendPrivateTextRequest) error {
+		if hookCalls.Add(1) == 1 {
+			close(firstHook)
+			<-releaseFirst
+		}
+		return nil
+	}}
+	type sendResult struct {
+		result domain.SendPrivateTextResult
+		err    error
+	}
+	results := make(chan sendResult, 2)
+	send := func() {
+		result, err := messages.sendPrivateTextWithHooks(ctx, req, hooks)
+		results <- sendResult{result: result, err: err}
+	}
+	go send()
+	<-firstHook
+	go send()
+	select {
+	case <-db.secondBegin:
+	case <-time.After(3 * time.Second):
+		close(releaseFirst)
+		t.Fatal("second concurrent send did not begin")
+	}
+	close(releaseFirst)
+
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent sends failed: first=%v second=%v", first.err, second.err)
+	}
+	if hookCalls.Load() != 1 {
+		t.Fatalf("aggregate hook calls = %d, want 1", hookCalls.Load())
+	}
+	if first.result.Duplicate == second.result.Duplicate ||
+		first.result.SenderMessage.ID != second.result.SenderMessage.ID ||
+		first.result.RecipientMessage.ID != second.result.RecipientMessage.ID {
+		t.Fatalf("concurrent replay results = %+v / %+v", first.result, second.result)
 	}
 }
 

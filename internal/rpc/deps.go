@@ -22,7 +22,7 @@ type AuthService interface {
 	ResolveAuthKey(ctx context.Context, authKeyID [8]byte) ([8]byte, bool, error)
 	UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
 	PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
-	CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte) error
+	CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64) error
 	SendCode(ctx context.Context, phone string) (string, error)
 	CodeDelivery(ctx context.Context, phoneCodeHash string) (domain.AuthCodeDelivery, bool, error)
 	ResendCode(ctx context.Context, phone, phoneCodeHash string) (string, error)
@@ -70,7 +70,9 @@ type AuthKeyLayerRefresher = edgecontrol.AuthKeyLayerRefresher
 type AuthKeyInheritedLayerClearer = edgecontrol.AuthKeyInheritedLayerClearer
 type ActiveSessionLayerEvidenceProvider = edgecontrol.ActiveSessionLayerEvidenceProvider
 type SessionTerminator = edgecontrol.SessionTerminator
+type BoundedSessionTerminator = edgecontrol.BoundedSessionTerminator
 type RawSessionTerminator = edgecontrol.RawSessionTerminator
+type BoundedRawSessionTerminator = edgecontrol.BoundedRawSessionTerminator
 type TransientSessionPusher = edgecontrol.TransientSessionPusher
 type AuthKeyTargetedSessionPusher = edgecontrol.AuthKeyTargetedSessionPusher
 type LayerAwareTransientPusher = edgecontrol.LayerAwareTransientPusher
@@ -269,6 +271,7 @@ type AccountService interface {
 	GetPasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck) (domain.PrivatePasswordSettings, error)
 	UpdatePasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck, input domain.PasswordInputSettings) error
 	CheckPassword(ctx context.Context, userID int64, check domain.PasswordCheck) error
+	RevenueWithdrawalPasswordState(ctx context.Context, userID int64) (domain.RevenueWithdrawalPasswordState, error)
 	RequestPasswordRecovery(ctx context.Context, userID int64) (string, error)
 	CheckRecoveryPassword(ctx context.Context, userID int64, code string) error
 	RecoverPassword(ctx context.Context, userID int64, code string, input *domain.PasswordInputSettings) error

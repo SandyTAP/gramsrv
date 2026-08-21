@@ -69,7 +69,7 @@ codebase.
 | ✅ | Supergroups and channels | Create, join, leave, invite links, participants, admins, forum topics, linked discussion guests, history, send/edit/delete/read, reactions, public search, and previews. |
 | ✅ | Media and files | Upload, download, local blob storage, photos, documents, thumbnails, canonical GIFv conversion, external media fetch, web page previews, map tile cache hooks, profile/channel photos. |
 | ✅ | Stickers and reactions | Sticker/reaction catalog, seed support, saved GIFs, recent reactions, top reactions, default reactions, and moderation-oriented reaction paths. |
-| ✅ | Gifts and stars | Dynamic star gift catalog, admin import tools, collectible/unique gift upgrade flows, prepaid upgrade tracking, and local stars ledger foundations. |
+| ✅ | Gifts and stars | Dynamic star gift catalog, admin import tools, collectible/unique gift upgrade flows, prepaid upgrade tracking, channel Stars revenue withdrawal, and optional TON export worker. |
 | ✅ | Premium with Stars | Built-in `@premiumbot`, native Layer 228 self/gift invoices, atomic Stars settlement, expiring entitlements, refunds, and Bot API `giftPremiumSubscription`. See [docs/premium-stars.md](docs/premium-stars.md). |
 | ✅ | Bots and mini apps | Bot service foundations, callbacks, inline helpers, webview/mini-app paths, a minimal Bot API gateway for libraries such as `python-telegram-bot`, persistent `getUpdates` delivery, and demo tools. |
 | ✅ | Calls and live streams | Private call signaling foundations, group call state, RTMP live streaming, scheduled video chats, channel `join_as`, standalone SFU ownership, liveness, and expiry workers. |
@@ -104,6 +104,13 @@ go build -o bin/gramsrv-core.exe ./cmd/telesrv-core
 go build -o bin/gramsrv-egress.exe ./cmd/telesrv-egress
 go build -o bin/gramsrv-sfu.exe ./cmd/telesrv-sfu
 go build -o bin/gramsrv-edge.exe ./cmd/telesrv-edge
+```
+
+The TON export worker is optional and is built separately when an operator
+enables the fail-closed TON export configuration:
+
+```powershell
+go build -o bin/gramsrv-ton.exe ./cmd/telesrv-ton
 ```
 
 The checked-in local YAML examples use PostgreSQL and Redis from the Compose
@@ -283,6 +290,7 @@ cmd/telesrv-egress/       durable update delivery
 cmd/telesrv-file/         file data-plane service
 cmd/telesrv-sfu/          standalone realtime media owner
 cmd/telesrv-admin/        admin backend and web UI
+cmd/telesrv-ton/          optional TON gift export worker
 configs/examples/         local per-role YAML examples
 deploy/                   docker-compose, migrations, deploy helpers
 data/                     bundled language packs and optional seed data

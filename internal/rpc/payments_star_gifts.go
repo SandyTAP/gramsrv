@@ -1118,6 +1118,7 @@ func (r *Router) onPaymentsGetSavedStarGifts(ctx context.Context, req *tg.Paymen
 		ExcludeSaved:        req.ExcludeSaved,
 		ExcludeUnlimited:    req.ExcludeUnlimited,
 		ExcludeUnique:       req.ExcludeUnique,
+		ExcludeHosted:       req.ExcludeHosted,
 		ExcludeUpgradable:   req.ExcludeUpgradable,
 		ExcludeUnupgradable: req.ExcludeUnupgradable,
 		CollectionID:        collectionID,
@@ -1372,11 +1373,17 @@ func (r *Router) starGiftRefFromInput(ctx context.Context, userID int64, ref tg.
 		if err != nil {
 			return domain.SavedStarGiftRef{}, false, internalErr()
 		}
-		if !found || unique.Slug == "" || unique.Owner.ID == 0 ||
-			(unique.Owner.Type != domain.PeerTypeUser && unique.Owner.Type != domain.PeerTypeChannel) {
+		if !found || unique.Slug == "" {
 			return domain.SavedStarGiftRef{}, false, nil
 		}
-		resolved := domain.SavedStarGiftRef{Owner: unique.Owner, Slug: strings.ToLower(strings.TrimSpace(unique.Slug))}
+		owner := unique.Owner
+		if unique.OwnerAddress != "" && unique.Host.Type == domain.PeerTypeUser && unique.Host.ID > 0 {
+			owner = unique.Host
+		}
+		if owner.ID == 0 || (owner.Type != domain.PeerTypeUser && owner.Type != domain.PeerTypeChannel) {
+			return domain.SavedStarGiftRef{}, false, nil
+		}
+		resolved := domain.SavedStarGiftRef{Owner: owner, Slug: strings.ToLower(strings.TrimSpace(unique.Slug))}
 		return resolved, resolved.Valid(), nil
 	default:
 		return domain.SavedStarGiftRef{}, false, nil
@@ -1728,7 +1735,9 @@ func tgSavedStarGifts(viewerUserID int64, gifts []domain.SavedStarGift, catalog 
 				item.SetPrepaidUpgradeHash(g.PrepaidUpgradeHash)
 			}
 		}
-		if g.CanExportAt > 0 {
+		// The export RPC currently accepts only user-owned collectibles. Do not
+		// advertise a channel capability that the write path will reject.
+		if g.Owner.Type == domain.PeerTypeUser && g.CanExportAt > 0 {
 			item.SetCanExportAt(g.CanExportAt)
 		}
 		if g.TransferStars > 0 {

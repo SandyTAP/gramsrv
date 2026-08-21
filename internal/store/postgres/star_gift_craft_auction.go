@@ -62,7 +62,7 @@ func defaultStarGiftCraftDraw(upper int) (int, error) {
 }
 
 func starGiftCraftInputAvailable(gift domain.UniqueStarGift, owner domain.Peer, survivor bool) bool {
-	if gift.Owner != owner || gift.Burned || gift.OwnerAddress != "" || gift.CraftChancePermille <= 0 {
+	if gift.Owner != owner || gift.Burned || gift.ExternalizationPending || gift.OwnerAddress != "" || gift.CraftChancePermille <= 0 {
 		return false
 	}
 	// The first input survives a successful craft. Official clients reject an
@@ -432,7 +432,7 @@ WHERE id=ANY($1::bigint[])`, savedIDs[burnFrom:]); err != nil {
 			}
 			saved, found, err := savedStarGiftByID(ctx, tx, firstSavedID)
 			if err != nil || !found || saved.Owner != owner || saved.UniqueGiftID != gift.ID ||
-				!saved.LifecycleStatus.Live() || gift.Owner != owner || gift.Burned || !gift.Crafted {
+				!saved.LifecycleStatus.Live() || gift.Owner != owner || gift.Burned || gift.ExternalizationPending || !gift.Crafted {
 				if err != nil {
 					return err
 				}

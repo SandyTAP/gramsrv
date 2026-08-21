@@ -1,10 +1,11 @@
-import { Check, ChevronRight, Copy, Loader2, RefreshCw, Search } from "lucide-react";
+import { Check, ChevronRight, Copy, Layers3, Loader2, RefreshCw, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
 import { StaticLottie } from "../components/StaticLottie";
 import { Alert, Metric, PageFrame, QueryPanel } from "../components/ui";
 import { useI18n } from "../i18n";
 import type { EmojiListResponse, EmojiRow } from "../types";
+import type { Navigate } from "../routing";
 
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
@@ -68,7 +69,7 @@ function EmojiCard({ row }: { row: EmojiRow }) {
   );
 }
 
-export function EmojiPage() {
+export function EmojiPage({ navigate }: { navigate: Navigate }) {
   const { t } = useI18n();
   const [q, setQ] = useState("");
   const [data, setData] = useState<EmojiListResponse | null>(null);
@@ -107,9 +108,14 @@ export function EmojiPage() {
       title={t("emoji.pageTitle")}
       eyebrow={data?.listing === false ? t("emoji.queryResults") : t("emoji.recent")}
       actions={
-        <button className="btn" type="button" onClick={() => load(false)} disabled={busy}>
-          <RefreshCw size={15} /> {t("common.refresh")}
-        </button>
+        <>
+          <button className="btn" type="button" onClick={() => navigate("/emoji")}>
+            <Layers3 size={15} /> {t("emoji.packCatalog")}
+          </button>
+          <button className="btn" type="button" onClick={() => load(false)} disabled={busy}>
+            <RefreshCw size={15} /> {t("common.refresh")}
+          </button>
+        </>
       }
     >
       {error && <Alert>{error}</Alert>}

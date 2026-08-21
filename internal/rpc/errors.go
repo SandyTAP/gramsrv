@@ -329,6 +329,8 @@ func topicsEmptyErr() error     { return tgerr.New(400, "TOPICS_EMPTY") }
 // randomIDEmptyErr 表示发送消息缺少 random_id。
 func randomIDEmptyErr() error { return tgerr.New(400, "RANDOM_ID_EMPTY") }
 
+func randomIDExpiredErr() error { return tgerr.New(400, "RANDOM_ID_EXPIRED") }
+
 // randomIDDuplicateErr 表示同一发送者重复使用 random_id，但请求载荷与首次
 // 成功发送不一致。Layer 227 为该错误定义的 code 是 500。
 func randomIDDuplicateErr() error { return tgerr.New(500, "RANDOM_ID_DUPLICATE") }
