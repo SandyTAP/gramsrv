@@ -13,6 +13,8 @@ param(
     [string]$EgressAckToken = $(if ($env:TELESRV_EGRESS_ACK_TOKEN) { $env:TELESRV_EGRESS_ACK_TOKEN } else { 'edge-core-smoke-egress' }),
     [string]$FileToken = $(if ($env:TELESRV_FILE_TOKEN) { $env:TELESRV_FILE_TOKEN } else { 'edge-core-smoke-file' }),
     [string]$PostgresDSN = $env:TELESRV_POSTGRES_DSN,
+    [string]$PostgresContainer = 'telesrv-postgres',
+    [string]$PostgresUser = 'telesrv',
     [string]$RedisAddr = $env:TELESRV_REDIS_ADDR,
     [string]$RedisPassword = $env:TELESRV_REDIS_PASSWORD,
     [string]$RedisDB = $env:TELESRV_REDIS_DB,
@@ -26,6 +28,16 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $runDir = Join-Path $repo 'tmp\edge-core-smoke'
 $logDir = Join-Path $runDir 'logs'
 New-Item -ItemType Directory -Force -Path $runDir, $logDir | Out-Null
+
+if ([string]::IsNullOrWhiteSpace($PostgresDSN)) {
+    & (Join-Path $PSScriptRoot 'ensure-local-databases.ps1') `
+        -PostgresContainer $PostgresContainer `
+        -DbUser $PostgresUser
+    $PostgresDSN = 'postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_v2?sslmode=disable'
+    Write-Host '[ok] branch=v2 database=telesrv_v2'
+} else {
+    Write-Host '[ok] branch=v2 database=explicit-override'
+}
 
 function Get-ListenPort([string]$addr) {
     $parts = $addr.Split(':')

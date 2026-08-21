@@ -613,7 +613,8 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	if cfg.TelegramLoginEnabled {
 		telegramLoginHTTPHandler, err = telegramloginhttp.NewHandler(telegramloginhttp.Config{
 			Service: telegramLoginService, Tokens: telegramLoginIDTokens,
-			Limiter: redisstore.NewRateLimiter(rdb), AppName: cfg.PublicAppName,
+			BotUsernames: postgres.NewUserStore(pool),
+			Limiter:      redisstore.NewRateLimiter(rdb), AppName: cfg.PublicAppName,
 			Logger: logger.Named("telegram-login-http"), TrustedProxyCIDRs: cfg.TelegramLoginTrustedProxyCIDRs,
 			AllowHTTP: cfg.TelegramLoginAllowHTTP,
 		})

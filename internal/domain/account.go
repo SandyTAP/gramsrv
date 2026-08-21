@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/nyaruka/phonenumbers"
 )
 
 var (
@@ -260,33 +263,71 @@ func MaskEmail(email string) string {
 	return name[:1] + "***" + name[len(name)-1:] + email[at:]
 }
 
-// NormalizePhone 仅保留手机号中的数字（与 users.phone 的存储形态一致）。全部被过滤
-// 掉时返回原串，便于上层做 validPhone 拒绝。auth/account 两域共用同一规则避免漂移。
-func NormalizePhone(phone string) string {
+// PhoneDigits removes presentation punctuation from a phone number. It is
+// intentionally not an identity canonicalizer: callers that select accounts,
+// issue codes, or persist users must use NormalizePhone and ValidPhone.
+func PhoneDigits(phone string) string {
 	var b strings.Builder
 	b.Grow(len(phone))
+	seenDigit := false
+	seenPlus := false
 	for _, r := range phone {
-		if r >= '0' && r <= '9' {
+		switch {
+		case r >= '0' && r <= '9':
 			b.WriteRune(r)
+			seenDigit = true
+		case r == '+':
+			if seenPlus || seenDigit {
+				return ""
+			}
+			seenPlus = true
+		case unicode.IsSpace(r), r == '-', r == '(', r == ')', r == '.', r == '/':
+			// Presentation separators accepted by official clients and contact UIs.
+		default:
+			return ""
 		}
-	}
-	if b.Len() == 0 {
-		return phone
 	}
 	return b.String()
 }
 
-// ValidPhone 校验 NormalizePhone 后的持久化形态：5-32 位纯数字。
-// 上限与 users.phone 列宽一致；当前开发登录/改号链路不强制精确 E.164 长度，
-// 但拒绝空串、非数字和会截断的超长输入。
+// NormalizePhone returns the one persisted identity for an international
+// phone number: E.164 digits without the leading '+'. Parsing is deliberately
+// country-aware so a national trunk prefix is removed only where the numbering
+// plan says it is a prefix. For example, both +98 0998 167 9461 and
+// +98 998 167 9461 become 989981679461, while Italy's significant leading zero
+// in +39 02 ... is retained.
+//
+// IsPossibleNumber is the structural gate rather than IsValidNumber. It keeps
+// syntactically possible reserved/test ranges usable without accepting local
+// numbers that omit their country calling code or numbers outside E.164's
+// length/plan metadata.
+func NormalizePhone(phone string) string {
+	digits := PhoneDigits(phone)
+	if digits == "" {
+		return ""
+	}
+	// 42777 is the reserved, non-login phone of the built-in service identity.
+	// It predates the ordinary E.164 user invariant and remains resolvable only
+	// so auth can reject it as a system account instead of treating it as free.
+	if digits == OfficialSystemPhone {
+		return digits
+	}
+	number, err := phonenumbers.Parse("+"+digits, phonenumbers.UNKNOWN_REGION)
+	if err != nil || !phonenumbers.IsPossibleNumber(number) {
+		return ""
+	}
+	canonical := strings.TrimPrefix(phonenumbers.Format(number, phonenumbers.E164), "+")
+	if canonical == "" || len(canonical) > 15 {
+		return ""
+	}
+	return canonical
+}
+
+// ValidPhone reports whether phone is already in the persisted canonical form.
+// Callers accepting user input normalize first, then validate, so equivalent
+// international spellings converge before lookup, rate limiting, OTP delivery,
+// and uniqueness checks.
 func ValidPhone(phone string) bool {
-	if len(phone) < 5 || len(phone) > 32 {
-		return false
-	}
-	for _, r := range phone {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	canonical := NormalizePhone(phone)
+	return canonical != "" && canonical == phone
 }

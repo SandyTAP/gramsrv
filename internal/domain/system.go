@@ -10,6 +10,9 @@ import (
 const (
 	// OfficialSystemUserID 是 Telegram 兼容客户端识别的官方系统账号。
 	OfficialSystemUserID int64 = 777000
+	// OfficialSystemPhone is a reserved service identity, not an ordinary E.164
+	// login number. Auth must recognize and reject it before account lookup.
+	OfficialSystemPhone = "42777"
 
 	// BotFatherUserID 是内置 BotFather 账号，与官方 @BotFather 同 ID。
 	BotFatherUserID int64 = 93372553
@@ -113,7 +116,7 @@ func OfficialSystemUser() User {
 	return User{
 		ID:         OfficialSystemUserID,
 		AccessHash: 6599886787491911851,
-		Phone:      "42777",
+		Phone:      OfficialSystemPhone,
 		FirstName:  branding.ProductName(),
 		Username:   branding.ProductUsername(),
 		Verified:   true,

@@ -14,6 +14,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lestrrat-go/jwx/v3 v3.1.1
 	github.com/minio/minio-go/v7 v7.2.1
+	github.com/nyaruka/phonenumbers v1.8.1
 	github.com/pion/datachannel v1.6.2
 	github.com/pion/dtls/v3 v3.1.5
 	github.com/pion/ice/v4 v4.3.0

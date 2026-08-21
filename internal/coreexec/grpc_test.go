@@ -53,6 +53,12 @@ import (
 	"telesrv/internal/store/memory"
 )
 
+var grpcTestPhoneSequence atomic.Uint32
+
+func nextGRPCTestPhone() string {
+	return fmt.Sprintf("+1555%07d", grpcTestPhoneSequence.Add(1))
+}
+
 func TestGRPCRemoteDispatchRoundTripExactLayer(t *testing.T) {
 	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
 	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
@@ -155,7 +161,7 @@ func TestGRPCRemoteAuthenticatedDispatchSeesSignUpBinding(t *testing.T) {
 	if err := authKeyStore.Save(ctx, store.AuthKeyData{ID: authKeyID, CreatedAt: time.Now().Unix()}); err != nil {
 		t.Fatalf("seed auth key: %v", err)
 	}
-	phone := fmt.Sprintf("+15559%08d", time.Now().UnixNano()%100000000)
+	phone := nextGRPCTestPhone()
 	sentValue := decodeBoxedResult(t, dispatchRemoteResult(t, ctx, remote, authKeyID, sessionID, 100, &tg.AuthSendCodeRequest{
 		PhoneNumber: phone,
 		APIID:       1,
@@ -796,7 +802,7 @@ func TestGRPCRemoteAccountDeleteTeardownCommitsAfterResultDelivery(t *testing.T)
 
 	userStore := memory.NewUserStore()
 	user, err := userStore.Create(ctx, domain.User{
-		Phone:     fmt.Sprintf("+15558%08d", time.Now().UnixNano()%100000000),
+		Phone:     nextGRPCTestPhone(),
 		FirstName: "Delete",
 	})
 	if err != nil {
@@ -1460,7 +1466,7 @@ func TestGRPCRemoteStaticTargetsShareAuthenticatedSessionAcrossCores(t *testing.
 	if err := authKeyStore.Save(ctx, store.AuthKeyData{ID: authKeyID, CreatedAt: time.Now().Unix()}); err != nil {
 		t.Fatalf("seed auth key: %v", err)
 	}
-	phone := fmt.Sprintf("+15558%08d", time.Now().UnixNano()%100000000)
+	phone := nextGRPCTestPhone()
 	sentValue := decodeBoxedResult(t, dispatchRemoteResult(t, ctx, remote, authKeyID, sessionID, 1200, &tg.AuthSendCodeRequest{
 		PhoneNumber: phone,
 		APIID:       1,

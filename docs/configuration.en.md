@@ -325,12 +325,14 @@ parties. Start or restart `telesrv`, then verify the public endpoints:
 curl.exe http://192.0.2.25:2401/.well-known/openid-configuration
 curl.exe http://192.0.2.25:2401/.well-known/jwks.json
 curl.exe -I http://192.0.2.25:2401/js/telegram-login.js
+curl.exe -I 'http://192.0.2.25:2401/js/telegram-widget.js?23'
 ```
 
 The discovery `issuer` must equal the configured value, and its `authorization_endpoint`,
 `token_endpoint`, and `jwks_uri` must be reachable by the relying party. A reverse proxy must pass
 through `/.well-known/openid-configuration`, `/.well-known/jwks.json`, `/auth`, `/auth/status`,
-`/token`, `/crossapp`, `/inapp`, `/telegram-login.js`, and `/js/telegram-login.js` unchanged.
+`/token`, `/crossapp`, `/inapp`, `/telegram-login.js`, `/js/telegram-login.js`,
+`/telegram-widget.js`, `/js/telegram-widget.js`, and `POST /telegram-widget/resolve` unchanged.
 
 #### 3. Create an OIDC Client with the local `@BotFather`
 
@@ -394,6 +396,37 @@ Supported scopes are `openid`, `profile`, `phone`, and `telegram:bot_access`. Th
 currently expose UserInfo, refresh tokens, or an introspection endpoint. Browser applications may
 load `<issuer>/js/telegram-login.js` for the local JS SDK. A Client Secret must remain server-side.
 
+For an existing frontend that uses Telegram's attribute-based Login Widget, replace only the widget
+script source; do not use `https://telegram.org/js/telegram-widget.js` for a bot that exists only in
+telesrv:
+
+```html
+<script async src="https://<telesrv-issuer>/js/telegram-widget.js?23"
+  data-telegram-login="BotName"
+  data-size="large"
+  data-radius="10"
+  data-request-access="write"
+  data-lang="en"
+  data-onauth="onTelegramAuth(result)"></script>
+<script>
+  function onTelegramAuth(result) {
+    // telesrv SDK result: { id_token, user }, or { error }
+  }
+</script>
+```
+
+`data-client-id="<numeric bot user id>"` is preferred when supplied. With only
+`data-telegram-login`, the shim resolves the current local bot username only if its Login client is
+enabled and the browser's exact Origin is registered for that bot. `data-size` and `data-radius`
+style the simple local button, `data-lang` is forwarded to the Login SDK, and
+`data-request-access="write"` requests `openid profile telegram:bot_access`; without it the shim
+requests `openid profile`. The `data-onauth` callback receives the existing telesrv SDK result
+`{id_token, user}` rather than a fabricated official-widget payload.
+
+Mini Apps are a separate surface and must continue to load the official
+`https://telegram.org/js/telegram-web-app.js`. The telesrv `telegram-widget.js` shim does not replace
+the Mini App script or alter Mini App behavior.
+
 #### 5. Verify the complete path with the Bedolaga demo
 
 Install the demo dependencies:
@@ -445,7 +478,7 @@ key rings independently on different instances.
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
-| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable` | Primary durable business database. Production must replace the development credentials and TLS policy. |
+| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_v2?sslmode=disable` | Primary durable business database. Local `main` and `v2` use separate `telesrv_main` / `telesrv_v2` databases because their migration histories differ. Production must replace the development credentials and TLS policy. |
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | pgxpool maximum connections. `<=0` delegates to pgx defaults, which are usually too small for production outbox/RPC concurrency. |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool pre-warmed minimum connections. |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | Redis used for volatile codes, limits, and shared update/cache state. |

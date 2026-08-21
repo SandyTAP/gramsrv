@@ -194,6 +194,26 @@ func TestPhoneChangeRejectsOccupiedAndCrossAuthCode(t *testing.T) {
 	}
 }
 
+func TestPhoneChangeRejectsOccupiedNationalTrunkVariant(t *testing.T) {
+	f := newPhoneChangeFixture(t)
+	occupied, err := f.users.Create(f.ctx, domain.User{AccessHash: 103, Phone: "989981679461", FirstName: "Iran"})
+	if err != nil {
+		t.Fatalf("create occupied user: %v", err)
+	}
+	if _, _, err := f.service.SendChangePhoneCode(
+		f.ctx,
+		f.user.ID,
+		f.authKeyID,
+		77,
+		"+98 0998 167 9461",
+	); !errors.Is(err, domain.ErrPhoneNumberOccupied) {
+		t.Fatalf("occupied trunk variant err = %v", err)
+	}
+	if got, found, err := f.users.ByPhone(f.ctx, "989981679461"); err != nil || !found || got.ID != occupied.ID {
+		t.Fatalf("canonical owner user=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestPhoneChangeWrongCodeExhaustsAttempts(t *testing.T) {
 	f := newPhoneChangeFixture(t)
 	hash, _, err := f.service.SendChangePhoneCode(f.ctx, f.user.ID, f.authKeyID, 77, "15550012005")
