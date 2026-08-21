@@ -430,6 +430,55 @@ func TestPhoneCodeAcceptsTDesktopDigitsOnlySignIn(t *testing.T) {
 	}
 }
 
+func TestIranNationalTrunkVariantsShareOneAccountIdentity(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	authz := memory.NewAuthorizationStore()
+	delivery := &captureLoginCodeDelivery{}
+	svc := NewService(
+		users,
+		authz,
+		memory.NewCodeStore(),
+		nil,
+		nil,
+		"12345",
+		WithLoginCodeDelivery(delivery),
+	)
+	const (
+		withNationalTrunk = "+98 0998 167 9461"
+		international     = "989981679461"
+		canonical         = "989981679461"
+	)
+
+	firstHash, err := svc.SendCode(ctx, withNationalTrunk)
+	if err != nil {
+		t.Fatalf("SendCode trunk variant: %v", err)
+	}
+	verifyCodeForSignUp(t, svc, international, firstHash, "12345")
+	created, _, err := svc.SignUp(ctx, domain.Authorization{AuthKeyID: [8]byte{1}}, international, firstHash, "Iran", "User")
+	if err != nil {
+		t.Fatalf("SignUp international variant: %v", err)
+	}
+	if created.Phone != canonical {
+		t.Fatalf("created phone = %q, want %q", created.Phone, canonical)
+	}
+
+	secondHash, err := svc.SendCode(ctx, international)
+	if err != nil {
+		t.Fatalf("SendCode existing international variant: %v", err)
+	}
+	signedIn, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: [8]byte{2}}, withNationalTrunk, secondHash, "12345")
+	if err != nil {
+		t.Fatalf("SignIn trunk variant: %v", err)
+	}
+	if needSignUp || signedIn.ID != created.ID {
+		t.Fatalf("SignIn user=%d needSignUp=%v, want existing user %d", signedIn.ID, needSignUp, created.ID)
+	}
+	if got, found, err := users.ByPhone(ctx, canonical); err != nil || !found || got.ID != created.ID {
+		t.Fatalf("canonical lookup user=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func verifyCodeForSignUp(t *testing.T, svc *Service, phone, hash, code string) {
 	t.Helper()
 	got, msg, needSignUp, err := svc.SignIn(context.Background(), domain.Authorization{}, phone, hash, code)

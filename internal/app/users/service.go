@@ -702,17 +702,26 @@ func (s *Service) ResolvePhone(ctx context.Context, currentUserID int64, phone s
 	if _, err := s.loadSelf(ctx, currentUserID); err != nil {
 		return domain.User{}, false, err
 	}
-	phone = normalizePhone(phone)
-	if phone == "" {
+	canonicalPhone := domain.NormalizePhone(phone)
+	collectiblePhone := domain.NormalizeCollectiblePhone(phone)
+	validCollectible := domain.ValidCollectiblePhone(collectiblePhone)
+	if canonicalPhone == "" && !validCollectible {
 		return domain.User{}, false, domain.ErrPhoneNotOccupied
 	}
-	u, found, err := s.users.ByPhone(ctx, phone)
+	var (
+		u     domain.User
+		found bool
+		err   error
+	)
+	if canonicalPhone != "" {
+		u, found, err = s.users.ByPhone(ctx, canonicalPhone)
+	}
 	collectibleExclusive := false
 	if err != nil {
 		return u, false, err
 	}
-	if !found && s.phones != nil && domain.ValidCollectiblePhone(phone) {
-		asset, assetErr := s.phones.CollectiblePhone(ctx, phone)
+	if !found && s.phones != nil && validCollectible {
+		asset, assetErr := s.phones.CollectiblePhone(ctx, collectiblePhone)
 		if assetErr == nil && asset.Owned() {
 			u, found, err = s.loadBaseUserByID(ctx, asset.OwnerUserID)
 			collectibleExclusive = asset.AlwaysVisible()
@@ -919,19 +928,4 @@ func validUsername(username string) bool {
 		}
 	}
 	return true
-}
-
-func normalizePhone(phone string) string {
-	phone = strings.TrimSpace(phone)
-	if phone == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(phone))
-	for _, r := range phone {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

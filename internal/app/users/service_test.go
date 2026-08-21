@@ -8,8 +8,31 @@ import (
 
 	privacyapp "telesrv/internal/app/privacy"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+type resolvePhoneCollectibleStore struct {
+	store.CollectiblePhoneStore
+	asset domain.CollectiblePhone
+}
+
+func (s resolvePhoneCollectibleStore) CollectiblePhone(_ context.Context, phone string) (domain.CollectiblePhone, error) {
+	if phone == s.asset.Phone {
+		return s.asset, nil
+	}
+	return domain.CollectiblePhone{}, domain.ErrCollectiblePhoneNotFound
+}
+
+func (s resolvePhoneCollectibleStore) OwnedCollectiblePhones(_ context.Context, userIDs []int64) (map[int64]domain.CollectiblePhone, error) {
+	out := make(map[int64]domain.CollectiblePhone)
+	for _, userID := range userIDs {
+		if userID == s.asset.OwnerUserID {
+			out[userID] = s.asset
+		}
+	}
+	return out, nil
+}
 
 func TestServiceUsernameLifecycle(t *testing.T) {
 	ctx := context.Background()
@@ -183,6 +206,34 @@ func TestResolvePhoneHonorsAddedByPhone(t *testing.T) {
 	got, found, err := svc.ResolvePhone(ctx, viewer.ID, target.Phone)
 	if err != nil || !found || got.ID != target.ID {
 		t.Fatalf("ResolvePhone contact = %+v found=%v err=%v, want target", got, found, err)
+	}
+}
+
+func TestResolvePhoneKeepsCollectibleAliasSeparateFromE164Identity(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	viewer, err := users.Create(ctx, domain.User{AccessHash: 1, Phone: "15550001011", FirstName: "Viewer"})
+	if err != nil {
+		t.Fatalf("create viewer: %v", err)
+	}
+	target, err := users.Create(ctx, domain.User{AccessHash: 2, Phone: "15550001012", FirstName: "Target"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	asset := domain.CollectiblePhone{
+		Phone:       "8881111",
+		Tier:        domain.CollectiblePhoneTierExclusive,
+		Status:      domain.CollectibleUsernameStatusOwned,
+		OwnerUserID: target.ID,
+	}
+	svc := NewService(users, WithCollectiblePhoneStore(resolvePhoneCollectibleStore{asset: asset}))
+
+	got, found, err := svc.ResolvePhone(ctx, viewer.ID, "+888 1111")
+	if err != nil || !found || got.ID != target.ID {
+		t.Fatalf("ResolvePhone collectible = %+v found=%v err=%v, want target", got, found, err)
+	}
+	if got.Phone != asset.Phone {
+		t.Fatalf("projected phone = %q, want collectible %q", got.Phone, asset.Phone)
 	}
 }
 
