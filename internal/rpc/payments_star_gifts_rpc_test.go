@@ -735,6 +735,9 @@ func TestSavedStarGiftProjectionPreservesCollectibleLifecycle(t *testing.T) {
 	channelSaved.MsgID = 0
 	channelSaved.SavedID = 51
 	channelProjected := tgSavedStarGifts(0, []domain.SavedStarGift{channelSaved}, nil, nil)[0]
+	if _, ok := channelProjected.GetCanExportAt(); ok {
+		t.Fatal("channel can_export_at must be absent until channel export is executable")
+	}
 	if _, ok := channelProjected.GetCanCraftAt(); ok {
 		t.Fatal("channel can_craft_at must be absent until channel Craft is executable")
 	}
@@ -773,18 +776,25 @@ func TestSavedStarGiftProjectionPreservesCollectibleLifecycle(t *testing.T) {
 		if _, ok := channelDecoded.Gifts[0].GetCanCraftAt(); ok {
 			t.Fatalf("Layer %d channel saved gift exposed can_craft_at", profile)
 		}
+		if _, ok := channelDecoded.Gifts[0].GetCanExportAt(); ok {
+			t.Fatalf("Layer %d channel saved gift exposed can_export_at", profile)
+		}
 	}
 }
 
-func TestChannelUniqueActionSuppressesCraftReadinessAcrossProfiles(t *testing.T) {
+func TestChannelUniqueActionSuppressesUnavailableReadinessAcrossProfiles(t *testing.T) {
 	const readyAt = 1_780_000_123
 	unique := domain.UniqueStarGift{
 		ID: 9902, GiftID: 8002, Title: "Channel Craftable", Slug: "channel-craftable-1", Num: 1,
 		Owner: domain.Peer{Type: domain.PeerTypeChannel, ID: 8102}, CraftChancePermille: 250,
 	}
 	action := tgMessageActionStarGiftUnique(&domain.MessageStarGiftUniqueAction{
-		Gift: unique, Peer: unique.Owner, SavedID: 52, Saved: true, CanCraftAt: readyAt,
+		Gift: unique, Peer: unique.Owner, SavedID: 52, Saved: true,
+		CanExportAt: readyAt - 1, CanCraftAt: readyAt,
 	}).(*tg.MessageActionStarGiftUnique)
+	if _, ok := action.GetCanExportAt(); ok {
+		t.Fatal("channel unique action must not expose can_export_at")
+	}
 	if _, ok := action.GetCanCraftAt(); ok {
 		t.Fatal("channel unique action must not expose can_craft_at")
 	}
@@ -807,6 +817,9 @@ func TestChannelUniqueActionSuppressesCraftReadinessAcrossProfiles(t *testing.T)
 		}
 		if _, ok := decoded.GetCanCraftAt(); ok {
 			t.Fatalf("Layer %d channel unique action exposed can_craft_at", profile)
+		}
+		if _, ok := decoded.GetCanExportAt(); ok {
+			t.Fatalf("Layer %d channel unique action exposed can_export_at", profile)
 		}
 		gift, ok := decoded.Gift.(*tg.StarGiftUnique)
 		if !ok || gift.CraftChancePermille != unique.CraftChancePermille {

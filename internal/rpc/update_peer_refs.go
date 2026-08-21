@@ -363,6 +363,14 @@ func collectMessagePeerRefs(msg domain.Message, currentChannelID int64, userIDs,
 				userIDs[reaction.UserID] = struct{}{}
 			}
 		}
+		if msg.Reactions.Paid != nil {
+			for _, reactor := range msg.Reactions.Paid.TopReactors {
+				if reactor.Anonymous && !reactor.My {
+					continue
+				}
+				addDomainPeerRef(reactor.DisplayPeer(), currentChannelID, userIDs, channelIDs)
+			}
+		}
 	}
 }
 
@@ -466,6 +474,14 @@ func collectChannelMessagePeerRefs(msg domain.ChannelMessage, currentChannelID i
 		for _, reaction := range msg.Reactions.Recent {
 			if reaction.UserID != 0 {
 				userIDs[reaction.UserID] = struct{}{}
+			}
+		}
+		if msg.Reactions.Paid != nil {
+			for _, reactor := range msg.Reactions.Paid.TopReactors {
+				if reactor.Anonymous && !reactor.My {
+					continue
+				}
+				addDomainPeerRef(reactor.DisplayPeer(), currentChannelID, userIDs, channelIDs)
 			}
 		}
 	}

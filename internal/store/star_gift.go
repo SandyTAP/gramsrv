@@ -107,11 +107,16 @@ type StarGiftLifecycleStore interface {
 	RecordStarGiftWithdrawal(ctx context.Context, req domain.StarGiftWithdrawalRequest, provider, providerRequestID, url string, expiresAt int) (domain.StarGiftWithdrawal, error)
 	ResolveStarGiftWithdrawal(ctx context.Context, providerRequestID string) (domain.StarGiftWithdrawal, bool, error)
 	CompleteStarGiftWithdrawal(ctx context.Context, providerRequestID string, date int) (domain.StarGiftWithdrawal, error)
+	IssueChannelRevenueWithdrawal(ctx context.Context, req domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error)
+	ResolveChannelRevenueWithdrawal(ctx context.Context, tokenDigest []byte) (domain.ChannelRevenueWithdrawal, bool, error)
+	CompleteChannelRevenueWithdrawal(ctx context.Context, tokenDigest []byte, date int) (domain.ChannelRevenueWithdrawal, error)
 	TonBalance(ctx context.Context, userID int64) (int64, error)
 	TonTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error)
 	ChannelStarsBalance(ctx context.Context, channelID int64) (int64, error)
+	ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error)
 	ChannelStarsTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error)
 	ChannelTonBalance(ctx context.Context, channelID int64) (int64, error)
+	ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error)
 	ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error)
 	// SweepStarGiftLifecycle advances time-driven offer/auction aggregates and
 	// drains their durable notification/delivery outboxes in bounded batches.

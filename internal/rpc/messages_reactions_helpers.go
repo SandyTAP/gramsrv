@@ -177,6 +177,17 @@ func messageReactionErr(err error) error {
 
 func channelReactionErr(err error) error {
 	switch {
+	case errors.Is(err, domain.ErrPaidReactionCutoverAmbiguous):
+		// TDesktop automatically creates a new random_id and resends the same
+		// charge on RANDOM_ID_EXPIRED. A cutover ambiguity must fail closed as a
+		// duplicate so an old-writer lost response cannot become a second debit.
+		return randomIDDuplicateErr()
+	case errors.Is(err, domain.ErrPaidReactionRandomIDExpired):
+		return randomIDExpiredErr()
+	case errors.Is(err, domain.ErrPaidReactionSendAsPeerInvalid):
+		return sendAsPeerInvalidErr()
+	case errors.Is(err, domain.ErrMessageRandomIDDuplicate):
+		return randomIDDuplicateErr()
 	case errors.Is(err, domain.ErrMessageIDInvalid):
 		return messageIDInvalidErr()
 	case errors.Is(err, domain.ErrReactionInvalid):

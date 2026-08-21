@@ -157,6 +157,41 @@ func TestCollectChannelMessagePeerRefsIncludesNestedWireUsers(t *testing.T) {
 	}
 }
 
+func TestCollectChannelMessagePeerRefsIncludesVisiblePaidReactorPeers(t *testing.T) {
+	const currentChannelID = int64(3001)
+	users := map[int64]struct{}{}
+	channels := map[int64]struct{}{}
+	collectChannelMessagePeerRefs(domain.ChannelMessage{
+		Reactions: &domain.ChannelMessageReactions{Paid: &domain.ChannelMessagePaidReactions{
+			TopReactors: []domain.PaidReactor{
+				{UserID: 1001, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 4001}, Stars: 10},
+				{UserID: 1002, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 1002}, Stars: 9},
+				{UserID: 1003, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 4002}, Stars: 8, Anonymous: true},
+				{UserID: 1004, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 1004}, Stars: 7, Anonymous: true, My: true},
+				{UserID: 1005, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: currentChannelID}, Stars: 6},
+			},
+		}},
+	}, currentChannelID, users, channels)
+
+	if _, ok := channels[4001]; !ok {
+		t.Fatalf("paid reactor channel refs=%v, missing visible channel", channels)
+	}
+	if _, ok := channels[4002]; ok {
+		t.Fatalf("anonymous other paid reactor leaked channel ref=%v", channels)
+	}
+	if _, ok := channels[currentChannelID]; ok {
+		t.Fatalf("current paid reactor channel leaked into external refs=%v", channels)
+	}
+	for _, id := range []int64{1002, 1004} {
+		if _, ok := users[id]; !ok {
+			t.Fatalf("paid reactor user refs=%v, missing %d", users, id)
+		}
+	}
+	if _, ok := users[1003]; ok {
+		t.Fatalf("anonymous other paid reactor leaked user ref=%v", users)
+	}
+}
+
 func TestMessageMentionNameUsersAreProjectedInStrictAndNonStrictEnvelopes(t *testing.T) {
 	const (
 		viewerID   = int64(1001)

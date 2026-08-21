@@ -323,27 +323,48 @@ func (r *Router) onChannelsGetSendAs(ctx context.Context, req *tg.ChannelsGetSen
 			}
 		}
 		chats = []tg.ChatClass{tgChannelChatForView(userID, view)}
-		// 以「当前频道/群本身」发言：广播频道自帖、匿名管理员等（canCurrentChannelSendAs 判定）。
-		if canCurrentChannelSendAs(view) {
-			peers = append(peers, tg.SendAsPeer{Peer: &tg.PeerChannel{ChannelID: view.Channel.ID}})
-		}
-		// 以「用户自己拥有的其它广播频道」身份在本群发言。非本群关联频道的个人频道需会员
-		// （premium_required，对齐官方：仅本群的 linked 讨论频道免会员），客户端据此置灰/引导开会员，
-		// 服务端在发送侧用 PremiumActiveAt 兜底门控。
-		if owned, err := r.deps.Channels.ListSendAsChannels(ctx, userID); err == nil && len(owned) > 0 {
-			extras := make([]domain.Channel, 0, len(owned))
+		owned, ownedErr := r.deps.Channels.ListSendAsChannels(ctx, userID)
+		if req.ForPaidReactions {
+			// Paid reaction identities are self plus currently owned/postable
+			// broadcast channels. They are not message send-as candidates and do
+			// not carry the unrelated premium_required gate.
+			seen := make(map[int64]struct{}, len(owned))
 			for _, ch := range owned {
-				if ch.ID == 0 || ch.ID == view.Channel.ID {
+				if ch.ID == 0 || ch.Deleted || !ch.Broadcast || ch.CreatorUserID != userID {
 					continue
 				}
-				sendAs := tg.SendAsPeer{Peer: &tg.PeerChannel{ChannelID: ch.ID}}
-				if ch.ID != view.Channel.LinkedChatID {
-					sendAs.PremiumRequired = true
+				if _, ok := seen[ch.ID]; ok {
+					continue
 				}
-				peers = append(peers, sendAs)
-				extras = append(extras, ch)
+				seen[ch.ID] = struct{}{}
+				peers = append(peers, tg.SendAsPeer{Peer: &tg.PeerChannel{ChannelID: ch.ID}})
+				if ch.ID != view.Channel.ID {
+					chats = append(chats, tgChannels(userID, []domain.Channel{ch})...)
+				}
 			}
-			chats = append(chats, tgChannels(userID, extras)...)
+		} else {
+			// 以「当前频道/群本身」发言：广播频道自帖、匿名管理员等（canCurrentChannelSendAs 判定）。
+			if canCurrentChannelSendAs(view) {
+				peers = append(peers, tg.SendAsPeer{Peer: &tg.PeerChannel{ChannelID: view.Channel.ID}})
+			}
+			// 以「用户自己拥有的其它广播频道」身份在本群发言。非本群关联频道的个人频道需会员
+			// （premium_required，对齐官方：仅本群的 linked 讨论频道免会员），客户端据此置灰/引导开会员，
+			// 服务端在发送侧用 PremiumActiveAt 兜底门控。
+			if ownedErr == nil && len(owned) > 0 {
+				extras := make([]domain.Channel, 0, len(owned))
+				for _, ch := range owned {
+					if ch.ID == 0 || ch.ID == view.Channel.ID {
+						continue
+					}
+					sendAs := tg.SendAsPeer{Peer: &tg.PeerChannel{ChannelID: ch.ID}}
+					if ch.ID != view.Channel.LinkedChatID {
+						sendAs.PremiumRequired = true
+					}
+					peers = append(peers, sendAs)
+					extras = append(extras, ch)
+				}
+				chats = append(chats, tgChannels(userID, extras)...)
+			}
 		}
 	}
 	out := &tg.ChannelsSendAsPeers{

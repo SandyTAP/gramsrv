@@ -128,6 +128,17 @@ func newLogger() (*zap.Logger, error) {
 	), nil
 }
 
+func localStarGiftWithdrawalOption(publicBaseURL, publicLinkWebAddr string) (stargifts.Option, error) {
+	if strings.TrimSpace(publicLinkWebAddr) == "" {
+		return nil, nil
+	}
+	provider, err := stargifts.NewLocalWithdrawalProvider(publicBaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return stargifts.WithWithdrawalProvider(provider), nil
+}
+
 func newBusinessAutomationOptions(cfg config.Config, online messageapp.BusinessAutomationOnlineChecker, generator messageapp.BusinessAITextGenerator, logger *zap.Logger) []messageapp.BusinessAutomationOption {
 	opts := []messageapp.BusinessAutomationOption{
 		messageapp.WithBusinessAutomationOnlineChecker(online),
@@ -718,6 +729,7 @@ func run(logger *zap.Logger) error {
 	channelBoostCache := postgres.NewChannelBoostCache(cfg.ChannelBoostCacheMaxEntries, cfg.ChannelBoostCacheTTL)
 	channelStore := postgres.NewChannelStore(pool,
 		postgres.WithChannelAllocators(channelIDAllocator, channelMessageIDAllocator),
+		postgres.WithChannelStarsStartingGrant(cfg.StarsStartingGrant),
 		postgres.WithChannelLogger(logger.Named("store").Named("channels")),
 		postgres.WithChannelRowCache(channelRowCache),
 		postgres.WithChannelMemberCache(channelMemberCache),
@@ -1088,14 +1100,18 @@ func run(logger *zap.Logger) error {
 			StarsProceedsPermille: cfg.StarGiftStarsProceedsPermille,
 			TONProceedsPermille:   cfg.StarGiftTONProceedsPermille,
 		}))
-	starGiftWithdrawalProvider, err := stargifts.NewLocalWithdrawalProvider(cfg.PublicBaseURL)
+	starGiftWithdrawalOption, err := localStarGiftWithdrawalOption(cfg.PublicBaseURL, cfg.PublicLinkWebAddr)
 	if err != nil {
 		return fmt.Errorf("init local star gift withdrawal provider: %w", err)
 	}
-	giftsService := stargifts.NewService(starGiftStore, blobBackend, cfg.DC,
+	starGiftOptions := []stargifts.Option{
 		stargifts.WithUpgradeStore(starGiftUpgradeStore),
 		stargifts.WithLifecycleStore(starGiftLifecycleStore),
-		stargifts.WithWithdrawalProvider(starGiftWithdrawalProvider))
+	}
+	if starGiftWithdrawalOption != nil {
+		starGiftOptions = append(starGiftOptions, starGiftWithdrawalOption)
+	}
+	giftsService := stargifts.NewService(starGiftStore, blobBackend, cfg.DC, starGiftOptions...)
 	// Passkey:凭据持久化走 postgres;一次性挑战走进程内内存(短 TTL,与 QR 登录 token
 	// 同属进程内一次性凭据,不跨实例)。
 	passkeyStore := postgres.NewPasskeyStore(pool)
@@ -1567,21 +1583,22 @@ func run(logger *zap.Logger) error {
 		return fmt.Errorf("start admin api: %w", err)
 	}
 	if _, err := web.Start(ctx, web.Config{
-		Addr:              cfg.PublicLinkWebAddr,
-		PublicBaseURL:     cfg.PublicBaseURL,
-		AppScheme:         cfg.PublicAppScheme,
-		AppLinkBase:       cfg.PublicAppLinkBase,
-		WebBaseURL:        cfg.PublicWebBaseURL,
-		AppName:           cfg.PublicAppName,
-		StickerSets:       filesService,
-		Users:             userStore,
-		Channels:          channelStore,
-		Privacy:           privacyService,
-		Photos:            filesService,
-		UniqueGifts:       giftsService,
-		GiftWithdrawals:   giftsService,
-		ModerationAppeals: moderationService,
-		TelegramLogin:     telegramLoginHTTPHandler,
+		Addr:               cfg.PublicLinkWebAddr,
+		PublicBaseURL:      cfg.PublicBaseURL,
+		AppScheme:          cfg.PublicAppScheme,
+		AppLinkBase:        cfg.PublicAppLinkBase,
+		WebBaseURL:         cfg.PublicWebBaseURL,
+		AppName:            cfg.PublicAppName,
+		StickerSets:        filesService,
+		Users:              userStore,
+		Channels:           channelStore,
+		Privacy:            privacyService,
+		Photos:             filesService,
+		UniqueGifts:        giftsService,
+		GiftWithdrawals:    giftsService,
+		RevenueWithdrawals: giftsService,
+		ModerationAppeals:  moderationService,
+		TelegramLogin:      telegramLoginHTTPHandler,
 	}, logger.Named("public-web")); err != nil {
 		return fmt.Errorf("start public Web: %w", err)
 	}

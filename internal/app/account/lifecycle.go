@@ -19,6 +19,22 @@ import (
 
 const accountDeletionDelay = 7 * 24 * time.Hour
 
+func (s *Service) RevenueWithdrawalPasswordState(ctx context.Context, userID int64) (domain.RevenueWithdrawalPasswordState, error) {
+	if s == nil || s.lifecycle == nil || userID == 0 {
+		return domain.RevenueWithdrawalPasswordState{}, fmt.Errorf("revenue withdrawal password state is unavailable")
+	}
+	snapshot, found, err := s.lifecycle.AccountDeletionSnapshot(ctx, userID)
+	if err != nil {
+		return domain.RevenueWithdrawalPasswordState{}, err
+	}
+	if !found {
+		return domain.RevenueWithdrawalPasswordState{}, domain.ErrUserNotFound
+	}
+	return domain.RevenueWithdrawalPasswordState{
+		HasPassword: snapshot.HasPassword, PasswordChangedAt: snapshot.PasswordUpdatedAt,
+	}, nil
+}
+
 // DeleteAccount implements the official 2FA deletion decision. A supplied and
 // valid SRP proof always deletes immediately. Without a proof, an account whose
 // password is older than seven days and which was active during the last seven

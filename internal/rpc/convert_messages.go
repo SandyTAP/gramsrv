@@ -307,7 +307,10 @@ func tgMessageActionStarGiftUnique(action *domain.MessageStarGiftUniqueAction) t
 		FromOffer: action.FromOffer, Craft: action.Craft,
 		Gift: tgUniqueStarGift(action.Gift),
 	}
-	if action.CanExportAt > 0 {
+	// Channel-owned gifts cannot execute payments.getStarGiftWithdrawalUrl.
+	// Keep that impossible action off service messages and admin-log/history
+	// projections just as we already do for channel Craft readiness below.
+	if action.Gift.Owner.Type == domain.PeerTypeUser && action.CanExportAt > 0 {
 		out.SetCanExportAt(action.CanExportAt)
 	}
 	if action.TransferStars > 0 {

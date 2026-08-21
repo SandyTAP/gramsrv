@@ -1,10 +1,18 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+
 	"telesrv/internal/domain"
+	"telesrv/internal/store/postgres/sqlcgen"
 )
 
 func (s *ChannelStore) SetChannelMessageReactions(ctx context.Context, req domain.SetChannelMessageReactionsRequest) (domain.ChannelMessageReactionsResult, error) {
@@ -182,18 +190,54 @@ DO UPDATE SET reaction_count = user_top_reactions.reaction_count + 1, reaction_d
 	}, nil
 }
 
-// AddChannelMessagePaidReaction 为一条广播频道消息增投付费 reaction 星数（累计），返回聚合
-// 状态供 rpc 投影与扇出。扣费在 rpc 层经 Stars 账本 Debit 完成，本方法只负责累计与聚合。
+// AddChannelMessagePaidReaction atomically binds random_id to an immutable
+// command, debits the payer, credits the channel, increments the reaction and
+// stores the first settlement receipt. It deliberately allocates no PTS.
 func (s *ChannelStore) AddChannelMessagePaidReaction(ctx context.Context, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, error) {
-	if req.UserID == 0 || req.ChannelID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
+	if req.UserID == 0 || req.ChannelID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID || req.RandomID == 0 {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
 	}
 	if req.Stars <= 0 || req.Stars > domain.MaxPaidReactionStarsPerRequest {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
 	}
+	privacyKind := req.Privacy.Kind
+	if privacyKind == "" {
+		privacyKind = domain.PaidReactionPrivacyDefault
+	}
+	displayPeer := req.DisplayPeer
+	switch privacyKind {
+	case domain.PaidReactionPrivacyDefault:
+		if req.Anonymous || displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyAccountDefault:
+		if req.Anonymous && displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyAnonymous:
+		if !req.Anonymous || displayPeer.ID != 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+		}
+	case domain.PaidReactionPrivacyPeer:
+		if req.Anonymous || req.Privacy.Peer == nil || req.Privacy.Peer.Type != domain.PeerTypeChannel || req.Privacy.Peer.ID <= 0 {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+		if displayPeer.ID == 0 {
+			displayPeer = *req.Privacy.Peer
+		}
+		if displayPeer != *req.Privacy.Peer {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+	default:
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+	}
+	if displayPeer.ID != 0 && (displayPeer.Type != domain.PeerTypeChannel || displayPeer.ID <= 0) {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+	}
 	if req.Date <= 0 {
 		req.Date = nowUnix()
 	}
+	fingerprint := req.Fingerprint()
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
 		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("add channel paid reaction: db does not support transactions")
@@ -208,13 +252,144 @@ func (s *ChannelStore) AddChannelMessagePaidReaction(ctx context.Context, req do
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if _, err := tx.Exec(ctx, `
+DELETE FROM channel_paid_reaction_commands
+WHERE ctid IN (
+    SELECT ctid FROM channel_paid_reaction_commands
+    WHERE created_at < now() - ($1::bigint * interval '1 second')
+    ORDER BY created_at ASC
+    LIMIT 32
+)`, domain.PaidReactionReceiptRetentionSeconds); err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("prune paid reaction receipts: %w", err)
+	}
+
+	// The placeholder is invisible until commit. A concurrent retry blocks on
+	// the primary key and then observes either the complete receipt or no row if
+	// this transaction rolled back.
+	inserted := false
+	err = tx.QueryRow(ctx, `
+INSERT INTO channel_paid_reaction_commands
+    (payer_user_id,random_id,request_fingerprint,channel_id,message_id,stars,anonymous,reaction_date)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (payer_user_id,random_id) DO NOTHING
+RETURNING true`, req.UserID, req.RandomID, fingerprint[:], req.ChannelID, req.MessageID, req.Stars, req.Anonymous, req.Date).Scan(&inserted)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("reserve paid reaction command: %w", err)
+	}
+
+	result := domain.ChannelMessagePaidReactionResult{}
+	if !inserted {
+		var (
+			storedFingerprint []byte
+			completed         bool
+			resultSnapshot    []byte
+		)
+		if err := tx.QueryRow(ctx, `
+SELECT request_fingerprint,completed,result_snapshot
+FROM channel_paid_reaction_commands
+WHERE payer_user_id=$1 AND random_id=$2`, req.UserID, req.RandomID).
+			Scan(&storedFingerprint, &completed, &resultSnapshot); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("load paid reaction receipt: %w", err)
+		}
+		if !bytes.Equal(storedFingerprint, fingerprint[:]) {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrMessageRandomIDDuplicate
+		}
+		if !completed {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("paid reaction receipt is incomplete")
+		}
+		result, err = decodePaidReactionResultSnapshot(resultSnapshot)
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("decode paid reaction receipt: %w", err)
+		}
+		// Financial effects remain the immutable first receipt, but an absolute
+		// balance update must reflect current authority rather than rewinding a
+		// client after later transactions.
+		if err := tx.QueryRow(ctx, `SELECT balance,granted FROM stars_balances WHERE user_id=$1`, req.UserID).
+			Scan(&result.PayerBalance.Balance, &result.PayerBalance.Granted); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("load current paid reaction replay balance: %w", err)
+		}
+		result.PayerBalance.UserID = req.UserID
+		result.Duplicate = true
+		result.Recipients = []int64{req.UserID}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("commit paid reaction replay: %w", err)
+		}
+		committed = true
+		return result, nil
+	}
+	if domain.PaidReactionRandomIDExpired(req.RandomID, req.Date) {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionRandomIDExpired
+	}
+	var rejectRandomIDThrough int
+	if err := tx.QueryRow(ctx, `SELECT reject_random_id_through
+FROM channel_paid_reaction_cutover
+WHERE singleton`).Scan(&rejectRandomIDThrough); err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("load paid reaction cutover fence: %w", err)
+	}
+	if rejectRandomIDThrough > 0 && domain.PaidReactionRandomIDTimestamp(req.RandomID) <= rejectRandomIDThrough {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionCutoverAmbiguous
+	}
+
+	if inserted {
+		// Lock target and display channel/member rows in one global channel-id
+		// order. This prevents target-A/as-B versus target-B/as-A deadlocks and
+		// holds paid policy plus send-as ownership through settlement.
+		lockIDs := []int64{req.ChannelID}
+		if displayPeer.ID != 0 && displayPeer.ID != req.ChannelID {
+			lockIDs = append(lockIDs, displayPeer.ID)
+		}
+		sort.Slice(lockIDs, func(i, j int) bool { return lockIDs[i] < lockIDs[j] })
+		rows, err := tx.Query(ctx, `SELECT id FROM channels WHERE id=ANY($1::bigint[]) ORDER BY id FOR SHARE`, lockIDs)
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction channels: %w", err)
+		}
+		for rows.Next() {
+			var ignored int64
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("scan paid reaction channel lock: %w", err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction channels: %w", err)
+		}
+		rows.Close()
+		rows, err = tx.Query(ctx, `
+SELECT channel_id FROM channel_members
+WHERE user_id=$1 AND channel_id=ANY($2::bigint[])
+ORDER BY channel_id FOR SHARE`, req.UserID, lockIDs)
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction members: %w", err)
+		}
+		for rows.Next() {
+			var ignored int64
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("scan paid reaction member lock: %w", err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction members: %w", err)
+		}
+		rows.Close()
+	}
 	channel, member, err := s.getChannelForMember(ctx, tx, req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.ChannelMessagePaidReactionResult{}, err
 	}
-	// 付费 reaction 仅用于广播频道帖子（官方语义）。
-	if !channel.Broadcast || channel.Megagroup {
+	// Paid reactions are available only on broadcast posts whose owner enabled
+	// the durable paid reaction policy. A committed exact replay is still valid
+	// if the owner disables the feature later.
+	if !channel.Broadcast || channel.Megagroup || (inserted && !channel.ReactionPolicy.PaidEnabled) {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrReactionInvalid
+	}
+	if inserted {
+		var lockedMessageID int
+		if err := tx.QueryRow(ctx, `SELECT id FROM channel_messages WHERE channel_id=$1 AND id=$2 FOR UPDATE`, req.ChannelID, req.MessageID).Scan(&lockedMessageID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction message: %w", err)
+		}
 	}
 	msg, err := s.getChannelMessage(ctx, tx, req.ChannelID, req.MessageID)
 	if err != nil {
@@ -223,45 +398,257 @@ func (s *ChannelStore) AddChannelMessagePaidReaction(ctx context.Context, req do
 	if msg.Deleted || msg.Action != nil || msg.ID <= member.AvailableMinID {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrMessageIDInvalid
 	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO channel_message_paid_reactions (channel_id, message_id, reactor_user_id, stars, anonymous, reaction_date)
-VALUES ($1,$2,$3,$4,$5,$6)
+	if displayPeer.ID != 0 {
+		displayChannel, displayMember, err := s.getChannelForMember(ctx, tx, req.UserID, displayPeer.ID)
+		if err != nil || displayChannel.Deleted || !displayChannel.Broadcast ||
+			displayChannel.CreatorUserID != req.UserID || displayMember.Role != domain.ChannelRoleCreator {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrPaidReactionSendAsPeerInvalid
+		}
+	}
+
+	if inserted {
+		var (
+			balance        int64
+			granted        bool
+			payerTxnID     int64
+			channelTxnID   int64
+			reactorStars   int64
+			totalStars     int64
+			channelBalance int64
+		)
+		storedDisplayPeer := domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID}
+		if displayPeer.ID != 0 {
+			storedDisplayPeer = displayPeer
+		}
+		// Materialize the lazy grant with a unique-row upsert before locking it.
+		// Concurrent distinct commands from a fresh payer then serialize on the
+		// same row and exactly one transaction records the starting grant.
+		insertedGrant := false
+		err := tx.QueryRow(ctx, `
+INSERT INTO stars_balances(user_id,balance,granted,updated_at)
+VALUES($1,$2,true,now())
+ON CONFLICT(user_id) DO NOTHING
+RETURNING true`, req.UserID, s.paidReactionStartingGrant).Scan(&insertedGrant)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("materialize paid reaction payer balance: %w", err)
+		}
+		if insertedGrant && s.paidReactionStartingGrant > 0 {
+			if err := insertStarsTxn(ctx, tx, req.UserID, s.paidReactionStartingGrant, domain.StarsReasonGrant, domain.Peer{}, req.Date, "", ""); err != nil {
+				return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("insert paid reaction payer grant: %w", err)
+			}
+		}
+		err = tx.QueryRow(ctx, `SELECT balance,granted FROM stars_balances WHERE user_id=$1 FOR UPDATE`, req.UserID).Scan(&balance, &granted)
+		switch {
+		case err != nil:
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("lock paid reaction payer balance: %w", err)
+		case !granted && s.paidReactionStartingGrant > 0:
+			if err := tx.QueryRow(ctx, `UPDATE stars_balances SET balance=balance+$2,granted=true,updated_at=now() WHERE user_id=$1 RETURNING balance`, req.UserID, s.paidReactionStartingGrant).Scan(&balance); err != nil {
+				return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("apply paid reaction payer grant: %w", err)
+			}
+			granted = true
+			if err := insertStarsTxn(ctx, tx, req.UserID, s.paidReactionStartingGrant, domain.StarsReasonGrant, domain.Peer{}, req.Date, "", ""); err != nil {
+				return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("insert paid reaction payer grant: %w", err)
+			}
+		}
+		if balance < req.Stars {
+			return domain.ChannelMessagePaidReactionResult{}, domain.ErrStarsInsufficient
+		}
+		if err := tx.QueryRow(ctx, `UPDATE stars_balances SET balance=balance-$2,updated_at=now() WHERE user_id=$1 RETURNING balance`, req.UserID, req.Stars).Scan(&balance); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("debit paid reaction payer: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+INSERT INTO stars_transactions(user_id,peer_type,peer_id,amount,reason,title,description,date)
+VALUES($1,'channel',$2,$3,$4,'Paid reaction','',$5)
+RETURNING id`, req.UserID, req.ChannelID, -req.Stars, string(domain.StarsReasonReaction), req.Date).Scan(&payerTxnID); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("insert paid reaction payer transaction: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+INSERT INTO channel_message_paid_reactions
+    (channel_id,message_id,reactor_user_id,stars,anonymous,reaction_date,display_peer_type,display_peer_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 ON CONFLICT (channel_id, message_id, reactor_user_id)
 DO UPDATE SET stars = channel_message_paid_reactions.stars + EXCLUDED.stars,
              anonymous = EXCLUDED.anonymous,
-             reaction_date = EXCLUDED.reaction_date`,
-		req.ChannelID, req.MessageID, req.UserID, req.Stars, req.Anonymous, req.Date); err != nil {
-		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("upsert channel paid reaction: %w", err)
+		     reaction_date = EXCLUDED.reaction_date,
+		     display_peer_type = EXCLUDED.display_peer_type,
+		     display_peer_id = EXCLUDED.display_peer_id
+RETURNING stars`, req.ChannelID, req.MessageID, req.UserID, req.Stars, req.Anonymous, req.Date,
+			storedDisplayPeer.Type, storedDisplayPeer.ID).Scan(&reactorStars); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("upsert channel paid reaction: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(stars),0) FROM channel_message_paid_reactions WHERE channel_id=$1 AND message_id=$2`, req.ChannelID, req.MessageID).Scan(&totalStars); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("sum channel paid reactions: %w", err)
+		}
+		// messages.sendPaidReaction transfers the full count to the channel;
+		// unlike paid messages there is no commission parameter in this method.
+		if err := tx.QueryRow(ctx, `
+INSERT INTO channel_stars_balances(channel_id,balance) VALUES($1,$2)
+ON CONFLICT(channel_id) DO UPDATE SET balance=channel_stars_balances.balance+EXCLUDED.balance,updated_at=now()
+RETURNING balance`, req.ChannelID, req.Stars).Scan(&channelBalance); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("credit paid reaction channel: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+INSERT INTO channel_stars_transactions(channel_id,actor_user_id,amount,reason,peer_type,peer_id,date)
+VALUES($1,$2,$3,$4,'user',$2,$5)
+RETURNING id`, req.ChannelID, req.UserID, req.Stars, string(domain.StarsReasonReaction), req.Date).Scan(&channelTxnID); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("insert paid reaction channel transaction: %w", err)
+		}
+		result.PayerBalance = domain.StarsBalance{UserID: req.UserID, Balance: balance, Granted: granted}
+		result.ChannelBalance = channelBalance
+		messages := []domain.ChannelMessage{msg}
+		if err := s.populateChannelMessagesReactions(ctx, tx, req.UserID, []domain.Channel{channel}, messages); err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("project paid reaction receipt: %w", err)
+		}
+		msg = messages[0]
+		if msg.Reactions == nil || msg.Reactions.Paid == nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("project paid reaction receipt: paid aggregate missing")
+		}
+		result.Channel = channel
+		result.Message = msg
+		result.Paid = *msg.Reactions.Paid
+		result.DisplayChannels, err = listChannelsByIDsInOrder(ctx, tx, paidReactionDisplayChannelIDs(result.Paid))
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("snapshot paid reaction display channels: %w", err)
+		}
+		resultSnapshot, err := encodePaidReactionResultSnapshot(result)
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("encode paid reaction receipt: %w", err)
+		}
+		commandTag, err := tx.Exec(ctx, `
+UPDATE channel_paid_reaction_commands
+SET completed=true,payer_transaction_id=$3,channel_transaction_id=$4,
+    payer_balance_after=$5,channel_balance_after=$6,reactor_stars_after=$7,total_stars_after=$8,
+    result_snapshot=$9
+WHERE payer_user_id=$1 AND random_id=$2 AND NOT completed`, req.UserID, req.RandomID,
+			payerTxnID, channelTxnID, balance, channelBalance, reactorStars, totalStars, resultSnapshot)
+		if err != nil {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("complete paid reaction receipt: %w", err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("complete paid reaction receipt: command changed")
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("commit add channel paid reaction: %w", err)
 	}
 	committed = true
-	messages := []domain.ChannelMessage{msg}
-	if err := s.populateChannelMessagesReactions(ctx, s.db, req.UserID, []domain.Channel{channel}, messages); err != nil {
-		return domain.ChannelMessagePaidReactionResult{}, err
-	}
-	msg = messages[0]
-	paid, err := s.aggregateChannelPaidReactions(ctx, req.ChannelID, req.MessageID, req.UserID)
-	if err != nil {
-		return domain.ChannelMessagePaidReactionResult{}, err
-	}
-	recipients, err := s.ListActiveChannelMemberIDs(ctx, req.UserID, req.ChannelID, domain.MaxChannelRealtimeFanout)
+	recipients := []int64{req.UserID}
+	recipients, err = s.ListActiveChannelMemberIDs(ctx, req.UserID, req.ChannelID, domain.MaxChannelRealtimeFanout)
 	if err != nil || len(recipients) == 0 {
 		recipients = []int64{req.UserID}
 	}
+	result.Recipients = recipients
+	return result, nil
+}
+
+func paidReactionDisplayChannelIDs(paid domain.ChannelMessagePaidReactions) []int64 {
+	seen := make(map[int64]struct{}, len(paid.TopReactors))
+	for _, reactor := range paid.TopReactors {
+		peer := reactor.DisplayPeer()
+		if peer.Type == domain.PeerTypeChannel && peer.ID > 0 {
+			seen[peer.ID] = struct{}{}
+		}
+	}
+	ids := make([]int64, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+type paidReactionResultSnapshot struct {
+	Version         int                                `json:"version"`
+	Channel         domain.Channel                     `json:"channel"`
+	Message         domain.ChannelMessage              `json:"message"`
+	Paid            domain.ChannelMessagePaidReactions `json:"paid"`
+	PayerBalance    domain.StarsBalance                `json:"payer_balance"`
+	ChannelBalance  int64                              `json:"channel_balance"`
+	DisplayChannels []domain.Channel                   `json:"display_channels,omitempty"`
+}
+
+func encodePaidReactionResultSnapshot(result domain.ChannelMessagePaidReactionResult) ([]byte, error) {
+	return json.Marshal(paidReactionResultSnapshot{
+		Version:         1,
+		Channel:         result.Channel,
+		Message:         result.Message,
+		Paid:            result.Paid,
+		PayerBalance:    result.PayerBalance,
+		ChannelBalance:  result.ChannelBalance,
+		DisplayChannels: result.DisplayChannels,
+	})
+}
+
+func decodePaidReactionResultSnapshot(raw []byte) (domain.ChannelMessagePaidReactionResult, error) {
+	var snapshot paidReactionResultSnapshot
+	if len(raw) == 0 {
+		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("empty snapshot")
+	}
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, err
+	}
+	if snapshot.Version != 1 || snapshot.Channel.ID <= 0 || snapshot.Message.ID <= 0 ||
+		snapshot.PayerBalance.UserID <= 0 || snapshot.PayerBalance.Balance < 0 ||
+		snapshot.ChannelBalance < 0 || snapshot.Paid.TotalStars <= 0 {
+		return domain.ChannelMessagePaidReactionResult{}, fmt.Errorf("invalid snapshot")
+	}
 	return domain.ChannelMessagePaidReactionResult{
-		Channel:    channel,
-		Message:    msg,
-		Paid:       paid,
-		Recipients: recipients,
+		Channel:         snapshot.Channel,
+		Message:         snapshot.Message,
+		Paid:            snapshot.Paid,
+		PayerBalance:    snapshot.PayerBalance,
+		ChannelBalance:  snapshot.ChannelBalance,
+		DisplayChannels: snapshot.DisplayChannels,
 	}, nil
+}
+
+// ReplayChannelMessagePaidReaction returns an immutable completed receipt
+// without consulting current channel/message/member/send-as state. RPC uses
+// this before access checks so a lost successful response remains replayable.
+func (s *ChannelStore) ReplayChannelMessagePaidReaction(ctx context.Context, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error) {
+	if req.UserID == 0 || req.RandomID == 0 {
+		return domain.ChannelMessagePaidReactionResult{}, false, domain.ErrChannelInvalid
+	}
+	fingerprint := req.Fingerprint()
+	var storedFingerprint, resultSnapshot []byte
+	err := s.db.QueryRow(ctx, `
+SELECT request_fingerprint,result_snapshot
+FROM channel_paid_reaction_commands
+WHERE payer_user_id=$1 AND random_id=$2 AND completed
+  AND created_at >= now() - ($3::bigint * interval '1 second')`,
+		req.UserID, req.RandomID, domain.PaidReactionReceiptRetentionSeconds).
+		Scan(&storedFingerprint, &resultSnapshot)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ChannelMessagePaidReactionResult{}, false, nil
+	}
+	if err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, false, fmt.Errorf("load paid reaction replay: %w", err)
+	}
+	if !bytes.Equal(storedFingerprint, fingerprint[:]) {
+		return domain.ChannelMessagePaidReactionResult{}, true, domain.ErrMessageRandomIDDuplicate
+	}
+	result, err := decodePaidReactionResultSnapshot(resultSnapshot)
+	if err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, true, fmt.Errorf("decode paid reaction replay: %w", err)
+	}
+	if err := s.db.QueryRow(ctx, `SELECT balance,granted FROM stars_balances WHERE user_id=$1`, req.UserID).
+		Scan(&result.PayerBalance.Balance, &result.PayerBalance.Granted); err != nil {
+		return domain.ChannelMessagePaidReactionResult{}, true, fmt.Errorf("load current paid reaction replay balance: %w", err)
+	}
+	result.PayerBalance.UserID = req.UserID
+	result.Duplicate = true
+	result.Recipients = []int64{req.UserID}
+	return result, true, nil
 }
 
 // aggregateChannelPaidReactions 汇总一条消息的付费 reaction：总星数 + viewer 自身 + top reactors。
 func (s *ChannelStore) aggregateChannelPaidReactions(ctx context.Context, channelID int64, messageID int, viewerUserID int64) (domain.ChannelMessagePaidReactions, error) {
-	rows, err := s.db.Query(ctx, `
-SELECT reactor_user_id, stars, anonymous
+	return aggregateChannelPaidReactionsDB(ctx, s.db, channelID, messageID, viewerUserID)
+}
+
+func aggregateChannelPaidReactionsDB(ctx context.Context, db sqlcgen.DBTX, channelID int64, messageID int, viewerUserID int64) (domain.ChannelMessagePaidReactions, error) {
+	rows, err := db.Query(ctx, `
+SELECT reactor_user_id, display_peer_type, display_peer_id, stars, anonymous
 FROM channel_message_paid_reactions
 WHERE channel_id = $1 AND message_id = $2
 ORDER BY stars DESC, reactor_user_id ASC`, channelID, messageID)
@@ -274,7 +661,7 @@ ORDER BY stars DESC, reactor_user_id ASC`, channelID, messageID)
 	myInTop := false
 	for rows.Next() {
 		var r domain.PaidReactor
-		if err := rows.Scan(&r.UserID, &r.Stars, &r.Anonymous); err != nil {
+		if err := rows.Scan(&r.UserID, &r.Peer.Type, &r.Peer.ID, &r.Stars, &r.Anonymous); err != nil {
 			return domain.ChannelMessagePaidReactions{}, err
 		}
 		out.TotalStars += r.Stars

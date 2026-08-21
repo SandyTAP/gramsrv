@@ -740,7 +740,7 @@ func (r *Router) completePendingPasswordSignIn(ctx context.Context, authKeyID [8
 	if r.deps.Auth == nil {
 		return nil
 	}
-	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID); err != nil {
+	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID, userID); err != nil {
 		return err
 	}
 	r.invalidateAuthUserCache(authKeyID)

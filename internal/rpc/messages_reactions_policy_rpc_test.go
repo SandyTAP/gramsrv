@@ -6,15 +6,18 @@ import (
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
 	"strings"
+	appaccount "telesrv/internal/app/account"
 	appchannels "telesrv/internal/app/channels"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
 	"testing"
+	"time"
 )
 
 type reactionPolicyFixture struct {
 	router     *Router
+	accountSvc *appaccount.Service
 	channelSvc *appchannels.Service
 	sessions   *captureSessions
 	channel    domain.Channel
@@ -42,6 +45,8 @@ func newReactionPolicyFixture(t *testing.T, broadcast bool) reactionPolicyFixtur
 	}
 	channelStore := memory.NewChannelStore()
 	channelSvc := appchannels.NewService(channelStore)
+	passwordStore := memory.NewPasswordStore()
+	accountSvc := appaccount.NewService(passwordStore, appaccount.WithReactionSettings(passwordStore))
 	created, err := channelSvc.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		Title:         "Reaction Policy",
 		Broadcast:     broadcast,
@@ -64,11 +69,13 @@ func newReactionPolicyFixture(t *testing.T, broadcast bool) reactionPolicyFixtur
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
 		Users:    appusers.NewService(userStore),
+		Account:  accountSvc,
 		Channels: channelSvc,
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 	return reactionPolicyFixture{
 		router:     r,
+		accountSvc: accountSvc,
 		channelSvc: channelSvc,
 		sessions:   sessions,
 		channel:    created.Channel,
@@ -143,6 +150,211 @@ func TestSendReactionRespectsChannelReactionPolicy(t *testing.T) {
 	// 策略收紧后撤销存量 reaction 必须仍然可行。
 	if _, err := f.sendReaction(t, f.memberID); err != nil {
 		t.Fatalf("retract reaction under none policy: %v", err)
+	}
+}
+
+func TestSendPaidReactionUsesAtomicChannelSettlement(t *testing.T) {
+	f := newReactionPolicyFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.channelSvc.SetAvailableReactions(ctx, f.ownerID, f.channel.ID, domain.ChannelReactionPolicy{
+		Type: domain.ChannelReactionPolicyAll, PaidEnabled: true,
+	}); err != nil {
+		t.Fatalf("enable paid reactions: %v", err)
+	}
+	f.sessions.channelViewers = map[int64][]int64{f.channel.ID: {f.member2ID}}
+	req := &tg.MessagesSendPaidReactionRequest{
+		Peer:     &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		MsgID:    f.messageID,
+		Count:    100,
+		RandomID: int64(uint64(uint32(time.Now().Unix()))<<32 | 88001),
+	}
+	updates, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), req)
+	if err != nil {
+		t.Fatalf("first paid reaction: %v", err)
+	}
+	update := reactionUpdateFromUpdates(t, updates)
+	if len(update.Reactions.Results) == 0 || update.Reactions.Results[0].Count != 100 {
+		t.Fatalf("first paid reaction projection = %+v", update.Reactions.Results)
+	}
+	box := updates.(*tg.Updates)
+	balance := int64(-1)
+	for _, item := range box.Updates {
+		if b, ok := item.(*tg.UpdateStarsBalance); ok {
+			if amount, ok := b.Balance.(*tg.StarsAmount); ok {
+				balance = amount.Amount
+			}
+		}
+	}
+	if balance != domain.DefaultStarsStartingGrant-100 {
+		t.Fatalf("payer balance update=%d", balance)
+	}
+	later := *req
+	later.Count = 25
+	later.RandomID++
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &later); err != nil {
+		t.Fatalf("later paid reaction: %v", err)
+	}
+	expired := *req
+	expired.RandomID = int64(uint64(uint32(time.Now().Unix()-domain.PaidReactionRandomIDMaxAgeSeconds-1))<<32 | 88009)
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &expired); err == nil || !strings.Contains(err.Error(), "RANDOM_ID_EXPIRED") {
+		t.Fatalf("expired paid reaction random_id err=%v", err)
+	}
+	if _, err := f.channelSvc.LeaveChannel(ctx, f.memberID, f.channel.ID, int(time.Now().Unix())); err != nil {
+		t.Fatalf("leave channel before replay: %v", err)
+	}
+	if _, err := f.channelSvc.DeleteMessages(ctx, f.ownerID, domain.DeleteChannelMessagesRequest{
+		ChannelID: f.channel.ID, IDs: []int{f.messageID}, Date: int(time.Now().Unix()),
+	}); err != nil {
+		t.Fatalf("delete paid reaction target before replay: %v", err)
+	}
+
+	f.sessions.clearMessages()
+	replay, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), req)
+	if err != nil {
+		t.Fatalf("exact paid reaction replay: %v", err)
+	}
+	if got := reactionUpdateFromUpdates(t, replay).Reactions.Results[0].Count; got != 100 {
+		t.Fatalf("replay paid reaction count=%d, want frozen first receipt", got)
+	}
+	replayBalance := int64(-1)
+	for _, item := range replay.(*tg.Updates).Updates {
+		if update, ok := item.(*tg.UpdateStarsBalance); ok {
+			if amount, ok := update.Balance.(*tg.StarsAmount); ok {
+				replayBalance = amount.Amount
+			}
+		}
+	}
+	if replayBalance != domain.DefaultStarsStartingGrant-125 {
+		t.Fatalf("replay current payer balance=%d, want %d", replayBalance, domain.DefaultStarsStartingGrant-125)
+	}
+	if pushed := f.sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("exact replay pushed duplicate fanout to %v", pushed)
+	}
+
+	conflict := *req
+	conflict.Count++
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &conflict); err == nil || !strings.Contains(err.Error(), "RANDOM_ID_DUPLICATE") {
+		t.Fatalf("changed paid reaction random_id err=%v", err)
+	}
+	explicitSelf := *req
+	explicitSelf.SetPrivate(&tg.PaidReactionPrivacyDefault{})
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &explicitSelf); err == nil || !strings.Contains(err.Error(), "RANDOM_ID_DUPLICATE") {
+		t.Fatalf("account-default versus explicit-self random_id err=%v", err)
+	}
+	zero := *req
+	zero.RandomID = 0
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &zero); err == nil || !strings.Contains(err.Error(), "RANDOM_ID_EMPTY") {
+		t.Fatalf("zero paid reaction random_id err=%v", err)
+	}
+}
+
+func TestPaidReactionCutoverAmbiguityDoesNotTriggerExpiredAutoRetry(t *testing.T) {
+	err := channelReactionErr(domain.ErrPaidReactionCutoverAmbiguous)
+	if err == nil || !strings.Contains(err.Error(), "RANDOM_ID_DUPLICATE") || strings.Contains(err.Error(), "RANDOM_ID_EXPIRED") {
+		t.Fatalf("cutover paid reaction error=%v, want non-retrying RANDOM_ID_DUPLICATE", err)
+	}
+}
+
+func TestSendPaidReactionChannelSendAsAuthorizationAndProjection(t *testing.T) {
+	f := newReactionPolicyFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.channelSvc.SetAvailableReactions(ctx, f.ownerID, f.channel.ID, domain.ChannelReactionPolicy{
+		Type: domain.ChannelReactionPolicyAll, PaidEnabled: true,
+	}); err != nil {
+		t.Fatalf("enable paid reactions: %v", err)
+	}
+	owned, err := f.channelSvc.CreateChannel(ctx, f.memberID, domain.CreateChannelRequest{
+		Title: "Paid Reactor Identity", Broadcast: true, Date: 1200,
+	})
+	if err != nil {
+		t.Fatalf("create owned send-as channel: %v", err)
+	}
+	req := &tg.MessagesSendPaidReactionRequest{
+		Peer:  &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		MsgID: f.messageID, Count: 33,
+		RandomID: int64(uint64(uint32(time.Now().Unix()))<<32 | 88101),
+	}
+	req.SetPrivate(&tg.PaidReactionPrivacyPeer{Peer: &tg.InputPeerChannel{
+		ChannelID: owned.Channel.ID, AccessHash: owned.Channel.AccessHash,
+	}})
+	updates, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), req)
+	if err != nil {
+		t.Fatalf("owned channel paid reaction: %v", err)
+	}
+	update := reactionUpdateFromUpdates(t, updates)
+	top, ok := update.Reactions.GetTopReactors()
+	if !ok || len(top) != 1 {
+		t.Fatalf("top reactors=%+v set=%v", top, ok)
+	}
+	peer, ok := top[0].PeerID.(*tg.PeerChannel)
+	if !ok || peer.ChannelID != owned.Channel.ID {
+		t.Fatalf("top reactor peer=%T %+v, want channel %d", top[0].PeerID, top[0].PeerID, owned.Channel.ID)
+	}
+	chatFound := false
+	for _, chat := range updates.(*tg.Updates).Chats {
+		if channel, ok := chat.(*tg.Channel); ok && channel.ID == owned.Channel.ID {
+			chatFound = true
+		}
+	}
+	if !chatFound {
+		t.Fatalf("updates chats=%+v, missing send-as channel %d", updates.(*tg.Updates).Chats, owned.Channel.ID)
+	}
+	ownedPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: owned.Channel.ID}
+	if _, err := f.accountSvc.SetPaidReactionPrivacy(ctx, f.memberID, domain.PaidReactionPrivacy{
+		Kind: domain.PaidReactionPrivacyPeer, Peer: &ownedPeer,
+	}); err != nil {
+		t.Fatalf("save account-default paid reaction channel: %v", err)
+	}
+	accountDefault := &tg.MessagesSendPaidReactionRequest{
+		Peer:  &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		MsgID: f.messageID, Count: 7, RandomID: req.RandomID + 10,
+	}
+	defaultUpdates, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), accountDefault)
+	if err != nil {
+		t.Fatalf("account-default channel paid reaction: %v", err)
+	}
+	defaultTop, ok := reactionUpdateFromUpdates(t, defaultUpdates).Reactions.GetTopReactors()
+	if !ok || len(defaultTop) != 1 {
+		t.Fatalf("account-default top reactors=%+v set=%v", defaultTop, ok)
+	}
+	defaultPeer, ok := defaultTop[0].PeerID.(*tg.PeerChannel)
+	if !ok || defaultPeer.ChannelID != owned.Channel.ID {
+		t.Fatalf("account-default top peer=%T %+v", defaultTop[0].PeerID, defaultTop[0].PeerID)
+	}
+
+	foreign, err := f.channelSvc.CreateChannel(ctx, f.member2ID, domain.CreateChannelRequest{
+		Title: "Foreign Paid Reactor Identity", Broadcast: true, MemberUserIDs: []int64{f.memberID}, Date: 1201,
+	})
+	if err != nil {
+		t.Fatalf("create foreign send-as channel: %v", err)
+	}
+	if _, err := f.channelSvc.EditAdmin(ctx, f.member2ID, domain.EditChannelAdminRequest{
+		ChannelID: foreign.Channel.ID, MemberID: f.memberID,
+		AdminRights: domain.ChannelAdminRights{PostMessages: true}, Date: 1202,
+	}); err != nil {
+		t.Fatalf("promote non-owner paid reaction admin: %v", err)
+	}
+	invalid := *req
+	invalid.RandomID++
+	invalid.SetPrivate(&tg.PaidReactionPrivacyPeer{Peer: &tg.InputPeerChannel{
+		ChannelID: foreign.Channel.ID, AccessHash: foreign.Channel.AccessHash,
+	}})
+	if _, err := f.router.onMessagesSendPaidReaction(WithUserID(ctx, f.memberID), &invalid); err == nil || !strings.Contains(err.Error(), "SEND_AS_PEER_INVALID") {
+		t.Fatalf("post-messages admin paid reaction send-as err=%v", err)
+	}
+}
+
+func TestSendPaidReactionRejectsDisabledPolicy(t *testing.T) {
+	f := newReactionPolicyFixture(t, true)
+	now := uint64(uint32(time.Now().Unix()))
+	_, err := f.router.onMessagesSendPaidReaction(WithUserID(context.Background(), f.memberID), &tg.MessagesSendPaidReactionRequest{
+		Peer:     &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		MsgID:    f.messageID,
+		Count:    1,
+		RandomID: int64(now<<32 | 88002),
+	})
+	if err == nil || !strings.Contains(err.Error(), "REACTION_INVALID") {
+		t.Fatalf("disabled paid reaction err=%v", err)
 	}
 }
 

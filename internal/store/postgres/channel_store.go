@@ -3,6 +3,7 @@ package postgres
 import (
 	"go.uber.org/zap"
 
+	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
@@ -25,6 +26,9 @@ type ChannelStore struct {
 	memberCache *ChannelMemberCache
 	dialogCache *ChannelDialogCache
 	boostCache  *ChannelBoostCache
+	// paidReactionStartingGrant mirrors app/stars lazy grant policy inside the
+	// paid reaction settlement transaction.
+	paidReactionStartingGrant int64
 }
 
 // ChannelStoreOption 调整 PostgreSQL ChannelStore 依赖。
@@ -77,6 +81,18 @@ func WithChannelBoostCache(cache *ChannelBoostCache) ChannelStoreOption {
 	}
 }
 
+// WithChannelStarsStartingGrant keeps paid reaction's atomic debit aligned
+// with the configured app/stars lazy first-use grant.
+func WithChannelStarsStartingGrant(amount int64) ChannelStoreOption {
+	return func(s *ChannelStore) {
+		if amount > 0 {
+			s.paidReactionStartingGrant = amount
+		} else {
+			s.paidReactionStartingGrant = 0
+		}
+	}
+}
+
 // cacheActive 报告当前句柄是否可用频道行缓存：仅启用缓存且走连接池(非事务)时。
 // 事务内(db != s.db)一律绕过缓存实时读，保证事务读己写。
 func (s *ChannelStore) cacheActive(db sqlcgen.DBTX) bool {
@@ -97,7 +113,7 @@ func (s *ChannelStore) boostCacheActive(db sqlcgen.DBTX) bool {
 
 // NewChannelStore 基于 pgx 连接池（或事务）创建 ChannelStore。
 func NewChannelStore(db sqlcgen.DBTX, opts ...ChannelStoreOption) *ChannelStore {
-	s := &ChannelStore{db: db}
+	s := &ChannelStore{db: db, paidReactionStartingGrant: domain.DefaultStarsStartingGrant}
 	for _, opt := range opts {
 		opt(s)
 	}

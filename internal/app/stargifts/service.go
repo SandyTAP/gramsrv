@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -78,6 +79,16 @@ type StarGiftWithdrawalProviderResult struct {
 	RequestID string
 	URL       string
 	ExpiresAt int
+}
+
+type ChannelRevenueWithdrawalProvider interface {
+	CreateRevenueWithdrawal(ctx context.Context, req ChannelRevenueWithdrawalProviderRequest) (StarGiftWithdrawalProviderResult, error)
+}
+
+type ChannelRevenueWithdrawalProviderRequest struct {
+	ChannelID     int64
+	CreatorUserID int64
+	Currency      domain.ChannelRevenueCurrency
 }
 
 func WithWithdrawalProvider(provider StarGiftWithdrawalProvider) Option {
@@ -821,6 +832,62 @@ func (s *Service) CompleteWithdrawal(ctx context.Context, providerRequestID stri
 	return s.lifecycle.CompleteStarGiftWithdrawal(ctx, providerRequestID, date)
 }
 
+// IssueChannelRevenueWithdrawal creates a short-lived same-origin bearer URL
+// and persists only its digest. Funds remain in the channel until the URL's
+// confirmation POST atomically completes the claim.
+func (s *Service) IssueChannelRevenueWithdrawal(ctx context.Context, req domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error) {
+	if s == nil || s.lifecycle == nil {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	provider, ok := s.withdrawal.(ChannelRevenueWithdrawalProvider)
+	if !ok {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	provided, err := provider.CreateRevenueWithdrawal(ctx, ChannelRevenueWithdrawalProviderRequest{
+		ChannelID: req.ChannelID, CreatorUserID: req.CreatorUserID, Currency: req.Currency,
+	})
+	if err != nil {
+		return domain.ChannelRevenueWithdrawal{}, err
+	}
+	token := strings.TrimSpace(provided.RequestID)
+	if token == "" || len(token) > 256 || strings.TrimSpace(provided.URL) == "" || provided.ExpiresAt <= req.Date {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalUnavailable
+	}
+	digest := sha256.Sum256([]byte(token))
+	req.TokenDigest = digest[:]
+	req.ExpiresAt = provided.ExpiresAt
+	out, err := s.lifecycle.IssueChannelRevenueWithdrawal(ctx, req)
+	if err != nil {
+		return domain.ChannelRevenueWithdrawal{}, err
+	}
+	out.URL = provided.URL
+	return out, nil
+}
+
+func (s *Service) ResolveRevenueWithdrawal(ctx context.Context, token string) (domain.ChannelRevenueWithdrawal, bool, error) {
+	if s == nil || s.lifecycle == nil || strings.TrimSpace(token) != token || token == "" || len(token) > 256 {
+		return domain.ChannelRevenueWithdrawal{}, false, nil
+	}
+	digest := sha256.Sum256([]byte(token))
+	return s.lifecycle.ResolveChannelRevenueWithdrawal(ctx, digest[:])
+}
+
+func (s *Service) CompleteRevenueWithdrawal(ctx context.Context, token string, date int) (domain.ChannelRevenueWithdrawal, error) {
+	if s == nil || s.lifecycle == nil || strings.TrimSpace(token) != token || token == "" || len(token) > 256 {
+		return domain.ChannelRevenueWithdrawal{}, domain.ErrChannelRevenueWithdrawalInvalid
+	}
+	digest := sha256.Sum256([]byte(token))
+	return s.lifecycle.CompleteChannelRevenueWithdrawal(ctx, digest[:], date)
+}
+
+func (s *Service) ChannelRevenueWithdrawalAvailable() bool {
+	if s == nil || s.lifecycle == nil {
+		return false
+	}
+	_, ok := s.withdrawal.(ChannelRevenueWithdrawalProvider)
+	return ok
+}
+
 func (s *Service) TonBalance(ctx context.Context, userID int64) (int64, error) {
 	if s == nil || s.lifecycle == nil {
 		return 0, nil
@@ -846,6 +913,13 @@ func (s *Service) ChannelStarsBalance(ctx context.Context, channelID int64) (int
 	return s.lifecycle.ChannelStarsBalance(ctx, channelID)
 }
 
+func (s *Service) ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.ChannelStarsOverallRevenue(ctx, channelID)
+}
+
 func (s *Service) ChannelStarsTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
 	if s == nil || s.lifecycle == nil {
 		return domain.StarsTransactionPage{}, nil
@@ -862,6 +936,13 @@ func (s *Service) ChannelTonBalance(ctx context.Context, channelID int64) (int64
 		return 0, nil
 	}
 	return s.lifecycle.ChannelTonBalance(ctx, channelID)
+}
+
+func (s *Service) ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.ChannelTonOverallRevenue(ctx, channelID)
 }
 
 func (s *Service) ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error) {

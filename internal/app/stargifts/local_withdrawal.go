@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -26,12 +27,31 @@ func NewLocalWithdrawalProvider(publicBaseURL string) (*LocalWithdrawalProvider,
 		(parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("invalid local star gift withdrawal base URL")
 	}
+	if parsed.Scheme == "http" && !localWithdrawalLoopbackHost(parsed.Hostname()) {
+		return nil, fmt.Errorf("local star gift withdrawal base URL requires HTTPS outside loopback")
+	}
 	return &LocalWithdrawalProvider{publicBaseURL: publicBaseURL}, nil
+}
+
+func localWithdrawalLoopbackHost(host string) bool {
+	if strings.EqualFold(strings.TrimSpace(host), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (p *LocalWithdrawalProvider) Name() string { return "telesrv-local" }
 
 func (p *LocalWithdrawalProvider) CreateWithdrawal(_ context.Context, _ StarGiftWithdrawalProviderRequest) (StarGiftWithdrawalProviderResult, error) {
+	return p.createWithdrawal("gift-withdrawal")
+}
+
+func (p *LocalWithdrawalProvider) CreateRevenueWithdrawal(_ context.Context, _ ChannelRevenueWithdrawalProviderRequest) (StarGiftWithdrawalProviderResult, error) {
+	return p.createWithdrawal("revenue-withdrawal")
+}
+
+func (p *LocalWithdrawalProvider) createWithdrawal(path string) (StarGiftWithdrawalProviderResult, error) {
 	if p == nil || p.publicBaseURL == "" {
 		return StarGiftWithdrawalProviderResult{}, fmt.Errorf("local star gift withdrawal provider is not configured")
 	}
@@ -42,9 +62,10 @@ func (p *LocalWithdrawalProvider) CreateWithdrawal(_ context.Context, _ StarGift
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	return StarGiftWithdrawalProviderResult{
 		RequestID: token,
-		URL:       p.publicBaseURL + "/gift-withdrawal/" + url.PathEscape(token),
+		URL:       p.publicBaseURL + "/" + path + "/" + url.PathEscape(token),
 		ExpiresAt: int(time.Now().Add(localWithdrawalTTL).Unix()),
 	}, nil
 }
 
 var _ StarGiftWithdrawalProvider = (*LocalWithdrawalProvider)(nil)
+var _ ChannelRevenueWithdrawalProvider = (*LocalWithdrawalProvider)(nil)

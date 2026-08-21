@@ -210,7 +210,7 @@ ORDER BY channel_id ASC, message_id ASC, reaction_date DESC, reacted_user_id DES
 
 func populateChannelMessagesPaidReactions(ctx context.Context, db sqlcgen.DBTX, viewerUserID int64, channelsByID map[int64]domain.Channel, indexes map[channelReactionMessageKey][]int, messages []domain.ChannelMessage, pairChannels []int64, pairMessages []int32) error {
 	rows, err := db.Query(ctx, `
-SELECT channel_id, message_id, reactor_user_id, stars, anonymous
+SELECT channel_id, message_id, reactor_user_id, display_peer_type, display_peer_id, stars, anonymous
 FROM channel_message_paid_reactions
 WHERE (channel_id, message_id) IN (SELECT * FROM unnest($1::bigint[], $2::int[]))
 ORDER BY channel_id ASC, message_id ASC, stars DESC, reactor_user_id ASC`, pairChannels, pairMessages)
@@ -223,7 +223,7 @@ ORDER BY channel_id ASC, message_id ASC, stars DESC, reactor_user_id ASC`, pairC
 		var channelID int64
 		var msgID int
 		var r domain.PaidReactor
-		if err := rows.Scan(&channelID, &msgID, &r.UserID, &r.Stars, &r.Anonymous); err != nil {
+		if err := rows.Scan(&channelID, &msgID, &r.UserID, &r.Peer.Type, &r.Peer.ID, &r.Stars, &r.Anonymous); err != nil {
 			return err
 		}
 		key := channelReactionMessageKey{channelID: channelID, messageID: msgID}

@@ -1035,8 +1035,8 @@ func (s *Service) SetMessageReactions(ctx context.Context, userID int64, req dom
 	return s.channels.SetChannelMessageReactions(ctx, req)
 }
 
-// SendPaidReaction 为一条广播频道消息增投付费 reaction 星数；扣费在 rpc 层经 Stars 账本
-// Debit 完成，本方法只负责累计与聚合。
+// SendPaidReaction 为一条广播频道消息增投付费 reaction 星数。幂等命令、
+// payer 扣款、channel 入账、reaction 累计和 receipt 由 store 在一个事务完成。
 func (s *Service) SendPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, error) {
 	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
@@ -1044,10 +1044,34 @@ func (s *Service) SendPaidReaction(ctx context.Context, userID int64, req domain
 	if req.UserID == 0 {
 		req.UserID = userID
 	}
-	if req.UserID != userID || req.MessageID > domain.MaxMessageBoxID || req.Stars <= 0 || req.Stars > domain.MaxPaidReactionStarsPerRequest {
+	if req.UserID != userID || req.MessageID > domain.MaxMessageBoxID || req.Stars <= 0 || req.Stars > domain.MaxPaidReactionStarsPerRequest || req.RandomID == 0 {
 		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
 	}
 	return s.channels.AddChannelMessagePaidReaction(ctx, req)
+}
+
+type paidReactionReplayStore interface {
+	ReplayChannelMessagePaidReaction(ctx context.Context, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error)
+}
+
+// ReplayPaidReaction reads a completed immutable receipt before mutable RPC
+// access/send-as checks. Production and the explicit memory fake implement it;
+// adapters without durable command receipts simply report a miss.
+func (s *Service) ReplayPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.RandomID == 0 {
+		return domain.ChannelMessagePaidReactionResult{}, false, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID {
+		return domain.ChannelMessagePaidReactionResult{}, false, domain.ErrChannelInvalid
+	}
+	replayer, ok := s.channels.(paidReactionReplayStore)
+	if !ok {
+		return domain.ChannelMessagePaidReactionResult{}, false, nil
+	}
+	return replayer.ReplayChannelMessagePaidReaction(ctx, req)
 }
 
 // VoteMessagePoll 给频道/超级群消息上的 poll 投票（options 为空 = 撤票）。

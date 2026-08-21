@@ -3,7 +3,9 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
@@ -171,6 +173,9 @@ func (r *Router) registerPayments(d *tlprofile.Dispatcher) {
 	registerRPC[*tg.PaymentsGetStarsRevenueStatsRequest](d, tlprofile.SemanticMethodPaymentsGetStarsRevenueStats, func(ctx context.Context, req *tg.PaymentsGetStarsRevenueStatsRequest) (any, error) {
 		return r.onPaymentsGetStarsRevenueStats(ctx, req)
 	})
+	registerRPC[*tg.PaymentsGetStarsRevenueWithdrawalURLRequest](d, tlprofile.SemanticMethodPaymentsGetStarsRevenueWithdrawalURL, func(ctx context.Context, req *tg.PaymentsGetStarsRevenueWithdrawalURLRequest) (any, error) {
+		return r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req)
+	})
 
 }
 
@@ -212,14 +217,27 @@ func (r *Router) onPaymentsGetStarsRevenueStats(ctx context.Context, req *tg.Pay
 	if owner.Type != domain.PeerTypeChannel {
 		return tdesktop.StarsRevenueStats(ton), nil
 	}
-	if err := r.checkStarGiftOwnerPermission(ctx, userID, owner); err != nil {
-		return nil, err
+	if r.deps.Channels == nil {
+		return nil, peerIDInvalidErr()
+	}
+	view, err := r.deps.Channels.ResolveChannel(ctx, userID, owner.ID)
+	if err != nil {
+		return nil, channelInvalidErr(err)
+	}
+	if view.Self.Role != domain.ChannelRoleCreator &&
+		(view.Self.Role != domain.ChannelRoleAdmin || !view.Self.AdminRights.PostMessages) {
+		return nil, tgerr.New(400, "CHAT_ADMIN_REQUIRED")
+	}
+	isCreator := view.Self.Role == domain.ChannelRoleCreator && view.Channel.CreatorUserID == userID
+	if !isCreator && view.Self.Role == domain.ChannelRoleCreator {
+		return nil, tgerr.New(400, "CHAT_ADMIN_REQUIRED")
 	}
 	ledger, ok := r.deps.Gifts.(channelGiftLedgerReader)
 	if !ok {
 		return tdesktop.StarsRevenueStats(ton), nil
 	}
 	var balance int64
+	overallRevenue := int64(0)
 	if ton {
 		balance, err = ledger.ChannelTonBalance(ctx, owner.ID)
 	} else {
@@ -228,18 +246,170 @@ func (r *Router) onPaymentsGetStarsRevenueStats(ctx context.Context, req *tg.Pay
 	if err != nil {
 		return nil, internalErr()
 	}
+	overallRevenue = balance
+	if overall, ok := r.deps.Gifts.(channelRevenueOverallReader); ok {
+		if ton {
+			overallRevenue, err = overall.ChannelTonOverallRevenue(ctx, owner.ID)
+		} else {
+			overallRevenue, err = overall.ChannelStarsOverallRevenue(ctx, owner.ID)
+		}
+		if err != nil {
+			return nil, internalErr()
+		}
+	}
 	stats := tdesktop.StarsRevenueStats(ton)
 	var amount tg.StarsAmountClass = &tg.StarsAmount{Amount: balance}
+	var overallAmount tg.StarsAmountClass = &tg.StarsAmount{Amount: overallRevenue}
 	if ton {
 		amount = &tg.StarsTonAmount{Amount: balance}
+		overallAmount = &tg.StarsTonAmount{Amount: overallRevenue}
 	}
-	// Channel ledgers currently only receive collectible conversion/marketplace
-	// proceeds and have no withdrawal/debit path, so balance equals lifetime
-	// revenue. Withdrawal stays disabled because no external payout exists.
+	// Current/available are the spendable channel balance. Overall remains the
+	// positive lifetime revenue even after creator claims add debit entries.
 	stats.Status.CurrentBalance = amount
 	stats.Status.AvailableBalance = amount
-	stats.Status.OverallRevenue = amount
+	stats.Status.OverallRevenue = overallAmount
+	issuer, withdrawalAvailable := r.deps.Gifts.(channelRevenueWithdrawalIssuer)
+	stats.Status.WithdrawalEnabled = isCreator && balance > 0 && withdrawalAvailable && issuer.ChannelRevenueWithdrawalAvailable()
 	return stats, nil
+}
+
+type channelRevenueWithdrawalIssuer interface {
+	ChannelRevenueWithdrawalAvailable() bool
+	IssueChannelRevenueWithdrawal(ctx context.Context, req domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error)
+}
+
+type channelRevenueOverallReader interface {
+	ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error)
+	ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error)
+}
+
+func (r *Router) onPaymentsGetStarsRevenueWithdrawalURL(ctx context.Context, req *tg.PaymentsGetStarsRevenueWithdrawalURLRequest) (*tg.PaymentsStarsRevenueWithdrawalURL, error) {
+	if req == nil || r.deps.Account == nil || r.deps.Auth == nil || r.deps.Channels == nil {
+		return nil, peerIDInvalidErr()
+	}
+	issuer, ok := r.deps.Gifts.(channelRevenueWithdrawalIssuer)
+	if !ok || !issuer.ChannelRevenueWithdrawalAvailable() {
+		return nil, tgerr.New(400, "STARS_REVENUE_WITHDRAWAL_UNAVAILABLE")
+	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	owner, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if owner.Type != domain.PeerTypeChannel {
+		return nil, peerIDInvalidErr()
+	}
+	view, err := r.deps.Channels.ResolveChannel(ctx, userID, owner.ID)
+	if err != nil {
+		return nil, channelInvalidErr(err)
+	}
+	// Revenue belongs to the channel entity. Only its current creator may bind
+	// a claim to their personal ledger; PostMessages admins remain read-only.
+	if view.Self.Role != domain.ChannelRoleCreator || view.Channel.CreatorUserID != userID {
+		return nil, tgerr.New(400, "CHAT_ADMIN_REQUIRED")
+	}
+	passwordState, err := r.deps.Account.RevenueWithdrawalPasswordState(ctx, userID)
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !passwordState.HasPassword {
+		return nil, tgerr.New(400, "PASSWORD_MISSING")
+	}
+	if _, ok := req.Password.(*tg.InputCheckPasswordSRP); !ok {
+		return nil, passwordHashInvalidErr()
+	}
+	if err := r.deps.Account.CheckPassword(ctx, userID, domainPasswordCheck(req.Password)); err != nil {
+		return nil, passwordErr(err)
+	}
+	now := r.clock.Now()
+	if wait := revenueWithdrawalFreshWait(passwordState.PasswordChangedAt, now); wait < 0 {
+		return nil, internalErr()
+	} else if wait > 0 {
+		return nil, tgerr.New(400, fmt.Sprintf("PASSWORD_TOO_FRESH_%d", wait))
+	}
+	authKeyID, ok := AuthKeyIDFrom(ctx)
+	if !ok || authKeyID == ([8]byte{}) {
+		return nil, authKeyUnregisteredErr()
+	}
+	authorization, found, err := r.deps.Auth.Authorization(ctx, authKeyID)
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !found || authorization.AuthKeyID != authKeyID || authorization.UserID != userID || authorization.PasswordPending {
+		return nil, authKeyUnregisteredErr()
+	}
+	if wait := revenueWithdrawalFreshWait(authorization.CreatedAt, now); wait < 0 {
+		return nil, internalErr()
+	} else if wait > 0 {
+		return nil, tgerr.New(400, fmt.Sprintf("SESSION_TOO_FRESH_%d", wait))
+	}
+	amount, hasAmount := req.GetAmount()
+	if hasAmount && amount <= 0 {
+		return nil, starsAmountInvalidErr()
+	}
+	if !hasAmount {
+		amount = 0
+	}
+	currency := domain.ChannelRevenueStars
+	if req.GetTon() {
+		currency = domain.ChannelRevenueTON
+	}
+	issued, err := issuer.IssueChannelRevenueWithdrawal(ctx, domain.ChannelRevenueWithdrawalRequest{
+		ChannelID: owner.ID, CreatorUserID: userID, Currency: currency, Amount: amount,
+		PasswordChangedAt: passwordState.PasswordChangedAt, AuthKeyID: authKeyID,
+		AuthorizationCreatedAt: authorization.CreatedAt, Date: int(now.Unix()),
+	})
+	if err != nil {
+		var passwordStateChanged *domain.ChannelRevenuePasswordStateChangedError
+		var authorizationStateChanged *domain.ChannelRevenueAuthorizationStateChangedError
+		switch {
+		case errors.As(err, &passwordStateChanged):
+			if !passwordStateChanged.HasPassword {
+				return nil, tgerr.New(400, "PASSWORD_MISSING")
+			}
+			if wait := revenueWithdrawalFreshWait(passwordStateChanged.PasswordChangedAt, now); wait > 0 {
+				return nil, tgerr.New(400, fmt.Sprintf("PASSWORD_TOO_FRESH_%d", wait))
+			}
+			return nil, internalErr()
+		case errors.As(err, &authorizationStateChanged):
+			if !authorizationStateChanged.HasAuthorization || !authorizationStateChanged.OwnerMatches || authorizationStateChanged.PasswordPending {
+				return nil, authKeyUnregisteredErr()
+			}
+			if wait := revenueWithdrawalFreshWait(authorizationStateChanged.CreatedAt, now); wait > 0 {
+				return nil, tgerr.New(400, fmt.Sprintf("SESSION_TOO_FRESH_%d", wait))
+			}
+			return nil, internalErr()
+		case errors.Is(err, domain.ErrChannelRevenueInsufficient):
+			return nil, balanceTooLowErr()
+		case errors.Is(err, domain.ErrChannelRevenueWithdrawalInvalid):
+			return nil, starsAmountInvalidErr()
+		default:
+			return nil, internalErr()
+		}
+	}
+	if issued.URL == "" {
+		return nil, internalErr()
+	}
+	return &tg.PaymentsStarsRevenueWithdrawalURL{URL: issued.URL}, nil
+}
+
+const revenueWithdrawalFreshness = 24 * time.Hour
+
+// revenueWithdrawalFreshWait returns -1 when the durable timestamp is missing.
+// Otherwise it rounds up so the client cannot retry one fractional second early.
+func revenueWithdrawalFreshWait(changedAt, now time.Time) int {
+	if changedAt.IsZero() || now.IsZero() {
+		return -1
+	}
+	remaining := changedAt.Add(revenueWithdrawalFreshness).Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	return int((remaining + time.Second - 1) / time.Second)
 }
 
 type channelGiftLedgerReader interface {

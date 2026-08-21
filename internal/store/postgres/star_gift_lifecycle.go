@@ -1666,6 +1666,16 @@ func (s *StarGiftLifecycleStore) ChannelStarsBalance(ctx context.Context, channe
 	return balance, err
 }
 
+func (s *StarGiftLifecycleStore) ChannelStarsOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if channelID <= 0 {
+		return 0, domain.ErrStarGiftOwnerInvalid
+	}
+	var revenue int64
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(sum(amount) FILTER (WHERE amount>0),0)
+FROM channel_stars_transactions WHERE channel_id=$1`, channelID).Scan(&revenue)
+	return revenue, err
+}
+
 func (s *StarGiftLifecycleStore) ChannelStarsTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
 	if channelID <= 0 {
 		return domain.StarsTransactionPage{}, domain.ErrStarGiftOwnerInvalid
@@ -1711,6 +1721,16 @@ func (s *StarGiftLifecycleStore) ChannelTonBalance(ctx context.Context, channelI
 	var balance int64
 	err := s.db.QueryRow(ctx, `SELECT COALESCE((SELECT balance_nanoton FROM channel_ton_balances WHERE channel_id=$1),0)`, channelID).Scan(&balance)
 	return balance, err
+}
+
+func (s *StarGiftLifecycleStore) ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error) {
+	if channelID <= 0 {
+		return 0, domain.ErrStarGiftOwnerInvalid
+	}
+	var revenue int64
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(sum(amount_nanoton) FILTER (WHERE amount_nanoton>0),0)
+FROM channel_ton_transactions WHERE channel_id=$1`, channelID).Scan(&revenue)
+	return revenue, err
 }
 
 func (s *StarGiftLifecycleStore) ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error) {

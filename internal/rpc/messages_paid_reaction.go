@@ -14,6 +14,10 @@ type channelPaidReactionService interface {
 	SendPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, error)
 }
 
+type channelPaidReactionReplayService interface {
+	ReplayPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error)
+}
+
 // channelPaidReactionUpdates 为某 viewer 构造一条 updateMessageReactions：把消息已有的普通
 // reaction 与付费 ReactionPaid（总星数 + top reactors）合并。非请求者走 min 语义（置 Min，
 // 客户端忽略 chosen 保留本地态），避免把请求者视角串给他人。
@@ -41,10 +45,32 @@ func (r *Router) channelPaidReactionUpdates(ctx context.Context, requestUserID, 
 		MsgID:     msgID,
 		Reactions: *mr,
 	}
+	channelIDs := paidReactorChannelIDs(paid)
+	channels := make([]domain.Channel, 0, 1+len(res.DisplayChannels))
+	channels = append(channels, res.Channel)
+	seenChannels := map[int64]struct{}{res.Channel.ID: {}}
+	for _, channel := range res.DisplayChannels {
+		if channel.ID == 0 {
+			continue
+		}
+		if _, seen := seenChannels[channel.ID]; seen {
+			continue
+		}
+		seenChannels[channel.ID] = struct{}{}
+		channels = append(channels, channel)
+	}
+	chats := tgChannels(viewerUserID, channels)
+	missingChannelIDs := make([]int64, 0, len(channelIDs))
+	for _, channelID := range channelIDs {
+		if _, seen := seenChannels[channelID]; !seen {
+			missingChannelIDs = append(missingChannelIDs, channelID)
+		}
+	}
+	chats = append(chats, r.tgChatsForChannelIDs(ctx, viewerUserID, missingChannelIDs)...)
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{update},
-		Users:   r.tgUsersForIDs(ctx, viewerUserID, paidReactorUserIDs(res.Paid)),
-		Chats:   tgChannels(viewerUserID, []domain.Channel{res.Channel}),
+		Users:   r.tgUsersForIDs(ctx, viewerUserID, paidReactorUserIDs(paid)),
+		Chats:   chats,
 		Date:    int(r.clock.Now().Unix()),
 		Seq:     0,
 	}
@@ -90,8 +116,10 @@ func injectPaidReaction(mr *tg.MessageReactions, paid domain.ChannelMessagePaidR
 			item.Anonymous = true
 		}
 		// PeerID：非匿名给出；匿名仅本人给出（TL 语义：匿名本人 anonymous+peer 都置）。
-		if rr.UserID != 0 && (!rr.Anonymous || rr.My) {
-			item.SetPeerID(&tg.PeerUser{UserID: rr.UserID})
+		if (!rr.Anonymous || rr.My) && rr.DisplayPeer().ID != 0 {
+			if peer := tgPeer(rr.DisplayPeer()); peer != nil {
+				item.SetPeerID(peer)
+			}
 		}
 		reactors = append(reactors, item)
 	}
@@ -100,13 +128,26 @@ func injectPaidReaction(mr *tg.MessageReactions, paid domain.ChannelMessagePaidR
 	}
 }
 
-// paidReactorUserIDs 收集非匿名 reactor 的用户 id，供 Updates.Users 富化头像。
+// paidReactorUserIDs collects visible user display identities. An anonymous
+// reactor is visible only to itself, matching injectPaidReaction.
 func paidReactorUserIDs(paid domain.ChannelMessagePaidReactions) []int64 {
 	ids := make([]int64, 0, len(paid.TopReactors))
 	for _, rr := range paid.TopReactors {
-		if rr.UserID != 0 && !rr.Anonymous {
-			ids = append(ids, rr.UserID)
+		peer := rr.DisplayPeer()
+		if peer.Type == domain.PeerTypeUser && peer.ID != 0 && (!rr.Anonymous || rr.My) {
+			ids = append(ids, peer.ID)
 		}
 	}
 	return ids
+}
+
+func paidReactorChannelIDs(paid domain.ChannelMessagePaidReactions) []int64 {
+	ids := make([]int64, 0, len(paid.TopReactors))
+	for _, rr := range paid.TopReactors {
+		peer := rr.DisplayPeer()
+		if peer.Type == domain.PeerTypeChannel && peer.ID != 0 && (!rr.Anonymous || rr.My) {
+			ids = append(ids, peer.ID)
+		}
+	}
+	return uniqueInt64(ids)
 }

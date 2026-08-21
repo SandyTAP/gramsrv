@@ -319,9 +319,9 @@ func (s *AuthorizationStore) Bind(_ context.Context, a domain.Authorization) err
 	if a.Hash == 0 {
 		a.Hash = int64(binary.LittleEndian.Uint64(a.AuthKeyID[:]))
 	}
-	if a.CreatedAt.IsZero() {
-		a.CreatedAt = now
-	}
+	// Bind is an explicit login boundary. Metadata-only refreshes use
+	// UpdateClientInfo and must not reset the session age.
+	a.CreatedAt = now
 	a.ActiveAt = now
 	s.linkMu.RLock()
 	if s.authKeys != nil {
@@ -353,9 +353,6 @@ func (s *AuthorizationStore) Bind(_ context.Context, a domain.Authorization) err
 }
 
 func (s *AuthorizationStore) bindLocked(a domain.Authorization) {
-	if existing, ok := s.m[a.AuthKeyID]; ok && !existing.CreatedAt.IsZero() {
-		a.CreatedAt = existing.CreatedAt
-	}
 	s.m[a.AuthKeyID] = a
 }
 
@@ -419,14 +416,18 @@ func mergeAuthorizationClientInfo(a *domain.Authorization, info domain.AuthKeyCl
 	a.ActiveAt = time.Now()
 }
 
-func (s *AuthorizationStore) MarkPasswordPassed(_ context.Context, id [8]byte) error {
+func (s *AuthorizationStore) MarkPasswordPassed(_ context.Context, id [8]byte, expectedUserID int64) error {
 	s.mu.Lock()
-	if a, ok := s.m[id]; ok {
-		a.PasswordPending = false
-		a.ActiveAt = time.Now()
-		s.m[id] = a
+	defer s.mu.Unlock()
+	a, ok := s.m[id]
+	if !ok || expectedUserID == 0 || a.UserID != expectedUserID || !a.PasswordPending {
+		return store.ErrAuthorizationStateChanged
 	}
-	s.mu.Unlock()
+	now := time.Now()
+	a.PasswordPending = false
+	a.CreatedAt = now
+	a.ActiveAt = now
+	s.m[id] = a
 	return nil
 }
 

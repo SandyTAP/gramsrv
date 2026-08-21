@@ -1724,7 +1724,9 @@ func tgSavedStarGifts(viewerUserID int64, gifts []domain.SavedStarGift, catalog 
 				item.SetPrepaidUpgradeHash(g.PrepaidUpgradeHash)
 			}
 		}
-		if g.CanExportAt > 0 {
+		// The export RPC currently accepts only user-owned collectibles. Do not
+		// advertise a channel capability that the write path will reject.
+		if g.Owner.Type == domain.PeerTypeUser && g.CanExportAt > 0 {
 			item.SetCanExportAt(g.CanExportAt)
 		}
 		if g.TransferStars > 0 {

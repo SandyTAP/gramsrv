@@ -23,6 +23,17 @@ type boostSlotKey struct {
 	slot   int
 }
 
+type paidReactionCommandKey struct {
+	userID   int64
+	randomID int64
+}
+
+type memoryPaidReactionReceipt struct {
+	fingerprint [32]byte
+	createdAt   int
+	result      domain.ChannelMessagePaidReactionResult
+}
+
 // channelReadWatermark 是 channel 级公共已读水位：任一成员推进过的最高两个
 // read_inbox。sender 的 read_outbox 由它派生（top1 持有者本人取 top2）。
 // memoryMention 是 owner 视角一条 mention 的状态：topID 支持 topic 过滤，
@@ -73,11 +84,12 @@ type ChannelStore struct {
 	messages  map[int64][]domain.ChannelMessage
 	reactions map[int64]map[int]map[int64][]domain.ChannelMessagePeerReaction
 	// paidReactions 是 per-(channel,message,user) 付费 reaction 累计星数 + 匿名标志。
-	paidReactions map[int64]map[int]map[int64]memoryPaidReaction
-	top           map[int64]map[string]domain.TopMessageReaction
-	recent        map[int64]map[string]domain.RecentMessageReaction
-	mentions      map[int64]map[int64]map[int]memoryMention
-	msgViews      map[int64]map[int]int
+	paidReactions        map[int64]map[int]map[int64]memoryPaidReaction
+	paidReactionCommands map[paidReactionCommandKey]memoryPaidReactionReceipt
+	top                  map[int64]map[string]domain.TopMessageReaction
+	recent               map[int64]map[string]domain.RecentMessageReaction
+	mentions             map[int64]map[int64]map[int]memoryMention
+	msgViews             map[int64]map[int]int
 	// msgViewers stores the first durable view time for each unique viewer.
 	// Keeping the timestamp (instead of only a set membership bit) lets stats
 	// produce real event-time graphs while preserving idempotent view counts.
@@ -138,6 +150,7 @@ func NewChannelStore() *ChannelStore {
 		messages:               make(map[int64][]domain.ChannelMessage),
 		reactions:              make(map[int64]map[int]map[int64][]domain.ChannelMessagePeerReaction),
 		paidReactions:          make(map[int64]map[int]map[int64]memoryPaidReaction),
+		paidReactionCommands:   make(map[paidReactionCommandKey]memoryPaidReactionReceipt),
 		top:                    make(map[int64]map[string]domain.TopMessageReaction),
 		recent:                 make(map[int64]map[string]domain.RecentMessageReaction),
 		mentions:               make(map[int64]map[int64]map[int]memoryMention),

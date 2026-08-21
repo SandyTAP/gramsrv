@@ -391,7 +391,7 @@ func TestDeletedUserCannotCrossAuthorizationBoundaries(t *testing.T) {
 	if err := authz.Bind(ctx, domain.Authorization{AuthKeyID: pendingAuthKeyID, UserID: deleted.ID, PasswordPending: true}); err != nil {
 		t.Fatalf("seed stale pending authorization: %v", err)
 	}
-	if err := svc.CompletePasswordSignIn(ctx, pendingAuthKeyID); !errors.Is(err, ErrSystemUserLoginForbidden) {
+	if err := svc.CompletePasswordSignIn(ctx, pendingAuthKeyID, deleted.ID); !errors.Is(err, ErrSystemUserLoginForbidden) {
 		t.Fatalf("CompletePasswordSignIn deleted user err = %v, want ErrSystemUserLoginForbidden", err)
 	}
 	if _, found, err := authz.ByAuthKey(ctx, pendingAuthKeyID); err != nil || found {
@@ -860,7 +860,10 @@ func TestSignInExistingTwoFactorAccountNeedsPassword(t *testing.T) {
 		t.Fatalf("PendingPasswordUserID = %d pending=%v err=%v, want %d", pendingUID, pending, err, u.ID)
 	}
 	// 两步验证通过后转为完全授权。
-	if err := svc.CompletePasswordSignIn(ctx, key); err != nil {
+	if err := svc.CompletePasswordSignIn(ctx, key, 0); !errors.Is(err, store.ErrAuthorizationStateChanged) {
+		t.Fatalf("CompletePasswordSignIn without expected user err=%v, want authorization state changed", err)
+	}
+	if err := svc.CompletePasswordSignIn(ctx, key, u.ID); err != nil {
 		t.Fatalf("CompletePasswordSignIn: %v", err)
 	}
 	bound, found, err = svc.UserID(ctx, key)

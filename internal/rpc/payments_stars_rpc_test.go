@@ -3,9 +3,11 @@ package rpc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
 	appstars "telesrv/internal/app/stars"
@@ -226,10 +228,17 @@ func TestOnPaymentsGetStarsStatusNilDeps(t *testing.T) {
 
 type channelLedgerGifts struct {
 	GiftsService
-	starsBalance int64
-	tonBalance   int64
-	starsPage    domain.StarsTransactionPage
-	tonPage      domain.TonTransactionPage
+	starsBalance        int64
+	tonBalance          int64
+	starsPage           domain.StarsTransactionPage
+	tonPage             domain.TonTransactionPage
+	withdrawalAvailable bool
+}
+
+func (s *channelLedgerGifts) ChannelRevenueWithdrawalAvailable() bool { return s.withdrawalAvailable }
+
+func (s *channelLedgerGifts) IssueChannelRevenueWithdrawal(context.Context, domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error) {
+	return domain.ChannelRevenueWithdrawal{URL: "https://links.example.test/revenue-withdrawal/token"}, nil
 }
 
 func (s *channelLedgerGifts) ChannelStarsBalance(context.Context, int64) (int64, error) {
@@ -268,8 +277,9 @@ func TestPaymentsStarsLedgerUsesRequestedChannelOwner(t *testing.T) {
 		Self:    domain.ChannelMember{ChannelID: channelID, UserID: viewerID, Role: domain.ChannelRoleCreator, Status: domain.ChannelMemberActive},
 	}
 	gifts := &channelLedgerGifts{
-		starsBalance: 20,
-		tonBalance:   900,
+		starsBalance:        20,
+		tonBalance:          900,
+		withdrawalAvailable: true,
 		starsPage: domain.StarsTransactionPage{Balance: 20, Transactions: []domain.StarsTransaction{{
 			ID: 1, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 1000000002}, Amount: 20, Date: 10, Reason: domain.StarsReasonGift,
 		}}},
@@ -295,9 +305,15 @@ func TestPaymentsStarsLedgerUsesRequestedChannelOwner(t *testing.T) {
 	if current, ok := revenue.Status.CurrentBalance.(*tg.StarsAmount); !ok || current.Amount != 20 {
 		t.Fatalf("channel stars revenue current = %+v", revenue.Status.CurrentBalance)
 	}
-	if overall, ok := revenue.Status.OverallRevenue.(*tg.StarsAmount); !ok || overall.Amount != 20 || revenue.Status.WithdrawalEnabled {
+	if overall, ok := revenue.Status.OverallRevenue.(*tg.StarsAmount); !ok || overall.Amount != 20 || !revenue.Status.WithdrawalEnabled {
 		t.Fatalf("channel stars revenue overall = %+v withdrawal=%v", revenue.Status.OverallRevenue, revenue.Status.WithdrawalEnabled)
 	}
+	gifts.withdrawalAvailable = false
+	unreachableRevenue, err := r.onPaymentsGetStarsRevenueStats(ctx, &tg.PaymentsGetStarsRevenueStatsRequest{Peer: peer})
+	if err != nil || unreachableRevenue.Status.WithdrawalEnabled {
+		t.Fatalf("unreachable revenue endpoint status=%+v err=%v", unreachableRevenue, err)
+	}
+	gifts.withdrawalAvailable = true
 
 	txnReq := &tg.PaymentsGetStarsTransactionsRequest{Peer: peer, Limit: 20}
 	txnReq.SetTon(true)
@@ -317,6 +333,144 @@ func TestPaymentsStarsLedgerUsesRequestedChannelOwner(t *testing.T) {
 	}
 	if current, ok := tonRevenue.Status.CurrentBalance.(*tg.StarsTonAmount); !ok || current.Amount != 900 {
 		t.Fatalf("channel ton revenue current = %+v", tonRevenue.Status.CurrentBalance)
+	}
+}
+
+type revenueWithdrawalGifts struct {
+	GiftsService
+	issued    domain.ChannelRevenueWithdrawalRequest
+	err       error
+	available bool
+}
+
+func (s *revenueWithdrawalGifts) ChannelRevenueWithdrawalAvailable() bool { return s.available }
+
+func (s *revenueWithdrawalGifts) IssueChannelRevenueWithdrawal(_ context.Context, req domain.ChannelRevenueWithdrawalRequest) (domain.ChannelRevenueWithdrawal, error) {
+	s.issued = req
+	if s.err != nil {
+		return domain.ChannelRevenueWithdrawal{}, s.err
+	}
+	return domain.ChannelRevenueWithdrawal{URL: "https://links.example.test/revenue-withdrawal/token"}, nil
+}
+
+type revenueWithdrawalAccount struct {
+	AccountService
+	checks int
+	state  domain.RevenueWithdrawalPasswordState
+}
+
+func (s *revenueWithdrawalAccount) CheckPassword(context.Context, int64, domain.PasswordCheck) error {
+	s.checks++
+	return nil
+}
+
+func (s *revenueWithdrawalAccount) RevenueWithdrawalPasswordState(context.Context, int64) (domain.RevenueWithdrawalPasswordState, error) {
+	return s.state, nil
+}
+
+type revenueWithdrawalAuth struct {
+	AuthService
+	authorization domain.Authorization
+}
+
+func (s *revenueWithdrawalAuth) Authorization(context.Context, [8]byte) (domain.Authorization, bool, error) {
+	return s.authorization, true, nil
+}
+
+func TestPaymentsStarsRevenueWithdrawalRequiresCreatorAndBindsRequest(t *testing.T) {
+	const viewerID, channelID int64 = 1000000001, 2000000001
+	view := domain.ChannelView{
+		Channel: domain.Channel{ID: channelID, AccessHash: 9876, Title: "Revenue Channel", Broadcast: true, CreatorUserID: viewerID},
+		Self:    domain.ChannelMember{ChannelID: channelID, UserID: viewerID, Role: domain.ChannelRoleCreator, Status: domain.ChannelMemberActive},
+	}
+	gifts := &revenueWithdrawalGifts{available: true}
+	now := time.Now()
+	account := &revenueWithdrawalAccount{state: domain.RevenueWithdrawalPasswordState{
+		HasPassword: true, PasswordChangedAt: now.Add(-48 * time.Hour),
+	}}
+	authKeyID := [8]byte{7, 6, 5, 4, 3, 2, 1}
+	auth := &revenueWithdrawalAuth{authorization: domain.Authorization{
+		AuthKeyID: authKeyID, UserID: viewerID, CreatedAt: now.Add(-48 * time.Hour),
+	}}
+	r := New(Config{}, Deps{Gifts: gifts, Account: account, Auth: auth, Channels: &channelLedgerChannels{view: view}}, zaptest.NewLogger(t), clock.System)
+	ctx := WithAuthKeyID(WithUserID(context.Background(), viewerID), authKeyID)
+	peer := &tg.InputPeerChannel{ChannelID: channelID, AccessHash: view.Channel.AccessHash}
+	req := &tg.PaymentsGetStarsRevenueWithdrawalURLRequest{Peer: peer, Password: &tg.InputCheckPasswordSRP{SRPID: 7}}
+	req.SetAmount(12)
+	req.SetTon(true)
+	got, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req)
+	if err != nil || got.URL != "https://links.example.test/revenue-withdrawal/token" {
+		t.Fatalf("get revenue withdrawal URL = %+v err=%v", got, err)
+	}
+	if account.checks != 1 || gifts.issued.ChannelID != channelID || gifts.issued.CreatorUserID != viewerID ||
+		gifts.issued.Currency != domain.ChannelRevenueTON || gifts.issued.Amount != 12 || gifts.issued.Date <= 0 ||
+		gifts.issued.AuthKeyID != authKeyID || !gifts.issued.AuthorizationCreatedAt.Equal(auth.authorization.CreatedAt) ||
+		!gifts.issued.PasswordChangedAt.Equal(account.state.PasswordChangedAt) {
+		t.Fatalf("bound withdrawal = %+v password_checks=%d", gifts.issued, account.checks)
+	}
+
+	account.state.HasPassword = false
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "PASSWORD_MISSING") {
+		t.Fatalf("missing password err=%v, want PASSWORD_MISSING", err)
+	}
+	account.state = domain.RevenueWithdrawalPasswordState{HasPassword: true, PasswordChangedAt: time.Now().Add(-time.Hour)}
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "PASSWORD_TOO_FRESH") {
+		t.Fatalf("fresh password err=%v, want PASSWORD_TOO_FRESH", err)
+	} else if rpcErr, ok := tgerr.As(err); !ok || rpcErr.Argument <= 22*60*60 || rpcErr.Argument > 23*60*60 {
+		t.Fatalf("fresh password wait=%+v, want about 23 hours", rpcErr)
+	}
+	account.state.PasswordChangedAt = time.Now().Add(-48 * time.Hour)
+	auth.authorization.CreatedAt = time.Now().Add(-time.Hour)
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "SESSION_TOO_FRESH") {
+		t.Fatalf("fresh session err=%v, want SESSION_TOO_FRESH", err)
+	} else if rpcErr, ok := tgerr.As(err); !ok || rpcErr.Argument <= 22*60*60 || rpcErr.Argument > 23*60*60 {
+		t.Fatalf("fresh session wait=%+v, want about 23 hours", rpcErr)
+	}
+	auth.authorization.CreatedAt = time.Now().Add(-48 * time.Hour)
+	changedDuringAdmission := time.Now().Add(-time.Hour)
+	gifts.err = &domain.ChannelRevenuePasswordStateChangedError{
+		HasPassword: true, PasswordChangedAt: changedDuringAdmission,
+	}
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "PASSWORD_TOO_FRESH") {
+		t.Fatalf("password changed before durable issue err=%v, want PASSWORD_TOO_FRESH", err)
+	} else if rpcErr, ok := tgerr.As(err); !ok || rpcErr.Argument <= 22*60*60 || rpcErr.Argument > 23*60*60 {
+		t.Fatalf("changed password wait=%+v, want about 23 hours", rpcErr)
+	}
+	gifts.err = nil
+	changedSession := time.Now().Add(-time.Hour)
+	gifts.err = &domain.ChannelRevenueAuthorizationStateChangedError{
+		HasAuthorization: true, OwnerMatches: true, CreatedAt: changedSession,
+	}
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "SESSION_TOO_FRESH") {
+		t.Fatalf("session changed before durable issue err=%v, want SESSION_TOO_FRESH", err)
+	} else if rpcErr, ok := tgerr.As(err); !ok || rpcErr.Argument <= 22*60*60 || rpcErr.Argument > 23*60*60 {
+		t.Fatalf("changed session wait=%+v, want about 23 hours", rpcErr)
+	}
+	gifts.err = nil
+	gifts.available = false
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "STARS_REVENUE_WITHDRAWAL_UNAVAILABLE") {
+		t.Fatalf("disabled listener withdrawal err=%v", err)
+	}
+	gifts.available = true
+
+	// PostMessages administrators may inspect revenue, but cannot direct it to
+	// their own personal ledger.
+	view.Channel.CreatorUserID = viewerID + 1
+	view.Self.Role = domain.ChannelRoleAdmin
+	view.Self.AdminRights.PostMessages = true
+	r.deps.Channels = &channelLedgerChannels{view: view}
+	if _, err := r.onPaymentsGetStarsRevenueWithdrawalURL(ctx, req); !tgerr.Is(err, "CHAT_ADMIN_REQUIRED") {
+		t.Fatalf("post-messages admin withdrawal err=%v, want CHAT_ADMIN_REQUIRED", err)
+	}
+	if account.checks != 5 {
+		t.Fatalf("password checked before creator permission: checks=%d", account.checks)
+	}
+
+	ledger := &channelLedgerGifts{starsBalance: 12}
+	r.deps.Gifts = ledger
+	stats, err := r.onPaymentsGetStarsRevenueStats(ctx, &tg.PaymentsGetStarsRevenueStatsRequest{Peer: peer})
+	if err != nil || stats.Status.WithdrawalEnabled {
+		t.Fatalf("admin revenue stats = %+v err=%v, withdrawal must stay disabled", stats, err)
 	}
 }
 

@@ -77,6 +77,26 @@ type fakeGiftWithdrawals struct {
 	completeCalls int
 }
 
+type fakeRevenueWithdrawals struct {
+	value         domain.ChannelRevenueWithdrawal
+	found         bool
+	completeCalls int
+	completeErr   error
+}
+
+func (f *fakeRevenueWithdrawals) ResolveRevenueWithdrawal(context.Context, string) (domain.ChannelRevenueWithdrawal, bool, error) {
+	return f.value, f.found, nil
+}
+
+func (f *fakeRevenueWithdrawals) CompleteRevenueWithdrawal(context.Context, string, int) (domain.ChannelRevenueWithdrawal, error) {
+	f.completeCalls++
+	if f.completeErr != nil {
+		return f.value, f.completeErr
+	}
+	f.value.Status = "completed"
+	return f.value, nil
+}
+
 type fakeUniqueGifts struct {
 	bySlug map[string]domain.UniqueStarGift
 	err    error
@@ -355,12 +375,124 @@ func TestHandlerCompletesLocalStarGiftWithdrawal(t *testing.T) {
 	if csp := rr.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self'") {
 		t.Fatalf("withdrawal CSP does not allow its same-origin POST form: %q", csp)
 	}
+	assertBearerCapabilityHeaders(t, rr)
 
 	rr = httptest.NewRecorder()
 	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/gift-withdrawal/safe-token", strings.NewReader("")))
 	if rr.Code != http.StatusOK || resolver.completeCalls != 1 || !strings.Contains(rr.Body.String(), "Status: completed") ||
 		!strings.Contains(rr.Body.String(), "telesrv-owner:test") || !strings.Contains(rr.Body.String(), "telesrv-gift:test") {
 		t.Fatalf("withdrawal POST calls=%d status=%d body=%s", resolver.completeCalls, rr.Code, rr.Body.String())
+	}
+	assertBearerCapabilityHeaders(t, rr)
+}
+
+func TestHandlerCompletesLocalChannelRevenueWithdrawal(t *testing.T) {
+	resolver := &fakeRevenueWithdrawals{found: true, value: domain.ChannelRevenueWithdrawal{
+		ID: 7, ChannelID: 2000000001, CreatorUserID: 1000000001, Currency: domain.ChannelRevenueStars,
+		Amount: 42, Status: "pending", ExpiresAt: int(time.Now().Add(time.Minute).Unix()), CreatedAt: int(time.Now().Unix()),
+	}}
+	handler, err := NewHandler(Config{StickerSets: fakeResolver{}, RevenueWithdrawals: resolver,
+		PublicBaseURL: "https://telesrv.net", AppName: "telesrv"})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/revenue-withdrawal/safe-token", nil))
+	if rr.Code != http.StatusOK || rr.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(rr.Body.String(), "Claim revenue") || !strings.Contains(rr.Body.String(), "42 Stars") {
+		t.Fatalf("revenue withdrawal GET status=%d headers=%v body=%s", rr.Code, rr.Header(), rr.Body.String())
+	}
+	assertBearerCapabilityHeaders(t, rr)
+
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/revenue-withdrawal/safe-token", strings.NewReader("")))
+	if rr.Code != http.StatusOK || resolver.completeCalls != 1 || !strings.Contains(rr.Body.String(), "Status: completed") {
+		t.Fatalf("revenue withdrawal POST calls=%d status=%d body=%s", resolver.completeCalls, rr.Code, rr.Body.String())
+	}
+	assertBearerCapabilityHeaders(t, rr)
+
+	resolver.value.Status = "pending"
+	resolver.completeErr = domain.ErrChannelRevenueInsufficient
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/revenue-withdrawal/safe-token", strings.NewReader("")))
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "no longer has enough") {
+		t.Fatalf("revenue withdrawal insufficient status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	assertBearerCapabilityHeaders(t, rr)
+}
+
+func TestHandlerWithdrawalRoutesHonorPublicBasePathPrefix(t *testing.T) {
+	gift := &fakeGiftWithdrawals{found: true, value: domain.StarGiftWithdrawal{
+		ProviderRequestID: "gift-token", Status: "pending", ExpiresAt: int(time.Now().Add(time.Minute).Unix()),
+		Gift: domain.UniqueStarGift{Title: "Gift", Slug: "gift-1"},
+	}}
+	revenue := &fakeRevenueWithdrawals{found: true, value: domain.ChannelRevenueWithdrawal{
+		ID: 8, ChannelID: 2000000002, CreatorUserID: 1000000002, Currency: domain.ChannelRevenueStars,
+		Amount: 17, Status: "pending", ExpiresAt: int(time.Now().Add(time.Minute).Unix()), CreatedAt: int(time.Now().Unix()),
+	}}
+	handler, err := NewHandler(Config{
+		StickerSets: fakeResolver{}, GiftWithdrawals: gift, RevenueWithdrawals: revenue,
+		PublicBaseURL: "https://telesrv.example/public/v2/", AppName: "telesrv",
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "gift", path: "/public/v2/gift-withdrawal/gift-token"},
+		{name: "revenue", path: "/public/v2/revenue-withdrawal/revenue-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, test.path, nil))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("GET %s status=%d body=%q", test.path, rr.Code, rr.Body.String())
+			}
+			assertBearerCapabilityHeaders(t, rr)
+		})
+	}
+
+	for _, unprefixed := range []string{
+		"/gift-withdrawal/gift-token",
+		"/revenue-withdrawal/revenue-token",
+	} {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, unprefixed, nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("unprefixed GET %s status=%d, want 404", unprefixed, rr.Code)
+		}
+	}
+}
+
+func TestGiftWithdrawalNotFoundStillHasBearerSecurityHeaders(t *testing.T) {
+	handler, err := NewHandler(Config{
+		StickerSets: fakeResolver{}, GiftWithdrawals: &fakeGiftWithdrawals{},
+		PublicBaseURL: "https://telesrv.example/base", AppName: "telesrv",
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/base/gift-withdrawal/missing", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing gift withdrawal status=%d, want 404", rr.Code)
+	}
+	assertBearerCapabilityHeaders(t, rr)
+}
+
+func assertBearerCapabilityHeaders(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control=%q, want no-store", got)
+	}
+	if got := rr.Header().Get("X-Robots-Tag"); got != "noindex, nofollow" {
+		t.Fatalf("X-Robots-Tag=%q, want noindex, nofollow", got)
+	}
+	if got := rr.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy=%q, want no-referrer", got)
 	}
 }
 
