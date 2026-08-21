@@ -3339,7 +3339,17 @@ func (s *Service) RevokeSessions(ctx context.Context, req RevokeSessionsRequest)
 	if s == nil || s.auth == nil || s.revoker == nil {
 		return CommandResult{}, fmt.Errorf("admin auth dependencies are not configured")
 	}
-	if (req.Hash == 0 && req.KeepHash == 0 && !req.RevokeAll) || (req.Hash != 0 && (req.KeepHash != 0 || req.RevokeAll)) {
+	modeCount := 0
+	if req.Hash != 0 {
+		modeCount++
+	}
+	if req.KeepHash != 0 {
+		modeCount++
+	}
+	if req.RevokeAll {
+		modeCount++
+	}
+	if modeCount != 1 {
 		return CommandResult{}, fmt.Errorf("choose one revoke mode")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionRevokeSessions, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -3354,7 +3364,7 @@ func (s *Service) RevokeSessions(ctx context.Context, req RevokeSessionsRequest)
 		details := map[string]any{
 			"target_hashes": authorizationHashes(targets),
 			"target_count":  len(targets),
-			"keep_hash":     keep.Hash,
+			"keep_hash":     authorizationHashString(keep.Hash),
 		}
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
@@ -3365,9 +3375,10 @@ func (s *Service) RevokeSessions(ctx context.Context, req RevokeSessionsRequest)
 			if err != nil {
 				return CommandResult{}, err
 			}
-			if found {
-				revoked = append(revoked, deleted)
+			if !found {
+				return CommandResult{}, fmt.Errorf("authorization hash not found")
 			}
+			revoked = append(revoked, deleted)
 		} else {
 			deleted, err := s.auth.ResetAuthorizations(ctx, req.UserID, keep.AuthKeyID)
 			if err != nil {
@@ -4557,7 +4568,7 @@ func revokeTargets(items []domain.Authorization, req RevokeSessionsRequest) ([]d
 				return []domain.Authorization{a}, domain.Authorization{}, nil
 			}
 		}
-		return nil, domain.Authorization{}, nil
+		return nil, domain.Authorization{}, fmt.Errorf("authorization hash not found")
 	}
 	var keep domain.Authorization
 	if req.KeepHash != 0 {
@@ -4583,13 +4594,24 @@ func revokeTargets(items []domain.Authorization, req RevokeSessionsRequest) ([]d
 	return targets, keep, nil
 }
 
-func authorizationHashes(items []domain.Authorization) []int64 {
-	out := make([]int64, 0, len(items))
+func authorizationHashes(items []domain.Authorization) []string {
+	hashes := make([]int64, 0, len(items))
 	for _, a := range items {
-		out = append(out, a.Hash)
+		hashes = append(hashes, a.Hash)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	out := make([]string, 0, len(hashes))
+	for _, hash := range hashes {
+		out = append(out, authorizationHashString(hash))
+	}
 	return out
+}
+
+func authorizationHashString(hash int64) string {
+	if hash == 0 {
+		return ""
+	}
+	return strconv.FormatInt(hash, 10)
 }
 
 func normalizeIDs(ids []int) ([]int, error) {

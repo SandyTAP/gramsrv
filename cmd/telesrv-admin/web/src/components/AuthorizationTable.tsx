@@ -1,5 +1,4 @@
 import { Cable, LogOut, ShieldCheck } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
 import { formatDate } from "../lib/format";
 import { useI18n } from "../i18n";
 import type { AuthorizationRow } from "../types";
@@ -8,21 +7,6 @@ import { EmptyRow } from "./ui";
 
 export function AuthorizationTable({ rows, userID, onDone }: { rows: AuthorizationRow[]; userID: number; onDone: () => void }) {
   const { t } = useI18n();
-  const [removedHashes, setRemovedHashes] = useState<Set<number>>(() => new Set());
-
-  useEffect(() => {
-    setRemovedHashes(new Set());
-  }, [userID]);
-
-  const visibleRows = useMemo(
-    () => rows.filter((row) => !removedHashes.has(row.Hash)),
-    [rows, removedHashes]
-  );
-
-  function afterRevoke(mutator: (previous: Set<number>) => Set<number>) {
-    setRemovedHashes((previous) => mutator(previous));
-    onDone();
-  }
 
   return (
     <div className="authorization-block">
@@ -38,7 +22,7 @@ export function AuthorizationTable({ rows, userID, onDone }: { rows: Authorizati
             </tr>
           </thead>
           <tbody>
-            {visibleRows.map((row) => (
+            {rows.map((row) => (
               <tr key={row.Hash}>
                 <td className="device-text">{row.DeviceModel} {row.SystemVersion}</td>
                 <td className="device-text">{row.Platform} {row.AppVersion}</td>
@@ -52,7 +36,7 @@ export function AuthorizationTable({ rows, userID, onDone }: { rows: Authorizati
                       compact
                       path="/api/actions/revoke-sessions"
                       payload={() => ({ user_id: userID, hash: row.Hash })}
-                      onDone={() => afterRevoke((previous) => new Set([...previous, row.Hash]))}
+                      onDone={onDone}
                     />
                     <ActionButton
                       label={t("auth.keepCurrent")}
@@ -60,13 +44,13 @@ export function AuthorizationTable({ rows, userID, onDone }: { rows: Authorizati
                       compact
                       path="/api/actions/revoke-sessions"
                       payload={() => ({ user_id: userID, keep_hash: row.Hash })}
-                      onDone={() => afterRevoke(() => new Set(rows.filter((item) => item.Hash !== row.Hash).map((item) => item.Hash)))}
+                      onDone={onDone}
                     />
                   </div>
                 </td>
               </tr>
             ))}
-            {visibleRows.length === 0 && <EmptyRow colSpan={5} />}
+            {rows.length === 0 && <EmptyRow colSpan={5} />}
           </tbody>
         </table>
       </div>
@@ -76,7 +60,7 @@ export function AuthorizationTable({ rows, userID, onDone }: { rows: Authorizati
           icon={<Cable size={15} />}
           path="/api/actions/revoke-sessions"
           payload={() => ({ user_id: userID, revoke_all: true })}
-          onDone={() => afterRevoke(() => new Set(rows.map((item) => item.Hash)))}
+          onDone={onDone}
         />
       </div>
     </div>

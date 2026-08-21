@@ -1944,13 +1944,13 @@ func (s *server) handleSetChannelVerifiedAPI(w http.ResponseWriter, r *http.Requ
 }
 
 type revokeSessionsAPIRequest struct {
-	CommandID string `json:"command_id"`
-	Reason    string `json:"reason"`
-	Confirm   bool   `json:"confirm"`
-	UserID    int64  `json:"user_id"`
-	Hash      int64  `json:"hash"`
-	KeepHash  int64  `json:"keep_hash"`
-	RevokeAll bool   `json:"revoke_all"`
+	CommandID string    `json:"command_id"`
+	Reason    string    `json:"reason"`
+	Confirm   bool      `json:"confirm"`
+	UserID    int64     `json:"user_id"`
+	Hash      flexInt64 `json:"hash"`
+	KeepHash  flexInt64 `json:"keep_hash"`
+	RevokeAll bool      `json:"revoke_all"`
 }
 
 func (s *server) handleRevokeSessionsAPI(w http.ResponseWriter, r *http.Request) {
@@ -1961,8 +1961,8 @@ func (s *server) handleRevokeSessionsAPI(w http.ResponseWriter, r *http.Request)
 	req := admin.RevokeSessionsRequest{
 		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "revoke-sessions"),
 		UserID:      body.UserID,
-		Hash:        body.Hash,
-		KeepHash:    body.KeepHash,
+		Hash:        body.Hash.Int64(),
+		KeepHash:    body.KeepHash.Int64(),
 		RevokeAll:   body.RevokeAll,
 	}
 	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/revoke-sessions", req)

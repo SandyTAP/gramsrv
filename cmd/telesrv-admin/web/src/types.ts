@@ -38,8 +38,8 @@ export type RestrictionRow = {
 };
 
 export type AuthorizationRow = {
-  AuthKeyID: number;
-  Hash: number;
+  AuthKeyID: string;
+  Hash: string;
   Layer: number;
   DeviceModel: string;
   Platform: string;
