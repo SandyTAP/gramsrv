@@ -272,12 +272,14 @@ origin，并保持 `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP=false`。issuer 是 token 
 curl.exe http://192.0.2.25:2401/.well-known/openid-configuration
 curl.exe http://192.0.2.25:2401/.well-known/jwks.json
 curl.exe -I http://192.0.2.25:2401/js/telegram-login.js
+curl.exe -I 'http://192.0.2.25:2401/js/telegram-widget.js?23'
 ```
 
 discovery 返回的 `issuer` 必须等于配置值，`authorization_endpoint`、`token_endpoint`
 和 `jwks_uri` 必须可从依赖方访问。使用反向代理时需原样转发
 `/.well-known/openid-configuration`、`/.well-known/jwks.json`、`/auth`、`/auth/status`、
-`/token`、`/crossapp`、`/inapp`、`/telegram-login.js` 和 `/js/telegram-login.js`。
+`/token`、`/crossapp`、`/inapp`、`/telegram-login.js`、`/js/telegram-login.js`、
+`/telegram-widget.js`、`/js/telegram-widget.js` 以及 `POST /telegram-widget/resolve`。
 
 #### 3. 用本服 `@BotFather` 创建 OIDC Client
 
@@ -334,6 +336,36 @@ http://192.0.2.25:2401/.well-known/openid-configuration
 支持的 scope 为 `openid`、`profile`、`phone`、`telegram:bot_access`。当前不提供
 UserInfo、refresh token 或 introspection endpoint。浏览器前端可以加载
 `<issuer>/js/telegram-login.js` 使用本地 JS SDK；Client Secret 只能留在服务端。
+
+已有前端若使用 Telegram 的 attribute-based Login Widget，只替换 widget script 的
+来源；仅存在于 telesrv 的 bot 不得继续使用
+`https://telegram.org/js/telegram-widget.js`：
+
+```html
+<script async src="https://<telesrv-issuer>/js/telegram-widget.js?23"
+  data-telegram-login="BotName"
+  data-size="large"
+  data-radius="10"
+  data-request-access="write"
+  data-lang="zh"
+  data-onauth="onTelegramAuth(result)"></script>
+<script>
+  function onTelegramAuth(result) {
+    // telesrv SDK 返回：{ id_token, user }，失败时为 { error }
+  }
+</script>
+```
+
+同时提供 `data-client-id="<数字 bot user id>"` 时优先使用该值；只有
+`data-telegram-login` 时，shim 仅在本服 username 当前指向 bot、其 Login client 已
+启用且浏览器精确 Origin 已为该 bot 登记时返回 `client_id`。`data-size` / `data-radius`
+控制本地简单按钮，`data-lang` 透传给 Login SDK；`data-request-access="write"` 请求
+`openid profile telegram:bot_access`，未设置时请求 `openid profile`。`data-onauth`
+收到现有 telesrv SDK 的 `{id_token, user}`，不会伪造 Telegram 官方 widget payload。
+
+Mini App 是独立接口，必须继续加载官方
+`https://telegram.org/js/telegram-web-app.js`。telesrv 的 `telegram-widget.js` shim 不
+替换该脚本，也不改变 Mini App 行为。
 
 #### 5. 使用 Bedolaga demo 验证完整链路
 
