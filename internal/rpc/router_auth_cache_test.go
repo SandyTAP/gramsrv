@@ -40,6 +40,24 @@ func (s *authBindingCaptureSessions) PushToUserExceptAuthKeySession(_ context.Co
 	return 1, nil
 }
 
+// PushToUserTransientExceptAuthKeySession must also be overridden: the presence
+// announcer (announceSessionOnline -> pushSessionOnlineAsync) delivers status
+// pushes through this transient variant on a background goroutine. Without
+// this override the embedded captureSessions.PushToUserTransientExceptAuthKeySession
+// promotion calls its own PushToUserExceptAuthKeySession (not this type's
+// override, since Go embedding has no virtual dispatch), which writes userID
+// as a side effect. That async write can land after revokeAuthKeySessions has
+// already cleared the session, flakily resurrecting a revoked identity.
+func (s *authBindingCaptureSessions) PushToUserTransientExceptAuthKeySession(_ context.Context, userID int64, _ [8]byte, _ int64, t proto.MessageType, msg tg.UpdatesClass, _ time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messageType = t
+	s.message = msg
+	s.userMessage = msg
+	s.pushUserIDs = append(s.pushUserIDs, userID)
+	return 1, nil
+}
+
 func TestDispatchPromotesNegativeSessionCacheFromPositiveAuthCache(t *testing.T) {
 	authKeyID := [8]byte{0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91}
 	const (
