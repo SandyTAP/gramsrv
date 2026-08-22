@@ -14,7 +14,7 @@ func TestStarGiftLifecycleMigrationsApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate star gift lifecycle schema: %v", err)
 	}
-	if status.Dirty || status.Empty || status.Version != 182 {
-		t.Fatalf("migration status = %+v, want clean version 182", status)
+	if status.Dirty || status.Empty || status.Version != 185 {
+		t.Fatalf("migration status = %+v, want clean version 185", status)
 	}
 }

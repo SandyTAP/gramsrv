@@ -64,6 +64,7 @@ import (
 	"telesrv/internal/app/userprojection"
 	"telesrv/internal/app/users"
 	verificationapp "telesrv/internal/app/verification"
+	welcomemessagesapp "telesrv/internal/app/welcomemessages"
 	"telesrv/internal/botapi"
 	"telesrv/internal/branding"
 	"telesrv/internal/config"
@@ -708,6 +709,7 @@ func run(logger *zap.Logger) error {
 	botCallbackStore := redisstore.NewBotCallbackRegistryStore(rdb)
 	ephemeralStore := redisstore.NewEphemeralMessageStore(rdb)
 	ephemeralReportStore := postgres.NewEphemeralReportStore(pool)
+	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
 	moderationReportStore := postgres.NewModerationReportStore(pool)
 	authDeliveryReportStore := postgres.NewAuthDeliveryReportStore(pool)
 	clientTelemetryStore := postgres.NewClientTelemetryStore(pool)
@@ -1144,6 +1146,7 @@ func run(logger *zap.Logger) error {
 	)
 	communitiesService := communitiesapp.NewService(communityStore)
 	ephemeralService := ephemeralapp.NewService(ephemeralStore, channelsService, usersService, botsService)
+	welcomeMessageService := welcomemessagesapp.NewService(welcomeMessageStore, channelsService)
 	storiesService := storiesapp.NewService(storyStore, storiesapp.WithChannelStoryAccess(channelsService))
 	chatlistsService := chatlistsapp.NewService(
 		chatlistStore,
@@ -1330,6 +1333,7 @@ func run(logger *zap.Logger) error {
 		AICompose:               aiComposeService,
 		Ephemeral:               ephemeralService,
 		EphemeralPush:           ephemeralStore,
+		WelcomeMessages:         welcomeMessageService,
 		Moderation:              moderationService,
 		Users:                   usersService,
 		Usernames:               usernamesService,
@@ -1519,6 +1523,7 @@ func run(logger *zap.Logger) error {
 		rpc.WithOutboxUpdateBuilder(router.BuildOutboxUpdates),
 	).Run(ctx)
 	go rpc.NewBootstrapUpdateDispatcher(router, logger.Named("rpc").Named("bootstrap")).Run(ctx)
+	go rpc.NewWelcomeDeliveryDispatcher(router, welcomeMessageStore, logger.Named("rpc").Named("welcome-delivery")).Run(ctx)
 	go rpc.NewScheduledDispatcher(router, logger.Named("rpc").Named("scheduled")).Run(ctx)
 	go rpc.NewSuggestedPostDispatcher(router, logger.Named("rpc").Named("suggested-post")).Run(ctx)
 	go rpc.NewExpiryDispatcher(router, logger.Named("rpc").Named("expiry")).Run(ctx)

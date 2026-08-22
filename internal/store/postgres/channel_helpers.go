@@ -132,6 +132,14 @@ func (s *ChannelStore) DeleteChannel(ctx context.Context, req domain.DeleteChann
 			linkedMono = &mono
 		}
 	}
+	if err := deleteChannelWelcomeMessageDeliveriesTx(ctx, tx, channel.ID); err != nil {
+		return domain.DeleteChannelResult{}, err
+	}
+	if linkedMono != nil {
+		if err := deleteChannelWelcomeMessageDeliveriesTx(ctx, tx, linkedMono.ID); err != nil {
+			return domain.DeleteChannelResult{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.DeleteChannelResult{}, fmt.Errorf("commit delete channel: %w", err)
 	}

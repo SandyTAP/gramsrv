@@ -505,6 +505,7 @@ func purgeDeletedBotPrivateState(ctx context.Context, tx pgx.Tx, userID int64, n
 		`DELETE FROM group_call_invites WHERE inviter_user_id = $1 OR invitee_user_id = $1`,
 		`DELETE FROM channel_boost_slots WHERE user_id = $1`,
 		`DELETE FROM channel_invite_importers WHERE user_id = $1`,
+		`DELETE FROM welcome_message_deliveries WHERE target_user_id = $1`,
 		`DELETE FROM channel_topic_read WHERE user_id = $1`,
 		`DELETE FROM channel_unread_mentions WHERE user_id = $1`,
 		`DELETE FROM channel_unread_mention_index WHERE user_id = $1`,

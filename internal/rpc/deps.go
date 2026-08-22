@@ -6,6 +6,7 @@ import (
 
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tlprofile"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/sfu"
@@ -190,13 +191,12 @@ type AuthKeyTargetedSessionBinder interface {
 	PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 }
 
-// ExactLayerTransientSessionBinder is the admission boundary for updates whose
-// constructors do not exist in older profiles. Implementations must filter the
-// live session index before encoding, skip unknown/not-ready profiles, and must
-// never queue the transient payload for later delivery.
-type ExactLayerTransientSessionBinder interface {
-	PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
-	PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+// SemanticTransientSessionBinder filters by generated exact-profile metadata
+// instead of a hard-coded minimum layer. A newly generated profile therefore
+// becomes eligible automatically when it has a wire constructor for semantic.
+type SemanticTransientSessionBinder interface {
+	PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+	PushToUserAuthKeyTransientCompatible(ctx context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 }
 
 // OnlineUserProvider exposes a bounded runtime snapshot for best-effort fanout.
@@ -959,6 +959,18 @@ type EphemeralService interface {
 	ReportTarget(ctx context.Context, userID int64, device domain.EphemeralDevice, peer domain.Peer, id int) (domain.EphemeralMessage, error)
 }
 
+// WelcomeMessageService owns the independent durable Layer 229 peer templates.
+// It has no transient device, PTS, difference, push or outbox responsibility.
+type WelcomeMessageService interface {
+	Authorize(ctx context.Context, userID int64, peer domain.Peer) error
+	Create(ctx context.Context, userID int64, peer domain.Peer, randomID int64, content domain.WelcomeMessageContent) (domain.WelcomeMessage, bool, error)
+	Edit(ctx context.Context, userID int64, peer domain.Peer, id int, fields domain.WelcomeMessageEditFields) (domain.WelcomeMessage, error)
+	List(ctx context.Context, userID int64, peer domain.Peer, hash int64) (domain.WelcomeMessageList, error)
+	Delete(ctx context.Context, userID int64, peer domain.Peer, id int) (bool, error)
+	DeleteAll(ctx context.Context, userID int64, peer domain.Peer) (bool, error)
+	HasAny(ctx context.Context, peer domain.Peer) (bool, error)
+}
+
 // ModerationService accepts only final report choices. Implementations must
 // validate and snapshot referenced evidence, then durably commit the immutable
 // submission before returning success.
@@ -1071,6 +1083,7 @@ type Deps struct {
 	AICompose               AIComposeService
 	Ephemeral               EphemeralService
 	EphemeralPush           store.EphemeralPushBroker
+	WelcomeMessages         WelcomeMessageService
 	Moderation              ModerationService
 	Users                   UsersService
 	Usernames               UsernameRegistryService

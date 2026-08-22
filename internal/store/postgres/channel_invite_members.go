@@ -121,6 +121,9 @@ func (s *ChannelStore) InviteToChannel(ctx context.Context, channelID, inviterUs
 			return domain.CreateChannelResult{}, err
 		}
 	}
+	if err := enqueueWelcomeMessageDeliveriesTx(ctx, tx, channel.ID, members); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.CreateChannelResult{}, fmt.Errorf("commit invite channel: %w", err)
 	}
