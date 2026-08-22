@@ -188,6 +188,9 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 			return nil, channelInvalidErr(domain.ErrChannelPrivate)
 		}
 		full := cached.full
+		if err := r.applyWelcomeMessagesToFullChat(ctx, ref.ID, &full); err != nil {
+			return nil, err
+		}
 		if err := r.applyTranslationDisabledToChannelFull(ctx, userID, ref.ID, &full); err != nil {
 			return nil, err
 		}
@@ -240,6 +243,9 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 		chats:         append([]tg.ChatClass(nil), chats...),
 		userIDs:       userIDs,
 	}, loadEpoch)
+	if err := r.applyWelcomeMessagesToFullChat(ctx, view.Channel.ID, full); err != nil {
+		return nil, err
+	}
 	if err := r.applyTranslationDisabledToChannelFull(ctx, userID, view.Channel.ID, full); err != nil {
 		return nil, err
 	}
@@ -256,6 +262,23 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 		Chats:    chats,
 		Users:    users,
 	}, nil
+}
+
+func (r *Router) applyWelcomeMessagesToFullChat(ctx context.Context, channelID int64, full tg.ChatFullClass) error {
+	if r.deps.WelcomeMessages == nil || channelID <= 0 || full == nil {
+		return nil
+	}
+	hasAny, err := r.deps.WelcomeMessages.HasAny(ctx, domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
+	if err != nil {
+		return internalErr()
+	}
+	switch value := full.(type) {
+	case *tg.ChannelFull:
+		value.HasWelcomeMessages = hasAny
+	case *tg.ChatFull:
+		value.HasWelcomeMessages = hasAny
+	}
+	return nil
 }
 
 func (r *Router) applyStarGiftsCountToChannelFull(ctx context.Context, channelID int64, full *tg.ChannelFull) {

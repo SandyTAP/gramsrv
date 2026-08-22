@@ -7,6 +7,7 @@ import (
 
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tlprofile"
 )
 
 var ErrOutboxDeliveryIndeterminate = errors.New("edgecontrol: outbox delivery indeterminate")
@@ -177,6 +178,7 @@ type SessionControlCommand struct {
 	TargetUserID      int64
 	ReceivesUpdates   bool
 	Layer             int
+	Semantic          tlprofile.SemanticID
 	MessageType       proto.MessageType
 	UpdateBytes       []byte
 	UserPushes        []SessionControlUserPush
@@ -477,6 +479,13 @@ type AuthKeyTargetedSessionPusher interface {
 type LayerAwareTransientPusher interface {
 	PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 	PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+}
+
+// SemanticTransientPusher filters transient updates through generated exact-profile
+// metadata. It avoids hard-coding the first layer that introduced a constructor.
+type SemanticTransientPusher interface {
+	PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+	PushToUserAuthKeyTransientCompatible(ctx context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 }
 
 // OnlineUserProvider exposes a bounded runtime snapshot for transient online fanout.

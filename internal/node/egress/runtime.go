@@ -104,6 +104,7 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	updateEventStore := postgres.NewUpdateEventStore(pool, postgres.WithUpdateEventLogger(logger.Named("store").Named("updates")))
 	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(cfg.OutboxLeaseTimeout))
 	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool, postgres.WithDeliveryLeaseTimeout(cfg.OutboxLeaseTimeout))
+	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
 	if _, err := egresssvc.StartGRPCAck(ctx, egresssvc.GRPCAckServerConfig{
 		Addr:            cfg.EgressAckGRPCAddr,
 		InstanceID:      instanceID,
@@ -123,7 +124,20 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 		Bus:            redisbus.New(rdb),
 		CommandTimeout: cfg.OutboundPushTimeout,
 	})
+	welcomeEdgeControl, err := edgecontrol.NewControlFabricController(
+		edgecontrol.NewNoLocalController(),
+		edgecontrol.NewSessionControlFabric(edgecontrol.SessionControlFabricConfig{
+			InstanceID: instanceID, Registry: redisregistry.New(rdb), Bus: redisbus.New(rdb),
+			CommandTimeout: cfg.OutboundPushTimeout,
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("init welcome Edge control fabric: %w", err)
+	}
 	projection := newEgressProjectionRuntime(pool, rdb, cfg, instanceID, logger.Named("egress").Named("projection"))
+	welcomeDispatcher := projection.projector.NewWelcomeDeliveryDispatcher(
+		welcomeEdgeControl, welcomeMessageStore, logger.Named("egress").Named("welcome-delivery"),
+	)
 	readModelListener := postgres.NewReadModelChangeListener(cfg.PostgresDSN, projection.caches, logger.Named("egress").Named("read-model-listener"))
 	go readModelListener.Run(ctx)
 	wakes := newEgressWakeLanes()
@@ -155,6 +169,7 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 		zap.String("egress_ack_grpc_addr", cfg.EgressAckGRPCAddr),
 	)
 	go deliveryService.RunWithWake(ctx, wakes.edgeDeliveryOutbox)
+	go welcomeDispatcher.Run(ctx)
 	service.RunWithWake(ctx, wakes.dispatchOutbox)
 	return nil
 }

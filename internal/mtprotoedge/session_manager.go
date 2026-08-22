@@ -1622,7 +1622,7 @@ func (m *SessionManager) PushChannelUpdateToUserExceptAuthKeySession(ctx context
 		return 0, fmt.Errorf("invalid channel delivery watermark")
 	}
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, edgecontrol.OutboxDeliveryRef{}, delivery, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, edgecontrol.OutboxDeliveryRef{}, delivery, func(c *Conn) error {
 		claim, ok := c.reserveChannelDeliveryWatermark(delivery)
 		if !ok {
 			return errChannelDeliverySkipped
@@ -1688,16 +1688,20 @@ func (m *SessionManager) PushOutboxUpdate(ctx context.Context, req edgecontrol.O
 func (m *SessionManager) PushToUserAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass) (int, error) {
 	// Secret-chat qts is the durable source of truth, so online delivery is an accelerator just
 	// like account pts fan-out.  Do not synchronously wait for every PFS/raw connection's socket.
-	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, 0, t, msg, 2*time.Second)
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, 0, 0, t, msg, 2*time.Second)
 }
 
 // PushToUserAuthKeyTransient 是 PushToUserAuthKey 的 transient（typing）best-effort 版本。
 func (m *SessionManager) PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, 0, t, msg, timeout)
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, 0, 0, t, msg, timeout)
 }
 
 func (m *SessionManager) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, minLayer, t, msg, timeout)
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, minLayer, 0, t, msg, timeout)
+}
+
+func (m *SessionManager) PushToUserAuthKeyTransientCompatible(ctx context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, 0, semantic, t, msg, timeout)
 }
 
 // PushToUserExceptBusinessAuthKey 把 update 投给账号其它设备，精确排除同一 permanent
@@ -1705,7 +1709,7 @@ func (m *SessionManager) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Cont
 // discarded，同时保证获胜设备的其它连接不会误删刚建立的密聊。
 func (m *SessionManager) PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1721,7 +1725,7 @@ func (m *SessionManager) PushToUserExceptBusinessAuthKey(ctx context.Context, us
 	})
 }
 
-func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -1744,7 +1748,7 @@ func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, us
 		defer cancel()
 	}
 	getUpdates := onceLayerUpdatesFanout(sendCtx, msg)
-	return m.pushToBusinessAuthKey(ctx, userID, businessAuthKeyID, minLayer, func(c *Conn) error {
+	return m.pushToBusinessAuthKey(ctx, userID, businessAuthKeyID, minLayer, semantic, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1767,7 +1771,7 @@ func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, us
 	})
 }
 
-func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, semantic tlprofile.SemanticID, send func(*Conn) error) (int, error) {
 	m.mu.Lock()
 	candidates := m.businessAuthKeyCandidatesLocked(businessAuthKeyID)
 	conns := make([]*Conn, 0, len(candidates))
@@ -1779,7 +1783,7 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 			// 未就绪：密聊消息靠 getDifference 补，typing 直接丢——都不进 pending。
 			continue
 		}
-		if !sessionSupportsMinimumLayer(c, minLayer) {
+		if !sessionSupportsCompatibility(c, minLayer, semantic) {
 			continue
 		}
 		conns = append(conns, c)
@@ -1833,7 +1837,7 @@ func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAu
 
 func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, outboxRef edgecontrol.OutboxDeliveryRef) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1857,7 +1861,7 @@ func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int
 // 「durable 兜底」丢弃。走 best-effort 发送，不阻塞调用方。
 func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1875,7 +1879,25 @@ func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Con
 
 func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+		if c.outbound == nil || c.outboundControl == nil {
+			return ErrConnClosed
+		}
+		updates, err := getUpdates()
+		if err != nil {
+			return err
+		}
+		encoded, err := updates.prepareForConn(ctx, c)
+		if err != nil {
+			return err
+		}
+		return c.SendBestEffortEncoded(ctx, t, encoded, timeout)
+	})
+}
+
+func (m *SessionManager) PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	getUpdates := onceLayerUpdatesFanout(ctx, msg)
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, 0, semantic, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1925,7 +1947,7 @@ func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, user
 		defer cancel()
 	}
 	getUpdates := onceLayerUpdatesFanout(sendCtx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1973,7 +1995,7 @@ func onceLayerUpdatesFanout(ctx context.Context, msg tg.UpdatesClass) func() (*l
 	}
 }
 
-func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark, send func(*Conn) error) (int, error) {
 	// push fan-out 是连接层最热路径之一：debug 日志的字段构造（含 auth_key hex 格式化）
 	// 在关闭 debug 时也会求值，先查级别一次、按需记日志。
 	debug := m.log.Core().Enabled(zapcore.DebugLevel)
@@ -1993,7 +2015,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 			excluded++
 			continue
 		}
-		if !sessionSupportsMinimumLayer(c, minLayer) {
+		if !sessionSupportsCompatibility(c, minLayer, semantic) {
 			skipped++
 			continue
 		}
@@ -2025,7 +2047,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 				excluded++
 				continue
 			}
-			if !sessionSupportsMinimumLayer(c, minLayer) {
+			if !sessionSupportsCompatibility(c, minLayer, semantic) {
 				skipped++
 				continue
 			}
@@ -3407,6 +3429,21 @@ func shouldExcludeBusinessAuthKey(c *Conn, excludeBusinessAuthKeyID *[8]byte) bo
 	return connUsesBusinessAuthKey(c, *excludeBusinessAuthKeyID)
 }
 
+func sessionSupportsSemantic(c *Conn, semantic tlprofile.SemanticID) bool {
+	if semantic == 0 {
+		return true
+	}
+	if c == nil {
+		return false
+	}
+	state := c.LayerProfileState()
+	if state.Origin == LayerProfileUnknown {
+		return false
+	}
+	_, ok := tlprofile.WireID(state.Profile, semantic)
+	return ok
+}
+
 func sessionSupportsMinimumLayer(c *Conn, minLayer int) bool {
 	if minLayer <= 0 {
 		return true
@@ -3416,6 +3453,13 @@ func sessionSupportsMinimumLayer(c *Conn, minLayer int) bool {
 	}
 	state := c.LayerProfileState()
 	return state.Origin != LayerProfileUnknown && int(state.Profile) >= minLayer
+}
+
+func sessionSupportsCompatibility(c *Conn, minLayer int, semantic tlprofile.SemanticID) bool {
+	if semantic != 0 {
+		return sessionSupportsSemantic(c, semantic)
+	}
+	return sessionSupportsMinimumLayer(c, minLayer)
 }
 
 func sessionKeyLog(id [8]byte) string {

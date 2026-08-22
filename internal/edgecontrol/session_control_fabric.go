@@ -10,6 +10,7 @@ import (
 
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tlprofile"
 )
 
 const (
@@ -158,6 +159,14 @@ func (c *controlFabricController) PushToUserTransientAtLeastLayer(ctx context.Co
 
 func (c *controlFabricController) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	return c.fabric.PushToUserAuthKeyTransientAtLeastLayer(ctx, userID, businessAuthKeyID, minLayer, t, msg, timeout)
+}
+
+func (c *controlFabricController) PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return c.fabric.PushToUserTransientCompatible(ctx, userID, semantic, t, msg, timeout)
+}
+
+func (c *controlFabricController) PushToUserAuthKeyTransientCompatible(ctx context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return c.fabric.PushToUserAuthKeyTransientCompatible(ctx, userID, businessAuthKeyID, semantic, t, msg, timeout)
 }
 
 func (c *controlFabricController) IsUserOnline(userID int64) bool {
@@ -521,23 +530,27 @@ func splitSessionControlUserPushes(entries []SessionControlUserPush) [][]Session
 }
 
 func (f *SessionControlFabric) PushToUserAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass) (int, error) {
-	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKey, userID, businessAuthKeyID, 0, t, msg, 0)
+	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKey, userID, businessAuthKeyID, 0, 0, t, msg, 0)
 }
 
 func (f *SessionControlFabric) PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKeyTransient, userID, businessAuthKeyID, 0, t, msg, timeout)
+	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKeyTransient, userID, businessAuthKeyID, 0, 0, t, msg, timeout)
 }
 
 func (f *SessionControlFabric) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKeyTransientAtLeastLayer, userID, businessAuthKeyID, minLayer, t, msg, timeout)
+	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKeyTransientAtLeastLayer, userID, businessAuthKeyID, minLayer, 0, t, msg, timeout)
 }
 
-func (f *SessionControlFabric) pushBusinessAuthKey(ctx context.Context, kind SessionControlKind, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+func (f *SessionControlFabric) PushToUserAuthKeyTransientCompatible(ctx context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return f.pushBusinessAuthKey(ctx, SessionControlPushUserAuthKeyTransientAtLeastLayer, userID, businessAuthKeyID, 0, semantic, t, msg, timeout)
+}
+
+func (f *SessionControlFabric) pushBusinessAuthKey(ctx context.Context, kind SessionControlKind, userID int64, businessAuthKeyID [8]byte, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	if f == nil || userID == 0 || businessAuthKeyID == ([8]byte{}) || msg == nil {
 		return 0, nil
 	}
 	sent := 0
-	targets := remoteBusinessAuthKeyPushTargets(f.instanceID, userID, businessAuthKeyID, minLayer, f.businessAuthKeyRecords(businessAuthKeyID))
+	targets := remoteBusinessAuthKeyPushTargets(f.instanceID, userID, businessAuthKeyID, minLayer, semantic, f.businessAuthKeyRecords(businessAuthKeyID))
 	if len(targets) == 0 {
 		return sent, nil
 	}
@@ -550,6 +563,7 @@ func (f *SessionControlFabric) pushBusinessAuthKey(ctx context.Context, kind Ses
 		TargetUserID:      userID,
 		BusinessAuthKeyID: businessAuthKeyID,
 		Layer:             minLayer,
+		Semantic:          semantic,
 		MessageType:       t,
 		UpdateBytes:       updateBytes,
 		DeliveryTimeout:   timeout,
@@ -588,6 +602,14 @@ func (f *SessionControlFabric) PushToUserExceptBusinessAuthKey(ctx context.Conte
 }
 
 func (f *SessionControlFabric) PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return f.pushUserTransientCompatible(ctx, userID, minLayer, 0, t, msg, timeout)
+}
+
+func (f *SessionControlFabric) PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	return f.pushUserTransientCompatible(ctx, userID, 0, semantic, t, msg, timeout)
+}
+
+func (f *SessionControlFabric) pushUserTransientCompatible(ctx context.Context, userID int64, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	if f == nil || userID == 0 || msg == nil {
 		return 0, nil
 	}
@@ -596,7 +618,7 @@ func (f *SessionControlFabric) PushToUserTransientAtLeastLayer(ctx context.Conte
 	if err != nil {
 		return sent, err
 	}
-	targets := remoteLayerPushTargets(f.instanceID, userID, minLayer, records)
+	targets := remoteLayerPushTargets(f.instanceID, userID, minLayer, semantic, records)
 	if len(targets) == 0 {
 		return sent, nil
 	}
@@ -608,6 +630,7 @@ func (f *SessionControlFabric) PushToUserTransientAtLeastLayer(ctx context.Conte
 		Kind:            SessionControlPushUserTransientAtLeastLayer,
 		TargetUserID:    userID,
 		Layer:           minLayer,
+		Semantic:        semantic,
 		MessageType:     t,
 		UpdateBytes:     updateBytes,
 		DeliveryTimeout: timeout,
@@ -1189,7 +1212,7 @@ func remoteControlTargets(localInstanceID string, records []LocationRecord) []st
 	return out
 }
 
-func remoteBusinessAuthKeyPushTargets(localInstanceID string, userID int64, businessAuthKeyID [8]byte, minLayer int, records []LocationRecord) []string {
+func remoteBusinessAuthKeyPushTargets(localInstanceID string, userID int64, businessAuthKeyID [8]byte, minLayer int, semantic tlprofile.SemanticID, records []LocationRecord) []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0, len(records))
 	for _, record := range records {
@@ -1199,7 +1222,7 @@ func remoteBusinessAuthKeyPushTargets(localInstanceID string, userID int64, busi
 		if record.BusinessAuthKeyID != businessAuthKeyID && record.RawAuthKeyID != businessAuthKeyID {
 			continue
 		}
-		if minLayer > 0 && record.Layer < minLayer {
+		if !locationSupportsCompatibility(record, minLayer, semantic) {
 			continue
 		}
 		if _, ok := seen[record.InstanceID]; ok {
@@ -1230,14 +1253,14 @@ func remoteExceptBusinessAuthKeyPushTargets(localInstanceID string, userID int64
 	return out
 }
 
-func remoteLayerPushTargets(localInstanceID string, userID int64, minLayer int, records []LocationRecord) []string {
+func remoteLayerPushTargets(localInstanceID string, userID int64, minLayer int, semantic tlprofile.SemanticID, records []LocationRecord) []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0, len(records))
 	for _, record := range records {
 		if record.InstanceID == "" || record.InstanceID == localInstanceID || record.UserID != userID || !record.ReceivesUpdates {
 			continue
 		}
-		if minLayer > 0 && record.Layer < minLayer {
+		if !locationSupportsCompatibility(record, minLayer, semantic) {
 			continue
 		}
 		if _, ok := seen[record.InstanceID]; ok {
@@ -1247,6 +1270,18 @@ func remoteLayerPushTargets(localInstanceID string, userID int64, minLayer int, 
 		out = append(out, record.InstanceID)
 	}
 	return out
+}
+
+func locationSupportsCompatibility(record LocationRecord, minLayer int, semantic tlprofile.SemanticID) bool {
+	if semantic != 0 {
+		profile, ok := tlprofile.ResolveProfile(record.Layer)
+		if !ok {
+			return false
+		}
+		_, ok = tlprofile.WireID(profile, semantic)
+		return ok
+	}
+	return minLayer <= 0 || record.Layer >= minLayer
 }
 
 func positiveLimitOrLen(limit, length int) int {
@@ -1418,9 +1453,25 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 		case SessionControlPushUserExceptBusinessAuthKey:
 			ack.Affected, err = local.PushToUserExceptBusinessAuthKey(ctx, cmd.TargetUserID, cmd.BusinessAuthKeyID, cmd.MessageType, update, cmd.DeliveryTimeout)
 		case SessionControlPushUserTransientAtLeastLayer:
-			ack.Affected, err = local.PushToUserTransientAtLeastLayer(ctx, cmd.TargetUserID, cmd.Layer, cmd.MessageType, update, cmd.DeliveryTimeout)
+			if cmd.Semantic != 0 {
+				if pusher, ok := any(local).(SemanticTransientPusher); ok {
+					ack.Affected, err = pusher.PushToUserTransientCompatible(ctx, cmd.TargetUserID, cmd.Semantic, cmd.MessageType, update, cmd.DeliveryTimeout)
+				} else {
+					err = fmt.Errorf("semantic transient pusher unavailable")
+				}
+			} else {
+				ack.Affected, err = local.PushToUserTransientAtLeastLayer(ctx, cmd.TargetUserID, cmd.Layer, cmd.MessageType, update, cmd.DeliveryTimeout)
+			}
 		case SessionControlPushUserAuthKeyTransientAtLeastLayer:
-			ack.Affected, err = local.PushToUserAuthKeyTransientAtLeastLayer(ctx, cmd.TargetUserID, cmd.BusinessAuthKeyID, cmd.Layer, cmd.MessageType, update, cmd.DeliveryTimeout)
+			if cmd.Semantic != 0 {
+				if pusher, ok := any(local).(SemanticTransientPusher); ok {
+					ack.Affected, err = pusher.PushToUserAuthKeyTransientCompatible(ctx, cmd.TargetUserID, cmd.BusinessAuthKeyID, cmd.Semantic, cmd.MessageType, update, cmd.DeliveryTimeout)
+				} else {
+					err = fmt.Errorf("semantic transient pusher unavailable")
+				}
+			} else {
+				ack.Affected, err = local.PushToUserAuthKeyTransientAtLeastLayer(ctx, cmd.TargetUserID, cmd.BusinessAuthKeyID, cmd.Layer, cmd.MessageType, update, cmd.DeliveryTimeout)
+			}
 		default:
 			ack.Affected, err = local.PushToUserExceptAuthKeySession(ctx, cmd.TargetUserID, cmd.RawAuthKeyID, cmd.ExceptSessionID, cmd.MessageType, update)
 		}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tlprofile"
 )
 
 func TestHandleSessionControlCommandAppliesSessionMutations(t *testing.T) {
@@ -401,6 +402,62 @@ func TestSessionControlFabricRoutesBusinessAuthKeyPushToOwningRemoteEdges(t *tes
 	}
 }
 
+func TestSessionControlFabricRoutesSemanticTransientOnlyToCompatibleProfiles(t *testing.T) {
+	const userID int64 = 42
+	registry := &captureLocationRegistry{users: map[int64][]LocationRecord{
+		userID: {
+			{InstanceID: "edge-227", UserID: userID, ReceivesUpdates: true, Layer: 227},
+			{InstanceID: "edge-228", UserID: userID, ReceivesUpdates: true, Layer: 228},
+			{InstanceID: "edge-229", UserID: userID, ReceivesUpdates: true, Layer: 229},
+			{InstanceID: "edge-unknown", UserID: userID, ReceivesUpdates: true},
+		},
+	}}
+	bus := &captureSessionBus{affected: 1}
+	fabric := NewSessionControlFabric(SessionControlFabricConfig{InstanceID: "egress", Registry: registry, Bus: bus})
+	update := &tg.UpdateShort{Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}}, Date: 1}
+
+	sent, err := fabric.PushToUserTransientCompatible(
+		context.Background(), userID, tlprofile.SemanticTypeUpdateNewEphemeralMessage,
+		proto.MessageFromServer, update, 40*time.Millisecond,
+	)
+	if err != nil || sent != 2 {
+		t.Fatalf("semantic push sent=%d err=%v", sent, err)
+	}
+	if len(bus.sent) != 2 {
+		t.Fatalf("targets=%+v, want exact compatible profiles only", bus.sent)
+	}
+	targets := map[string]bool{}
+	for _, sent := range bus.sent {
+		targets[sent.target] = true
+		cmd := sent.cmd
+		if cmd.Semantic != tlprofile.SemanticTypeUpdateNewEphemeralMessage || cmd.Layer != 0 || cmd.Kind != SessionControlPushUserTransientAtLeastLayer {
+			t.Fatalf("semantic command=%+v", cmd)
+		}
+	}
+	if !targets["edge-228"] || !targets["edge-229"] || targets["edge-227"] || targets["edge-unknown"] {
+		t.Fatalf("targets=%+v, want edge-228 and edge-229", targets)
+	}
+}
+
+func TestHandleSessionControlCommandAppliesSemanticTransientPush(t *testing.T) {
+	local := &captureFullController{}
+	updateBytes, err := EncodeOutboxUpdate(&tg.UpdateShort{Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}}, Date: 1})
+	if err != nil {
+		t.Fatalf("encode update: %v", err)
+	}
+	ack := HandleSessionControlCommand(local, SessionControlCommand{
+		CommandID: "semantic-welcome", Kind: SessionControlPushUserTransientAtLeastLayer,
+		TargetUserID: 42, Semantic: tlprofile.SemanticTypeUpdateNewEphemeralMessage,
+		MessageType: proto.MessageFromServer, UpdateBytes: updateBytes, DeliveryTimeout: 25 * time.Millisecond,
+	})
+	if ack.Error != "" || ack.Affected != 4 {
+		t.Fatalf("semantic push ack=%+v", ack)
+	}
+	if local.pushSemantic != tlprofile.SemanticTypeUpdateNewEphemeralMessage || local.pushUserID != 42 {
+		t.Fatalf("semantic capture=%#x user=%d", local.pushSemantic, local.pushUserID)
+	}
+}
+
 func TestHandleSessionControlCommandAppliesBusinessAuthKeyPush(t *testing.T) {
 	local := &captureFullController{}
 	business := [8]byte{6}
@@ -756,6 +813,7 @@ type captureFullController struct {
 	pushSession  int64
 	pushBusiness [8]byte
 	pushLayer    int
+	pushSemantic tlprofile.SemanticID
 	pushType     proto.MessageType
 	pushMessage  tg.UpdatesClass
 	pushTimeout  time.Duration
@@ -857,6 +915,18 @@ func (c *captureFullController) PushToUserTransientAtLeastLayer(_ context.Contex
 
 func (c *captureFullController) PushToUserAuthKeyTransientAtLeastLayer(_ context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	c.captureBusinessPush(SessionControlPushUserAuthKeyTransientAtLeastLayer, userID, businessAuthKeyID, minLayer, t, msg, timeout)
+	return 4, nil
+}
+
+func (c *captureFullController) PushToUserTransientCompatible(_ context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	c.captureBusinessPush(SessionControlPushUserTransientAtLeastLayer, userID, [8]byte{}, 0, t, msg, timeout)
+	c.pushSemantic = semantic
+	return 4, nil
+}
+
+func (c *captureFullController) PushToUserAuthKeyTransientCompatible(_ context.Context, userID int64, businessAuthKeyID [8]byte, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	c.captureBusinessPush(SessionControlPushUserAuthKeyTransientAtLeastLayer, userID, businessAuthKeyID, 0, t, msg, timeout)
+	c.pushSemantic = semantic
 	return 4, nil
 }
 

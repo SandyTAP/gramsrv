@@ -28,6 +28,9 @@ func TestAppConfigPremiumKeys(t *testing.T) {
 	if err := json.Unmarshal(cfg.JSON, &decoded); err != nil {
 		t.Fatalf("app config json invalid: %v", err)
 	}
+	if got := decoded["ephemeral_welcome_messages_max"]; got != float64(domain.MaxWelcomeMessagesPerPeer) {
+		t.Fatalf("ephemeral_welcome_messages_max = %v, want %d", got, domain.MaxWelcomeMessagesPerPeer)
+	}
 	if period, ok := decoded["no_forwards_request_expire_period"].(float64); !ok || int(period) != domain.PrivateNoForwardsRequestExpirePeriod {
 		t.Fatalf("no_forwards_request_expire_period = %v, want %d", decoded["no_forwards_request_expire_period"], domain.PrivateNoForwardsRequestExpirePeriod)
 	}

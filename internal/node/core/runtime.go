@@ -56,6 +56,7 @@ import (
 	usernamesapp "telesrv/internal/app/usernames"
 	"telesrv/internal/app/users"
 	verificationapp "telesrv/internal/app/verification"
+	welcomemessagesapp "telesrv/internal/app/welcomemessages"
 	"telesrv/internal/blobstorage"
 	"telesrv/internal/botapi"
 	"telesrv/internal/config"
@@ -640,6 +641,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	loginTokenStore := redisstore.NewLoginTokenRegistryStore(rdb)
 	ephemeralStore := redisstore.NewEphemeralMessageStore(rdb)
 	ephemeralReportStore := postgres.NewEphemeralReportStore(pool)
+	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
 	moderationReportStore := postgres.NewModerationReportStore(pool)
 	authDeliveryReportStore := postgres.NewAuthDeliveryReportStore(pool)
 	clientTelemetryStore := postgres.NewClientTelemetryStore(pool)
@@ -1160,6 +1162,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	)
 	communitiesService := communitiesapp.NewService(communityStore)
 	ephemeralService := ephemeralapp.NewService(ephemeralStore, channelsService, usersService, botsService)
+	welcomeMessageService := welcomemessagesapp.NewService(welcomeMessageStore, channelsService)
 	storiesService := storiesapp.NewService(storyStore, storiesapp.WithChannelStoryAccess(channelsService))
 	chatlistsService := chatlistsapp.NewService(
 		chatlistStore,
@@ -1349,6 +1352,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		AICompose:               aiComposeService,
 		Ephemeral:               ephemeralService,
 		EphemeralPush:           ephemeralStore,
+		WelcomeMessages:         welcomeMessageService,
 		Moderation:              moderationService,
 		Users:                   usersService,
 		Usernames:               usernamesService,

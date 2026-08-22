@@ -867,6 +867,9 @@ func (s *CommunityStore) banCommunityParticipantFromChannelTx(ctx context.Contex
 	if err := clearChannelMentionsForUserTx(ctx, tx, channelID, participantUserID); err != nil {
 		return domain.EditChannelBannedResult{}, false, err
 	}
+	if err := deleteWelcomeMessageDeliveriesTx(ctx, tx, channelID, []int64{participantUserID}); err != nil {
+		return domain.EditChannelBannedResult{}, false, err
+	}
 	var serviceMessage domain.ChannelMessage
 	var serviceEvent domain.ChannelUpdateEvent
 	if channel.Megagroup {

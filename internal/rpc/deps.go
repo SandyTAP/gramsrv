@@ -92,6 +92,8 @@ const (
 	ChannelDeliveryNudge   = edgecontrol.ChannelDeliveryNudge
 )
 
+type SemanticTransientSessionBinder = edgecontrol.SemanticTransientPusher
+
 // ChannelFanoutRecoveryPtsProvider reloads the authoritative channel pts after in-memory fan-out
 // saturation. Production channels.Service implements it through the channel store; keeping this
 // separate from ChannelsService avoids burdening lightweight RPC fakes that never run the worker.
@@ -820,6 +822,18 @@ type EphemeralService interface {
 	ReportTarget(ctx context.Context, userID int64, device domain.EphemeralDevice, peer domain.Peer, id int) (domain.EphemeralMessage, error)
 }
 
+// WelcomeMessageService owns the independent durable Layer 229 peer templates.
+// It has no transient device, PTS, difference, push or outbox responsibility.
+type WelcomeMessageService interface {
+	Authorize(ctx context.Context, userID int64, peer domain.Peer) error
+	Create(ctx context.Context, userID int64, peer domain.Peer, randomID int64, content domain.WelcomeMessageContent) (domain.WelcomeMessage, bool, error)
+	Edit(ctx context.Context, userID int64, peer domain.Peer, id int, fields domain.WelcomeMessageEditFields) (domain.WelcomeMessage, error)
+	List(ctx context.Context, userID int64, peer domain.Peer, hash int64) (domain.WelcomeMessageList, error)
+	Delete(ctx context.Context, userID int64, peer domain.Peer, id int) (bool, error)
+	DeleteAll(ctx context.Context, userID int64, peer domain.Peer) (bool, error)
+	HasAny(ctx context.Context, peer domain.Peer) (bool, error)
+}
+
 // ModerationService accepts only final report choices. Implementations must
 // validate and snapshot referenced evidence, then durably commit the immutable
 // submission before returning success.
@@ -933,6 +947,7 @@ type Deps struct {
 	AICompose               AIComposeService
 	Ephemeral               EphemeralService
 	EphemeralPush           store.EphemeralPushBroker
+	WelcomeMessages         WelcomeMessageService
 	Moderation              ModerationService
 	Users                   UsersService
 	Usernames               UsernameRegistryService

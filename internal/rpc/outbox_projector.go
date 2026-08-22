@@ -9,6 +9,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/egress"
+	"telesrv/internal/store"
 )
 
 var ErrOutboxProjectorUnavailable = errors.New("outbox projector is unavailable")
@@ -72,6 +73,17 @@ func (p *OutboxProjector) BuildOutboxUpdateBytes(ctx context.Context, requests [
 		return nil, ErrOutboxProjectorUnavailable
 	}
 	return p.router.BuildOutboxUpdateBytes(ctx, requests)
+}
+
+// NewWelcomeDeliveryDispatcher wires the projection-only Egress router to the
+// remote Edge control boundary. It does not expose Core RPC dispatch or local
+// session ownership to the Egress process.
+func (p *OutboxProjector) NewWelcomeDeliveryDispatcher(sessions EdgeController, deliveries store.WelcomeMessageDeliveryStore, log *zap.Logger) *WelcomeDeliveryDispatcher {
+	if p == nil || p.router == nil {
+		return NewWelcomeDeliveryDispatcher(nil, deliveries, log)
+	}
+	p.router.deps.Sessions = sessions
+	return NewWelcomeDeliveryDispatcher(p.router, deliveries, log)
 }
 
 func (p *OutboxProjector) InvalidateStoryReadModelViewers(viewerUserIDs ...int64) {
