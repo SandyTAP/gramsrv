@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -375,6 +376,29 @@ func (r *Router) DispatchWithMethod(ctx context.Context, authKeyID [8]byte, sess
 		r.registerUpdatesDeliveryPlan(ctx, updatesDelivery)
 	}
 	return enc, meta.method, err
+}
+
+// dispatchGeneratedSafely is the last process-safety boundary around business
+// RPC execution. Persisted snapshots and projection bugs must return a scoped
+// RPC failure; they must never terminate every MTProto connection in the
+// process. The stack is retained in structured logs so recovery is not silent.
+func (r *Router) dispatchGeneratedSafely(ctx context.Context, method string, request tlprofile.Admission) (result tlprofile.Result, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			fields := append([]zap.Field{
+				zap.String("method", method),
+				zap.Int("profile", int(request.Call().Profile())),
+				zap.Any("panic", recovered),
+				zap.ByteString("stack", debug.Stack()),
+			}, r.contextLogFields(ctx)...)
+			if r != nil && r.log != nil {
+				r.log.Error("RPC handler panic isolated", fields...)
+			}
+			result = nil
+			err = internalErr()
+		}
+	}()
+	return r.dispatcher.Dispatch(ctx, request)
 }
 
 func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) ([8]byte, error) {
@@ -804,7 +828,7 @@ func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int, meta *r
 		if err != nil {
 			return nil, err
 		}
-		exact, err := r.dispatcher.Dispatch(ctx, admission)
+		exact, err := r.dispatchGeneratedSafely(ctx, tlTypeName(id), admission)
 		var enc bin.Encoder = exact
 		if err == nil && exact != nil {
 			if canonical, ok := exact.CanonicalValue().(bin.Encoder); ok {

@@ -888,8 +888,8 @@ func TestInlineBotArticleTextChannelRoundTrip(t *testing.T) {
 	}
 	editReq := &tg.MessagesEditInlineBotMessageRequest{ID: msgID}
 	editReq.SetMessage("inline group edited")
-	editReq.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{{
-		Buttons: []tg.KeyboardButtonClass{&tg.KeyboardButtonCallback{Text: "Done", Data: []byte("v2")}},
+	editReq.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardInlineButtonRow{{
+		Buttons: []tg.KeyboardInlineButton{{Text: "Done", Type: &tg.InlineButtonTypeCallback{Data: []byte("v2")}}},
 	}}})
 	if ok, err := f.router.onMessagesEditInlineBotMessage(botCtx, editReq); err != nil || !ok {
 		t.Fatalf("channel inline edit = %v,%v, want true,nil", ok, err)
@@ -2112,12 +2112,13 @@ func assertTGInlineReplyMarkup(t *testing.T, msg *tg.Message, wantText string, w
 	if len(markup.Rows) != 1 || len(markup.Rows[0].Buttons) != 1 {
 		t.Fatalf("reply_markup rows = %+v, want one callback button", markup.Rows)
 	}
-	button, ok := markup.Rows[0].Buttons[0].(*tg.KeyboardButtonCallback)
+	button := markup.Rows[0].Buttons[0]
+	callback, ok := button.Type.(*tg.InlineButtonTypeCallback)
 	if !ok {
-		t.Fatalf("reply_markup button = %T, want callback", markup.Rows[0].Buttons[0])
+		t.Fatalf("reply_markup button type = %T, want callback", button.Type)
 	}
-	if button.Text != wantText || !bytes.Equal(button.Data, wantData) {
-		t.Fatalf("reply_markup button = %q/%v, want %q/%v", button.Text, button.Data, wantText, wantData)
+	if button.Text != wantText || !bytes.Equal(callback.Data, wantData) {
+		t.Fatalf("reply_markup button = %q/%v, want %q/%v", button.Text, callback.Data, wantText, wantData)
 	}
 }
 
@@ -2166,8 +2167,8 @@ func inlineArticleResult(id, message string) tg.InputBotInlineResultClass {
 func inlineArticleResultWithCallback(id, message, button string, data []byte) tg.InputBotInlineResultClass {
 	result := inlineArticleResult(id, message).(*tg.InputBotInlineResult)
 	msg := result.SendMessage.(*tg.InputBotInlineMessageText)
-	msg.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{{
-		Buttons: []tg.KeyboardButtonClass{&tg.KeyboardButtonCallback{Text: button, Data: data}},
+	msg.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardInlineButtonRow{{
+		Buttons: []tg.KeyboardInlineButton{{Text: button, Type: &tg.InlineButtonTypeCallback{Data: data}}},
 	}}})
 	return result
 }
@@ -2355,8 +2356,8 @@ func inlineContactResult(id, phone, first, last, vcard string) *tg.InputBotInlin
 func inlineContactResultWithCallback(id, phone, first, last string, data []byte) tg.InputBotInlineResultClass {
 	result := inlineContactResult(id, phone, first, last, "BEGIN:VCARD\nFN:"+first+" "+last+"\nEND:VCARD")
 	msg := result.SendMessage.(*tg.InputBotInlineMessageMediaContact)
-	msg.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{{
-		Buttons: []tg.KeyboardButtonClass{&tg.KeyboardButtonCallback{Text: "Contact", Data: data}},
+	msg.SetReplyMarkup(&tg.ReplyInlineMarkup{Rows: []tg.KeyboardInlineButtonRow{{
+		Buttons: []tg.KeyboardInlineButton{{Text: "Contact", Type: &tg.InlineButtonTypeCallback{Data: data}}},
 	}}})
 	return result
 }

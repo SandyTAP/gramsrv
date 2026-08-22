@@ -274,7 +274,7 @@ func (r *Router) DispatchAdmitted(
 	}
 	dbBefore := dbtrace.SnapshotFromContext(ctx)
 	start := time.Now()
-	result, err := r.dispatcher.Dispatch(ctx, request)
+	result, err := r.dispatchGeneratedSafely(ctx, method, request)
 	dur := time.Since(start)
 	dbDelta := dbtrace.SnapshotFromContext(ctx).Sub(dbBefore)
 	fields := append([]zap.Field{
