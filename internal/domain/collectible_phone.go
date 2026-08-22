@@ -97,7 +97,9 @@ func ValidateCollectiblePhonePrice(currency string, amount int64, cryptoCurrency
 }
 
 // NormalizeCollectiblePhone accepts the formatting clients commonly send and
-// returns the digits stored on User.phone and inputCollectiblePhone.
+// returns the canonical digits shared by virtual users.phone login identities
+// and inputCollectiblePhone assets. Login identity and asset ownership remain
+// independent facts.
 func NormalizeCollectiblePhone(phone string) string {
 	phone = strings.TrimSpace(phone)
 	var b strings.Builder

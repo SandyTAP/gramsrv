@@ -430,6 +430,51 @@ func TestPhoneCodeAcceptsTDesktopDigitsOnlySignIn(t *testing.T) {
 	}
 }
 
+func TestVirtual888PhoneRegistersAndSignsIn(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	authz := memory.NewAuthorizationStore()
+	delivery := &captureLoginCodeDelivery{}
+	svc := NewService(
+		users,
+		authz,
+		memory.NewCodeStore(),
+		nil,
+		nil,
+		"12345",
+		WithLoginCodeDelivery(delivery),
+	)
+	const (
+		formatted = "+888 12-34"
+		canonical = "8881234"
+	)
+
+	firstHash, err := svc.SendCode(ctx, formatted)
+	if err != nil {
+		t.Fatalf("SendCode virtual phone: %v", err)
+	}
+	verifyCodeForSignUp(t, svc, canonical, firstHash, "12345")
+	created, _, err := svc.SignUp(ctx, domain.Authorization{AuthKeyID: [8]byte{0x54}}, formatted, firstHash, "Virtual", "User")
+	if err != nil {
+		t.Fatalf("SignUp virtual phone: %v", err)
+	}
+	if created.Phone != canonical {
+		t.Fatalf("created phone = %q, want %q", created.Phone, canonical)
+	}
+
+	secondHash, err := svc.SendCode(ctx, canonical)
+	if err != nil {
+		t.Fatalf("SendCode existing virtual phone: %v", err)
+	}
+	signedIn, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: [8]byte{0x55}}, formatted, secondHash, "12345")
+	if err != nil {
+		t.Fatalf("SignIn virtual phone: %v", err)
+	}
+	if needSignUp || signedIn.ID != created.ID {
+		t.Fatalf("SignIn user=%d needSignUp=%v, want existing user %d", signedIn.ID, needSignUp, created.ID)
+	}
+}
+
 func TestIranNationalTrunkVariantsShareOneAccountIdentity(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()

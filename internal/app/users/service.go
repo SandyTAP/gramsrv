@@ -72,8 +72,9 @@ func WithAccountFreezeProvider(p userprojection.AccountFreezeProvider) Option {
 	return func(s *Service) { s.freezes = p }
 }
 
-// WithCollectiblePhoneStore enables +888 identity aliases and their
-// viewer-specific phone projection without modifying the authentication phone.
+// WithCollectiblePhoneStore enables collectible +888 ownership aliases and
+// their viewer-specific projection. Independent +888 login identities live in
+// users.phone and take lookup precedence over this optional alias registry.
 func WithCollectiblePhoneStore(p store.CollectiblePhoneStore) Option {
 	return func(s *Service) { s.phones = p }
 }
