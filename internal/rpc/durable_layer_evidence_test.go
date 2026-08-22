@@ -94,12 +94,12 @@ func TestDurableSessionLayerFutureProfileCanBeCorrectedByGreaterSelector(t *test
 	now := time.Now().UTC()
 	futureID := int64(proto.NewMessageIDGen(func() time.Time { return now }).New(proto.MessageFromClient))
 	correctID := int64(proto.NewMessageIDGen(func() time.Time { return now.Add(time.Second) }).New(proto.MessageFromClient))
-	if _, applied, err := keys.AdvanceSessionLayer(ctx, authKeyID, 20, 229, futureID); err != nil || !applied {
+	if _, applied, err := keys.AdvanceSessionLayer(ctx, authKeyID, 20, 230, futureID); err != nil || !applied {
 		t.Fatalf("seed future evidence = applied %v err %v", applied, err)
 	}
 	r := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
 	layer, msgID, found, err := r.ResolveNegotiatedSessionLayerEvidence(ctx, authKeyID, 20)
-	if err != nil || !found || layer != 229 || msgID != futureID {
+	if err != nil || !found || layer != 230 || msgID != futureID {
 		t.Fatalf("future restore = (%d,%d,%v,%v)", layer, msgID, found, err)
 	}
 	if _, _, cached := r.NegotiatedSessionLayerEvidence(authKeyID, 20); cached {
@@ -201,7 +201,7 @@ func TestDurableInheritedLayerRevalidatesEachNewSession(t *testing.T) {
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, authKeyID); err != nil || !found || layer != 225 {
 		t.Fatalf("initial default = (%d,%v,%v)", layer, found, err)
 	}
-	auth.authKeyClientInfos[authKeyID] = domain.AuthKeyClientInfo{Layer: 229, LayerObservationID: 2}
+	auth.authKeyClientInfos[authKeyID] = domain.AuthKeyClientInfo{Layer: 230, LayerObservationID: 2}
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, authKeyID); err != nil || !found || layer != 0 {
 		t.Fatalf("future authoritative default = (%d,%v,%v)", layer, found, err)
 	}
