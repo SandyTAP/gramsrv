@@ -309,6 +309,11 @@ func NormalizePhone(phone string) string {
 	// 42777 is the reserved, non-login phone of the built-in service identity.
 	// It predates the ordinary E.164 user invariant and remains resolvable only
 	// so auth can reject it as a system account instead of treating it as free.
+	if len(digits) >= MinCollectiblePhoneLength &&
+		len(digits) <= MaxCollectiblePhoneLength &&
+		strings.HasPrefix(digits, "888") {
+		return digits
+	}
 	if digits == OfficialSystemPhone {
 		return digits
 	}
