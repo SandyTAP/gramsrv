@@ -140,11 +140,11 @@ parameters only produce a warning and never overwrite deployment identity. Edit
 The default image prefix is `ghcr.io/iamxvbaba/gramsrv`. It contains six
 packages: `migrate`, `file`, `core`, `egress`, `sfu`, and `edge`. The convenient
 channel tag is `v2`; every publish also produces an immutable `sha-<commit>`
-tag. Pushes to the repository's `v2` branch run the
-`Publish v2 container images` workflow. A newly created GHCR package is private
-by default, so maintainers must set each of the six packages to Public in
-GitHub Packages before anonymous one-click pulls work. While they remain
-private, run `docker login ghcr.io` first.
+tag. Automatic publication on `v2` pushes is currently paused; maintainers run
+the `Publish v2 container images` workflow manually from GitHub Actions. A newly
+created GHCR package is private by default, so maintainers must set each of the
+six packages to Public in GitHub Packages before anonymous one-click pulls
+work. While they remain private, run `docker login ghcr.io` first.
 
 To validate modified source with locally built images, opt in explicitly. The
 Compose Edge build target is `edge-test`, matching the public v2 test channel:

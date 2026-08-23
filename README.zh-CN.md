@@ -13,6 +13,53 @@
   <img src="docs/assets/gramsrv-android.png" width="23%" alt="Android 客户端正在连接 gramsrv">
 </p>
 
+## Windows 一键体验（v2）
+
+先安装 Git 和 Docker Desktop，把 Docker Desktop 切换到 Linux containers 并启动，
+然后在 PowerShell 5.1 或更高版本中执行：
+
+```powershell
+git clone --branch v2 --single-branch https://github.com/iamxvbaba/gramsrv.git
+Set-Location gramsrv
+.\scripts\start-docker.ps1
+```
+
+本机首次体验只需要这些命令。脚本会自动创建 `deploy/docker/.env`，无需登录即可从
+`ghcr.io/iamxvbaba/gramsrv` 拉取六个已经构建好的 `v2` 镜像，按照依赖顺序启动
+PostgreSQL、Redis、Migrate、File、Core、Egress、SFU 和 Edge，并等待全部服务就绪。
+用户不需要安装 Go、PostgreSQL 或 Redis，也不需要本地构建镜像或执行
+`docker login`。
+
+- 开发环境登录验证码固定为 **`12345`**。
+- 零参数启动默认只监听 `127.0.0.1`，供同一台电脑上的客户端体验。
+- 客户端使用的匹配测试公钥位于
+  [`deploy/docker/assets/test-server-rsa.pub`](deploy/docker/assets/test-server-rsa.pub)。
+- 账号、数据库、媒体、Redis 状态和 RSA 身份保存在 Docker named volumes 中，
+  重建容器或正常执行 Compose 停止后仍会保留。除非明确要清空数据，否则不要使用
+  Compose `down -v`。
+- 不带 `-Build` 会直接使用发布镜像；`-Build` 仅用于验证本地源码修改。
+
+如果 Windows 提示禁止运行 PowerShell 脚本，只为当前 PowerShell 窗口临时放行后重试：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\start-docker.ps1
+```
+
+局域网临时体验时，把示例地址替换为 Windows 宿主机的局域网地址：
+
+```powershell
+.\scripts\start-docker.ps1 `
+  -AdvertiseIP 192.168.1.20 `
+  -PublicBaseURL http://192.168.1.20:2401 `
+  -PublicWebBaseURL http://192.168.1.20:2401 `
+  -AllowInsecureDevelopmentAuth
+```
+
+官方 Telegram 客户端需要修改服务器 endpoint 和 RSA key 才能连接；请从
+[项目官网](https://telesrv.net)获取兼容客户端。Linux/macOS、端口与防火墙、备份、升级、
+远程访问和正式环境说明见 [Docker 部署手册](docs/docker-deployment.md)。
+
 ## 为什么选择 gramsrv
 
 大多数 Telegram clone 复刻的是界面；`gramsrv` 实现的是服务器协议，让兼容
@@ -66,23 +113,6 @@ flowchart LR
 ```
 
 长连接留在 Edge，业务执行留在 Core，可靠更新则通过 Egress 持久化投递。
-
-## 使用 Docker 运行 v2
-
-完整 Docker 部署会启动 PostgreSQL、Redis、一次性 schema migrator、File、Core、
-Egress、SFU 和 Edge，并使用按角色拆分的安全加固镜像：
-
-```powershell
-.\scripts\start-docker.ps1
-```
-
-首次运行会创建本地 `.env`，从 `ghcr.io/iamxvbaba/gramsrv` 拉取六个 `v2`
-角色镜像、执行 schema migration 并等待服务健康。数据库、媒体和 MTProto RSA
-身份使用独立持久卷。公开测试公钥位于
-`deploy/docker/assets/test-server-rsa.pub`；对应的测试 Edge 镜像会在全新部署中
-使用这套刻意公开的测试身份。Linux/macOS 命令、备份、升级、S3、远程客户端接入
-和安全门禁见 [Docker 部署手册](docs/docker-deployment.md)。本地修改源码后使用
-`.\scripts\start-docker.ps1 -Build`。
 
 ## 当前能力
 

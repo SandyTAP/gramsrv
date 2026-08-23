@@ -113,9 +113,10 @@ webhook，再运行无参数 `start-docker.ps1`。已有 `.env` 时启动脚本�
 
 默认镜像前缀是 `ghcr.io/iamxvbaba/gramsrv`，包含 `migrate`、`file`、`core`、`egress`、
 `sfu`、`edge` 六个 package。体验 tag 是 `v2`，每次发布同时产生不可变的 `sha-<commit>` tag。
-仓库的 `v2` 分支推送会触发 `Publish v2 container images` workflow。GHCR 首次创建 package 时
-默认是 private；维护者需要在 GitHub Packages 中把这六个 package 分别设置成 Public，之后普通
-用户无需登录即可拉取。若暂时保持 private，先执行 `docker login ghcr.io`。
+自动随 `v2` push 发布目前已暂停；维护者需要在 GitHub Actions 中手动运行
+`Publish v2 container images` workflow。GHCR 首次创建 package 时默认是 private；维护者需要在
+GitHub Packages 中把这六个 package 分别设置成 Public，之后普通用户无需登录即可拉取。若暂时
+保持 private，先执行 `docker login ghcr.io`。
 
 修改源码后要验证本地镜像时，显式构建；Compose 中的 Edge 本地构建目标同样是带公开测试密钥的
 `edge-test`：
