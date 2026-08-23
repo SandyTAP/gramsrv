@@ -14,6 +14,59 @@ Telegram-like interface.
   <img src="docs/assets/gramsrv-android.png" width="23%" alt="gramsrv running on Android">
 </p>
 
+## Quick start with Docker (v2)
+
+The one-click Docker deployment lives on the [`v2`](../../tree/v2) branch;
+the `main` branch is the monolithic development line and does not contain the
+Docker startup scripts. Install Git and Docker Desktop, switch Docker Desktop
+to Linux containers, start it, and run in PowerShell 5.1 or later:
+
+```powershell
+git clone --branch v2 --single-branch https://github.com/iamxvbaba/gramsrv.git
+Set-Location gramsrv
+.\scripts\start-docker.ps1
+```
+
+That is all a local first run needs. The script creates the deployment
+environment, anonymously pulls the six ready-to-run `v2` images from GHCR,
+starts PostgreSQL, Redis, Migrate, File, Core, Egress, SFU, and Edge in
+dependency order, and waits until the stack is ready. No local Go toolchain,
+PostgreSQL, Redis, image build, or `docker login` is required.
+
+- The development login code is **`12345`**.
+- Zero-argument startup listens only on `127.0.0.1` for a client on the same
+  computer.
+- The matching [public test key](../../blob/v2/deploy/docker/assets/test-server-rsa.pub)
+  is included on `v2` for compatible clients.
+- Accounts, database state, media, Redis state, and the RSA identity use Docker
+  named volumes and survive container recreation and normal Compose shutdown.
+- Run without `-Build` to use the published images; `-Build` is only for local
+  source changes.
+
+If Windows blocks PowerShell scripts, allow them only for the current window
+and retry:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\start-docker.ps1
+```
+
+For a temporary LAN experience, replace the example address with the Windows
+host's LAN address:
+
+```powershell
+.\scripts\start-docker.ps1 `
+  -AdvertiseIP 192.168.1.20 `
+  -PublicBaseURL http://192.168.1.20:2401 `
+  -PublicWebBaseURL http://192.168.1.20:2401 `
+  -AllowInsecureDevelopmentAuth
+```
+
+Stock Telegram clients require an endpoint and RSA-key patch. Use a compatible
+client from the [project website](https://telesrv.net), and see the
+[`v2` Docker deployment runbook](../../blob/v2/docs/docker-deployment.en.md) for
+Linux/macOS, firewall, backup, upgrade, remote access, and production guidance.
+
 ## Why gramsrv
 
 Most Telegram clones reproduce the interface. `gramsrv` implements the server
