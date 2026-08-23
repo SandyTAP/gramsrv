@@ -290,12 +290,13 @@ func PhoneDigits(phone string) string {
 	return b.String()
 }
 
-// NormalizePhone returns the one persisted identity for an international
-// phone number: E.164 digits without the leading '+'. Parsing is deliberately
-// country-aware so a national trunk prefix is removed only where the numbering
-// plan says it is a prefix. For example, both +98 0998 167 9461 and
-// +98 998 167 9461 become 989981679461, while Italy's significant leading zero
-// in +39 02 ... is retained.
+// NormalizePhone returns the one persisted login identity. Virtual +888
+// identities are independent of the collectible-phone registry and accept
+// 7-15 canonical digits. Ordinary international numbers use E.164 digits
+// without the leading '+'. Their parsing is deliberately country-aware so a
+// national trunk prefix is removed only where the numbering plan says it is a
+// prefix. For example, both +98 0998 167 9461 and +98 998 167 9461 become
+// 989981679461, while Italy's significant leading zero in +39 02 ... is retained.
 //
 // IsPossibleNumber is the structural gate rather than IsValidNumber. It keeps
 // syntactically possible reserved/test ranges usable without accepting local
@@ -305,6 +306,15 @@ func NormalizePhone(phone string) string {
 	digits := PhoneDigits(phone)
 	if digits == "" {
 		return ""
+	}
+	// Every syntactically valid +888 virtual number is an independent login
+	// identity; minting or owning the same collectible-phone value is not a
+	// prerequisite. users.phone therefore takes lookup precedence over the
+	// optional collectible alias registry.
+	if len(digits) >= MinCollectiblePhoneLength &&
+		len(digits) <= MaxCollectiblePhoneLength &&
+		strings.HasPrefix(digits, "888") {
+		return digits
 	}
 	// 42777 is the reserved, non-login phone of the built-in service identity.
 	// It predates the ordinary E.164 user invariant and remains resolvable only
