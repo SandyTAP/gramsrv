@@ -67,6 +67,23 @@ flowchart LR
 
 长连接留在 Edge，业务执行留在 Core，可靠更新则通过 Egress 持久化投递。
 
+## 使用 Docker 运行 v2
+
+完整 Docker 部署会启动 PostgreSQL、Redis、一次性 schema migrator、File、Core、
+Egress、SFU 和 Edge，并使用按角色拆分的安全加固镜像：
+
+```powershell
+.\scripts\start-docker.ps1
+```
+
+首次运行会创建本地 `.env`，从 `ghcr.io/iamxvbaba/gramsrv` 拉取六个 `v2`
+角色镜像、执行 schema migration 并等待服务健康。数据库、媒体和 MTProto RSA
+身份使用独立持久卷。公开测试公钥位于
+`deploy/docker/assets/test-server-rsa.pub`；对应的测试 Edge 镜像会在全新部署中
+使用这套刻意公开的测试身份。Linux/macOS 命令、备份、升级、S3、远程客户端接入
+和安全门禁见 [Docker 部署手册](docs/docker-deployment.md)。本地修改源码后使用
+`.\scripts\start-docker.ps1 -Build`。
+
 ## 当前能力
 
 - 账号、联系人、用户资料、隐私、在线状态和多会话。

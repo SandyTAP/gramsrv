@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -412,6 +413,86 @@ func TestLoadExampleRoleYAMLFiles(t *testing.T) {
 			t.Setenv("TELESRV_CONFIG", filepath.Join(exampleDir, tt.file))
 			if err := tt.load(); err != nil {
 				t.Fatalf("load %s: %v", tt.file, err)
+			}
+		})
+	}
+}
+
+func TestLoadDockerRoleYAMLFiles(t *testing.T) {
+	t.Setenv("TELESRV_INSTANCE_ID", "compose-test-1")
+	t.Setenv("TELESRV_POSTGRES_DSN", "postgres://telesrv:secret@postgres:5432/telesrv_v2?sslmode=disable")
+	t.Setenv("TELESRV_REDIS_PASSWORD", "redis-secret")
+	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "core-secret")
+	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
+	t.Setenv("TELESRV_EGRESS_ACK_TOKEN", "egress-secret")
+	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "group-call-secret")
+	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
+	t.Setenv("TELESRV_DEV_AUTH_CODE", "918274")
+	t.Setenv("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "development")
+	t.Setenv("TELESRV_OTP_WEBHOOK_URL", "https://otp.example.test/v1/deliveries")
+	t.Setenv("TELESRV_OTP_WEBHOOK_SECRET", "otp-secret")
+	t.Setenv("TELESRV_OTP_WEBHOOK_TIMEOUT", "4s")
+	t.Setenv("TELESRV_ADVERTISE_IP", "203.0.113.10")
+	t.Setenv("TELESRV_ADVERTISE_PORT", "2398")
+	t.Setenv("TELESRV_SFU_UDP_PORT", "12399")
+	t.Setenv("TELESRV_DEFAULT_COUNTRY_CODE", "CN")
+	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://example.test")
+	t.Setenv("TELESRV_PUBLIC_APP_SCHEME", "telesrv")
+	t.Setenv("TELESRV_PUBLIC_WEB_BASE_URL", "https://web.example.test")
+	t.Setenv("TELESRV_BLOB_BACKEND", "localfs")
+	t.Setenv("TELESRV_EXTERNAL_MEDIA_ENABLE", "true")
+	t.Setenv("TELESRV_WEBPAGE_PREVIEW_ENABLE", "true")
+	t.Setenv("TELESRV_S3_USE_SSL", "true")
+	t.Setenv("TELESRV_S3_PATH_STYLE", "false")
+	t.Setenv("TELESRV_S3_CREATE_BUCKET", "false")
+
+	dockerConfigDir := filepath.Join("..", "..", "deploy", "docker", "config")
+	tests := []struct {
+		name string
+		file string
+		load func() error
+	}{
+		{name: "edge", file: "edge.yaml", load: func() error {
+			cfg, err := LoadEdge()
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCTargets != "core:2440" || cfg.CoreExecGRPCResolver != "dns" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.EgressAckGRPCTargets != "egress:2510" || cfg.EgressAckGRPCResolver != "dns") {
+				return fmt.Errorf("unexpected Docker edge identity or service targets")
+			}
+			return err
+		}},
+		{name: "core", file: "core.yaml", load: func() error {
+			cfg, err := LoadCore()
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCAddr != "0.0.0.0:2440" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.LangPackSeedDir != "/usr/share/telesrv/langpack" || cfg.OTPWebhookURL != "https://otp.example.test/v1/deliveries" || cfg.OTPWebhookSecret != "otp-secret" || cfg.OTPWebhookTimeout != 4*time.Second) {
+				return fmt.Errorf("unexpected Docker core identity, listeners, or seed path")
+			}
+			return err
+		}},
+		{name: "egress", file: "egress.yaml", load: func() error {
+			cfg, err := LoadEgress()
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.EgressAckGRPCAddr != "0.0.0.0:2510" || cfg.DefaultCountryCode != "CN" || cfg.PublicBaseURL != "https://example.test" || cfg.PublicAppScheme != "telesrv") {
+				return fmt.Errorf("unexpected Docker egress identity or listener")
+			}
+			return err
+		}},
+		{name: "file", file: "file.yaml", load: func() error {
+			cfg, err := LoadFile()
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.FileGRPCAddr != "0.0.0.0:2520" || cfg.BlobDir != "/var/lib/telesrv-file/blobs") {
+				return fmt.Errorf("unexpected Docker file identity, listener, or blob path")
+			}
+			return err
+		}},
+		{name: "sfu", file: "sfu.yaml", load: func() error {
+			cfg, err := LoadSFU()
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.SFUControlGRPCAddr != "0.0.0.0:2450" || cfg.SFUControlGRPCURL != "grpc://compose-test-1:2450" || cfg.GroupCallControlURL != "http://core:2420") {
+				return fmt.Errorf("unexpected Docker SFU identity or control endpoint")
+			}
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TELESRV_CONFIG", filepath.Join(dockerConfigDir, tt.file))
+			if err := tt.load(); err != nil {
+				t.Fatalf("load Docker %s: %v", tt.file, err)
 			}
 		})
 	}

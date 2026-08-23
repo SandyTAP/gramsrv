@@ -75,7 +75,7 @@ jobs:
             suffix=".exe"
           fi
 
-          for role in edge core egress file sfu admin ton; do
+          for role in migrate edge core egress file sfu admin ton; do
             go build \
               -trimpath \
               -ldflags="-s -w" \

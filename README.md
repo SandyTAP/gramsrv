@@ -74,6 +74,25 @@ flowchart LR
 Connections stay at the Edge, business execution stays in Core, and reliable
 delivery remains durable through Egress.
 
+## Run v2 with Docker
+
+The complete Docker deployment starts PostgreSQL, Redis, a one-shot schema
+migrator, File, Core, Egress, SFU, and Edge with hardened role-specific images:
+
+```powershell
+.\scripts\start-docker.ps1
+```
+
+The first run creates a local `.env`, pulls the six `v2` role images from
+`ghcr.io/iamxvbaba/gramsrv`, applies the schema, and waits for readiness.
+Database, media, and the MTProto RSA identity use separate persistent volumes.
+The public test key is available at
+`deploy/docker/assets/test-server-rsa.pub`; the matching test Edge image uses
+that deliberately public identity on a fresh deployment. See the
+[Docker deployment runbook](docs/docker-deployment.en.md) for Linux/macOS
+commands, backup, upgrades, S3, remote-client setup, and security gates. Use
+`.\scripts\start-docker.ps1 -Build` after changing source locally.
+
 ## What works today
 
 - Accounts, contacts, profiles, privacy, presence, and multiple sessions.

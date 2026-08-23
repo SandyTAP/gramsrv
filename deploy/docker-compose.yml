@@ -16,7 +16,7 @@ services:
     # 全库已去分区（普通表），max_locks_per_transaction 默认 64 已够；512 仅留余量，对内存近乎零开销。
     # pg_stat_statements：聚合各 SQL 的累计/平均耗时与调用次数，用于定位 postgres 容器 CPU 热点
     # （telesrv 是宿主进程，docker stats 里的 CPU 尖峰是本容器）。需 CREATE EXTENSION 后才有视图：
-    #   docker exec -i telesrv-postgres psql -U telesrv -d telesrv -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+    #   docker exec -i telesrv-postgres psql -U telesrv -d telesrv_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
     command:
       - "postgres"
       - "-c"
@@ -33,7 +33,7 @@ services:
       POSTGRES_PASSWORD: telesrv
       TZ: UTC
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres-init:/docker-entrypoint-initdb.d:ro
@@ -49,7 +49,7 @@ services:
     container_name: telesrv-redis
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6399:6379"   # 宿主 6379 常被其他项目占用，telesrv 对外用 6399（容器内仍 6379）
+      - "127.0.0.1:6399:6379"   # 仅宿主回环可达；容器内仍为 6379
     volumes:
       - redisdata:/data
     healthcheck:

@@ -11,7 +11,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# 本地环境 / 密钥（server RSA private key 必须持久化，但禁止入库）
+# 本地环境 / 正式密钥（仅 deploy/docker/assets 下明确发布的测试私钥例外）
 .env
 .env.*
 !.env.example
@@ -27,6 +27,8 @@ logs/
 tmp/
 .gocache/
 .tdesktop-e2e/
+/deploy/docker/backups/
+/deploy/docker/overrides/
 
 # IDE
 .idea/

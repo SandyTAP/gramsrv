@@ -89,3 +89,79 @@ jobs:
       - name: Test
         working-directory: cmd/bots/grammystore
         run: npm test
+
+  docker-smoke:
+    name: Docker full-topology smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Generate isolated environment
+        shell: pwsh
+        run: ./scripts/new-docker-env.ps1 -AdvertiseIP 127.0.0.1
+
+      - name: Validate deployment inputs
+        run: |
+          docker compose version
+          sh -n deploy/docker/docker-entrypoint.sh
+          docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml config --quiet
+
+      - name: Build role images
+        run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml build --pull migrate file core egress sfu edge
+
+      - name: Start and wait for readiness
+        run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml up -d --no-build --wait --wait-timeout 300
+
+      - name: Verify runtime hardening
+        run: |
+          compose=(docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
+          migrate_id="$("${compose[@]}" ps --all --quiet migrate)"
+          test -n "$migrate_id"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$migrate_id")" = "0"
+          for service in migrate file core egress sfu edge; do
+            container_id="$("${compose[@]}" ps --all --quiet "$service")"
+            test -n "$container_id"
+            test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
+            test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
+            test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$container_id")" = '["ALL"]'
+            test "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$container_id")" = "512"
+            test "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_id")" = '["no-new-privileges:true"]'
+          done
+          "${compose[@]}" ps --all
+
+      - name: Verify dependency-aware readiness
+        run: |
+          compose=(docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
+          "${compose[@]}" stop core
+          edge_failed_closed=false
+          for attempt in $(seq 1 45); do
+            if test "$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet edge)")" = "unhealthy"; then
+              edge_failed_closed=true
+              break
+            fi
+            sleep 2
+          done
+          test "$edge_failed_closed" = "true"
+          "${compose[@]}" start core
+          stack_recovered=false
+          for attempt in $(seq 1 60); do
+            core_health="$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet core)")"
+            edge_health="$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet edge)")"
+            if test "$core_health" = "healthy" && test "$edge_health" = "healthy"; then
+              stack_recovered=true
+              break
+            fi
+            sleep 2
+          done
+          test "$stack_recovered" = "true"
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml logs --no-color --tail 200
+
+      - name: Remove isolated stack
+        if: always()
+        run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml down --volumes --remove-orphans

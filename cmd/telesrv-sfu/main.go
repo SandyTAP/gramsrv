@@ -2,10 +2,14 @@
 package main
 
 import (
+	"go.uber.org/zap"
+
 	"telesrv/internal/node/common"
 	sfunode "telesrv/internal/node/sfu"
 )
 
 func main() {
-	common.Main("telesrv-sfu", sfunode.Run)
+	common.MainWithMetadata("telesrv-sfu", currentBuildMetadata(), func(logger *zap.Logger, _ common.BuildMetadata) error {
+		return sfunode.Run(logger)
+	})
 }
