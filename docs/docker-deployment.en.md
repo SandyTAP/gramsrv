@@ -40,7 +40,8 @@ File service or restore a local file fallback in Core or Edge.
 - Docker Engine 24+ or Docker Desktop, with Compose v2.24+.
 - At least 4 GiB of available memory. Use 8 GiB for local image builds and keep
   at least 2 GiB of free disk for the Core and File transcoding volumes.
-- An IPv4 or IPv6 address reachable by the patched client.
+- An IPv4 or IPv6 address reachable by the patched client. The embedded TURN
+  listener is currently IPv4, so TURN deployments need a client-reachable IPv4.
 - Network access to `ghcr.io` and Docker Hub for the default startup. Go module
   and Alpine package access is needed only for a local `-Build`.
 
@@ -83,6 +84,13 @@ Check all of the following:
   entrypoint fails fast when one remains.
 - `TELESRV_ADVERTISE_IP` must be an IP address reachable by clients, not a
   Docker service name or DNS name.
+- IPv4 deployments enable TURN by default. `TELESRV_TURN_ADVERTISE_IP` must be
+  a client-reachable IPv4 and `TELESRV_TURN_SECRET` must be an independent
+  random value. Forward the TURN listener and relay range without translating
+  `12500-12999/udp` to a different external range. The generator explicitly
+  disables embedded TURN for IPv6-only deployments.
+- RTMP is enabled by default. `TELESRV_LIVESTREAM_RTMP_URL` must be an
+  OBS/publisher-reachable `rtmp://<host>:2400/live` URL.
 - Development login codes require
   `TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH=true`. The generator enables it
   automatically only for loopback. For temporary LAN testing, pass
@@ -92,8 +100,8 @@ Check all of the following:
   `TELESRV_OTP_WEBHOOK_SECRET`; see [`otp-delivery.md`](otp-delivery.md).
 - The password inside `TELESRV_POSTGRES_DSN` must match `POSTGRES_PASSWORD`.
   URL-encode special characters when editing it manually.
-- The five internal tokens must be independent and must not reuse a database,
-  Redis, or administrator password.
+- The five internal tokens and TURN secret must be independent and must not
+  reuse a database, Redis, or administrator password.
 
 The generator has no force-overwrite mode. Regenerating `.env` would make an
 existing PostgreSQL password, Redis password, and container tokens inconsistent.
@@ -123,8 +131,11 @@ and waits for readiness:
 ```
 
 When startup completes, the script prints the default development login code
-`12345`. A temporary LAN deployment can also be initialized with one command.
-Replace the example address with the LAN address of the Docker host:
+`12345`, TURN/STUN endpoint, relay range, and RTMP ingest URL. Docker Desktop
+may need several minutes to create the complete TURN UDP range on first startup;
+wait until the script reports that the stack is ready. A temporary LAN deployment
+can also be initialized with one command. Replace the example address with the
+LAN address of the Docker host:
 
 ```powershell
 .\scripts\start-docker.ps1 -AdvertiseIP 192.168.1.20 -PublicBaseURL http://192.168.1.20:2401 -PublicWebBaseURL http://192.168.1.20:2401 -AllowInsecureDevelopmentAuth
@@ -200,6 +211,8 @@ are `healthy`, and the logs include:
 - `telesrv-migrate: schema ready ...`
 - `telesrv file ready`
 - `telesrv core role ready`
+- `turn listening`
+- `live stream rtmp ingest listening`
 - `telesrv egress ready`
 - SFU standalone ready/heartbeat messages
 - `telesrv edge ready`
@@ -210,6 +223,9 @@ are `healthy`, and the logs include:
 |---|---|---|
 | `2398/tcp` | `127.0.0.1` for zero-argument setup; `0.0.0.0`/`::` for non-loopback initialization | MTProto Edge client entrypoint |
 | `12399/udp` | `127.0.0.1` for zero-argument setup; `0.0.0.0`/`::` for non-loopback initialization | SFU media |
+| `12400/udp` | `127.0.0.1` for zero-argument setup; `0.0.0.0` for non-loopback IPv4 initialization | TURN/STUN listener |
+| `12500-12999/udp` | Same binding as `12400/udp`; 1:1 host/container ports | TURN relay allocations |
+| `2400/tcp` | `127.0.0.1` for zero-argument setup; `0.0.0.0`/`::` for non-loopback initialization | RTMP ingest for OBS or another publisher |
 | `2401/tcp` | `127.0.0.1` by default; the advertised IP for a direct HTTP URL | Public-link HTTP or host nginx/Caddy reverse proxy |
 
 PostgreSQL, Redis, CoreExec, FileData, Egress ACK, SFU control, and debug/pprof
@@ -219,16 +235,25 @@ Docker daemon, host root, and containers on the same control network are part of
 the trust boundary. A cross-host deployment needs a TLS/mTLS overlay and cannot
 reuse these probes unchanged.
 
-On a host with multiple network interfaces, set `TELESRV_PUBLIC_BIND_IP` to a
-specific address. When the generator sees a PublicBaseURL in the form
+IPv4 Docker deployments enable embedded TURN and RTMP by default. The router/NAT
+and Windows/Linux firewall must both allow `12400/udp`, the complete
+`12500-12999/udp` range, and `2400/tcp`. The TURN relay range requires 1:1
+forwarding and `TELESRV_TURN_ADVERTISE_IP` must be the address clients can reach;
+changing only `.env` or only the firewall is not a complete forwarding setup.
+The v2 `compose.yaml` already configures the listeners and published ports from
+`.env`; no manual Compose edit is needed. Run the startup script again after
+changing these variables so Compose recreates Core when required.
+
+On a host with multiple network interfaces, set `TELESRV_PUBLIC_BIND_IP` and
+the IPv4 TURN `TELESRV_TURN_BIND_IP` to specific addresses. When the generator
+sees a PublicBaseURL in the form
 `http://<AdvertiseIP>:...`, it binds port 2401 directly to that address for a
 simple LAN experience. For an Internet-facing reverse proxy, keep 2401 bound to
 host loopback and terminate TLS in nginx or Caddy. Never publish pprof or
 internal gRPC directly.
 
-TURN, RTMP, Bot API, Admin, and the TON worker are not enabled by the default
-Compose topology. Add explicit configuration, ports, credentials, and validation
-for those features instead of publishing a broad port range.
+Bot API, Admin, and the TON worker are not enabled by the default Compose
+topology; add explicit configuration and validation when needed.
 
 ## 5. Data and RSA Identity
 
@@ -239,7 +264,7 @@ for those features instead of publishing a broad port range.
 | `file_data` | localfs blobs, upload parts, and map cache | Media cannot be recovered |
 | `file_tmp` | File GIF/video transcoding temporary files | Safe to recreate; do not back up |
 | `core_state` | Optional seeds, map cache, and OIDC key files | Enabled features fail or identity changes |
-| `core_tmp` | Bounded ffmpeg/ffprobe temporary files | Safe to recreate; do not back up |
+| `core_tmp` | Temporary files for ffmpeg/ffprobe and RTMP segments | Safe to recreate; do not back up |
 | `edge_state` | MTProto RSA private and public keys | Patched clients can no longer complete the handshake |
 
 ### 5.1 Where One-Click Startup Stores Data
@@ -435,8 +460,8 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml p
 
 - `id -u` is `10001`; writes to the root filesystem fail, while declared data
   volumes remain writable.
-- The host exposes only the expected 2398/tcp, 12399/udp, and the 2401/tcp
-  binding selected in `.env`.
+- The host exposes only the expected `2398/tcp`, `12399/udp`, `12400/udp`,
+  `12500-12999/udp`, `2400/tcp`, and the `2401/tcp` binding selected in `.env`.
 - Stopping Core, File, or Egress makes Edge `unhealthy`; affected business
   requests fail closed and do not execute in-process. Health recovers when the
   backend returns.
@@ -459,8 +484,15 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml p
   owner, not a local Core fallback.
 - **Edge is unhealthy:** inspect the local 2398 listener, then authenticated
   health for CoreExec, FileData, and Egress ACK.
-- **Login works but media fails:** verify `TELESRV_ADVERTISE_IP` and NAT/firewall
-  forwarding for `12399/udp`.
+- **A group call joins but media fails:** verify `TELESRV_ADVERTISE_IP` and
+  NAT/firewall forwarding for `12399/udp`.
+- **A private call cannot use relay:** confirm Core logs `turn listening`, then
+  verify `TELESRV_TURN_ADVERTISE_IP` and 1:1 NAT/firewall forwarding for
+  `12400/udp` and the complete `12500-12999/udp` range.
+- **OBS cannot connect to RTMP:** confirm Core logs
+  `live stream rtmp ingest listening`, then verify
+  `TELESRV_LIVESTREAM_RTMP_URL` and `2400/tcp` forwarding. The client live-stream
+  settings page generates the stream key.
 - **The client RSA fingerprint does not match:** export the public key from the
   current `edge_state`; an old volume may preserve a different identity. A fresh
   default test volume exactly matches `deploy/docker/assets/test-server-rsa.pub`.

@@ -151,7 +151,8 @@ COPY --chown=telesrv:telesrv data/langpack/ /usr/share/telesrv/langpack/
 COPY --chown=telesrv:telesrv deploy/docker/assets/seed-manifest.json /usr/share/telesrv/seed-manifest.json
 COPY --chown=telesrv:telesrv deploy/docker/config/core.yaml /etc/telesrv/core.yaml
 USER 10001:10001
-EXPOSE 2420 2440 2401
+# TURN relay ports 12500-12999/udp are published by Compose as a 1:1 range.
+EXPOSE 2400 2401 2420 2440 12400/udp
 CMD ["telesrv-core", "--config", "/etc/telesrv/core.yaml"]
 
 FROM runtime-base AS egress

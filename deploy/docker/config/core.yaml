@@ -58,10 +58,22 @@ auth:
   otp_webhook_timeout: ${TELESRV_OTP_WEBHOOK_TIMEOUT}
 
 turn:
-  enabled: false
+  enabled: ${TELESRV_TURN_ENABLE}
+  udp_port: ${TELESRV_TURN_UDP_PORT}
+  advertise_ip: "${TELESRV_TURN_ADVERTISE_IP}"
+  secret: "${TELESRV_TURN_SECRET}"
+  relay_min_port: ${TELESRV_TURN_RELAY_MIN_PORT}
+  relay_max_port: ${TELESRV_TURN_RELAY_MAX_PORT}
+  credential_ttl: ${TELESRV_CALL_TURN_CREDENTIAL_TTL}
+  force_relay: ${TELESRV_CALL_FORCE_RELAY}
 
 livestream:
-  enabled: false
+  enabled: ${TELESRV_LIVESTREAM_ENABLE}
+  rtmp_addr: "0.0.0.0:${TELESRV_LIVESTREAM_RTMP_PORT}"
+  rtmp_url: "${TELESRV_LIVESTREAM_RTMP_URL}"
+  ffmpeg_path: ffmpeg
+  work_dir: /var/tmp/telesrv-core/livestream
+  segment_keep: 32
 
 translation:
   enabled: false

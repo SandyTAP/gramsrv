@@ -188,6 +188,17 @@ services:
       TELESRV_BLOB_BACKEND: ${TELESRV_BLOB_BACKEND:-localfs}
       TELESRV_EXTERNAL_MEDIA_ENABLE: ${TELESRV_EXTERNAL_MEDIA_ENABLE:-true}
       TELESRV_WEBPAGE_PREVIEW_ENABLE: ${TELESRV_WEBPAGE_PREVIEW_ENABLE:-true}
+      TELESRV_TURN_ENABLE: ${TELESRV_TURN_ENABLE:-true}
+      TELESRV_TURN_UDP_PORT: ${TELESRV_TURN_UDP_PORT:-12400}
+      TELESRV_TURN_ADVERTISE_IP: ${TELESRV_TURN_ADVERTISE_IP:?set the client-reachable TELESRV_TURN_ADVERTISE_IP in deploy/docker/.env}
+      TELESRV_TURN_SECRET: ${TELESRV_TURN_SECRET:?set TELESRV_TURN_SECRET in deploy/docker/.env}
+      TELESRV_TURN_RELAY_MIN_PORT: ${TELESRV_TURN_RELAY_MIN_PORT:-12500}
+      TELESRV_TURN_RELAY_MAX_PORT: ${TELESRV_TURN_RELAY_MAX_PORT:-12999}
+      TELESRV_CALL_TURN_CREDENTIAL_TTL: ${TELESRV_CALL_TURN_CREDENTIAL_TTL:-6h}
+      TELESRV_CALL_FORCE_RELAY: ${TELESRV_CALL_FORCE_RELAY:-false}
+      TELESRV_LIVESTREAM_ENABLE: ${TELESRV_LIVESTREAM_ENABLE:-true}
+      TELESRV_LIVESTREAM_RTMP_PORT: ${TELESRV_LIVESTREAM_RTMP_PORT:-2400}
+      TELESRV_LIVESTREAM_RTMP_URL: ${TELESRV_LIVESTREAM_RTMP_URL:?set the client-reachable TELESRV_LIVESTREAM_RTMP_URL in deploy/docker/.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -209,6 +220,17 @@ services:
         published: "${TELESRV_PUBLIC_LINK_PORT:-2401}"
         host_ip: ${TELESRV_LOCAL_BIND_IP:-127.0.0.1}
         protocol: tcp
+      - name: rtmp-ingest
+        target: ${TELESRV_LIVESTREAM_RTMP_PORT:-2400}
+        published: "${TELESRV_LIVESTREAM_RTMP_PORT:-2400}"
+        host_ip: ${TELESRV_PUBLIC_BIND_IP:-0.0.0.0}
+        protocol: tcp
+      - name: turn
+        target: ${TELESRV_TURN_UDP_PORT:-12400}
+        published: "${TELESRV_TURN_UDP_PORT:-12400}"
+        host_ip: ${TELESRV_TURN_BIND_IP:-127.0.0.1}
+        protocol: udp
+      - "${TELESRV_TURN_BIND_IP:-127.0.0.1}:${TELESRV_TURN_RELAY_MIN_PORT:-12500}-${TELESRV_TURN_RELAY_MAX_PORT:-12999}:${TELESRV_TURN_RELAY_MIN_PORT:-12500}-${TELESRV_TURN_RELAY_MAX_PORT:-12999}/udp"
     healthcheck:
       test:
         - CMD
@@ -231,7 +253,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 6
-      start_period: 30s
+      start_period: 240s
     networks:
       - data
       - control

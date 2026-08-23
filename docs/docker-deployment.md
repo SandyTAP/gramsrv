@@ -36,7 +36,8 @@ fallback。
 - Docker Engine 24+ 或 Docker Desktop，并安装 Compose v2.24+。
 - 至少 4 GiB 可用内存；本地构建镜像时建议 8 GiB，并为 Core/File 临时转码卷预留至少 2 GiB
   可用磁盘空间。
-- patched client 可访问的 IPv4 或 IPv6 地址。
+- patched client 可访问的 IPv4 或 IPv6 地址。内嵌 TURN 当前是 IPv4 listener；需要 TURN
+  时必须提供客户端可达的 IPv4。
 - 默认启动需要访问 `ghcr.io`、Docker Hub；只有使用 `-Build` 本地构建时才需要访问 Go module
   和 Alpine package 源。
 
@@ -72,6 +73,11 @@ ${EDITOR:-vi} deploy/docker/.env
 
 - `.env` 的赋值中不能保留任何 `CHANGEME` 占位值；容器 entrypoint 会 fail fast。
 - `TELESRV_ADVERTISE_IP` 必须是客户端可达 IP，不能写 Docker service name 或 DNS 名。
+- IPv4 部署默认启用 TURN；`TELESRV_TURN_ADVERTISE_IP` 必须是客户端可达 IPv4，
+  `TELESRV_TURN_SECRET` 必须是独立随机值。TURN 主端口和 relay range 必须原端口转发，不能把
+  `12500-12999/udp` 平移到另一段外部端口。IPv6-only 生成配置会显式关闭内嵌 TURN。
+- RTMP 默认启用；`TELESRV_LIVESTREAM_RTMP_URL` 必须是 OBS/推流端可达的
+  `rtmp://<host>:2400/live` 地址。
 - development 登录码只有在 `TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH=true` 时才允许；生成器
   仅为 loopback 部署自动打开它，局域网临时体验可显式传
   `-AllowInsecureDevelopmentAuth`。公网部署必须设置
@@ -79,7 +85,7 @@ ${EDITOR:-vi} deploy/docker/.env
   `TELESRV_OTP_WEBHOOK_SECRET`，协议见 `docs/otp-delivery.md`。
 - `TELESRV_POSTGRES_DSN` 中的密码必须与 `POSTGRES_PASSWORD` 相同；手工使用特殊字符时先做
   URL 编码。
-- 五种内部 token 必须彼此独立，不能复用数据库、Redis 或管理员密码。
+- 五种内部 token 和 TURN secret 必须彼此独立，不能复用数据库、Redis 或管理员密码。
 
 生成脚本不会提供“强制覆盖”。直接重生成 `.env` 会令现有 PostgreSQL 密码、Redis 密码和
 新旧容器 token 失配；凭据轮换必须逐项修改后协调重启，不能当作初始化重跑。
@@ -100,8 +106,9 @@ Windows 本机首次体验直接从仓库根目录运行；脚本会在缺少 `.
 .\scripts\start-docker.ps1
 ```
 
-脚本完成后会直接打印默认 development 登录码 `12345`。局域网临时体验可以一条命令初始化；
-把示例地址替换为宿主机的局域网地址：
+脚本完成后会直接打印默认 development 登录码 `12345`、TURN/STUN 端点、relay range 和 RTMP
+ingest URL。Docker Desktop 首次创建完整 TURN UDP range 时可能需要几分钟，请等待脚本显示
+ready。局域网临时体验可以一条命令初始化；把示例地址替换为宿主机的局域网地址：
 
 ```powershell
 .\scripts\start-docker.ps1 -AdvertiseIP 192.168.1.20 -PublicBaseURL http://192.168.1.20:2401 -PublicWebBaseURL http://192.168.1.20:2401 -AllowInsecureDevelopmentAuth
@@ -164,6 +171,8 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml l
 - `telesrv-migrate: schema ready ...`
 - `telesrv file ready`
 - `telesrv core role ready`
+- `turn listening`
+- `live stream rtmp ingest listening`
 - `telesrv egress ready`
 - SFU standalone ready/heartbeat 日志
 - `telesrv edge ready`
@@ -174,6 +183,9 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml l
 |---|---|---|
 | `2398/tcp` | 零参数为 `127.0.0.1`；非 loopback 初始化为 `0.0.0.0`/`::` | MTProto Edge，客户端入口 |
 | `12399/udp` | 零参数为 `127.0.0.1`；非 loopback 初始化为 `0.0.0.0`/`::` | SFU media |
+| `12400/udp` | 零参数为 `127.0.0.1`；非 loopback IPv4 初始化为 `0.0.0.0` | TURN/STUN 主 listener |
+| `12500-12999/udp` | 与 `12400/udp` 相同；宿主/容器端口 1:1 | TURN relay allocations |
+| `2400/tcp` | 零参数为 `127.0.0.1`；非 loopback 初始化为 `0.0.0.0`/`::` | OBS 等推流端的 RTMP ingest |
 | `2401/tcp` | 默认 `127.0.0.1`；直接使用 advertise IP 的 HTTP URL 时绑定该 IP | public-link HTTP 或宿主 nginx/Caddy 反代 |
 
 PostgreSQL、Redis、CoreExec、FileData、Egress ACK、SFU control 和 debug/pprof 均不发布到
@@ -181,12 +193,18 @@ PostgreSQL、Redis、CoreExec、FileData、Egress ACK、SFU control 和 debug/pp
 明文传输，因此 Docker daemon、宿主 root 与同一 control network 都属于信任边界。跨主机前
 必须增加 TLS/mTLS overlay，不能直接复用本探针配置。
 
-若宿主有多块网卡，设置 `TELESRV_PUBLIC_BIND_IP` 为明确地址。生成器发现 PublicBaseURL 是
+IPv4 Docker 部署默认启用内嵌 TURN 和 RTMP；路由器/NAT 与 Windows/Linux 防火墙必须同时放行
+`12400/udp`、完整的 `12500-12999/udp` 以及 `2400/tcp`。TURN relay range 必须 1:1 转发，
+`TELESRV_TURN_ADVERTISE_IP` 必须填写客户端看到的地址；只改 `.env` 或只开防火墙都不构成完整转发。
+当前 v2 `compose.yaml` 已按 `.env` 配置 listener 和端口发布，不需要手工修改 Compose；更改这些
+变量后重新执行启动脚本，让 Compose 重建 Core 容器即可。
+
+若宿主有多块网卡，设置 `TELESRV_PUBLIC_BIND_IP` 和 IPv4 TURN 使用的
+`TELESRV_TURN_BIND_IP` 为明确地址。生成器发现 PublicBaseURL 是
 `http://<AdvertiseIP>:...` 时，会让 2401 直接绑定该地址，便于局域网首次体验；公网反代 2401
 时保留宿主 loopback binding，并让 nginx/Caddy 终止 TLS。不要直接公开 pprof 或内部 gRPC。
 
-TURN、RTMP、Bot API、Admin、TON worker 没有在默认 Compose 中启用。开启这些能力前应按
-对应模块文档增加显式配置、端口、密钥和验证，而不是顺手发布一整段端口范围。
+Bot API、Admin、TON worker 没有在默认 Compose 中启用；需要时应增加显式配置和验证。
 
 ## 5. 数据和 RSA 身份
 
@@ -197,7 +215,7 @@ TURN、RTMP、Bot API、Admin、TON worker 没有在默认 Compose 中启用。�
 | `file_data` | localfs blobs、upload parts、map cache | 媒体不可恢复 |
 | `file_tmp` | File 的 GIF/video 转码临时文件 | 可安全重建，不应备份 |
 | `core_state` | 可选 seeds、map cache、OIDC key files | 对应功能不可用或身份变化 |
-| `core_tmp` | ffmpeg/ffprobe 有界并发的磁盘临时文件 | 可安全重建，不应备份 |
+| `core_tmp` | ffmpeg/ffprobe 和 RTMP 分段的磁盘临时文件 | 可安全重建，不应备份 |
 | `edge_state` | MTProto RSA private/public key | patched clients 无法再握手 |
 
 ### 5.1 一键启动后数据放在哪里
@@ -353,7 +371,8 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml p
 ```
 
 - `id -u` 为 `10001`；对 root filesystem 的写入失败，但声明的数据卷可写。
-- 宿主只能看到预期的 2398/tcp、12399/udp，以及按 `.env` 绑定的 2401/tcp。
+- 宿主只能看到预期的 `2398/tcp`、`12399/udp`、`12400/udp`、`12500-12999/udp`、
+  `2400/tcp`，以及按 `.env` 绑定的 `2401/tcp`。
 - 停止 Core/File/Egress 后 Edge 必须转为 `unhealthy`，相应业务请求 fail closed，不能回退进程
   内执行；后端恢复后应自动回到 `healthy`。
 - `down`（不带 `-v`）再 `up` 后 RSA fingerprint、schema、账号和 media blob 不变。
@@ -369,6 +388,10 @@ docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml p
   public-link 三个 listener；SFU 是独立 owner，不是 Core 的本地 fallback。
 - **Edge 不健康**：依次检查本地 2398 listener，以及 CoreExec/FileData/Egress ACK 的 bearer
   token 和 health。
-- **电话能登录但媒体失败**：确认 `TELESRV_ADVERTISE_IP` 与 `12399/udp` 的 NAT/firewall 转发。
+- **群通话能加入但媒体失败**：确认 `TELESRV_ADVERTISE_IP` 与 `12399/udp` 的 NAT/firewall 转发。
+- **私聊通话无法中继**：确认 Core 日志有 `turn listening`，并检查
+  `TELESRV_TURN_ADVERTISE_IP`、`12400/udp` 和完整 `12500-12999/udp` 的 1:1 NAT/firewall 转发。
+- **OBS 无法连接 RTMP**：确认 Core 日志有 `live stream rtmp ingest listening`，并检查
+  `TELESRV_LIVESTREAM_RTMP_URL` 与 `2400/tcp` 转发；推流 key 由客户端直播设置页生成。
 - **client RSA fingerprint 不匹配**：从当前 `edge_state` 导出 public key；旧卷可能保留了另一套
   身份。全新默认 test volume 应与 `deploy/docker/assets/test-server-rsa.pub` 完全一致。

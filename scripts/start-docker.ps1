@@ -75,7 +75,7 @@ else {
 }
 
 try {
-    Invoke-Compose -Arguments @("up", "--detach", "--no-build", "--wait", "--wait-timeout", "300")
+    Invoke-Compose -Arguments @("up", "--detach", "--no-build", "--wait", "--wait-timeout", "600")
 }
 catch {
     & docker @composeBase logs --no-color --tail 120
@@ -85,10 +85,21 @@ catch {
 Invoke-Compose -Arguments @("ps", "--all")
 Write-Host "telesrv Docker stack is ready. Configuration: $envPath"
 
-$phoneDelivery = Get-Content -LiteralPath $envPath | Where-Object { $_ -match '^TELESRV_PHONE_CODE_DELIVERY_PROVIDER=' } | Select-Object -First 1
-if ($phoneDelivery -eq 'TELESRV_PHONE_CODE_DELIVERY_PROVIDER=development') {
-    $developmentCode = Get-Content -LiteralPath $envPath | Where-Object { $_ -match '^TELESRV_DEV_AUTH_CODE=[0-9]{5,6}$' } | Select-Object -First 1
-    if ($null -ne $developmentCode) {
-        Write-Host "Development login code: $($developmentCode.Substring($developmentCode.IndexOf('=') + 1))"
+$deployment = @{}
+foreach ($line in Get-Content -LiteralPath $envPath) {
+    if ($line -match '^([A-Z0-9_]+)=(.*)$') {
+        $deployment[$Matches[1]] = $Matches[2]
     }
+}
+
+if ($deployment['TELESRV_PHONE_CODE_DELIVERY_PROVIDER'] -eq 'development' -and
+    $deployment['TELESRV_DEV_AUTH_CODE'] -match '^[0-9]{5,6}$') {
+    Write-Host "Development login code: $($deployment['TELESRV_DEV_AUTH_CODE'])"
+}
+if ($deployment['TELESRV_TURN_ENABLE'] -eq 'true') {
+    Write-Host "TURN/STUN: udp://$($deployment['TELESRV_TURN_ADVERTISE_IP']):$($deployment['TELESRV_TURN_UDP_PORT'])"
+    Write-Host "TURN relay UDP range: $($deployment['TELESRV_TURN_RELAY_MIN_PORT'])-$($deployment['TELESRV_TURN_RELAY_MAX_PORT'])"
+}
+if ($deployment['TELESRV_LIVESTREAM_ENABLE'] -eq 'true') {
+    Write-Host "RTMP ingest: $($deployment['TELESRV_LIVESTREAM_RTMP_URL']) (stream key is provided by the client)"
 }

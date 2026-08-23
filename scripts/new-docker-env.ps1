@@ -138,6 +138,23 @@ elseif (([Uri]$PublicBaseURL).Scheme -eq "http") {
     }
 }
 
+# The embedded TURN listener is udp4. Keep IPv6-only deployments usable by
+# disabling TURN there while leaving RTMP and the rest of the stack enabled.
+$turnEnabled = (-not $isIPv6).ToString().ToLowerInvariant()
+$turnAdvertiseIP = "127.0.0.1"
+$turnBindIP = "127.0.0.1"
+if (-not $isIPv6) {
+    $turnAdvertiseIP = $parsedIP.ToString()
+    if (-not $isLoopback) {
+        $turnBindIP = "0.0.0.0"
+    }
+}
+$rtmpHost = $parsedIP.ToString()
+if ($isIPv6) {
+    $rtmpHost = "[${rtmpHost}]"
+}
+$rtmpURL = "rtmp://${rtmpHost}:2400/live"
+
 $postgresPassword = New-HexSecret 24
 $values = [ordered]@{
     TELESRV_BUILD_COMMIT                    = $buildCommit
@@ -152,12 +169,17 @@ $values = [ordered]@{
     TELESRV_EGRESS_ACK_TOKEN                = New-HexSecret 32
     TELESRV_GROUPCALL_CONTROL_TOKEN         = New-HexSecret 32
     TELESRV_SFU_CONTROL_TOKEN               = New-HexSecret 32
+    TELESRV_TURN_SECRET                      = New-HexSecret 32
     TELESRV_OTP_WEBHOOK_SECRET              = New-HexSecret 32
     TELESRV_DEV_AUTH_CODE                   = "12345"
     TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH = ($isLoopback -or $AllowInsecureDevelopmentAuth).ToString().ToLowerInvariant()
     TELESRV_ADVERTISE_IP                    = $parsedIP.ToString()
     TELESRV_PUBLIC_BASE_URL                 = $PublicBaseURL
     TELESRV_PUBLIC_WEB_BASE_URL             = $PublicWebBaseURL
+    TELESRV_TURN_ENABLE                      = $turnEnabled
+    TELESRV_TURN_ADVERTISE_IP                = $turnAdvertiseIP
+    TELESRV_TURN_BIND_IP                     = $turnBindIP
+    TELESRV_LIVESTREAM_RTMP_URL              = $rtmpURL
     TELESRV_PUBLIC_BIND_IP                  = $publicBindIP
     TELESRV_LOCAL_BIND_IP                   = $localBindIP
 }

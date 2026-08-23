@@ -35,6 +35,11 @@ required.
 - The development login code is **`12345`**.
 - The default listener is restricted to `127.0.0.1` for a client on the same
   computer.
+- The generated stack enables RTMP ingest and IPv4 TURN. For remote use, allow
+  and forward `2400/tcp`, `12400/udp`, and `12500-12999/udp` in addition to the
+  client and SFU ports; the startup script prints the configured endpoints.
+  The v2 Compose file already publishes these ports from `.env`, so no manual
+  `compose.yaml` edit is needed.
 - The matching public test key is
   [`deploy/docker/assets/test-server-rsa.pub`](deploy/docker/assets/test-server-rsa.pub).
 - Accounts, database state, media, Redis state, and the RSA identity are stored

@@ -135,6 +135,14 @@ jobs:
             test "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$container_id")" = "512"
             test "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_id")" = '["no-new-privileges:true"]'
           done
+          core_id="$("${compose[@]}" ps --quiet core)"
+          test -n "$(docker port "$core_id" 2400/tcp)"
+          test -n "$(docker port "$core_id" 12400/udp)"
+          test -n "$(docker port "$core_id" 12500/udp)"
+          test -n "$(docker port "$core_id" 12999/udp)"
+          timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2400'
+          "${compose[@]}" logs --no-color core | grep -q 'turn listening'
+          "${compose[@]}" logs --no-color core | grep -q 'live stream rtmp ingest listening'
           "${compose[@]}" ps --all
 
       - name: Verify dependency-aware readiness

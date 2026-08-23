@@ -161,6 +161,33 @@ case "$command_name" in
     require_secret TELESRV_FILE_TOKEN
     require_secret TELESRV_GROUPCALL_CONTROL_TOKEN
     require_secret TELESRV_SFU_CONTROL_TOKEN
+    turn_enable="$(printf '%s' "${TELESRV_TURN_ENABLE:-false}" | tr '[:upper:]' '[:lower:]')"
+    case "$turn_enable" in
+      true)
+        require_value TELESRV_TURN_UDP_PORT
+        require_value TELESRV_TURN_ADVERTISE_IP
+        require_secret TELESRV_TURN_SECRET
+        require_value TELESRV_TURN_RELAY_MIN_PORT
+        require_value TELESRV_TURN_RELAY_MAX_PORT
+        ;;
+      false) ;;
+      *)
+        echo "telesrv: TELESRV_TURN_ENABLE must be true or false" >&2
+        exit 64
+        ;;
+    esac
+    livestream_enable="$(printf '%s' "${TELESRV_LIVESTREAM_ENABLE:-false}" | tr '[:upper:]' '[:lower:]')"
+    case "$livestream_enable" in
+      true)
+        require_value TELESRV_LIVESTREAM_RTMP_PORT
+        require_value TELESRV_LIVESTREAM_RTMP_URL
+        ;;
+      false) ;;
+      *)
+        echo "telesrv: TELESRV_LIVESTREAM_ENABLE must be true or false" >&2
+        exit 64
+        ;;
+    esac
     phone_delivery="$(printf '%s' "${TELESRV_PHONE_CODE_DELIVERY_PROVIDER:-development}" | tr '[:upper:]' '[:lower:]')"
     case "$phone_delivery" in
       development)

@@ -32,6 +32,9 @@ PostgreSQL、Redis、Migrate、File、Core、Egress、SFU 和 Edge，并等待�
 
 - 开发环境登录验证码固定为 **`12345`**。
 - 零参数启动默认只监听 `127.0.0.1`，供同一台电脑上的客户端体验。
+- 生成的部署默认启用 RTMP ingest 和 IPv4 TURN。远程使用时，除客户端和 SFU 端口外，
+  还要在防火墙/NAT 放行并转发 `2400/tcp`、`12400/udp` 和 `12500-12999/udp`；启动脚本
+  会打印实际端点。v2 Compose 已根据 `.env` 发布这些端口，不需要手改 `compose.yaml`。
 - 客户端使用的匹配测试公钥位于
   [`deploy/docker/assets/test-server-rsa.pub`](deploy/docker/assets/test-server-rsa.pub)。
 - 账号、数据库、媒体、Redis 状态和 RSA 身份保存在 Docker named volumes 中，
