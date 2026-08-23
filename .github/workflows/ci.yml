@@ -110,7 +110,12 @@ jobs:
           docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml config --quiet
 
       - name: Build role images
-        run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml build --pull migrate file core egress sfu edge
+        run: |
+          compose=(docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
+          for role in migrate file core egress sfu edge; do
+            echo "Building ${role} image"
+            "${compose[@]}" build --pull "$role"
+          done
 
       - name: Start and wait for readiness
         run: docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml up -d --no-build --wait --wait-timeout 300
