@@ -49,6 +49,7 @@ var (
 	errOutboxUpdateBuilderEmpty   = errors.New("egress: update builder returned empty non-noop payload")
 	ErrInvalidOutboxExclusionPair = errors.New("egress: exclusion requires both raw auth key and session id")
 	errProjectedDeliveryTooLarge  = errors.New("egress: projected delivery exceeds v3 batch limits")
+	errActorCapacity              = errors.New("egress: domain actor mailbox capacity exhausted")
 )
 
 type boundDeliveryPendingError struct{ cause error }
@@ -67,13 +68,15 @@ type Metrics interface {
 	OutboxClaimed(count int)
 	OutboxDelivered(time.Duration)
 	OutboxFailed(error)
+	OutboxStage(queue, stage string, duration time.Duration, items int)
 }
 
 type nopMetrics struct{}
 
-func (nopMetrics) OutboxClaimed(int)             {}
-func (nopMetrics) OutboxDelivered(time.Duration) {}
-func (nopMetrics) OutboxFailed(error)            {}
+func (nopMetrics) OutboxClaimed(int)                              {}
+func (nopMetrics) OutboxDelivered(time.Duration)                  {}
+func (nopMetrics) OutboxFailed(error)                             {}
+func (nopMetrics) OutboxStage(string, string, time.Duration, int) {}
 
 type OutboxUpdateRequest struct {
 	TargetUserID int64
@@ -90,16 +93,17 @@ type ChannelUpdateRequest struct {
 type ChannelUpdateBuilder func(context.Context, []ChannelUpdateRequest) ([][]byte, error)
 
 type deliveryCoordinator struct {
-	events         store.DispatchUpdateEventStore
-	dispatch       store.DispatchOutboxStore
-	absolute       store.DeliveryOutboxStore
-	channel        store.ChannelDeliveryStore
-	planner        edgecontrol.DeliveryPlanner
-	updateBuilder  OutboxUpdateBuilder
-	channelBuilder ChannelUpdateBuilder
-	metrics        Metrics
-	log            *zap.Logger
-	instanceID     string
+	dispatch               store.DispatchOutboxStore
+	absolute               store.DeliveryOutboxStore
+	channel                store.ChannelDeliveryStore
+	mutations              AttemptMutationWriter
+	planner                edgecontrol.DeliveryPlanner
+	ptsProjector           ptsWindowProjector
+	readModelInvalidations store.ReadModelInvalidationPublisher
+	channelBuilder         ChannelUpdateBuilder
+	metrics                Metrics
+	log                    *zap.Logger
+	instanceID             string
 }
 
 type projectedOutboxItem struct {
@@ -135,11 +139,13 @@ func (c *deliveryCoordinator) processWindowBudgeted(
 	if stateStore == nil || len(window.Items) == 0 {
 		return
 	}
+	totalStarted := time.Now()
+	defer func() { c.observeStage(window.QueueKind, "window", totalStarted, len(window.Items)) }()
 	if err := validateClaimWindow(window); err != nil {
 		c.resolveItems(ctx, stateStore, window.Owner, window.Items, err, true)
 		return
 	}
-	notAfter, err := claimCommandNotAfter(window)
+	notAfter, evidenceDeadline, err := claimDeadlines(window)
 	if err != nil {
 		c.resolveItems(ctx, stateStore, window.Owner, window.Items, err, true)
 		return
@@ -150,12 +156,59 @@ func (c *deliveryCoordinator) processWindowBudgeted(
 		// overlap across hosts.
 		return
 	}
-	deliveryCtx, cancel := context.WithDeadline(ctx, notAfter)
-	defer cancel()
+	recoveryCtx, cancelRecovery := context.WithDeadline(ctx, evidenceDeadline)
+	defer cancelRecovery()
+	deliveryCtx, cancelDelivery := context.WithDeadline(recoveryCtx, notAfter)
+	defer cancelDelivery()
+	if window.QueueKind == store.OutboxQueueDispatchPTS {
+		invalidationStarted := time.Now()
+		if err := c.publishDispatchReadModelInvalidations(deliveryCtx, window); err != nil {
+			c.observeStage(window.QueueKind, "read_model_invalidation", invalidationStarted, len(window.Items))
+			c.log.Warn("durable dialog read-model invalidation remains pending", zap.Error(err))
+			return
+		}
+		c.observeStage(window.QueueKind, "read_model_invalidation", invalidationStarted, len(window.Items))
+	}
+	var accountRoute *edgecontrol.FrozenAccountDeliveryRoute
+	if window.QueueKind == store.OutboxQueueDispatchPTS && window.Items[0].SourceInstanceID == "" {
+		routeRequest, err := accountDeliveryRouteRequest(window, notAfter, evidenceDeadline)
+		if err != nil {
+			c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, err, true)
+			return
+		}
+		routeStarted := time.Now()
+		route, err := c.planner.PrepareAccountDeliveryRoute(deliveryCtx, routeRequest)
+		c.observeStage(window.QueueKind, "route", routeStarted, len(window.Items))
+		if err != nil {
+			if deliveryCtx.Err() == nil {
+				c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, err, false)
+			}
+			return
+		}
+		if route.SourceInstanceID() != c.instanceID || route.TargetUserID() != window.StreamID {
+			c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, errors.New("egress: frozen account route identity mismatch"), true)
+			return
+		}
+		if len(route.Targets()) == 0 {
+			bindStarted := time.Now()
+			if err := c.bindClaimedAuthoritativeEmpty(deliveryCtx, window.Items, route.SourceInstanceID()); err != nil {
+				if deliveryCtx.Err() == nil {
+					c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, err, false)
+				}
+			}
+			c.observeStage(window.QueueKind, "bind_empty", bindStarted, len(window.Items))
+			return
+		}
+		accountRoute = &route
+	}
 	projectionBytes := int64(0)
 	if reservation != nil && window.QueueKind != store.OutboxQueueAbsoluteDelivery {
 		if !reservation.retain(maxProjectedWindowRetainedBytes) {
-			c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, errorsNewActorCapacity(), false)
+			// Claim already froze a durable evidence deadline. Do not amplify local
+			// memory pressure into an immediate retry+finalize write storm; the
+			// deadline sweep will fence and retry this exact unbound attempt.
+			c.log.Debug("defer durable delivery for actor byte capacity",
+				zap.Uint8("queue_kind", uint8(window.QueueKind)), zap.Int64("stream_id", window.StreamID))
 			return
 		}
 		projectionBytes = maxProjectedWindowRetainedBytes
@@ -165,7 +218,9 @@ func (c *deliveryCoordinator) processWindowBudgeted(
 			}
 		}()
 	}
+	projectionStarted := time.Now()
 	projected, err := c.projectWindow(deliveryCtx, window)
+	c.observeStage(window.QueueKind, "projection", projectionStarted, len(window.Items))
 	if err != nil {
 		if deliveryCtx.Err() == nil {
 			c.resolveItems(deliveryCtx, stateStore, window.Owner, window.Items, err, projectionErrorIsTerminal(err))
@@ -192,39 +247,121 @@ func (c *deliveryCoordinator) processWindowBudgeted(
 		return
 	}
 	if projected[0].claimed.SourceInstanceID != "" {
-		if err := c.replayBoundItems(deliveryCtx, projected, notAfter, reservation); err != nil {
+		if err := c.replayBoundItems(deliveryCtx, recoveryCtx, projected, notAfter, evidenceDeadline, reservation); err != nil {
 			c.log.Warn("replay bound durable delivery remains pending", zap.Error(err), zap.Time("not_after", notAfter))
 		}
 		return
 	}
-	if err := c.freezeBindAndAdmit(deliveryCtx, stateStore, projected, projected[0].targetUsers, notAfter, reservation); err != nil {
+	bindAdmitStarted := time.Now()
+	if err := c.freezeBindAndAdmit(deliveryCtx, recoveryCtx, projected, projected[0].targetUsers, notAfter, evidenceDeadline, reservation, accountRoute); err != nil {
+		c.observeStage(window.QueueKind, "bind_admit", bindAdmitStarted, len(projected))
 		var pending *boundDeliveryPendingError
-		if errors.As(err, &pending) || deliveryCtx.Err() != nil {
+		if errors.As(err, &pending) || errors.Is(err, errActorCapacity) || deliveryCtx.Err() != nil {
 			c.log.Warn("bound durable delivery remains pending", zap.Error(err), zap.Time("not_after", notAfter))
 			return
 		}
 		c.resolveItems(deliveryCtx, stateStore, window.Owner, claimedItems(projected), err, false)
+		return
+	}
+	c.observeStage(window.QueueKind, "bind_admit", bindAdmitStarted, len(projected))
+}
+
+func (c *deliveryCoordinator) publishDispatchReadModelInvalidations(ctx context.Context, window store.OutboxClaimWindow) error {
+	if c == nil || window.QueueKind != store.OutboxQueueDispatchPTS {
+		return nil
+	}
+	latest := make(map[store.ReadModelKey]int64)
+	for _, item := range window.Items {
+		payload, ok := item.Payload.(store.DispatchOutboxPayload)
+		if !ok || payload.ReadModelPeer.ID <= 0 {
+			continue
+		}
+		key := store.ReadModelKey{
+			Model: "dialog_light", OwnerUserID: window.StreamID,
+			PeerType: payload.ReadModelPeer.Type, PeerID: payload.ReadModelPeer.ID,
+		}
+		if item.Ref.Sequence > latest[key] {
+			latest[key] = item.Ref.Sequence
+		}
+	}
+	if len(latest) == 0 {
+		return nil
+	}
+	if c.readModelInvalidations == nil {
+		return errors.New("egress: Redis read-model invalidation publisher is required")
+	}
+	items := make([]store.ReadModelInvalidation, 0, len(latest))
+	for key, sequence := range latest {
+		items = append(items, store.NewSequencedReadModelInvalidation(key, sequence))
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Key.OwnerUserID != items[j].Key.OwnerUserID {
+			return items[i].Key.OwnerUserID < items[j].Key.OwnerUserID
+		}
+		if items[i].Key.PeerType != items[j].Key.PeerType {
+			return items[i].Key.PeerType < items[j].Key.PeerType
+		}
+		return items[i].Key.PeerID < items[j].Key.PeerID
+	})
+	return c.readModelInvalidations.PublishReadModelInvalidations(ctx, items)
+}
+
+func (c *deliveryCoordinator) observeStage(kind store.OutboxQueueKind, stage string, started time.Time, items int) {
+	if c == nil || c.metrics == nil || started.IsZero() {
+		return
+	}
+	c.metrics.OutboxStage(outboxQueueMetric(kind), stage, time.Since(started), items)
+}
+
+func outboxQueueMetric(kind store.OutboxQueueKind) string {
+	switch kind {
+	case store.OutboxQueueDispatchPTS:
+		return "account_pts"
+	case store.OutboxQueueAbsoluteDelivery:
+		return "account_absolute"
+	case store.OutboxQueueChannelPTS:
+		return "channel_pts"
+	default:
+		return "invalid"
 	}
 }
 
-func claimCommandNotAfter(window store.OutboxClaimWindow) (time.Time, error) {
+func accountDeliveryRouteRequest(window store.OutboxClaimWindow, notAfter, evidenceDeadline time.Time) (edgecontrol.AccountDeliveryRouteRequest, error) {
+	if window.QueueKind != store.OutboxQueueDispatchPTS || window.StreamID <= 0 || len(window.Items) == 0 ||
+		notAfter.IsZero() || !evidenceDeadline.After(notAfter) {
+		return edgecontrol.AccountDeliveryRouteRequest{}, errors.New("egress: invalid account route window")
+	}
+	firstAuth := window.Items[0].ExcludeAuthKeyID
+	firstSession := window.Items[0].ExcludeSessionID
+	for i := 1; i < len(window.Items); i++ {
+		if window.Items[i].ExcludeAuthKeyID != firstAuth || window.Items[i].ExcludeSessionID != firstSession {
+			return edgecontrol.AccountDeliveryRouteRequest{}, fmt.Errorf("egress: non-homogeneous account route at item %d", window.Items[i].Ref.ItemID)
+		}
+	}
+	return edgecontrol.AccountDeliveryRouteRequest{
+		TargetUserID: window.StreamID, ExcludeAuthKeyID: firstAuth,
+		ExcludeSessionID: firstSession, NotAfter: notAfter, EvidenceDeadline: evidenceDeadline,
+	}, nil
+}
+
+func claimDeadlines(window store.OutboxClaimWindow) (time.Time, time.Time, error) {
 	if window.LeaseUntil.IsZero() || len(window.Items) == 0 {
-		return time.Time{}, errors.New("egress: missing persisted command deadline")
+		return time.Time{}, time.Time{}, errors.New("egress: missing persisted command deadline")
 	}
 	deadline := window.Items[0].CommandNotAfter.UTC()
 	if deadline.IsZero() || !deadline.Before(window.LeaseUntil) {
-		return time.Time{}, errors.New("egress: invalid persisted command deadline")
+		return time.Time{}, time.Time{}, errors.New("egress: invalid persisted command deadline")
 	}
 	evidenceDeadline := window.Items[0].EvidenceDeadline.UTC()
 	if !evidenceDeadline.After(deadline) || !evidenceDeadline.Before(window.LeaseUntil) {
-		return time.Time{}, errors.New("egress: invalid persisted evidence deadline")
+		return time.Time{}, time.Time{}, errors.New("egress: invalid persisted evidence deadline")
 	}
 	for _, item := range window.Items {
 		if !item.CommandNotAfter.Equal(deadline) || !item.EvidenceDeadline.Equal(evidenceDeadline) {
-			return time.Time{}, errors.New("egress: inconsistent persisted command/evidence deadline")
+			return time.Time{}, time.Time{}, errors.New("egress: inconsistent persisted command/evidence deadline")
 		}
 	}
-	return deadline, nil
+	return deadline, evidenceDeadline, nil
 }
 
 func validateClaimWindow(window store.OutboxClaimWindow) error {
@@ -281,53 +418,10 @@ func (c *deliveryCoordinator) projectWindow(ctx context.Context, window store.Ou
 }
 
 func (c *deliveryCoordinator) projectPTSWindow(ctx context.Context, window store.OutboxClaimWindow) ([]projectedOutboxItem, error) {
-	if c.events == nil || c.updateBuilder == nil {
+	if c.ptsProjector == nil {
 		return nil, errOutboxUpdateBuilderMissing
 	}
-	cursors := make([]store.EventCursor, len(window.Items))
-	for i, item := range window.Items {
-		if item.Ref.Sequence <= 0 || item.Ref.Sequence > int64(^uint32(0)>>1) {
-			return nil, fmt.Errorf("egress: invalid account PTS %d", item.Ref.Sequence)
-		}
-		cursors[i] = store.EventCursor{UserID: window.StreamID, Pts: int(item.Ref.Sequence)}
-	}
-	events, err := c.events.BatchByCursor(ctx, cursors)
-	if err != nil {
-		return nil, fmt.Errorf("egress: load PTS window: %w", err)
-	}
-	byPTS := make(map[int]domain.UpdateEvent, len(events))
-	for _, event := range events {
-		if event.UserID == window.StreamID {
-			byPTS[event.Pts] = event
-		}
-	}
-	requests := make([]OutboxUpdateRequest, len(window.Items))
-	for i, item := range window.Items {
-		event, ok := byPTS[int(item.Ref.Sequence)]
-		if !ok {
-			return nil, fmt.Errorf("%w user=%d pts=%d", errMissingOutboxEvent, window.StreamID, item.Ref.Sequence)
-		}
-		payload, ok := item.Payload.(store.DispatchOutboxPayload)
-		if !ok || payload.EventType != event.Type {
-			return nil, fmt.Errorf("egress: durable event identity mismatch item=%d", item.Ref.ItemID)
-		}
-		requests[i] = OutboxUpdateRequest{TargetUserID: window.StreamID, Event: event}
-	}
-	built, err := c.updateBuilder(ctx, requests)
-	if err != nil {
-		return nil, fmt.Errorf("egress: build PTS window: %w", err)
-	}
-	if len(built) != len(requests) {
-		return nil, fmt.Errorf("%w: got %d want %d", errOutboxUpdateBuilderCount, len(built), len(requests))
-	}
-	out := make([]projectedOutboxItem, len(window.Items))
-	for i := range built {
-		if len(built[i]) == 0 && requests[i].Event.Type != domain.UpdateEventNoop {
-			return nil, fmt.Errorf("%w item=%d", errOutboxUpdateBuilderEmpty, window.Items[i].Ref.ItemID)
-		}
-		out[i] = projectedOutboxItem{claimed: window.Items[i], payload: built[i], targetUsers: []int64{window.StreamID}}
-	}
-	return out, nil
+	return c.ptsProjector.Project(ctx, window)
 }
 
 func projectAbsoluteWindow(window store.OutboxClaimWindow) ([]projectedOutboxItem, error) {
@@ -394,11 +488,13 @@ func deliveryPlanRetainedBytes(items []projectedOutboxItem, targetCapacity int) 
 
 func (c *deliveryCoordinator) freezeBindAndAdmit(
 	ctx context.Context,
-	stateStore store.DurableOutboxStateStore,
+	recoveryCtx context.Context,
 	items []projectedOutboxItem,
 	targetUsers []int64,
 	notAfter time.Time,
+	evidenceDeadline time.Time,
 	reservation *deliveryActorReservation,
+	accountRoute *edgecontrol.FrozenAccountDeliveryRoute,
 ) error {
 	if c.planner == nil || c.instanceID == "" {
 		return ErrMissingDependency
@@ -407,7 +503,7 @@ func (c *deliveryCoordinator) freezeBindAndAdmit(
 		return errors.New("egress: empty delivery group")
 	}
 	if len(items[0].payload) == 0 {
-		return c.bindAuthoritativeEmpty(ctx, stateStore, items, c.instanceID)
+		return c.bindAuthoritativeEmpty(ctx, items, c.instanceID)
 	}
 	targetUsers = uniquePositiveIDs(targetUsers)
 	type userPlan struct {
@@ -416,7 +512,11 @@ func (c *deliveryCoordinator) freezeBindAndAdmit(
 		targets      []edgecontrol.PreparedDeliveryTarget
 	}
 	plans := make([]userPlan, 0, len(targetUsers))
-	planBytes := deliveryPlanRetainedBytes(items, edgecontrol.MaxDeliveryTargets)
+	targetCapacity := edgecontrol.MaxDeliveryTargets
+	if accountRoute != nil {
+		targetCapacity = len(accountRoute.Targets())
+	}
+	planBytes := deliveryPlanRetainedBytes(items, targetCapacity)
 	retainedPlanBytes := int64(0)
 	retainedLedgerBytes := int64(0)
 	defer func() {
@@ -439,11 +539,19 @@ func (c *deliveryCoordinator) freezeBindAndAdmit(
 			}
 			retainedPlanBytes += planBytes
 		}
-		request, err := c.deliveryRequest(items, targetUserID, notAfter)
+		request, err := c.deliveryRequest(items, targetUserID, notAfter, evidenceDeadline)
 		if err != nil {
 			return err
 		}
-		plan, err := c.planner.PrepareDelivery(ctx, request)
+		var plan edgecontrol.FrozenDeliveryPlan
+		if accountRoute != nil {
+			if len(targetUsers) != 1 || targetUserID != accountRoute.TargetUserID() {
+				return errors.New("egress: frozen account route target mismatch")
+			}
+			plan, err = accountRoute.BindDelivery(request)
+		} else {
+			plan, err = c.planner.PrepareDelivery(ctx, request)
+		}
 		if err != nil {
 			return fmt.Errorf("egress: freeze delivery target user %d: %w", targetUserID, err)
 		}
@@ -477,7 +585,12 @@ func (c *deliveryCoordinator) freezeBindAndAdmit(
 			}
 		}
 	}
-	bound, err := stateStore.BindAttemptTargets(ctx, sets)
+	if c.mutations == nil {
+		return ErrMissingDependency
+	}
+	bindStarted := time.Now()
+	bound, err := c.mutations.BindAttemptTargets(ctx, items[0].claimed.Ref.QueueKind, sets)
+	c.observeStage(items[0].claimed.Ref.QueueKind, "bind", bindStarted, len(items))
 	if err != nil {
 		return fmt.Errorf("egress: bind frozen target set: %w", err)
 	}
@@ -490,18 +603,24 @@ func (c *deliveryCoordinator) freezeBindAndAdmit(
 		}
 	}
 	if len(plans) == 0 || len(sets[0].Targets) == 0 {
-		return markBoundDeliveryPending(c.recordAuthoritativeEmpty(ctx, stateStore, items, c.instanceID))
+		// Binding an authoritative empty set atomically records confirmed
+		// completion. There is no second evidence mutation to race the finalizer.
+		c.metrics.OutboxDelivered(0)
+		return nil
 	}
+	admitStarted := time.Now()
 	for _, prepared := range plans {
-		if err := c.admitFrozenPlan(ctx, prepared.plan, notAfter); err != nil {
+		if err := c.admitFrozenPlan(ctx, recoveryCtx, prepared.plan, notAfter, evidenceDeadline); err != nil {
+			c.observeStage(items[0].claimed.Ref.QueueKind, "admit", admitStarted, len(items))
 			return markBoundDeliveryPending(err)
 		}
 	}
+	c.observeStage(items[0].claimed.Ref.QueueKind, "admit", admitStarted, len(items))
 	return nil
 }
 
-func (c *deliveryCoordinator) deliveryRequest(items []projectedOutboxItem, targetUserID int64, notAfter time.Time) (edgecontrol.DeliveryRequest, error) {
-	if targetUserID < 0 || len(items) == 0 || notAfter.IsZero() {
+func (c *deliveryCoordinator) deliveryRequest(items []projectedOutboxItem, targetUserID int64, notAfter, evidenceDeadline time.Time) (edgecontrol.DeliveryRequest, error) {
+	if targetUserID < 0 || len(items) == 0 || notAfter.IsZero() || !evidenceDeadline.After(notAfter) {
 		return edgecontrol.DeliveryRequest{}, errors.New("egress: invalid delivery target")
 	}
 	channel := items[0].claimed.Ref.QueueKind == store.OutboxQueueChannelPTS
@@ -509,7 +628,7 @@ func (c *deliveryCoordinator) deliveryRequest(items []projectedOutboxItem, targe
 		return edgecontrol.DeliveryRequest{}, errors.New("egress: delivery target does not match ordering domain")
 	}
 	request := edgecontrol.DeliveryRequest{
-		TargetUserID: targetUserID, NotAfter: notAfter,
+		TargetUserID: targetUserID, NotAfter: notAfter, EvidenceDeadline: evidenceDeadline,
 		ExcludeAuthKeyID: items[0].claimed.ExcludeAuthKeyID,
 		ExcludeSessionID: items[0].claimed.ExcludeSessionID,
 		Items:            make([]edgecontrol.DeliveryItem, len(items)),
@@ -528,12 +647,24 @@ func (c *deliveryCoordinator) deliveryRequest(items []projectedOutboxItem, targe
 	return request, nil
 }
 
-func (c *deliveryCoordinator) bindAuthoritativeEmpty(ctx context.Context, stateStore store.DurableOutboxStateStore, items []projectedOutboxItem, source string) error {
+func (c *deliveryCoordinator) bindAuthoritativeEmpty(ctx context.Context, items []projectedOutboxItem, source string) error {
+	return c.bindClaimedAuthoritativeEmpty(ctx, claimedItems(items), source)
+}
+
+func (c *deliveryCoordinator) bindClaimedAuthoritativeEmpty(ctx context.Context, items []store.OutboxClaimedItem, source string) error {
+	if len(items) == 0 {
+		return errors.New("egress: empty authoritative target bind")
+	}
 	sets := make([]store.OutboxAttemptTargetSet, len(items))
 	for i, item := range items {
-		sets[i] = store.OutboxAttemptTargetSet{Ref: item.claimed.Ref, SourceInstanceID: source, Targets: []store.OutboxAttemptTarget{}}
+		sets[i] = store.OutboxAttemptTargetSet{Ref: item.Ref, SourceInstanceID: source, Targets: []store.OutboxAttemptTarget{}}
 	}
-	results, err := stateStore.BindAttemptTargets(ctx, sets)
+	if c.mutations == nil {
+		return ErrMissingDependency
+	}
+	bindStarted := time.Now()
+	results, err := c.mutations.BindAttemptTargets(ctx, items[0].Ref.QueueKind, sets)
+	c.observeStage(items[0].Ref.QueueKind, "bind", bindStarted, len(items))
 	if err != nil {
 		return fmt.Errorf("egress: bind authoritative empty set: %w", err)
 	}
@@ -544,39 +675,7 @@ func (c *deliveryCoordinator) bindAuthoritativeEmpty(ctx context.Context, stateS
 		if result.Outcome != store.OutboxBindTargetBound && result.Outcome != store.OutboxBindTargetDuplicate {
 			return markBoundDeliveryPending(fmt.Errorf("egress: bind empty outcome %d", result.Outcome))
 		}
-	}
-	return markBoundDeliveryPending(c.recordAuthoritativeEmpty(ctx, stateStore, items, source))
-}
-
-func (c *deliveryCoordinator) recordAuthoritativeEmpty(ctx context.Context, stateStore store.DurableOutboxStateStore, items []projectedOutboxItem, source string) error {
-	if source == "" {
-		return errors.New("egress: authoritative empty source is required")
-	}
-	now := time.Now().UTC()
-	evidence := make([]store.OutboxAttemptEvidence, len(items))
-	finalize := make([]store.OutboxFinalizeRequest, len(items))
-	for i, item := range items {
-		evidence[i] = store.OutboxAttemptEvidence{Ref: item.claimed.Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets, SourceInstanceID: source, ObservedAt: now}
-		finalize[i] = store.OutboxFinalizeRequest{Ref: item.claimed.Ref}
-	}
-	recorded, err := stateStore.RecordAttemptEvidenceBatch(ctx, evidence)
-	if err != nil {
-		return fmt.Errorf("egress: record authoritative empty set: %w", err)
-	}
-	if len(recorded) != len(evidence) {
-		return fmt.Errorf("egress: empty evidence result count %d want %d", len(recorded), len(evidence))
-	}
-	for _, result := range recorded {
-		if result.Outcome != store.OutboxEvidenceRecorded && result.Outcome != store.OutboxEvidenceDuplicate && result.Outcome != store.OutboxEvidenceAlreadyFinalized {
-			return fmt.Errorf("egress: empty evidence outcome %d", result.Outcome)
-		}
-	}
-	finalized, err := stateStore.FinalizeAttempts(ctx, finalize)
-	if err != nil {
-		return fmt.Errorf("egress: finalize authoritative empty set: %w", err)
-	}
-	for _, result := range finalized.Results {
-		if result.Outcome == store.OutboxFinalizeApplied {
+		if result.Outcome == store.OutboxBindTargetBound {
 			c.metrics.OutboxDelivered(0)
 		}
 	}
@@ -585,8 +684,10 @@ func (c *deliveryCoordinator) recordAuthoritativeEmpty(ctx context.Context, stat
 
 func (c *deliveryCoordinator) replayBoundItems(
 	ctx context.Context,
+	recoveryCtx context.Context,
 	items []projectedOutboxItem,
 	notAfter time.Time,
+	evidenceDeadline time.Time,
 	reservation *deliveryActorReservation,
 ) error {
 	stateStore := c.stateStore(items[0].claimed.Ref.QueueKind)
@@ -599,7 +700,9 @@ func (c *deliveryCoordinator) replayBoundItems(
 		}
 	}
 	if len(items[0].claimed.Targets) == 0 {
-		return c.recordAuthoritativeEmpty(ctx, stateStore, items, items[0].claimed.SourceInstanceID)
+		// Empty binding and confirmed resolution are one durable fact. Recovery
+		// only needs to wait for (or re-wake) the fixed finalizer.
+		return nil
 	}
 	type batchKey struct {
 		batch        [16]byte
@@ -676,7 +779,7 @@ func (c *deliveryCoordinator) replayBoundItems(
 				}
 				defer reservation.releaseRetained(planBytes)
 			}
-			request, err := c.deliveryRequest(batchItems, key.targetUserID, notAfter)
+			request, err := c.deliveryRequest(batchItems, key.targetUserID, notAfter, evidenceDeadline)
 			if err != nil {
 				return err
 			}
@@ -694,7 +797,7 @@ func (c *deliveryCoordinator) replayBoundItems(
 			if err != nil {
 				return fmt.Errorf("egress: rehydrate frozen delivery: %w", err)
 			}
-			if err := c.admitFrozenPlan(ctx, plan, notAfter); err != nil {
+			if err := c.admitFrozenPlan(ctx, recoveryCtx, plan, notAfter, evidenceDeadline); err != nil {
 				return fmt.Errorf("egress: replay frozen delivery: %w", err)
 			}
 			return nil
@@ -707,36 +810,77 @@ func (c *deliveryCoordinator) replayBoundItems(
 
 func (c *deliveryCoordinator) admitFrozenPlan(
 	ctx context.Context,
+	recoveryCtx context.Context,
 	plan edgecontrol.FrozenDeliveryPlan,
-	notAfter time.Time,
+	notAfter, evidenceDeadline time.Time,
 ) error {
-	if c == nil || c.planner == nil || notAfter.IsZero() {
+	if c == nil || c.planner == nil || notAfter.IsZero() || !evidenceDeadline.After(notAfter) {
 		return ErrMissingDependency
 	}
 	admitCtx, cancel := context.WithDeadline(ctx, notAfter)
-	defer cancel()
 	backoff := minimumOutboxRetryDelay
+	var lastErr error
 	for {
 		admitted, err := c.planner.AdmitPreparedDelivery(admitCtx, plan)
 		if err == nil {
+			cancel()
 			if err := validateFrozenAdmission(plan, admitted); err != nil {
 				return fmt.Errorf("egress: validate frozen delivery admission: %w", err)
 			}
 			return nil
 		}
 		if !errors.Is(err, edgecontrol.ErrDeliveryIndeterminate) {
+			cancel()
 			return fmt.Errorf("egress: admit frozen delivery: %w", err)
 		}
+		lastErr = err
 		if admitCtx.Err() != nil {
-			return fmt.Errorf("egress: admit frozen delivery before command deadline: %w", err)
+			break
 		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-admitCtx.Done():
-			if !timer.Stop() {
-				<-timer.C
+			stopMutationTimer(timer)
+		case <-timer.C:
+		}
+		if admitCtx.Err() != nil {
+			break
+		}
+		if backoff < 64*time.Millisecond {
+			backoff *= 2
+			if backoff > 64*time.Millisecond {
+				backoff = 64 * time.Millisecond
 			}
-			return fmt.Errorf("egress: admit frozen delivery before command deadline: %w", err)
+		}
+	}
+	cancel()
+
+	// The command write boundary is now closed. Reusing the same frozen plan is
+	// an exact receipt probe: DeliveryFabric and Edge enforce replay-only until
+	// evidenceDeadline, so this path cannot create a new attempt or socket write.
+	if recoveryCtx == nil || recoveryCtx.Err() != nil || !time.Now().Before(evidenceDeadline) {
+		return fmt.Errorf("egress: admit frozen delivery before command deadline: %w", lastErr)
+	}
+	replayCtx, cancelReplay := context.WithDeadline(recoveryCtx, evidenceDeadline)
+	defer cancelReplay()
+	backoff = minimumOutboxRetryDelay
+	for {
+		admitted, err := c.planner.AdmitPreparedDelivery(replayCtx, plan)
+		if err == nil {
+			if validateErr := validateFrozenAdmission(plan, admitted); validateErr != nil {
+				return fmt.Errorf("egress: validate frozen receipt replay: %w", validateErr)
+			}
+			return nil
+		}
+		lastErr = err
+		if !errors.Is(err, edgecontrol.ErrDeliveryIndeterminate) {
+			return fmt.Errorf("egress: replay frozen delivery receipt: %w", err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-replayCtx.Done():
+			stopMutationTimer(timer)
+			return fmt.Errorf("egress: replay frozen delivery receipt before evidence deadline: %w", lastErr)
 		case <-timer.C:
 		}
 		if backoff < 64*time.Millisecond {
@@ -792,7 +936,6 @@ func (c *deliveryCoordinator) resolveItems(
 		return
 	}
 	resolutions := make([]store.OutboxOwnedAttemptResolution, len(items))
-	finalize := make([]store.OutboxFinalizeRequest, len(items))
 	for i, item := range items {
 		kind := store.OutboxResolutionRetry
 		retryDelay := retryDelayForAttempt(item.Ref.Attempt)
@@ -809,9 +952,8 @@ func (c *deliveryCoordinator) resolveItems(
 		resolutions[i] = store.OutboxOwnedAttemptResolution{
 			Ref: item.Ref, Owner: owner, Kind: kind, RetryDelay: retryDelay, LastError: cause.Error(),
 		}
-		finalize[i] = store.OutboxFinalizeRequest{Ref: item.Ref}
 	}
-	results, err := stateStore.ResolveOwnedAttemptBatch(ctx, resolutions)
+	results, err := c.mutations.ResolveOwnedAttemptBatch(ctx, items[0].Ref.QueueKind, resolutions)
 	if err != nil {
 		c.log.Error("resolve durable delivery attempt", zap.Error(err), zap.Error(cause))
 		c.metrics.OutboxFailed(err)
@@ -822,11 +964,9 @@ func (c *deliveryCoordinator) resolveItems(
 			c.log.Error("durable delivery resolution rejected", zap.Int64("item_id", result.Ref.ItemID), zap.Error(cause))
 		}
 	}
-	if _, err := stateStore.FinalizeAttempts(ctx, finalize); err != nil {
-		c.log.Error("finalize durable delivery resolution", zap.Error(err), zap.Error(cause))
-		c.metrics.OutboxFailed(err)
-		return
-	}
+	// The mutation actor transfers every recorded exact ref to its bounded
+	// finalizer lane before completing this call. PostgreSQL remains the durable
+	// recovery fact if the process exits between commit and that in-memory handoff.
 	if terminal {
 		c.metrics.OutboxFailed(cause)
 	}

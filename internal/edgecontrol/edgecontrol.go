@@ -184,6 +184,7 @@ type DeliveryBatch struct {
 	ExcludeAuthKeyID [8]byte
 	ExcludeSessionID int64
 	NotAfter         time.Time
+	EvidenceDeadline time.Time
 	Items            []DeliveryItem
 }
 
@@ -213,7 +214,19 @@ type DeliveryRequest struct {
 	ExcludeAuthKeyID [8]byte
 	ExcludeSessionID int64
 	NotAfter         time.Time
+	EvidenceDeadline time.Time
 	Items            []DeliveryItem
+}
+
+// AccountDeliveryRouteRequest is the payload-free account routing boundary.
+// Egress uses it before an expensive PTS projection so an authoritative empty
+// online target set can be committed without loading or encoding the update.
+type AccountDeliveryRouteRequest struct {
+	TargetUserID     int64
+	ExcludeAuthKeyID [8]byte
+	ExcludeSessionID int64
+	NotAfter         time.Time
+	EvidenceDeadline time.Time
 }
 
 // ValidateDeliveryBatchEnvelope validates bounded v3 identities and ownership
@@ -230,10 +243,11 @@ func ValidateDeliveryBatchEnvelope(batch DeliveryBatch) error {
 	if (batch.ExcludeAuthKeyID != ([8]byte{})) != (batch.ExcludeSessionID != 0) {
 		return fmt.Errorf("edgecontrol: invalid delivery exclusion pair")
 	}
-	if batch.NotAfter.IsZero() || batch.NotAfter.UnixNano() <= 0 {
-		return fmt.Errorf("edgecontrol: absolute delivery deadline is required")
+	if batch.NotAfter.IsZero() || batch.NotAfter.UnixNano() <= 0 ||
+		!batch.EvidenceDeadline.After(batch.NotAfter) {
+		return fmt.Errorf("edgecontrol: ordered command and evidence deadlines are required")
 	}
-	if batch.NotAfter.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
+	if batch.EvidenceDeadline.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
 		return fmt.Errorf("edgecontrol: delivery deadline exceeds maximum horizon")
 	}
 	domain := batch.Items[0].Ref.Domain
@@ -432,6 +446,49 @@ type PreparedDeliveryTarget struct {
 	CommandID        CommandID
 }
 
+// FrozenAccountDeliveryRoute owns one exact Redis registry snapshot and all
+// protocol identities allocated from it. BindDelivery attaches immutable
+// payloads without consulting the registry a second time.
+type FrozenAccountDeliveryRoute struct {
+	batchID          BatchID
+	sourceInstanceID string
+	targetUserID     int64
+	excludeAuthKeyID [8]byte
+	excludeSessionID int64
+	notAfter         time.Time
+	evidenceDeadline time.Time
+	targets          []PreparedDeliveryTarget
+}
+
+func (r FrozenAccountDeliveryRoute) BatchID() BatchID { return r.batchID }
+
+func (r FrozenAccountDeliveryRoute) SourceInstanceID() string { return r.sourceInstanceID }
+
+func (r FrozenAccountDeliveryRoute) TargetUserID() int64 { return r.targetUserID }
+
+func (r FrozenAccountDeliveryRoute) Targets() []PreparedDeliveryTarget {
+	return append([]PreparedDeliveryTarget(nil), r.targets...)
+}
+
+func (r FrozenAccountDeliveryRoute) BindDelivery(request DeliveryRequest) (FrozenDeliveryPlan, error) {
+	if request.TargetUserID != r.targetUserID || request.ExcludeAuthKeyID != r.excludeAuthKeyID ||
+		request.ExcludeSessionID != r.excludeSessionID || !request.NotAfter.Equal(r.notAfter) ||
+		!request.EvidenceDeadline.Equal(r.evidenceDeadline) {
+		return FrozenDeliveryPlan{}, fmt.Errorf("edgecontrol: delivery request differs from frozen account route")
+	}
+	if err := validateDeliveryRequest(request); err != nil {
+		return FrozenDeliveryPlan{}, err
+	}
+	if request.Items[0].Ref.Domain.Kind == QueueChannelPTS {
+		return FrozenDeliveryPlan{}, fmt.Errorf("edgecontrol: channel delivery cannot bind an account route")
+	}
+	if err := validateFrozenAccountDeliveryRoute(r); err != nil {
+		return FrozenDeliveryPlan{}, err
+	}
+	plan := buildFrozenDeliveryPlan(r.sourceInstanceID, r.batchID, request, r.targets)
+	return plan, validateFrozenDeliveryPlanEnvelope(plan)
+}
+
 // FrozenDeliveryPlan is deliberately opaque. PrepareDelivery freezes the
 // registry snapshot and allocates every wire identity without publishing.
 // Callers bind a copy of Targets() in their durable ledger, then pass this same
@@ -443,6 +500,7 @@ type FrozenDeliveryPlan struct {
 	excludeAuthKeyID [8]byte
 	excludeSessionID int64
 	notAfter         time.Time
+	evidenceDeadline time.Time
 	items            []DeliveryItem
 	targets          []PreparedDeliveryTarget
 }
@@ -477,11 +535,13 @@ func buildFrozenDeliveryPlan(sourceInstanceID string, batchID BatchID, request D
 		batchID: batchID, sourceInstanceID: sourceInstanceID,
 		targetUserID: request.TargetUserID, excludeAuthKeyID: request.ExcludeAuthKeyID,
 		excludeSessionID: request.ExcludeSessionID, notAfter: request.NotAfter.UTC(),
-		items: items, targets: append([]PreparedDeliveryTarget(nil), targets...),
+		evidenceDeadline: request.EvidenceDeadline.UTC(),
+		items:            items, targets: append([]PreparedDeliveryTarget(nil), targets...),
 	}
 }
 
 type DeliveryPlanner interface {
+	PrepareAccountDeliveryRoute(context.Context, AccountDeliveryRouteRequest) (FrozenAccountDeliveryRoute, error)
 	PrepareDelivery(context.Context, DeliveryRequest) (FrozenDeliveryPlan, error)
 	AdmitPreparedDelivery(context.Context, FrozenDeliveryPlan) (FrozenDelivery, error)
 }

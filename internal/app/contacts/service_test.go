@@ -29,12 +29,18 @@ func contactMutationTestEffects(snapshot store.ContactMutationSnapshot) ([]store
 
 type serviceCountingContactStore struct {
 	store.ContactStore
-	listCalls int
+	listCalls    int
+	blockedCalls int
 }
 
 func (s *serviceCountingContactStore) ListByUser(ctx context.Context, userID int64) (domain.ContactList, error) {
 	s.listCalls++
 	return s.ContactStore.ListByUser(ctx, userID)
+}
+
+func (s *serviceCountingContactStore) IsBlocked(ctx context.Context, userID, blockedUserID int64) (bool, error) {
+	s.blockedCalls++
+	return s.ContactStore.IsBlocked(ctx, userID, blockedUserID)
 }
 
 type serviceCountingUserStore struct {
@@ -89,6 +95,39 @@ func TestGetContactsReturnsNotModifiedFromReadModelHashWithoutLoadingList(t *tes
 	}
 	if counting.listCalls != 0 {
 		t.Fatalf("ListByUser calls = %d, want 0 on hash hit", counting.listCalls)
+	}
+}
+
+func TestIsBlockedUsesBoundedCacheAndOwnerInvalidation(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	if _, err := base.Block(ctx, 2, 1, contactMutationTestDate); err != nil {
+		t.Fatal(err)
+	}
+	counting := &serviceCountingContactStore{ContactStore: base}
+	svc := NewService(counting)
+	for i := 0; i < 2; i++ {
+		blocked, err := svc.IsBlocked(ctx, 2, 1)
+		if err != nil || !blocked {
+			t.Fatalf("IsBlocked[%d]=%v err=%v", i, blocked, err)
+		}
+	}
+	if counting.blockedCalls != 1 {
+		t.Fatalf("blocked reads=%d want one", counting.blockedCalls)
+	}
+	if _, err := base.Unblock(ctx, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if blocked, _ := svc.IsBlocked(ctx, 2, 1); !blocked {
+		t.Fatal("backing change crossed cache before read-model invalidation")
+	}
+	svc.InvalidateViewers(2)
+	blocked, err := svc.IsBlocked(ctx, 2, 1)
+	if err != nil || blocked {
+		t.Fatalf("IsBlocked after invalidation=%v err=%v", blocked, err)
+	}
+	if counting.blockedCalls != 2 {
+		t.Fatalf("blocked reads=%d want exact reload", counting.blockedCalls)
 	}
 }
 

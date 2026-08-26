@@ -216,18 +216,13 @@ FOR UPDATE`, userID).Scan(&laneFence)
 	laneExists := err == nil
 	if laneExists {
 		if _, err := tx.Exec(ctx, `
-UPDATE dispatch_outbox_attempts
-SET resolution = COALESCE(resolution, 'terminal_resync'),
-    finalized_at = now(),
-    finalization_outcome = 'terminal_resync',
-    last_error = CASE WHEN last_error = '' THEN 'durable event retained after client confirmation' ELSE last_error END
+DELETE FROM dispatch_outbox_attempts
 WHERE stream_id = $1 AND lease_fence = $2
   AND item_id IN (
     SELECT id FROM dispatch_outbox
     WHERE target_user_id = $1 AND pts = ANY($3::int[])
-  )
-  AND finalized_at IS NULL`, userID, laneFence, pts); err != nil {
-			return 0, fmt.Errorf("finalize retained user update attempts: %w", err)
+  )`, userID, laneFence, pts); err != nil {
+			return 0, fmt.Errorf("delete retained user update attempts: %w", err)
 		}
 	}
 	if _, err := tx.Exec(ctx, `
@@ -264,6 +259,7 @@ LIMIT 1`, userID).Scan(&successorID, &successorPTS)
 			if _, err := tx.Exec(ctx, `
 UPDATE dispatch_outbox_lanes
 SET head_item_id = $2, head_sequence = $3,
+    head_attempt = 0,
     state = 'ready', ready_at = now(),
     lease_fence = nextval('dispatch_outbox_lease_fence_seq'),
     lease_owner = '', lease_until = NULL,

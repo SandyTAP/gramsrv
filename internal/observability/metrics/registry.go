@@ -382,6 +382,16 @@ func (r *Registry) MessageSend(d time.Duration, duplicate bool, err error) {
 	r.observe("telesrv_rpc_message_send_duration_seconds", d, labels...)
 }
 
+// PlainPrivateSendBatch implements postgres.PlainPrivateSendBatchObserver.
+// Batch outcomes use the fixed error vocabulary; task count is an aggregate,
+// never a request label.
+func (r *Registry) PlainPrivateSendBatch(d time.Duration, tasks int, err error) {
+	labels := []Label{{Name: "outcome", Value: errorOutcome(err)}}
+	r.inc("telesrv_core_plain_private_send_batches_total", labels...)
+	r.add("telesrv_core_plain_private_send_tasks_total", uint64(max(tasks, 0)), labels...)
+	r.observe("telesrv_core_plain_private_send_batch_seconds", d, labels...)
+}
+
 // MessageRateLimited implements rpc.Metrics.
 func (r *Registry) MessageRateLimited(retryAfterSeconds int) {
 	r.inc("telesrv_rpc_message_rate_limited_total")
@@ -402,6 +412,14 @@ func (r *Registry) OutboxDelivered(d time.Duration) {
 // OutboxFailed implements rpc.Metrics.
 func (r *Registry) OutboxFailed(err error) {
 	r.inc("telesrv_rpc_outbox_failed_total", Label{Name: "outcome", Value: errorOutcome(err)})
+}
+
+// OutboxStage records fixed Egress pipeline stages. Callers supply only the
+// closed queue/stage vocabulary owned by the server, never request data.
+func (r *Registry) OutboxStage(queue, stage string, d time.Duration, items int) {
+	labels := []Label{{Name: "queue", Value: queue}, {Name: "stage", Value: stage}}
+	r.observe("telesrv_egress_outbox_stage_seconds", d, labels...)
+	r.add("telesrv_egress_outbox_stage_items_total", uint64(max(items, 0)), labels...)
 }
 
 // ServeHTTP writes Prometheus text format.

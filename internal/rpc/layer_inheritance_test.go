@@ -104,45 +104,44 @@ func TestResolveInheritedAuthKeyLayerNormalizesBoundTempToPermanent(t *testing.T
 	}
 }
 
-func TestResolveInheritedAuthKeyLayerMarksOnlyAvailabilityFailures(t *testing.T) {
-	boom := errors.New("postgres temporarily unavailable")
+func TestResolveInheritedAuthKeyLayerFailsClosedWithoutAvailabilityMarker(t *testing.T) {
+	boom := errors.New("Redis temporarily unavailable")
 	for _, tt := range []struct {
-		name       string
-		auth       AuthService
-		want       error
-		wantMarker bool
+		name  string
+		auth  AuthService
+		store store.AuthKeySessionLayerStore
+		want  error
 	}{
 		{
 			name: "temporary binding lookup outage",
 			auth: &unavailableResolveAuthService{
 				captureAuthService: &captureAuthService{}, err: boom,
 			},
-			want: boom, wantMarker: true,
+			store: memory.NewAuthKeyStore(), want: boom,
 		},
 		{
-			name: "auth key default lookup outage",
-			auth: &unavailableAuthKeyInfoService{
-				captureAuthService: &captureAuthService{}, err: boom,
-			},
-			want: boom, wantMarker: true,
+			name:  "Redis default lookup outage",
+			auth:  &captureAuthService{},
+			store: unavailableSessionLayerStore{err: boom},
+			want:  boom,
 		},
 		{
 			name: "structural binding failure",
 			auth: &unavailableResolveAuthService{
 				captureAuthService: &captureAuthService{}, err: store.ErrAuthKeyBindingInvalid,
 			},
-			want: store.ErrAuthKeyBindingInvalid,
+			store: memory.NewAuthKeyStore(), want: store.ErrAuthKeyBindingInvalid,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			r := New(Config{DC: 2}, Deps{Auth: tt.auth}, zaptest.NewLogger(t), clock.System)
+			r := New(Config{DC: 2}, Deps{Auth: tt.auth, AuthKeySessionLayers: tt.store}, zaptest.NewLogger(t), clock.System)
 			layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), [8]byte{0x33})
 			if layer != 0 || found || !errors.Is(err, tt.want) {
 				t.Fatalf("resolution = (%d,%v,%v), want (0,false,%v)", layer, found, err, tt.want)
 			}
 			var marker interface{ LayerEvidenceDurabilityUnavailable() }
-			if got := errors.As(err, &marker); got != tt.wantMarker {
-				t.Fatalf("availability marker=%v, want %v", got, tt.wantMarker)
+			if errors.As(err, &marker) {
+				t.Fatal("obsolete local-fallback marker must not escape")
 			}
 		})
 	}
@@ -356,7 +355,9 @@ func TestBindTempAuthKeyFuturePermanentClearsInheritedUntilFreshExplicit(t *test
 	}
 	sessions := &inheritedLayerCaptureSessions{}
 	r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
-	r.setAuthKeyLayerDefaults(225, rawAuthKeyID)
+	r.clientInfoMu.Lock()
+	r.rememberAuthClientLayerLocked(rawAuthKeyID, 225)
+	r.clientInfoMu.Unlock()
 	ctx := WithAuthKeyID(WithSessionID(WithRawAuthKeyID(context.Background(), rawAuthKeyID), sessionID), rawAuthKeyID)
 	ok, err := r.onAuthBindTempAuthKey(ctx, &tg.AuthBindTempAuthKeyRequest{PermAuthKeyID: businessAuthKeyInt64(permAuthKeyID)})
 	if err != nil || !ok {

@@ -30,10 +30,20 @@ const (
 	OutboxRecoveryAbsoluteReload
 )
 
-// OutboxNextReady is a database-clock observation of the next claim deadline.
+type OutboxReadyKind uint8
+
+const (
+	OutboxReadyClaim OutboxReadyKind = iota + 1
+	OutboxReadyRecoverLease
+)
+
+// OutboxNextReady is a database-clock observation of the next claim or lease
+// recovery deadline. Kind prevents a ready lane from paying the evidence-expiry
+// scans required only for an expired leased lane.
 type OutboxNextReady struct {
 	ObservedAt time.Time
 	ReadyAt    time.Time
+	Kind       OutboxReadyKind
 }
 
 func (n OutboxNextReady) Delay() time.Duration { return n.ReadyAt.Sub(n.ObservedAt) }
@@ -68,7 +78,8 @@ type OutboxClaimRequest struct {
 type OutboxClaimPayload interface{ outboxClaimPayload() }
 
 type DispatchOutboxPayload struct {
-	EventType domain.UpdateEventType
+	EventType     domain.UpdateEventType
+	ReadModelPeer domain.Peer
 }
 
 func (DispatchOutboxPayload) outboxClaimPayload() {}
@@ -120,12 +131,14 @@ type OutboxRecoverBoundRequest struct {
 
 // OutboxRecoverFinalizableRequest scopes the durable completion scan used on
 // process startup and finalize notifications. LaneLimit bounds ordering
-// domains, not individual attempts.
+// domains. AttemptLimit independently bounds returned attempts and must fit the
+// downstream FinalizeAttempts batch contract.
 type OutboxRecoverFinalizableRequest struct {
 	QueueKind         OutboxQueueKind
 	LogicalShardCount int
 	LogicalShardIDs   []int
 	LaneLimit         int
+	AttemptLimit      int
 }
 
 // OutboxEvidenceExpiryRequest drives the durable physical-receipt deadline
@@ -160,7 +173,6 @@ type OutboxBindTargetOutcome uint8
 const (
 	OutboxBindTargetBound OutboxBindTargetOutcome = iota + 1
 	OutboxBindTargetDuplicate
-	OutboxBindTargetAlreadyFinalized
 	OutboxBindTargetFenced
 	OutboxBindTargetRejected
 )
@@ -176,7 +188,6 @@ const (
 	OutboxEvidenceEdgeWritten OutboxEvidenceKind = iota + 1
 	OutboxEvidenceEdgeNoEligible
 	OutboxEvidenceAuthoritativeNoTargets
-	OutboxEvidenceClientAck
 )
 
 type OutboxAttemptEvidence struct {
@@ -189,8 +200,6 @@ type OutboxAttemptEvidence struct {
 	CommandID        [16]byte
 	EligibleSessions int
 	WrittenSessions  int
-	AuthKeyID        [8]byte
-	SessionID        int64
 	ServerMsgID      int64
 	ObservedAt       time.Time
 }
@@ -200,7 +209,6 @@ type OutboxEvidenceOutcome uint8
 const (
 	OutboxEvidenceRecorded OutboxEvidenceOutcome = iota + 1
 	OutboxEvidenceDuplicate
-	OutboxEvidenceAlreadyFinalized
 	OutboxEvidenceFenced
 	OutboxEvidenceRejected
 )
@@ -249,7 +257,6 @@ type OutboxResolutionOutcome uint8
 const (
 	OutboxResolutionRecorded OutboxResolutionOutcome = iota + 1
 	OutboxResolutionDuplicate
-	OutboxResolutionAlreadyFinalized
 	OutboxResolutionFenced
 	OutboxResolutionRejected
 )
@@ -275,7 +282,6 @@ const (
 	OutboxFinalizeScheduledRetry
 	OutboxFinalizeAbandoned
 	OutboxFinalizeTerminalResync
-	OutboxFinalizeAlreadyFinalized
 	OutboxFinalizeWaitingForPredecessor
 	OutboxFinalizeFenced
 	OutboxFinalizeRejected
@@ -303,9 +309,5 @@ type DurableOutboxStateStore interface {
 	ResolveTargetAttemptBatch(context.Context, []OutboxTargetAttemptResolution) ([]OutboxResolutionResult, error)
 	ResolveOwnedAttemptBatch(context.Context, []OutboxOwnedAttemptResolution) ([]OutboxResolutionResult, error)
 	FinalizeAttempts(context.Context, []OutboxFinalizeRequest) (OutboxFinalizeBatch, error)
-	// DeleteFinalizedAttempts is bounded capacity garbage collection. It never
-	// participates in delivery correctness and must only remove expired attempt
-	// tombstones after the configured late-evidence retention horizon.
-	DeleteFinalizedAttempts(context.Context, time.Time, int) (int, error)
 	NextReadyAt(context.Context, OutboxQueueKind, int, []int) (OutboxNextReady, bool, error)
 }

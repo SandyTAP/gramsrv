@@ -107,6 +107,8 @@ type CacheSetDeps struct {
 	BotProfiles        postgres.BotProfileReadModelCache
 	StarGifts          postgres.StarGiftCatalogCache
 	AccountSettings    postgres.AccountSettingsReadModelCache
+	AccountFreezes     postgres.AccountFreezeReadModelCache
+	BusinessAutomation postgres.BusinessAutomationReadModelCache
 }
 
 func (s Stores) ReadModelCacheSet(deps CacheSetDeps) postgres.ReadModelCacheSet {
@@ -130,6 +132,9 @@ func (s Stores) ReadModelCacheSet(deps CacheSetDeps) postgres.ReadModelCacheSet 
 		BotProfiles:        deps.BotProfiles,
 		StarGifts:          deps.StarGifts,
 		AccountSettings:    deps.AccountSettings,
+		AccountFreezes:     deps.AccountFreezes,
+		CollectiblePhones:  s.CollectiblePhoneStore,
+		BusinessAutomation: deps.BusinessAutomation,
 	}
 }
 

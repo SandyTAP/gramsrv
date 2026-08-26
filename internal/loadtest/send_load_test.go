@@ -25,6 +25,7 @@ import (
 	"telesrv/internal/edgecontrol/redisbus"
 	"telesrv/internal/edgecontrol/redisregistry"
 	"telesrv/internal/egress"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres"
 	"telesrv/internal/store/redisstore"
 )
@@ -142,9 +143,23 @@ func TestMessageSendBaseline(t *testing.T) {
 		}
 		return out, nil
 	}
+	egressCtx, stopEgress := context.WithCancel(ctx)
+	outboxWake := make(chan struct{}, 1)
+	deliveryWake := make(chan struct{}, 1)
+	channelWake := make(chan struct{}, 1)
+	mutationBatcher, err := egress.NewAttemptMutationBatcher(
+		dispatchOutboxStore, deliveryOutboxStore, channelDeliveryStore, nil,
+	)
+	if err != nil {
+		t.Fatalf("new egress mutation actors: %v", err)
+	}
+	go mutationBatcher.Run(egressCtx)
+	if err := mutationBatcher.WaitReady(ctx); err != nil {
+		t.Fatalf("start egress mutation actors: %v", err)
+	}
 	egressService, err := egress.NewService(
 		updateEventStore, dispatchOutboxStore, deliveryOutboxStore, channelDeliveryStore,
-		deliveryFabric, updateBuilder, channelBuilder, metrics, zap.NewNop(), egress.Config{
+		mutationBatcher, deliveryFabric, updateBuilder, loadReadModelInvalidationPublisher{}, channelBuilder, metrics, zap.NewNop(), egress.Config{
 			InstanceID:    "loadtest-egress",
 			Workers:       workers,
 			Batch:         outboxBatch,
@@ -153,24 +168,8 @@ func TestMessageSendBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new egress service: %v", err)
 	}
-	egressCtx, stopEgress := context.WithCancel(ctx)
 	egressDone := make(chan struct{})
-	listenerDone := make(chan struct{})
-	outboxWake := make(chan struct{}, 1)
-	deliveryWake := make(chan struct{}, 1)
-	channelWake := make(chan struct{}, 1)
-	wakeOutbox := func() {
-		select {
-		case outboxWake <- struct{}{}:
-		default:
-		}
-	}
 	startEgress := func() {
-		outboxReadyListener := postgres.NewDispatchOutboxReadyListener(dsn, zap.NewNop())
-		go func() {
-			defer close(listenerDone)
-			outboxReadyListener.Run(egressCtx, wakeOutbox)
-		}()
 		go func() {
 			egressService.RunWithWake(egressCtx, egress.WakeSources{
 				AccountPTS: outboxWake, AccountNonPTS: deliveryWake, ChannelPTS: channelWake,
@@ -297,7 +296,7 @@ func TestMessageSendBaseline(t *testing.T) {
 	<-sampleDone
 	stopEgress()
 	<-egressDone
-	<-listenerDone
+	mutationBatcher.Wait()
 
 	// 合并发送延迟样本并排序。
 	latencies := make([]time.Duration, 0, totalMsgs)
@@ -371,6 +370,12 @@ func TestMessageSendBaseline(t *testing.T) {
 	}
 }
 
+type loadReadModelInvalidationPublisher struct{}
+
+func (loadReadModelInvalidationPublisher) PublishReadModelInvalidations(context.Context, []store.ReadModelInvalidation) error {
+	return nil
+}
+
 // loadMetrics 实现 egress.Metrics，统计 outbox claim/deliver/fail。
 type loadMetrics struct {
 	claimed   atomic.Int64
@@ -378,11 +383,12 @@ type loadMetrics struct {
 	failed    atomic.Int64
 }
 
-func (m *loadMetrics) MessageSend(time.Duration, bool, error) {}
-func (m *loadMetrics) MessageRateLimited(int)                 {}
-func (m *loadMetrics) OutboxClaimed(n int)                    { m.claimed.Add(int64(n)) }
-func (m *loadMetrics) OutboxDelivered(time.Duration)          { m.delivered.Add(1) }
-func (m *loadMetrics) OutboxFailed(error)                     { m.failed.Add(1) }
+func (m *loadMetrics) MessageSend(time.Duration, bool, error)         {}
+func (m *loadMetrics) MessageRateLimited(int)                         {}
+func (m *loadMetrics) OutboxClaimed(n int)                            { m.claimed.Add(int64(n)) }
+func (m *loadMetrics) OutboxDelivered(time.Duration)                  { m.delivered.Add(1) }
+func (m *loadMetrics) OutboxFailed(error)                             { m.failed.Add(1) }
+func (m *loadMetrics) OutboxStage(string, string, time.Duration, int) {}
 
 func seedUsers(t *testing.T, ctx context.Context, store *postgres.UserStore, n int) []int64 {
 	t.Helper()

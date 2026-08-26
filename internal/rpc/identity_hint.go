@@ -2,11 +2,15 @@ package rpc
 
 import (
 	"context"
+	"time"
 
 	"telesrv/internal/rpcidentity"
+	"telesrv/internal/store"
 )
 
 type layerRPCIdentityHintKey struct{}
+
+const redisAuthKeyIdentitySingleflightPrefix = "redis-auth-identity:"
 
 func (r *Router) WithLayerRPCIdentityHint(ctx context.Context, hint rpcidentity.LayerRPCIdentityHint) context.Context {
 	if ctx == nil {
@@ -38,18 +42,57 @@ func (r *Router) permanentAuthKeyIDFromIdentityHint(ctx context.Context, rawAuth
 	return rawAuthKeyID, true
 }
 
-func (r *Router) cachedTempAuthKeyIDFromIdentityHint(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) ([8]byte, bool) {
+func (r *Router) redisVerifiedTempAuthKeyIDFromIdentityHint(
+	ctx context.Context,
+	rawAuthKeyID [8]byte,
+	sessionID int64,
+) ([8]byte, bool, error) {
 	if r == nil || r.cfg.TempKeyResolveCacheTTL <= 0 {
-		return [8]byte{}, false
+		return [8]byte{}, false, nil
 	}
 	hint, ok := layerRPCIdentityHintFromContext(ctx, rawAuthKeyID, sessionID)
-	if !ok ||
-		!hint.BusinessAuthKeyResolved ||
-		hint.BusinessAuthKeyID == rawAuthKeyID ||
-		hint.BusinessAuthKeyID == ([8]byte{}) {
-		return [8]byte{}, false
+	if !ok || !hint.BusinessAuthKeyResolved || !hint.RawAuthKeyExpiresAtResolved ||
+		hint.BusinessAuthKeyID == rawAuthKeyID || hint.BusinessAuthKeyID == ([8]byte{}) ||
+		hint.RawAuthKeyExpiresAt <= 0 {
+		return [8]byte{}, false, nil
 	}
-	return r.tempKeyResolveCache.Get(rawAuthKeyID, hint.BusinessAuthKeyID, r.clock.Now())
+	if perm, ok := r.tempKeyResolveCache.Get(rawAuthKeyID, hint.BusinessAuthKeyID, r.clock.Now()); ok {
+		return perm, true, nil
+	}
+	v, err, _ := r.authUserSF.Do(redisAuthKeyIdentitySingleflightPrefix+string(rawAuthKeyID[:]), func() (any, error) {
+		if perm, ok := r.tempKeyResolveCache.Get(rawAuthKeyID, hint.BusinessAuthKeyID, r.clock.Now()); ok {
+			return perm, nil
+		}
+		resolver, ok := r.deps.AuthKeySessionLayers.(store.AuthKeyLayerIdentityResolver)
+		if !ok {
+			return [8]byte{}, store.ErrAuthKeySessionLayerStoreRequired
+		}
+		identity, found, err := resolver.ResolveCachedAuthKeyLayerIdentity(ctx, rawAuthKeyID)
+		if err != nil {
+			return [8]byte{}, err
+		}
+		if !found {
+			return [8]byte{}, store.ErrAuthKeyNotFound
+		}
+		if identity.EffectiveAuthKeyID != hint.BusinessAuthKeyID || identity.RawExpiresAt <= 0 {
+			return [8]byte{}, store.ErrAuthKeyBindingInvalid
+		}
+		now := r.clock.Now()
+		expiresAt := time.Unix(int64(identity.RawExpiresAt), 0)
+		if !now.Before(expiresAt) {
+			return [8]byte{}, store.ErrAuthKeyNotFound
+		}
+		cacheUntil := now.Add(r.cfg.TempKeyResolveCacheTTL)
+		if expiresAt.Before(cacheUntil) {
+			cacheUntil = expiresAt
+		}
+		r.tempKeyResolveCache.Store(rawAuthKeyID, identity.EffectiveAuthKeyID, cacheUntil, now)
+		return identity.EffectiveAuthKeyID, nil
+	})
+	if err != nil {
+		return [8]byte{}, true, err
+	}
+	return v.([8]byte), true, nil
 }
 
 func (r *Router) userIDFromIdentityHint(ctx context.Context, rawAuthKeyID, authKeyID [8]byte, sessionID int64) (int64, bool) {

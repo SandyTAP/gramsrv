@@ -604,7 +604,7 @@ func requireChannelForwardRefOnlyEvent(t *testing.T, event domain.UpdateEvent, s
 	}
 }
 
-func TestMessageStoreSendPrivateTextRecomputesInboxUnreadFromReadMax(t *testing.T) {
+func TestMessageStoreSendPrivateTextMaintainsInboxUnreadFromReadMax(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	suffix := randomSuffix(t)
@@ -650,16 +650,6 @@ func TestMessageStoreSendPrivateTextRecomputesInboxUnreadFromReadMax(t *testing.
 	}); err != nil {
 		t.Fatalf("ReadHistory: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
-		UPDATE dialogs
-		SET unread_count = 2
-		WHERE user_id = $1
-		  AND peer_type = $2
-		  AND peer_id = $3
-	`, recipient.ID, string(domain.PeerTypeUser), sender.ID); err != nil {
-		t.Fatalf("corrupt unread count: %v", err)
-	}
-
 	bodies := []string{"one", "two", "three"}
 	var last domain.SendPrivateTextResult
 	for i, body := range bodies {

@@ -5,53 +5,69 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
 
-func TestChannelDeliveryReadyListenerWakesForReadyAndFinalizePostgres(t *testing.T) {
-	pool := testPool(t)
-	dsn := os.Getenv("TELESRV_TEST_POSTGRES_DSN")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	wakes := make(chan struct{}, 4)
-	errs := make(chan error, 1)
-	listener := NewChannelDeliveryReadyListener(dsn, nil)
-	go func() {
-		errs <- listener.listenAndConsume(ctx, func() { wakes <- struct{}{} })
-	}()
-	waitChannelDeliveryWake(t, wakes, "initial LISTEN")
-	if _, err := pool.Exec(context.Background(), `SELECT pg_notify($1, '')`, ChannelDeliveryReadyNotifyChannel); err != nil {
-		t.Fatalf("notify channel ready: %v", err)
-	}
-	waitChannelDeliveryWake(t, wakes, "ready notification")
-	if _, err := pool.Exec(context.Background(), `SELECT pg_notify($1, '')`, ChannelDeliveryFinalizeNotifyChannel); err != nil {
-		t.Fatalf("notify channel finalize: %v", err)
-	}
-	waitChannelDeliveryWake(t, wakes, "finalize notification")
-	cancel()
-	select {
-	case <-errs:
-	case <-time.After(3 * time.Second):
-		t.Fatal("channel delivery listener did not stop after cancellation")
-	}
+type countingBeginDB struct {
+	*pgxpool.Pool
+	beginCount atomic.Int64
+	queryCount atomic.Int64
 }
 
-func waitChannelDeliveryWake(t *testing.T, wakes <-chan struct{}, label string) {
-	t.Helper()
-	select {
-	case <-wakes:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timed out waiting for %s wake", label)
+func (db *countingBeginDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	db.beginCount.Add(1)
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return &countingTx{Tx: tx, queryCount: &db.queryCount}, nil
+}
+
+type countingTx struct {
+	pgx.Tx
+	queryCount *atomic.Int64
+}
+
+func (tx *countingTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	tx.queryCount.Add(1)
+	return tx.Tx.Exec(ctx, sql, arguments...)
+}
+
+func (tx *countingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	tx.queryCount.Add(1)
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *countingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	tx.queryCount.Add(1)
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (db *countingBeginDB) resetBeginCount() {
+	db.beginCount.Store(0)
+}
+
+func (db *countingBeginDB) begins() int64 {
+	return db.beginCount.Load()
+}
+
+func (db *countingBeginDB) resetQueryCount() {
+	db.queryCount.Store(0)
+}
+
+func (db *countingBeginDB) queries() int64 {
+	return db.queryCount.Load()
 }
 
 func TestChannelDeliverySignalFreezesExactMonoforumAudiencePostgres(t *testing.T) {
@@ -400,18 +416,12 @@ ORDER BY min_pts`, channelID)
 			ServerMsgID:      9001,
 			ObservedAt:       now,
 		},
-		{
-			Ref:              windows[0].Items[1].Ref,
-			Kind:             store.OutboxEvidenceAuthoritativeNoTargets,
-			SourceInstanceID: "channel-egress-source",
-			ObservedAt:       now,
-		},
 	})
 	if err != nil {
 		t.Fatalf("record channel evidence: %v", err)
 	}
-	if len(evidence) != 2 || evidence[0].Outcome != store.OutboxEvidenceRecorded || evidence[1].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("evidence outcomes = %+v, want Recorded/Recorded", evidence)
+	if len(evidence) != 1 || evidence[0].Outcome != store.OutboxEvidenceRecorded {
+		t.Fatalf("evidence outcomes = %+v, want Recorded", evidence)
 	}
 	finalize := make([]store.OutboxFinalizeRequest, 0, 2)
 	for _, item := range windows[0].Items {
@@ -424,7 +434,7 @@ ORDER BY min_pts`, channelID)
 	if len(finalized.Results) != 2 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied || finalized.Results[1].Outcome != store.OutboxFinalizeApplied {
 		t.Fatalf("finalize outcomes = %+v, want Applied/Applied", finalized.Results)
 	}
-	var signals, targets, tombstones int
+	var signals, targets, attempts int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_delivery_events WHERE channel_id = $1`, channelID).Scan(&signals); err != nil {
 		t.Fatalf("count finalized channel signals: %v", err)
 	}
@@ -435,11 +445,11 @@ JOIN channel_delivery_attempts a USING (item_id, lease_fence)
 WHERE a.channel_id = $1`, channelID).Scan(&targets); err != nil {
 		t.Fatalf("count channel target commands: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_delivery_attempts WHERE channel_id = $1 AND finalized_at IS NOT NULL`, channelID).Scan(&tombstones); err != nil {
-		t.Fatalf("count channel attempt tombstones: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_delivery_attempts WHERE channel_id = $1`, channelID).Scan(&attempts); err != nil {
+		t.Fatalf("count live channel attempts: %v", err)
 	}
-	if signals != 0 || targets != 1 || tombstones != 2 {
-		t.Fatalf("final state signals/targets/tombstones = %d/%d/%d, want 0/1/2", signals, targets, tombstones)
+	if signals != 0 || targets != 0 || attempts != 0 {
+		t.Fatalf("final state signals/targets/attempts = %d/%d/%d, want 0/0/0", signals, targets, attempts)
 	}
 	late, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
 		Ref:              windows[0].Items[0].Ref,
@@ -457,26 +467,12 @@ WHERE a.channel_id = $1`, channelID).Scan(&targets); err != nil {
 	if err != nil {
 		t.Fatalf("record late channel evidence: %v", err)
 	}
-	if len(late) != 1 || late[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
-		t.Fatalf("late evidence = %+v, want AlreadyFinalized tombstone proof", late)
-	}
-	deleted, err := delivery.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 1)
-	if err != nil || deleted != 1 {
-		t.Fatalf("bounded channel tombstone delete = %d, %v", deleted, err)
-	}
-	lateAfterGC, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{lateChannelPhysicalEvidence(
-		windows[0].Items[0].Ref, "channel-egress-source", "edge-a", batchID, commandID, now.Add(2*time.Second),
-	)})
-	if err != nil || len(lateAfterGC) != 1 ||
-		(lateAfterGC[0].Outcome != store.OutboxEvidenceFenced && lateAfterGC[0].Outcome != store.OutboxEvidenceRejected) {
-		t.Fatalf("late channel evidence after retention = %+v, %v", lateAfterGC, err)
+	if len(late) != 1 || (late[0].Outcome != store.OutboxEvidenceFenced && late[0].Outcome != store.OutboxEvidenceRejected) {
+		t.Fatalf("late evidence after live attempt deletion = %+v", late)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_delivery_attempt_targets WHERE item_id = $1 AND lease_fence = $2`,
 		windows[0].Items[0].Ref.ItemID, int64(windows[0].Items[0].Ref.LeaseFence)).Scan(&targets); err != nil || targets != 0 {
-		t.Fatalf("channel target cascade after attempt GC = %d, %v", targets, err)
-	}
-	if deleted, err = delivery.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 1); err != nil || deleted != 1 {
-		t.Fatalf("remaining channel tombstone delete = %d, %v", deleted, err)
+		t.Fatalf("channel target cascade after finalization = %d, %v", targets, err)
 	}
 }
 
@@ -533,27 +529,11 @@ WHERE t.item_id = a.item_id AND t.lease_fence = a.lease_fence AND a.channel_id =
 			Ref: windows[0].Items[0].Ref, SourceInstanceID: "edge-source-stable",
 			Targets: []store.OutboxAttemptTarget{{TargetInstanceID: "edge-shared", TargetUserID: 0, BatchID: oldBatchID, CommandID: oldCommandID}},
 		},
-		{Ref: windows[0].Items[1].Ref, SourceInstanceID: "edge-source-stable", Targets: []store.OutboxAttemptTarget{}},
+		{Ref: windows[0].Items[1].Ref, SourceInstanceID: "edge-source-stable", Targets: []store.OutboxAttemptTarget{{TargetInstanceID: "edge-shared", TargetUserID: 0, BatchID: oldBatchID, CommandID: oldCommandID}}},
 	}
 	bound, err := delivery.BindAttemptTargets(ctx, sets)
 	if err != nil || len(bound) != 2 || bound[0].Outcome != store.OutboxBindTargetBound || bound[1].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind recovery targets = %+v, %v", bound, err)
-	}
-	observedAt := time.Now().UTC()
-	clientAck, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: windows[0].Items[0].Ref, Kind: store.OutboxEvidenceClientAck, SourceInstanceID: "edge-source-stable",
-		TargetInstanceID: "edge-shared", TargetUserID: 0,
-		BatchID: oldBatchID, CommandID: oldCommandID, AuthKeyID: [8]byte{1},
-		SessionID: 91, ServerMsgID: 92, ObservedAt: observedAt.Add(time.Millisecond),
-	}})
-	if err != nil || len(clientAck) != 1 || clientAck[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record channel client ack = %+v, %v", clientAck, err)
-	}
-	premature, err := delivery.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1,
-	})
-	if err != nil || len(premature) != 0 {
-		t.Fatalf("client ack advanced channel attempt: %+v, %v", premature, err)
 	}
 	exact, err := delivery.RecoverBoundWindows(ctx, store.OutboxRecoverBoundRequest{
 		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, Mode: store.OutboxBoundRecoveryExactOwnerLive,
@@ -600,23 +580,16 @@ WHERE channel_id = $1 AND lease_fence = $2`,
 			ServerMsgID: 499, ObservedAt: time.Now().Add(time.Hour),
 		},
 		{
-			Ref: windows[0].Items[1].Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-			SourceInstanceID: "edge-source-stable", ObservedAt: time.Now().Add(time.Hour),
+			Ref: windows[0].Items[1].Ref, Kind: store.OutboxEvidenceEdgeWritten,
+			SourceInstanceID: "edge-source-stable", TargetInstanceID: "edge-shared", TargetUserID: 0,
+			BatchID: oldBatchID, CommandID: oldCommandID, EligibleSessions: 1, WrittenSessions: 1,
+			ServerMsgID: 500, ObservedAt: time.Now().Add(time.Hour),
 		},
 	})
 	if err != nil || len(lateBeforeSweep) != 2 ||
 		lateBeforeSweep[0].Outcome != store.OutboxEvidenceFenced ||
 		lateBeforeSweep[1].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("late channel completion before expiry sweep = %+v, %v, want Fenced/Fenced", lateBeforeSweep, err)
-	}
-	lateACK, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: windows[0].Items[0].Ref, Kind: store.OutboxEvidenceClientAck,
-		SourceInstanceID: "edge-source-stable", TargetInstanceID: "edge-shared", TargetUserID: 0,
-		BatchID: oldBatchID, CommandID: oldCommandID, AuthKeyID: [8]byte{1},
-		SessionID: 91, ServerMsgID: 92, ObservedAt: time.Now().Add(time.Hour),
-	}})
-	if err != nil || len(lateACK) != 1 || lateACK[0].Outcome != store.OutboxEvidenceDuplicate {
-		t.Fatalf("late channel diagnostic ACK = %+v, %v", lateACK, err)
 	}
 	ownedAfterDBLease, err := delivery.ResolveOwnedAttemptBatch(ctx, []store.OutboxOwnedAttemptResolution{{
 		Ref: windows[0].Items[0].Ref, Owner: windows[0].Owner,
@@ -646,7 +619,7 @@ WHERE channel_id = $1 AND lease_fence = $2`,
 		t.Fatalf("pending finalization leaked into NextReadyAt: next=%+v ok=%v err=%v", next, ok, err)
 	}
 	finalizable, err := delivery.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1,
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(finalizable) != 1 || finalizable[0].Ref != windows[0].Items[0].Ref {
 		t.Fatalf("recover expired finalizable channel head = %+v, %v", finalizable, err)
@@ -655,14 +628,15 @@ WHERE channel_id = $1 AND lease_fence = $2`,
 	if err != nil || len(retried.Results) != 1 || retried.Results[0].Outcome != store.OutboxFinalizeScheduledRetry {
 		t.Fatalf("finalize expired channel retry = %+v, %v", retried, err)
 	}
+	observedAt := time.Now()
 	lateOld, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
 		Ref: windows[0].Items[0].Ref, Kind: store.OutboxEvidenceEdgeWritten, SourceInstanceID: "edge-source-stable",
 		TargetInstanceID: "edge-shared", TargetUserID: 0,
 		BatchID: oldBatchID, CommandID: oldCommandID, EligibleSessions: 1, WrittenSessions: 1,
 		ServerMsgID: 501, ObservedAt: observedAt.Add(time.Second),
 	}})
-	if err != nil || len(lateOld) != 1 || lateOld[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
-		t.Fatalf("old channel evidence after retry = %+v, %v, want AlreadyFinalized", lateOld, err)
+	if err != nil || len(lateOld) != 1 || lateOld[0].Outcome != store.OutboxEvidenceFenced {
+		t.Fatalf("old channel evidence after retry = %+v, %v, want Fenced", lateOld, err)
 	}
 	fresh, err := delivery.ClaimWindows(ctx, store.OutboxClaimRequest{
 		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, WindowSize: 8,
@@ -705,13 +679,13 @@ WHERE channel_id = $1 AND lease_fence = $2`,
 		t.Fatalf("complete recovered channel evidence = %+v, %v", completed, err)
 	}
 	finalizable, err = delivery.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1,
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, AttemptLimit: 1,
 	})
-	if err != nil || len(finalizable) != 2 {
+	if err != nil || len(finalizable) != 1 {
 		t.Fatalf("recover finalizable channel attempts = %+v, %v", finalizable, err)
 	}
 	finalized, err := delivery.FinalizeAttempts(ctx, finalizable)
-	if err != nil || len(finalized.Results) != 2 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied || finalized.Results[1].Outcome != store.OutboxFinalizeApplied {
+	if err != nil || len(finalized.Results) != 1 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
 		t.Fatalf("finalize recovered channel attempts = %+v, %v", finalized, err)
 	}
 	if _, err := appendChannelDeliveryTestEvent(ctx, pool, channelID, 1700150002, 0); err != nil {
@@ -745,28 +719,21 @@ WHERE channel_id = $1`, channelID); err != nil {
 	if unboundFresh[0].LeaseFence <= unboundOld[0].LeaseFence || unboundFresh[0].Items[0].Ref.Attempt <= unboundOld[0].Items[0].Ref.Attempt {
 		t.Fatalf("unbound reclaim did not allocate fresh identities: old=%+v fresh=%+v", unboundOld[0], unboundFresh[0])
 	}
-	var oldUnboundOutcome string
+	var oldUnboundAttempts int
 	if err := pool.QueryRow(ctx, `
-SELECT final_outcome
+SELECT count(*)
 FROM channel_delivery_attempts
-WHERE item_id = $1 AND lease_fence = $2`, unboundOld[0].Items[0].Ref.ItemID, int64(unboundOld[0].LeaseFence)).Scan(&oldUnboundOutcome); err != nil {
-		t.Fatalf("load old unbound tombstone: %v", err)
+WHERE item_id = $1 AND lease_fence = $2`, unboundOld[0].Items[0].Ref.ItemID, int64(unboundOld[0].LeaseFence)).Scan(&oldUnboundAttempts); err != nil {
+		t.Fatalf("load old unbound live attempt count: %v", err)
 	}
-	if oldUnboundOutcome != "superseded" {
-		t.Fatalf("old unbound outcome = %q, want superseded", oldUnboundOutcome)
+	if oldUnboundAttempts != 0 {
+		t.Fatalf("old unbound live attempts = %d, want 0", oldUnboundAttempts)
 	}
 	bound, err = delivery.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{{
 		Ref: unboundFresh[0].Items[0].Ref, SourceInstanceID: "edge-source-unbound-fresh", Targets: []store.OutboxAttemptTarget{},
 	}})
 	if err != nil || len(bound) != 1 || bound[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind reclaimed unbound channel plan = %+v, %v", bound, err)
-	}
-	confirmed, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: unboundFresh[0].Items[0].Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "edge-source-unbound-fresh", ObservedAt: observedAt.Add(3 * time.Second),
-	}})
-	if err != nil || len(confirmed) != 1 || confirmed[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("confirm reclaimed unbound channel plan = %+v, %v", confirmed, err)
 	}
 	last, err := delivery.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: unboundFresh[0].Items[0].Ref}})
 	if err != nil || len(last.Results) != 1 || last.Results[0].Outcome != store.OutboxFinalizeApplied {
@@ -784,7 +751,11 @@ WHERE item_id = $1 AND lease_fence = $2`, unboundOld[0].Items[0].Ref.ItemID, int
 		t.Fatalf("claim terminal-resync channel plan = %+v, %v", resyncWindow, err)
 	}
 	bound, err = delivery.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{{
-		Ref: resyncWindow[0].Items[0].Ref, SourceInstanceID: "edge-source-terminal-resync", Targets: []store.OutboxAttemptTarget{},
+		Ref: resyncWindow[0].Items[0].Ref, SourceInstanceID: "edge-source-terminal-resync",
+		Targets: []store.OutboxAttemptTarget{{
+			TargetInstanceID: "edge-terminal-resync", TargetUserID: 0,
+			BatchID: [16]byte{31}, CommandID: [16]byte{32},
+		}},
 	}})
 	if err != nil || len(bound) != 1 || bound[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind terminal-resync channel plan = %+v, %v", bound, err)
@@ -863,12 +834,6 @@ WHERE t.item_id = a.item_id AND t.lease_fence = a.lease_fence AND a.channel_id =
 	}}); err != nil || bound[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind = %+v err=%v", bound, err)
 	}
-	if evidence, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "channel-commit-fence-source", ObservedAt: time.Now(),
-	}}); err != nil || evidence[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("evidence = %+v err=%v", evidence, err)
-	}
 	var committedBefore int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_delivery_events WHERE channel_id = $1`, channelID).Scan(&committedBefore); err != nil {
 		t.Fatal(err)
@@ -937,6 +902,92 @@ SELECT id FROM channel_delivery_events WHERE channel_id = $1 AND max_pts = $2`, 
 	}
 	if headID != successorID {
 		t.Fatalf("head=%d want uncommitted successor=%d", headID, successorID)
+	}
+}
+
+func TestChannelDeliveryFinalizeBatchesIndependentLanesIntoBoundedTransactionsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := channelDeliveryRandomSuffix(t)
+	owner, err := NewUserStore(pool).Create(ctx, domain.User{
+		AccessHash: 6299, Phone: "+177769" + suffix, FirstName: "ChannelFinalizeBatchOwner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const laneCount = outboxFinalizeTransactionLanes + 1
+	channelIDs := make([]int64, 0, laneCount)
+	channels := newTestChannelStore(pool)
+	for i := 0; i < laneCount; i++ {
+		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
+			CreatorUserID: owner.ID,
+			Title:         fmt.Sprintf("channel-finalize-batch-%s-%02d", suffix, i),
+			Megagroup:     true,
+			Date:          1700191000 + i,
+		})
+		if err != nil {
+			t.Fatalf("create channel %d: %v", i, err)
+		}
+		channelIDs = append(channelIDs, created.Channel.ID)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_delivery_attempt_targets t
+USING channel_delivery_attempts a
+WHERE t.item_id = a.item_id AND t.lease_fence = a.lease_fence
+  AND a.channel_id = ANY($1::bigint[])`, channelIDs)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_delivery_attempts WHERE channel_id = ANY($1::bigint[])`, channelIDs)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channels WHERE id = ANY($1::bigint[])`, channelIDs)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, owner.ID)
+	})
+
+	countingDB := &countingBeginDB{Pool: pool}
+	delivery := NewChannelDeliveryStore(countingDB)
+	windows, err := delivery.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: laneCount, WindowSize: 1,
+		WindowByteLimit: 1 << 20, LeaseDuration: time.Minute,
+		PhysicalDuration: 10 * time.Second, ClockSkewAllowance: time.Second,
+		Owner: "channel-finalize-batch-egress",
+	})
+	if err != nil || len(windows) != laneCount {
+		t.Fatalf("claim lanes = %d err=%v, want %d", len(windows), err, laneCount)
+	}
+	sets := make([]store.OutboxAttemptTargetSet, 0, laneCount)
+	evidence := make([]store.OutboxAttemptEvidence, 0, laneCount)
+	finalize := make([]store.OutboxFinalizeRequest, 0, laneCount)
+	for _, window := range windows {
+		if len(window.Items) != 1 {
+			t.Fatalf("lane %d items=%d want=1", window.StreamID, len(window.Items))
+		}
+		ref := window.Items[0].Ref
+		sets = append(sets, store.OutboxAttemptTargetSet{
+			Ref: ref, SourceInstanceID: "channel-finalize-batch-source", Targets: []store.OutboxAttemptTarget{},
+		})
+		evidence = append(evidence, store.OutboxAttemptEvidence{
+			Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
+			SourceInstanceID: "channel-finalize-batch-source", ObservedAt: time.Now(),
+		})
+		finalize = append(finalize, store.OutboxFinalizeRequest{Ref: ref})
+	}
+	if bound, err := delivery.BindAttemptTargets(ctx, sets); err != nil || len(bound) != laneCount {
+		t.Fatalf("bind lanes = %d err=%v", len(bound), err)
+	}
+	if recorded, err := delivery.RecordAttemptEvidenceBatch(ctx, evidence); err != nil || len(recorded) != laneCount {
+		t.Fatalf("record evidence = %d err=%v", len(recorded), err)
+	}
+
+	countingDB.resetBeginCount()
+	batch, err := delivery.FinalizeAttempts(ctx, finalize)
+	if err != nil || len(batch.Results) != laneCount {
+		t.Fatalf("finalize lanes = %d err=%v", len(batch.Results), err)
+	}
+	for i, result := range batch.Results {
+		if result.Outcome != store.OutboxFinalizeApplied {
+			t.Fatalf("finalize result %d = %+v", i, result)
+		}
+	}
+	if got := countingDB.begins(); got != 2 {
+		t.Fatalf("finalize begin count=%d want=2 for %d lanes", got, laneCount)
 	}
 }
 

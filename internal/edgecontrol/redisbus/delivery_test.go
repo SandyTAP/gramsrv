@@ -12,10 +12,11 @@ import (
 
 func testDeliveryBatch() edgecontrol.DeliveryBatch {
 	payload := []byte{1, 2, 3, 4}
-	return edgecontrol.DeliveryBatch{BatchID: edgecontrol.BatchID{1}, CommandID: edgecontrol.CommandID{2}, SourceInstanceID: "egress-a", TargetInstanceID: "edge-b", TargetUserID: 42, NotAfter: time.Now().Add(time.Minute).UTC(), Items: []edgecontrol.DeliveryItem{{Ref: edgecontrol.DeliveryRef{Domain: edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42}, OutboxID: 9, TargetUserID: 42, PTS: 3, LeaseFence: 7, Attempt: 2}, MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload}}}
+	notAfter := time.Now().Add(time.Minute).UTC()
+	return edgecontrol.DeliveryBatch{BatchID: edgecontrol.BatchID{1}, CommandID: edgecontrol.CommandID{2}, SourceInstanceID: "egress-a", TargetInstanceID: "edge-b", TargetUserID: 42, NotAfter: notAfter, EvidenceDeadline: notAfter.Add(time.Second), Items: []edgecontrol.DeliveryItem{{Ref: edgecontrol.DeliveryRef{Domain: edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42}, OutboxID: 9, TargetUserID: 42, PTS: 3, LeaseFence: 7, Attempt: 2}, MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload}}}
 }
 
-func TestDeliveryV3WireRoundTripAndRejectsLegacy(t *testing.T) {
+func TestDeliveryV4WireRoundTripCarriesBothDeadlinesAndRejectsOlderVersions(t *testing.T) {
 	want := testDeliveryBatch()
 	raw, err := encodeDeliveryBatchWire(want)
 	if err != nil {
@@ -25,10 +26,12 @@ func TestDeliveryV3WireRoundTripAndRejectsLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.BatchID != want.BatchID || got.CommandID != want.CommandID || got.Items[0].Ref != want.Items[0].Ref || got.Items[0].MessageType != proto.MessageFromServer {
+	if got.BatchID != want.BatchID || got.CommandID != want.CommandID ||
+		!got.NotAfter.Equal(want.NotAfter) || !got.EvidenceDeadline.Equal(want.EvidenceDeadline) ||
+		got.Items[0].Ref != want.Items[0].Ref || got.Items[0].MessageType != proto.MessageFromServer {
 		t.Fatalf("roundtrip=%+v", got)
 	}
-	for _, legacy := range []string{"OBX\x02payload", "{\"CommandID\":\"old\"}"} {
+	for _, legacy := range []string{"EDC\x03payload", "OBX\x02payload", "{\"CommandID\":\"old\"}"} {
 		if _, err := decodeDeliveryBatchWire(legacy); err == nil {
 			t.Fatalf("legacy wire accepted: %q", legacy)
 		}

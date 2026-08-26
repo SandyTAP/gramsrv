@@ -62,8 +62,19 @@ func TestDeliveryOutboxWindowGapAndEvidenceCrashRecovery(t *testing.T) {
 	refs := []store.OutboxAttemptRef{
 		windows[0].Items[0].Ref, windows[0].Items[1].Ref, windows[0].Items[2].Ref,
 	}
-	bindAuthoritativeEmptyForTest(t, ctx, outbox, refs...)
-	recordNoTargetsForTest(t, ctx, outbox, refs[1])
+	target := store.OutboxAttemptTarget{
+		TargetInstanceID: "edge-a", TargetUserID: refs[0].StreamID,
+		BatchID: bytes16(11), CommandID: bytes16(12),
+	}
+	bound, err := outbox.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{
+		{Ref: refs[0], SourceInstanceID: "egress-a", Targets: []store.OutboxAttemptTarget{target}},
+		{Ref: refs[1], SourceInstanceID: "egress-a", Targets: []store.OutboxAttemptTarget{}},
+		{Ref: refs[2], SourceInstanceID: "egress-a", Targets: []store.OutboxAttemptTarget{target}},
+	})
+	if err != nil || len(bound) != 3 || bound[0].Outcome != store.OutboxBindTargetBound ||
+		bound[1].Outcome != store.OutboxBindTargetBound || bound[2].Outcome != store.OutboxBindTargetBound {
+		t.Fatalf("bind gap targets = %+v err=%v", bound, err)
+	}
 
 	// A finalizer on any process may consume durable evidence, but cannot skip
 	// the unresolved predecessor.
@@ -77,7 +88,15 @@ func TestDeliveryOutboxWindowGapAndEvidenceCrashRecovery(t *testing.T) {
 
 	// Evidence survives the delivery executor. A separate finalizer advances
 	// the exact contiguous prefix without waiting for lease expiry.
-	recordNoTargetsForTest(t, ctx, outbox, refs[0])
+	evidence, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
+		Ref: refs[0], Kind: store.OutboxEvidenceEdgeWritten,
+		SourceInstanceID: "egress-a", TargetInstanceID: target.TargetInstanceID,
+		TargetUserID: target.TargetUserID, BatchID: target.BatchID, CommandID: target.CommandID,
+		EligibleSessions: 1, WrittenSessions: 1, ServerMsgID: 1001, ObservedAt: time.Now(),
+	}})
+	if err != nil || len(evidence) != 1 || evidence[0].Outcome != store.OutboxEvidenceRecorded {
+		t.Fatalf("record predecessor evidence = %+v err=%v", evidence, err)
+	}
 	batch, err = outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: refs[0]}, {Ref: refs[1]}})
 	if err != nil || len(batch.Results) != 2 ||
 		batch.Results[0].Outcome != store.OutboxFinalizeApplied ||
@@ -112,19 +131,6 @@ func TestDeliveryOutboxFrozenTargetsRequireEveryCommand(t *testing.T) {
 	}})
 	if err != nil || wrongSource[0].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("wrong-source evidence = %+v err=%v", wrongSource, err)
-	}
-	ackOnly, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceClientAck, SourceInstanceID: "egress-a",
-		TargetInstanceID: targets[0].TargetInstanceID, TargetUserID: targets[0].TargetUserID,
-		BatchID: targets[0].BatchID, CommandID: targets[0].CommandID,
-		AuthKeyID: [8]byte{1}, SessionID: 9, ServerMsgID: 11, ObservedAt: time.Now(),
-	}})
-	if err != nil || ackOnly[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("client ack observation = %+v err=%v", ackOnly, err)
-	}
-	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: ref}}); err != nil ||
-		batch.Results[0].Outcome != store.OutboxFinalizeWaitingForPredecessor {
-		t.Fatalf("client ack must not finalize = %+v err=%v", batch, err)
 	}
 	recorded, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
 		Ref: ref, Kind: store.OutboxEvidenceEdgeWritten, SourceInstanceID: "egress-a",
@@ -216,7 +222,7 @@ func TestDeliveryOutboxResolutionRequiresExactTargetOrLiveOwner(t *testing.T) {
 	}
 }
 
-func TestDeliveryOutboxFenceAndTombstoneAreDistinct(t *testing.T) {
+func TestDeliveryOutboxLiveAttemptFenceIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	outbox := NewDeliveryOutboxStore()
 	enqueueAbsoluteForTest(t, ctx, outbox, 3001, []byte{0x01})
@@ -230,7 +236,7 @@ func TestDeliveryOutboxFenceAndTombstoneAreDistinct(t *testing.T) {
 		t.Fatalf("reclaimed ref = %+v, first = %+v", reclaimed, first)
 	}
 	staleBind, err := outbox.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{{Ref: first, SourceInstanceID: "egress-a", Targets: nil}})
-	if err != nil || staleBind[0].Outcome != store.OutboxBindTargetAlreadyFinalized {
+	if err != nil || staleBind[0].Outcome != store.OutboxBindTargetFenced {
 		t.Fatalf("stale bind = %+v err=%v", staleBind, err)
 	}
 
@@ -241,8 +247,8 @@ func TestDeliveryOutboxFenceAndTombstoneAreDistinct(t *testing.T) {
 		t.Fatalf("finalize reclaimed = %+v err=%v", batch, err)
 	}
 	batch, err = outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: reclaimed}})
-	if err != nil || batch.Results[0].Outcome != store.OutboxFinalizeAlreadyFinalized {
-		t.Fatalf("tombstone replay = %+v err=%v", batch, err)
+	if err != nil || batch.Results[0].Outcome != store.OutboxFinalizeFenced {
+		t.Fatalf("completed live-attempt replay = %+v err=%v", batch, err)
 	}
 	enqueueAbsoluteForTest(t, ctx, outbox, 3001, []byte{0x02})
 	newGeneration := claimAbsoluteForTest(t, ctx, outbox, "egress-c/worker-3", 1, 1)[0].Items[0].Ref
@@ -323,7 +329,7 @@ func TestDeliveryOutboxRecoverBoundWindowPreservesPlanAndFencesTakeover(t *testi
 		t.Fatalf("expired plan must resolve retry, got=%+v err=%v", expired, err)
 	}
 	requests, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(requests) != 1 || requests[0].Ref != ref {
 		t.Fatalf("expired finalizable = %+v err=%v", requests, err)
@@ -343,7 +349,7 @@ func TestDeliveryOutboxRecoverBoundWindowPreservesPlanAndFencesTakeover(t *testi
 		TargetInstanceID: target.TargetInstanceID, TargetUserID: target.TargetUserID,
 		BatchID: target.BatchID, CommandID: target.CommandID, ObservedAt: time.Now(),
 	}})
-	if err != nil || stale[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
+	if err != nil || stale[0].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("stale evidence = %+v err=%v", stale, err)
 	}
 }
@@ -356,7 +362,7 @@ func TestDeliveryOutboxRecoverFinalizableAfterEvidenceCrash(t *testing.T) {
 	bindAuthoritativeEmptyForTest(t, ctx, outbox, ref)
 	recordNoTargetsForTest(t, ctx, outbox, ref)
 	requests, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(requests) != 1 || requests[0].Ref != ref || requests[0].RetainLease {
 		t.Fatalf("RecoverFinalizableAttempts = %+v err=%v", requests, err)
@@ -364,6 +370,58 @@ func TestDeliveryOutboxRecoverFinalizableAfterEvidenceCrash(t *testing.T) {
 	batch, err := outbox.FinalizeAttempts(ctx, requests)
 	if err != nil || batch.Results[0].Outcome != store.OutboxFinalizeApplied || len(outbox.Snapshot()) != 0 {
 		t.Fatalf("FinalizeAttempts recovered = %+v err=%v", batch, err)
+	}
+}
+
+func TestDeliveryOutboxRecoverFinalizableBoundsAttemptsAcrossLanes(t *testing.T) {
+	ctx := context.Background()
+	outbox := NewDeliveryOutboxStore()
+	for lane := 0; lane < 2; lane++ {
+		for item := 0; item < store.MaxDeliveryBatchItems; item++ {
+			enqueueAbsoluteForTest(t, ctx, outbox, int64(6101+lane), []byte{byte(item + 1)})
+		}
+	}
+	windows := claimAbsoluteForTest(t, ctx, outbox, "egress-recovery-limit", 2, store.MaxDeliveryBatchItems)
+	if len(windows) != 2 {
+		t.Fatalf("claimed windows = %d, want 2", len(windows))
+	}
+	for _, window := range windows {
+		if len(window.Items) != store.MaxDeliveryBatchItems {
+			t.Fatalf("claimed lane %d items = %d, want %d", window.StreamID, len(window.Items), store.MaxDeliveryBatchItems)
+		}
+		sets := make([]store.OutboxAttemptTargetSet, len(window.Items))
+		evidence := make([]store.OutboxAttemptEvidence, len(window.Items))
+		for i, item := range window.Items {
+			sets[i] = store.OutboxAttemptTargetSet{Ref: item.Ref, SourceInstanceID: "egress-recovery-limit", Targets: []store.OutboxAttemptTarget{}}
+			evidence[i] = store.OutboxAttemptEvidence{
+				Ref: item.Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
+				SourceInstanceID: "egress-recovery-limit", ObservedAt: time.Now(),
+			}
+		}
+		if bound, err := outbox.BindAttemptTargets(ctx, sets); err != nil || len(bound) != len(sets) {
+			t.Fatalf("bind lane %d = %d err=%v", window.StreamID, len(bound), err)
+		}
+		if recorded, err := outbox.RecordAttemptEvidenceBatch(ctx, evidence); err != nil || len(recorded) != len(evidence) {
+			t.Fatalf("record lane %d = %d err=%v", window.StreamID, len(recorded), err)
+		}
+	}
+
+	request := store.OutboxRecoverFinalizableRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 2, AttemptLimit: store.MaxDeliveryBatchItems,
+	}
+	for batchIndex := 0; batchIndex < 2; batchIndex++ {
+		requests, err := outbox.RecoverFinalizableAttempts(ctx, request)
+		if err != nil || len(requests) != store.MaxDeliveryBatchItems {
+			t.Fatalf("recover batch %d = %d err=%v, want %d", batchIndex, len(requests), err, store.MaxDeliveryBatchItems)
+		}
+		finalized, err := outbox.FinalizeAttempts(ctx, requests)
+		if err != nil || len(finalized.Results) != len(requests) {
+			t.Fatalf("finalize batch %d = %d err=%v", batchIndex, len(finalized.Results), err)
+		}
+	}
+	requests, err := outbox.RecoverFinalizableAttempts(ctx, request)
+	if err != nil || len(requests) != 0 || len(outbox.Snapshot()) != 0 {
+		t.Fatalf("terminal recovery = %d remaining=%d err=%v", len(requests), len(outbox.Snapshot()), err)
 	}
 }
 
@@ -380,23 +438,18 @@ func TestDeliveryOutboxRepeatedCrashSupersedesUnboundAttempts(t *testing.T) {
 		latest = claimAbsoluteForTest(t, ctx, outbox, fmt.Sprintf("egress/%d", i), 1, 1)[0].Items[0].Ref
 	}
 	outbox.mu.Lock()
-	unfinalized := 0
-	for _, attempt := range outbox.attempts {
-		if !attempt.finalized {
-			unfinalized++
-		}
-	}
+	liveAttempts := len(outbox.attempts)
 	outbox.mu.Unlock()
-	if unfinalized != 1 || latest.Attempt != 101 || latest.LeaseFence != 101 {
-		t.Fatalf("active attempts/latest = %d/%+v want 1 and attempt/fence 101", unfinalized, latest)
+	if liveAttempts != 1 || latest.Attempt != 101 || latest.LeaseFence != 101 {
+		t.Fatalf("live attempts/latest = %d/%+v want 1 and attempt/fence 101", liveAttempts, latest)
 	}
 	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: first}}); err != nil ||
-		batch.Results[0].Outcome != store.OutboxFinalizeAlreadyFinalized {
-		t.Fatalf("superseded tombstone = %+v err=%v", batch, err)
+		batch.Results[0].Outcome != store.OutboxFinalizeFenced {
+		t.Fatalf("superseded live attempt = %+v err=%v", batch, err)
 	}
 }
 
-func TestDeliveryOutboxExpiredHeadRetryTombstonesConfirmedSuffix(t *testing.T) {
+func TestDeliveryOutboxExpiredHeadRetryDeletesConfirmedSuffixAttempt(t *testing.T) {
 	ctx := context.Background()
 	outbox := NewDeliveryOutboxStore()
 	enqueueAbsoluteForTest(t, ctx, outbox, 7101, []byte{0x01})
@@ -435,14 +488,14 @@ func TestDeliveryOutboxExpiredHeadRetryTombstonesConfirmedSuffix(t *testing.T) {
 		t.Fatalf("expire head = %+v err=%v", expired, err)
 	}
 	requests, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(requests) != 2 {
 		t.Fatalf("finalizable = %+v err=%v", requests, err)
 	}
 	finalized, err := outbox.FinalizeAttempts(ctx, requests)
 	if err != nil || finalized.Results[0].Outcome != store.OutboxFinalizeScheduledRetry ||
-		finalized.Results[1].Outcome != store.OutboxFinalizeAlreadyFinalized {
+		finalized.Results[1].Outcome != store.OutboxFinalizeFenced {
 		t.Fatalf("finalize retry/suffix = %+v err=%v", finalized, err)
 	}
 	stale, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
@@ -451,7 +504,7 @@ func TestDeliveryOutboxExpiredHeadRetryTombstonesConfirmedSuffix(t *testing.T) {
 		BatchID: targets[1].BatchID, CommandID: targets[1].CommandID,
 		EligibleSessions: 2, WrittenSessions: 2, ServerMsgID: 104, ObservedAt: time.Now(),
 	}})
-	if err != nil || stale[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
+	if err != nil || stale[0].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("stale suffix receipt = %+v err=%v", stale, err)
 	}
 	fresh := claimAbsoluteForTest(t, ctx, outbox, "egress-b", 1, 2)
@@ -544,7 +597,7 @@ func TestDeliveryOutboxBoundResolutionWaitsForEvidenceDeadline(t *testing.T) {
 		time.Sleep(wait)
 	}
 	ready, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(ready) != 1 || ready[0].Ref != item.Ref {
 		t.Fatalf("recover held resolution = %+v err=%v", ready, err)
@@ -563,16 +616,14 @@ func TestDeliveryOutboxLateCompletionEvidenceUsesStoreClock(t *testing.T) {
 	ctx := context.Background()
 	outbox := NewDeliveryOutboxStore()
 	enqueueAbsoluteForTest(t, ctx, outbox, 7351, []byte{0x01})
-	enqueueAbsoluteForTest(t, ctx, outbox, 7351, []byte{0x02})
-	window := claimAbsoluteForTest(t, ctx, outbox, "egress-deadline", 1, 2)[0]
+	window := claimAbsoluteForTest(t, ctx, outbox, "egress-deadline", 1, 1)[0]
 	target := store.OutboxAttemptTarget{
 		TargetInstanceID: "edge-a", TargetUserID: 7351,
 		BatchID: bytes16(81), CommandID: bytes16(82),
 	}
 	if bound, err := outbox.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{
 		{Ref: window.Items[0].Ref, SourceInstanceID: "egress-source", Targets: []store.OutboxAttemptTarget{target}},
-		{Ref: window.Items[1].Ref, SourceInstanceID: "egress-source", Targets: []store.OutboxAttemptTarget{}},
-	}); err != nil || bound[0].Outcome != store.OutboxBindTargetBound || bound[1].Outcome != store.OutboxBindTargetBound {
+	}); err != nil || bound[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind deadline targets = %+v err=%v", bound, err)
 	}
 	outbox.mu.Lock()
@@ -593,31 +644,17 @@ func TestDeliveryOutboxLateCompletionEvidenceUsesStoreClock(t *testing.T) {
 			EligibleSessions: 1, WrittenSessions: 1, ServerMsgID: 7351,
 			ObservedAt: time.Now().Add(time.Hour),
 		},
-		{
-			Ref: window.Items[1].Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-			SourceInstanceID: "egress-source", ObservedAt: time.Now().Add(time.Hour),
-		},
 	})
-	if err != nil || late[0].Outcome != store.OutboxEvidenceFenced || late[1].Outcome != store.OutboxEvidenceFenced {
-		t.Fatalf("late completion evidence = %+v err=%v, want Fenced/Fenced", late, err)
-	}
-	ack, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: window.Items[0].Ref, Kind: store.OutboxEvidenceClientAck,
-		SourceInstanceID: "egress-source", TargetInstanceID: target.TargetInstanceID,
-		TargetUserID: target.TargetUserID, BatchID: target.BatchID, CommandID: target.CommandID,
-		AuthKeyID: [8]byte{1}, SessionID: 9, ServerMsgID: 10, ObservedAt: time.Now(),
-	}})
-	if err != nil || ack[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("late diagnostic ACK = %+v err=%v", ack, err)
+	if err != nil || late[0].Outcome != store.OutboxEvidenceFenced {
+		t.Fatalf("late completion evidence = %+v err=%v, want Fenced", late, err)
 	}
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
 	first := outbox.attempts[memoryAttemptKey{itemID: window.Items[0].Ref.ItemID, fence: window.Items[0].Ref.LeaseFence}]
-	second := outbox.attempts[memoryAttemptKey{itemID: window.Items[1].Ref.ItemID, fence: window.Items[1].Ref.LeaseFence}]
-	if first.resolution != 0 || second.resolution != 0 || first.targets[memoryTargetKey{
+	if first.resolution != 0 || first.targets[memoryTargetKey{
 		instance: target.TargetInstanceID, userID: target.TargetUserID, batch: target.BatchID, command: target.CommandID,
 	}].evidence != 0 {
-		t.Fatalf("late completion mutated attempt state: first=%+v second=%+v", first, second)
+		t.Fatalf("late completion mutated attempt state: first=%+v", first)
 	}
 }
 
@@ -694,7 +731,7 @@ func TestDeliveryOutboxClaimsOnlyContiguousExclusionPrefix(t *testing.T) {
 	}
 }
 
-func TestDeliveryOutboxFinalizedAttemptRetentionIsBounded(t *testing.T) {
+func TestDeliveryOutboxFinalizationDeletesLiveAttempts(t *testing.T) {
 	ctx := context.Background()
 	outbox := NewDeliveryOutboxStore()
 	for i := 0; i < 3; i++ {
@@ -716,29 +753,21 @@ func TestDeliveryOutboxFinalizedAttemptRetentionIsBounded(t *testing.T) {
 	if finalized, err := outbox.FinalizeAttempts(ctx, requests); err != nil || len(finalized.Results) != len(refs) {
 		t.Fatalf("finalize retention window = %+v err=%v", finalized, err)
 	}
-	lateBeforeGC, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
+	late, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
 		Ref: refs[0], Kind: store.OutboxEvidenceAuthoritativeNoTargets,
 		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
 	}})
-	if err != nil || lateBeforeGC[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
-		t.Fatalf("late evidence during retention = %+v err=%v", lateBeforeGC, err)
-	}
-	deleted, err := outbox.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 2)
-	if err != nil || deleted != 2 {
-		t.Fatalf("bounded tombstone delete = %d err=%v", deleted, err)
-	}
-	lateAfterGC, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: refs[0], Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
-	}})
-	if err != nil || (lateAfterGC[0].Outcome != store.OutboxEvidenceFenced && lateAfterGC[0].Outcome != store.OutboxEvidenceRejected) {
-		t.Fatalf("late evidence after retention = %+v err=%v", lateAfterGC, err)
-	}
-	if deleted, err = outbox.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 2); err != nil || deleted != 1 {
-		t.Fatalf("remaining tombstone delete = %d err=%v", deleted, err)
+	if err != nil || late[0].Outcome != store.OutboxEvidenceFenced {
+		t.Fatalf("late evidence after live-attempt deletion = %+v err=%v", late, err)
 	}
 	if len(outbox.Snapshot()) != 0 {
-		t.Fatalf("attempt GC touched finalized item state: %+v", outbox.Snapshot())
+		t.Fatalf("finalization retained item state: %+v", outbox.Snapshot())
+	}
+	outbox.mu.Lock()
+	liveAttempts := len(outbox.attempts)
+	outbox.mu.Unlock()
+	if liveAttempts != 0 {
+		t.Fatalf("finalization retained live attempt state: attempts=%d", liveAttempts)
 	}
 }
 
@@ -789,7 +818,7 @@ func recordNoTargetsForTest(t *testing.T, ctx context.Context, outbox *DeliveryO
 		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
 		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
 	}})
-	if err != nil || len(results) != 1 || results[0].Outcome != store.OutboxEvidenceRecorded {
+	if err != nil || len(results) != 1 || (results[0].Outcome != store.OutboxEvidenceRecorded && results[0].Outcome != store.OutboxEvidenceDuplicate) {
 		t.Fatalf("RecordAttemptEvidenceBatch = %+v err=%v", results, err)
 	}
 }

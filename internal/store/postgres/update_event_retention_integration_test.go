@@ -614,10 +614,10 @@ func TestUserUpdateRetentionDeletesDispatchLeaseAndPromotesHeadPostgres(t *testi
 		t.Fatalf("delete retained dispatch prefix = %d/%v, want 1/nil", deleted, err)
 	}
 
-	// Retention leaves an exact abandonment tombstone and promotes the next item
+	// Retention deletes the abandoned live attempt and promotes the next item
 	// under a new fence; no mutable item status or compatibility token remains.
 	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: claimed}}); err != nil ||
-		batch.Results[0].Outcome != store.OutboxFinalizeAlreadyFinalized {
+		batch.Results[0].Outcome != store.OutboxFinalizeFenced {
 		t.Fatalf("finalize retained dispatch attempt = %+v err=%v", batch, err)
 	}
 	var eventRows, outboxRows, headPts int

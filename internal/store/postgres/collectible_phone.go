@@ -10,14 +10,37 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/readmodelcache"
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-type CollectiblePhoneStore struct{ db sqlcgen.DBTX }
+const (
+	collectiblePhoneOwnerCacheMaxEntries = 200000
+	collectiblePhoneOwnerCacheTTL        = 30 * time.Minute
+)
+
+type collectiblePhoneOwnerCacheValue struct {
+	asset domain.CollectiblePhone
+	found bool
+}
+
+// CollectiblePhoneStore keeps only the rebuildable owner projection in memory.
+// Mutations and read-model notifications invalidate it; PostgreSQL remains the
+// durable ownership authority.
+type CollectiblePhoneStore struct {
+	db         sqlcgen.DBTX
+	ownerCache *readmodelcache.Cache[int64, collectiblePhoneOwnerCacheValue]
+}
 
 func NewCollectiblePhoneStore(db sqlcgen.DBTX) *CollectiblePhoneStore {
-	return &CollectiblePhoneStore{db: db}
+	return &CollectiblePhoneStore{
+		db: db,
+		ownerCache: readmodelcache.New(readmodelcache.Config[int64, collectiblePhoneOwnerCacheValue]{
+			MaxEntries: collectiblePhoneOwnerCacheMaxEntries,
+			TTL:        collectiblePhoneOwnerCacheTTL,
+		}),
+	}
 }
 
 var _ store.CollectiblePhoneStore = (*CollectiblePhoneStore)(nil)
@@ -163,6 +186,9 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$4,0,1,now(),now()) RETURNING `+collectibl
 		created = true
 		return nil
 	})
+	if err == nil && created {
+		s.InvalidateCollectiblePhoneReadModel(out.OwnerUserID)
+	}
 	return out, created, err
 }
 
@@ -207,6 +233,9 @@ WHERE id=$1 RETURNING `+collectiblePhoneColumns, a.ID, req.Currency, req.Amount,
 		changed = true
 		return nil
 	})
+	if err == nil && changed {
+		s.InvalidateCollectiblePhoneReadModel(out.OwnerUserID)
+	}
 	return out, changed, err
 }
 
@@ -219,6 +248,7 @@ func (s *CollectiblePhoneStore) TransferCollectiblePhoneWithDelivery(ctx context
 		return domain.CollectiblePhone{}, false, err
 	}
 	var out domain.CollectiblePhone
+	var previousOwnerUserID int64
 	changed := false
 	err := withTx(ctx, s.db, "transfer collectible phone", func(tx pgx.Tx) error {
 		if replay, found, err := replayCollectiblePhone(ctx, tx, req.CommandKey); err != nil {
@@ -238,6 +268,7 @@ func (s *CollectiblePhoneStore) TransferCollectiblePhoneWithDelivery(ctx context
 			out = a
 			return nil
 		}
+		previousOwnerUserID = a.OwnerUserID
 		if err := ensureCollectiblePhoneOwner(ctx, tx, req.ToUserID); err != nil {
 			return err
 		}
@@ -263,6 +294,10 @@ WHERE id=$1 RETURNING `+collectiblePhoneColumns, a.ID, req.ToUserID, original))
 		changed = true
 		return nil
 	})
+	if err == nil && changed {
+		s.InvalidateCollectiblePhoneReadModel(previousOwnerUserID)
+		s.InvalidateCollectiblePhoneReadModel(out.OwnerUserID)
+	}
 	return out, changed, err
 }
 
@@ -275,6 +310,7 @@ func (s *CollectiblePhoneStore) RevokeCollectiblePhoneWithDelivery(ctx context.C
 		return domain.CollectiblePhone{}, false, err
 	}
 	var out domain.CollectiblePhone
+	var previousOwnerUserID int64
 	changed := false
 	err := withTx(ctx, s.db, "revoke collectible phone", func(tx pgx.Tx) error {
 		if replay, found, err := replayCollectiblePhone(ctx, tx, req.CommandKey); err != nil {
@@ -294,6 +330,7 @@ func (s *CollectiblePhoneStore) RevokeCollectiblePhoneWithDelivery(ctx context.C
 			out = a
 			return nil
 		}
+		previousOwnerUserID = a.OwnerUserID
 		status := domain.CollectibleUsernameStatusVault
 		kind := domain.CollectibleUsernameKindRevoke
 		if req.Burn {
@@ -314,6 +351,9 @@ version=version+1, updated_at=now() WHERE id=$1 RETURNING `+collectiblePhoneColu
 		changed = true
 		return nil
 	})
+	if err == nil && changed {
+		s.InvalidateCollectiblePhoneReadModel(previousOwnerUserID)
+	}
 	return out, changed, err
 }
 
@@ -326,6 +366,7 @@ func (s *CollectiblePhoneStore) DeleteCollectiblePhoneWithDelivery(ctx context.C
 		return false, err
 	}
 	deleted := false
+	var previousOwnerUserID int64
 	err := withTx(ctx, s.db, "delete collectible phone with delivery", func(tx pgx.Tx) error {
 		asset, err := scanCollectiblePhone(tx.QueryRow(ctx, `SELECT `+collectiblePhoneColumns+` FROM collectible_phones WHERE phone=$1 ORDER BY id DESC LIMIT 1 FOR UPDATE`, req.Phone))
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -344,11 +385,15 @@ func (s *CollectiblePhoneStore) DeleteCollectiblePhoneWithDelivery(ctx context.C
 		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, asset, []int64{asset.OwnerUserID}, effects); err != nil {
 			return err
 		}
+		previousOwnerUserID = asset.OwnerUserID
 		deleted = true
 		return nil
 	})
 	if err != nil {
 		return false, fmt.Errorf("delete collectible phone: %w", err)
+	}
+	if deleted {
+		s.InvalidateCollectiblePhoneReadModel(previousOwnerUserID)
 	}
 	return deleted, nil
 }
@@ -400,22 +445,77 @@ func (s *CollectiblePhoneStore) CollectiblePhoneByID(ctx context.Context, id int
 
 func (s *CollectiblePhoneStore) OwnedCollectiblePhones(ctx context.Context, userIDs []int64) (map[int64]domain.CollectiblePhone, error) {
 	out := make(map[int64]domain.CollectiblePhone)
-	if len(userIDs) == 0 {
+	if s == nil || s.db == nil || len(userIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.db.Query(ctx, `SELECT `+collectiblePhoneColumns+` FROM collectible_phones WHERE status='owned' AND owner_user_id=ANY($1::bigint[])`, userIDs)
+	ids := uniqueCollectiblePhoneOwnerIDs(userIDs)
+	values, err := s.ownerCache.GetOrLoadBatch(
+		ctx,
+		ids,
+		func(int64) (int64, bool) { return 0, true },
+		func(loadCtx context.Context, missing []int64) (map[int64]collectiblePhoneOwnerCacheValue, error) {
+			loaded := make(map[int64]collectiblePhoneOwnerCacheValue, len(missing))
+			for _, userID := range missing {
+				loaded[userID] = collectiblePhoneOwnerCacheValue{}
+			}
+			rows, queryErr := s.db.Query(loadCtx, `SELECT `+collectiblePhoneColumns+` FROM collectible_phones WHERE status='owned' AND owner_user_id=ANY($1::bigint[])`, missing)
+			if queryErr != nil {
+				return nil, queryErr
+			}
+			defer rows.Close()
+			for rows.Next() {
+				asset, scanErr := scanCollectiblePhone(rows)
+				if scanErr != nil {
+					return nil, scanErr
+				}
+				loaded[asset.OwnerUserID] = collectiblePhoneOwnerCacheValue{asset: asset, found: true}
+			}
+			if rowsErr := rows.Err(); rowsErr != nil {
+				return nil, rowsErr
+			}
+			return loaded, nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		a, err := scanCollectiblePhone(rows)
-		if err != nil {
-			return nil, err
+	for userID, value := range values {
+		if value.found {
+			out[userID] = value.asset
 		}
-		out[a.OwnerUserID] = a
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+// InvalidateCollectiblePhoneReadModel applies one committed owner-key change.
+func (s *CollectiblePhoneStore) InvalidateCollectiblePhoneReadModel(userID int64) {
+	if s != nil && s.ownerCache != nil && userID > 0 {
+		s.ownerCache.Invalidate(userID)
+	}
+}
+
+// FlushCollectiblePhoneReadModel closes notification disconnect windows and is
+// used after listener reconnects to close a lost-notification window.
+func (s *CollectiblePhoneStore) FlushCollectiblePhoneReadModel() {
+	if s != nil && s.ownerCache != nil {
+		s.ownerCache.Flush()
+	}
+}
+
+func uniqueCollectiblePhoneOwnerIDs(values []int64) []int64 {
+	out := make([]int64, 0, len(values))
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *CollectiblePhoneStore) ListCollectiblePhones(ctx context.Context, f domain.CollectiblePhoneFilter) ([]domain.CollectiblePhone, error) {

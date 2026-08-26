@@ -25,6 +25,35 @@ func NewAuthKeyStore(db sqlcgen.DBTX) *AuthKeyStore {
 	return &AuthKeyStore{q: sqlcgen.New(db), db: db}
 }
 
+// ResolveAuthKeyLayerIdentity is the one-shot cold loader for the Redis Layer
+// authority. It deliberately does not touch last_used_at: Edge auth-key
+// admission owns that durable heartbeat, while this query only resolves the
+// already-admitted raw key to its canonical protocol identity.
+func (s *AuthKeyStore) ResolveAuthKeyLayerIdentity(
+	ctx context.Context,
+	rawAuthKeyID [8]byte,
+) (store.AuthKeyLayerIdentity, bool, error) {
+	var effectiveID int64
+	var rawExpiresAt int
+	err := s.db.QueryRow(ctx, `
+SELECT COALESCE(binding.perm_auth_key_id, raw.auth_key_id), raw.expires_at
+FROM auth_keys AS raw
+LEFT JOIN temp_auth_key_bindings AS binding
+  ON binding.temp_auth_key_id = raw.auth_key_id
+WHERE raw.auth_key_id = $1
+`, authKeyIDToInt64(rawAuthKeyID)).Scan(&effectiveID, &rawExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.AuthKeyLayerIdentity{}, false, nil
+	}
+	if err != nil {
+		return store.AuthKeyLayerIdentity{}, false, fmt.Errorf("resolve auth key Layer identity: %w", err)
+	}
+	return store.AuthKeyLayerIdentity{
+		EffectiveAuthKeyID: authKeyIDFromInt64(effectiveID),
+		RawExpiresAt:       rawExpiresAt,
+	}, true, nil
+}
+
 // Save 实现 store.AuthKeyStore。auth_key_id 以小端解释为 int64 存入 BIGINT；
 // created_at/last_used_at 交由 DB 默认值（now()），故传入的 CreatedAt 不落库。
 func (s *AuthKeyStore) Save(ctx context.Context, k store.AuthKeyData) error {

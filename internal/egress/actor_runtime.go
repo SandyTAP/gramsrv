@@ -16,14 +16,21 @@ import (
 const (
 	defaultDomainActorPartitions = 256
 	defaultDomainActorMailbox    = 128
-	defaultDomainActorBytes      = int64(256 << 20)
-	defaultDomainIOWorkers       = 256
-	ptsClaimByteEstimate         = 64 << 10
-	claimItemRetainedBytes       = int64(256)
-	claimAttemptTargetBytes      = int64(64)
-	deliveryReservationReleased  = uint64(1) << 63
-	deliveryReservationByteMask  = deliveryReservationReleased - 1
-	maxClaimWindowRetainedBytes  = int64(edgecontrol.MaxDeliveryBatchBytes) +
+	defaultDomainActorBytes      = int64(3 << 30)
+	// Actor partitions distribute ordering domains; they are not a database
+	// concurrency target. One hundred twenty-eight callers feed the fixed
+	// projection actors and the single set-based mutation actor; they do not become
+	// independent event or mutation writers. The 3 GiB reservation ceiling covers every
+	// caller holding one legal 16 MiB projection window plus bounded claim/plan
+	// metadata without preallocating that memory.
+	defaultDomainIOWorkers      = 128
+	activeWindowsPerIOWorker    = 4
+	ptsClaimByteEstimate        = 64 << 10
+	claimItemRetainedBytes      = int64(256)
+	claimAttemptTargetBytes     = int64(64)
+	deliveryReservationReleased = uint64(1) << 63
+	deliveryReservationByteMask = deliveryReservationReleased - 1
+	maxClaimWindowRetainedBytes = int64(edgecontrol.MaxDeliveryBatchBytes) +
 		int64(edgecontrol.MaxDeliveryBatchItems)*claimItemRetainedBytes +
 		int64(edgecontrol.MaxDeliveryBatchItems)*int64(edgecontrol.MaxDeliveryTargets)*
 			(claimAttemptTargetBytes+int64(edgecontrol.MaxDeliveryInstanceIDBytes))
@@ -38,8 +45,9 @@ type deliveryActorWork struct {
 }
 
 type deliveryActorReservation struct {
-	owner *deliveryActorExecutor
-	state atomic.Uint64
+	owner      *deliveryActorExecutor
+	state      atomic.Uint64
+	windowSlot bool
 }
 
 type deliveryOrderingDomain struct {
@@ -75,6 +83,8 @@ type deliveryActorExecutor struct {
 	shards      []deliveryActorShard
 	ioQueue     chan deliveryActorIOTask
 	ioWorkers   int
+	maxWindows  int
+	windowSlots chan struct{}
 	maxBytes    int64
 	usedBytes   atomic.Int64
 	maxTasks    int64
@@ -111,6 +121,8 @@ func newDeliveryActorExecutor(coordinator *deliveryCoordinator, partitions, mail
 		ioQueue:  make(chan deliveryActorIOTask, int(maxTasks)),
 		capacity: make(chan struct{}, 1),
 	}
+	executor.maxWindows = ioWorkers * activeWindowsPerIOWorker
+	executor.windowSlots = make(chan struct{}, executor.maxWindows)
 	if coordinator != nil {
 		executor.process = coordinator.processWindowBudgeted
 	}
@@ -254,19 +266,32 @@ func orderingDomainOf(window store.OutboxClaimWindow) deliveryOrderingDomain {
 }
 
 func (e *deliveryActorExecutor) submit(ctx context.Context, window store.OutboxClaimWindow) bool {
+	if !e.reserveWindowSlot(ctx) {
+		return false
+	}
+	return e.submitReserved(ctx, window)
+}
+
+func (e *deliveryActorExecutor) submitReserved(ctx context.Context, window store.OutboxClaimWindow) bool {
 	if e == nil || len(e.shards) == 0 || len(window.Items) == 0 {
+		if e != nil {
+			e.releaseWindowSlots(1)
+		}
 		return false
 	}
 	e.lifecycle.RLock()
 	defer e.lifecycle.RUnlock()
 	if e.stopped || ctx.Err() != nil {
+		e.releaseWindowSlots(1)
 		return false
 	}
 	bytes := claimWindowBytes(window)
 	if !e.reserveContext(ctx, bytes) {
+		e.releaseWindowSlots(1)
 		return false
 	}
 	reservation := newDeliveryActorReservation(e, bytes)
+	reservation.windowSlot = true
 	work := deliveryActorWork{window: window, bytes: bytes, reservation: reservation}
 	index := orderingDomainHash(window.QueueKind, window.StreamID) % uint64(len(e.shards))
 	select {
@@ -275,6 +300,47 @@ func (e *deliveryActorExecutor) submit(ctx context.Context, window store.OutboxC
 	case <-ctx.Done():
 		e.releaseWork(work)
 		return false
+	}
+}
+
+func (e *deliveryActorExecutor) reserveWindowSlot(ctx context.Context) bool {
+	if e == nil || e.maxWindows <= 0 || e.windowSlots == nil {
+		return false
+	}
+	select {
+	case e.windowSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (e *deliveryActorExecutor) reserveWindowSlots(ctx context.Context, limit int) int {
+	if limit <= 0 || !e.reserveWindowSlot(ctx) {
+		return 0
+	}
+	reserved := 1
+	for reserved < limit {
+		select {
+		case e.windowSlots <- struct{}{}:
+			reserved++
+		default:
+			return reserved
+		}
+	}
+	return reserved
+}
+
+func (e *deliveryActorExecutor) releaseWindowSlots(count int) {
+	if e == nil || e.windowSlots == nil {
+		return
+	}
+	for i := 0; i < count; i++ {
+		select {
+		case <-e.windowSlots:
+		default:
+			panic("egress: active window reservation underflow")
+		}
 	}
 }
 
@@ -333,6 +399,9 @@ func (e *deliveryActorExecutor) releaseWork(work deliveryActorWork) {
 	}
 	if bytes, ok := work.reservation.take(); ok {
 		e.release(bytes)
+		if work.reservation.windowSlot {
+			e.releaseWindowSlots(1)
+		}
 	}
 }
 
@@ -476,110 +545,198 @@ type queueRunnerConfig struct {
 	clockSkewAllowance time.Duration
 }
 
+type deliveryQueueWorkerSignal struct {
+	durableDeadlineWake bool
+}
+
 func (s *Service) runQueue(ctx context.Context, cfg queueRunnerConfig, actors *deliveryActorExecutor, wait *sync.WaitGroup) {
 	if cfg.store == nil || cfg.wake == nil {
 		s.log.Error("durable queue dependency missing", zap.Uint8("queue_kind", uint8(cfg.kind)))
 		return
 	}
 	workers := normalizedOutboxWorkers(cfg.workers)
-	workerWakes := make([]chan struct{}, workers)
+	workerWakes := make([]chan deliveryQueueWorkerSignal, workers)
+	workerDone := make(chan bool, workers)
 	for i := range workerWakes {
-		workerWakes[i] = make(chan struct{}, 1)
-		workerWakes[i] <- struct{}{}
+		workerWakes[i] = make(chan deliveryQueueWorkerSignal, 1)
 	}
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		broadcastOutboxWake(ctx, cfg.wake, workerWakes)
-	}()
 	for worker := 0; worker < workers; worker++ {
 		worker := worker
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			s.runQueueWorker(ctx, cfg, worker, workerWakes[worker], actors)
+			s.runQueueWorker(ctx, cfg, worker, workerWakes[worker], workerDone, actors)
 		}()
 	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		dispatch := func(ctx context.Context, durableDeadlineWake bool) bool {
+			for _, workerWake := range workerWakes {
+				select {
+				case workerWake <- deliveryQueueWorkerSignal{durableDeadlineWake: durableDeadlineWake}:
+				case <-ctx.Done():
+					return false
+				}
+			}
+			worked := false
+			for range workerWakes {
+				select {
+				case workerWorked := <-workerDone:
+					worked = worked || workerWorked
+				case <-ctx.Done():
+					return false
+				}
+			}
+			return worked
+		}
+		nextReady := func(ctx context.Context) (store.OutboxNextReady, bool, error) {
+			return cfg.store.NextReadyAt(ctx, cfg.kind, 0, nil)
+		}
+		runWakeScheduledDispatchLoop(ctx, cfg.wake, dispatch, nextReady, func(err error) {
+			s.log.Warn("schedule durable delivery queue", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
+		})
+	}()
 }
 
 func (s *Service) runQueueWorker(
 	ctx context.Context,
 	cfg queueRunnerConfig,
 	worker int,
-	wake <-chan struct{},
+	wake <-chan deliveryQueueWorkerSignal,
+	done chan<- bool,
 	actors *deliveryActorExecutor,
 ) {
 	shards := logicalShardsForWorker(worker, cfg.workers)
 	owner := deliveryWorkerOwner(s.coordinator.instanceID, cfg.kind, worker)
+	laneLimit := deliveryActorLaneLimit(cfg.laneLimit, cfg.workers, actors.maxWindows)
 	recovery := store.OutboxRecoverBoundRequest{
 		QueueKind: cfg.kind, Mode: store.OutboxBoundRecoveryExactOwnerLive, Owner: owner,
 		LogicalShardCount: cfg.logicalCount, LogicalShardIDs: shards,
-		LaneLimit: cfg.laneLimit, LeaseDuration: cfg.lease,
+		LaneLimit: laneLimit, LeaseDuration: cfg.lease,
+	}
+	recoverySlots := actors.reserveWindowSlots(ctx, laneLimit)
+	recovery.LaneLimit = recoverySlots
+	if recoverySlots == 0 {
+		return
 	}
 	if windows, err := cfg.store.RecoverBoundWindows(ctx, recovery); err != nil {
+		actors.releaseWindowSlots(recoverySlots)
 		s.log.Error("recover bound delivery windows", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
 	} else {
-		for _, window := range windows {
-			if !actors.submit(ctx, window) {
-				return
-			}
+		if !submitReservedWindows(ctx, actors, windows, recoverySlots) {
+			return
 		}
 	}
 	claim := store.OutboxClaimRequest{
 		QueueKind: cfg.kind, LogicalShardCount: cfg.logicalCount, LogicalShardIDs: shards,
-		LaneLimit: cfg.laneLimit, WindowSize: cfg.windowSize, WindowByteLimit: cfg.windowBytes,
+		LaneLimit: laneLimit, WindowSize: cfg.windowSize, WindowByteLimit: cfg.windowBytes,
 		LeaseDuration: cfg.lease, PhysicalDuration: cfg.physicalDuration,
 		ClockSkewAllowance: cfg.clockSkewAllowance, Owner: owner,
 	}
 	expired := store.OutboxEvidenceExpiryRequest{
 		QueueKind:         cfg.kind,
 		LogicalShardCount: cfg.logicalCount, LogicalShardIDs: shards,
-		LaneLimit: cfg.laneLimit, MaxAttempts: maxOnlineDeliveryAttempts,
+		LaneLimit: laneLimit, MaxAttempts: maxOnlineDeliveryAttempts,
 	}
-	dispatch := func(ctx context.Context) bool {
+	finalizable := store.OutboxRecoverFinalizableRequest{
+		QueueKind: cfg.kind, LogicalShardCount: cfg.logicalCount,
+		LogicalShardIDs: shards, LaneLimit: laneLimit,
+		AttemptLimit: store.MaxDeliveryBatchItems,
+	}
+	dispatch := func(ctx context.Context, durableDeadlineWake bool) bool {
 		// The DB clock waits until recover_after (wire NotAfter + skew allowance)
 		// before resolving a missing receipt. Finalize before claiming a new fence;
 		// the domain actor queues any successor behind work still completing.
-		expiredFinalizers, err := cfg.store.ExpireEvidenceDeadlines(ctx, expired)
-		if err != nil {
-			s.log.Warn("expire durable delivery evidence", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
+		// A successful attempt mutation normally wakes the fixed finalizer through
+		// the local/Redis signal lane. If that acceleration signal is lost, the
+		// claim-time durable evidence deadline is still armed here and closes the
+		// commit-before-publish crash window without a periodic queue scan.
+		slots := actors.reserveWindowSlots(ctx, laneLimit)
+		if slots == 0 {
 			return false
 		}
-		if len(expiredFinalizers) > 0 {
-			finalized, err := cfg.store.FinalizeAttempts(ctx, expiredFinalizers)
+		if durableDeadlineWake {
+			request := finalizable
+			request.LaneLimit = slots
+			ready, err := cfg.store.RecoverFinalizableAttempts(ctx, request)
 			if err != nil {
-				s.log.Warn("finalize expired durable delivery evidence", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
+				actors.releaseWindowSlots(slots)
+				s.log.Warn("recover durable finalization at evidence deadline", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
 				return false
 			}
-			for _, next := range finalized.Next {
-				if !actors.submit(ctx, next) {
+			if len(ready) > 0 {
+				finalized, err := cfg.store.FinalizeAttempts(ctx, ready)
+				if err != nil {
+					actors.releaseWindowSlots(slots)
+					s.log.Warn("finalize durable evidence at deadline", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
 					return false
 				}
+				if !submitReservedWindows(ctx, actors, finalized.Next, slots) {
+					return false
+				}
+				return true
+			}
+			expiry := expired
+			expiry.LaneLimit = slots
+			expiredFinalizers, err := cfg.store.ExpireEvidenceDeadlines(ctx, expiry)
+			if err != nil {
+				actors.releaseWindowSlots(slots)
+				s.log.Warn("expire durable delivery evidence", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
+				return false
+			}
+			if len(expiredFinalizers) > 0 {
+				finalized, err := cfg.store.FinalizeAttempts(ctx, expiredFinalizers)
+				if err != nil {
+					actors.releaseWindowSlots(slots)
+					s.log.Warn("finalize expired durable delivery evidence", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
+					return false
+				}
+				if !submitReservedWindows(ctx, actors, finalized.Next, slots) {
+					return false
+				}
+				return true
 			}
 		}
-		windows, err := cfg.store.ClaimWindows(ctx, claim)
+		claimRequest := claim
+		claimRequest.LaneLimit = slots
+		claimStarted := time.Now()
+		windows, err := cfg.store.ClaimWindows(ctx, claimRequest)
+		claimedItems := 0
+		for _, window := range windows {
+			claimedItems += len(window.Items)
+		}
+		s.coordinator.observeStage(cfg.kind, "claim", claimStarted, claimedItems)
 		if err != nil {
+			actors.releaseWindowSlots(slots)
 			s.log.Warn("claim durable delivery windows", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
 			return false
 		}
 		if len(windows) == 0 {
+			actors.releaseWindowSlots(slots)
 			return false
 		}
 		for _, window := range windows {
 			s.coordinator.metrics.OutboxClaimed(len(window.Items))
-			if actors.submit(ctx, window) {
-				continue
-			}
-			s.coordinator.resolveItems(ctx, cfg.store, window.Owner, window.Items, errorsNewActorCapacity(), false)
+		}
+		if !submitReservedWindows(ctx, actors, windows, slots) {
+			return false
 		}
 		return true
 	}
-	nextReady := func(ctx context.Context) (store.OutboxNextReady, bool, error) {
-		return cfg.store.NextReadyAt(ctx, cfg.kind, cfg.logicalCount, shards)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case signal := <-wake:
+			worked := dispatch(ctx, signal.durableDeadlineWake)
+			select {
+			case done <- worked:
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
-	runWakeScheduledDispatchLoop(ctx, wake, dispatch, nextReady, func(err error) {
-		s.log.Warn("schedule durable delivery queue", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
-	})
 }
 
 func deliveryWorkerOwner(instanceID string, kind store.OutboxQueueKind, worker int) string {
@@ -587,52 +744,63 @@ func deliveryWorkerOwner(instanceID string, kind store.OutboxQueueKind, worker i
 }
 
 func errorsNewActorCapacity() error {
-	return fmt.Errorf("egress: domain actor mailbox capacity exhausted")
+	return errActorCapacity
 }
 
-func broadcastOutboxWake(ctx context.Context, wake <-chan struct{}, workers []chan struct{}) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-wake:
-			if !ok {
-				return
-			}
-			for _, worker := range workers {
-				select {
-				case worker <- struct{}{}:
-				default:
-				}
-			}
-		}
+func deliveryActorLaneLimit(configured, workers, maxWindows int) int {
+	if configured <= 0 {
+		configured = 1
 	}
+	workers = normalizedOutboxWorkers(workers)
+	limit := maxWindows / workers
+	if limit < 1 {
+		limit = 1
+	}
+	if configured < limit {
+		return configured
+	}
+	return limit
 }
 
-func (s *Service) runFinalizers(
+func submitReservedWindows(
+	ctx context.Context,
+	actors *deliveryActorExecutor,
+	windows []store.OutboxClaimWindow,
+	reserved int,
+) bool {
+	if actors == nil || reserved <= 0 || len(windows) > reserved {
+		if actors != nil && reserved > 0 {
+			actors.releaseWindowSlots(reserved)
+		}
+		return false
+	}
+	for i, window := range windows {
+		if actors.submitReserved(ctx, window) {
+			continue
+		}
+		actors.releaseWindowSlots(reserved - i - 1)
+		return false
+	}
+	actors.releaseWindowSlots(reserved - len(windows))
+	return true
+}
+
+func (s *Service) runStartupFinalizers(
 	ctx context.Context,
 	cfg queueRunnerConfig,
-	wake <-chan struct{},
 	actors *deliveryActorExecutor,
 	wait *sync.WaitGroup,
 ) {
 	workers := normalizedOutboxWorkers(cfg.workers)
-	workerWakes := make([]chan struct{}, workers)
-	for i := range workerWakes {
-		workerWakes[i] = make(chan struct{}, 1)
-		workerWakes[i] <- struct{}{}
-	}
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		broadcastOutboxWake(ctx, wake, workerWakes)
-	}()
 	for worker := 0; worker < workers; worker++ {
 		worker := worker
+		wake := make(chan struct{}, 1)
+		wake <- struct{}{}
+		close(wake)
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			s.runFinalizerWorker(ctx, cfg, worker, workerWakes[worker], actors)
+			s.runFinalizerWorker(ctx, cfg, worker, wake, actors)
 		}()
 	}
 }
@@ -645,9 +813,11 @@ func (s *Service) runFinalizerWorker(
 	actors *deliveryActorExecutor,
 ) {
 	shards := logicalShardsForWorker(worker, cfg.workers)
+	laneLimit := deliveryActorLaneLimit(cfg.laneLimit, cfg.workers, actors.maxWindows)
 	request := store.OutboxRecoverFinalizableRequest{
 		QueueKind: cfg.kind, LogicalShardCount: cfg.logicalCount,
-		LogicalShardIDs: shards, LaneLimit: cfg.laneLimit,
+		LogicalShardIDs: shards, LaneLimit: laneLimit,
+		AttemptLimit: store.MaxDeliveryBatchItems,
 	}
 	for {
 		select {
@@ -660,22 +830,32 @@ func (s *Service) runFinalizerWorker(
 		}
 		backoff := outboxScheduleErrorBackoff
 		for {
-			requests, err := cfg.store.RecoverFinalizableAttempts(ctx, request)
+			slots := actors.reserveWindowSlots(ctx, laneLimit)
+			if slots == 0 {
+				return
+			}
+			bounded := request
+			bounded.LaneLimit = slots
+			recoverStarted := time.Now()
+			requests, err := cfg.store.RecoverFinalizableAttempts(ctx, bounded)
+			s.coordinator.observeStage(cfg.kind, "recover_finalizable", recoverStarted, len(requests))
 			if err == nil && len(requests) == 0 {
+				actors.releaseWindowSlots(slots)
 				break
 			}
 			if err == nil {
 				var finalized store.OutboxFinalizeBatch
+				finalizeStarted := time.Now()
 				finalized, err = cfg.store.FinalizeAttempts(ctx, requests)
+				s.coordinator.observeStage(cfg.kind, "finalize", finalizeStarted, len(requests))
 				if err == nil {
-					for _, window := range finalized.Next {
-						if !actors.submit(ctx, window) {
-							return
-						}
+					if !submitReservedWindows(ctx, actors, finalized.Next, slots) {
+						return
 					}
 					continue
 				}
 			}
+			actors.releaseWindowSlots(slots)
 			s.log.Warn("recover durable finalization", zap.Uint8("queue_kind", uint8(cfg.kind)), zap.Error(err))
 			timer := time.NewTimer(backoff)
 			select {
@@ -690,31 +870,6 @@ func (s *Service) runFinalizerWorker(
 				backoff *= 2
 				if backoff > maxOutboxScheduleBackoff {
 					backoff = maxOutboxScheduleBackoff
-				}
-			}
-		}
-	}
-}
-
-func fanoutQueueWake(ctx context.Context, source <-chan struct{}, outputs ...chan struct{}) {
-	for _, output := range outputs {
-		select {
-		case output <- struct{}{}:
-		default:
-		}
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-source:
-			if !ok {
-				return
-			}
-			for _, output := range outputs {
-				select {
-				case output <- struct{}{}:
-				default:
 				}
 			}
 		}

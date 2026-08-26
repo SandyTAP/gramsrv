@@ -66,6 +66,35 @@ func TestRegistryExportsCoreExecGRPCMetrics(t *testing.T) {
 	}
 }
 
+func TestRegistryExportsEgressStageMetrics(t *testing.T) {
+	registry := New()
+	registry.OutboxStage("account_pts", "projection", 7*time.Millisecond, 12)
+
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	body := recorder.Body.String()
+	if !strings.Contains(body, `telesrv_egress_outbox_stage_seconds_bucket{queue="account_pts",stage="projection"`) {
+		t.Fatalf("egress stage histogram missing:\n%s", body)
+	}
+	if !strings.Contains(body, `telesrv_egress_outbox_stage_items_total{queue="account_pts",stage="projection"} 12`) {
+		t.Fatalf("egress stage item counter missing:\n%s", body)
+	}
+}
+
+func TestRegistryExportsPlainPrivateSendBatchMetrics(t *testing.T) {
+	registry := New()
+	registry.PlainPrivateSendBatch(9*time.Millisecond, 7, nil)
+
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	body := recorder.Body.String()
+	if !strings.Contains(body, `telesrv_core_plain_private_send_batches_total{outcome="ok"} 1`) ||
+		!strings.Contains(body, `telesrv_core_plain_private_send_tasks_total{outcome="ok"} 7`) ||
+		!strings.Contains(body, `telesrv_core_plain_private_send_batch_seconds_bucket{outcome="ok"`) {
+		t.Fatalf("plain private send batch metrics missing:\n%s", body)
+	}
+}
+
 func TestRegistryExportsCoreExecPendingAdmissionMetrics(t *testing.T) {
 	registry := New()
 	registry.CoreExecPendingAdmissionRejected("grpc", "capacity")

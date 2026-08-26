@@ -115,6 +115,123 @@ func TestRouterBuildOutboxUpdatesProjectsSenderPerViewerAndCaches(t *testing.T) 
 	if !reflect.DeepEqual(users.sparseRequest[viewerUserID], []int64{senderUserID}) {
 		t.Fatalf("sparse request = %+v, want viewer=%d ids=[%d]", users.sparseRequest, viewerUserID, senderUserID)
 	}
+
+	// A later Egress projection call for the same receiver/sender pair must use
+	// the bounded cross-call cache. The per-call viewerPeerCache is new, so this
+	// specifically proves the stable projection survived outside that object.
+	if _, err := router.buildOutboxUpdates(context.Background(), requests); err != nil {
+		t.Fatalf("buildOutboxUpdates cached: %v", err)
+	}
+	if users.sparseCalls != 1 || len(users.calls) != 0 {
+		t.Fatalf("cached user projection calls = sparse %d scalar %+v, want unchanged", users.sparseCalls, users.calls)
+	}
+
+	// Target and viewer invalidations are independent cache dimensions. Each
+	// must force exactly one new sparse projection and never a scalar fallback.
+	router.InvalidateRPCProjectionReadModelForUser(senderUserID)
+	if _, err := router.buildOutboxUpdates(context.Background(), requests); err != nil {
+		t.Fatalf("buildOutboxUpdates after target invalidation: %v", err)
+	}
+	if users.sparseCalls != 2 || len(users.calls) != 0 {
+		t.Fatalf("target invalidation calls = sparse %d scalar %+v, want 2/0", users.sparseCalls, users.calls)
+	}
+	router.InvalidateRPCProjectionReadModelForViewer(viewerUserID)
+	if _, err := router.buildOutboxUpdates(context.Background(), requests); err != nil {
+		t.Fatalf("buildOutboxUpdates after viewer invalidation: %v", err)
+	}
+	if users.sparseCalls != 3 || len(users.calls) != 0 {
+		t.Fatalf("viewer invalidation calls = sparse %d scalar %+v, want 3/0", users.sparseCalls, users.calls)
+	}
+}
+
+func TestOutboxProjectorBatchesPresenceOnceWithoutScalarFallback(t *testing.T) {
+	const (
+		senderA = int64(1000000201)
+		senderB = int64(1000000202)
+		viewerA = int64(1000000211)
+		viewerB = int64(1000000212)
+	)
+	users := &countingOutboxUsersService{users: map[int64]domain.User{
+		senderA: {ID: senderA, FirstName: "Sender A", LastSeenAt: 100},
+		senderB: {ID: senderB, FirstName: "Sender B", LastSeenAt: 200},
+	}}
+	presence := &outboxBatchPresenceProvider{records: map[int64][]EdgeLocationRecord{
+		senderA: {{UserID: senderA, ReceivesUpdates: true}},
+	}}
+	projector, err := NewOutboxProjector(Config{}, OutboxProjectionDeps{
+		Users: users, Presence: presence,
+	}, zaptest.NewLogger(t), clock.System)
+	if err != nil {
+		t.Fatalf("NewOutboxProjector: %v", err)
+	}
+	requests := []egress.OutboxUpdateRequest{
+		outboxNewMessageRequest(viewerA, senderA, 41),
+		outboxNewMessageRequest(viewerB, senderB, 42),
+	}
+	updates, err := projector.router.buildOutboxUpdates(context.Background(), requests)
+	if err != nil {
+		t.Fatalf("buildOutboxUpdates: %v", err)
+	}
+	if presence.calls != 1 || !reflect.DeepEqual(presence.userIDs, []int64{senderA, senderB}) {
+		t.Fatalf("batch presence calls=%d ids=%v, want one sorted union", presence.calls, presence.userIDs)
+	}
+	byA := tgUsersByIDForProjectionParity(updates[0].Users)[senderA]
+	if byA == nil {
+		t.Fatal("online sender missing from first update")
+	}
+	if _, ok := byA.Status.(*tg.UserStatusOnline); !ok {
+		t.Fatalf("online sender status=%T, want UserStatusOnline", byA.Status)
+	}
+	byB := tgUsersByIDForProjectionParity(updates[1].Users)[senderB]
+	if byB == nil {
+		t.Fatal("offline sender missing from second update")
+	}
+	if status, ok := byB.Status.(*tg.UserStatusOffline); !ok || status.WasOnline != 200 {
+		t.Fatalf("offline sender status=%#v, want was_online=200", byB.Status)
+	}
+}
+
+func TestNewOutboxProjectorRequiresBatchPresence(t *testing.T) {
+	users := &countingOutboxUsersService{users: map[int64]domain.User{}}
+	if _, err := NewOutboxProjector(Config{}, OutboxProjectionDeps{Users: users}, zaptest.NewLogger(t), clock.System); !errors.Is(err, ErrOutboxPresenceBatchUnavailable) {
+		t.Fatalf("NewOutboxProjector err=%v, want ErrOutboxPresenceBatchUnavailable", err)
+	}
+}
+
+type outboxBatchPresenceProvider struct {
+	calls   int
+	userIDs []int64
+	records map[int64][]EdgeLocationRecord
+	err     error
+}
+
+func (p *outboxBatchPresenceProvider) UserLocationRecordsForUsers(_ context.Context, userIDs []int64) (map[int64][]EdgeLocationRecord, error) {
+	p.calls++
+	p.userIDs = append([]int64(nil), userIDs...)
+	if p.err != nil {
+		return nil, p.err
+	}
+	out := make(map[int64][]EdgeLocationRecord, len(userIDs))
+	for _, userID := range userIDs {
+		out[userID] = append([]EdgeLocationRecord(nil), p.records[userID]...)
+	}
+	return out, nil
+}
+
+func outboxNewMessageRequest(viewerID, senderID int64, pts int) egress.OutboxUpdateRequest {
+	message := domain.Message{
+		ID: pts, OwnerUserID: viewerID,
+		Peer: domain.Peer{Type: domain.PeerTypeUser, ID: senderID},
+		From: domain.Peer{Type: domain.PeerTypeUser, ID: senderID},
+		Date: 1700000000 + pts, Body: "presence batch", Pts: pts,
+	}
+	return egress.OutboxUpdateRequest{
+		TargetUserID: viewerID,
+		Event: domain.UpdateEvent{
+			UserID: viewerID, Type: domain.UpdateEventNewMessage,
+			Pts: pts, PtsCount: 1, Date: message.Date, Message: message,
+		},
+	}
 }
 
 func TestRouterBuildOutboxUpdatesReplacesRawOnlyUserEnvelopeWithoutScalarFallback(t *testing.T) {

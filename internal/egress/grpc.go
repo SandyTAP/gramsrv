@@ -55,6 +55,8 @@ type GRPCDeliveryServerConfig struct {
 	Store           store.DispatchOutboxStore
 	DeliveryStore   store.DeliveryOutboxStore
 	ChannelStore    store.ChannelDeliveryStore
+	Mutations       AttemptMutationWriter
+	ClientAcks      ClientAckObservationSink
 	Logger          *zap.Logger
 	MaxRecvMsgBytes int
 	MaxSendMsgBytes int
@@ -96,7 +98,7 @@ func StartGRPCDelivery(ctx context.Context, cfg GRPCDeliveryServerConfig) (*grpc
 	if strings.TrimSpace(cfg.Token) == "" {
 		return nil, ErrGRPCDeliveryTokenMissing
 	}
-	if cfg.Store == nil || cfg.DeliveryStore == nil || cfg.ChannelStore == nil {
+	if cfg.Store == nil || cfg.DeliveryStore == nil || cfg.ChannelStore == nil || cfg.Mutations == nil || cfg.ClientAcks == nil {
 		return nil, ErrMissingDependency
 	}
 	if cfg.Logger == nil {
@@ -120,7 +122,7 @@ func StartGRPCDelivery(ctx context.Context, cfg GRPCDeliveryServerConfig) (*grpc
 	}
 	srv := grpc.NewServer(opts...)
 	egresspb.RegisterEgressDeliveryServiceServer(srv, newEgressDeliveryGRPCServer(
-		cfg.Store, cfg.DeliveryStore, cfg.ChannelStore, cfg.InstanceID,
+		cfg.Store, cfg.DeliveryStore, cfg.ChannelStore, cfg.Mutations, cfg.ClientAcks, cfg.InstanceID,
 	))
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus(egresspb.EgressDeliveryService_ServiceDesc.ServiceName, healthpb.HealthCheckResponse_SERVING)
@@ -257,10 +259,12 @@ func newEgressDeliveryGRPCServer(
 	dispatch store.DispatchOutboxStore,
 	absolute store.DeliveryOutboxStore,
 	channel store.ChannelDeliveryStore,
+	mutations AttemptMutationWriter,
+	clientAcks ClientAckObservationSink,
 	instanceID string,
 ) *egressDeliveryGRPCServer {
 	return &egressDeliveryGRPCServer{
-		stores:     deliveryEvidenceStores{dispatch: dispatch, absolute: absolute, channel: channel},
+		stores:     deliveryEvidenceStores{dispatch: dispatch, absolute: absolute, channel: channel, mutations: mutations, clientAcks: clientAcks},
 		instanceID: strings.TrimSpace(instanceID),
 	}
 }

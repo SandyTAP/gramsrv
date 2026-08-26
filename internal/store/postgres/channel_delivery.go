@@ -94,12 +94,9 @@ func (s *ChannelDeliveryStore) ClaimWindows(ctx context.Context, req store.Outbo
 	}
 
 	rows, err := s.db.Query(ctx, `
-WITH candidates AS MATERIALIZED (
-    SELECT l.channel_id, l.head_item_id, l.lease_fence AS old_lease_fence,
-           nextval('public.channel_delivery_lease_fence_seq') AS lease_fence,
-           statement_timestamp() + ($5::bigint * interval '1 microsecond') AS lease_until,
-           statement_timestamp() + ($9::bigint * interval '1 microsecond') AS command_not_after,
-           statement_timestamp() + (($9::bigint + $10::bigint) * interval '1 microsecond') AS evidence_deadline
+WITH picked AS MATERIALIZED (
+    SELECT l.channel_id, l.head_item_id, l.retry_count,
+           l.lease_fence AS old_lease_fence
     FROM channel_delivery_lanes l
     WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
       AND (
@@ -115,14 +112,25 @@ WITH candidates AS MATERIALIZED (
           FROM channel_delivery_attempts a
           WHERE a.channel_id = l.channel_id
             AND a.lease_fence = l.lease_fence
-            AND a.finalized_at IS NULL
             AND (a.targets_bound OR a.resolution <> 'pending')
       )
     ORDER BY l.ready_at, l.channel_id
     FOR UPDATE OF l SKIP LOCKED
     LIMIT $3
+), fence AS MATERIALIZED (
+    SELECT nextval('public.channel_delivery_lease_fence_seq') AS lease_fence
+    FROM picked
+    LIMIT 1
+), candidates AS MATERIALIZED (
+    SELECT p.channel_id, p.head_item_id, p.old_lease_fence, f.lease_fence,
+           p.retry_count + 1 AS attempt_no,
+           statement_timestamp() + ($5::bigint * interval '1 microsecond') AS lease_until,
+           statement_timestamp() + ($9::bigint * interval '1 microsecond') AS command_not_after,
+           statement_timestamp() + (($9::bigint + $10::bigint) * interval '1 microsecond') AS evidence_deadline
+    FROM picked p
+    CROSS JOIN fence f
 ), window_items AS MATERIALIZED (
-    SELECT l.channel_id, l.lease_fence, l.lease_until,
+    SELECT l.channel_id, l.lease_fence, l.attempt_no, l.lease_until,
            l.command_not_after, l.evidence_deadline,
            e.id AS item_id, e.min_pts, e.max_pts, e.projection_kind,
            e.audience_kind, e.audience_user_ids, e.affected_user_ids, e.ordinal
@@ -163,12 +171,7 @@ WITH candidates AS MATERIALIZED (
         FROM chain
     ) e
 ), numbered AS MATERIALIZED (
-    SELECT w.*,
-           COALESCE((
-               SELECT max(a.attempt_no)
-               FROM channel_delivery_attempts a
-               WHERE a.item_id = w.item_id
-           ), 0) + 1 AS attempt_no
+    SELECT w.*
     FROM window_items w
 ), planned_tails AS MATERIALIZED (
     SELECT DISTINCT ON (channel_id) channel_id, item_id, max_pts
@@ -178,6 +181,7 @@ WITH candidates AS MATERIALIZED (
     UPDATE channel_delivery_lanes l
     SET state = 'leased',
         lease_fence = c.lease_fence,
+        retry_count = c.attempt_no,
         lease_owner = $4,
         lease_until = c.lease_until,
         window_tail_item_id = tail.item_id,
@@ -199,16 +203,12 @@ WITH candidates AS MATERIALIZED (
     JOIN leased USING (channel_id, lease_fence, lease_until)
     RETURNING item_id, lease_fence, attempt_no
 ), superseded_unbound AS MATERIALIZED (
-    UPDATE channel_delivery_attempts old
-    SET finalized_at = clock_timestamp(),
-        final_outcome = 'superseded',
-        resolution_error = 'unbound channel delivery lease superseded after expiry'
-    FROM leased fresh
+    DELETE FROM channel_delivery_attempts old
+    USING leased fresh
     WHERE old.channel_id = fresh.channel_id
       AND old.lease_fence = fresh.old_lease_fence
       AND NOT old.targets_bound
       AND old.resolution = 'pending'
-      AND old.finalized_at IS NULL
     RETURNING old.item_id, old.lease_fence
 )
 SELECT n.channel_id, n.lease_fence, n.lease_until,
@@ -305,77 +305,56 @@ func (s *ChannelDeliveryStore) NextReadyAt(ctx context.Context, kind store.Outbo
 	if scoped && len(shards) == 0 {
 		return store.OutboxNextReady{}, false, nil
 	}
-	var observed time.Time
-	var readyAt *time.Time
+	var observed, readyAt time.Time
+	var recoverLease bool
 	err = s.db.QueryRow(ctx, `
-SELECT clock_timestamp(), min(
-    CASE state
-      WHEN 'ready' THEN ready_at
-      WHEN 'leased' THEN CASE WHEN NOT EXISTS (
-        SELECT 1
-        FROM channel_delivery_attempts pending_finalize
-        WHERE pending_finalize.channel_id = l.channel_id
-          AND pending_finalize.lease_fence = l.lease_fence
-          AND pending_finalize.item_id = l.head_item_id
-          AND pending_finalize.resolution <> 'pending'
-          AND pending_finalize.finalized_at IS NULL
-          AND (pending_finalize.retry_at IS NULL OR pending_finalize.retry_at <= clock_timestamp())
-      ) THEN LEAST(lease_until, COALESCE((
-        SELECT CASE
-          WHEN head_attempt.resolution = 'pending' THEN head_attempt.evidence_deadline
-          ELSE head_attempt.retry_at
-        END
-        FROM channel_delivery_attempts head_attempt
-        WHERE head_attempt.channel_id = l.channel_id
-          AND head_attempt.item_id = l.head_item_id
-          AND head_attempt.lease_fence = l.lease_fence
-          AND head_attempt.finalized_at IS NULL
-      ), lease_until)) END
-    END
+WITH db_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS observed
+), candidates AS MATERIALIZED (
+    SELECT c.observed,
+           CASE l.state
+             WHEN 'ready' THEN l.ready_at
+             WHEN 'leased' THEN CASE WHEN NOT EXISTS (
+               SELECT 1
+               FROM channel_delivery_attempts pending_finalize
+               WHERE pending_finalize.channel_id = l.channel_id
+                 AND pending_finalize.lease_fence = l.lease_fence
+                 AND pending_finalize.item_id = l.head_item_id
+                 AND pending_finalize.resolution <> 'pending'
+                 AND (pending_finalize.retry_at IS NULL OR pending_finalize.retry_at <= c.observed)
+             ) THEN LEAST(l.lease_until, COALESCE((
+               SELECT CASE
+                 WHEN head_attempt.resolution = 'pending' THEN head_attempt.evidence_deadline
+                 ELSE head_attempt.retry_at
+               END
+               FROM channel_delivery_attempts head_attempt
+               WHERE head_attempt.channel_id = l.channel_id
+                 AND head_attempt.item_id = l.head_item_id
+                 AND head_attempt.lease_fence = l.lease_fence
+             ), l.lease_until)) END
+           END AS ready_at,
+           l.state = 'leased' AS recover_lease
+    FROM channel_delivery_lanes l
+    CROSS JOIN db_clock c
+    WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
+      AND l.state IN ('ready', 'leased')
 )
-FROM channel_delivery_lanes l
-WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
-  AND state IN ('ready', 'leased')`, scoped, shards).Scan(&observed, &readyAt)
+SELECT observed, ready_at, recover_lease
+FROM candidates
+WHERE ready_at IS NOT NULL
+ORDER BY ready_at, recover_lease DESC
+LIMIT 1`, scoped, shards).Scan(&observed, &readyAt, &recoverLease)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.OutboxNextReady{}, false, nil
+	}
 	if err != nil {
 		return store.OutboxNextReady{}, false, fmt.Errorf("next channel delivery ready at: %w", err)
 	}
-	if readyAt == nil {
-		return store.OutboxNextReady{}, false, nil
+	readyKind := store.OutboxReadyClaim
+	if recoverLease {
+		readyKind = store.OutboxReadyRecoverLease
 	}
-	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: *readyAt}, true, nil
-}
-
-// DeleteFinalizedAttempts performs bounded capacity GC for durable channel
-// delivery tombstones. Finalized attempts remain queryable while their event
-// still exists; only tombstones whose immutable event has already been removed
-// are eligible. Target rows are removed by the attempt FK's ON DELETE CASCADE.
-func (s *ChannelDeliveryStore) DeleteFinalizedAttempts(ctx context.Context, finalizedBefore time.Time, limit int) (int, error) {
-	if finalizedBefore.IsZero() {
-		return 0, fmt.Errorf("delete finalized channel delivery attempts: finalized_before is required")
-	}
-	if limit <= 0 {
-		return 0, fmt.Errorf("delete finalized channel delivery attempts: positive limit is required")
-	}
-	if limit > maxOutboxTombstoneDeleteLimit {
-		limit = maxOutboxTombstoneDeleteLimit
-	}
-	tag, err := s.db.Exec(ctx, `
-WITH picked AS MATERIALIZED (
-  SELECT a.item_id, a.lease_fence
-  FROM channel_delivery_attempts a
-  WHERE a.finalized_at < $1
-    AND NOT EXISTS (SELECT 1 FROM channel_delivery_events e WHERE e.id = a.item_id)
-  ORDER BY a.finalized_at, a.item_id, a.lease_fence
-  LIMIT $2
-  FOR UPDATE SKIP LOCKED
-)
-DELETE FROM channel_delivery_attempts a
-USING picked p
-WHERE a.item_id = p.item_id AND a.lease_fence = p.lease_fence`, finalizedBefore, int32(limit))
-	if err != nil {
-		return 0, fmt.Errorf("delete finalized channel delivery attempts: %w", err)
-	}
-	return int(tag.RowsAffected()), nil
+	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: readyAt, Kind: readyKind}, true, nil
 }
 
 func normalizeChannelDeliveryWindow(size, byteLimit int) (int, int) {

@@ -22,7 +22,22 @@ type fakeRPCProjectionReadModelCache struct {
 	flushes int
 }
 
+type fakeAccountFreezeReadModelCache struct {
+	users   []int64
+	flushes int
+}
+
+func (f *fakeAccountFreezeReadModelCache) InvalidateAccountFreezeReadModel(userID int64) {
+	f.users = append(f.users, userID)
+}
+
+func (f *fakeAccountFreezeReadModelCache) FlushAccountFreezeReadModel() {
+	f.flushes++
+}
+
 func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForViewer(int64) {}
+func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForContactOwner(int64) {
+}
 func (f *fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForUser(id int64) {
 	f.users = append(f.users, id)
 }
@@ -106,9 +121,11 @@ func TestReadModelChangeListenerRoutesStoryPeer(t *testing.T) {
 func TestReadModelChangeListenerRoutesUserVisibility(t *testing.T) {
 	stories := &fakeStoryReadModelCache{}
 	rpcProjections := &fakeRPCProjectionReadModelCache{}
+	accountFreezes := &fakeAccountFreezeReadModelCache{}
 	listener := NewReadModelChangeListener("", ReadModelCacheSet{
 		Stories:        stories,
 		RPCProjections: rpcProjections,
+		AccountFreezes: accountFreezes,
 	}, nil)
 
 	listener.handlePayload(`{"model":"user_visibility","owner_user_id":0,"peer_type":"user","peer_id":777,"version":2}`)
@@ -118,11 +135,18 @@ func TestReadModelChangeListenerRoutesUserVisibility(t *testing.T) {
 	if peers := stories.peersSnapshot(); len(peers) != 1 || peers[0] != (domain.Peer{Type: domain.PeerTypeUser, ID: 777}) {
 		t.Fatalf("story projection invalidations = %+v, want user 777", peers)
 	}
+	if len(accountFreezes.users) != 1 || accountFreezes.users[0] != 777 {
+		t.Fatalf("account freeze invalidations = %v, want [777]", accountFreezes.users)
+	}
 
 	listener.handlePayload(`{"model":"user_visibility","owner_user_id":0,"peer_type":"channel","peer_id":888,"version":3}`)
 	listener.handlePayload(`{"model":"user_visibility","owner_user_id":0,"peer_type":"user","peer_id":0,"version":4}`)
-	if len(rpcProjections.users) != 1 || len(stories.peersSnapshot()) != 1 {
-		t.Fatalf("invalid visibility events were not ignored: users=%v peers=%+v", rpcProjections.users, stories.peersSnapshot())
+	if len(rpcProjections.users) != 1 || len(stories.peersSnapshot()) != 1 || len(accountFreezes.users) != 1 {
+		t.Fatalf("invalid visibility events were not ignored: users=%v peers=%+v freezes=%v", rpcProjections.users, stories.peersSnapshot(), accountFreezes.users)
+	}
+	listener.flush()
+	if accountFreezes.flushes != 1 {
+		t.Fatalf("account freeze reconnect flushes=%d want=1", accountFreezes.flushes)
 	}
 }
 

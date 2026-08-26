@@ -38,6 +38,14 @@ type ReadModelCacheSet struct {
 	BotProfiles        BotProfileReadModelCache
 	StarGifts          StarGiftCatalogCache
 	AccountSettings    AccountSettingsReadModelCache
+	AccountFreezes     AccountFreezeReadModelCache
+	CollectiblePhones  CollectiblePhoneReadModelCache
+	BusinessAutomation BusinessAutomationReadModelCache
+}
+
+type BusinessAutomationReadModelCache interface {
+	InvalidateBusinessAutomationReadModel(context.Context, int64) error
+	FlushBusinessAutomationReadModel()
 }
 
 type StarGiftCatalogCache interface {
@@ -52,6 +60,16 @@ type AccountSettingsReadModelCache interface {
 
 type AccountSettingsReadModelWarmer interface {
 	WarmAccountSettingsReadModel(context.Context, int64) error
+}
+
+type AccountFreezeReadModelCache interface {
+	InvalidateAccountFreezeReadModel(userID int64)
+	FlushAccountFreezeReadModel()
+}
+
+type CollectiblePhoneReadModelCache interface {
+	InvalidateCollectiblePhoneReadModel(userID int64)
+	FlushCollectiblePhoneReadModel()
 }
 
 // BaseUserCache 是跨进程共享的 user:base 缓存(Redis)。user_base/user_deleted
@@ -155,6 +173,7 @@ type PrivateMediaCountReadModelCache interface {
 
 type RPCProjectionReadModelCache interface {
 	InvalidateRPCProjectionReadModelForViewer(viewerUserID int64)
+	InvalidateRPCProjectionReadModelForContactOwner(ownerUserID int64)
 	InvalidateRPCProjectionReadModelForUser(userID int64)
 	InvalidateRPCProjectionReadModelForPeer(ownerUserID int64, peer domain.Peer)
 	InvalidateRPCProjectionReadModelForChannel(channelID int64)
@@ -253,7 +272,10 @@ func (l *ReadModelChangeListener) empty() bool {
 		l.caches.BaseUsers == nil &&
 		l.caches.BotProfiles == nil &&
 		l.caches.StarGifts == nil &&
-		l.caches.AccountSettings == nil
+		l.caches.AccountSettings == nil &&
+		l.caches.AccountFreezes == nil &&
+		l.caches.CollectiblePhones == nil &&
+		l.caches.BusinessAutomation == nil
 }
 
 func (l *ReadModelChangeListener) flush(reasons ...string) {
@@ -334,6 +356,18 @@ func (l *ReadModelChangeListener) flush(reasons ...string) {
 		l.caches.AccountSettings.FlushAccountSettingsReadModel()
 		flushed = append(flushed, "account_settings")
 	}
+	if l.caches.AccountFreezes != nil {
+		l.caches.AccountFreezes.FlushAccountFreezeReadModel()
+		flushed = append(flushed, "account_freezes")
+	}
+	if l.caches.CollectiblePhones != nil {
+		l.caches.CollectiblePhones.FlushCollectiblePhoneReadModel()
+		flushed = append(flushed, "collectible_phones")
+	}
+	if l.caches.BusinessAutomation != nil {
+		l.caches.BusinessAutomation.FlushBusinessAutomationReadModel()
+		flushed = append(flushed, "business_automation")
+	}
 	// 注意：BaseUsers(Redis) 刻意不在重连时 flush——它是跨实例共享缓存，整库清空会误伤
 	// 其它实例；漏掉的通知由其 5min TTL 兜底。
 	l.log.Info("read model caches flushed",
@@ -348,6 +382,56 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		l.log.Debug("ignore malformed read model change payload", zap.String("payload", payload), zap.Error(err))
 		return
 	}
+	l.handleChange(evt)
+}
+
+// HandleReadModelInvalidations applies Redis-transported exact keys through
+// the same cache semantics as PostgreSQL notifications.
+func (l *ReadModelChangeListener) HandleReadModelInvalidations(items []store.ReadModelInvalidation) {
+	if l == nil {
+		return
+	}
+	for _, item := range items {
+		l.handleChange(readModelChangePayload{
+			Model: item.Key.Model, OwnerUserID: item.Key.OwnerUserID,
+			PeerType: string(item.Key.PeerType), PeerID: item.Key.PeerID,
+			Version: item.Version, Hash: item.Hash,
+		})
+	}
+}
+
+// FlushRelayedReadModelCaches closes a Redis Pub/Sub disconnect window for the
+// cache families transported by the durable PostgreSQL -> Redis relay.
+func (l *ReadModelChangeListener) FlushRelayedReadModelCaches(reason string) {
+	if l == nil {
+		return
+	}
+	flushed := make([]string, 0, 4)
+	if l.caches.ReadModelVersions != nil {
+		l.caches.ReadModelVersions.FlushReadModelCache()
+		flushed = append(flushed, "read_model_versions")
+	}
+	if l.caches.ChannelDialogs != nil {
+		l.caches.ChannelDialogs.flush()
+		flushed = append(flushed, "channel_dialogs")
+	}
+	if l.caches.Dialogs != nil {
+		l.caches.Dialogs.FlushReadModelCache()
+		flushed = append(flushed, "dialogs")
+	}
+	if l.caches.RPCProjections != nil {
+		l.caches.RPCProjections.FlushRPCProjectionReadModel()
+		flushed = append(flushed, "rpc_projections")
+	}
+	if l.caches.BusinessAutomation != nil {
+		l.caches.BusinessAutomation.FlushBusinessAutomationReadModel()
+		flushed = append(flushed, "business_automation")
+	}
+	l.log.Info("relayed read-model caches flushed",
+		zap.String("reason", reason), zap.Strings("caches", flushed))
+}
+
+func (l *ReadModelChangeListener) handleChange(evt readModelChangePayload) {
 	if l.caches.ReadModelVersions != nil && evt.Model != "" {
 		key := store.ReadModelKey{
 			Model:       evt.Model,
@@ -362,6 +446,13 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		}
 	}
 	switch evt.Model {
+	case "business_automation":
+		if evt.OwnerUserID != 0 && l.caches.BusinessAutomation != nil {
+			if err := l.caches.BusinessAutomation.InvalidateBusinessAutomationReadModel(context.Background(), evt.OwnerUserID); err != nil {
+				l.log.Warn("invalidate business automation read model",
+					zap.Int64("owner_user_id", evt.OwnerUserID), zap.Error(err))
+			}
+		}
 	case "account_settings":
 		if evt.OwnerUserID != 0 && l.caches.AccountSettings != nil {
 			l.caches.AccountSettings.InvalidateAccountSettingsReadModel(evt.OwnerUserID)
@@ -418,11 +509,23 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		}
 	case "user_visibility":
 		if evt.PeerType == "user" && evt.PeerID != 0 {
+			if l.caches.AccountFreezes != nil {
+				l.caches.AccountFreezes.InvalidateAccountFreezeReadModel(evt.PeerID)
+			}
 			if l.caches.RPCProjections != nil {
 				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForUser(evt.PeerID)
 			}
 			if l.caches.Stories != nil {
 				l.caches.Stories.InvalidateStoryReadModelPeer(domain.Peer{Type: domain.PeerTypeUser, ID: evt.PeerID})
+			}
+		}
+	case "collectible_phone":
+		if evt.PeerType == "user" && evt.PeerID != 0 {
+			if l.caches.CollectiblePhones != nil {
+				l.caches.CollectiblePhones.InvalidateCollectiblePhoneReadModel(evt.PeerID)
+			}
+			if l.caches.RPCProjections != nil {
+				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForUser(evt.PeerID)
 			}
 		}
 	case "bot_full":
@@ -442,7 +545,14 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 			l.caches.Stories.InvalidateStoryReadModelPeer(domain.Peer{Type: domain.PeerTypeUser, ID: evt.OwnerUserID})
 		}
 		if evt.OwnerUserID != 0 && l.caches.RPCProjections != nil {
-			l.caches.RPCProjections.InvalidateRPCProjectionReadModelForViewer(evt.OwnerUserID)
+			if evt.Model == "contact_account" {
+				// contact_account is an owner-level aggregate event: direct contact
+				// fields affect owner-as-viewer, while the inverse contact edge can
+				// change how every viewer sees owner through privacy rules.
+				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForContactOwner(evt.OwnerUserID)
+			} else {
+				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForViewer(evt.OwnerUserID)
+			}
 		}
 	case "story_peer":
 		// stories / story_hidden_peers 写(0135 触发器)→ 按 owner peer 失效该 peer 的

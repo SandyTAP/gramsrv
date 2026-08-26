@@ -11,6 +11,11 @@ import (
 const (
 	rpcProjectionCacheTTL        = 30 * time.Minute
 	rpcProjectionCacheMaxEntries = 100000
+	// Receiver projection is keyed by (viewer,target), so a 1000-account load
+	// can legitimately retain more pairs than the heavier RPC object caches.
+	// This is a reservation ceiling only; entries are allocated on demand and
+	// evicted by the shared bounded LRU/TTL primitive.
+	receiverUserProjectionCacheMaxEntries = 200000
 )
 
 // userFullProjectionCache / peerSettingsProjectionCache / channelFullProjectionCache 是三个
@@ -20,6 +25,63 @@ const (
 type userFullProjectionKey struct {
 	viewerUserID int64
 	targetUserID int64
+}
+
+// receiverUserProjectionCache stores the stable, viewer-specific domain.User
+// projection used by Durable Egress. It deliberately sits before the runtime
+// presence overlay: online/offline status is recomputed for every TL build.
+// Values are deep-cloned because domain.User contains slice-backed fields.
+type receiverUserProjectionCache struct {
+	*projectionCache[userFullProjectionKey, domain.User]
+}
+
+func newReceiverUserProjectionCache(clock func() time.Time) *receiverUserProjectionCache {
+	return &receiverUserProjectionCache{
+		newProjectionCache[userFullProjectionKey, domain.User](receiverUserProjectionCacheMaxEntries, rpcProjectionCacheTTL, clock, cloneDomainUser),
+	}
+}
+
+func (c *receiverUserProjectionCache) Lookup(viewerUserID, targetUserID int64) (domain.User, bool) {
+	if c == nil || viewerUserID == 0 || targetUserID == 0 {
+		return domain.User{}, false
+	}
+	return c.lookup(userFullProjectionKey{viewerUserID: viewerUserID, targetUserID: targetUserID})
+}
+
+func (c *receiverUserProjectionCache) StoreIfEpoch(viewerUserID, targetUserID int64, user domain.User, loadEpoch uint64) {
+	if c == nil || viewerUserID == 0 || targetUserID == 0 || user.ID != targetUserID {
+		return
+	}
+	c.storeIfEpoch(userFullProjectionKey{viewerUserID: viewerUserID, targetUserID: targetUserID}, user, loadEpoch)
+}
+
+func (c *receiverUserProjectionCache) DeleteViewer(viewerUserID int64) {
+	if c == nil || viewerUserID == 0 {
+		return
+	}
+	c.deleteWhere(func(k userFullProjectionKey) bool { return k.viewerUserID == viewerUserID })
+}
+
+func (c *receiverUserProjectionCache) DeleteTarget(targetUserID int64) {
+	if c == nil || targetUserID == 0 {
+		return
+	}
+	c.deleteWhere(func(k userFullProjectionKey) bool { return k.targetUserID == targetUserID })
+}
+
+func (c *receiverUserProjectionCache) DeletePair(viewerUserID, targetUserID int64) {
+	if c == nil || viewerUserID == 0 || targetUserID == 0 {
+		return
+	}
+	c.deleteKey(userFullProjectionKey{viewerUserID: viewerUserID, targetUserID: targetUserID})
+}
+
+func cloneDomainUser(in domain.User) domain.User {
+	out := in
+	out.RestrictionReasons = append([]domain.UserRestrictionReason(nil), in.RestrictionReasons...)
+	out.ContactNoteEntities = append([]domain.MessageEntity(nil), in.ContactNoteEntities...)
+	out.PhotoStripped = append([]byte(nil), in.PhotoStripped...)
+	return out
 }
 
 type userFullProjectionCache struct {
@@ -135,6 +197,41 @@ type channelFullProjection struct {
 
 type channelFullProjectionCache struct {
 	*projectionCache[channelFullProjectionKey, channelFullProjection]
+}
+
+type peerUsernameProjectionCache struct {
+	*projectionCache[domain.Peer, []domain.Username]
+}
+
+func newPeerUsernameProjectionCache(clock func() time.Time) *peerUsernameProjectionCache {
+	return &peerUsernameProjectionCache{
+		newProjectionCache[domain.Peer, []domain.Username](rpcProjectionCacheMaxEntries, rpcProjectionCacheTTL, clock, cloneDomainUsernames),
+	}
+}
+
+func (c *peerUsernameProjectionCache) Lookup(peer domain.Peer) ([]domain.Username, bool) {
+	if c == nil || peer.ID == 0 {
+		return nil, false
+	}
+	return c.lookup(peer)
+}
+
+func (c *peerUsernameProjectionCache) StoreIfEpoch(peer domain.Peer, usernames []domain.Username, loadEpoch uint64) {
+	if c == nil || peer.ID == 0 {
+		return
+	}
+	c.storeIfEpoch(peer, usernames, loadEpoch)
+}
+
+func (c *peerUsernameProjectionCache) DeletePeer(peer domain.Peer) {
+	if c == nil || peer.ID == 0 {
+		return
+	}
+	c.deleteKey(peer)
+}
+
+func cloneDomainUsernames(in []domain.Username) []domain.Username {
+	return append([]domain.Username(nil), in...)
 }
 
 func newChannelFullProjectionCache(clock func() time.Time) *channelFullProjectionCache {
@@ -256,6 +353,9 @@ func cloneChatClasses(in []tg.ChatClass) []tg.ChatClass {
 }
 
 func (r *Router) invalidateRPCProjectionForViewer(viewerUserID int64) {
+	if r.receiverUserProjectionCache != nil {
+		r.receiverUserProjectionCache.DeleteViewer(viewerUserID)
+	}
 	if r.userFullProjectionCache != nil {
 		r.userFullProjectionCache.DeleteViewer(viewerUserID)
 	}
@@ -268,6 +368,10 @@ func (r *Router) invalidateRPCProjectionForViewer(viewerUserID int64) {
 }
 
 func (r *Router) invalidateRPCProjectionForUser(userID int64) {
+	if r.receiverUserProjectionCache != nil {
+		r.receiverUserProjectionCache.DeleteTarget(userID)
+		r.receiverUserProjectionCache.DeleteViewer(userID)
+	}
 	if r.userFullProjectionCache != nil {
 		r.userFullProjectionCache.DeleteTarget(userID)
 		r.userFullProjectionCache.DeleteViewer(userID)
@@ -275,6 +379,9 @@ func (r *Router) invalidateRPCProjectionForUser(userID int64) {
 	if r.peerSettingsProjectionCache != nil {
 		r.peerSettingsProjectionCache.DeleteViewer(userID)
 		r.peerSettingsProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeUser, ID: userID})
+	}
+	if r.peerUsernameProjectionCache != nil {
+		r.peerUsernameProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeUser, ID: userID})
 	}
 }
 
@@ -296,6 +403,9 @@ func (r *Router) InvalidateStarGiftProfiles(peers ...domain.Peer) {
 }
 
 func (r *Router) invalidateRPCProjectionForPeer(ownerUserID int64, peer domain.Peer) {
+	if r.receiverUserProjectionCache != nil && peer.Type == domain.PeerTypeUser {
+		r.receiverUserProjectionCache.DeletePair(ownerUserID, peer.ID)
+	}
 	if r.userFullProjectionCache != nil && peer.Type == domain.PeerTypeUser {
 		r.userFullProjectionCache.DeletePair(ownerUserID, peer.ID)
 	}
@@ -314,9 +424,15 @@ func (r *Router) invalidateRPCProjectionForChannel(channelID int64) {
 	if r.peerSettingsProjectionCache != nil {
 		r.peerSettingsProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
 	}
+	if r.peerUsernameProjectionCache != nil {
+		r.peerUsernameProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
+	}
 }
 
 func (r *Router) flushRPCProjectionCache() {
+	if r.receiverUserProjectionCache != nil {
+		r.receiverUserProjectionCache.Clear()
+	}
 	if r.userFullProjectionCache != nil {
 		r.userFullProjectionCache.Clear()
 	}
@@ -326,10 +442,27 @@ func (r *Router) flushRPCProjectionCache() {
 	if r.channelFullProjectionCache != nil {
 		r.channelFullProjectionCache.Clear()
 	}
+	if r.peerUsernameProjectionCache != nil {
+		r.peerUsernameProjectionCache.Clear()
+	}
 }
 
 func (r *Router) InvalidateRPCProjectionReadModelForViewer(viewerUserID int64) {
 	r.invalidateRPCProjectionForViewer(viewerUserID)
+}
+
+// InvalidateRPCProjectionReadModelForContactOwner invalidates both dimensions
+// affected by one owner's aggregate contact snapshot. The inverse owner->viewer
+// contact edge participates in privacy projection, while the read-model event
+// intentionally does not enumerate the changed peer.
+func (r *Router) InvalidateRPCProjectionReadModelForContactOwner(ownerUserID int64) {
+	r.invalidateRPCProjectionForViewer(ownerUserID)
+	if r.receiverUserProjectionCache != nil {
+		r.receiverUserProjectionCache.DeleteTarget(ownerUserID)
+	}
+	if r.userFullProjectionCache != nil {
+		r.userFullProjectionCache.DeleteTarget(ownerUserID)
+	}
 }
 
 func (r *Router) InvalidateRPCProjectionReadModelForUser(userID int64) {

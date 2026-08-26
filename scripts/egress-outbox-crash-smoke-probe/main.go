@@ -157,7 +157,7 @@ func run() error {
 	}
 	finalizable, err := queue.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
 		QueueKind: store.OutboxQueueDispatchPTS, LogicalShardCount: store.DispatchOutboxLogicalShards,
-		LogicalShardIDs: []int{shard}, LaneLimit: 1,
+		LogicalShardIDs: []int{shard}, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(finalizable) != 1 || finalizable[0].Ref != fresh {
 		return fmt.Errorf("current finalizable=%+v err=%v", finalizable, err)

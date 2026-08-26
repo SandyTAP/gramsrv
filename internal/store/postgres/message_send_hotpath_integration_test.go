@@ -48,7 +48,8 @@ func TestPlainPrivateSendHotPathDurableFactsAndQueryCount(t *testing.T) {
 		t.Fatalf("SendPrivateText: %v", err)
 	}
 	rows, err := pool.Query(baseCtx, `
-SELECT target_user_id, exclude_auth_key_id, exclude_session_id
+SELECT target_user_id, exclude_auth_key_id, exclude_session_id,
+       read_model_peer_type, read_model_peer_id
 FROM dispatch_outbox
 WHERE target_user_id = ANY($1::bigint[])
 ORDER BY target_user_id`, []int64{sender.ID, recipient.ID})
@@ -58,18 +59,25 @@ ORDER BY target_user_id`, []int64{sender.ID, recipient.ID})
 	defer rows.Close()
 	seen := 0
 	for rows.Next() {
-		var userID, sessionID int64
+		var userID, sessionID, readModelPeerID int64
 		var raw []byte
-		if err := rows.Scan(&userID, &raw, &sessionID); err != nil {
+		var readModelPeerType string
+		if err := rows.Scan(&userID, &raw, &sessionID, &readModelPeerType, &readModelPeerID); err != nil {
 			t.Fatalf("scan hot-path dispatch exclusion: %v", err)
 		}
 		if userID == sender.ID {
 			if string(raw) != string(highBitAuthKeyID[:]) || sessionID != 240824 {
 				t.Fatalf("sender exclusion = %x/%d, want exact %x/240824", raw, sessionID, highBitAuthKeyID)
 			}
+			if readModelPeerType != "user" || readModelPeerID != recipient.ID {
+				t.Fatalf("sender read-model peer = %s/%d, want user/%d", readModelPeerType, readModelPeerID, recipient.ID)
+			}
 		} else if userID == recipient.ID {
 			if string(raw) != string(make([]byte, 8)) || sessionID != 0 {
 				t.Fatalf("recipient exclusion = %x/%d, want zero", raw, sessionID)
+			}
+			if readModelPeerType != "user" || readModelPeerID != sender.ID {
+				t.Fatalf("recipient read-model peer = %s/%d, want user/%d", readModelPeerType, readModelPeerID, sender.ID)
 			}
 		} else {
 			t.Fatalf("unexpected dispatch user %d", userID)
@@ -86,11 +94,24 @@ ORDER BY target_user_id`, []int64{sender.ID, recipient.ID})
 		result.SenderMessage.Pts != 2 || result.RecipientMessage.Pts != 1 {
 		t.Fatalf("result = %+v, want boxes 2/1 and distinct PTS 2/1", result)
 	}
-	// BEGIN + one ordered-lock statement + one TTL/logical-message CTE + one
-	// combined PTS/projection CTE + COMMIT. The preflight lookup
+	// BEGIN + one ordered account-lock statement + one globally ordered dispatch
+	// append-fence statement + one local trigger-defer statement +
+	// one TTL/logical-message CTE + one combined PTS/projection CTE + COMMIT. The preflight lookup
 	// and PostgreSQL box-id query are deliberately absent from this contract.
-	if snapshot := stats.Snapshot(); snapshot.Queries != 5 || snapshot.Errors != 0 {
-		t.Fatalf("query stats = %+v, want exactly 5 successful statements", snapshot)
+	if snapshot := stats.Snapshot(); snapshot.Queries != 7 || snapshot.Errors != 0 {
+		t.Fatalf("query stats = %+v, want exactly 7 successful statements", snapshot)
+	}
+	var hotDialogVersionRows int
+	if err := pool.QueryRow(baseCtx, `
+SELECT count(*)
+FROM read_model_versions
+WHERE model='dialog_light'
+  AND ((owner_user_id=$1 AND peer_type='user' AND peer_id=$2)
+    OR (owner_user_id=$2 AND peer_type='user' AND peer_id=$1))`, sender.ID, recipient.ID).Scan(&hotDialogVersionRows); err != nil {
+		t.Fatalf("count hot dialog versions: %v", err)
+	}
+	if hotDialogVersionRows != 0 {
+		t.Fatalf("plain send wrote %d dialog_light version rows; hot PG token writes are forbidden", hotDialogVersionRows)
 	}
 
 	for _, fact := range []struct {
@@ -174,6 +195,36 @@ ON CONFLICT (user_id) DO UPDATE SET contiguous_pts = EXCLUDED.contiguous_pts`, s
 	}
 }
 
+func TestMessageBoxIndexesAreConsolidatedPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	var replyMissing, privateMissing, dialogPresent bool
+	if err := pool.QueryRow(ctx, `
+SELECT
+  to_regclass('public.message_boxes_reply_lookup_idx') IS NULL,
+  to_regclass('public.message_boxes_private_lookup_idx') IS NULL,
+  to_regclass('public.message_boxes_dialog_seek_idx') IS NOT NULL`).Scan(
+		&replyMissing, &privateMissing, &dialogPresent,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !replyMissing || !privateMissing || !dialogPresent {
+		t.Fatalf("consolidated indexes reply_missing=%t private_missing=%t dialog_present=%t",
+			replyMissing, privateMissing, dialogPresent)
+	}
+	var definition string
+	if err := pool.QueryRow(ctx, `
+SELECT pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'public.message_boxes'::regclass
+  AND conname = 'message_boxes_owner_user_id_private_message_id_key'`).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	if definition != "UNIQUE (private_message_id, owner_user_id)" {
+		t.Fatalf("message box pair uniqueness=%q", definition)
+	}
+}
+
 func BenchmarkPlainPrivateSendHotPath(b *testing.B) {
 	dsn := os.Getenv("TELESRV_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -218,7 +269,7 @@ func BenchmarkPlainPrivateSendHotPath(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(stats.Snapshot().Queries)/float64(b.N), "pg-queries/op")
-	b.ReportMetric(3, "business-sql/op")
+	b.ReportMetric(4, "business-sql/op")
 }
 
 func randomDigits(v int64) string {

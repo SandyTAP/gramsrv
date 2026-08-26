@@ -10,9 +10,11 @@ import (
 )
 
 type deliveryEvidenceStores struct {
-	dispatch store.DispatchOutboxStore
-	absolute store.DeliveryOutboxStore
-	channel  store.ChannelDeliveryStore
+	dispatch   store.DispatchOutboxStore
+	absolute   store.DeliveryOutboxStore
+	channel    store.ChannelDeliveryStore
+	mutations  AttemptMutationWriter
+	clientAcks ClientAckObservationSink
 }
 
 func (s deliveryEvidenceStores) forEdgeKind(kind edgecontrol.QueueKind) (store.DurableOutboxStateStore, store.OutboxQueueKind, bool) {
@@ -154,13 +156,15 @@ func applyPhysicalReceiptBatch(
 		if group == nil {
 			continue
 		}
-		applyPhysicalEvidenceGroup(ctx, group.store, group.evidenceIndices, group.evidence, group.resolutionIndices, group.resolutions, results)
+		applyPhysicalEvidenceGroup(ctx, stores.mutations, kind, group.store, group.evidenceIndices, group.evidence, group.resolutionIndices, group.resolutions, results)
 	}
 	return results
 }
 
 func applyPhysicalEvidenceGroup(
 	ctx context.Context,
+	mutations AttemptMutationWriter,
+	queueKind store.OutboxQueueKind,
 	stateStore store.DurableOutboxStateStore,
 	evidenceIndices []int,
 	evidence []store.OutboxAttemptEvidence,
@@ -168,14 +172,13 @@ func applyPhysicalEvidenceGroup(
 	resolutions []store.OutboxTargetAttemptResolution,
 	results []edgecontrol.PhysicalReceiptResult,
 ) {
-	if stateStore == nil {
+	if stateStore == nil || mutations == nil {
 		markPhysicalResultsRetryable(evidenceIndices, results)
 		markPhysicalResultsRetryable(resolutionIndices, results)
 		return
 	}
-	acceptedRefs := make(map[store.OutboxAttemptRef]struct{}, len(evidence)+len(resolutions))
 	if len(evidence) > 0 {
-		got, err := stateStore.RecordAttemptEvidenceBatch(ctx, evidence)
+		got, err := mutations.RecordAttemptEvidenceBatch(ctx, queueKind, evidence)
 		if err != nil || len(got) != len(evidence) {
 			markPhysicalResultsRetryable(evidenceIndices, results)
 		} else {
@@ -183,9 +186,6 @@ func applyPhysicalEvidenceGroup(
 				index := evidenceIndices[i]
 				switch result.Outcome {
 				case store.OutboxEvidenceRecorded, store.OutboxEvidenceDuplicate:
-					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptApplied}
-					acceptedRefs[result.Ref] = struct{}{}
-				case store.OutboxEvidenceAlreadyFinalized:
 					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptApplied}
 				case store.OutboxEvidenceFenced:
 					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptStale, Detail: edgecontrol.DetailAttemptConflict}
@@ -198,7 +198,7 @@ func applyPhysicalEvidenceGroup(
 		}
 	}
 	if len(resolutions) > 0 {
-		got, err := stateStore.ResolveTargetAttemptBatch(ctx, resolutions)
+		got, err := mutations.ResolveTargetAttemptBatch(ctx, queueKind, resolutions)
 		if err != nil || len(got) != len(resolutions) {
 			markPhysicalResultsRetryable(resolutionIndices, results)
 		} else {
@@ -206,9 +206,6 @@ func applyPhysicalEvidenceGroup(
 				index := resolutionIndices[i]
 				switch result.Outcome {
 				case store.OutboxResolutionRecorded, store.OutboxResolutionDuplicate:
-					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptApplied}
-					acceptedRefs[result.Ref] = struct{}{}
-				case store.OutboxResolutionAlreadyFinalized:
 					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptApplied}
 				case store.OutboxResolutionFenced:
 					results[index] = edgecontrol.PhysicalReceiptResult{Outcome: edgecontrol.PhysicalReceiptStale, Detail: edgecontrol.DetailAttemptConflict}
@@ -220,17 +217,9 @@ func applyPhysicalEvidenceGroup(
 			}
 		}
 	}
-	if len(acceptedRefs) == 0 {
-		return
-	}
-	requests := make([]store.OutboxFinalizeRequest, 0, len(acceptedRefs))
-	for ref := range acceptedRefs {
-		requests = append(requests, store.OutboxFinalizeRequest{Ref: ref})
-	}
-	// Evidence is already durable. A finalizer error must not cause Edge to
-	// resend the same receipt indefinitely; PostgreSQL finalize NOTIFY and the
-	// fixed finalizer pool will resume this exact prefix.
-	_, _ = stateStore.FinalizeAttempts(ctx, requests)
+	// The mutation actor hands successful exact refs to its bounded finalizer
+	// lane. This handler returns after that reliable handoff; it never performs
+	// per-lane finalization or a queue-wide recovery scan.
 }
 
 func markPhysicalResultsRetryable(indices []int, results []edgecontrol.PhysicalReceiptResult) {

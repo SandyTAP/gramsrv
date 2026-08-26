@@ -74,39 +74,34 @@ func (f *DeliveryFabric) PrepareDelivery(ctx context.Context, req DeliveryReques
 	if !time.Now().Before(req.NotAfter) {
 		return plan, fmt.Errorf("edgecontrol: delivery request deadline elapsed")
 	}
+	if req.Items[0].Ref.Domain.Kind != QueueChannelPTS {
+		route, err := f.PrepareAccountDeliveryRoute(ctx, AccountDeliveryRouteRequest{
+			TargetUserID: req.TargetUserID, ExcludeAuthKeyID: req.ExcludeAuthKeyID,
+			ExcludeSessionID: req.ExcludeSessionID, NotAfter: req.NotAfter,
+			EvidenceDeadline: req.EvidenceDeadline,
+		})
+		if err != nil {
+			return plan, err
+		}
+		return route.BindDelivery(req)
+	}
 	var targets []string
-	if req.Items[0].Ref.Domain.Kind == QueueChannelPTS {
-		registry, ok := f.registry.(ChannelDeliveryTargetRegistry)
-		if !ok {
-			return plan, fmt.Errorf("edgecontrol: channel delivery target registry is required")
-		}
-		routes := make([]ChannelDeliveryRoute, len(req.Items))
-		for i := range req.Items {
-			routes[i] = req.Items[i].Channel
-		}
-		var err error
-		targets, err = registry.ListChannelDeliveryTargets(ctx, routes)
-		if err != nil {
-			return plan, err
-		}
-		targets, err = canonicalDeliveryInstanceIDs(targets)
-		if err != nil {
-			return plan, err
-		}
-	} else {
-		records, err := f.registry.ListUser(ctx, req.TargetUserID)
-		if err != nil {
-			return plan, err
-		}
-		for _, record := range records {
-			if record.UserID == req.TargetUserID && record.ReceivesUpdates && !ValidDeliveryInstanceID(record.InstanceID) {
-				return plan, fmt.Errorf("edgecontrol: invalid delivery target instance identity")
-			}
-		}
-		// The planner runs in Egress, not on an Edge. Its instance ID must never be
-		// interpreted as a local Edge exclusion, even if deployment names collide.
-		targets = remoteDeliveryTargets("", req.TargetUserID, req.ExcludeAuthKeyID, req.ExcludeSessionID, records)
-		sort.Strings(targets)
+	registry, ok := f.registry.(ChannelDeliveryTargetRegistry)
+	if !ok {
+		return plan, fmt.Errorf("edgecontrol: channel delivery target registry is required")
+	}
+	routes := make([]ChannelDeliveryRoute, len(req.Items))
+	for i := range req.Items {
+		routes[i] = req.Items[i].Channel
+	}
+	var err error
+	targets, err = registry.ListChannelDeliveryTargets(ctx, routes)
+	if err != nil {
+		return plan, err
+	}
+	targets, err = canonicalDeliveryInstanceIDs(targets)
+	if err != nil {
+		return plan, err
 	}
 	if len(targets) > MaxDeliveryTargets {
 		return plan, fmt.Errorf("edgecontrol: delivery target count %d exceeds %d", len(targets), MaxDeliveryTargets)
@@ -132,6 +127,98 @@ func (f *DeliveryFabric) PrepareDelivery(ctx context.Context, req DeliveryReques
 	return plan, validateFrozenDeliveryPlanEnvelope(plan)
 }
 
+// PrepareAccountDeliveryRoute freezes the account registry snapshot before
+// PTS projection. It performs no payload work and never publishes.
+func (f *DeliveryFabric) PrepareAccountDeliveryRoute(
+	ctx context.Context,
+	req AccountDeliveryRouteRequest,
+) (FrozenAccountDeliveryRoute, error) {
+	var route FrozenAccountDeliveryRoute
+	if f == nil || f.registry == nil || f.bus == nil || f.executor == nil {
+		return route, ErrDeliveryIndeterminate
+	}
+	if !ValidDeliveryInstanceID(f.instanceID) {
+		return route, fmt.Errorf("edgecontrol: invalid delivery source instance identity")
+	}
+	if err := validateAccountDeliveryRouteRequest(req); err != nil {
+		return route, err
+	}
+	if !time.Now().Before(req.NotAfter) {
+		return route, fmt.Errorf("edgecontrol: delivery request deadline elapsed")
+	}
+	records, err := f.registry.ListUser(ctx, req.TargetUserID)
+	if err != nil {
+		return route, err
+	}
+	for _, record := range records {
+		if record.UserID == req.TargetUserID && record.ReceivesUpdates && !ValidDeliveryInstanceID(record.InstanceID) {
+			return route, fmt.Errorf("edgecontrol: invalid delivery target instance identity")
+		}
+	}
+	// Egress is not an Edge. Its instance ID must never become a local target
+	// exclusion even if deployment names happen to collide.
+	targetIDs := remoteDeliveryTargets("", req.TargetUserID, req.ExcludeAuthKeyID, req.ExcludeSessionID, records)
+	sort.Strings(targetIDs)
+	if len(targetIDs) > MaxDeliveryTargets {
+		return route, fmt.Errorf("edgecontrol: delivery target count %d exceeds %d", len(targetIDs), MaxDeliveryTargets)
+	}
+	for _, target := range targetIDs {
+		if !ValidDeliveryInstanceID(target) {
+			return route, fmt.Errorf("edgecontrol: invalid delivery target instance identity")
+		}
+	}
+	batchID, err := newDeliveryBatchID()
+	if err != nil {
+		return route, fmt.Errorf("edgecontrol: allocate delivery batch id: %w", err)
+	}
+	targets := make([]PreparedDeliveryTarget, len(targetIDs))
+	for i, target := range targetIDs {
+		commandID, err := newDeliveryCommandID()
+		if err != nil {
+			return FrozenAccountDeliveryRoute{}, fmt.Errorf("edgecontrol: allocate delivery command id: %w", err)
+		}
+		targets[i] = PreparedDeliveryTarget{TargetInstanceID: target, CommandID: commandID}
+	}
+	route = FrozenAccountDeliveryRoute{
+		batchID: batchID, sourceInstanceID: f.instanceID, targetUserID: req.TargetUserID,
+		excludeAuthKeyID: req.ExcludeAuthKeyID, excludeSessionID: req.ExcludeSessionID,
+		notAfter: req.NotAfter.UTC(), evidenceDeadline: req.EvidenceDeadline.UTC(), targets: targets,
+	}
+	return route, validateFrozenAccountDeliveryRoute(route)
+}
+
+func validateAccountDeliveryRouteRequest(req AccountDeliveryRouteRequest) error {
+	if req.TargetUserID <= 0 || (req.ExcludeAuthKeyID != ([8]byte{})) != (req.ExcludeSessionID != 0) {
+		return fmt.Errorf("edgecontrol: invalid account delivery route identity")
+	}
+	if req.NotAfter.IsZero() || req.NotAfter.UnixNano() <= 0 ||
+		!req.EvidenceDeadline.After(req.NotAfter) ||
+		req.EvidenceDeadline.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
+		return fmt.Errorf("edgecontrol: invalid account delivery route deadline")
+	}
+	return nil
+}
+
+func validateFrozenAccountDeliveryRoute(route FrozenAccountDeliveryRoute) error {
+	if route.batchID.Empty() || !ValidDeliveryInstanceID(route.sourceInstanceID) || route.targetUserID <= 0 ||
+		(route.excludeAuthKeyID != ([8]byte{})) != (route.excludeSessionID != 0) ||
+		route.notAfter.IsZero() || route.notAfter.UnixNano() <= 0 ||
+		!route.evidenceDeadline.After(route.notAfter) || len(route.targets) > MaxDeliveryTargets {
+		return fmt.Errorf("edgecontrol: invalid frozen account delivery route")
+	}
+	seen := make(map[string]struct{}, len(route.targets))
+	for _, target := range route.targets {
+		if !ValidDeliveryInstanceID(target.TargetInstanceID) || target.CommandID.Empty() {
+			return fmt.Errorf("edgecontrol: invalid frozen account delivery target")
+		}
+		if _, exists := seen[target.TargetInstanceID]; exists {
+			return fmt.Errorf("edgecontrol: duplicate frozen account delivery target")
+		}
+		seen[target.TargetInstanceID] = struct{}{}
+	}
+	return nil
+}
+
 // AdmitPreparedDelivery publishes only an already-frozen plan. It does not
 // consult the registry and therefore cannot race Egress's target-ledger bind.
 func (f *DeliveryFabric) AdmitPreparedDelivery(ctx context.Context, plan FrozenDeliveryPlan) (FrozenDelivery, error) {
@@ -142,8 +229,9 @@ func (f *DeliveryFabric) AdmitPreparedDelivery(ctx context.Context, plan FrozenD
 	if err := validateFrozenDeliveryPlanEnvelope(plan); err != nil {
 		return result, err
 	}
-	if !time.Now().Before(plan.notAfter) {
-		return result, fmt.Errorf("edgecontrol: prepared delivery deadline elapsed")
+	now := time.Now()
+	if !now.Before(plan.evidenceDeadline) {
+		return result, fmt.Errorf("edgecontrol: prepared delivery evidence deadline elapsed")
 	}
 	// Exact frozen-plan replay is legal only for the same stable Egress owner
 	// while its lease remains live. Cross-owner/expired recovery must resolve the
@@ -151,7 +239,11 @@ func (f *DeliveryFabric) AdmitPreparedDelivery(ctx context.Context, plan FrozenD
 	if plan.sourceInstanceID != f.instanceID {
 		return result, fmt.Errorf("edgecontrol: prepared delivery source mismatch")
 	}
-	admitCtx, cancel := context.WithDeadline(ctx, plan.notAfter)
+	admissionDeadline := plan.notAfter
+	if !now.Before(plan.notAfter) {
+		admissionDeadline = plan.evidenceDeadline
+	}
+	admitCtx, cancel := context.WithDeadline(ctx, admissionDeadline)
 	defer cancel()
 	result.Targets = make([]TargetAdmission, len(plan.targets))
 	if len(plan.targets) == 0 {
@@ -166,6 +258,7 @@ func (f *DeliveryFabric) AdmitPreparedDelivery(ctx context.Context, plan FrozenD
 			TargetUserID: plan.targetUserID, ExcludeAuthKeyID: plan.excludeAuthKeyID,
 			ExcludeSessionID: plan.excludeSessionID,
 			NotAfter:         plan.notAfter,
+			EvidenceDeadline: plan.evidenceDeadline,
 			Items:            plan.items,
 		}
 		result.Targets[i] = TargetAdmission{TargetInstanceID: target.TargetInstanceID, CommandID: target.CommandID}
@@ -210,10 +303,11 @@ func (f *DeliveryFabric) AdmitPreparedDelivery(ctx context.Context, plan FrozenD
 }
 
 func validateDeliveryRequestEnvelope(req DeliveryRequest) error {
-	if req.TargetUserID < 0 || len(req.Items) == 0 || len(req.Items) > MaxDeliveryBatchItems || req.NotAfter.IsZero() || req.NotAfter.UnixNano() <= 0 {
+	if req.TargetUserID < 0 || len(req.Items) == 0 || len(req.Items) > MaxDeliveryBatchItems ||
+		req.NotAfter.IsZero() || req.NotAfter.UnixNano() <= 0 || !req.EvidenceDeadline.After(req.NotAfter) {
 		return fmt.Errorf("edgecontrol: invalid delivery request")
 	}
-	if req.NotAfter.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
+	if req.EvidenceDeadline.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
 		return fmt.Errorf("edgecontrol: delivery request deadline exceeds maximum horizon")
 	}
 	if (req.ExcludeAuthKeyID != ([8]byte{})) != (req.ExcludeSessionID != 0) {
@@ -277,7 +371,7 @@ func validateFrozenDeliveryPlan(plan FrozenDeliveryPlan) error {
 
 func validateFrozenDeliveryPlanEnvelope(plan FrozenDeliveryPlan) error {
 	if plan.batchID.Empty() || plan.sourceInstanceID == "" || plan.targetUserID < 0 ||
-		len(plan.items) == 0 || plan.notAfter.IsZero() {
+		len(plan.items) == 0 || plan.notAfter.IsZero() || !plan.evidenceDeadline.After(plan.notAfter) {
 		return fmt.Errorf("edgecontrol: invalid frozen delivery plan")
 	}
 	if !ValidDeliveryInstanceID(plan.sourceInstanceID) || len(plan.targets) > MaxDeliveryTargets {
@@ -287,6 +381,7 @@ func validateFrozenDeliveryPlanEnvelope(plan FrozenDeliveryPlan) error {
 		TargetUserID: plan.targetUserID, ExcludeAuthKeyID: plan.excludeAuthKeyID,
 		ExcludeSessionID: plan.excludeSessionID,
 		NotAfter:         plan.notAfter,
+		EvidenceDeadline: plan.evidenceDeadline,
 		Items:            plan.items,
 	}
 	if err := validateDeliveryRequestEnvelope(request); err != nil {
@@ -313,9 +408,14 @@ func (f *DeliveryFabric) sendAdmission(ctx context.Context, target string, batch
 	if timeout < minDeliveryCommandTimeout {
 		timeout = minDeliveryCommandTimeout
 	}
-	deadline := time.Now().Add(timeout)
-	if batch.NotAfter.Before(deadline) {
-		deadline = batch.NotAfter
+	now := time.Now()
+	deadline := now.Add(timeout)
+	capDeadline := batch.NotAfter
+	if !now.Before(batch.NotAfter) {
+		capDeadline = batch.EvidenceDeadline
+	}
+	if capDeadline.Before(deadline) {
+		deadline = capDeadline
 	}
 	if !time.Now().Before(deadline) {
 		return bindDeliveryAdmission(batch, DeliveryAdmission{}), fmt.Errorf("edgecontrol: delivery deadline elapsed before admission")

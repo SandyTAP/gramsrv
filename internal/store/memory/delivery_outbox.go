@@ -13,15 +13,16 @@ import (
 )
 
 type memoryOutboxLane struct {
-	streamID   int64
-	headItemID int64
-	state      string
-	readyAt    time.Time
-	fence      uint64
-	owner      string
-	leaseUntil time.Time
-	windowEnd  int64
-	lastError  string
+	streamID    int64
+	headItemID  int64
+	state       string
+	readyAt     time.Time
+	fence       uint64
+	owner       string
+	leaseUntil  time.Time
+	windowEnd   int64
+	headAttempt int
+	lastError   string
 }
 
 type memoryAttemptKey struct {
@@ -42,10 +43,6 @@ type memoryAttemptTarget struct {
 	eligibleSessions         int
 	writtenSessions          int
 	physicalFirstServerMsgID int64
-	clientAckAt              time.Time
-	clientAckAuthKeyID       [8]byte
-	clientAckSessionID       int64
-	clientAckServerMsgID     int64
 }
 
 type memoryOutboxAttempt struct {
@@ -63,16 +60,14 @@ type memoryOutboxAttempt struct {
 	resolution       store.OutboxResolutionKind
 	retryAt          time.Time
 	lastError        string
-	finalized        bool
-	finalizedAt      time.Time
-	finalOutcome     store.OutboxFinalizeOutcome
 }
 
 const memoryOutboxLeaseSafetyMargin = 100 * time.Millisecond
 
 // DeliveryOutboxStore is a production-isomorphic in-memory absolute delivery
 // state machine. Its mutex replaces PostgreSQL row locks only for tests; every
-// fence, evidence, prefix and tombstone transition is retained.
+// fence, evidence and prefix transition is retained. Finalized attempts are
+// deleted in the same critical section as their item/lane transition.
 type DeliveryOutboxStore struct {
 	mu        sync.Mutex
 	nextID    int64
@@ -236,21 +231,23 @@ func (s *DeliveryOutboxStore) ClaimWindows(_ context.Context, req store.OutboxCl
 		lane.fence = s.nextFence
 		s.nextFence++
 		if oldFence > 0 {
-			for _, old := range s.memoryCurrentAttempts(lane.streamID, oldFence) {
-				old.finalized = true
-				old.finalizedAt = now
+			for key, old := range s.attempts {
+				if old.ref.StreamID == lane.streamID && key.fence == oldFence {
+					delete(s.attempts, key)
+				}
 			}
 		}
 		lane.state = "leased"
 		lane.owner = req.Owner
 		lane.leaseUntil = now.Add(req.LeaseDuration)
 		lane.windowEnd = windowItems[len(windowItems)-1].ID
+		lane.headAttempt++
 		window := store.OutboxClaimWindow{
 			QueueKind: store.OutboxQueueAbsoluteDelivery, StreamID: lane.streamID,
 			Owner: lane.owner, LeaseFence: lane.fence, LeaseUntil: lane.leaseUntil,
 		}
 		for ordinal, item := range windowItems {
-			attemptNo := s.nextAttempt(item.ID)
+			attemptNo := lane.headAttempt
 			ref := store.OutboxAttemptRef{
 				QueueKind: store.OutboxQueueAbsoluteDelivery, StreamID: item.TargetUserID,
 				ItemID: item.ID, Sequence: 0, LeaseFence: lane.fence, Attempt: attemptNo,
@@ -369,7 +366,7 @@ func (s *DeliveryOutboxStore) RecoverBoundWindows(_ context.Context, req store.O
 func (s *DeliveryOutboxStore) memoryCurrentAttempts(streamID int64, fence uint64) []*memoryOutboxAttempt {
 	result := make([]*memoryOutboxAttempt, 0)
 	for _, attempt := range s.attempts {
-		if attempt.ref.StreamID == streamID && attempt.ref.LeaseFence == fence && !attempt.finalized {
+		if attempt.ref.StreamID == streamID && attempt.ref.LeaseFence == fence {
 			result = append(result, attempt)
 		}
 	}
@@ -395,6 +392,9 @@ func (s *DeliveryOutboxStore) memoryLaneRecoverable(lane *memoryOutboxLane, mode
 func (s *DeliveryOutboxStore) RecoverFinalizableAttempts(_ context.Context, req store.OutboxRecoverFinalizableRequest) ([]store.OutboxFinalizeRequest, error) {
 	if req.QueueKind != store.OutboxQueueAbsoluteDelivery {
 		return nil, fmt.Errorf("recover finalizable absolute delivery attempts: queue kind %d", req.QueueKind)
+	}
+	if req.AttemptLimit <= 0 || req.AttemptLimit > store.MaxDeliveryBatchItems {
+		return nil, fmt.Errorf("recover finalizable absolute delivery attempts: attempt limit must be between 1 and %d", store.MaxDeliveryBatchItems)
 	}
 	if req.LaneLimit <= 0 {
 		req.LaneLimit = 100
@@ -435,6 +435,9 @@ func (s *DeliveryOutboxStore) RecoverFinalizableAttempts(_ context.Context, req 
 		for _, attempt := range s.memoryCurrentAttempts(lane.streamID, lane.fence) {
 			if attempt.resolution != 0 && (attempt.retryAt.IsZero() || !attempt.retryAt.After(time.Now())) {
 				requests = append(requests, store.OutboxFinalizeRequest{Ref: attempt.ref})
+				if len(requests) == req.AttemptLimit {
+					return requests, nil
+				}
 			}
 		}
 	}
@@ -473,7 +476,7 @@ func (s *DeliveryOutboxStore) ExpireEvidenceDeadlines(_ context.Context, req sto
 			}
 		}
 		attempt := s.attempts[memoryAttemptKey{itemID: lane.headItemID, fence: lane.fence}]
-		if attempt == nil || attempt.finalized || attempt.resolution != 0 ||
+		if attempt == nil || attempt.resolution != 0 ||
 			attempt.evidenceDeadline.IsZero() || attempt.evidenceDeadline.After(now) {
 			continue
 		}
@@ -556,7 +559,11 @@ func (s *DeliveryOutboxStore) BindAttemptTargets(_ context.Context, sets []store
 			continue
 		}
 		if attempt.targetsBound {
-			if attempt.sourceInstanceID == sourceInstanceID && sameMemoryTargetSet(attempt.targets, wanted) {
+			equal := attempt.sourceInstanceID == sourceInstanceID && sameMemoryTargetSet(attempt.targets, wanted)
+			if equal && len(wanted) == 0 && (!attempt.emptyEvidence || attempt.resolution != memoryConfirmedResolution) {
+				equal = false
+			}
+			if equal {
 				results[i].Outcome = store.OutboxBindTargetDuplicate
 			} else {
 				results[i].Outcome = store.OutboxBindTargetRejected
@@ -571,6 +578,10 @@ func (s *DeliveryOutboxStore) BindAttemptTargets(_ context.Context, sets []store
 		attempt.targetsBound = true
 		attempt.sourceInstanceID = sourceInstanceID
 		attempt.targets = wanted
+		if len(wanted) == 0 {
+			attempt.emptyEvidence = true
+			attempt.resolution = memoryConfirmedResolution
+		}
 		results[i].Outcome = store.OutboxBindTargetBound
 	}
 	return results, nil
@@ -589,9 +600,6 @@ func (s *DeliveryOutboxStore) RecordAttemptEvidenceBatch(_ context.Context, evid
 	}
 	seen := make(map[evidenceKey]store.OutboxAttemptEvidence, len(evidence))
 	for i, item := range evidence {
-		if item.Kind == store.OutboxEvidenceClientAck {
-			continue
-		}
 		key := evidenceKey{
 			ref: item.Ref, targetInstanceID: item.TargetInstanceID, targetUserID: item.TargetUserID,
 			batchID: item.BatchID, commandID: item.CommandID,
@@ -624,11 +632,6 @@ func (s *DeliveryOutboxStore) RecordAttemptEvidenceBatch(_ context.Context, evid
 				results[i].Outcome = store.OutboxEvidenceRejected
 				continue
 			}
-		case store.OutboxEvidenceClientAck:
-			if item.EligibleSessions != 0 || item.WrittenSessions != 0 {
-				results[i].Outcome = store.OutboxEvidenceRejected
-				continue
-			}
 		default:
 			results[i].Outcome = store.OutboxEvidenceRejected
 			continue
@@ -649,8 +652,8 @@ func (s *DeliveryOutboxStore) RecordAttemptEvidenceBatch(_ context.Context, evid
 		}
 		// Match the durable stores: only the store clock authorizes physical
 		// completion. ObservedAt is diagnostic and cannot revive an expired
-		// command. Client ACK remains a non-completing observation.
-		if item.Kind != store.OutboxEvidenceClientAck && !time.Now().Before(attempt.evidenceDeadline) {
+		// command.
+		if !time.Now().Before(attempt.evidenceDeadline) {
 			results[i].Outcome = store.OutboxEvidenceFenced
 			continue
 		}
@@ -677,20 +680,6 @@ func (s *DeliveryOutboxStore) RecordAttemptEvidenceBatch(_ context.Context, evid
 		target, ok := attempt.targets[key]
 		if !ok {
 			results[i].Outcome = store.OutboxEvidenceRejected
-			continue
-		}
-		if item.Kind == store.OutboxEvidenceClientAck {
-			if item.AuthKeyID == ([8]byte{}) || item.SessionID == 0 || item.ServerMsgID <= 0 {
-				results[i].Outcome = store.OutboxEvidenceRejected
-			} else if !target.clientAckAt.IsZero() {
-				results[i].Outcome = store.OutboxEvidenceDuplicate
-			} else {
-				target.clientAckAt = item.ObservedAt
-				target.clientAckAuthKeyID = item.AuthKeyID
-				target.clientAckSessionID = item.SessionID
-				target.clientAckServerMsgID = item.ServerMsgID
-				results[i].Outcome = store.OutboxEvidenceRecorded
-			}
 			continue
 		}
 		if item.Kind != store.OutboxEvidenceEdgeWritten && item.Kind != store.OutboxEvidenceEdgeNoEligible {
@@ -885,7 +874,6 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 	sort.Slice(streams, func(i, j int) bool { return streams[i] < streams[j] })
 	newly := make(map[memoryAttemptKey]store.OutboxFinalizeOutcome)
 	var next []store.OutboxClaimWindow
-	finalizedAt := time.Now()
 	for _, streamID := range streams {
 		lane := s.lanes[streamID]
 		if lane == nil || lane.state != "leased" {
@@ -911,10 +899,15 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 		consumed := 0
 		stopped := false
 		stopIndex := -1
+		var physicalDuration, clockSkewAllowance time.Duration
 		for itemIndex, item := range current {
 			attempt := s.attempts[memoryAttemptKey{item.ID, lane.fence}]
-			if attempt == nil || attempt.finalized || attempt.resolution == 0 {
+			if attempt == nil || attempt.resolution == 0 {
 				break
+			}
+			if physicalDuration == 0 {
+				physicalDuration = attempt.commandNotAfter.Sub(attempt.issuedAt)
+				clockSkewAllowance = attempt.evidenceDeadline.Sub(attempt.commandNotAfter)
 			}
 			if !attempt.retryAt.IsZero() && attempt.retryAt.After(time.Now()) {
 				break
@@ -922,24 +915,17 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 			key := memoryAttemptKey{item.ID, lane.fence}
 			switch attempt.resolution {
 			case memoryConfirmedResolution:
-				attempt.finalized = true
-				attempt.finalizedAt = finalizedAt
-				attempt.finalOutcome = store.OutboxFinalizeApplied
-				newly[key] = attempt.finalOutcome
+				newly[key] = store.OutboxFinalizeApplied
+				delete(s.attempts, key)
 				delete(s.items, item.ID)
 				consumed++
 			case store.OutboxResolutionAbandoned:
-				attempt.finalized = true
-				attempt.finalizedAt = finalizedAt
-				attempt.finalOutcome = store.OutboxFinalizeAbandoned
-				newly[key] = attempt.finalOutcome
+				newly[key] = store.OutboxFinalizeAbandoned
+				delete(s.attempts, key)
 				delete(s.items, item.ID)
 				consumed++
 			case store.OutboxResolutionRetry:
-				attempt.finalized = true
-				attempt.finalizedAt = finalizedAt
-				attempt.finalOutcome = store.OutboxFinalizeScheduledRetry
-				newly[key] = attempt.finalOutcome
+				newly[key] = store.OutboxFinalizeScheduledRetry
 				lane.state = "ready"
 				lane.readyAt = attempt.retryAt
 				lane.owner = ""
@@ -954,11 +940,8 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 			}
 		}
 		if stopped {
-			for _, suffix := range current[stopIndex+1:] {
-				if attempt := s.attempts[memoryAttemptKey{suffix.ID, lane.fence}]; attempt != nil && !attempt.finalized {
-					attempt.finalized = true
-					attempt.finalizedAt = finalizedAt
-				}
+			for _, suffix := range current[stopIndex:] {
+				delete(s.attempts, memoryAttemptKey{suffix.ID, lane.fence})
 			}
 			continue
 		}
@@ -971,6 +954,7 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 		if consumed < len(current) {
 			continue
 		}
+		lane.headAttempt = 0
 		var retain *store.OutboxFinalizeRequest
 		for _, index := range byStream[streamID] {
 			request := &requests[index]
@@ -987,7 +971,7 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 			lane.windowEnd = 0
 			continue
 		}
-		window, err := s.issueMemoryHandoff(lane, *retain)
+		window, err := s.issueMemoryHandoff(lane, *retain, physicalDuration, clockSkewAllowance)
 		if err != nil {
 			return store.OutboxFinalizeBatch{}, err
 		}
@@ -1004,8 +988,6 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 		attempt := s.attempts[key]
 		if attempt == nil || attempt.ref != request.Ref {
 			results[i].Outcome = store.OutboxFinalizeFenced
-		} else if attempt.finalized {
-			results[i].Outcome = store.OutboxFinalizeAlreadyFinalized
 		} else if lane := s.lanes[request.Ref.StreamID]; lane != nil && lane.fence == request.Ref.LeaseFence {
 			results[i].Outcome = store.OutboxFinalizeWaitingForPredecessor
 		} else {
@@ -1013,47 +995,6 @@ func (s *DeliveryOutboxStore) FinalizeAttempts(_ context.Context, requests []sto
 		}
 	}
 	return store.OutboxFinalizeBatch{Results: results, Next: next}, nil
-}
-
-func (s *DeliveryOutboxStore) DeleteFinalizedAttempts(_ context.Context, finalizedBefore time.Time, limit int) (int, error) {
-	if finalizedBefore.IsZero() {
-		return 0, fmt.Errorf("delete finalized absolute delivery attempts: finalized_before is required")
-	}
-	if limit <= 0 {
-		return 0, fmt.Errorf("delete finalized absolute delivery attempts: positive limit is required")
-	}
-	if limit > 10000 {
-		limit = 10000
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	type candidate struct {
-		key memoryAttemptKey
-		at  time.Time
-	}
-	candidates := make([]candidate, 0)
-	for key, attempt := range s.attempts {
-		_, itemStillActive := s.items[key.itemID]
-		if attempt.finalized && !itemStillActive && !attempt.finalizedAt.IsZero() && attempt.finalizedAt.Before(finalizedBefore) {
-			candidates = append(candidates, candidate{key: key, at: attempt.finalizedAt})
-		}
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if !candidates[i].at.Equal(candidates[j].at) {
-			return candidates[i].at.Before(candidates[j].at)
-		}
-		if candidates[i].key.itemID != candidates[j].key.itemID {
-			return candidates[i].key.itemID < candidates[j].key.itemID
-		}
-		return candidates[i].key.fence < candidates[j].key.fence
-	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-	for _, candidate := range candidates {
-		delete(s.attempts, candidate.key)
-	}
-	return len(candidates), nil
 }
 
 func (s *DeliveryOutboxStore) NextReadyAt(_ context.Context, kind store.OutboxQueueKind, shardCount int, shardIDs []int) (store.OutboxNextReady, bool, error) {
@@ -1068,6 +1009,7 @@ func (s *DeliveryOutboxStore) NextReadyAt(_ context.Context, kind store.OutboxQu
 	defer s.mu.Unlock()
 	observed := time.Now()
 	var earliest time.Time
+	recoverEarliest := false
 	for _, lane := range s.lanes {
 		if scoped {
 			if _, ok := selected[int(lane.streamID%store.DispatchOutboxLogicalShards)]; !ok {
@@ -1077,7 +1019,7 @@ func (s *DeliveryOutboxStore) NextReadyAt(_ context.Context, kind store.OutboxQu
 		candidate := lane.readyAt
 		if lane.state == "leased" {
 			candidate = lane.leaseUntil
-			if attempt := s.attempts[memoryAttemptKey{itemID: lane.headItemID, fence: lane.fence}]; attempt != nil && !attempt.finalized {
+			if attempt := s.attempts[memoryAttemptKey{itemID: lane.headItemID, fence: lane.fence}]; attempt != nil {
 				if attempt.resolution != 0 {
 					if attempt.retryAt.IsZero() || !attempt.retryAt.After(observed) {
 						continue
@@ -1092,14 +1034,20 @@ func (s *DeliveryOutboxStore) NextReadyAt(_ context.Context, kind store.OutboxQu
 		} else if lane.state != "ready" {
 			continue
 		}
-		if earliest.IsZero() || candidate.Before(earliest) {
+		recoverLane := lane.state == "leased"
+		if earliest.IsZero() || candidate.Before(earliest) || (candidate.Equal(earliest) && recoverLane) {
 			earliest = candidate
+			recoverEarliest = recoverLane
 		}
 	}
 	if earliest.IsZero() {
 		return store.OutboxNextReady{}, false, nil
 	}
-	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: earliest}, true, nil
+	readyKind := store.OutboxReadyClaim
+	if recoverEarliest {
+		readyKind = store.OutboxReadyRecoverLease
+	}
+	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: earliest, Kind: readyKind}, true, nil
 }
 
 func (s *DeliveryOutboxStore) Snapshot() []store.DeliveryOutboxItem {
@@ -1122,9 +1070,6 @@ func (s *DeliveryOutboxStore) currentAttempt(ref store.OutboxAttemptRef) (*memor
 	if attempt == nil || attempt.ref != ref {
 		return nil, nil, store.OutboxFinalizeFenced
 	}
-	if attempt.finalized {
-		return attempt, nil, store.OutboxFinalizeAlreadyFinalized
-	}
 	lane := s.lanes[ref.StreamID]
 	if lane == nil || lane.state != "leased" || lane.fence != ref.LeaseFence {
 		return attempt, lane, store.OutboxFinalizeFenced
@@ -1135,7 +1080,7 @@ func (s *DeliveryOutboxStore) currentAttempt(ref store.OutboxAttemptRef) (*memor
 func (s *DeliveryOutboxStore) hasPendingFinalization(lane *memoryOutboxLane) bool {
 	for key, attempt := range s.attempts {
 		if key.fence == lane.fence && attempt.ref.StreamID == lane.streamID &&
-			attempt.resolution != 0 && !attempt.finalized {
+			attempt.resolution != 0 {
 			return true
 		}
 	}
@@ -1146,21 +1091,11 @@ func (s *DeliveryOutboxStore) hasBoundRecovery(lane *memoryOutboxLane) bool {
 	for key, attempt := range s.attempts {
 		if key.fence == lane.fence && attempt.ref.StreamID == lane.streamID &&
 			attempt.ref.ItemID == lane.headItemID &&
-			attempt.targetsBound && attempt.resolution == 0 && !attempt.finalized {
+			attempt.targetsBound && attempt.resolution == 0 {
 			return true
 		}
 	}
 	return false
-}
-
-func (s *DeliveryOutboxStore) nextAttempt(itemID int64) int {
-	maxAttempt := 0
-	for _, attempt := range s.attempts {
-		if attempt.ref.ItemID == itemID && attempt.ref.Attempt > maxAttempt {
-			maxAttempt = attempt.ref.Attempt
-		}
-	}
-	return maxAttempt + 1
 }
 
 func (s *DeliveryOutboxStore) streamItems(streamID int64) []store.DeliveryOutboxItem {
@@ -1174,7 +1109,7 @@ func (s *DeliveryOutboxStore) streamItems(streamID int64) []store.DeliveryOutbox
 	return items
 }
 
-func (s *DeliveryOutboxStore) issueMemoryHandoff(lane *memoryOutboxLane, request store.OutboxFinalizeRequest) (store.OutboxClaimWindow, error) {
+func (s *DeliveryOutboxStore) issueMemoryHandoff(lane *memoryOutboxLane, request store.OutboxFinalizeRequest, physicalDuration, clockSkewAllowance time.Duration) (store.OutboxClaimWindow, error) {
 	if request.WindowSize <= 0 {
 		request.WindowSize = 16
 	}
@@ -1187,19 +1122,6 @@ func (s *DeliveryOutboxStore) issueMemoryHandoff(lane *memoryOutboxLane, request
 	if request.LeaseDuration <= 0 {
 		request.LeaseDuration = 30 * time.Second
 	}
-	var template *memoryOutboxAttempt
-	for _, attempt := range s.attempts {
-		if attempt.ref.StreamID == lane.streamID && attempt.ref.LeaseFence == lane.fence &&
-			!attempt.issuedAt.IsZero() && !attempt.commandNotAfter.IsZero() && !attempt.evidenceDeadline.IsZero() {
-			template = attempt
-			break
-		}
-	}
-	if template == nil {
-		return store.OutboxClaimWindow{}, fmt.Errorf("issue absolute delivery handoff: persisted deadline intervals are missing")
-	}
-	physicalDuration := template.commandNotAfter.Sub(template.issuedAt)
-	clockSkewAllowance := template.evidenceDeadline.Sub(template.commandNotAfter)
 	if physicalDuration <= 0 || clockSkewAllowance <= 0 ||
 		request.LeaseDuration <= memoryOutboxLeaseSafetyMargin ||
 		physicalDuration >= request.LeaseDuration-memoryOutboxLeaseSafetyMargin ||
@@ -1216,6 +1138,7 @@ func (s *DeliveryOutboxStore) issueMemoryHandoff(lane *memoryOutboxLane, request
 	commandNotAfter := now.Add(physicalDuration)
 	evidenceDeadline := commandNotAfter.Add(clockSkewAllowance)
 	bytesUsed := 0
+	lane.headAttempt = 1
 	for _, item := range items {
 		if len(window.Items) >= request.WindowSize {
 			break
@@ -1230,7 +1153,7 @@ func (s *DeliveryOutboxStore) issueMemoryHandoff(lane *memoryOutboxLane, request
 			}
 		}
 		bytesUsed += len(item.Payload)
-		attemptNo := s.nextAttempt(item.ID)
+		attemptNo := lane.headAttempt
 		ref := store.OutboxAttemptRef{
 			QueueKind: store.OutboxQueueAbsoluteDelivery, StreamID: item.TargetUserID,
 			ItemID: item.ID, LeaseFence: lane.fence, Attempt: attemptNo,
@@ -1302,8 +1225,6 @@ func memorySelectedShards(count int, ids []int) (map[int]struct{}, bool, error) 
 
 func bindOutcomeFromAttempt(outcome store.OutboxFinalizeOutcome) store.OutboxBindTargetOutcome {
 	switch outcome {
-	case store.OutboxFinalizeAlreadyFinalized:
-		return store.OutboxBindTargetAlreadyFinalized
 	case store.OutboxFinalizeFenced:
 		return store.OutboxBindTargetFenced
 	default:
@@ -1313,8 +1234,6 @@ func bindOutcomeFromAttempt(outcome store.OutboxFinalizeOutcome) store.OutboxBin
 
 func evidenceOutcomeFromAttempt(outcome store.OutboxFinalizeOutcome) store.OutboxEvidenceOutcome {
 	switch outcome {
-	case store.OutboxFinalizeAlreadyFinalized:
-		return store.OutboxEvidenceAlreadyFinalized
 	case store.OutboxFinalizeFenced:
 		return store.OutboxEvidenceFenced
 	default:
@@ -1324,8 +1243,6 @@ func evidenceOutcomeFromAttempt(outcome store.OutboxFinalizeOutcome) store.Outbo
 
 func resolutionOutcomeFromAttempt(outcome store.OutboxFinalizeOutcome) store.OutboxResolutionOutcome {
 	switch outcome {
-	case store.OutboxFinalizeAlreadyFinalized:
-		return store.OutboxResolutionAlreadyFinalized
 	case store.OutboxFinalizeFenced:
 		return store.OutboxResolutionFenced
 	default:

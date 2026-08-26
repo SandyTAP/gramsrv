@@ -223,27 +223,14 @@ WITH box_seed (
       WHEN EXCLUDED.top_message_id >= dialogs.top_message_id THEN EXCLUDED.top_message_date
       ELSE dialogs.top_message_date
     END,
-    unread_count = CASE
-      WHEN EXCLUDED.unread_count = 0 THEN dialogs.unread_count
-      ELSE (
-        SELECT COUNT(*)::int
-        FROM message_boxes m
-        WHERE m.owner_user_id = dialogs.user_id
-          AND m.peer_type = dialogs.peer_type
-          AND m.peer_id = dialogs.peer_id
-          AND NOT m.deleted
-          AND NOT m.outgoing
-          AND m.box_id > dialogs.read_inbox_max_id
-          AND m.box_id <= GREATEST(dialogs.top_message_id, EXCLUDED.top_message_id)
-      ) + (
-        SELECT COUNT(*)::int
-        FROM boxes added
-        WHERE added.owner_user_id = dialogs.user_id
-          AND added.peer_id = dialogs.peer_id
-          AND NOT added.outgoing
-          AND added.box_id > dialogs.read_inbox_max_id
-          AND added.box_id <= GREATEST(dialogs.top_message_id, EXCLUDED.top_message_id)
-      )
+    -- boxes contains only rows inserted by this statement. Account writers use
+    -- the same ordered transaction lock, so the dialog read boundary cannot
+    -- cross this incoming box concurrently. Increment the materialized counter
+    -- instead of rescanning the owner's complete message history on every send.
+    unread_count = dialogs.unread_count + CASE
+      WHEN EXCLUDED.unread_count > 0
+       AND EXCLUDED.top_message_id > dialogs.read_inbox_max_id THEN 1
+      ELSE 0
     END,
     unread_mark = CASE
       WHEN EXCLUDED.unread_count = 0 THEN false
@@ -262,11 +249,13 @@ WITH box_seed (
   FROM boxes b
   RETURNING user_id, pts
 ), dispatch_rows AS (
-  INSERT INTO dispatch_outbox (
-    target_user_id, pts, event_type, exclude_auth_key_id, exclude_session_id
-  )
-  SELECT
-    e.user_id, e.pts, 'new_message', i.exclude_auth_key_id, i.exclude_session_id
+	INSERT INTO dispatch_outbox (
+		target_user_id, pts, event_type, exclude_auth_key_id, exclude_session_id,
+		read_model_peer_type, read_model_peer_id
+	)
+	SELECT
+		e.user_id, e.pts, 'new_message', i.exclude_auth_key_id, i.exclude_session_id,
+		'user', i.peer_id
   FROM event_rows e
   JOIN box_input i ON i.owner_user_id = e.user_id AND i.pts = e.pts
   ON CONFLICT DO NOTHING

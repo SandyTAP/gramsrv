@@ -43,6 +43,17 @@ func TestDomainActorRunsCollidingDomainsWithoutIOHeadOfLineBlocking(t *testing.T
 	}
 }
 
+func TestDefaultDomainIOPoolFitsConcurrentWorstCaseProjectionReservations(t *testing.T) {
+	executor := newDeliveryActorExecutor(nil, defaultDomainActorPartitions, defaultDomainActorMailbox, defaultDomainActorBytes)
+	if executor.ioWorkers != defaultDomainIOWorkers {
+		t.Fatalf("default I/O workers=%d want=%d", executor.ioWorkers, defaultDomainIOWorkers)
+	}
+	reserved := int64(executor.ioWorkers) * maxProjectedWindowRetainedBytes
+	if reserved >= executor.maxBytes {
+		t.Fatalf("projection reservations=%d exhaust actor budget=%d", reserved, executor.maxBytes)
+	}
+}
+
 func TestDomainActorSerializesOneOrderingDomain(t *testing.T) {
 	executor := newDeliveryActorExecutor(nil, 2, 8, 1<<20)
 	started := make(chan struct{}, 2)
@@ -259,6 +270,47 @@ func TestClaimWindowRejectsTargetLedgerBeyondV3Bound(t *testing.T) {
 	}
 	if err := validateClaimWindow(window); err == nil {
 		t.Fatal("persisted target ledger beyond v3 bound was accepted")
+	}
+}
+
+func TestActorActiveWindowAdmissionIsFixedAndReleased(t *testing.T) {
+	executor := newDeliveryActorExecutor(nil, defaultDomainIOWorkers, 8, defaultDomainActorBytes)
+	if executor.maxWindows != defaultDomainIOWorkers*activeWindowsPerIOWorker {
+		t.Fatalf("active window capacity=%d", executor.maxWindows)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got := executor.reserveWindowSlots(ctx, executor.maxWindows); got != executor.maxWindows {
+		t.Fatalf("reserved active windows=%d want %d", got, executor.maxWindows)
+	}
+	acquired := make(chan bool, 1)
+	go func() { acquired <- executor.reserveWindowSlot(ctx) }()
+	select {
+	case <-acquired:
+		t.Fatal("active window admission exceeded its fixed capacity")
+	case <-time.After(20 * time.Millisecond):
+	}
+	executor.releaseWindowSlots(1)
+	select {
+	case ok := <-acquired:
+		if !ok {
+			t.Fatal("active window admission did not resume after release")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active window waiter remained blocked after release")
+	}
+	executor.releaseWindowSlots(executor.maxWindows)
+}
+
+func TestDeliveryActorLaneLimitSharesActiveWindowsAcrossWorkers(t *testing.T) {
+	if got := deliveryActorLaneLimit(128, 4, 16); got != 4 {
+		t.Fatalf("lane limit=%d want 4", got)
+	}
+	if got := deliveryActorLaneLimit(2, 4, 16); got != 2 {
+		t.Fatalf("configured smaller lane limit=%d want 2", got)
+	}
+	if got := deliveryActorLaneLimit(128, 32, 16); got != 1 {
+		t.Fatalf("oversubscribed worker lane limit=%d want 1", got)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"math"
 
 	"github.com/iamxvbaba/td/tlprofile"
-	"go.uber.org/zap"
 )
 
 // LayerProfileOrigin records why a Conn currently uses a wire profile. The
@@ -312,125 +311,38 @@ func (s *Server) seedInitialLayerProfile(
 	if s == nil || c == nil {
 		return nil
 	}
-	durableResolver, hasDurableResolver := s.layerRPC.(LayerRPCDurableSessionProfileResolver)
-	if hasDurableResolver {
-		layer, msgID, found, err := durableResolver.ResolveNegotiatedSessionLayerEvidence(ctx, c.authKeyID, c.sessionID)
-		if err != nil {
-			if isLayerEvidenceDurabilityUnavailable(err) {
-				s.log.Warn("Resolve durable exact session Layer during connection seed unavailable; continuing with auth-key default",
-					zap.String("auth_key_id", c.authKeyHex), zap.Int64("session_id", c.sessionID), zap.Error(err))
-				// Exact-session proof is the strongest recovery source, but its
-				// availability failure must not discard a permanent auth_keys.layer
-				// already loaded with the key on this same first frame. Continue to the
-				// auth-key default below; never reuse previous connection-local evidence
-				// in durable mode.
-				found = false
-			} else {
-				return fmt.Errorf("resolve durable exact session Layer during connection seed: %w", err)
-			}
-		}
-		if found {
-			if layer <= 0 || msgID < 0 {
-				return fmt.Errorf("invalid durable exact session Layer seed layer=%d msg_id=%d", layer, msgID)
-			}
-			if msgID > 0 {
-				return c.seedRawLayerEvidence(layer, msgID)
-			}
-			// Older in-process exact-session registries did not retain a message
-			// watermark. Keep that compatibility-only seed usable without treating
-			// it as durable ordered evidence; real durable stores never persist zero.
-			profile, supported := tlprofile.ResolveProfile(layer)
-			if !supported {
-				return nil
-			}
-			return c.seedOrderedLayerProfile(profile, 0)
-		}
-	} else if resolver, ok := s.layerRPC.(LayerRPCOrderedSessionProfileResolver); ok {
-		if layer, msgID, found := resolver.NegotiatedSessionLayerEvidence(c.authKeyID, c.sessionID); found {
-			if layer <= 0 || msgID < 0 {
-				return nil
-			}
-			if msgID > 0 {
-				return c.seedRawLayerEvidence(layer, msgID)
-			}
-			profile, supported := tlprofile.ResolveProfile(layer)
-			if !supported {
-				return nil
-			}
-			return c.seedOrderedLayerProfile(profile, 0)
-		}
-	} else if resolver, ok := s.layerRPC.(LayerRPCSessionProfileResolver); ok {
-		if layer, found := resolver.NegotiatedSessionLayer(c.authKeyID, c.sessionID); found {
-			profile, supported := tlprofile.ResolveProfile(layer)
-			if !supported {
-				return nil
-			}
-			return c.SeedLayerProfile(profile)
-		}
+	_ = fetchedLayer
+	_ = previous
+	durableResolver, ok := s.layerRPC.(LayerRPCDurableSessionProfileResolver)
+	if !ok {
+		return fmt.Errorf("durable exact session Layer resolver is required")
 	}
-	// A freshly fetched permanent-key row is already the canonical auth-key
-	// record. Prefer its non-zero Layer without making Router query the same PG
-	// row again. Unsupported metadata remains unknown and must not fall through
-	// to a weaker mirror.
-	if c.authKeyExpiresAt == 0 && fetchedLayer != 0 {
-		profile, supported := tlprofile.ResolveProfile(fetchedLayer)
-		if !supported {
-			return nil
-		}
-		return c.SeedInheritedLayerProfile(profile)
+	layer, msgID, found, err := durableResolver.ResolveNegotiatedSessionLayerEvidence(ctx, c.authKeyID, c.sessionID)
+	if err != nil {
+		return fmt.Errorf("resolve durable exact session Layer during connection seed: %w", err)
 	}
-	// Temporary keys resolve through their bound permanent key before consulting
-	// the raw temp-key shadow, which may predate a client upgrade.
-	if resolver, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver); ok {
-		layer, found, err := resolver.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
-		if err != nil {
-			if !isLayerEvidenceDurabilityUnavailable(err) {
-				// A binding conflict, missing/destroyed key, or malformed durable
-				// value is not an availability hint. Stay unknown and never let a
-				// stale raw temp-key shadow outrank that structural failure.
-				if s.log != nil {
-					s.log.Warn("Resolve inherited auth-key Layer failed; awaiting explicit evidence",
-						zap.String("auth_key_id", c.authKeyHex), zap.Error(err))
-				}
-				return nil
-			}
-			// The same first frame already authenticated and loaded fetchedLayer
-			// from this raw temp key. During a transient permanent-identity lookup
-			// outage it is safe only as this physical Conn's inherited shadow; it
-			// is never published back to the shared permanent default.
-			if s.log != nil {
-				s.log.Warn("Resolve inherited auth-key Layer unavailable; continuing with raw auth-key shadow",
-					zap.String("auth_key_id", c.authKeyHex), zap.Error(err))
-			}
-		} else if !found {
-			// Fall through to a raw auth-key shadow when the resolver has no
-			// canonical permanent-key default (for example an unbound temp key).
-		} else {
-			profile, supported := tlprofile.ResolveProfile(layer)
-			if !supported {
-				return nil
-			}
-			return c.SeedInheritedLayerProfile(profile)
+	if found {
+		if layer <= 0 || msgID <= 0 {
+			return fmt.Errorf("invalid durable exact session Layer seed layer=%d msg_id=%d", layer, msgID)
 		}
+		return c.seedRawLayerEvidence(layer, msgID)
 	}
-	if fetchedLayer != 0 {
-		profile, supported := tlprofile.ResolveProfile(fetchedLayer)
-		if !supported {
-			return nil
-		}
-		return c.SeedInheritedLayerProfile(profile)
+	inherited, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver)
+	if !ok {
+		return fmt.Errorf("Redis inherited auth-key Layer resolver is required")
 	}
-	if hasDurableResolver {
-		// previous belongs to the old logical Conn which occupied this physical
-		// transport. In durable mode only an exact session row or auth-key default
-		// may cross that boundary. In particular, a connection-local selector used
-		// during a store outage must not leak into a newly selected session.
+	layer, found, err = inherited.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
+	if err != nil {
+		return fmt.Errorf("resolve inherited auth-key Layer: %w", err)
+	}
+	if !found {
 		return nil
 	}
-	if previous.Origin != LayerProfileUnknown {
-		return c.SeedInheritedLayerProfile(previous.Profile)
+	profile, supported := tlprofile.ResolveProfile(layer)
+	if !supported {
+		return nil
 	}
-	return nil
+	return c.SeedInheritedLayerProfile(profile)
 }
 
 // refreshActivatedInheritedLayerProfile closes the auth.bindTempAuthKey race
@@ -442,52 +354,23 @@ func (s *Server) refreshActivatedInheritedLayerProfile(ctx context.Context, c *C
 	if s == nil || c == nil || c.LayerProfileState().Origin == LayerProfileExplicit {
 		return nil
 	}
-	if c.authKeyExpiresAt == 0 {
-		if fetchedLayer == 0 {
-			return nil
-		}
-		profile, ok := tlprofile.ResolveProfile(fetchedLayer)
-		if !ok {
-			return c.clearInheritedLayerProfile()
-		}
-		_, err := c.refreshInheritedLayerProfile(profile)
-		return err
-	}
-	if resolver, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver); ok {
-		layer, found, err := resolver.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
-		if err != nil {
-			if !isLayerEvidenceDurabilityUnavailable(err) {
-				if s.log != nil {
-					s.log.Warn("Re-resolve inherited auth-key Layer after activation claim failed",
-						zap.String("auth_key_id", c.authKeyHex), zap.Error(err))
-				}
-				// A pre-claim raw temp shadow may have been installed before a
-				// concurrent bind became visible. Structural identity/key failures
-				// must revoke that weaker inherited evidence; only an explicit
-				// selector (guarded above) is allowed to survive this branch.
-				return c.clearInheritedLayerProfile()
-			}
-			if s.log != nil {
-				s.log.Warn("Re-resolve inherited auth-key Layer unavailable; keeping raw auth-key shadow",
-					zap.String("auth_key_id", c.authKeyHex), zap.Error(err))
-			}
-		} else if found {
-			profile, supported := tlprofile.ResolveProfile(layer)
-			if !supported {
-				return c.clearInheritedLayerProfile()
-			}
-			_, err = c.refreshInheritedLayerProfile(profile)
-			return err
-		}
-	}
-	if fetchedLayer == 0 {
-		return nil
-	}
-	profile, ok := tlprofile.ResolveProfile(fetchedLayer)
+	_ = fetchedLayer
+	resolver, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver)
 	if !ok {
+		return fmt.Errorf("Redis inherited auth-key Layer resolver is required")
+	}
+	layer, found, err := resolver.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
+	if err != nil {
+		return fmt.Errorf("re-resolve inherited auth-key Layer after activation: %w", err)
+	}
+	if !found {
 		return c.clearInheritedLayerProfile()
 	}
-	_, err := c.refreshInheritedLayerProfile(profile)
+	profile, supported := tlprofile.ResolveProfile(layer)
+	if !supported {
+		return c.clearInheritedLayerProfile()
+	}
+	_, err = c.refreshInheritedLayerProfile(profile)
 	return err
 }
 

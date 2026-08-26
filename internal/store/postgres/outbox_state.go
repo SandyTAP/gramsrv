@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,8 +29,11 @@ const (
 	outboxLeaseSafetyMargin      = 100 * time.Millisecond
 	// PTS projection bytes do not exist until Egress builds the update. Reserve
 	// a deliberately conservative budget per durable event when sizing a claim.
-	ptsEventByteEstimate          = 64 << 10
-	maxOutboxTombstoneDeleteLimit = 10000
+	ptsEventByteEstimate = 64 << 10
+	// Bound lock hold time while amortizing BEGIN/COMMIT and WAL flush across
+	// independent ordering domains. All stream ids in a group are processed in
+	// ascending order, matching the global durable-lane lock order.
+	outboxFinalizeTransactionLanes = 16
 )
 
 type outboxStateConfig struct {
@@ -57,7 +61,7 @@ var (
 		laneLockScope: "account_pts",
 		sequenceSQL:   "i.pts::bigint",
 		orderSQL:      "i.pts ASC, i.id ASC",
-		payloadSQL:    "i.event_type::text",
+		payloadSQL:    "concat(i.event_type::text, chr(31), i.read_model_peer_type::text, chr(31), i.read_model_peer_id::text)",
 		recoverySQL:   "'difference'::text",
 	}
 	deliveryOutboxStateConfig = outboxStateConfig{
@@ -175,73 +179,83 @@ LIMIT $4`, s.cfg.itemsTable)
 	budgetPredicate := "TRUE"
 
 	query := fmt.Sprintf(`
-WITH picked AS MATERIALIZED (
-  SELECT l.stream_id, l.head_item_id, l.head_sequence,
-         l.lease_fence AS old_fence
+WITH ready_candidates AS MATERIALIZED (
+  SELECT l.stream_id, l.head_item_id, l.head_sequence, l.head_attempt,
+         l.lease_fence AS old_fence,
+         l.ready_at AS available_at
   FROM %s l
   WHERE %s
     AND %s
     AND l.lease_fence < %d
-    AND (
-      (l.state = 'ready' AND l.ready_at <= now())
-      OR (
-        l.state = 'leased'
-        AND l.lease_until <= now()
-        AND NOT EXISTS (
-          SELECT 1
-          FROM %s pending_finalization
-          WHERE pending_finalization.stream_id = l.stream_id
-            AND pending_finalization.lease_fence = l.lease_fence
-            AND pending_finalization.resolution IS NOT NULL
-            AND pending_finalization.finalized_at IS NULL
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM %s recoverable_bound
-          WHERE recoverable_bound.stream_id = l.stream_id
-            AND recoverable_bound.lease_fence = l.lease_fence
-            AND recoverable_bound.item_id = l.head_item_id
-            AND recoverable_bound.targets_bound
-            AND recoverable_bound.resolution IS NULL
-            AND recoverable_bound.finalized_at IS NULL
-        )
-      )
-    )
-  ORDER BY
-    CASE WHEN l.state = 'ready' THEN l.ready_at ELSE l.lease_until END,
-    l.stream_id,
-    l.head_sequence,
-    l.head_item_id
+    AND l.state = 'ready'
+    AND l.ready_at <= now()
+  ORDER BY l.ready_at, l.stream_id, l.head_sequence, l.head_item_id
   LIMIT $3
   FOR UPDATE OF l SKIP LOCKED
+), expired_candidates AS MATERIALIZED (
+  SELECT l.stream_id, l.head_item_id, l.head_sequence, l.head_attempt,
+         l.lease_fence AS old_fence,
+         l.lease_until AS available_at
+  FROM %s l
+  WHERE %s
+    AND %s
+    AND l.lease_fence < %d
+    AND l.state = 'leased'
+    AND l.lease_until <= now()
+    AND NOT EXISTS (
+      SELECT 1
+      FROM %s pending_finalization
+      WHERE pending_finalization.stream_id = l.stream_id
+        AND pending_finalization.lease_fence = l.lease_fence
+        AND pending_finalization.resolution IS NOT NULL
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM %s recoverable_bound
+      WHERE recoverable_bound.stream_id = l.stream_id
+        AND recoverable_bound.lease_fence = l.lease_fence
+        AND recoverable_bound.item_id = l.head_item_id
+        AND recoverable_bound.targets_bound
+        AND recoverable_bound.resolution IS NULL
+    )
+  ORDER BY l.lease_until, l.stream_id, l.head_sequence, l.head_item_id
+  LIMIT $3
+  FOR UPDATE OF l SKIP LOCKED
+), picked AS MATERIALIZED (
+  SELECT stream_id, head_item_id, head_sequence, head_attempt, old_fence
+  FROM (
+    SELECT * FROM ready_candidates
+    UNION ALL
+    SELECT * FROM expired_candidates
+  ) candidates
+  ORDER BY available_at, stream_id, head_sequence, head_item_id
+  LIMIT $3
+), fence AS MATERIALIZED (
+  SELECT nextval('%s') AS lease_fence
+  FROM picked
+  LIMIT 1
 ), leased AS MATERIALIZED (
   SELECT p.stream_id, p.head_item_id, p.head_sequence, p.old_fence,
-         nextval('%s') AS lease_fence,
+         f.lease_fence,
+         p.head_attempt + 1 AS attempt,
          $1::text AS lease_owner,
          now() + ($2::bigint * interval '1 millisecond') AS lease_until,
          now() + ($6::bigint * interval '1 millisecond') AS command_not_after,
          now() + (($6::bigint + $7::bigint) * interval '1 millisecond') AS evidence_deadline
   FROM picked p
+  CROSS JOIN fence f
 ), superseded AS MATERIALIZED (
-  UPDATE %s old
-  SET finalized_at = now(), finalization_outcome = 'superseded',
-      last_error = 'unbound delivery lease superseded after expiry'
-  FROM leased fresh
+  DELETE FROM %s old
+  USING leased fresh
   WHERE old.stream_id = fresh.stream_id
     AND old.lease_fence = fresh.old_fence
-    AND old.finalized_at IS NULL
   RETURNING old.item_id, old.lease_fence
 ), windowed AS MATERIALIZED (
   SELECT leased.*, item.*
   FROM leased
   CROSS JOIN LATERAL (%s) item
 ), numbered AS MATERIALIZED (
-  SELECT w.*,
-         COALESCE((
-           SELECT max(old.attempt)
-           FROM %s old
-           WHERE old.item_id = w.id
-         ), 0) + 1 AS attempt
+  SELECT w.*
   FROM windowed w
 ), issued AS MATERIALIZED (
   INSERT INTO %s (
@@ -256,6 +270,7 @@ WITH picked AS MATERIALIZED (
   UPDATE %s l
   SET state = 'leased',
       lease_fence = ends.lease_fence,
+      head_attempt = ends.attempt,
       lease_owner = ends.lease_owner,
       lease_until = ends.lease_until,
       window_end_item_id = ends.item_id,
@@ -264,7 +279,7 @@ WITH picked AS MATERIALIZED (
       updated_at = now()
   FROM (
     SELECT DISTINCT ON (n.stream_id)
-           n.stream_id, n.old_fence, n.lease_fence,
+           n.stream_id, n.old_fence, n.lease_fence, n.attempt,
            n.lease_owner, n.lease_until,
            n.id AS item_id, n.sequence
     FROM numbered n
@@ -282,9 +297,10 @@ FROM numbered n
 JOIN issued i ON i.item_id = n.id AND i.lease_fence = n.lease_fence
 JOIN lane_windows lw ON lw.stream_id = n.stream_id AND lw.lease_fence = n.lease_fence
 ORDER BY n.stream_id, n.window_ordinal`,
+		s.cfg.lanesTable, shardPredicate, budgetPredicate, int64(math.MaxInt64),
 		s.cfg.lanesTable, shardPredicate, budgetPredicate, int64(math.MaxInt64), s.cfg.attemptsTable, s.cfg.attemptsTable,
 		s.cfg.fenceSequence,
-		s.cfg.attemptsTable, windowSource, s.cfg.attemptsTable, s.cfg.attemptsTable, s.cfg.lanesTable)
+		s.cfg.attemptsTable, windowSource, s.cfg.attemptsTable, s.cfg.lanesTable)
 
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -382,7 +398,6 @@ func (s *durableOutboxState) RecoverBoundWindows(ctx context.Context, req store.
     SELECT 1 FROM %s invalid_attempt
     WHERE invalid_attempt.stream_id = l.stream_id
       AND invalid_attempt.lease_fence = l.lease_fence
-      AND invalid_attempt.finalized_at IS NULL
       AND (NOT invalid_attempt.targets_bound OR invalid_attempt.resolution IS NOT NULL
            OR invalid_attempt.command_not_after <= now()
            OR invalid_attempt.evidence_deadline <= now())
@@ -404,7 +419,6 @@ WHERE %s
       AND head_attempt.command_not_after > now()
       AND head_attempt.evidence_deadline > now()
       AND head_attempt.resolution IS NULL
-      AND head_attempt.finalized_at IS NULL
   )
   AND (%s)
 ORDER BY l.lease_until, l.stream_id
@@ -452,7 +466,7 @@ WHERE stream_id = $1 AND lease_fence = $2 AND lease_owner = $4 AND state = 'leas
 			if _, err := tx.Exec(ctx, fmt.Sprintf(`
 UPDATE %s
 SET lease_until = GREATEST(lease_until, now() + ($3::bigint * interval '1 millisecond'))
-WHERE stream_id = $1 AND lease_fence = $2 AND finalized_at IS NULL`,
+WHERE stream_id = $1 AND lease_fence = $2`,
 				s.cfg.attemptsTable), lane.streamID, lane.oldFence, leaseMillis); err != nil {
 				return fmt.Errorf("renew recoverable %s attempts: %w", s.queueName(), err)
 			}
@@ -494,7 +508,7 @@ SELECT l.stream_id, l.lease_fence, l.lease_until,
 FROM %s l
 JOIN %s a
   ON a.stream_id = l.stream_id AND a.lease_fence = l.lease_fence
- AND a.targets_bound AND a.resolution IS NULL AND a.finalized_at IS NULL
+ AND a.targets_bound AND a.resolution IS NULL
 JOIN %s i ON i.id = a.item_id AND i.target_user_id = a.stream_id
 LEFT JOIN %s t ON t.item_id = a.item_id AND t.lease_fence = a.lease_fence
 WHERE l.stream_id = ANY($1::bigint[]) AND l.state = 'leased' AND l.lease_owner = $2
@@ -574,6 +588,9 @@ func (s *durableOutboxState) RecoverFinalizableAttempts(ctx context.Context, req
 	if req.QueueKind != s.cfg.kind {
 		return nil, fmt.Errorf("recover finalizable %s attempts: queue kind %d", s.queueName(), req.QueueKind)
 	}
+	if req.AttemptLimit <= 0 || req.AttemptLimit > store.MaxDeliveryBatchItems {
+		return nil, fmt.Errorf("recover finalizable %s attempts: attempt limit must be between 1 and %d", s.queueName(), store.MaxDeliveryBatchItems)
+	}
 	if req.LaneLimit <= 0 {
 		req.LaneLimit = 100
 	}
@@ -588,9 +605,9 @@ func (s *durableOutboxState) RecoverFinalizableAttempts(ctx context.Context, req
 		return []store.OutboxFinalizeRequest{}, nil
 	}
 	predicate := "TRUE"
-	args := []any{int32(req.LaneLimit)}
+	args := []any{int32(req.LaneLimit), int32(req.AttemptLimit)}
 	if scoped {
-		predicate = "l.logical_shard = ANY($2::smallint[])"
+		predicate = "l.logical_shard = ANY($3::smallint[])"
 		args = append(args, shardIDs)
 	}
 	rows, err := s.db.Query(ctx, fmt.Sprintf(`
@@ -603,7 +620,6 @@ WITH picked AS MATERIALIZED (
       WHERE ready.stream_id = l.stream_id
         AND ready.lease_fence = l.lease_fence
         AND ready.resolution IS NOT NULL
-        AND ready.finalized_at IS NULL
         AND (ready.retry_at IS NULL OR ready.retry_at <= now())
     )
   ORDER BY l.updated_at, l.stream_id
@@ -613,9 +629,10 @@ SELECT a.stream_id, a.item_id, a.sequence, a.lease_fence, a.attempt
 FROM picked p
 JOIN %s a
   ON a.stream_id = p.stream_id AND a.lease_fence = p.lease_fence
-WHERE a.resolution IS NOT NULL AND a.finalized_at IS NULL
+WHERE a.resolution IS NOT NULL
   AND (a.retry_at IS NULL OR a.retry_at <= now())
-ORDER BY a.stream_id, a.window_ordinal`, s.cfg.lanesTable, predicate,
+ORDER BY a.stream_id, a.window_ordinal
+LIMIT $2`, s.cfg.lanesTable, predicate,
 		s.cfg.attemptsTable, s.cfg.attemptsTable), args...)
 	if err != nil {
 		return nil, fmt.Errorf("recover finalizable %s attempts: %w", s.queueName(), err)
@@ -680,7 +697,7 @@ WITH candidates AS MATERIALIZED (
    AND l.head_item_id = a.item_id AND l.state = 'leased'
   WHERE %s
     AND a.evidence_deadline <= now()
-    AND a.resolution IS NULL AND a.finalized_at IS NULL
+    AND a.resolution IS NULL
   ORDER BY a.evidence_deadline, a.stream_id, a.item_id
   LIMIT $2
   FOR UPDATE OF a SKIP LOCKED
@@ -694,7 +711,7 @@ WITH candidates AS MATERIALIZED (
       END
   FROM candidates c
   WHERE a.item_id = c.item_id AND a.lease_fence = c.lease_fence
-    AND a.resolution IS NULL AND a.finalized_at IS NULL
+    AND a.resolution IS NULL
   RETURNING a.stream_id, a.item_id, a.sequence, a.lease_fence, a.attempt
 )
 SELECT stream_id, item_id, sequence, lease_fence, attempt
@@ -802,12 +819,25 @@ func (s *durableOutboxState) claimedItem(streamID, itemID, sequence int64, fence
 	}
 	switch s.cfg.kind {
 	case store.OutboxQueueDispatchPTS:
-		eventType, ok := payloadRaw.(string)
+		encoded, ok := payloadRaw.(string)
 		if !ok {
 			return item, fmt.Errorf("scan dispatch claim payload %T", payloadRaw)
 		}
+		parts := strings.SplitN(encoded, string(rune(31)), 3)
+		if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" {
+			return item, fmt.Errorf("scan dispatch claim payload %q", encoded)
+		}
+		peerID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			return item, fmt.Errorf("scan dispatch read-model peer id %q: %w", parts[2], err)
+		}
+		peer := domain.Peer{Type: domain.PeerType(parts[1]), ID: peerID}
+		if (peer.Type == "") != (peer.ID == 0) ||
+			(peer.Type != "" && peer.Type != domain.PeerTypeUser && peer.Type != domain.PeerTypeChannel) {
+			return item, fmt.Errorf("scan dispatch read-model peer %+v", peer)
+		}
 		item.RecoveryPolicy = store.OutboxRecoveryDifference
-		item.Payload = store.DispatchOutboxPayload{EventType: domain.UpdateEventType(eventType)}
+		item.Payload = store.DispatchOutboxPayload{EventType: domain.UpdateEventType(parts[0]), ReadModelPeer: peer}
 		if recovery != "difference" {
 			return item, fmt.Errorf("scan dispatch recovery policy %q", recovery)
 		}
@@ -836,37 +866,6 @@ func outboxAuthKeyID(raw []byte) ([8]byte, error) {
 	return id, nil
 }
 
-func (s *durableOutboxState) DeleteFinalizedAttempts(ctx context.Context, finalizedBefore time.Time, limit int) (int, error) {
-	if finalizedBefore.IsZero() {
-		return 0, fmt.Errorf("delete finalized %s attempts: finalized_before is required", s.queueName())
-	}
-	if limit <= 0 {
-		return 0, fmt.Errorf("delete finalized %s attempts: positive limit is required", s.queueName())
-	}
-	if limit > maxOutboxTombstoneDeleteLimit {
-		limit = maxOutboxTombstoneDeleteLimit
-	}
-	tag, err := s.db.Exec(ctx, fmt.Sprintf(`
-WITH picked AS MATERIALIZED (
-  SELECT a.item_id, a.lease_fence
-  FROM %s a
-  WHERE a.finalized_at < $1
-    AND NOT EXISTS (SELECT 1 FROM %s i WHERE i.id = a.item_id)
-  ORDER BY a.finalized_at, a.item_id, a.lease_fence
-  LIMIT $2
-  FOR UPDATE SKIP LOCKED
-)
-DELETE FROM %s a
-USING picked p
-WHERE a.item_id = p.item_id AND a.lease_fence = p.lease_fence`,
-		s.cfg.attemptsTable, s.cfg.itemsTable, s.cfg.attemptsTable),
-		finalizedBefore, int32(limit))
-	if err != nil {
-		return 0, fmt.Errorf("delete finalized %s attempts: %w", s.queueName(), err)
-	}
-	return int(tag.RowsAffected()), nil
-}
-
 func (s *durableOutboxState) NextReadyAt(ctx context.Context, kind store.OutboxQueueKind, shardCount int, shardIDs []int) (store.OutboxNextReady, bool, error) {
 	if kind != s.cfg.kind {
 		return store.OutboxNextReady{}, false, fmt.Errorf("next %s ready at: queue kind %d", s.queueName(), kind)
@@ -884,47 +883,67 @@ func (s *durableOutboxState) NextReadyAt(ctx context.Context, kind store.OutboxQ
 		predicate = "l.logical_shard = ANY($1::smallint[])"
 		args = append(args, ids)
 	}
-	var observed time.Time
-	var ready *time.Time
+	var observed, ready time.Time
+	var recoverLease bool
 	err = s.db.QueryRow(ctx, fmt.Sprintf(`
-SELECT clock_timestamp(), min(CASE
-  WHEN l.state = 'ready' THEN l.ready_at
-  WHEN l.state = 'leased' THEN LEAST(l.lease_until, COALESCE((
-    SELECT CASE
-      WHEN deadline.resolution IS NULL THEN deadline.evidence_deadline
-      ELSE deadline.retry_at
-    END
-    FROM %s deadline
-    WHERE deadline.stream_id = l.stream_id
-      AND deadline.item_id = l.head_item_id
-      AND deadline.lease_fence = l.lease_fence
-      AND deadline.finalized_at IS NULL
-  ), l.lease_until))
-END)
-FROM %s l
-WHERE %s
-  AND (
-    l.state = 'ready'
-    OR (
-      l.state = 'leased'
-      AND NOT EXISTS (
-        SELECT 1 FROM %s finalizable
-        WHERE finalizable.stream_id = l.stream_id
-          AND finalizable.lease_fence = l.lease_fence
-          AND finalizable.item_id = l.head_item_id
-          AND finalizable.resolution IS NOT NULL
-          AND finalizable.finalized_at IS NULL
-          AND (finalizable.retry_at IS NULL OR finalizable.retry_at <= now())
-      )
+WITH db_clock AS MATERIALIZED (
+  SELECT clock_timestamp() AS observed
+), ready_candidate AS MATERIALIZED (
+  SELECT c.observed, l.ready_at, false AS recover_lease
+  FROM %s l
+  CROSS JOIN db_clock c
+  WHERE %s
+    AND l.state = 'ready'
+    AND l.ready_at IS NOT NULL
+  ORDER BY l.ready_at, l.stream_id
+  LIMIT 1
+), leased_candidate AS MATERIALIZED (
+  SELECT
+    c.observed,
+    LEAST(l.lease_until, COALESCE(
+      CASE
+        WHEN deadline.resolution IS NULL THEN deadline.evidence_deadline
+        ELSE deadline.retry_at
+      END,
+      l.lease_until
+    )) AS ready_at,
+    true AS recover_lease
+  FROM %s l
+  CROSS JOIN db_clock c
+  LEFT JOIN %s deadline
+    ON deadline.stream_id = l.stream_id
+   AND deadline.item_id = l.head_item_id
+   AND deadline.lease_fence = l.lease_fence
+  WHERE %s
+    AND l.state = 'leased'
+    AND l.lease_until IS NOT NULL
+    AND NOT (
+      deadline.resolution IS NOT NULL
+      AND (deadline.retry_at IS NULL OR deadline.retry_at <= c.observed)
     )
-  )`, s.cfg.attemptsTable, s.cfg.lanesTable, predicate, s.cfg.attemptsTable), args...).Scan(&observed, &ready)
+  ORDER BY ready_at, l.stream_id
+  LIMIT 1
+), candidates AS MATERIALIZED (
+  SELECT * FROM ready_candidate
+  UNION ALL
+  SELECT * FROM leased_candidate
+)
+SELECT observed, ready_at, recover_lease
+FROM candidates
+WHERE ready_at IS NOT NULL
+ORDER BY ready_at, recover_lease DESC
+LIMIT 1`, s.cfg.lanesTable, predicate, s.cfg.lanesTable, s.cfg.attemptsTable, predicate), args...).Scan(&observed, &ready, &recoverLease)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.OutboxNextReady{}, false, nil
+	}
 	if err != nil {
 		return store.OutboxNextReady{}, false, fmt.Errorf("next %s ready at: %w", s.queueName(), err)
 	}
-	if ready == nil {
-		return store.OutboxNextReady{}, false, nil
+	readyKind := store.OutboxReadyClaim
+	if recoverLease {
+		readyKind = store.OutboxReadyRecoverLease
 	}
-	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: *ready}, true, nil
+	return store.OutboxNextReady{ObservedAt: observed, ReadyAt: ready, Kind: readyKind}, true, nil
 }
 
 type attemptTargetJSON struct {
@@ -1020,8 +1039,8 @@ WITH input AS MATERIALIZED (
 ), exact AS MATERIALIZED (
 
   SELECT i.*, a.targets_bound, a.target_count, a.delivery_source_instance_id,
+         a.empty_evidence_kind, a.resolution,
          a.command_not_after, a.evidence_deadline, a.lease_until,
-         a.finalized_at,
          l.lease_fence AS current_fence, l.state AS lane_state
   FROM input i
   LEFT JOIN locked_attempts a
@@ -1032,7 +1051,7 @@ WITH input AS MATERIALIZED (
 ), bindable AS MATERIALIZED (
   SELECT e.*
   FROM exact e
-  WHERE NOT e.targets_bound AND e.finalized_at IS NULL
+  WHERE NOT e.targets_bound
     AND e.command_not_after < e.evidence_deadline
     AND e.evidence_deadline < e.lease_until
     AND e.current_fence = e.lease_fence AND e.lane_state = 'leased'
@@ -1066,11 +1085,23 @@ WITH input AS MATERIALIZED (
   SET targets_bound = true,
 
       target_count = jsonb_array_length(b.targets),
-      delivery_source_instance_id = b.source_instance_id
+      delivery_source_instance_id = b.source_instance_id,
+      empty_evidence_kind = CASE
+        WHEN jsonb_array_length(b.targets) = 0 THEN 'authoritative_no_targets'
+        ELSE NULL
+      END,
+      evidence_at = CASE
+        WHEN jsonb_array_length(b.targets) = 0 THEN clock_timestamp()
+        ELSE NULL
+      END,
+      resolution = CASE
+        WHEN jsonb_array_length(b.targets) = 0 THEN 'confirmed'
+        ELSE NULL
+      END
   FROM bindable b
   CROSS JOIN inserted_count inserted
   WHERE a.item_id = b.item_id AND a.lease_fence = b.lease_fence
-    AND NOT a.targets_bound AND a.finalized_at IS NULL
+    AND NOT a.targets_bound
     AND inserted.target_count = (
       SELECT count(*)::integer
       FROM expanded x
@@ -1080,13 +1111,16 @@ WITH input AS MATERIALIZED (
 SELECT e.ordinal,
   CASE
     WHEN e.targets_bound IS NULL THEN 'fenced'
-    WHEN e.finalized_at IS NOT NULL THEN 'already_finalized'
     WHEN e.current_fence IS DISTINCT FROM e.lease_fence OR e.lane_state <> 'leased' THEN 'fenced'
     WHEN n.item_id IS NOT NULL THEN 'bound'
 
     WHEN e.targets_bound
       AND e.delivery_source_instance_id = e.source_instance_id
       AND e.target_count = jsonb_array_length(e.targets)
+      AND (
+        e.target_count > 0 OR
+        (e.empty_evidence_kind = 'authoritative_no_targets' AND e.resolution = 'confirmed')
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM jsonb_to_recordset(e.targets) AS wanted(
@@ -1145,8 +1179,6 @@ func bindTargetOutcome(value string) store.OutboxBindTargetOutcome {
 		return store.OutboxBindTargetBound
 	case "duplicate":
 		return store.OutboxBindTargetDuplicate
-	case "already_finalized":
-		return store.OutboxBindTargetAlreadyFinalized
 	case "fenced":
 		return store.OutboxBindTargetFenced
 	case "rejected":
@@ -1166,8 +1198,6 @@ type evidenceJSON struct {
 	CommandID        string    `json:"command_id"`
 	EligibleSessions int       `json:"eligible_sessions"`
 	WrittenSessions  int       `json:"written_sessions"`
-	AuthKeyID        string    `json:"auth_key_id"`
-	SessionID        int64     `json:"session_id"`
 	ServerMsgID      int64     `json:"server_msg_id"`
 	ObservedAt       time.Time `json:"observed_at"`
 }
@@ -1203,10 +1233,6 @@ func (s *durableOutboxState) RecordAttemptEvidenceBatch(ctx context.Context, evi
 		} else if instanceID != "" || item.TargetUserID != 0 || validBytes16(item.BatchID) || validBytes16(item.CommandID) {
 			return nil, fmt.Errorf("record %s evidence: authoritative empty evidence has a target at index %d", s.queueName(), i)
 		}
-		if item.Kind == store.OutboxEvidenceClientAck &&
-			(item.AuthKeyID == ([8]byte{}) || item.SessionID == 0 || item.ServerMsgID <= 0) {
-			return nil, fmt.Errorf("record %s evidence: invalid client ack at index %d", s.queueName(), i)
-		}
 		switch item.Kind {
 		case store.OutboxEvidenceEdgeWritten:
 			if item.EligibleSessions <= 0 || item.WrittenSessions != item.EligibleSessions || item.ServerMsgID <= 0 {
@@ -1215,10 +1241,6 @@ func (s *durableOutboxState) RecordAttemptEvidenceBatch(ctx context.Context, evi
 		case store.OutboxEvidenceEdgeNoEligible, store.OutboxEvidenceAuthoritativeNoTargets:
 			if item.EligibleSessions != 0 || item.WrittenSessions != 0 || item.ServerMsgID != 0 {
 				return nil, fmt.Errorf("record %s evidence: unexpected physical evidence fields at index %d", s.queueName(), i)
-			}
-		case store.OutboxEvidenceClientAck:
-			if item.EligibleSessions != 0 || item.WrittenSessions != 0 {
-				return nil, fmt.Errorf("record %s evidence: unexpected physical session counts at index %d", s.queueName(), i)
 			}
 		}
 		key := fmt.Sprintf("%d/%d/%s/%d/%s/%s", item.Ref.ItemID, item.Ref.LeaseFence,
@@ -1231,9 +1253,9 @@ func (s *durableOutboxState) RecordAttemptEvidenceBatch(ctx context.Context, evi
 			attemptRefJSON: refJSON(i, item.Ref), Kind: kind,
 			SourceInstanceID: sourceInstanceID,
 			TargetInstanceID: instanceID, TargetUserID: item.TargetUserID, BatchID: bytes16Hex(item.BatchID),
-			CommandID: bytes16Hex(item.CommandID), AuthKeyID: hex.EncodeToString(item.AuthKeyID[:]),
+			CommandID:        bytes16Hex(item.CommandID),
 			EligibleSessions: item.EligibleSessions, WrittenSessions: item.WrittenSessions,
-			SessionID: item.SessionID, ServerMsgID: item.ServerMsgID, ObservedAt: item.ObservedAt,
+			ServerMsgID: item.ServerMsgID, ObservedAt: item.ObservedAt,
 		}
 	}
 	payload, err := marshalJSONInput(input)
@@ -1249,8 +1271,7 @@ WITH input AS MATERIALIZED (
     lease_fence bigint, attempt integer, kind text, source_instance_id text,
     target_instance_id text, target_user_id bigint, batch_id text, command_id text,
     eligible_sessions integer, written_sessions integer,
-    auth_key_id text, session_id bigint, server_msg_id bigint,
-    observed_at timestamptz
+    server_msg_id bigint, observed_at timestamptz
   )
 ), db_clock AS MATERIALIZED (
   SELECT clock_timestamp() AS observed_now
@@ -1268,14 +1289,13 @@ WITH input AS MATERIALIZED (
 ), exact AS MATERIALIZED (
   SELECT i.*, a.targets_bound, a.target_count, a.resolution,
          a.delivery_source_instance_id,
-         a.empty_evidence_kind, a.finalized_at, a.evidence_deadline,
+         a.empty_evidence_kind, a.evidence_deadline,
          a.evidence_deadline > c.observed_now AS evidence_live,
          l.lease_fence AS current_fence, l.state AS lane_state,
          t.evidence_kind AS target_evidence_kind,
          t.eligible_sessions AS target_eligible_sessions,
          t.written_sessions AS target_written_sessions,
          t.physical_first_server_msg_id AS target_server_msg_id,
-         t.client_ack_at AS target_client_ack_at,
          (t.item_id IS NOT NULL) AS target_exists
   FROM input i
   LEFT JOIN locked_attempts a
@@ -1306,31 +1326,11 @@ WITH input AS MATERIALIZED (
     AND t.batch_id = decode(e.batch_id, 'hex')
     AND t.command_id = decode(e.command_id, 'hex')
     AND t.evidence_kind IS NULL
-    AND e.finalized_at IS NULL AND e.resolution IS NULL
+    AND e.resolution IS NULL
     AND e.delivery_source_instance_id = e.source_instance_id
     AND e.targets_bound AND e.current_fence = e.lease_fence
     AND e.lane_state = 'leased'
     AND e.evidence_live
-  RETURNING t.item_id, t.lease_fence, t.target_instance_id, t.target_user_id, t.batch_id, t.command_id
-), ack_updated AS MATERIALIZED (
-  UPDATE %s t
-  SET client_ack_at = e.observed_at,
-      client_ack_auth_key_id = decode(e.auth_key_id, 'hex'),
-      client_ack_session_id = e.session_id,
-      client_ack_server_msg_id = e.server_msg_id
-  FROM exact e
-  WHERE e.kind = 'client_ack'
-    AND t.item_id = e.item_id AND t.lease_fence = e.lease_fence
-    AND t.target_instance_id = e.target_instance_id
-    AND t.target_user_id = e.target_user_id
-    AND t.batch_id = decode(e.batch_id, 'hex')
-    AND t.command_id = decode(e.command_id, 'hex')
-    AND t.client_ack_at IS NULL
-    AND e.finalized_at IS NULL
-    AND e.delivery_source_instance_id = e.source_instance_id
-    AND (e.resolution IS NULL OR e.resolution = 'confirmed')
-    AND e.targets_bound AND e.current_fence = e.lease_fence
-    AND e.lane_state = 'leased'
   RETURNING t.item_id, t.lease_fence, t.target_instance_id, t.target_user_id, t.batch_id, t.command_id
 ), empty_updated AS MATERIALIZED (
   UPDATE %s a
@@ -1340,7 +1340,7 @@ WITH input AS MATERIALIZED (
   FROM exact e
   WHERE e.kind = 'authoritative_no_targets'
     AND a.item_id = e.item_id AND a.lease_fence = e.lease_fence
-    AND a.finalized_at IS NULL AND a.resolution IS NULL
+    AND a.resolution IS NULL
     AND e.delivery_source_instance_id = e.source_instance_id
     AND a.targets_bound AND a.target_count = 0
     AND e.current_fence = e.lease_fence AND e.lane_state = 'leased'
@@ -1350,7 +1350,7 @@ WITH input AS MATERIALIZED (
   UPDATE %s a
   SET resolution = 'confirmed',
       evidence_at = COALESCE(a.evidence_at, now())
-  WHERE a.finalized_at IS NULL AND a.resolution IS NULL
+  WHERE a.resolution IS NULL
     AND a.targets_bound AND a.target_count > 0
     AND EXISTS (
       SELECT 1 FROM target_updated u
@@ -1377,17 +1377,14 @@ WITH input AS MATERIALIZED (
 SELECT e.ordinal,
   CASE
     WHEN e.targets_bound IS NULL THEN 'fenced'
-    WHEN e.finalized_at IS NOT NULL THEN 'already_finalized'
     WHEN e.current_fence IS DISTINCT FROM e.lease_fence OR e.lane_state <> 'leased' THEN 'fenced'
     WHEN e.delivery_source_instance_id IS DISTINCT FROM e.source_instance_id THEN 'fenced'
-    WHEN e.kind <> 'client_ack' AND NOT COALESCE(e.evidence_live, false) THEN 'fenced'
+    WHEN NOT COALESCE(e.evidence_live, false) THEN 'fenced'
     WHEN NOT e.targets_bound THEN 'rejected'
     WHEN e.kind = 'authoritative_no_targets' AND e.target_count <> 0 THEN 'rejected'
     WHEN e.kind = 'authoritative_no_targets' AND e.empty_evidence_kind IS NOT NULL THEN 'duplicate'
     WHEN e.kind = 'authoritative_no_targets' AND eu.item_id IS NOT NULL THEN 'recorded'
     WHEN e.kind <> 'authoritative_no_targets' AND NOT e.target_exists THEN 'rejected'
-    WHEN e.kind = 'client_ack' AND e.target_client_ack_at IS NOT NULL THEN 'duplicate'
-    WHEN e.kind = 'client_ack' AND au.item_id IS NOT NULL THEN 'recorded'
     WHEN e.kind IN ('edge_written', 'edge_no_eligible')
       AND e.target_evidence_kind = e.kind
       AND e.target_eligible_sessions = e.eligible_sessions
@@ -1408,14 +1405,8 @@ LEFT JOIN target_updated tu
  AND tu.target_user_id = e.target_user_id
  AND tu.batch_id = decode(e.batch_id, 'hex')
  AND tu.command_id = decode(e.command_id, 'hex')
-LEFT JOIN ack_updated au
-  ON au.item_id = e.item_id AND au.lease_fence = e.lease_fence
- AND au.target_instance_id = e.target_instance_id
- AND au.target_user_id = e.target_user_id
- AND au.batch_id = decode(e.batch_id, 'hex')
- AND au.command_id = decode(e.command_id, 'hex')
 ORDER BY e.ordinal`, s.cfg.attemptsTable, s.cfg.lanesTable, s.cfg.targetsTable,
-		s.cfg.targetsTable, s.cfg.targetsTable, s.cfg.attemptsTable, s.cfg.attemptsTable, s.cfg.targetsTable), payload)
+		s.cfg.targetsTable, s.cfg.attemptsTable, s.cfg.attemptsTable, s.cfg.targetsTable), payload)
 	if err != nil {
 		return nil, fmt.Errorf("record %s evidence: %w", s.queueName(), err)
 	}
@@ -1451,8 +1442,6 @@ func evidenceKindString(kind store.OutboxEvidenceKind) (string, bool) {
 		return "edge_no_eligible", true
 	case store.OutboxEvidenceAuthoritativeNoTargets:
 		return "authoritative_no_targets", false
-	case store.OutboxEvidenceClientAck:
-		return "client_ack", true
 	default:
 		return "", false
 	}
@@ -1464,11 +1453,6 @@ func sameOutboxCompletionEvidence(a, b store.OutboxAttemptEvidence) bool {
 		a.BatchID != b.BatchID || a.CommandID != b.CommandID {
 		return false
 	}
-	if a.Kind == store.OutboxEvidenceClientAck {
-		// Several sessions can ACK one target command. Client ACK is diagnostic
-		// only; the target ledger intentionally retains its first observation.
-		return true
-	}
 	return a.EligibleSessions == b.EligibleSessions && a.WrittenSessions == b.WrittenSessions &&
 		a.ServerMsgID == b.ServerMsgID
 }
@@ -1479,8 +1463,6 @@ func evidenceOutcome(value string) store.OutboxEvidenceOutcome {
 		return store.OutboxEvidenceRecorded
 	case "duplicate":
 		return store.OutboxEvidenceDuplicate
-	case "already_finalized":
-		return store.OutboxEvidenceAlreadyFinalized
 	case "fenced":
 		return store.OutboxEvidenceFenced
 	case "rejected":
@@ -1631,7 +1613,7 @@ WITH input AS MATERIALIZED (
   FOR UPDATE OF a
 ), exact AS MATERIALIZED (
   SELECT i.*, (a.item_id IS NOT NULL) AS attempt_exists,
-         a.resolution, a.finalized_at, a.targets_bound,
+         a.resolution, a.targets_bound,
          a.evidence_deadline,
 		 a.delivery_source_instance_id, a.lease_owner AS attempt_owner,
          a.lease_until AS attempt_lease_until,
@@ -1666,7 +1648,7 @@ WITH input AS MATERIALIZED (
       last_error = left(e.last_error, 2000)
   FROM exact e
   WHERE a.item_id = e.item_id AND a.lease_fence = e.lease_fence
-    AND a.finalized_at IS NULL AND a.resolution IS NULL
+    AND a.resolution IS NULL
     AND e.current_fence = e.lease_fence AND e.lane_state = 'leased'
     AND (
       (e.authority = 'target'
@@ -1685,7 +1667,6 @@ WITH input AS MATERIALIZED (
 SELECT e.ordinal,
   CASE
     WHEN NOT e.attempt_exists THEN 'fenced'
-    WHEN e.finalized_at IS NOT NULL THEN 'already_finalized'
     WHEN e.current_fence IS DISTINCT FROM e.lease_fence OR e.lane_state <> 'leased' THEN 'fenced'
     WHEN e.authority = 'target' AND e.delivery_source_instance_id IS DISTINCT FROM e.source_instance_id THEN 'fenced'
     WHEN e.authority = 'target' AND (NOT e.targets_bound OR NOT e.target_exists OR e.target_evidence_kind IS NOT NULL) THEN 'rejected'
@@ -1751,8 +1732,6 @@ func resolutionOutcome(value string) store.OutboxResolutionOutcome {
 		return store.OutboxResolutionRecorded
 	case "duplicate":
 		return store.OutboxResolutionDuplicate
-	case "already_finalized":
-		return store.OutboxResolutionAlreadyFinalized
 	case "fenced":
 		return store.OutboxResolutionFenced
 	case "rejected":
@@ -1787,13 +1766,15 @@ type outboxLaneRow struct {
 }
 
 type outboxWindowAttemptRow struct {
-	itemID          int64
-	sequence        int64
-	attempt         *int
-	resolution      *string
-	retryAt         *time.Time
-	resolutionReady *bool
-	finalizedAt     *time.Time
+	itemID           int64
+	sequence         int64
+	attempt          *int
+	issuedAt         *time.Time
+	commandNotAfter  *time.Time
+	evidenceDeadline *time.Time
+	resolution       *string
+	retryAt          *time.Time
+	resolutionReady  *bool
 }
 
 func (s *durableOutboxState) FinalizeAttempts(ctx context.Context, requests []store.OutboxFinalizeRequest) (store.OutboxFinalizeBatch, error) {
@@ -1850,23 +1831,38 @@ func (s *durableOutboxState) FinalizeAttempts(ctx context.Context, requests []st
 
 	newlyFinalized := make(map[finalizedAttemptKey]string)
 	var next []store.OutboxClaimWindow
-	for _, streamID := range streamIDs {
-		// A batch is only a transport optimization. Each ordering domain gets an
-		// independent transaction so one blocked hot lane cannot retain locks or
-		// delay completion for unrelated domains in the same RPC.
+	for groupStart := 0; groupStart < len(streamIDs); groupStart += outboxFinalizeTransactionLanes {
+		groupEnd := min(groupStart+outboxFinalizeTransactionLanes, len(streamIDs))
+		group := streamIDs[groupStart:groupEnd]
+		// Finalization is durable lane work, not merely a transport batch. Use one
+		// bounded transaction for a small stable-ordered group so 128 one-item
+		// user lanes do not become 128 WAL flushes. The hard group limit prevents
+		// one blocked lane from retaining an unbounded set of unrelated locks.
 		err := withOutboxTx(ctx, s.db, func(tx pgx.Tx) error {
-			// finalizeLockedLane takes the one blocking lane lock. Its subsequent
-			// READ COMMITTED statements observe producers that committed while it
-			// waited, closing the empty-lane marker race.
-			window, finalized, err := s.finalizeLockedLane(ctx, tx, streamID, byStream[streamID])
-			if err != nil {
-				return err
+			if groupUsesExactFinalization(group, byStream) {
+				finalized, err := s.finalizeLockedLaneGroup(ctx, tx, group, byStream)
+				if err != nil {
+					return err
+				}
+				for key, outcome := range finalized {
+					newlyFinalized[key] = outcome
+				}
+				return nil
 			}
-			for key, outcome := range finalized {
-				newlyFinalized[key] = outcome
-			}
-			if window != nil {
-				next = append(next, *window)
+			for _, streamID := range group {
+				// finalizeLockedLane takes the blocking lane lock in ascending stream
+				// order. Its later READ COMMITTED statements observe producers that
+				// committed while it waited, closing the empty-lane marker race.
+				window, finalized, err := s.finalizeLockedLane(ctx, tx, streamID, byStream[streamID])
+				if err != nil {
+					return err
+				}
+				for key, outcome := range finalized {
+					newlyFinalized[key] = outcome
+				}
+				if window != nil {
+					next = append(next, *window)
+				}
 			}
 			return nil
 		})
@@ -1883,20 +1879,16 @@ func (s *durableOutboxState) FinalizeAttempts(ctx context.Context, requests []st
 			results[i] = result
 			continue
 		}
-		var finalizedAt *time.Time
-		var persistedOutcome *string
+		var attemptExists bool
 		err := s.db.QueryRow(ctx, fmt.Sprintf(`
-SELECT finalized_at, finalization_outcome
-FROM %s
+SELECT EXISTS(SELECT 1 FROM %s
 WHERE stream_id = $1 AND item_id = $2 AND sequence = $3
-  AND lease_fence = $4 AND attempt = $5`, s.cfg.attemptsTable),
+  AND lease_fence = $4 AND attempt = $5)`, s.cfg.attemptsTable),
 			request.Ref.StreamID, request.Ref.ItemID, request.Ref.Sequence,
-			int64(request.Ref.LeaseFence), request.Ref.Attempt).Scan(&finalizedAt, &persistedOutcome)
-		if err == nil && finalizedAt != nil && persistedOutcome != nil {
-			result.Outcome = store.OutboxFinalizeAlreadyFinalized
-		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			int64(request.Ref.LeaseFence), request.Ref.Attempt).Scan(&attemptExists)
+		if err != nil {
 			return store.OutboxFinalizeBatch{}, fmt.Errorf("classify %s finalize result: %w", s.queueName(), err)
-		} else if err == nil {
+		} else if attemptExists {
 			var currentFence int64
 			laneErr := s.db.QueryRow(ctx, fmt.Sprintf(`SELECT lease_fence FROM %s WHERE stream_id = $1`, s.cfg.lanesTable), request.Ref.StreamID).Scan(&currentFence)
 			if laneErr == nil && currentFence == int64(request.Ref.LeaseFence) {
@@ -1912,6 +1904,17 @@ WHERE stream_id = $1 AND item_id = $2 AND sequence = $3
 		results[i] = result
 	}
 	return store.OutboxFinalizeBatch{Results: results, Next: next}, nil
+}
+
+func groupUsesExactFinalization(streamIDs []int64, byStream map[int64][]store.OutboxFinalizeRequest) bool {
+	for _, streamID := range streamIDs {
+		for _, request := range byStream[streamID] {
+			if request.RetainLease {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *durableOutboxState) finalizeLockedLane(ctx context.Context, tx pgx.Tx, streamID int64,
@@ -1952,7 +1955,7 @@ func (s *durableOutboxState) finalizeLockedLane(ctx context.Context, tx pgx.Tx, 
 	stopIndex := -1
 	for i := range windowRows {
 		row := &windowRows[i]
-		if row.attempt == nil || row.resolution == nil || row.finalizedAt != nil ||
+		if row.attempt == nil || row.resolution == nil ||
 			row.resolutionReady == nil || !*row.resolutionReady {
 			break
 		}
@@ -1975,7 +1978,7 @@ func (s *durableOutboxState) finalizeLockedLane(ctx context.Context, tx pgx.Tx, 
 	}
 
 	if len(deleteIDs) > 0 {
-		if err := s.persistFinalizedAttempts(ctx, tx, lane, deleteIDs, deleteOutcomes); err != nil {
+		if err := s.deleteAttempts(ctx, tx, lane, deleteIDs); err != nil {
 			return nil, nil, err
 		}
 		for i, itemID := range deleteIDs {
@@ -1991,21 +1994,20 @@ WHERE target_user_id = $1 AND id = ANY($2::bigint[])`, s.cfg.itemsTable), stream
 	if stopResolution != nil {
 		outcome := "scheduled_retry"
 		readyAt := stopResolution.retryAt
-		if err := s.persistFinalizedAttempts(ctx, tx, lane, []int64{stopResolution.itemID}, []string{outcome}); err != nil {
+		if err := s.deleteAttempts(ctx, tx, lane, []int64{stopResolution.itemID}); err != nil {
 			return nil, nil, err
 		}
 		finalized[finalizedAttemptKey{stopResolution.itemID, lane.leaseFence}] = outcome
 		// Once this head is retried/quarantined, every later command issued under
-		// the old fence is invalid. Tombstone the suffix without consuming its
-		// immutable items so stale receipts classify AlreadyFinalized and a fresh
-		// claim cannot be blocked by orphaned pending resolutions.
+		// the old fence is invalid. Delete the suffix live attempts without
+		// consuming immutable items; late receipts classify stale/fenced.
 		superseded := make([]int64, 0, len(windowRows)-stopIndex-1)
 		for i := stopIndex + 1; i < len(windowRows); i++ {
-			if windowRows[i].attempt != nil && windowRows[i].finalizedAt == nil {
+			if windowRows[i].attempt != nil {
 				superseded = append(superseded, windowRows[i].itemID)
 			}
 		}
-		if err := s.persistSupersededAttempts(ctx, tx, lane, superseded); err != nil {
+		if err := s.deleteAttempts(ctx, tx, lane, superseded); err != nil {
 			return nil, nil, err
 		}
 		if readyAt == nil {
@@ -2057,6 +2059,7 @@ WHERE stream_id = $1 AND lease_fence = $4`, s.cfg.lanesTable),
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 UPDATE %s
 SET head_item_id = $3, head_sequence = $4,
+    head_attempt = 0,
     state = 'ready', ready_at = now(), lease_owner = '', lease_until = NULL,
     window_end_item_id = NULL, window_end_sequence = NULL, updated_at = now()
 WHERE stream_id = $1 AND lease_fence = $2`, s.cfg.lanesTable),
@@ -2065,7 +2068,13 @@ WHERE stream_id = $1 AND lease_fence = $2`, s.cfg.lanesTable),
 		}
 		return nil, finalized, nil
 	}
-	handoff, err := s.issueHandoffWindow(ctx, tx, lane, *retain)
+	first := &windowRows[0]
+	if first.issuedAt == nil || first.commandNotAfter == nil || first.evidenceDeadline == nil {
+		return nil, nil, fmt.Errorf("issue %s handoff: current window has no persisted deadlines", s.queueName())
+	}
+	physicalDuration := first.commandNotAfter.Sub(*first.issuedAt)
+	clockSkewAllowance := first.evidenceDeadline.Sub(*first.commandNotAfter)
+	handoff, err := s.issueHandoffWindow(ctx, tx, lane, *retain, physicalDuration, clockSkewAllowance)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2102,11 +2111,11 @@ func (s *durableOutboxState) loadCurrentWindow(ctx context.Context, tx pgx.Tx, l
 		where = "(i.pts, i.id) >= ($2::int, $3::bigint) AND (i.pts, i.id) <= ($4::int, $5::bigint)"
 	}
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
-SELECT i.id, %s AS sequence, a.attempt, a.resolution, a.retry_at,
+SELECT i.id, %s AS sequence, a.attempt, a.issued_at, a.command_not_after, a.evidence_deadline,
+       a.resolution, a.retry_at,
        CASE WHEN a.item_id IS NULL THEN NULL
             ELSE (a.retry_at IS NULL OR a.retry_at <= clock_timestamp())
-       END AS resolution_ready,
-       a.finalized_at
+       END AS resolution_ready
 FROM %s i
 LEFT JOIN %s a
   ON a.item_id = i.id AND a.lease_fence = $6
@@ -2122,8 +2131,9 @@ ORDER BY %s`, s.cfg.sequenceSQL, s.cfg.itemsTable, s.cfg.attemptsTable,
 	var out []outboxWindowAttemptRow
 	for rows.Next() {
 		var row outboxWindowAttemptRow
-		if err := rows.Scan(&row.itemID, &row.sequence, &row.attempt, &row.resolution,
-			&row.retryAt, &row.resolutionReady, &row.finalizedAt); err != nil {
+		if err := rows.Scan(&row.itemID, &row.sequence, &row.attempt, &row.issuedAt,
+			&row.commandNotAfter, &row.evidenceDeadline, &row.resolution,
+			&row.retryAt, &row.resolutionReady); err != nil {
 			return nil, fmt.Errorf("scan current %s window: %w", s.queueName(), err)
 		}
 		out = append(out, row)
@@ -2134,47 +2144,21 @@ ORDER BY %s`, s.cfg.sequenceSQL, s.cfg.itemsTable, s.cfg.attemptsTable,
 	return out, nil
 }
 
-func (s *durableOutboxState) persistFinalizedAttempts(ctx context.Context, tx pgx.Tx, lane outboxLaneRow,
-	itemIDs []int64, outcomes []string) error {
-	if len(itemIDs) != len(outcomes) {
-		return errors.New("outbox finalization input length mismatch")
-	}
-	tag, err := tx.Exec(ctx, fmt.Sprintf(`
-WITH input AS (
-  SELECT * FROM unnest($1::bigint[], $2::text[]) AS x(item_id, outcome)
-)
-UPDATE %s a
-SET finalized_at = now(), finalization_outcome = input.outcome
-FROM input
-WHERE a.item_id = input.item_id AND a.stream_id = $3
-  AND a.lease_fence = $4 AND a.finalized_at IS NULL`, s.cfg.attemptsTable),
-		itemIDs, outcomes, lane.streamID, int64(lane.leaseFence))
-	if err != nil {
-		return fmt.Errorf("persist finalized %s attempts: %w", s.queueName(), err)
-	}
-	if tag.RowsAffected() != int64(len(itemIDs)) {
-		return fmt.Errorf("persist finalized %s attempts: updated %d of %d", s.queueName(), tag.RowsAffected(), len(itemIDs))
-	}
-	return nil
-}
-
-func (s *durableOutboxState) persistSupersededAttempts(ctx context.Context, tx pgx.Tx, lane outboxLaneRow,
+func (s *durableOutboxState) deleteAttempts(ctx context.Context, tx pgx.Tx, lane outboxLaneRow,
 	itemIDs []int64) error {
 	if len(itemIDs) == 0 {
 		return nil
 	}
 	tag, err := tx.Exec(ctx, fmt.Sprintf(`
-UPDATE %s
-SET finalized_at = now(), finalization_outcome = 'superseded',
-    last_error = 'attempt superseded by predecessor retry or terminal stop'
+DELETE FROM %s
 WHERE stream_id = $1 AND lease_fence = $2
-  AND item_id = ANY($3::bigint[]) AND finalized_at IS NULL`, s.cfg.attemptsTable),
+  AND item_id = ANY($3::bigint[])`, s.cfg.attemptsTable),
 		lane.streamID, int64(lane.leaseFence), itemIDs)
 	if err != nil {
-		return fmt.Errorf("persist superseded %s attempts: %w", s.queueName(), err)
+		return fmt.Errorf("delete %s attempts: %w", s.queueName(), err)
 	}
 	if tag.RowsAffected() != int64(len(itemIDs)) {
-		return fmt.Errorf("persist superseded %s attempts: updated %d of %d", s.queueName(), tag.RowsAffected(), len(itemIDs))
+		return fmt.Errorf("delete %s attempts: deleted %d of %d", s.queueName(), tag.RowsAffected(), len(itemIDs))
 	}
 	return nil
 }
@@ -2223,6 +2207,7 @@ func (s *durableOutboxState) deleteEmptyLaneAndRestoreAppendRace(ctx context.Con
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`
 UPDATE %s
 SET head_item_id = $2, head_sequence = $3, state = 'ready', ready_at = now(),
+    head_attempt = 0,
     lease_owner = '', lease_until = NULL,
     window_end_item_id = NULL, window_end_sequence = NULL,
     last_error = '', updated_at = now()
@@ -2264,20 +2249,7 @@ func selectRetainRequest(requests []store.OutboxFinalizeRequest, lane outboxLane
 }
 
 func (s *durableOutboxState) issueHandoffWindow(ctx context.Context, tx pgx.Tx, lane outboxLaneRow,
-	request store.OutboxFinalizeRequest) (*store.OutboxClaimWindow, error) {
-	var issuedAt, commandNotAfter, evidenceDeadline time.Time
-	if err := tx.QueryRow(ctx, fmt.Sprintf(`
-SELECT issued_at, command_not_after, evidence_deadline
-FROM %s
-WHERE stream_id = $1 AND lease_fence = $2
-ORDER BY window_ordinal
-LIMIT 1`, s.cfg.attemptsTable), lane.streamID, int64(lane.leaseFence)).Scan(
-		&issuedAt, &commandNotAfter, &evidenceDeadline,
-	); err != nil {
-		return nil, fmt.Errorf("load %s handoff deadlines: %w", s.queueName(), err)
-	}
-	physicalDuration := commandNotAfter.Sub(issuedAt)
-	clockSkewAllowance := evidenceDeadline.Sub(commandNotAfter)
+	request store.OutboxFinalizeRequest, physicalDuration, clockSkewAllowance time.Duration) (*store.OutboxClaimWindow, error) {
 	if physicalDuration <= 0 || clockSkewAllowance <= 0 ||
 		request.LeaseDuration <= outboxLeaseSafetyMargin ||
 		physicalDuration >= request.LeaseDuration-outboxLeaseSafetyMargin ||
@@ -2344,8 +2316,7 @@ LIMIT $4`, s.cfg.itemsTable)
 	}
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH windowed AS MATERIALIZED (%s), numbered AS MATERIALIZED (
-  SELECT w.*,
-         COALESCE((SELECT max(old.attempt) FROM %s old WHERE old.item_id = w.id), 0) + 1 AS attempt
+  SELECT w.*, 1::integer AS attempt
   FROM windowed w
 ), issued AS MATERIALIZED (
   INSERT INTO %s (
@@ -2363,6 +2334,7 @@ WITH windowed AS MATERIALIZED (%s), numbered AS MATERIALIZED (
   UPDATE %s l
   SET head_item_id = bounds.head_id,
       head_sequence = CASE WHEN $9::boolean THEN bounds.head_sequence ELSE bounds.head_id END,
+      head_attempt = 1,
       state = 'leased', lease_owner = $3,
       lease_until = now() + ($6::bigint * interval '1 millisecond'),
       window_end_item_id = bounds.tail_id,
@@ -2385,7 +2357,7 @@ SELECT n.id, n.sequence, n.exclude_auth_key_id, n.exclude_session_id,
 FROM numbered n
 JOIN issued i ON i.item_id = n.id AND i.lease_fence = $2
 JOIN advanced a ON a.stream_id = $1
-ORDER BY n.window_ordinal`, windowSource, s.cfg.attemptsTable, s.cfg.attemptsTable, s.cfg.lanesTable),
+ORDER BY n.window_ordinal`, windowSource, s.cfg.attemptsTable, s.cfg.lanesTable),
 		lane.streamID, int64(lane.leaseFence), lane.leaseOwner, int32(windowSize),
 		int64(request.WindowByteLimit), durationMillis(request.LeaseDuration),
 		physicalDuration.Microseconds(), clockSkewAllowance.Microseconds(),

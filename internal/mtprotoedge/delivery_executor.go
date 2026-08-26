@@ -19,7 +19,6 @@ const (
 	deliveryExecutorMailbox       = 256
 	deliveryExecutorMaxBytes      = int64(128 << 20)
 	deliveryAttemptsPerShard      = 4096
-	deliveryTerminalSkewSlack     = 2 * time.Second
 	deliveryFanoutSessionQuantum  = 32
 	deliveryFanoutTimeQuantum     = 500 * time.Microsecond
 	deliveryRetainedBytesPerShard = int64(4 << 20)
@@ -36,6 +35,7 @@ type deliveryAttemptFingerprint struct {
 	targetInstanceID string
 	sourceInstanceID string
 	notAfterUnixNano int64
+	evidenceUnixNano int64
 	channelRouteHash [16]byte
 }
 
@@ -45,6 +45,7 @@ type deliveryAttemptEntry struct {
 	index         int
 	base          edgecontrol.PhysicalReceipt
 	deadline      time.Time
+	evidenceUntil time.Time
 	terminalAt    time.Time
 	terminal      edgecontrol.PhysicalReceipt
 	retainedBytes int64
@@ -102,10 +103,11 @@ func (h *deliveryDeadlineHeap) Pop() any {
 }
 
 type deliveryCommandTask struct {
-	ctx   context.Context
-	batch edgecontrol.DeliveryBatch
-	bytes int
-	done  chan edgecontrol.DeliveryAdmission
+	ctx        context.Context
+	batch      edgecontrol.DeliveryBatch
+	bytes      int
+	replayOnly bool
+	done       chan edgecontrol.DeliveryAdmission
 }
 
 type deliveryFanoutTask struct {
@@ -186,7 +188,8 @@ func (m *SessionManager) AdmitDeliveryBatch(ctx context.Context, batch edgecontr
 		admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailInvalidPayload
 		return admission
 	}
-	if !time.Now().Before(batch.NotAfter) {
+	now := time.Now()
+	if !now.Before(batch.EvidenceDeadline) {
 		admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailDeadline
 		return admission
 	}
@@ -195,7 +198,7 @@ func (m *SessionManager) AdmitDeliveryBatch(ctx context.Context, batch edgecontr
 		admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailCapacity
 		return admission
 	}
-	return executor.admit(ctx, batch)
+	return executor.admit(ctx, batch, !now.Before(batch.NotAfter))
 }
 
 func newDeliveryExecutor(manager *SessionManager, sink edgecontrol.PhysicalReceiptSink) *deliveryExecutor {
@@ -216,9 +219,9 @@ func newDeliveryExecutor(manager *SessionManager, sink edgecontrol.PhysicalRecei
 	return e
 }
 
-func (e *deliveryExecutor) admit(ctx context.Context, batch edgecontrol.DeliveryBatch) edgecontrol.DeliveryAdmission {
+func (e *deliveryExecutor) admit(ctx context.Context, batch edgecontrol.DeliveryBatch, replayOnly bool) edgecontrol.DeliveryAdmission {
 	admission := edgecontrol.DeliveryAdmission{BatchID: batch.BatchID, CommandID: batch.CommandID, SourceInstanceID: batch.SourceInstanceID, TargetInstanceID: batch.TargetInstanceID}
-	if !time.Now().Before(batch.NotAfter) {
+	if !time.Now().Before(batch.EvidenceDeadline) {
 		admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailDeadline
 		return admission
 	}
@@ -230,7 +233,7 @@ func (e *deliveryExecutor) admit(ctx context.Context, batch edgecontrol.Delivery
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	task := deliveryCommandTask{ctx: ctx, batch: batch, bytes: bytes, done: make(chan edgecontrol.DeliveryAdmission, 1)}
+	task := deliveryCommandTask{ctx: ctx, batch: batch, bytes: bytes, replayOnly: replayOnly, done: make(chan edgecontrol.DeliveryAdmission, 1)}
 	shard := &e.shards[edgecontrol.OrderingDomainHash(batch.Items[0].Ref.Domain)&uint64(len(e.shards)-1)]
 	select {
 	case shard.commands <- task:
@@ -304,9 +307,13 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 	batch := task.batch
 	admission := edgecontrol.DeliveryAdmission{BatchID: batch.BatchID, CommandID: batch.CommandID, SourceInstanceID: batch.SourceInstanceID, TargetInstanceID: batch.TargetInstanceID}
 	now := time.Now()
-	if (task.ctx != nil && task.ctx.Err() != nil) || !now.Before(batch.NotAfter) {
+	if (task.ctx != nil && task.ctx.Err() != nil) || !now.Before(batch.EvidenceDeadline) {
 		admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailDeadline
 		task.done <- admission
+		return
+	}
+	if task.replayOnly || !now.Before(batch.NotAfter) {
+		s.replayTerminalOnly(task, admission)
 		return
 	}
 	domain := batch.Items[0].Ref.Domain
@@ -336,7 +343,7 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 		// overload branch so an old Conn queue cannot write after reclamation.
 		fenceState.max.Store(fence)
 	}
-	fenceExpiresAt := batch.NotAfter.Add(deliveryTerminalSkewSlack)
+	fenceExpiresAt := batch.EvidenceDeadline
 	deadlineExtended := fenceExpiresAt.After(fenceState.expiresAt)
 	if deadlineExtended {
 		fenceState.expiresAt = fenceExpiresAt
@@ -381,7 +388,7 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 	}
 	if len(newIndexes) == 0 {
 		if allTerminal {
-			if err := s.republishTerminal(batch, terminalIndexes); err != nil {
+			if err := s.republishTerminal(batch, terminalIndexes, batch.EvidenceDeadline); err != nil {
 				admission.Outcome, admission.Detail = edgecontrol.AdmissionOverloaded, edgecontrol.DetailCapacity
 				task.done <- admission
 				return
@@ -418,7 +425,7 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 		task.done <- admission
 		return
 	}
-	if err := s.republishTerminal(batch, terminalIndexes); err != nil {
+	if err := s.republishTerminal(batch, terminalIndexes, batch.EvidenceDeadline); err != nil {
 		for i := range refs {
 			reservation.Release(i)
 		}
@@ -432,6 +439,7 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 		s.attempts[item.Ref] = &deliveryAttemptEntry{
 			fingerprint: deliveryFingerprint(batch, item), reservation: reservation, index: reservationIndex,
 			deadline:      deadline,
+			evidenceUntil: batch.EvidenceDeadline,
 			base:          edgecontrol.PhysicalReceipt{BatchID: batch.BatchID, CommandID: batch.CommandID, SourceInstanceID: batch.SourceInstanceID, TargetInstanceID: batch.TargetInstanceID, Ref: item.Ref},
 			retainedBytes: retained,
 		}
@@ -457,7 +465,48 @@ func (s *deliveryExecutorShard) handle(task deliveryCommandTask) {
 	}
 }
 
-func (s *deliveryExecutorShard) republishTerminal(batch edgecontrol.DeliveryBatch, indexes []int) error {
+// replayTerminalOnly is the post-command, pre-evidence-deadline state. It may
+// republish a receipt for an exact command already owned by this actor, but it
+// can never create an attempt, advance a fence, enumerate sessions, or enqueue
+// bytes to a Conn. A missing entry is therefore a terminal deadline rejection,
+// not permission to execute the command again.
+func (s *deliveryExecutorShard) replayTerminalOnly(task deliveryCommandTask, admission edgecontrol.DeliveryAdmission) {
+	batch := task.batch
+	terminalIndexes := make([]int, 0, len(batch.Items))
+	inFlight := false
+	for i, item := range batch.Items {
+		entry := s.attempts[item.Ref]
+		if entry == nil {
+			admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailDeadline
+			task.done <- admission
+			return
+		}
+		if entry.fingerprint != deliveryFingerprint(batch, item) {
+			admission.Outcome, admission.Detail = edgecontrol.AdmissionRejected, edgecontrol.DetailAttemptConflict
+			task.done <- admission
+			return
+		}
+		if entry.terminalAt.IsZero() {
+			inFlight = true
+			continue
+		}
+		terminalIndexes = append(terminalIndexes, i)
+	}
+	if err := s.republishTerminal(batch, terminalIndexes, batch.EvidenceDeadline); err != nil {
+		admission.Outcome, admission.Detail = edgecontrol.AdmissionOverloaded, edgecontrol.DetailCapacity
+		task.done <- admission
+		return
+	}
+	if inFlight {
+		admission.Outcome = edgecontrol.AdmissionDuplicateInFlight
+	} else {
+		admission.Outcome = edgecontrol.AdmissionDuplicateTerminal
+	}
+	admission.Detail = edgecontrol.DetailNone
+	task.done <- admission
+}
+
+func (s *deliveryExecutorShard) republishTerminal(batch edgecontrol.DeliveryBatch, indexes []int, reserveUntil time.Time) error {
 	if len(indexes) == 0 {
 		return nil
 	}
@@ -466,7 +515,7 @@ func (s *deliveryExecutorShard) republishTerminal(batch edgecontrol.DeliveryBatc
 		refs[i] = batch.Items[index].Ref
 	}
 	reservation, err := s.owner.sink.ReservePhysicalReceipts(
-		batch.BatchID, batch.SourceInstanceID, batch.TargetInstanceID, batch.CommandID, batch.NotAfter, refs,
+		batch.BatchID, batch.SourceInstanceID, batch.TargetInstanceID, batch.CommandID, reserveUntil, refs,
 	)
 	if err != nil {
 		return err
@@ -688,7 +737,7 @@ func (s *deliveryExecutorShard) complete(ref edgecontrol.DeliveryRef, receipt ed
 		s.active--
 	}
 	entry.reservation.Commit(entry.index, receipt)
-	heap.Push(&s.deadlines, deliveryDeadlineEntry{at: entry.deadline.Add(deliveryTerminalSkewSlack), kind: deliveryDeadlineTerminal, ref: ref})
+	heap.Push(&s.deadlines, deliveryDeadlineEntry{at: entry.evidenceUntil, kind: deliveryDeadlineTerminal, ref: ref})
 }
 
 func (s *deliveryExecutorShard) expire(now time.Time) {
@@ -706,7 +755,7 @@ func (s *deliveryExecutorShard) expire(now time.Time) {
 			}
 		case deliveryDeadlineTerminal:
 			entry := s.attempts[deadline.ref]
-			if entry != nil && !entry.terminalAt.IsZero() && !now.Before(entry.deadline.Add(deliveryTerminalSkewSlack)) {
+			if entry != nil && !entry.terminalAt.IsZero() && !now.Before(entry.evidenceUntil) {
 				s.retainedBytes -= entry.retainedBytes
 				delete(s.attempts, deadline.ref)
 			}
@@ -978,6 +1027,7 @@ func deliveryFingerprint(batch edgecontrol.DeliveryBatch, item edgecontrol.Deliv
 		excludeAuthKeyID: batch.ExcludeAuthKeyID, excludeSessionID: batch.ExcludeSessionID,
 		targetInstanceID: batch.TargetInstanceID, sourceInstanceID: batch.SourceInstanceID,
 		notAfterUnixNano: batch.NotAfter.UnixNano(),
+		evidenceUnixNano: batch.EvidenceDeadline.UnixNano(),
 		channelRouteHash: deliveryChannelRouteHash(item.Channel),
 	}
 }

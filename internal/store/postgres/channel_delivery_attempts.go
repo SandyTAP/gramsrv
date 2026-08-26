@@ -29,7 +29,6 @@ type channelDeliveryAttemptState struct {
 	evidenceDeadline         time.Time
 	evidenceLive             bool
 	resolution               string
-	finalizedAt              *time.Time
 	laneFence                *int64
 	laneState                *string
 	laneOwner                *string
@@ -47,7 +46,7 @@ SELECT a.channel_id, a.min_pts, a.max_pts, a.attempt_no,
        a.targets_bound, a.target_count, a.delivery_source_instance_id,
        a.owner, a.lease_until, a.lease_until > c.observed_now,
        a.command_not_after, a.evidence_deadline, a.evidence_deadline > c.observed_now,
-       a.resolution, a.finalized_at,
+       a.resolution,
        l.lease_fence, l.state, l.lease_owner, l.lease_until,
        COALESCE(l.lease_until > c.observed_now, false)
 FROM channel_delivery_attempts a
@@ -69,7 +68,6 @@ FOR UPDATE OF a`, ref.ItemID, int64(ref.LeaseFence)).Scan(
 		&out.evidenceDeadline,
 		&out.evidenceLive,
 		&out.resolution,
-		&out.finalizedAt,
 		&out.laneFence,
 		&out.laneState,
 		&out.laneOwner,
@@ -132,15 +130,11 @@ func (s *ChannelDeliveryStore) BindAttemptTargets(ctx context.Context, sets []st
 		set := sets[idx]
 		state, err := loadChannelDeliveryAttemptForUpdate(ctx, tx, set.Ref)
 		if errors.Is(err, pgx.ErrNoRows) {
-			results[idx].Outcome = store.OutboxBindTargetRejected
+			results[idx].Outcome = store.OutboxBindTargetFenced
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("bind channel attempt targets: load attempt: %w", err)
-		}
-		if state.finalizedAt != nil {
-			results[idx].Outcome = store.OutboxBindTargetAlreadyFinalized
-			continue
 		}
 		if !exactChannelAttemptRef(set.Ref, state) {
 			results[idx].Outcome = store.OutboxBindTargetRejected
@@ -154,6 +148,9 @@ func (s *ChannelDeliveryStore) BindAttemptTargets(ctx context.Context, sets []st
 			equal := state.deliverySourceInstanceID != nil && *state.deliverySourceInstanceID == set.SourceInstanceID
 			if equal {
 				equal, err = channelAttemptTargetsEqual(ctx, tx, set.Ref, set.Targets)
+			}
+			if equal && len(set.Targets) == 0 && state.resolution != "confirmed" {
+				equal = false
 			}
 			if err != nil {
 				return nil, err
@@ -202,7 +199,13 @@ FROM unnest($3::text[], $4::bigint[], $5::bytea[], $6::bytea[])
 		}
 		if _, err := tx.Exec(ctx, `
 UPDATE channel_delivery_attempts
-SET targets_bound = true, target_count = $3, delivery_source_instance_id = $4
+SET targets_bound = true,
+    target_count = $3,
+    delivery_source_instance_id = $4,
+    empty_evidence_kind = CASE WHEN $3 = 0 THEN 'authoritative_no_targets' ELSE NULL END,
+    evidence_at = CASE WHEN $3 = 0 THEN clock_timestamp() ELSE NULL END,
+    resolution = CASE WHEN $3 = 0 THEN 'confirmed' ELSE 'pending' END,
+    resolved_at = CASE WHEN $3 = 0 THEN clock_timestamp() ELSE NULL END
 WHERE item_id = $1 AND lease_fence = $2`,
 			set.Ref.ItemID,
 			int64(set.Ref.LeaseFence),
@@ -322,17 +325,15 @@ func (s *ChannelDeliveryStore) RecordAttemptEvidenceBatch(ctx context.Context, e
 		if err := validateChannelEvidence(evidence[i]); err != nil {
 			return nil, fmt.Errorf("record channel evidence: invalid evidence at index %d: %w", i, err)
 		}
-		if evidence[i].Kind != store.OutboxEvidenceClientAck {
-			key := completionKey{
-				ref: evidence[i].Ref, targetInstanceID: evidence[i].TargetInstanceID,
-				targetUserID: evidence[i].TargetUserID, batchID: evidence[i].BatchID,
-				commandID: evidence[i].CommandID,
-			}
-			if previous, ok := seen[key]; ok && !sameOutboxCompletionEvidence(previous, evidence[i]) {
-				return nil, fmt.Errorf("record channel evidence: conflicting duplicate at index %d", i)
-			}
-			seen[key] = evidence[i]
+		key := completionKey{
+			ref: evidence[i].Ref, targetInstanceID: evidence[i].TargetInstanceID,
+			targetUserID: evidence[i].TargetUserID, batchID: evidence[i].BatchID,
+			commandID: evidence[i].CommandID,
 		}
+		if previous, ok := seen[key]; ok && !sameOutboxCompletionEvidence(previous, evidence[i]) {
+			return nil, fmt.Errorf("record channel evidence: conflicting duplicate at index %d", i)
+		}
+		seen[key] = evidence[i]
 		indices = append(indices, i)
 	}
 	if len(indices) == 0 {
@@ -357,15 +358,11 @@ func (s *ChannelDeliveryStore) RecordAttemptEvidenceBatch(ctx context.Context, e
 		ev := evidence[idx]
 		state, err := loadChannelDeliveryAttemptForUpdate(ctx, tx, ev.Ref)
 		if errors.Is(err, pgx.ErrNoRows) {
-			results[idx].Outcome = store.OutboxEvidenceRejected
+			results[idx].Outcome = store.OutboxEvidenceFenced
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("record channel evidence: load attempt: %w", err)
-		}
-		if state.finalizedAt != nil {
-			results[idx].Outcome = store.OutboxEvidenceAlreadyFinalized
-			continue
 		}
 		if !exactChannelAttemptRef(ev.Ref, state) {
 			results[idx].Outcome = store.OutboxEvidenceRejected
@@ -381,7 +378,7 @@ func (s *ChannelDeliveryStore) RecordAttemptEvidenceBatch(ctx context.Context, e
 		}
 		// Physical completion authority is the database receipt deadline. The
 		// Edge timestamp is diagnostic only and must never admit a late receipt.
-		if ev.Kind != store.OutboxEvidenceClientAck && !state.evidenceLive {
+		if !state.evidenceLive {
 			results[idx].Outcome = store.OutboxEvidenceFenced
 			continue
 		}
@@ -409,7 +406,7 @@ SET empty_evidence_kind = 'authoritative_no_targets',
     resolution = 'confirmed',
     resolved_at = COALESCE($3::timestamptz, clock_timestamp())
 WHERE item_id = $1 AND lease_fence = $2
-  AND resolution = 'pending' AND finalized_at IS NULL
+  AND resolution = 'pending'
   AND evidence_deadline > clock_timestamp()`, ev.Ref.ItemID, int64(ev.Ref.LeaseFence), observedAt)
 			if err != nil {
 				return nil, fmt.Errorf("record channel no-target evidence: %w", err)
@@ -421,63 +418,6 @@ WHERE item_id = $1 AND lease_fence = $2
 			results[idx].Outcome = store.OutboxEvidenceRecorded
 			continue
 		}
-		if ev.Kind == store.OutboxEvidenceClientAck {
-			commandTag, err := tx.Exec(ctx, `
-UPDATE channel_delivery_attempt_targets
-SET client_ack_at = $7,
-    client_ack_auth_key_id = $8,
-    client_ack_session_id = $9,
-    client_ack_server_msg_id = $10,
-    updated_at = clock_timestamp()
-WHERE item_id = $1 AND lease_fence = $2
-  AND target_instance_id = $3 AND target_user_id = $4
-  AND batch_id = $5 AND command_id = $6
-  AND client_ack_at IS NULL`,
-				ev.Ref.ItemID,
-				int64(ev.Ref.LeaseFence),
-				ev.TargetInstanceID,
-				ev.TargetUserID,
-				ev.BatchID[:],
-				ev.CommandID[:],
-				ev.ObservedAt,
-				ev.AuthKeyID[:],
-				ev.SessionID,
-				ev.ServerMsgID,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("record channel client ack: %w", err)
-			}
-			if commandTag.RowsAffected() == 1 {
-				results[idx].Outcome = store.OutboxEvidenceRecorded
-				continue
-			}
-			var clientAckAt *time.Time
-			err = tx.QueryRow(ctx, `
-SELECT client_ack_at
-FROM channel_delivery_attempt_targets
-WHERE item_id = $1 AND lease_fence = $2
-  AND target_instance_id = $3 AND target_user_id = $4
-  AND batch_id = $5 AND command_id = $6`,
-				ev.Ref.ItemID,
-				int64(ev.Ref.LeaseFence),
-				ev.TargetInstanceID,
-				ev.TargetUserID,
-				ev.BatchID[:],
-				ev.CommandID[:],
-			).Scan(&clientAckAt)
-			switch {
-			case errors.Is(err, pgx.ErrNoRows):
-				results[idx].Outcome = store.OutboxEvidenceRejected
-			case err != nil:
-				return nil, fmt.Errorf("classify channel client ack: %w", err)
-			case clientAckAt != nil:
-				results[idx].Outcome = store.OutboxEvidenceDuplicate
-			default:
-				results[idx].Outcome = store.OutboxEvidenceRejected
-			}
-			continue
-		}
-
 		status, evidenceKind := channelEvidenceStatus(ev.Kind)
 		commandTag, err := tx.Exec(ctx, `
 UPDATE channel_delivery_attempt_targets
@@ -496,7 +436,7 @@ WHERE item_id = $1 AND lease_fence = $2
     SELECT 1
     FROM channel_delivery_attempts a
     WHERE a.item_id = $1 AND a.lease_fence = $2
-      AND a.resolution = 'pending' AND a.finalized_at IS NULL
+      AND a.resolution = 'pending'
       AND a.evidence_deadline > clock_timestamp()
   )`,
 			ev.Ref.ItemID,
@@ -607,10 +547,6 @@ func validateChannelEvidence(ev store.OutboxAttemptEvidence) error {
 		}
 		if ev.Kind == store.OutboxEvidenceEdgeNoEligible && (ev.EligibleSessions != 0 || ev.WrittenSessions != 0 || ev.ServerMsgID != 0) {
 			return errors.New("channel no-eligible evidence cannot report sessions")
-		}
-	case store.OutboxEvidenceClientAck:
-		if strings.TrimSpace(ev.TargetInstanceID) == "" || strings.TrimSpace(ev.TargetInstanceID) != ev.TargetInstanceID || len(ev.TargetInstanceID) > store.MaxDeliveryInstanceIDBytes || ev.TargetUserID != 0 || ev.BatchID == ([16]byte{}) || ev.CommandID == ([16]byte{}) || ev.AuthKeyID == ([8]byte{}) || ev.SessionID == 0 || ev.ServerMsgID <= 0 || ev.EligibleSessions != 0 || ev.WrittenSessions != 0 {
-			return errors.New("channel client ack requires exact target, command, auth key, session, and server message")
 		}
 	default:
 		return errors.New("unknown channel evidence kind")
@@ -733,10 +669,6 @@ func (s *ChannelDeliveryStore) resolveAuthorizedChannelAttempts(ctx context.Cont
 		if err != nil {
 			return nil, fmt.Errorf("resolve channel attempt: load attempt: %w", err)
 		}
-		if state.finalizedAt != nil {
-			results[idx].Outcome = store.OutboxResolutionAlreadyFinalized
-			continue
-		}
 		if !exactChannelAttemptRef(resolution.ref, state) {
 			results[idx].Outcome = store.OutboxResolutionRejected
 			continue
@@ -799,7 +731,7 @@ SET resolution = $3,
     END,
     resolved_at = clock_timestamp()
 WHERE item_id = $1 AND lease_fence = $2
-  AND resolution = 'pending' AND finalized_at IS NULL
+  AND resolution = 'pending'
   AND EXISTS (
     SELECT 1
     FROM channel_delivery_lanes l

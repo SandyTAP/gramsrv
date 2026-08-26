@@ -125,3 +125,17 @@ func TestEvaluateReportAcceptsReturnToNonZeroSharedServerBaseline(t *testing.T) 
 		t.Fatalf("report = %#v", report)
 	}
 }
+
+func TestEvaluateReportRejectsFixedRateDeliveryLoss(t *testing.T) {
+	report := &RunReport{
+		ExpectedSessions: 1, PeakReadySessions: 1,
+		SteadySamples: 1, SteadyReadyRatio: 1, MinSteadyReadySessions: 1,
+		MessageScheduled: 2, MessageEnqueued: 2, MessageCompleted: 2,
+		Delivery:   DeliveryReport{Expected: 2, Delivered: 1, Missing: 1},
+		Operations: map[string]OperationReport{},
+	}
+	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, MessageRate: 1})
+	if report.Pass {
+		t.Fatal("fixed-rate report with a missing recipient delivery passed")
+	}
+}

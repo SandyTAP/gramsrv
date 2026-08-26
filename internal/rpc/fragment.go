@@ -420,16 +420,37 @@ func (r *Router) usernameRegistryMap(ctx context.Context, peers []domain.Peer) m
 	if r.deps.Usernames == nil || len(peers) == 0 {
 		return nil
 	}
-	if len(peers) == 1 {
-		list, err := r.deps.Usernames.PeerUsernames(ctx, peers[0])
-		if err != nil || len(list) == 0 {
+	loadEpoch := r.peerUsernameProjectionCache.LoadEpoch()
+	result := make(map[domain.Peer][]domain.Username, len(peers))
+	missing := make([]domain.Peer, 0, len(peers))
+	for _, peer := range peers {
+		if cached, ok := r.peerUsernameProjectionCache.Lookup(peer); ok {
+			result[peer] = cached
+		} else {
+			missing = append(missing, peer)
+		}
+	}
+	if len(missing) == 0 {
+		return result
+	}
+	loaded := make(map[domain.Peer][]domain.Username, len(missing))
+	if len(missing) == 1 {
+		list, err := r.deps.Usernames.PeerUsernames(ctx, missing[0])
+		if err != nil {
 			return nil
 		}
-		return map[domain.Peer][]domain.Username{peers[0]: list}
+		loaded[missing[0]] = list
+	} else {
+		byPeer, err := r.deps.Usernames.UsernamesBatch(ctx, missing)
+		if err != nil {
+			return nil
+		}
+		loaded = byPeer
 	}
-	byPeer, err := r.deps.Usernames.UsernamesBatch(ctx, peers)
-	if err != nil {
-		return nil
+	for _, peer := range missing {
+		list := loaded[peer]
+		r.peerUsernameProjectionCache.StoreIfEpoch(peer, list, loadEpoch)
+		result[peer] = list
 	}
-	return byPeer
+	return result
 }

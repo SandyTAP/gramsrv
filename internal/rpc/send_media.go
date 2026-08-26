@@ -51,6 +51,44 @@ type outgoingSend struct {
 	allowPaidStars int64
 }
 
+type privateSendBaseUserResolver interface {
+	BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error)
+}
+
+// plainPrivateSendEcho reports whether the sender acknowledgement contains no
+// nested peer-bearing payload. The caller already supplied an InputPeerUser,
+// so UpdateNewMessage + UpdateMessageID can use an empty Users/Chats envelope.
+// This is a semantic hot path, not a fallback: complex sends retain the full
+// viewer projection below.
+func plainPrivateSendEcho(p outgoingSend) bool {
+	return len(p.entities) == 0 && p.media.IsZero() && !p.silent && !p.noforwards &&
+		p.replyToInput == nil && p.replyTo == nil && p.sendAsInput == nil && p.sendAs == nil &&
+		!p.clearDraft && p.replyMarkup.IsZero() && p.viaBotID == 0 && p.richMessage.IsZero() &&
+		p.groupedID == 0 && p.effect == 0 && p.allowPaidStars == 0
+}
+
+func (r *Router) validatePlainPrivateSendPeer(ctx context.Context, peerUserID int64) error {
+	if r == nil || r.deps.Users == nil || peerUserID == 0 {
+		return peerIDInvalidErr()
+	}
+	resolver, ok := r.deps.Users.(privateSendBaseUserResolver)
+	if !ok {
+		// Production wiring must expose the Redis-backed base identity boundary.
+		// Never fall back to the full viewer projection on the send hot path.
+		return internalErr()
+	}
+	users, err := resolver.BaseUsersByIDs(ctx, []int64{peerUserID})
+	if err != nil {
+		return internalErr()
+	}
+	for _, user := range users {
+		if user.ID == peerUserID {
+			return nil
+		}
+	}
+	return peerIDInvalidErr()
+}
+
 // sendOutgoing 把一条出站消息落地到私聊或频道，返回 *tg.Updates、是否重复、错误。
 // media 为空即纯文本。校验（长度/random_id/限流）由调用方完成。
 func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Peer, p outgoingSend) (tg.UpdatesClass, bool, error) {
@@ -136,8 +174,13 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	if err := r.ensureVoiceMessagesAllowed(ctx, userID, peer, p.media != nil && p.media.HasUnreadPayload()); err != nil {
 		return nil, false, err
 	}
+	plainEcho := plainPrivateSendEcho(p)
 	var projectedUsers []domain.User
-	if r.deps.Users != nil {
+	if plainEcho {
+		if err := r.validatePlainPrivateSendPeer(ctx, peer.ID); err != nil {
+			return nil, false, err
+		}
+	} else if r.deps.Users != nil {
 		loaded, err := r.deps.Users.ByIDs(ctx, userID, []int64{userID, peer.ID})
 		if err != nil {
 			return nil, false, internalErr()
@@ -212,7 +255,7 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	}
 	var users []tg.UserClass
 	var chats []tg.ChatClass
-	if !res.Duplicate {
+	if !res.Duplicate && !plainEcho {
 		users = r.usersForMessageUpdateWithPreloaded(ctx, userID, res.SenderMessage, projectedUsers)
 		chats = r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
 	}

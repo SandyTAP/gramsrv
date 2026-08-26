@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
@@ -29,10 +30,18 @@ func (missingBoxIDAllocator) CurrentBoxID(context.Context, int64) (int, error) {
 
 // MessageStore 用 PostgreSQL 实现 store.MessageStore。
 type MessageStore struct {
-	db     sqlcgen.DBTX
-	q      *sqlcgen.Queries
-	boxIDs store.BoxIDAllocator
-	log    *zap.Logger
+	db                     sqlcgen.DBTX
+	q                      *sqlcgen.Queries
+	boxIDs                 store.BoxIDAllocator
+	readModelInvalidations store.ReadModelInvalidationPublisher
+	batchObserver          PlainPrivateSendBatchObserver
+	log                    *zap.Logger
+}
+
+// PlainPrivateSendBatchObserver receives only fixed-shape Core capacity data;
+// request identities and message contents never cross this boundary.
+type PlainPrivateSendBatchObserver interface {
+	PlainPrivateSendBatch(duration time.Duration, tasks int, err error)
 }
 
 type txBeginner interface {
@@ -53,6 +62,24 @@ func WithMessageAllocators(boxIDs store.BoxIDAllocator) MessageStoreOption {
 func WithMessageLogger(log *zap.Logger) MessageStoreOption {
 	return func(s *MessageStore) {
 		s.log = log
+	}
+}
+
+// WithMessageReadModelInvalidations injects the Redis publisher used after a
+// plain-send commit. The same exact keys are also carried by dispatch_outbox and
+// republished by Egress, so this publisher is the read-your-write accelerator,
+// not the crash-recovery fact.
+func WithMessageReadModelInvalidations(publisher store.ReadModelInvalidationPublisher) MessageStoreOption {
+	return func(s *MessageStore) {
+		s.readModelInvalidations = publisher
+	}
+}
+
+// WithPlainPrivateSendBatchObserver installs the production batch capacity
+// observer. It has no effect on transaction semantics or admission.
+func WithPlainPrivateSendBatchObserver(observer PlainPrivateSendBatchObserver) MessageStoreOption {
+	return func(s *MessageStore) {
+		s.batchObserver = observer
 	}
 }
 

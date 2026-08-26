@@ -135,6 +135,9 @@ func runLoad(ctx context.Context, args []string) error {
 	ramp := flags.Duration("ramp", 2*time.Minute, "connection ramp duration")
 	rpcInterval := flags.Duration("rpc-interval", 5*time.Second, "per-session background RPC interval")
 	messageInterval := flags.Duration("message-interval", 30*time.Second, "per-primary-session message interval; negative disables")
+	messageRate := flags.Float64("message-rate", 0, "aggregate fixed arrival rate in messages/second; use with message-interval=-1")
+	messageQueue := flags.Int("message-queue", 8, "bounded pending sends per primary session for fixed-rate workload")
+	deliverySettle := flags.Duration("delivery-settle", 10*time.Second, "maximum live-delivery settle time before final updates.getDifference reconciliation")
 	fileInterval := flags.Duration("file-interval", time.Minute, "per-session upload.getFile interval")
 	fileSize := flags.Int("file-size", 4<<20, "generated shared download fixture bytes; 0 disables")
 	fileChunk := flags.Int("file-chunk", 1<<20, "upload.getFile bytes per request (max 1MiB)")
@@ -156,7 +159,8 @@ func runLoad(ctx context.Context, args []string) error {
 		ManifestPath: *manifest, SessionKeyPath: *sessionKey, RSAKeyOverride: *rsaOverride,
 		ReportPath: *report, EventsPath: *events, FileFixturePath: *fileFixture, ServerMetricsURL: *serverMetrics,
 		SessionLimit: *sessions, Duration: *duration, RecoveryDuration: *recovery, RampDuration: *ramp,
-		RPCInterval: *rpcInterval, MessageInterval: *messageInterval, SampleInterval: *sampleInterval,
+		RPCInterval: *rpcInterval, MessageInterval: *messageInterval, MessageRate: *messageRate,
+		MessageQueueDepth: *messageQueue, DeliverySettle: *deliverySettle, SampleInterval: *sampleInterval,
 		FileInterval: *fileInterval, FileSizeBytes: *fileSize, FileChunkBytes: *fileChunk, SetupTimeout: *setupTimeout,
 		OperationTimeout: *operationTimeout,
 		OfflineFraction:  *offlineFraction, OfflineAt: *offlineAt, OfflineFor: *offlineFor,
@@ -197,9 +201,9 @@ func runSummarize(args []string) error {
 }
 
 func printSummary(report *loadharness.RunReport) {
-	fmt.Fprintf(os.Stdout, "pass=%v sessions=%d peak_ready=%d reconnects=%d disconnects=%d flood_waits=%d fatal_errors=%d\n",
+	fmt.Fprintf(os.Stdout, "pass=%v sessions=%d peak_ready=%d reconnects=%d disconnects=%d flood_waits=%d fatal_errors=%d scheduled=%d delivered=%d missing=%d\n",
 		report.Pass, report.ExpectedSessions, report.PeakReadySessions, report.Reconnects, report.Disconnects,
-		totalFloodWaits(report), report.WorkerFatalErrors)
+		totalFloodWaits(report), report.WorkerFatalErrors, report.MessageScheduled, report.Delivery.Delivered, report.Delivery.Missing)
 	for _, failure := range report.Failures {
 		fmt.Fprintln(os.Stdout, "failure:", failure)
 	}

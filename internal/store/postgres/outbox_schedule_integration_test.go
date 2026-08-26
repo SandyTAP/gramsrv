@@ -20,7 +20,7 @@ func TestDeliveryOutboxNextReadyUsesDurableLaneDeadlinePostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	ready, ok, err := outbox.NextReadyAt(ctx, store.OutboxQueueAbsoluteDelivery, 0, nil)
-	if err != nil || !ok || ready.Delay() > time.Second {
+	if err != nil || !ok || ready.Kind != store.OutboxReadyClaim || ready.Delay() > time.Second {
 		t.Fatalf("ready deadline = %+v ok=%v err=%v", ready, ok, err)
 	}
 	windows, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
@@ -32,7 +32,7 @@ func TestDeliveryOutboxNextReadyUsesDurableLaneDeadlinePostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	ready, ok, err = outbox.NextReadyAt(ctx, store.OutboxQueueAbsoluteDelivery, 0, nil)
-	if err != nil || !ok || ready.ReadyAt.After(windows[0].Items[0].EvidenceDeadline) ||
+	if err != nil || !ok || ready.Kind != store.OutboxReadyRecoverLease || ready.ReadyAt.After(windows[0].Items[0].EvidenceDeadline) ||
 		!ready.ReadyAt.Before(windows[0].LeaseUntil) {
 		t.Fatalf("leased evidence deadline = %+v ok=%v err=%v window=%+v", ready, ok, err, windows[0])
 	}
@@ -41,12 +41,6 @@ func TestDeliveryOutboxNextReadyUsesDurableLaneDeadlinePostgres(t *testing.T) {
 		Ref: ref, SourceInstanceID: "egress-a", Targets: []store.OutboxAttemptTarget{},
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind empty = %+v err=%v", results, err)
-	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record empty = %+v err=%v", results, err)
 	}
 	ready, ok, err = outbox.NextReadyAt(ctx, store.OutboxQueueAbsoluteDelivery, 0, nil)
 	if err != nil || ok {

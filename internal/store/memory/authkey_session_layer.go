@@ -109,6 +109,26 @@ func (s *AuthKeyStore) AdvanceSessionLayer(
 	return current, true, nil
 }
 
+func (s *AuthKeyStore) GetAuthKeyLayerDefault(
+	_ context.Context,
+	rawAuthKeyID [8]byte,
+) (store.AuthKeyLayerDefault, bool, error) {
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	defaultKeyID := rawAuthKeyID
+	if binding, ok := s.state.bindings[rawAuthKeyID]; ok {
+		binary.LittleEndian.PutUint64(defaultKeyID[:], uint64(binding.PermAuthKeyID))
+	}
+	key, found := s.state.keys[defaultKeyID]
+	if !found {
+		return store.AuthKeyLayerDefault{}, false, store.ErrAuthKeyNotFound
+	}
+	if key.Layer == 0 || key.LayerObservationID == 0 {
+		return store.AuthKeyLayerDefault{}, false, nil
+	}
+	return store.AuthKeyLayerDefault{Layer: key.Layer, ObservationID: key.LayerObservationID}, true, nil
+}
+
 func (s *AuthKeyStore) DeleteSessionLayer(
 	_ context.Context,
 	rawAuthKeyID [8]byte,

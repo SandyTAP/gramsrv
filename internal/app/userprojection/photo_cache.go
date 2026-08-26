@@ -10,7 +10,7 @@ import (
 
 // DefaultPhotoCacheTTL 是头像投影缓存的兜底有效期；正常正确性依赖写入侧触发
 // read_model_versions/NOTIFY 后显式失效，TTL 只负责覆盖进程外漏通知或手工改库。
-const DefaultPhotoCacheTTL = 10 * time.Second
+const DefaultPhotoCacheTTL = 30 * time.Minute
 
 const photoCacheMaxEntries = 200000
 
@@ -34,7 +34,7 @@ type photoCacheValue struct {
 	has bool
 }
 
-// CachedPhotoProvider 给 owner 的当前 profile/fallback 头像查询加一层短 TTL 进程内缓存,
+// CachedPhotoProvider 给 owner 的当前 profile/fallback 头像查询加一层有界进程内缓存,
 // 由统一缓存原语承载(LRU 单条驱逐 / epoch 守卫 / clone;批量经 GetOrLoadBatch)。
 // projectBatch / ForViewers 对每批 owner 固定打 2 次 CurrentProfilePhotosKind（profile+fallback），
 // 且 base user 命中 redis 也不短路——高频「返回用户」的 RPC（getUsers 等）会把这两条头像查询

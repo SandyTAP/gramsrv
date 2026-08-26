@@ -29,8 +29,10 @@ type Bus struct {
 	c      redis.UniversalClient
 	prefix string
 
-	admissionMu    sync.Mutex
-	admissionMuxes map[string]*admissionMux
+	admissionMu     sync.Mutex
+	admissionMuxes  map[string]*admissionMux
+	sessionAckMu    sync.Mutex
+	sessionAckMuxes map[string]*sessionAckMux
 }
 
 type Option func(*Bus)
@@ -45,7 +47,11 @@ func WithPrefix(prefix string) Option {
 }
 
 func New(c redis.UniversalClient, opts ...Option) *Bus {
-	b := &Bus{c: c, prefix: defaultPrefix, admissionMuxes: make(map[string]*admissionMux)}
+	b := &Bus{
+		c: c, prefix: defaultPrefix,
+		admissionMuxes:  make(map[string]*admissionMux),
+		sessionAckMuxes: make(map[string]*sessionAckMux),
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(b)
@@ -58,16 +64,19 @@ func (b *Bus) SendSessionControl(ctx context.Context, targetInstanceID string, c
 	if b == nil || b.c == nil {
 		return edgecontrol.SessionControlAck{}, ErrNilClient
 	}
-	if strings.TrimSpace(targetInstanceID) == "" || strings.TrimSpace(cmd.CommandID) == "" {
-		return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus: target instance and command id are required")
+	if strings.TrimSpace(targetInstanceID) == "" || strings.TrimSpace(cmd.CommandID) == "" || strings.TrimSpace(cmd.SourceInstanceID) == "" {
+		return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus: source instance, target instance and command id are required")
 	}
 	cmd.TargetInstanceID = targetInstanceID
-	ackChannel := b.sessionControlAckChannel(cmd.CommandID)
-	pubsub := b.c.Subscribe(ctx, ackChannel)
-	defer func() { _ = pubsub.Close() }()
-	if _, err := pubsub.Receive(ctx); err != nil {
-		return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus subscribe session control ack: %w", err)
+	mux, err := b.ensureSessionAckMux(ctx, cmd.SourceInstanceID)
+	if err != nil {
+		return edgecontrol.SessionControlAck{}, err
 	}
+	waiter, unregister, err := mux.register(cmd.CommandID)
+	if err != nil {
+		return edgecontrol.SessionControlAck{}, err
+	}
+	defer unregister()
 	raw, err := json.Marshal(cmd)
 	if err != nil {
 		return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus encode session control command: %w", err)
@@ -75,24 +84,18 @@ func (b *Bus) SendSessionControl(ctx context.Context, targetInstanceID string, c
 	if err := b.c.Publish(ctx, b.sessionControlCommandChannel(targetInstanceID), raw).Err(); err != nil {
 		return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus publish session control command: %w", err)
 	}
-	messages := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return edgecontrol.SessionControlAck{}, ctx.Err()
-		case msg, ok := <-messages:
-			if !ok {
-				return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus session control ack subscription closed")
-			}
-			var ack edgecontrol.SessionControlAck
-			if err := json.Unmarshal([]byte(msg.Payload), &ack); err != nil {
-				return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus decode session control ack: %w", err)
-			}
-			if ack.CommandID != cmd.CommandID {
-				continue
-			}
-			return ack, nil
+	select {
+	case <-ctx.Done():
+		return edgecontrol.SessionControlAck{}, ctx.Err()
+	case got := <-waiter:
+		if got.err != nil {
+			return edgecontrol.SessionControlAck{}, got.err
 		}
+		ack := got.ack
+		if ack.CommandID != cmd.CommandID || ack.SourceInstanceID != cmd.SourceInstanceID || ack.TargetInstanceID != targetInstanceID {
+			return edgecontrol.SessionControlAck{}, fmt.Errorf("edge redis bus: session control ack identity mismatch")
+		}
+		return ack, nil
 	}
 }
 
@@ -148,7 +151,7 @@ func (b *Bus) publishSessionControlAck(ctx context.Context, cmd edgecontrol.Sess
 	}
 	raw, err := json.Marshal(ack)
 	if err == nil {
-		_ = b.c.Publish(ctx, b.sessionControlAckChannel(cmd.CommandID), raw).Err()
+		_ = b.c.Publish(ctx, b.sessionControlAckChannel(cmd.SourceInstanceID), raw).Err()
 	}
 }
 
@@ -164,6 +167,6 @@ func (b *Bus) sessionControlCommandChannel(instanceID string) string {
 	return fmt.Sprintf("%s:session:control:%s", b.prefix, instanceID)
 }
 
-func (b *Bus) sessionControlAckChannel(commandID string) string {
-	return fmt.Sprintf("%s:session:ack:%s", b.prefix, commandID)
+func (b *Bus) sessionControlAckChannel(sourceInstanceID string) string {
+	return fmt.Sprintf("%s:session:ack:%s", b.prefix, sourceInstanceID)
 }

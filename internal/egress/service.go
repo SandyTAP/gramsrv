@@ -49,6 +49,7 @@ type WakeSources struct {
 
 type Service struct {
 	coordinator *deliveryCoordinator
+	projection  *ptsProjectionPool
 	config      Config
 	log         *zap.Logger
 }
@@ -58,15 +59,17 @@ func NewService(
 	dispatch store.DispatchOutboxStore,
 	absolute store.DeliveryOutboxStore,
 	channel store.ChannelDeliveryStore,
+	mutations AttemptMutationWriter,
 	planner edgecontrol.DeliveryPlanner,
 	builder OutboxUpdateBuilder,
+	readModelInvalidations store.ReadModelInvalidationPublisher,
 	channelBuilder ChannelUpdateBuilder,
 	metrics Metrics,
 	log *zap.Logger,
 	cfg Config,
 ) (*Service, error) {
-	if events == nil || dispatch == nil || absolute == nil || channel == nil || planner == nil ||
-		builder == nil || channelBuilder == nil || strings.TrimSpace(cfg.InstanceID) == "" {
+	if events == nil || dispatch == nil || absolute == nil || channel == nil || mutations == nil || planner == nil ||
+		builder == nil || readModelInvalidations == nil || channelBuilder == nil || strings.TrimSpace(cfg.InstanceID) == "" {
 		return nil, ErrMissingDependency
 	}
 	if metrics == nil {
@@ -142,12 +145,15 @@ func NewService(
 	if cfg.ActorMailboxBytes > 0 && cfg.ActorMailboxBytes < minimumProductionActorBytes {
 		return nil, errors.New("egress: actor byte budget cannot make progress on one maximum v3 delivery window")
 	}
+	projection := newPTSProjectionPool(events, builder)
 	coordinator := &deliveryCoordinator{
-		events: events, dispatch: dispatch, absolute: absolute, channel: channel,
-		planner:       planner,
-		updateBuilder: builder, channelBuilder: channelBuilder, metrics: metrics, log: log, instanceID: cfg.InstanceID,
+		dispatch: dispatch, absolute: absolute, channel: channel,
+		mutations:    mutations,
+		planner:      planner,
+		ptsProjector: projection, readModelInvalidations: readModelInvalidations,
+		channelBuilder: channelBuilder, metrics: metrics, log: log, instanceID: cfg.InstanceID,
 	}
-	return &Service{coordinator: coordinator, config: cfg, log: log}, nil
+	return &Service{coordinator: coordinator, projection: projection, config: cfg, log: log}, nil
 }
 
 // RunWithWake starts only fixed-size workers: stable shard claimers and a
@@ -161,23 +167,8 @@ func (s *Service) RunWithWake(ctx context.Context, wakes WakeSources) {
 		s.coordinator, s.config.ActorPartitions, s.config.ActorMailbox, s.config.ActorMailboxBytes,
 	)
 	var wait sync.WaitGroup
+	s.projection.Run(ctx, &wait)
 	actors.run(ctx, &wait)
-	type wakePair struct {
-		claim    chan struct{}
-		finalize chan struct{}
-	}
-	newWakePair := func(source <-chan struct{}) wakePair {
-		pair := wakePair{claim: make(chan struct{}, 1), finalize: make(chan struct{}, 1)}
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			fanoutQueueWake(ctx, source, pair.claim, pair.finalize)
-		}()
-		return pair
-	}
-	ptsWake := newWakePair(wakes.AccountPTS)
-	absoluteWake := newWakePair(wakes.AccountNonPTS)
-	channelWake := newWakePair(wakes.ChannelPTS)
 	base := queueRunnerConfig{
 		workers: s.config.Workers, laneLimit: s.config.Batch,
 		windowSize: s.config.WindowSize, windowBytes: s.config.WindowByteLimit,
@@ -186,17 +177,16 @@ func (s *Service) RunWithWake(ctx context.Context, wakes WakeSources) {
 		clockSkewAllowance: s.config.DeliveryClockSkewAllowance,
 	}
 	pts := base
-	pts.kind, pts.store, pts.wake, pts.logicalCount = store.OutboxQueueDispatchPTS, s.coordinator.dispatch, ptsWake.claim, store.DispatchOutboxLogicalShards
+	pts.kind, pts.store, pts.wake, pts.logicalCount = store.OutboxQueueDispatchPTS, s.coordinator.dispatch, wakes.AccountPTS, store.DispatchOutboxLogicalShards
 	absolute := base
-	absolute.kind, absolute.store, absolute.wake, absolute.logicalCount = store.OutboxQueueAbsoluteDelivery, s.coordinator.absolute, absoluteWake.claim, store.DispatchOutboxLogicalShards
+	absolute.kind, absolute.store, absolute.wake, absolute.logicalCount = store.OutboxQueueAbsoluteDelivery, s.coordinator.absolute, wakes.AccountNonPTS, store.DispatchOutboxLogicalShards
 	channel := base
-	channel.kind, channel.store, channel.wake, channel.logicalCount = store.OutboxQueueChannelPTS, s.coordinator.channel, channelWake.claim, store.ChannelDeliveryLogicalShards
+	channel.kind, channel.store, channel.wake, channel.logicalCount = store.OutboxQueueChannelPTS, s.coordinator.channel, wakes.ChannelPTS, store.ChannelDeliveryLogicalShards
 	s.runQueue(ctx, pts, actors, &wait)
 	s.runQueue(ctx, absolute, actors, &wait)
 	s.runQueue(ctx, channel, actors, &wait)
-	s.runFinalizers(ctx, pts, ptsWake.finalize, actors, &wait)
-	s.runFinalizers(ctx, absolute, absoluteWake.finalize, actors, &wait)
-	s.runFinalizers(ctx, channel, channelWake.finalize, actors, &wait)
-	s.runFinalizedAttemptGC(ctx, &wait)
+	s.runStartupFinalizers(ctx, pts, actors, &wait)
+	s.runStartupFinalizers(ctx, absolute, actors, &wait)
+	s.runStartupFinalizers(ctx, channel, actors, &wait)
 	wait.Wait()
 }

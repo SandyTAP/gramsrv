@@ -13,6 +13,7 @@ import (
 )
 
 var ErrOutboxProjectorUnavailable = errors.New("outbox projector is unavailable")
+var ErrOutboxPresenceBatchUnavailable = errors.New("outbox batch presence provider is unavailable")
 
 // OutboxUsersService makes sparse viewer projection a construction-time
 // requirement for the production Egress projector instead of an optional
@@ -26,6 +27,7 @@ type OutboxUsersService interface {
 // receiver-specific online updates for Durable Egress.
 type OutboxProjectionDeps struct {
 	Users            OutboxUsersService
+	Presence         UserLocationBatchProvider
 	Usernames        UsernameRegistryService
 	Dialogs          DialogsService
 	Messages         MessagesService
@@ -45,7 +47,10 @@ type OutboxProjector struct {
 
 // NewOutboxProjector creates a projection-only adapter for Egress. It is a
 // separate constructor so Egress wiring does not need a CoreExec-capable router.
-func NewOutboxProjector(cfg Config, deps OutboxProjectionDeps, log *zap.Logger, clk clock.Clock) *OutboxProjector {
+func NewOutboxProjector(cfg Config, deps OutboxProjectionDeps, log *zap.Logger, clk clock.Clock) (*OutboxProjector, error) {
+	if deps.Users == nil || deps.Presence == nil {
+		return nil, ErrOutboxPresenceBatchUnavailable
+	}
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -63,7 +68,8 @@ func NewOutboxProjector(cfg Config, deps OutboxProjectionDeps, log *zap.Logger, 
 		AccountRatings:   deps.AccountRatings,
 		BotVerifications: deps.BotVerifications,
 	}, log, clk)
-	return &OutboxProjector{router: router}
+	router.outboxPresence = deps.Presence
+	return &OutboxProjector{router: router}, nil
 }
 
 // BuildOutboxUpdateBytes builds receiver-specific TL updates and returns their
@@ -126,6 +132,12 @@ func (p *OutboxProjector) FlushChannelFullBotInfoReadModel() {
 func (p *OutboxProjector) InvalidateRPCProjectionReadModelForViewer(viewerUserID int64) {
 	if p != nil && p.router != nil {
 		p.router.InvalidateRPCProjectionReadModelForViewer(viewerUserID)
+	}
+}
+
+func (p *OutboxProjector) InvalidateRPCProjectionReadModelForContactOwner(ownerUserID int64) {
+	if p != nil && p.router != nil {
+		p.router.InvalidateRPCProjectionReadModelForContactOwner(ownerUserID)
 	}
 }
 

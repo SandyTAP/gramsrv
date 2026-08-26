@@ -7,37 +7,10 @@ import (
 	"time"
 
 	"telesrv/internal/edgecontrol"
-	"telesrv/internal/store"
 )
 
-type clientAckObservationStore struct {
-	store.DurableOutboxStateStore
-	recorded      []store.OutboxAttemptEvidence
-	finalizeCalls int
-}
-
-func (s *clientAckObservationStore) RecordAttemptEvidenceBatch(
-	_ context.Context,
-	evidence []store.OutboxAttemptEvidence,
-) ([]store.OutboxEvidenceResult, error) {
-	s.recorded = append(s.recorded, evidence...)
-	results := make([]store.OutboxEvidenceResult, len(evidence))
-	for i := range evidence {
-		results[i] = store.OutboxEvidenceResult{Ref: evidence[i].Ref, Outcome: store.OutboxEvidenceRecorded}
-	}
-	return results, nil
-}
-
-func (s *clientAckObservationStore) FinalizeAttempts(
-	context.Context,
-	[]store.OutboxFinalizeRequest,
-) (store.OutboxFinalizeBatch, error) {
-	s.finalizeCalls++
-	return store.OutboxFinalizeBatch{}, nil
-}
-
 func TestClientAckObservationNeverFinalizesDelivery(t *testing.T) {
-	state := &clientAckObservationStore{}
+	ring := NewClientAckObservationRing(16).(*clientAckObservationRing)
 	var batch edgecontrol.BatchID
 	var command edgecontrol.CommandID
 	batch[0], command[0] = 1, 2
@@ -56,15 +29,18 @@ func TestClientAckObservationNeverFinalizesDelivery(t *testing.T) {
 		ObservedAt:       time.Now().UTC(),
 	}
 
-	results := applyClientAckBatch(context.Background(), deliveryEvidenceStores{dispatch: state}, []edgecontrol.ClientAckObservation{observation})
+	results := applyClientAckBatch(context.Background(), deliveryEvidenceStores{clientAcks: ring}, []edgecontrol.ClientAckObservation{observation})
 	if len(results) != 1 || results[0].Outcome != edgecontrol.ClientAckObservationApplied {
 		t.Fatalf("results = %+v, want one applied observation", results)
 	}
-	if len(state.recorded) != 1 || state.recorded[0].Kind != store.OutboxEvidenceClientAck {
-		t.Fatalf("recorded evidence = %+v, want one client ACK observation", state.recorded)
+	shard := &ring.shards[edgecontrol.OrderingDomainHash(observation.Tracking.Ref.Domain)&(clientAckObservationShards-1)]
+	got := shard.slots[0].Load()
+	if got == nil || got.value != observation {
+		t.Fatalf("ring observation = %+v, want %+v", got, observation)
 	}
-	if state.finalizeCalls != 0 {
-		t.Fatalf("FinalizeAttempts calls = %d, client ACK must not advance completion", state.finalizeCalls)
+	ring.Observe(observation)
+	if stats := ring.Stats(); stats.Capacity != 16 || stats.Written != 2 || stats.Overwritten != 1 {
+		t.Fatalf("ring stats = %+v, want capacity=16 written=2 overwritten=1", stats)
 	}
 }
 

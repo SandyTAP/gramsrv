@@ -10,7 +10,7 @@ import (
 	"telesrv/internal/edgecontrol"
 )
 
-var deliveryCommandMagic = [4]byte{'E', 'D', 'C', 3}
+var deliveryCommandMagic = [4]byte{'E', 'D', 'C', 4}
 var deliveryAdmissionMagic = [4]byte{'E', 'D', 'A', 3}
 
 const (
@@ -25,7 +25,7 @@ func encodeDeliveryBatchWire(batch edgecontrol.DeliveryBatch) ([]byte, error) {
 	if len(batch.Items) > edgecontrol.MaxDeliveryBatchItems {
 		return nil, fmt.Errorf("edge redis bus: delivery item count exceeds %d", edgecontrol.MaxDeliveryBatchItems)
 	}
-	size := 4 + 16 + 16 + 2 + len(batch.SourceInstanceID) + 2 + len(batch.TargetInstanceID) + 8 + 8 + 8 + 8 + 2
+	size := 4 + 16 + 16 + 2 + len(batch.SourceInstanceID) + 2 + len(batch.TargetInstanceID) + 8 + 8 + 8 + 8 + 8 + 2
 	for _, item := range batch.Items {
 		size += 1 + 8 + 8 + 8 + 4 + 8 + 4 + 1 + 16 + 8 + 1 + 2 + 2 +
 			8*(len(item.Channel.AudienceUsers)+len(item.Channel.AffectedUsers)) + 4 + len(item.UpdateBytes)
@@ -48,6 +48,7 @@ func encodeDeliveryBatchWire(batch edgecontrol.DeliveryBatch) ([]byte, error) {
 	out = append(out, batch.ExcludeAuthKeyID[:]...)
 	out = appendI64(out, batch.ExcludeSessionID)
 	out = appendI64(out, batch.NotAfter.UnixNano())
+	out = appendI64(out, batch.EvidenceDeadline.UnixNano())
 	out = appendU16(out, uint16(len(batch.Items)))
 	for _, item := range batch.Items {
 		out = append(out, byte(item.Ref.Domain.Kind))
@@ -109,6 +110,11 @@ func decodeDeliveryBatchWire(raw string) (edgecontrol.DeliveryBatch, error) {
 		return batch, err
 	}
 	batch.NotAfter = time.Unix(0, notAfter).UTC()
+	evidenceDeadline, err := r.i64()
+	if err != nil {
+		return batch, err
+	}
+	batch.EvidenceDeadline = time.Unix(0, evidenceDeadline).UTC()
 	count, err := r.u16()
 	if err != nil {
 		return batch, err

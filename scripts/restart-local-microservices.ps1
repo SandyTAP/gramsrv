@@ -15,6 +15,13 @@ param(
     [string]$PostgresDSN = $env:TELESRV_POSTGRES_DSN,
     [string]$PostgresContainer = 'telesrv-postgres',
     [string]$PostgresUser = 'telesrv',
+    [int]$CorePostgresMaxConns = 32,
+    [int]$EgressPostgresMaxConns = 32,
+    [int]$FilePostgresMaxConns = 8,
+    [int]$EgressWorkers = 4,
+    [string]$CoreDebugAddr = '127.0.0.1:6060',
+    [string]$EgressDebugAddr = '127.0.0.1:6061',
+    [string]$EdgeDebugAddr = '127.0.0.1:6062',
     [string]$RedisAddr = $env:TELESRV_REDIS_ADDR,
     [string]$RedisPassword = $env:TELESRV_REDIS_PASSWORD,
     [string]$RedisDB = $env:TELESRV_REDIS_DB,
@@ -264,7 +271,7 @@ public:
   dc: 2
 postgres:
   dsn: '`$`{TELESRV_POSTGRES_DSN`}'
-  max_conns: 8
+  max_conns: $FilePostgresMaxConns
   min_conns: 1
 file_data:
   addr: $(Quote-YamlScalar $FileGRPCAddr)
@@ -296,7 +303,7 @@ version: 1
 instance:
   id: $(Quote-YamlScalar "local-core-$PID")
 debug:
-  addr: '127.0.0.1:0'
+  addr: $(Quote-YamlScalar $CoreDebugAddr)
 public:
   dc: 2
   default_country_code: CN
@@ -308,7 +315,7 @@ public:
   web_base_url: https://weba.telesrv.net
 postgres:
   dsn: '`$`{TELESRV_POSTGRES_DSN`}'
-  max_conns: 8
+  max_conns: $CorePostgresMaxConns
   min_conns: 1
 redis:
   addr: $(Quote-YamlScalar $redisAddrValue)
@@ -367,7 +374,7 @@ version: 1
 instance:
   id: $(Quote-YamlScalar "local-egress-$PID")
 debug:
-  addr: '127.0.0.1:0'
+  addr: $(Quote-YamlScalar $EgressDebugAddr)
 public:
   dc: 2
   advertise:
@@ -375,7 +382,7 @@ public:
     port: $advertisePort
 postgres:
   dsn: '`$`{TELESRV_POSTGRES_DSN`}'
-  max_conns: 32
+  max_conns: $EgressPostgresMaxConns
   min_conns: 4
 redis:
   addr: $(Quote-YamlScalar $redisAddrValue)
@@ -385,7 +392,7 @@ egress:
   delivery_server:
     addr: $(Quote-YamlScalar $EgressDeliveryGRPCAddr)
     token: '`$`{TELESRV_EGRESS_DELIVERY_TOKEN`}'
-  workers: 4
+  workers: $EgressWorkers
   batch: 128
   lease_timeout: 30s
   outbound_push_timeout: 2s
@@ -437,7 +444,7 @@ version: 1
 instance:
   id: $(Quote-YamlScalar "local-edge-$PID")
 debug:
-  addr: '127.0.0.1:0'
+  addr: $(Quote-YamlScalar $EdgeDebugAddr)
 public:
   dc: 2
   default_country_code: CN

@@ -135,7 +135,7 @@ func TestDeliveryExecutorSeparatesAdmissionFromPhysicalReceiptAndDeduplicates(t 
 	ref := edgecontrol.DeliveryRef{Domain: edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42}, OutboxID: 9, TargetUserID: 42, PTS: 3, LeaseFence: 8, Attempt: 2}
 	batch := edgecontrol.DeliveryBatch{
 		BatchID: edgecontrol.BatchID{1}, CommandID: edgecontrol.CommandID{2}, SourceInstanceID: "egress-a", TargetInstanceID: "edge-b",
-		TargetUserID: 42, NotAfter: time.Now().Add(time.Second),
+		TargetUserID: 42, NotAfter: time.Now().Add(time.Second), EvidenceDeadline: time.Now().Add(2 * time.Second),
 		Items: []edgecontrol.DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload}},
 	}
 	admission := manager.AdmitDeliveryBatch(context.Background(), batch)
@@ -179,6 +179,100 @@ func TestDeliveryExecutorSeparatesAdmissionFromPhysicalReceiptAndDeduplicates(t 
 	}
 }
 
+func TestDeliveryExecutorAfterCommandDeadlineOnlyRepublishesExactTerminalReceipt(t *testing.T) {
+	manager := NewSessionManager(zaptest.NewLogger(t))
+	sink := &capturePhysicalReceiptSink{receipts: make(chan edgecontrol.PhysicalReceipt, 2)}
+	if err := manager.SetPhysicalReceiptSink(sink); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.CloseDeliveryExecutor()
+	payload, err := edgecontrol.EncodeDeliveryUpdate(&tg.Updates{Date: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := edgecontrol.DeliveryRef{
+		Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 43},
+		OutboxID: 10, TargetUserID: 43, PTS: 4, LeaseFence: 9, Attempt: 1,
+	}
+	notAfter := time.Now().Add(40 * time.Millisecond)
+	batch := edgecontrol.DeliveryBatch{
+		BatchID: edgecontrol.BatchID{3}, CommandID: edgecontrol.CommandID{4},
+		SourceInstanceID: "egress-a", TargetInstanceID: "edge-b", TargetUserID: 43,
+		NotAfter: notAfter, EvidenceDeadline: notAfter.Add(time.Second),
+		Items: []edgecontrol.DeliveryItem{{
+			Ref: ref, MessageType: proto.MessageFromServer,
+			PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload,
+		}},
+	}
+	if admission := manager.AdmitDeliveryBatch(context.Background(), batch); admission.Outcome != edgecontrol.AdmissionAccepted {
+		t.Fatalf("initial admission=%+v", admission)
+	}
+	select {
+	case receipt := <-sink.receipts:
+		if receipt.Outcome != edgecontrol.PhysicalNoEligibleSessions {
+			t.Fatalf("initial receipt=%+v", receipt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial terminal receipt not committed")
+	}
+	time.Sleep(time.Until(notAfter) + 10*time.Millisecond)
+	if admission := manager.AdmitDeliveryBatch(context.Background(), batch); admission.Outcome != edgecontrol.AdmissionDuplicateTerminal {
+		t.Fatalf("receipt-only replay admission=%+v", admission)
+	}
+	select {
+	case receipt := <-sink.receipts:
+		if receipt.Ref != ref || receipt.Outcome != edgecontrol.PhysicalNoEligibleSessions {
+			t.Fatalf("replayed receipt=%+v", receipt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("receipt-only replay did not republish terminal evidence")
+	}
+}
+
+func TestDeliveryExecutorAfterCommandDeadlineCannotCreateAttemptFenceOrSocketWork(t *testing.T) {
+	payload, err := edgecontrol.EncodeDeliveryUpdate(&tg.Updates{Date: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &capturePhysicalReceiptSink{receipts: make(chan edgecontrol.PhysicalReceipt, 1)}
+	executor := &deliveryExecutor{sink: sink}
+	shard := &deliveryExecutorShard{
+		owner: executor, attempts: make(map[edgecontrol.DeliveryRef]*deliveryAttemptEntry),
+		fences: make(map[edgecontrol.OrderingDomain]*deliveryFenceState),
+	}
+	heap.Init(&shard.deadlines)
+	now := time.Now()
+	batch := edgecontrol.DeliveryBatch{
+		BatchID: edgecontrol.BatchID{5}, CommandID: edgecontrol.CommandID{6},
+		SourceInstanceID: "egress-a", TargetInstanceID: "edge-b", TargetUserID: 44,
+		NotAfter: now.Add(-time.Millisecond), EvidenceDeadline: now.Add(time.Second),
+		Items: []edgecontrol.DeliveryItem{{
+			Ref: edgecontrol.DeliveryRef{
+				Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 44},
+				OutboxID: 11, TargetUserID: 44, PTS: 5, LeaseFence: 10, Attempt: 1,
+			},
+			MessageType: proto.MessageFromServer,
+			PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload,
+		}},
+	}
+	done := make(chan edgecontrol.DeliveryAdmission, 1)
+	shard.handle(deliveryCommandTask{
+		ctx: context.Background(), batch: batch, replayOnly: true, done: done,
+	})
+	if admission := <-done; admission.Outcome != edgecontrol.AdmissionRejected || admission.Detail != edgecontrol.DetailDeadline {
+		t.Fatalf("missing exact replay admission=%+v", admission)
+	}
+	if len(shard.attempts) != 0 || len(shard.fences) != 0 || len(shard.deadlines) != 0 || shard.active != 0 || shard.retainedBytes != 0 {
+		t.Fatalf("receipt-only miss mutated actor: attempts=%d fences=%d deadlines=%d active=%d retained=%d",
+			len(shard.attempts), len(shard.fences), len(shard.deadlines), shard.active, shard.retainedBytes)
+	}
+	select {
+	case receipt := <-sink.receipts:
+		t.Fatalf("receipt-only miss emitted physical receipt: %+v", receipt)
+	default:
+	}
+}
+
 func TestHigherFenceAdvancesBeforeCapacityOverload(t *testing.T) {
 	payload, err := edgecontrol.EncodeDeliveryUpdate(&tg.Updates{Date: 7})
 	if err != nil {
@@ -198,7 +292,7 @@ func TestHigherFenceAdvancesBeforeCapacityOverload(t *testing.T) {
 	batch := edgecontrol.DeliveryBatch{
 		BatchID: edgecontrol.BatchID{21}, CommandID: edgecontrol.CommandID{22},
 		SourceInstanceID: "egress-new", TargetInstanceID: "edge-a", TargetUserID: 42,
-		NotAfter: time.Now().Add(time.Second),
+		NotAfter: time.Now().Add(time.Second), EvidenceDeadline: time.Now().Add(2 * time.Second),
 		Items: []edgecontrol.DeliveryItem{{
 			Ref: edgecontrol.DeliveryRef{
 				Domain: domain, OutboxID: 23, TargetUserID: 42, PTS: 24, LeaseFence: 8, Attempt: 2,
@@ -271,7 +365,7 @@ func TestDeliveryFanoutRetainsCommandPayloadByteBudgetUntilTerminal(t *testing.T
 	batch := edgecontrol.DeliveryBatch{
 		BatchID: edgecontrol.BatchID{41}, CommandID: edgecontrol.CommandID{42},
 		SourceInstanceID: "egress-a", TargetInstanceID: "edge-a", TargetUserID: 62,
-		NotAfter: time.Now().Add(time.Second),
+		NotAfter: time.Now().Add(time.Second), EvidenceDeadline: time.Now().Add(2 * time.Second),
 		Items: []edgecontrol.DeliveryItem{{
 			Ref: ref, MessageType: proto.MessageFromServer,
 			PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload,
@@ -304,8 +398,9 @@ func TestTerminalRetentionBudgetBackpressuresAndExpiresWithoutEviction(t *testin
 		OutboxID: 31, TargetUserID: 52, PTS: 32, LeaseFence: 9, Attempt: 1,
 	}
 	deadline := time.Now().Add(time.Second)
+	evidenceDeadline := deadline.Add(time.Second)
 	entry := &deliveryAttemptEntry{
-		deadline: deadline, terminalAt: time.Now(), retainedBytes: deliveryRetainedBytesPerShard,
+		deadline: deadline, evidenceUntil: evidenceDeadline, terminalAt: time.Now(), retainedBytes: deliveryRetainedBytesPerShard,
 		terminal: edgecontrol.PhysicalReceipt{Ref: ref, Outcome: edgecontrol.PhysicalNoEligibleSessions},
 	}
 	executor := &deliveryExecutor{}
@@ -315,12 +410,12 @@ func TestTerminalRetentionBudgetBackpressuresAndExpiresWithoutEviction(t *testin
 		retainedBytes: deliveryRetainedBytesPerShard,
 	}
 	heap.Init(&shard.deadlines)
-	heap.Push(&shard.deadlines, deliveryDeadlineEntry{at: deadline.Add(deliveryTerminalSkewSlack), kind: deliveryDeadlineTerminal, ref: ref})
+	heap.Push(&shard.deadlines, deliveryDeadlineEntry{at: evidenceDeadline, kind: deliveryDeadlineTerminal, ref: ref})
 
 	newBatch := edgecontrol.DeliveryBatch{
 		BatchID: edgecontrol.BatchID{31}, CommandID: edgecontrol.CommandID{32},
 		SourceInstanceID: "egress-a", TargetInstanceID: "edge-a", TargetUserID: 53,
-		NotAfter: deadline,
+		NotAfter: deadline, EvidenceDeadline: evidenceDeadline,
 		Items: []edgecontrol.DeliveryItem{{
 			Ref: edgecontrol.DeliveryRef{
 				Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 53},
@@ -337,7 +432,7 @@ func TestTerminalRetentionBudgetBackpressuresAndExpiresWithoutEviction(t *testin
 	if shard.attempts[ref] != entry || shard.retainedBytes != deliveryRetainedBytesPerShard {
 		t.Fatal("live terminal identity was evicted to admit new physical work")
 	}
-	shard.expire(deadline.Add(deliveryTerminalSkewSlack))
+	shard.expire(evidenceDeadline)
 	if _, ok := shard.attempts[ref]; ok || shard.retainedBytes != 0 {
 		t.Fatalf("expired terminal retained: present=%t bytes=%d", ok, shard.retainedBytes)
 	}
@@ -376,8 +471,8 @@ func TestDeliveryExecutorCommandNotAfterBoundsMissingSocketReceipt(t *testing.T)
 	batch := edgecontrol.DeliveryBatch{
 		BatchID: edgecontrol.BatchID{3}, CommandID: edgecontrol.CommandID{4},
 		SourceInstanceID: "egress-a", TargetInstanceID: "edge-b", TargetUserID: 42,
-		NotAfter: notAfter,
-		Items:    []edgecontrol.DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload}},
+		NotAfter: notAfter, EvidenceDeadline: notAfter.Add(100 * time.Millisecond),
+		Items: []edgecontrol.DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload}},
 	}
 	if admission := manager.AdmitDeliveryBatch(context.Background(), batch); admission.Outcome != edgecontrol.AdmissionAccepted {
 		t.Fatalf("admission=%+v", admission)

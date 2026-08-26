@@ -22,6 +22,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/officialgifts"
+	"telesrv/internal/readmodelcache"
 	"telesrv/internal/store"
 )
 
@@ -114,6 +115,8 @@ const (
 	maxPremiumMonths         = 120
 	maxStarsGrant            = 1_000_000_000
 	maxFreezeAppealURLLength = 2048
+	accountFreezeCacheSize   = 1 << 16
+	accountFreezeCacheTTL    = 5 * time.Minute
 	// maxAccountRatingAdjustment bounds one manual rating adjustment in either
 	// direction. The domain only rejects a zero delta, so the operator-facing
 	// bound lives here next to the other grant limits.
@@ -504,11 +507,23 @@ type Service struct {
 	rating                AccountRatingService
 	verification          VerificationService
 	botVerification       BotVerificationService
+	accountFreezeCache    *readmodelcache.Cache[int64, accountFreezeCacheValue]
 	now                   func() time.Time
 }
 
+type accountFreezeCacheValue struct {
+	freeze domain.AccountFreeze
+	found  bool
+}
+
 func NewService(deps Dependencies) *Service {
-	s := &Service{now: time.Now}
+	s := &Service{
+		now: time.Now,
+		accountFreezeCache: readmodelcache.New(readmodelcache.Config[int64, accountFreezeCacheValue]{
+			MaxEntries: accountFreezeCacheSize,
+			TTL:        accountFreezeCacheTTL,
+		}),
+	}
 	return s.Configure(deps)
 }
 
@@ -517,6 +532,12 @@ func (s *Service) Configure(deps Dependencies) *Service {
 		s.commands = deps.Commands
 	}
 	if deps.Restrictions != nil {
+		// Dependencies are interfaces and may be backed by non-comparable test or
+		// adapter values. Configure is a cold path, so flush unconditionally instead
+		// of comparing interface values and risking a runtime panic.
+		if s.accountFreezeCache != nil {
+			s.accountFreezeCache.Flush()
+		}
 		s.restrictions = deps.Restrictions
 	}
 	if deps.Auth != nil {
@@ -1280,14 +1301,38 @@ func (s *Service) AccountFreeze(ctx context.Context, userID int64) (domain.Accou
 	if s == nil || s.restrictions == nil || userID == 0 {
 		return domain.AccountFreeze{}, false, nil
 	}
-	freeze, found, err := s.restrictions.GetAccountFreeze(ctx, userID)
-	if err != nil || !found {
-		return freeze, found, err
+	cached, err := s.accountFreezeCache.GetOrLoad(ctx, userID, func() (accountFreezeCacheValue, error) {
+		freeze, found, err := s.restrictions.GetAccountFreeze(ctx, userID)
+		if err != nil {
+			return accountFreezeCacheValue{}, err
+		}
+		if found {
+			if err := validateAccountFreeze(freeze); err != nil {
+				return accountFreezeCacheValue{}, fmt.Errorf("invalid durable account freeze for user %d: %w", userID, err)
+			}
+		}
+		return accountFreezeCacheValue{freeze: freeze, found: found}, nil
+	})
+	if err != nil {
+		return domain.AccountFreeze{}, false, err
 	}
-	if err := validateAccountFreeze(freeze); err != nil {
-		return domain.AccountFreeze{}, false, fmt.Errorf("invalid durable account freeze for user %d: %w", userID, err)
+	return cached.freeze, cached.found, nil
+}
+
+// InvalidateAccountFreezeReadModel is wired to the cross-Core
+// user_visibility notification. This cache only accelerates positive and
+// negative reads; PostgreSQL remains authoritative and listener reconnects
+// flush the complete bounded cache.
+func (s *Service) InvalidateAccountFreezeReadModel(userID int64) {
+	if s != nil && s.accountFreezeCache != nil && userID > 0 {
+		s.accountFreezeCache.Invalidate(userID)
 	}
-	return freeze, true, nil
+}
+
+func (s *Service) FlushAccountFreezeReadModel() {
+	if s != nil && s.accountFreezeCache != nil {
+		s.accountFreezeCache.Flush()
+	}
 }
 
 // AccountFreezes is the bounded-query projection API used by user hydration.
@@ -1299,32 +1344,53 @@ func (s *Service) AccountFreezes(ctx context.Context, userIDs []int64) (map[int6
 		return out, nil
 	}
 	ids := uniqueFreezeUserIDs(userIDs)
-	if batch, ok := s.restrictions.(accountFreezeBatchStore); ok {
-		const batchSize = 1000
-		for start := 0; start < len(ids); start += batchSize {
-			end := min(start+batchSize, len(ids))
-			items, err := batch.GetAccountFreezes(ctx, ids[start:end])
-			if err != nil {
-				return nil, err
+	values, err := s.accountFreezeCache.GetOrLoadBatch(
+		ctx,
+		ids,
+		func(int64) (int64, bool) { return 0, true },
+		func(loadCtx context.Context, missing []int64) (map[int64]accountFreezeCacheValue, error) {
+			loaded := make(map[int64]accountFreezeCacheValue, len(missing))
+			for _, id := range missing {
+				loaded[id] = accountFreezeCacheValue{}
 			}
-			for id, freeze := range items {
-				if err := validateAccountFreeze(freeze); err != nil {
-					return nil, fmt.Errorf("invalid durable account freeze for user %d: %w", id, err)
+			if batch, ok := s.restrictions.(accountFreezeBatchStore); ok {
+				const batchSize = 1000
+				for start := 0; start < len(missing); start += batchSize {
+					end := min(start+batchSize, len(missing))
+					items, loadErr := batch.GetAccountFreezes(loadCtx, missing[start:end])
+					if loadErr != nil {
+						return nil, loadErr
+					}
+					for id, freeze := range items {
+						if validationErr := validateAccountFreeze(freeze); validationErr != nil {
+							return nil, fmt.Errorf("invalid durable account freeze for user %d: %w", id, validationErr)
+						}
+						loaded[id] = accountFreezeCacheValue{freeze: freeze, found: true}
+					}
 				}
-				if freeze.Frozen {
-					out[id] = freeze
+				return loaded, nil
+			}
+			for _, id := range missing {
+				freeze, found, loadErr := s.restrictions.GetAccountFreeze(loadCtx, id)
+				if loadErr != nil {
+					return nil, loadErr
+				}
+				if found {
+					if validationErr := validateAccountFreeze(freeze); validationErr != nil {
+						return nil, fmt.Errorf("invalid durable account freeze for user %d: %w", id, validationErr)
+					}
+					loaded[id] = accountFreezeCacheValue{freeze: freeze, found: true}
 				}
 			}
-		}
-		return out, nil
+			return loaded, nil
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
-	for _, id := range ids {
-		freeze, found, err := s.AccountFreeze(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if found && freeze.Frozen {
-			out[id] = freeze
+	for id, value := range values {
+		if value.found && value.freeze.Frozen {
+			out[id] = value.freeze
 		}
 	}
 	return out, nil
@@ -1464,6 +1530,7 @@ func (s *Service) SetAccountFrozen(ctx context.Context, req SetAccountFrozenRequ
 		if err != nil {
 			return CommandResult{}, err
 		}
+		s.InvalidateAccountFreezeReadModel(req.UserID)
 		details["updated_at"] = updated.UpdatedAt.UTC().Format(time.RFC3339)
 		details["version"] = updated.Version
 		if err := s.notifyAccountFreezeChanged(ctx, updated); err != nil {

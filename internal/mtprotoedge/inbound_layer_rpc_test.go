@@ -85,8 +85,7 @@ func (exactProfileCapacityTestError) ExactSessionProfileCapacity() {}
 
 type layerDurabilityUnavailableTestError struct{}
 
-func (layerDurabilityUnavailableTestError) Error() string                       { return "layer durability unavailable" }
-func (layerDurabilityUnavailableTestError) LayerEvidenceDurabilityUnavailable() {}
+func (layerDurabilityUnavailableTestError) Error() string { return "layer durability unavailable" }
 
 type capacityAdmissionOnlyLayerRPC struct {
 	*orderedAdmissionOnlyLayerRPC
@@ -126,6 +125,10 @@ func (s unavailableEdgeSessionLayerStore) GetSessionLayer(context.Context, [8]by
 
 func (s unavailableEdgeSessionLayerStore) AdvanceSessionLayer(context.Context, [8]byte, int64, int, int64) (store.AuthKeySessionLayer, bool, error) {
 	return store.AuthKeySessionLayer{}, false, s.err
+}
+
+func (s unavailableEdgeSessionLayerStore) GetAuthKeyLayerDefault(context.Context, [8]byte) (store.AuthKeyLayerDefault, bool, error) {
+	return store.AuthKeyLayerDefault{}, false, s.err
 }
 
 func (s unavailableEdgeSessionLayerStore) DeleteSessionLayer(context.Context, [8]byte, int64) (bool, error) {
@@ -852,7 +855,7 @@ func TestExactProfileRegistryCapacityBecomesBoundedRPCAdmission(t *testing.T) {
 	}
 }
 
-func TestDurabilityOutageKeepsExplicitLayerConnectionLocal(t *testing.T) {
+func TestLayerStoreOutageRejectsExplicitEvidenceWithoutLocalMutation(t *testing.T) {
 	handler := &unavailableDurableAdmissionLayerRPC{orderedAdmissionOnlyLayerRPC: newOrderedAdmissionOnlyLayerRPC()}
 	s := New(Options{DC: 2, LayerRPC: handler})
 	c := &Conn{authKeyID: [8]byte{0x31, 0x07}, sessionID: 3107, metrics: NopMetrics{}}
@@ -863,23 +866,22 @@ func TestDurabilityOutageKeepsExplicitLayerConnectionLocal(t *testing.T) {
 		body: exactLayerRPCBody(t, &tg.InvokeWithLayerRequest{Layer: 227, Query: &tg.HelpGetConfigRequest{}}),
 	}}}
 	defer plan.close()
-	if err := s.prepareInboundLayerRPCBatch(context.Background(), c, plan); err != nil {
-		t.Fatalf("durability outage rejected explicit request: %v", err)
+	err := s.prepareInboundLayerRPCBatch(context.Background(), c, plan)
+	var unavailable layerDurabilityUnavailableTestError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("store outage error = %v", err)
 	}
-	if plan.items[0].kind != inboundItemRPC || len(plan.rpcTasks) != 1 {
-		t.Fatalf("local-only plan = kind:%d tasks:%d", plan.items[0].kind, len(plan.rpcTasks))
+	if len(plan.rpcTasks) != 0 {
+		t.Fatalf("store outage created %d executable tasks", len(plan.rpcTasks))
 	}
-	if !plan.items[0].profileEvidenceFresh() {
-		t.Fatal("durability fallback incorrectly disabled current-connection wrapper effects")
-	}
-	if state, msgID := c.layerProfileEvidenceState(); state.Profile != tlprofile.Profile227 || state.Origin != LayerProfileExplicit || msgID != 100 {
-		t.Fatalf("connection-local evidence = %#v msgID:%d", state, msgID)
+	if state, msgID := c.layerProfileEvidenceState(); state.Origin != LayerProfileUnknown || msgID != 0 {
+		t.Fatalf("store outage mutated connection state = %#v msgID:%d", state, msgID)
 	}
 	if _, _, found := handler.NegotiatedSessionLayerEvidence(c.authKeyID, c.sessionID); found {
-		t.Fatal("durability fallback polluted exact registry")
+		t.Fatal("store outage polluted exact registry")
 	}
 	if got := handler.publications(); len(got) != 0 {
-		t.Fatalf("durability fallback published auth-key default: %#v", got)
+		t.Fatalf("store outage published auth-key default: %#v", got)
 	}
 }
 
@@ -1495,7 +1497,7 @@ func TestPhysicalConnectionReadsDurableLayerOnceBeforeAdmissionHotPath(t *testin
 	}
 }
 
-func TestDurableExactSeedOutageKeepsFetchedAuthKeyDefaultServing(t *testing.T) {
+func TestDurableExactSeedOutageRejectsFetchedPostgresLayer(t *testing.T) {
 	handler := &unavailableDurableSeedLayerRPC{admissionOnlyLayerRPC: newAdmissionOnlyLayerRPC()}
 	edge := New(Options{DC: 2, LayerRPC: handler})
 	c := &Conn{
@@ -1504,41 +1506,23 @@ func TestDurableExactSeedOutageKeepsFetchedAuthKeyDefaultServing(t *testing.T) {
 	}
 	c.startInboundRPCScheduler(edge.rpcScheduler, 1, 8, time.Second)
 	defer c.Close()
-	if err := edge.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); err != nil {
-		t.Fatal(err)
+	err := edge.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{})
+	var unavailable layerDurabilityUnavailableTestError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("seed outage error = %v", err)
 	}
-	initial := c.LayerProfileState()
-	if initial.Profile != tlprofile.Profile225 || initial.Origin != LayerProfileInherited {
-		t.Fatalf("outage seed discarded fetched auth-key default: %#v", initial)
-	}
-
-	msgIDs := proto.NewMessageIDGen(time.Now)
-	body := exactOutboundLayerRPCBody(t, tlprofile.Profile225, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerSelf{}, Limit: 1,
-	})
-	for i := 0; i < 64; i++ {
-		plan := &inboundPlan{items: []inboundItem{{
-			kind: inboundItemRPC, msgID: msgIDs.New(proto.MessageFromClient), body: body,
-			layerProfileEvidenceFreshness: inboundLayerProfileEvidenceFresh,
-		}}}
-		if err := edge.prepareInboundLayerRPCBatch(context.Background(), c, plan); err != nil {
-			plan.close()
-			t.Fatalf("naked batch %d: %v", i, err)
-		}
-		plan.close()
-	}
-	if got := c.LayerProfileState(); got != initial {
-		t.Fatalf("naked traffic changed outage fallback: got %#v want %#v", got, initial)
+	if got := c.LayerProfileState(); got.Origin != LayerProfileUnknown {
+		t.Fatalf("seed outage used fetched PostgreSQL layer: %#v", got)
 	}
 	if got := handler.resolveCalls.Load(); got != 1 {
-		t.Fatalf("durable resolver calls=%d after 64 batches, want only initial seed", got)
+		t.Fatalf("durable resolver calls=%d, want 1", got)
 	}
 	if got := handler.inheritedCalls.Load(); got != 0 {
 		t.Fatalf("permanent fetched default unexpectedly queried inherited resolver %d times", got)
 	}
 }
 
-func TestBoundTempSeedOutageKeepsRawFetchedLayerServingCurrentConn(t *testing.T) {
+func TestBoundTempSeedOutageRejectsRawPostgresLayer(t *testing.T) {
 	handler := &unavailableDurableSeedLayerRPC{admissionOnlyLayerRPC: newAdmissionOnlyLayerRPC()}
 	edge := New(Options{DC: 2, LayerRPC: handler})
 	c := &Conn{
@@ -1547,37 +1531,19 @@ func TestBoundTempSeedOutageKeepsRawFetchedLayerServingCurrentConn(t *testing.T)
 	}
 	c.startInboundRPCScheduler(edge.rpcScheduler, 1, 8, time.Second)
 	defer c.Close()
-	if err := edge.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); err != nil {
-		t.Fatal(err)
+	err := edge.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{})
+	var unavailable layerDurabilityUnavailableTestError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("bound-temp seed outage error = %v", err)
 	}
-	initial := c.LayerProfileState()
-	if initial.Profile != tlprofile.Profile225 || initial.Origin != LayerProfileInherited {
-		t.Fatalf("bound-temp outage discarded same-frame raw default: %#v", initial)
-	}
-
-	msgIDs := proto.NewMessageIDGen(time.Now)
-	body := exactOutboundLayerRPCBody(t, tlprofile.Profile225, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerSelf{}, Limit: 1,
-	})
-	for i := 0; i < 64; i++ {
-		plan := &inboundPlan{items: []inboundItem{{
-			kind: inboundItemRPC, msgID: msgIDs.New(proto.MessageFromClient), body: body,
-			layerProfileEvidenceFreshness: inboundLayerProfileEvidenceFresh,
-		}}}
-		if err := edge.prepareInboundLayerRPCBatch(context.Background(), c, plan); err != nil {
-			plan.close()
-			t.Fatalf("naked batch %d: %v", i, err)
-		}
-		plan.close()
-	}
-	if got := c.LayerProfileState(); got != initial {
-		t.Fatalf("naked traffic changed bound-temp outage shadow: got %#v want %#v", got, initial)
+	if got := c.LayerProfileState(); got.Origin != LayerProfileUnknown {
+		t.Fatalf("bound-temp outage used raw PostgreSQL layer: %#v", got)
 	}
 	if got := handler.resolveCalls.Load(); got != 1 {
-		t.Fatalf("exact durable resolver calls=%d after 64 batches, want only initial seed", got)
+		t.Fatalf("exact durable resolver calls=%d, want 1", got)
 	}
-	if got := handler.inheritedCalls.Load(); got != 1 {
-		t.Fatalf("inherited durable resolver calls=%d after 64 batches, want only initial seed", got)
+	if got := handler.inheritedCalls.Load(); got != 0 {
+		t.Fatalf("exact store outage should stop before inherited lookup, got %d", got)
 	}
 	if got := handler.publications(); len(got) != 0 {
 		t.Fatalf("raw outage shadow leaked into shared Layer publication: %#v", got)

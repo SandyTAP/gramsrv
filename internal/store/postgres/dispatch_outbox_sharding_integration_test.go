@@ -48,13 +48,20 @@ func TestDispatchOutboxPTSWindowIsStrictlyContiguousPostgres(t *testing.T) {
 	}
 	refs := make([]store.OutboxAttemptRef, 3)
 	sets := make([]store.OutboxAttemptTargetSet, 3)
+	target := store.OutboxAttemptTarget{
+		TargetInstanceID: "edge-a", TargetUserID: user.ID,
+		BatchID: [16]byte{11}, CommandID: [16]byte{12},
+	}
 	for i, item := range windows[0].Items {
 		refs[i] = item.Ref
 		if item.Ref.Sequence != int64(i+1) {
 			t.Fatalf("item %d sequence=%d want=%d", i, item.Ref.Sequence, i+1)
 		}
-		sets[i] = store.OutboxAttemptTargetSet{
-			Ref: item.Ref, SourceInstanceID: "egress-a", Targets: []store.OutboxAttemptTarget{},
+		sets[i] = store.OutboxAttemptTargetSet{Ref: item.Ref, SourceInstanceID: "egress-a"}
+		if i == 1 {
+			sets[i].Targets = []store.OutboxAttemptTarget{}
+		} else {
+			sets[i].Targets = []store.OutboxAttemptTarget{target}
 		}
 	}
 	if results, err := outbox.BindAttemptTargets(ctx, sets); err != nil ||
@@ -63,24 +70,20 @@ func TestDispatchOutboxPTSWindowIsStrictlyContiguousPostgres(t *testing.T) {
 		results[2].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind = %+v err=%v", results, err)
 	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: refs[1], Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record second = %+v err=%v", results, err)
-	}
 	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: refs[1]}}); err != nil ||
 		batch.Results[0].Outcome != store.OutboxFinalizeWaitingForPredecessor {
 		t.Fatalf("gap finalize = %+v err=%v", batch, err)
 	}
 	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: refs[0], Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
+		Ref: refs[0], Kind: store.OutboxEvidenceEdgeWritten,
+		SourceInstanceID: "egress-a", TargetInstanceID: target.TargetInstanceID,
+		TargetUserID: target.TargetUserID, BatchID: target.BatchID, CommandID: target.CommandID,
+		EligibleSessions: 1, WrittenSessions: 1, ServerMsgID: 101, ObservedAt: time.Now(),
 	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
 		t.Fatalf("record first = %+v err=%v", results, err)
 	}
 	requests, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueDispatchPTS, LaneLimit: 1,
+		QueueKind: store.OutboxQueueDispatchPTS, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(requests) != 2 {
 		t.Fatalf("recover finalizable = %+v err=%v", requests, err)
@@ -141,6 +144,68 @@ SELECT $1, n, 'noop' FROM generate_series(2, 10001) AS n`, user.ID); err != nil 
 	}
 }
 
+func TestDispatchOutboxAppendDoesNotWaitForUncommittedActiveLaneUpdatePostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	user := createTestUser(t, ctx, NewUserStore(pool), "+1884"+randomSuffix(t)+"07", "DispatchUpdatedLane", "")
+	cleanupDispatchUser(t, pool, user.ID)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_update_events (user_id, pts, pts_count, date, event_type)
+VALUES ($1, 1, 1, 1700002700, 'noop'), ($1, 2, 1, 1700002701, 'noop')`, user.ID); err != nil {
+		t.Fatalf("insert events: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO dispatch_outbox (target_user_id, pts, event_type)
+VALUES ($1, 1, 'noop')`, user.ID); err != nil {
+		t.Fatalf("insert head: %v", err)
+	}
+
+	consumer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consumer.Rollback(context.Background()) }()
+	if _, err := consumer.Exec(ctx, `
+UPDATE dispatch_outbox_lanes
+SET lease_owner = 'uncommitted-consumer', updated_at = clock_timestamp()
+WHERE stream_id = $1`, user.ID); err != nil {
+		t.Fatalf("update active lane: %v", err)
+	}
+
+	appendCtx, cancelAppend := context.WithTimeout(ctx, time.Second)
+	defer cancelAppend()
+	appendDone := make(chan error, 1)
+	go func() {
+		_, err := pool.Exec(appendCtx, `
+INSERT INTO dispatch_outbox (target_user_id, pts, event_type)
+VALUES ($1, 2, 'noop')`, user.ID)
+		appendDone <- err
+	}()
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatalf("append behind uncommitted lane update: %v", err)
+		}
+	case <-appendCtx.Done():
+		_ = consumer.Rollback(context.Background())
+		t.Fatalf("append waited for consumer lane update: %v", appendCtx.Err())
+	}
+	if err := consumer.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var headPTS, count int64
+	if err := pool.QueryRow(ctx, `SELECT head_sequence FROM dispatch_outbox_lanes WHERE stream_id = $1`, user.ID).Scan(&headPTS); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM dispatch_outbox WHERE target_user_id = $1`, user.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if headPTS != 1 || count != 2 {
+		t.Fatalf("head pts=%d rows=%d want 1/2", headPTS, count)
+	}
+}
+
 func TestDispatchOutboxFinalizeWaitsForUncommittedAppendMarkerPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -168,12 +233,6 @@ func TestDispatchOutboxFinalizeWaitsForUncommittedAppendMarkerPostgres(t *testin
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind = %+v err=%v", results, err)
 	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-dispatch-commit-fence", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record = %+v err=%v", results, err)
-	}
 
 	producer, err := pool.Begin(ctx)
 	if err != nil {
@@ -192,7 +251,6 @@ VALUES ($1, 2, 'noop')
 RETURNING id`, user.ID).Scan(&successorID); err != nil {
 		t.Fatalf("insert uncommitted dispatch: %v", err)
 	}
-
 	type finalizeResult struct {
 		batch store.OutboxFinalizeBatch
 		err   error

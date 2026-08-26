@@ -25,6 +25,10 @@ type orderedSessionLayerResolver struct {
 	found bool
 }
 
+func (r *orderedSessionLayerResolver) ResolveNegotiatedSessionLayerEvidence(context.Context, [8]byte, int64) (int, int64, bool, error) {
+	return r.layer, r.msgID, r.found, nil
+}
+
 func (r *orderedSessionLayerResolver) NegotiatedSessionLayerEvidence([8]byte, int64) (int, int64, bool) {
 	return r.layer, r.msgID, r.found
 }
@@ -32,6 +36,10 @@ func (r *orderedSessionLayerResolver) NegotiatedSessionLayerEvidence([8]byte, in
 func (r *countingInheritedLayerResolver) ResolveInheritedAuthKeyLayer(context.Context, [8]byte) (int, bool, error) {
 	r.calls++
 	return r.layer, r.found, r.err
+}
+
+func (*countingInheritedLayerResolver) ResolveNegotiatedSessionLayerEvidence(context.Context, [8]byte, int64) (int, int64, bool, error) {
+	return 0, 0, false, nil
 }
 
 func TestConnLayerProfileUnknownFreezeAndIdempotence(t *testing.T) {
@@ -470,13 +478,13 @@ func TestInitialProfileSeedRestoresOrderedExactSessionEvidence(t *testing.T) {
 	}
 }
 
-func TestInheritedLayerResolverFailureLeavesExplicitRecoveryAvailable(t *testing.T) {
+func TestInheritedLayerResolverFailureFailsConnectionSeed(t *testing.T) {
 	resolverErr := errors.New("temporary resolver unavailable")
 	resolver := &countingInheritedLayerResolver{err: resolverErr}
 	s := &Server{layerRPC: resolver}
 	c := &Conn{authKeyExpiresAt: 1_900_000_000}
-	if err := s.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); err != nil {
-		t.Fatalf("optional inherited resolver error escaped: %v", err)
+	if err := s.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); !errors.Is(err, resolverErr) {
+		t.Fatalf("inherited Redis error = %v", err)
 	}
 	if got := c.LayerProfileState(); got.Origin != LayerProfileUnknown {
 		t.Fatalf("resolver error selected stale fallback = %#v", got)

@@ -74,17 +74,23 @@ func (r *Router) buildOutboxUpdates(ctx context.Context, requests []egress.Outbo
 		groups[viewerUserID] = items
 	}
 	if len(userIDsByViewer) > 0 {
-		resolver, ok := r.deps.Users.(SparseBatchViewerUsersResolver)
-		if !ok {
-			return nil, ErrSparseOutboxUserProjectionMissing
-		}
 		requested := make(map[int64][]int64, len(userIDsByViewer))
 		for viewerID, ids := range userIDsByViewer {
 			requested[viewerID] = sortedOutboxUserIDs(ids)
 		}
-		projected, err := resolveSparseOutboxUsers(ctx, resolver, requested)
+		projected, err := r.resolveCachedSparseOutboxUsers(ctx, requested)
 		if err != nil {
 			return nil, fmt.Errorf("sparse outbox user projection: %w", err)
+		}
+		if r.outboxPresence != nil {
+			online, err := r.resolveOutboxPresenceBatch(ctx, requested)
+			if err != nil {
+				return nil, fmt.Errorf("batch outbox presence projection: %w", err)
+			}
+			for viewerID, users := range projected {
+				projected[viewerID] = r.withUsersPresenceSnapshot(users, online)
+			}
+			cache.markOutboxPresenceComplete()
 		}
 		for viewerID, expectedIDs := range requested {
 			if missingID, missing := missingProjectedUserID(expectedIDs, projected[viewerID]); missing {
@@ -119,6 +125,93 @@ func (r *Router) buildOutboxUpdates(ctx context.Context, requests []egress.Outbo
 	// a registry query per event/session.
 	r.applyUsernamesToUpdatesBatch(ctx, out)
 	return out, nil
+}
+
+func (r *Router) resolveOutboxPresenceBatch(ctx context.Context, requested map[int64][]int64) (map[int64]bool, error) {
+	if r == nil || r.outboxPresence == nil {
+		return nil, ErrOutboxPresenceBatchUnavailable
+	}
+	set := make(map[int64]struct{})
+	for _, userIDs := range requested {
+		for _, userID := range userIDs {
+			if userID > 0 {
+				set[userID] = struct{}{}
+			}
+		}
+	}
+	userIDs := make([]int64, 0, len(set))
+	for userID := range set {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	if len(userIDs) == 0 {
+		return map[int64]bool{}, nil
+	}
+	recordsByUser, err := r.outboxPresence.UserLocationRecordsForUsers(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	online := make(map[int64]bool, len(userIDs))
+	for _, userID := range userIDs {
+		for _, record := range recordsByUser[userID] {
+			if record.UserID != userID {
+				return nil, fmt.Errorf("location record user_id=%d requested=%d", record.UserID, userID)
+			}
+			if record.ReceivesUpdates {
+				online[userID] = true
+				break
+			}
+		}
+	}
+	return online, nil
+}
+
+// resolveCachedSparseOutboxUsers resolves the stable portion of each
+// (viewer,target) projection. Cached values never contain a runtime presence
+// overlay; viewerPeerCache applies current presence after it has been primed.
+// Misses remain one strict sparse batch and never fall back to scalar reads.
+func (r *Router) resolveCachedSparseOutboxUsers(ctx context.Context, requested map[int64][]int64) (map[int64][]domain.User, error) {
+	projected := make(map[int64][]domain.User, len(requested))
+	missing := make(map[int64][]int64)
+	loadEpoch := uint64(0)
+	if r.receiverUserProjectionCache != nil {
+		loadEpoch = r.receiverUserProjectionCache.LoadEpoch()
+	}
+	for viewerID, targetIDs := range requested {
+		for _, targetID := range targetIDs {
+			if user, ok := r.receiverUserProjectionCache.Lookup(viewerID, targetID); ok {
+				projected[viewerID] = append(projected[viewerID], user)
+				continue
+			}
+			missing[viewerID] = append(missing[viewerID], targetID)
+		}
+	}
+	if len(missing) == 0 {
+		return projected, nil
+	}
+	resolver, ok := r.deps.Users.(SparseBatchViewerUsersResolver)
+	if !ok {
+		return nil, ErrSparseOutboxUserProjectionMissing
+	}
+	loaded, err := resolveSparseOutboxUsers(ctx, resolver, missing)
+	if err != nil {
+		return nil, err
+	}
+	// Validate the complete durable envelope before publishing any part of the
+	// batch into the cross-call cache. A partial resolver response is an error,
+	// not a negative cache entry or a reason to issue scalar compatibility reads.
+	for viewerID, expectedIDs := range missing {
+		if missingID, absent := missingProjectedUserID(expectedIDs, loaded[viewerID]); absent {
+			return nil, fmt.Errorf("%w: viewer_user_id=%d missing_user_id=%d", ErrSparseOutboxUserProjectionIncomplete, viewerID, missingID)
+		}
+	}
+	for viewerID, users := range loaded {
+		for _, user := range users {
+			projected[viewerID] = append(projected[viewerID], user)
+			r.receiverUserProjectionCache.StoreIfEpoch(viewerID, user.ID, user, loadEpoch)
+		}
+	}
+	return projected, nil
 }
 
 func resolveSparseOutboxUsers(ctx context.Context, resolver SparseBatchViewerUsersResolver, requested map[int64][]int64) (map[int64][]domain.User, error) {

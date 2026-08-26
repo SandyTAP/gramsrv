@@ -91,6 +91,37 @@ func TestMessagesSendMessageReturnsUpdateAndRecordsOwnerContext(t *testing.T) {
 	}
 }
 
+func TestPlainPrivateSendUsesBaseIdentityAndEmptyPeerEnvelope(t *testing.T) {
+	sender := domain.User{ID: 1000000101, AccessHash: 11, FirstName: "Sender"}
+	recipient := domain.User{ID: 1000000102, AccessHash: 22, FirstName: "Recipient"}
+	messages := &captureMessages{}
+	users := &countingMapUsersService{mapUsersService: mapUsersService{users: map[int64]domain.User{
+		sender.ID: sender, recipient.ID: recipient,
+	}}}
+	r := New(Config{}, Deps{Messages: messages, Users: users}, zaptest.NewLogger(t), clock.System)
+
+	updates, err := r.onMessagesSendMessage(WithUserID(context.Background(), sender.ID), &tg.MessagesSendMessageRequest{
+		Peer:    &tg.InputPeerUser{UserID: recipient.ID, AccessHash: recipient.AccessHash},
+		Message: "plain hot path", RandomID: 99112233,
+	})
+	if err != nil {
+		t.Fatalf("send plain private message: %v", err)
+	}
+	got, ok := updates.(*tg.Updates)
+	if !ok {
+		t.Fatalf("updates = %T, want *tg.Updates", updates)
+	}
+	if users.baseByIDsCalls != 1 || users.byIDsCalls != 0 {
+		t.Fatalf("base/full user lookups = %d/%d, want 1/0", users.baseByIDsCalls, users.byIDsCalls)
+	}
+	if len(got.Users) != 0 || len(got.Chats) != 0 {
+		t.Fatalf("plain sender envelope users/chats = %d/%d, want 0/0", len(got.Users), len(got.Chats))
+	}
+	if len(got.Updates) != 2 {
+		t.Fatalf("plain sender updates = %#v, want message id + new message", got.Updates)
+	}
+}
+
 func TestUsersForMessageUpdateUsesOneBatchLookup(t *testing.T) {
 	const ownerID int64 = 1000000001
 	const peerID int64 = 1000000002

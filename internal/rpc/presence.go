@@ -302,6 +302,13 @@ func (r *Router) userPresenceStatus(userID int64) domain.UserStatus {
 }
 
 func (r *Router) userPresenceStatusForUser(u domain.User) domain.UserStatus {
+	return r.userPresenceStatusForUserSnapshot(u, false, false)
+}
+
+// userPresenceStatusForUserSnapshot applies an authoritative batch location
+// result. When onlineKnown is true, a negative value is final for this builder
+// call and must not fall back to a scalar registry lookup.
+func (r *Router) userPresenceStatusForUserSnapshot(u domain.User, online, onlineKnown bool) domain.UserStatus {
 	userID := u.ID
 	if userID == 0 {
 		return domain.UserStatus{Kind: domain.UserStatusRecently}
@@ -321,11 +328,20 @@ func (r *Router) userPresenceStatusForUser(u domain.User) domain.UserStatus {
 	if status, ok := r.presence.statusFor(userID, now); ok {
 		return status
 	}
-	if provider, ok := r.deps.Sessions.(OnlineUserProvider); ok && provider.IsUserOnline(userID) {
+	if onlineKnown && online {
 		return domain.UserStatus{
 			Kind:      domain.UserStatusOnline,
 			Expires:   now + int(userOnlineTTL/time.Second),
 			WasOnline: now,
+		}
+	}
+	if !onlineKnown {
+		if provider, ok := r.deps.Sessions.(OnlineUserProvider); ok && provider.IsUserOnline(userID) {
+			return domain.UserStatus{
+				Kind:      domain.UserStatusOnline,
+				Expires:   now + int(userOnlineTTL/time.Second),
+				WasOnline: now,
+			}
 		}
 	}
 	if u.LastSeenAt > 0 {
@@ -542,6 +558,20 @@ func (r *Router) withUsersPresence(users []domain.User) []domain.User {
 	out := append([]domain.User(nil), users...)
 	for i := range out {
 		out[i] = r.withUserPresence(out[i])
+	}
+	return out
+}
+
+func (r *Router) withUsersPresenceSnapshot(users []domain.User, online map[int64]bool) []domain.User {
+	if len(users) == 0 {
+		return users
+	}
+	out := append([]domain.User(nil), users...)
+	for i := range out {
+		if out[i].ID == 0 || out[i].Bot {
+			continue
+		}
+		out[i].Status = r.userPresenceStatusForUserSnapshot(out[i], online[out[i].ID], true)
 	}
 	return out
 }

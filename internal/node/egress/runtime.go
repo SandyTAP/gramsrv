@@ -111,6 +111,26 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool, postgres.WithDeliveryLeaseTimeout(cfg.OutboxLeaseTimeout))
 	channelDeliveryStore := postgres.NewChannelDeliveryStore(pool)
 	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
+	wakes := newEgressWakeLanes()
+	mutationBatcher, err := egresssvc.NewAttemptMutationBatcher(
+		dispatchOutboxStore, deliveryOutboxStore, channelDeliveryStore, metricRegistry,
+	)
+	if err != nil {
+		return fmt.Errorf("init egress mutation actors: %w", err)
+	}
+	go mutationBatcher.Run(ctx)
+	if err := mutationBatcher.WaitReady(ctx); err != nil {
+		return fmt.Errorf("start egress mutation actors: %w", err)
+	}
+	clientAckRing := egresssvc.NewClientAckObservationRing(65536)
+	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
+		stats := clientAckRing.Stats()
+		return []obsmetrics.GaugeSample{
+			{Name: "telesrv_egress_client_ack_ring_capacity", Value: float64(stats.Capacity)},
+			{Name: "telesrv_egress_client_ack_ring_written_total", Value: float64(stats.Written)},
+			{Name: "telesrv_egress_client_ack_ring_overwritten_total", Value: float64(stats.Overwritten)},
+		}
+	})
 	if _, err := egresssvc.StartGRPCDelivery(ctx, egresssvc.GRPCDeliveryServerConfig{
 		Addr:            cfg.EgressDeliveryGRPCAddr,
 		InstanceID:      instanceID,
@@ -121,6 +141,8 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 		Store:           dispatchOutboxStore,
 		DeliveryStore:   deliveryOutboxStore,
 		ChannelStore:    channelDeliveryStore,
+		Mutations:       mutationBatcher,
+		ClientAcks:      clientAckRing,
 		Logger:          logger.Named("egress").Named("delivery").Named("grpc"),
 	}); err != nil {
 		return fmt.Errorf("start egress delivery grpc: %w", err)
@@ -144,26 +166,33 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	if err != nil {
 		return fmt.Errorf("init welcome Edge control fabric: %w", err)
 	}
-	projection := newEgressProjectionRuntime(pool, rdb, cfg, instanceID, logger.Named("egress").Named("projection"))
+	presence, ok := welcomeEdgeControl.(edgecontrol.UserLocationBatchProvider)
+	if !ok {
+		return fmt.Errorf("egress control fabric must provide batch user locations")
+	}
+	projection, err := newEgressProjectionRuntime(pool, rdb, cfg, instanceID, presence, logger.Named("egress").Named("projection"))
+	if err != nil {
+		return fmt.Errorf("init egress projection runtime: %w", err)
+	}
 	welcomeDispatcher := projection.projector.NewWelcomeDeliveryDispatcher(
 		welcomeEdgeControl, welcomeMessageStore, logger.Named("egress").Named("welcome-delivery"),
 	)
 	readModelListener := postgres.NewReadModelChangeListener(cfg.PostgresDSN, projection.caches, logger.Named("egress").Named("read-model-listener"))
 	go readModelListener.Run(ctx)
-	wakes := newEgressWakeLanes()
-	outboxReadyListener := postgres.NewDispatchOutboxReadyListener(cfg.PostgresDSN, logger.Named("egress").Named("outbox-ready-listener"))
-	go outboxReadyListener.Run(ctx, wakes.wakeDispatchOutbox)
-	deliveryReadyListener := postgres.NewEdgeDeliveryOutboxReadyListener(cfg.PostgresDSN, logger.Named("egress").Named("delivery-ready-listener"))
-	go deliveryReadyListener.Run(ctx, wakes.wakeEdgeDeliveryOutbox)
-	channelReadyListener := postgres.NewChannelDeliveryReadyListener(cfg.PostgresDSN, logger.Named("egress").Named("channel-ready-listener"))
-	go channelReadyListener.Run(ctx, wakes.wakeChannelDelivery)
+	readModelRedisBus := redisstore.NewReadModelInvalidationBus(rdb, logger.Named("egress").Named("read-model-redis"))
+	go readModelRedisBus.Run(ctx,
+		func() { readModelListener.FlushRelayedReadModelCaches("redis_subscribe") },
+		readModelListener.HandleReadModelInvalidations,
+	)
 	service, err := egresssvc.NewService(
 		updateEventStore,
 		dispatchOutboxStore,
 		deliveryOutboxStore,
 		channelDeliveryStore,
+		mutationBatcher,
 		deliverer,
 		projection.projector.BuildOutboxUpdateBytes,
+		readModelRedisBus,
 		projection.projector.BuildChannelUpdateBytes,
 		metricRegistry,
 		logger.Named("egress"),
@@ -188,6 +217,7 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	service.RunWithWake(ctx, egresssvc.WakeSources{
 		AccountPTS: wakes.dispatchOutbox, AccountNonPTS: wakes.edgeDeliveryOutbox, ChannelPTS: wakes.channelDelivery,
 	})
+	mutationBatcher.Wait()
 	return nil
 }
 

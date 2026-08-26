@@ -43,17 +43,13 @@ func (s *TempAuthKeyBindingStore) saveTx(ctx context.Context, tx pgx.Tx, b domai
 	if err := lockPermanentAuthIdentities(ctx, tx, []int64{permID}); err != nil {
 		return err
 	}
-	var (
-		tempExpiry        int
-		tempLayer         int
-		tempObservationID int64
-	)
+	var tempExpiry int
 	if err := tx.QueryRow(ctx, `
-SELECT expires_at, layer, layer_observation_id
+SELECT expires_at
 FROM auth_keys
 WHERE auth_key_id = $1
 FOR UPDATE
-`, rawID).Scan(&tempExpiry, &tempLayer, &tempObservationID); err != nil {
+`, rawID).Scan(&tempExpiry); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrAuthKeyBindingInvalid
 		}
@@ -79,17 +75,13 @@ WHERE temp_auth_key_id = $1
 		return fmt.Errorf("read existing temporary auth key binding: %w", err)
 	}
 
-	var (
-		permExpiry        int
-		permLayer         int
-		permObservationID int64
-	)
+	var permExpiry int
 	if err := tx.QueryRow(ctx, `
-SELECT expires_at, layer, layer_observation_id
+SELECT expires_at
 FROM auth_keys
 WHERE auth_key_id = $1
 FOR UPDATE
-`, permID).Scan(&permExpiry, &permLayer, &permObservationID); err != nil {
+`, permID).Scan(&permExpiry); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrAuthKeyBindingInvalid
 		}
@@ -97,14 +89,6 @@ FOR UPDATE
 	}
 	if permExpiry != 0 {
 		return store.ErrAuthKeyBindingInvalid
-	}
-
-	mergedLayer, mergedObservationID, err := store.MergeAuthKeyLayerObservations(
-		tempLayer, tempObservationID,
-		permLayer, permObservationID,
-	)
-	if err != nil {
-		return err
 	}
 
 	q := s.q.WithTx(tx)
@@ -125,26 +109,6 @@ FOR UPDATE
 	}
 	if n == 0 {
 		return store.ErrAuthKeyBindingInvalid
-	}
-	keyIDs := []int64{rawID, permID}
-	tag, err := tx.Exec(ctx, `
-UPDATE auth_keys
-SET layer = $2,
-    layer_observation_id = $3
-WHERE auth_key_id = ANY($1::bigint[])
-`, keyIDs, mergedLayer, mergedObservationID)
-	if err != nil {
-		return fmt.Errorf("merge bound auth key layer defaults: %w", err)
-	}
-	if tag.RowsAffected() != int64(len(keyIDs)) {
-		return fmt.Errorf("merge bound auth key layer defaults: updated %d of %d locked keys", tag.RowsAffected(), len(keyIDs))
-	}
-	if _, err := tx.Exec(ctx, `
-UPDATE authorizations
-SET layer = $2
-WHERE auth_key_id = ANY($1::bigint[])
-`, keyIDs, mergedLayer); err != nil {
-		return fmt.Errorf("mirror bound auth key layer default: %w", err)
 	}
 	return nil
 }

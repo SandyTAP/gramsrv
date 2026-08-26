@@ -16,11 +16,12 @@ type mapUsersService struct {
 
 type countingMapUsersService struct {
 	mapUsersService
-	selfCalls    int
-	byIDCalls    int
-	byIDsCalls   int
-	lastByIDs    []int64
-	byIDsBatches [][]int64
+	selfCalls      int
+	byIDCalls      int
+	byIDsCalls     int
+	baseByIDsCalls int
+	lastByIDs      []int64
+	byIDsBatches   [][]int64
 }
 
 func (s staticUsersService) Self(context.Context, int64) (domain.User, error) {
@@ -52,6 +53,10 @@ func (s staticUsersService) ByIDs(_ context.Context, _ int64, userIDs []int64) (
 		}
 	}
 	return out, nil
+}
+
+func (s staticUsersService) BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	return s.ByIDs(ctx, 1, userIDs)
 }
 
 func (s staticUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
@@ -91,6 +96,10 @@ func (s mapUsersService) ByIDs(_ context.Context, _ int64, userIDs []int64) ([]d
 		}
 	}
 	return out, nil
+}
+
+func (s mapUsersService) BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	return s.ByIDs(ctx, 1, userIDs)
 }
 
 func (s mapUsersService) ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error) {
@@ -148,6 +157,11 @@ func (s *countingMapUsersService) ByIDs(ctx context.Context, currentUserID int64
 	return s.mapUsersService.ByIDs(ctx, currentUserID, userIDs)
 }
 
+func (s *countingMapUsersService) BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	s.baseByIDsCalls++
+	return s.mapUsersService.ByIDs(ctx, 1, userIDs)
+}
+
 type captureUsersService struct {
 	user   domain.User
 	userID int64
@@ -175,6 +189,10 @@ func (s *captureUsersService) ByIDs(_ context.Context, currentUserID int64, user
 		}
 	}
 	return out, nil
+}
+
+func (s *captureUsersService) BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	return s.ByIDs(ctx, 1, userIDs)
 }
 
 func (s *captureUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {

@@ -11,6 +11,65 @@ import (
 	"telesrv/internal/store"
 )
 
+func TestDeliveryOutboxAppendDoesNotWaitForUncommittedActiveLaneUpdatePostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	user := createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"00", "AbsoluteUpdatedLane", "")
+	cleanupOutboxUser(t, pool, user.ID)
+	outbox := NewDeliveryOutboxStore(pool)
+	firstID, err := outbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+		TargetUserID: user.ID, Payload: []byte{0x01}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	})
+	if err != nil {
+		t.Fatalf("enqueue head: %v", err)
+	}
+
+	consumer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consumer.Rollback(context.Background()) }()
+	if _, err := consumer.Exec(ctx, `
+UPDATE edge_delivery_outbox_lanes
+SET lease_owner = 'uncommitted-consumer', updated_at = clock_timestamp()
+WHERE stream_id = $1`, user.ID); err != nil {
+		t.Fatalf("update active lane: %v", err)
+	}
+
+	appendCtx, cancelAppend := context.WithTimeout(ctx, time.Second)
+	defer cancelAppend()
+	appendDone := make(chan error, 1)
+	go func() {
+		_, err := outbox.Enqueue(appendCtx, store.DeliveryOutboxEnqueue{
+			TargetUserID: user.ID, Payload: []byte{0x02}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})
+		appendDone <- err
+	}()
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatalf("append behind uncommitted lane update: %v", err)
+		}
+	case <-appendCtx.Done():
+		_ = consumer.Rollback(context.Background())
+		t.Fatalf("append waited for consumer lane update: %v", appendCtx.Err())
+	}
+	if err := consumer.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var headID, count int64
+	if err := pool.QueryRow(ctx, `SELECT head_item_id FROM edge_delivery_outbox_lanes WHERE stream_id = $1`, user.ID).Scan(&headID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id = $1`, user.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if headID != firstID.ID || count != 2 {
+		t.Fatalf("head id=%d rows=%d want %d/2", headID, count, firstID.ID)
+	}
+}
+
 func TestDeliveryOutboxDurableAttemptRecoveryPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -79,7 +138,7 @@ WHERE item_id = $1 AND lease_fence = $2`, ref.ItemID, int64(ref.LeaseFence)); er
 		t.Fatalf("expired plan must resolve retry, refs=%+v err=%v", expiredRefs, err)
 	}
 	expired, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(expired) != 1 || expired[0].Ref != ref {
 		t.Fatalf("expired finalizable = %+v err=%v", expired, err)
@@ -115,7 +174,7 @@ WHERE item_id = $1 AND lease_fence = $2`, ref.ItemID, int64(ref.LeaseFence)); er
 		TargetInstanceID: target.TargetInstanceID, TargetUserID: target.TargetUserID,
 		BatchID: target.BatchID, CommandID: target.CommandID, ObservedAt: time.Now(),
 	}})
-	if err != nil || stale[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
+	if err != nil || stale[0].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("stale evidence = %+v err=%v", stale, err)
 	}
 	wrongSource, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
@@ -126,20 +185,6 @@ WHERE item_id = $1 AND lease_fence = $2`, ref.ItemID, int64(ref.LeaseFence)); er
 	}})
 	if err != nil || wrongSource[0].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("wrong-source evidence = %+v err=%v", wrongSource, err)
-	}
-	ackOnly, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: fresh.Ref, Kind: store.OutboxEvidenceClientAck, SourceInstanceID: "egress-source-b",
-		TargetInstanceID: newTarget.TargetInstanceID, TargetUserID: newTarget.TargetUserID,
-		BatchID: newTarget.BatchID, CommandID: newTarget.CommandID,
-		AuthKeyID: [8]byte{1}, SessionID: 77, ServerMsgID: 99, ObservedAt: time.Now(),
-	}})
-	if err != nil || ackOnly[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("client ack observation = %+v err=%v", ackOnly, err)
-	}
-	if premature, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
-	}); err != nil || len(premature) != 0 {
-		t.Fatalf("client ack became finalizable = %+v err=%v", premature, err)
 	}
 	current, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
 		Ref: fresh.Ref, Kind: store.OutboxEvidenceEdgeWritten, SourceInstanceID: "egress-source-b",
@@ -152,22 +197,21 @@ WHERE item_id = $1 AND lease_fence = $2`, ref.ItemID, int64(ref.LeaseFence)); er
 	}
 	var evidenceKind string
 	var eligibleSessions, writtenSessions int
-	var clientAckAt *time.Time
 	if err := pool.QueryRow(ctx, `
-SELECT evidence_kind, eligible_sessions, written_sessions, client_ack_at
+SELECT evidence_kind, eligible_sessions, written_sessions
 FROM edge_delivery_outbox_attempt_targets
 WHERE item_id = $1 AND lease_fence = $2
   AND target_instance_id = $3 AND target_user_id = $4
   AND batch_id = $5 AND command_id = $6`, fresh.Ref.ItemID, int64(fresh.Ref.LeaseFence),
 		newTarget.TargetInstanceID, newTarget.TargetUserID, newTarget.BatchID[:], newTarget.CommandID[:]).Scan(
-		&evidenceKind, &eligibleSessions, &writtenSessions, &clientAckAt); err != nil {
+		&evidenceKind, &eligibleSessions, &writtenSessions); err != nil {
 		t.Fatalf("load physical evidence ledger: %v", err)
 	}
-	if evidenceKind != "edge_written" || eligibleSessions != 1 || writtenSessions != 1 || clientAckAt == nil {
-		t.Fatalf("physical/ack ledger = %q/%d/%d/%v", evidenceKind, eligibleSessions, writtenSessions, clientAckAt)
+	if evidenceKind != "edge_written" || eligibleSessions != 1 || writtenSessions != 1 {
+		t.Fatalf("physical ledger = %q/%d/%d", evidenceKind, eligibleSessions, writtenSessions)
 	}
 	finalizable, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(finalizable) != 1 || finalizable[0].Ref != fresh.Ref {
 		t.Fatalf("recover finalizable = %+v err=%v", finalizable, err)
@@ -175,6 +219,158 @@ WHERE item_id = $1 AND lease_fence = $2
 	finalized, err := outbox.FinalizeAttempts(ctx, finalizable)
 	if err != nil || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
 		t.Fatalf("finalize = %+v err=%v", finalized, err)
+	}
+}
+
+func TestDeliveryOutboxRecoveryBoundsAttemptsAcrossLanesPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	users := []int64{
+		createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"31", "OutboxBatchA", "").ID,
+		createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"32", "OutboxBatchB", "").ID,
+	}
+	for _, userID := range users {
+		cleanupOutboxUser(t, pool, userID)
+	}
+	outbox := NewDeliveryOutboxStore(pool, WithDeliveryLeaseTimeout(time.Minute))
+	for _, userID := range users {
+		for item := 0; item < store.MaxDeliveryBatchItems; item++ {
+			if _, err := outbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+				TargetUserID: userID, Payload: []byte{byte(item + 1)}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}); err != nil {
+				t.Fatalf("enqueue lane %d item %d: %v", userID, item, err)
+			}
+		}
+	}
+	windows, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, Owner: "egress-recovery-limit",
+		LaneLimit: 2, WindowSize: store.MaxDeliveryBatchItems, WindowByteLimit: 1 << 20,
+		LeaseDuration: time.Minute, PhysicalDuration: 10 * time.Second, ClockSkewAllowance: time.Second,
+	})
+	if err != nil || len(windows) != 2 {
+		t.Fatalf("claim recovery lanes = %d err=%v, want 2", len(windows), err)
+	}
+	for _, window := range windows {
+		if len(window.Items) != store.MaxDeliveryBatchItems {
+			t.Fatalf("claimed lane %d items = %d, want %d", window.StreamID, len(window.Items), store.MaxDeliveryBatchItems)
+		}
+		sets := make([]store.OutboxAttemptTargetSet, len(window.Items))
+		evidence := make([]store.OutboxAttemptEvidence, len(window.Items))
+		for i, item := range window.Items {
+			sets[i] = store.OutboxAttemptTargetSet{Ref: item.Ref, SourceInstanceID: "egress-recovery-limit", Targets: []store.OutboxAttemptTarget{}}
+			evidence[i] = store.OutboxAttemptEvidence{
+				Ref: item.Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
+				SourceInstanceID: "egress-recovery-limit", ObservedAt: time.Now(),
+			}
+		}
+		if bound, err := outbox.BindAttemptTargets(ctx, sets); err != nil || len(bound) != len(sets) {
+			t.Fatalf("bind lane %d = %d err=%v", window.StreamID, len(bound), err)
+		}
+		if recorded, err := outbox.RecordAttemptEvidenceBatch(ctx, evidence); err != nil || len(recorded) != len(evidence) {
+			t.Fatalf("record lane %d = %d err=%v", window.StreamID, len(recorded), err)
+		}
+	}
+
+	request := store.OutboxRecoverFinalizableRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 2, AttemptLimit: store.MaxDeliveryBatchItems,
+	}
+	for batchIndex := 0; batchIndex < 2; batchIndex++ {
+		requests, err := outbox.RecoverFinalizableAttempts(ctx, request)
+		if err != nil || len(requests) != store.MaxDeliveryBatchItems {
+			t.Fatalf("recover batch %d = %d err=%v, want %d", batchIndex, len(requests), err, store.MaxDeliveryBatchItems)
+		}
+		finalized, err := outbox.FinalizeAttempts(ctx, requests)
+		if err != nil || len(finalized.Results) != len(requests) {
+			t.Fatalf("finalize batch %d = %d err=%v", batchIndex, len(finalized.Results), err)
+		}
+	}
+	requests, err := outbox.RecoverFinalizableAttempts(ctx, request)
+	if err != nil || len(requests) != 0 {
+		t.Fatalf("terminal recovery = %d err=%v", len(requests), err)
+	}
+}
+
+func TestDeliveryOutboxFinalizeBatchesIndependentLanesIntoBoundedTransactionsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	const laneCount = outboxFinalizeTransactionLanes + 1
+	userIDs := make([]int64, 0, laneCount)
+	users := NewUserStore(pool)
+	for i := 0; i < laneCount; i++ {
+		user := createTestUser(t, ctx, users, fmt.Sprintf("+1888%s%02d", randomSuffix(t), i), "OutboxFinalizeBatch", "")
+		userIDs = append(userIDs, user.ID)
+		cleanupOutboxUser(t, pool, user.ID)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		for _, userID := range userIDs {
+			cleanupOutboxUser(t, pool, userID)
+		}
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = ANY($1::bigint[])`, userIDs)
+	})
+
+	countingDB := &countingBeginDB{Pool: pool}
+	outbox := NewDeliveryOutboxStore(countingDB, WithDeliveryLeaseTimeout(time.Minute))
+	for _, userID := range userIDs {
+		if _, err := outbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{0x01}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		}); err != nil {
+			t.Fatalf("enqueue user %d: %v", userID, err)
+		}
+		if _, err := outbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{0x02}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		}); err != nil {
+			t.Fatalf("enqueue successor for user %d: %v", userID, err)
+		}
+	}
+	windows, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, Owner: "egress-finalize-batch",
+		LaneLimit: laneCount, WindowSize: 1, WindowByteLimit: 1024, LeaseDuration: time.Minute,
+		PhysicalDuration: 10 * time.Second, ClockSkewAllowance: time.Second,
+	})
+	if err != nil || len(windows) != laneCount {
+		t.Fatalf("claim lanes = %d err=%v, want %d", len(windows), err, laneCount)
+	}
+	sets := make([]store.OutboxAttemptTargetSet, 0, laneCount)
+	evidence := make([]store.OutboxAttemptEvidence, 0, laneCount)
+	finalize := make([]store.OutboxFinalizeRequest, 0, laneCount)
+	for _, window := range windows {
+		if len(window.Items) != 1 {
+			t.Fatalf("lane %d items=%d want=1", window.StreamID, len(window.Items))
+		}
+		ref := window.Items[0].Ref
+		sets = append(sets, store.OutboxAttemptTargetSet{
+			Ref: ref, SourceInstanceID: "egress-finalize-batch-source", Targets: []store.OutboxAttemptTarget{},
+		})
+		evidence = append(evidence, store.OutboxAttemptEvidence{
+			Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
+			SourceInstanceID: "egress-finalize-batch-source", ObservedAt: time.Now(),
+		})
+		finalize = append(finalize, store.OutboxFinalizeRequest{Ref: ref})
+	}
+	if bound, err := outbox.BindAttemptTargets(ctx, sets); err != nil || len(bound) != laneCount {
+		t.Fatalf("bind lanes = %d err=%v", len(bound), err)
+	}
+	if recorded, err := outbox.RecordAttemptEvidenceBatch(ctx, evidence); err != nil || len(recorded) != laneCount {
+		t.Fatalf("record evidence = %d err=%v", len(recorded), err)
+	}
+
+	countingDB.resetBeginCount()
+	countingDB.resetQueryCount()
+	batch, err := outbox.FinalizeAttempts(ctx, finalize)
+	if err != nil || len(batch.Results) != laneCount {
+		t.Fatalf("finalize lanes = %d err=%v", len(batch.Results), err)
+	}
+	for i, result := range batch.Results {
+		if result.Outcome != store.OutboxFinalizeApplied {
+			t.Fatalf("finalize result %d = %+v", i, result)
+		}
+	}
+	if got := countingDB.begins(); got != 2 {
+		t.Fatalf("finalize begin count=%d want=2 for %d lanes", got, laneCount)
+	}
+	if got := countingDB.queries(); got != 6 {
+		t.Fatalf("finalize transaction query count=%d want=6 (lock/window/mutation per group)", got)
 	}
 }
 
@@ -205,7 +401,7 @@ func TestDeliveryOutboxLateCompletionEvidenceUsesDatabaseClockPostgres(t *testin
 	}
 	if bound, err := outbox.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{
 		{Ref: windows[0].Items[0].Ref, SourceInstanceID: "egress-source", Targets: []store.OutboxAttemptTarget{target}},
-		{Ref: windows[0].Items[1].Ref, SourceInstanceID: "egress-source", Targets: []store.OutboxAttemptTarget{}},
+		{Ref: windows[0].Items[1].Ref, SourceInstanceID: "egress-source", Targets: []store.OutboxAttemptTarget{target}},
 	}); err != nil || bound[0].Outcome != store.OutboxBindTargetBound || bound[1].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind deadline targets = %+v err=%v", bound, err)
 	}
@@ -227,21 +423,15 @@ WHERE stream_id = $1 AND lease_fence = $2`, user.ID, int64(windows[0].LeaseFence
 			ObservedAt: time.Now().Add(time.Hour),
 		},
 		{
-			Ref: windows[0].Items[1].Ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-			SourceInstanceID: "egress-source", ObservedAt: time.Now().Add(time.Hour),
+			Ref: windows[0].Items[1].Ref, Kind: store.OutboxEvidenceEdgeWritten,
+			SourceInstanceID: "egress-source", TargetInstanceID: target.TargetInstanceID,
+			TargetUserID: target.TargetUserID, BatchID: target.BatchID, CommandID: target.CommandID,
+			EligibleSessions: 1, WrittenSessions: 1, ServerMsgID: 912,
+			ObservedAt: time.Now().Add(time.Hour),
 		},
 	})
 	if err != nil || late[0].Outcome != store.OutboxEvidenceFenced || late[1].Outcome != store.OutboxEvidenceFenced {
 		t.Fatalf("late completion evidence = %+v err=%v, want Fenced/Fenced", late, err)
-	}
-	ack, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: windows[0].Items[0].Ref, Kind: store.OutboxEvidenceClientAck,
-		SourceInstanceID: "egress-source", TargetInstanceID: target.TargetInstanceID,
-		TargetUserID: target.TargetUserID, BatchID: target.BatchID, CommandID: target.CommandID,
-		AuthKeyID: [8]byte{1}, SessionID: 9, ServerMsgID: 10, ObservedAt: time.Now(),
-	}})
-	if err != nil || ack[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("late diagnostic ACK = %+v err=%v", ack, err)
 	}
 	var completedAttempts, physicalTargets int
 	if err := pool.QueryRow(ctx, `
@@ -370,12 +560,6 @@ func TestDeliveryOutboxFinalizeFreshSnapshotClosesEmptyRacePostgres(t *testing.T
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind empty = %+v err=%v", results, err)
 	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("empty evidence = %+v err=%v", results, err)
-	}
 	lockTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -445,12 +629,6 @@ func TestDeliveryOutboxFinalizeWaitsForUncommittedAppendMarkerPostgres(t *testin
 		Ref: ref, SourceInstanceID: "egress-commit-fence", Targets: []store.OutboxAttemptTarget{},
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind = %+v err=%v", results, err)
-	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-commit-fence", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record = %+v err=%v", results, err)
 	}
 
 	producer, err := pool.Begin(ctx)
@@ -536,7 +714,7 @@ FROM generate_series(1, 10000)`, user.ID); err != nil {
 	}
 }
 
-func TestDurableOutboxTargetBindingValidatesOnceAndFreezesMembershipPostgres(t *testing.T) {
+func TestDurableOutboxTargetBindingIsSetExactAndFreezesMembershipPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	user := createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"12", "OutboxTargets", "")
@@ -568,34 +746,43 @@ func TestDurableOutboxTargetBindingValidatesOnceAndFreezesMembershipPostgres(t *
 	}}); err != nil || bound[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind 64 frozen targets = %+v err=%v", bound, err)
 	}
-	var countTriggers int
-	var countTriggerName string
+	var parentBound bool
+	var expectedCount, actualCount int
 	if err := pool.QueryRow(ctx, `
-SELECT count(*), min(tgname)
-FROM pg_trigger
-WHERE tgrelid = 'edge_delivery_outbox_attempts'::regclass
-  AND NOT tgisinternal AND tgname LIKE '%target_count%'`).Scan(&countTriggers, &countTriggerName); err != nil {
+SELECT a.targets_bound, a.target_count, count(t.*)::integer
+FROM edge_delivery_outbox_attempts a
+LEFT JOIN edge_delivery_outbox_attempt_targets t
+  ON t.item_id = a.item_id AND t.lease_fence = a.lease_fence
+WHERE a.item_id = $1 AND a.lease_fence = $2
+GROUP BY a.targets_bound, a.target_count`, ref.ItemID, int64(ref.LeaseFence)).
+		Scan(&parentBound, &expectedCount, &actualCount); err != nil {
 		t.Fatal(err)
 	}
-	if countTriggers != 1 || countTriggerName != "edge_delivery_outbox_attempt_target_count_from_attempt_bind" {
-		t.Fatalf("target count triggers=%d/%q, want one parent-bind validator", countTriggers, countTriggerName)
+	if !parentBound || expectedCount != len(targets) || actualCount != len(targets) {
+		t.Fatalf("bound=%t expected=%d actual=%d, want true/%d/%d",
+			parentBound, expectedCount, actualCount, len(targets), len(targets))
 	}
+	var countTriggers int
 	if err := pool.QueryRow(ctx, `
 SELECT count(*)
 FROM pg_trigger
-WHERE tgrelid = 'edge_delivery_outbox_attempt_targets'::regclass
+WHERE tgrelid IN (
+  'dispatch_outbox_attempts'::regclass,
+  'edge_delivery_outbox_attempts'::regclass,
+  'channel_delivery_attempts'::regclass
+)
   AND NOT tgisinternal AND tgname LIKE '%target_count%'`).Scan(&countTriggers); err != nil {
 		t.Fatal(err)
 	}
 	if countTriggers != 0 {
-		t.Fatalf("target-row count validators=%d, want zero", countTriggers)
+		t.Fatalf("per-attempt target count validators=%d, want zero set-based bind duplicates", countTriggers)
 	}
-	var cleanupIndex string
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.channel_delivery_attempts_tombstone_cleanup_idx')::text`).Scan(&cleanupIndex); err != nil {
+	var fenceIndex string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.channel_delivery_attempts_fence_idx')::text`).Scan(&fenceIndex); err != nil {
 		t.Fatal(err)
 	}
-	if cleanupIndex == "" {
-		t.Fatal("channel attempt tombstone cleanup index is missing")
+	if fenceIndex == "" {
+		t.Fatal("channel live-attempt fence index is missing")
 	}
 	extraBatch, extraCommand := testOutboxID(201), testOutboxID(202)
 	if _, err := pool.Exec(ctx, `
@@ -611,7 +798,7 @@ WHERE item_id = $1 AND lease_fence = $2 AND target_instance_id = $3`,
 		ref.ItemID, int64(ref.LeaseFence), targets[0].TargetInstanceID); err == nil {
 		t.Fatal("direct DELETE mutated frozen target membership")
 	}
-	// FK cascade must remain available to bounded tombstone GC.
+	// FK cascade must remain available to the same-transaction live-attempt delete.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -626,7 +813,7 @@ WHERE item_id = $1 AND lease_fence = $2 AND target_instance_id = $3`,
 	}
 }
 
-func TestDeliveryOutboxExpiredHeadRetryTombstonesConfirmedSuffixPostgres(t *testing.T) {
+func TestDeliveryOutboxExpiredHeadRetryDeletesConfirmedSuffixAttemptPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	user := createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"04", "OutboxSuffix", "")
@@ -686,23 +873,23 @@ WHERE item_id = $1 AND lease_fence = $2`, refs[0].ItemID, int64(refs[0].LeaseFen
 		t.Fatalf("expire head = %+v err=%v", expired, err)
 	}
 	requests, err := outbox.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
-		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1,
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
 	})
 	if err != nil || len(requests) != 2 {
 		t.Fatalf("recover finalizable = %+v err=%v", requests, err)
 	}
 	finalized, err := outbox.FinalizeAttempts(ctx, requests)
 	if err != nil || finalized.Results[0].Outcome != store.OutboxFinalizeScheduledRetry ||
-		finalized.Results[1].Outcome != store.OutboxFinalizeAlreadyFinalized {
+		finalized.Results[1].Outcome != store.OutboxFinalizeFenced {
 		t.Fatalf("finalize retry/suffix = %+v err=%v", finalized, err)
 	}
-	var suffixOutcome string
-	if err := pool.QueryRow(ctx, `SELECT finalization_outcome FROM edge_delivery_outbox_attempts
-WHERE item_id = $1 AND lease_fence = $2`, refs[1].ItemID, int64(refs[1].LeaseFence)).Scan(&suffixOutcome); err != nil {
+	var suffixAttempts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox_attempts
+WHERE item_id = $1 AND lease_fence = $2`, refs[1].ItemID, int64(refs[1].LeaseFence)).Scan(&suffixAttempts); err != nil {
 		t.Fatal(err)
 	}
-	if suffixOutcome != "superseded" {
-		t.Fatalf("suffix tombstone=%q want superseded", suffixOutcome)
+	if suffixAttempts != 0 {
+		t.Fatalf("suffix live attempts=%d want 0", suffixAttempts)
 	}
 	fresh, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
 		QueueKind: store.OutboxQueueAbsoluteDelivery, Owner: "egress-b",
@@ -830,12 +1017,6 @@ func TestDeliveryOutboxFenceNeverReusesEmptyLaneGenerationPostgres(t *testing.T)
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind first = %+v err=%v", results, err)
 	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: first, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-a", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record first = %+v err=%v", results, err)
-	}
 	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: first}}); err != nil ||
 		batch.Results[0].Outcome != store.OutboxFinalizeApplied {
 		t.Fatalf("finalize first = %+v err=%v", batch, err)
@@ -845,8 +1026,8 @@ func TestDeliveryOutboxFenceNeverReusesEmptyLaneGenerationPostgres(t *testing.T)
 		t.Fatalf("lane generation reused fence: first=%+v second=%+v", first, second)
 	}
 	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: first}}); err != nil ||
-		batch.Results[0].Outcome != store.OutboxFinalizeAlreadyFinalized {
-		t.Fatalf("old tombstone against new generation = %+v err=%v", batch, err)
+		batch.Results[0].Outcome != store.OutboxFinalizeFenced {
+		t.Fatalf("old live attempt against new generation = %+v err=%v", batch, err)
 	}
 	var currentFence int64
 	if err := pool.QueryRow(ctx, `SELECT lease_fence FROM edge_delivery_outbox_lanes WHERE stream_id = $1`, user.ID).Scan(&currentFence); err != nil {
@@ -883,12 +1064,6 @@ func TestDeliveryOutboxByteBudgetPreservesContiguousWindowAndHandoffPostgres(t *
 		Ref: ref, SourceInstanceID: "egress-budget", Targets: []store.OutboxAttemptTarget{},
 	}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 		t.Fatalf("bind head = %+v err=%v", results, err)
-	}
-	if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-		Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-		SourceInstanceID: "egress-budget", ObservedAt: time.Now(),
-	}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-		t.Fatalf("record head = %+v err=%v", results, err)
 	}
 	batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{
 		Ref: ref, Owner: windows[0].Owner, RetainLease: true,
@@ -974,12 +1149,6 @@ func TestDeliveryOutboxClaimsOnlyContiguousExclusionPrefixPostgres(t *testing.T)
 		}}); err != nil || results[0].Outcome != store.OutboxBindTargetBound {
 			t.Fatalf("bind item %d = %+v err=%v", i, results, err)
 		}
-		if results, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
-			Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
-			SourceInstanceID: "egress-exclusion", ObservedAt: time.Now(),
-		}}); err != nil || results[0].Outcome != store.OutboxEvidenceRecorded {
-			t.Fatalf("record item %d = %+v err=%v", i, results, err)
-		}
 		finalized, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: ref}})
 		if err != nil || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
 			t.Fatalf("finalize item %d = %+v err=%v", i, finalized, err)
@@ -987,7 +1156,7 @@ func TestDeliveryOutboxClaimsOnlyContiguousExclusionPrefixPostgres(t *testing.T)
 	}
 }
 
-func TestDeliveryOutboxFinalizedAttemptRetentionIsBoundedPostgres(t *testing.T) {
+func TestDeliveryOutboxFinalizationDeletesLiveAttemptsPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	user := createTestUser(t, ctx, NewUserStore(pool), "+1887"+randomSuffix(t)+"10", "OutboxAttemptRetention", "")
@@ -1039,25 +1208,18 @@ func TestDeliveryOutboxFinalizedAttemptRetentionIsBoundedPostgres(t *testing.T) 
 	if finalized, err := outbox.FinalizeAttempts(ctx, requests); err != nil || len(finalized.Results) != 3 {
 		t.Fatalf("finalize retention window = %+v err=%v", finalized, err)
 	}
-	lateBeforeGC, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{physical})
-	if err != nil || lateBeforeGC[0].Outcome != store.OutboxEvidenceAlreadyFinalized {
-		t.Fatalf("late physical evidence during retention = %+v err=%v", lateBeforeGC, err)
-	}
-	deleted, err := outbox.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 2)
-	if err != nil || deleted != 2 {
-		t.Fatalf("bounded tombstone delete = %d err=%v", deleted, err)
-	}
-	lateAfterGC, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{physical})
-	if err != nil || (lateAfterGC[0].Outcome != store.OutboxEvidenceFenced && lateAfterGC[0].Outcome != store.OutboxEvidenceRejected) {
-		t.Fatalf("late physical evidence after retention = %+v err=%v", lateAfterGC, err)
+	late, err := outbox.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{physical})
+	if err != nil || (late[0].Outcome != store.OutboxEvidenceFenced && late[0].Outcome != store.OutboxEvidenceRejected) {
+		t.Fatalf("late physical evidence after live attempt deletion = %+v err=%v", late, err)
 	}
 	var targetRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox_attempt_targets WHERE item_id = $1 AND lease_fence = $2`,
 		refs[0].ItemID, int64(refs[0].LeaseFence)).Scan(&targetRows); err != nil || targetRows != 0 {
 		t.Fatalf("cascaded target rows = %d err=%v", targetRows, err)
 	}
-	if deleted, err = outbox.DeleteFinalizedAttempts(ctx, time.Now().Add(time.Second), 2); err != nil || deleted != 1 {
-		t.Fatalf("remaining tombstone delete = %d err=%v", deleted, err)
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox_attempts WHERE stream_id = $1`, user.ID).Scan(&attempts); err != nil || attempts != 0 {
+		t.Fatalf("live attempts after finalization = %d err=%v", attempts, err)
 	}
 }
 

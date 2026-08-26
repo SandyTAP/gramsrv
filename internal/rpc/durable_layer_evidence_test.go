@@ -143,6 +143,10 @@ func (s unavailableSessionLayerStore) GetSessionLayer(context.Context, [8]byte, 
 	return store.AuthKeySessionLayer{}, false, s.err
 }
 
+func (s unavailableSessionLayerStore) GetAuthKeyLayerDefault(context.Context, [8]byte) (store.AuthKeyLayerDefault, bool, error) {
+	return store.AuthKeyLayerDefault{}, false, s.err
+}
+
 type mutableSessionLayerStore struct {
 	store.AuthKeySessionLayerStore
 	value store.AuthKeySessionLayer
@@ -177,13 +181,13 @@ func TestDurableSessionLayerCacheOrdersRebuiltRowsByObservationID(t *testing.T) 
 	}
 }
 
-func TestDurableSessionLayerAvailabilityErrorCarriesStructuralMarker(t *testing.T) {
-	boom := errors.New("database unavailable")
+func TestDurableSessionLayerStoreFailureIsReturnedWithoutFallbackMarker(t *testing.T) {
+	boom := errors.New("Redis unavailable")
 	r := New(Config{}, Deps{AuthKeySessionLayers: unavailableSessionLayerStore{err: boom}}, zaptest.NewLogger(t), clock.System)
 	_, _, _, err := r.ResolveNegotiatedSessionLayerEvidence(context.Background(), [8]byte{4}, 40)
 	var marker interface{ LayerEvidenceDurabilityUnavailable() }
-	if !errors.Is(err, boom) || !errors.As(err, &marker) {
-		t.Fatalf("availability error = %v, marker=%v", err, marker != nil)
+	if !errors.Is(err, boom) || errors.As(err, &marker) {
+		t.Fatalf("store error = %v, obsolete fallback marker=%v", err, marker != nil)
 	}
 }
 

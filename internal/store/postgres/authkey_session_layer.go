@@ -50,6 +50,35 @@ WHERE evidence.raw_auth_key_id = $1
 	return value, true, nil
 }
 
+// GetAuthKeyLayerDefault remains available for the historical PostgreSQL store
+// contract and isolated tests. Core production wiring uses the Redis protocol
+// authority and never calls this method as an availability fallback.
+func (s *AuthKeyStore) GetAuthKeyLayerDefault(
+	ctx context.Context,
+	rawAuthKeyID [8]byte,
+) (store.AuthKeyLayerDefault, bool, error) {
+	var value store.AuthKeyLayerDefault
+	err := s.db.QueryRow(ctx, `
+SELECT defaults.layer, defaults.layer_observation_id
+FROM auth_keys AS raw
+LEFT JOIN temp_auth_key_bindings AS binding
+  ON binding.temp_auth_key_id = raw.auth_key_id
+JOIN auth_keys AS defaults
+  ON defaults.auth_key_id = COALESCE(binding.perm_auth_key_id, raw.auth_key_id)
+WHERE raw.auth_key_id = $1
+`, authKeyIDToInt64(rawAuthKeyID)).Scan(&value.Layer, &value.ObservationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.AuthKeyLayerDefault{}, false, nil
+	}
+	if err != nil {
+		return store.AuthKeyLayerDefault{}, false, fmt.Errorf("get auth key layer default: %w", err)
+	}
+	if value.Layer == 0 || value.ObservationID == 0 {
+		return store.AuthKeyLayerDefault{}, false, nil
+	}
+	return value, true, nil
+}
+
 // AdvanceSessionLayer enters the permanent identity advisory gate before any
 // row lock when rawAuthKeyID is permanent or already-bound temporary. An
 // initially-unbound temp key that becomes bound while the raw row is acquired

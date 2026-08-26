@@ -25,6 +25,7 @@ import (
 	botsapp "telesrv/internal/app/bots"
 	botverificationapp "telesrv/internal/app/botverification"
 	broadcastapp "telesrv/internal/app/broadcast"
+	businessautomationapp "telesrv/internal/app/businessautomation"
 	channelapp "telesrv/internal/app/channels"
 	chatlistsapp "telesrv/internal/app/chatlists"
 	clienttelemetryapp "telesrv/internal/app/clienttelemetry"
@@ -683,6 +684,17 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	}
 
 	authKeyStore := postgres.NewAuthKeyStore(pool)
+	baseTempAuthKeyStore := postgres.NewTempAuthKeyBindingStore(pool)
+	authKeySessionLayers, err := redisstore.NewAuthKeySessionLayerStore(rdb, authKeyStore)
+	if err != nil {
+		return fmt.Errorf("initialize Redis auth key Layer authority: %w", err)
+	}
+	tempAuthKeyStore, err := redisstore.NewLayerAwareTempAuthKeyBindingStore(
+		baseTempAuthKeyStore, authKeySessionLayers,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize temp auth key Layer binding: %w", err)
+	}
 	authzStore := postgres.NewAuthorizationStore(pool)
 	adminStore := postgres.NewAdminStore(pool)
 	updateStateStore := postgres.NewUpdateStateStore(pool)
@@ -702,6 +714,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, counterRecovery.MessageBoxSource())
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, counterRecovery.ChannelIDSource())
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, counterRecovery.ChannelMessageIDSource())
+	readModelRedisBus := redisstore.NewReadModelInvalidationBus(rdb, logger.Named("store").Named("read-model-redis"))
 	projectionStores := nodeprojection.NewStores(pool, rdb, nodeprojection.StoreConfig{
 		ChannelRowCacheMaxEntries:    cfg.ChannelRowCacheMaxEntries,
 		ChannelMemberCacheMaxEntries: cfg.ChannelMemberCacheMaxEntries,
@@ -715,6 +728,8 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		},
 		MessageOptions: []postgres.MessageStoreOption{
 			postgres.WithMessageAllocators(boxIDAllocator),
+			postgres.WithMessageReadModelInvalidations(readModelRedisBus),
+			postgres.WithPlainPrivateSendBatchObserver(metricRegistry),
 		},
 	}, logger)
 	userStore := projectionStores.UserStore
@@ -845,9 +860,16 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	}
 	langPackStore := postgres.NewLangPackStore(pool)
 	passwordStore := postgres.NewPasswordStore(pool)
+	businessAutomationStore, err := businessautomationapp.NewCachedStore(
+		passwordStore,
+		redisstore.NewBusinessAutomationGateCache(rdb, redisstore.DefaultBusinessAutomationGateTTL),
+		logger.Named("app").Named("business-automation-cache"),
+	)
+	if err != nil {
+		return fmt.Errorf("init business automation read model: %w", err)
+	}
 	helpStore := postgres.NewHelpStore(pool)
 	aiComposeStore := postgres.NewAIComposeStore(pool)
-	tempAuthKeyStore := postgres.NewTempAuthKeyBindingStore(pool)
 	inlineRegistryStore := redisstore.NewInlineRegistryStore(rdb)
 	authInvalidationBroker := redisstore.NewAuthInvalidationBroker(rdb)
 	codeStore := redisstore.NewCodeStore(rdb)
@@ -878,7 +900,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		cfg.RetentionInterval,
 		cfg.RetentionBatch,
 	).WithBotAPIUpdateRetention(botAPIUpdateStore, cfg.BotAPIUpdateRetention).
-		WithAuthKeySessionLayerRetention(authKeyStore).
 		WithLoginCodeDeliveryRetention(messageStore).
 		WithClientTelemetryRetention(clientTelemetryStore, 30*24*time.Hour).
 		WithAuthDeliveryReportRetention(authDeliveryReportStore, 30*24*time.Hour).
@@ -921,7 +942,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		account.WithStickerCollections(passwordStore),
 		account.WithUserStickerSets(passwordStore),
 		account.WithSavedMusic(passwordStore),
-		account.WithBusinessAutomation(passwordStore),
+		account.WithBusinessAutomation(businessAutomationStore),
 		account.WithUsers(userStore),
 		account.WithPhoneChange(phoneChangeStore, authzStore, codeStore, userCache, cfg.DevAuthCode, cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts),
 		account.WithAccountLifecycle(accountLifecycleStore),
@@ -1228,7 +1249,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		messageapp.WithReadModelVersions(readModelVersionStore),
 		messageapp.WithBotResponder(botsService),
 		messageapp.WithSendPermissionChecker(adminService),
-		messageapp.WithBusinessAutomation(passwordStore, businessAutomationOptions...),
+		messageapp.WithBusinessAutomation(businessAutomationStore, businessAutomationOptions...),
 	)
 	moderationService := moderationapp.NewService(
 		moderationReportStore,
@@ -1389,7 +1410,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		AuthInvalidations:    authInvalidationBroker,
 		AuthDeliveryReports:  authDeliveryReportService,
 		ClientTelemetry:      clientTelemetryService,
-		AuthKeySessionLayers: authKeyStore,
+		AuthKeySessionLayers: authKeySessionLayers,
 		Account:              accountService,
 		Privacy:              privacyService,
 		Help: help.NewService(helpStore, helpStore,
@@ -1477,8 +1498,21 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		BotProfiles:        botsService,
 		StarGifts:          giftsService,
 		AccountSettings:    router,
+		AccountFreezes:     adminService,
+		BusinessAutomation: businessAutomationStore,
 	}), logger.Named("store").Named("read-model-listener"))
 	go readModelListener.Run(ctx)
+	go readModelRedisBus.Run(ctx,
+		func() { readModelListener.FlushRelayedReadModelCaches("redis_subscribe") },
+		readModelListener.HandleReadModelInvalidations,
+	)
+	readModelRelay, err := postgres.NewReadModelInvalidationRelay(
+		pool, readModelRedisBus, instanceID, logger.Named("store").Named("read-model-relay"),
+	)
+	if err != nil {
+		return fmt.Errorf("init dialog read-model invalidation relay: %w", err)
+	}
+	go readModelRelay.Run(ctx)
 	logger.Info("core role: edge session heartbeat and local command subscribers disabled",
 		zap.String("instance_id", instanceID))
 	if runRemoteSFUOwnerHeartbeat != nil {

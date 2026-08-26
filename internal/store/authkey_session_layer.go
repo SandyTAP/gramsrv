@@ -13,6 +13,11 @@ var (
 	// ErrAuthKeySessionLayerConflict means one client msg_id selected two
 	// different Layers for the same raw auth key and logical MTProto session.
 	ErrAuthKeySessionLayerConflict = errors.New("conflicting auth key session layer evidence")
+	// ErrAuthKeySessionLayerStoreRequired marks a missing production protocol
+	// state authority. Layer selection must fail closed; a process-local or
+	// PostgreSQL compatibility fallback would let different Core instances pick
+	// different wire profiles for the same logical session.
+	ErrAuthKeySessionLayerStoreRequired = errors.New("auth key session layer store is required")
 )
 
 // AuthKeySessionLayer is the short-lived durable high-water mark for explicit
@@ -36,6 +41,44 @@ type AuthKeySessionLayer struct {
 	SharedDefault bool
 }
 
+// AuthKeyLayerDefault is the auth-key-wide last explicit Layer observation
+// used only to seed a newly-created logical session. The exact current-session
+// selector always wins and does not mutate other live sessions.
+type AuthKeyLayerDefault struct {
+	Layer         int
+	ObservationID int64
+}
+
+// AuthKeyLayerIdentity is the cold PostgreSQL fact used to install the Redis
+// raw-key identity mapping. EffectiveAuthKeyID is raw for permanent/unbound
+// temporary keys and the canonical permanent key for a bound temporary key.
+type AuthKeyLayerIdentity struct {
+	EffectiveAuthKeyID [8]byte
+	RawExpiresAt       int
+}
+
+// AuthKeyLayerIdentitySource is called only when Redis has no raw-key identity
+// mapping. Production implementations must read the auth-key row and optional
+// temp binding in one snapshot; the session hot path must not call it.
+type AuthKeyLayerIdentitySource interface {
+	ResolveAuthKeyLayerIdentity(context.Context, [8]byte) (AuthKeyLayerIdentity, bool, error)
+}
+
+// AuthKeyLayerIdentityResolver proves a CoreExec identity hint from the Redis
+// authority. Implementations may install the mapping from the cold source on a
+// Redis miss, but must never use PostgreSQL as an availability fallback after
+// a Redis command fails.
+type AuthKeyLayerIdentityResolver interface {
+	ResolveCachedAuthKeyLayerIdentity(context.Context, [8]byte) (AuthKeyLayerIdentity, bool, error)
+}
+
+// AuthKeySessionLayerIdentityBinder merges raw/permanent Redis defaults after
+// a durable temp-key bind. The PostgreSQL bind may be retried idempotently when
+// this synchronous Redis step fails.
+type AuthKeySessionLayerIdentityBinder interface {
+	BindAuthKeyLayerIdentity(ctx context.Context, rawAuthKeyID, effectiveAuthKeyID [8]byte, rawExpiresAt int) error
+}
+
 // AuthKeySessionLayerStore linearizes explicit Layer evidence across server
 // processes and restarts. AdvanceSessionLayer never replaces a live row with a
 // lower msg_id. applied is true only for an insert, a strictly newer msg_id, or
@@ -48,6 +91,7 @@ type AuthKeySessionLayer struct {
 type AuthKeySessionLayerStore interface {
 	GetSessionLayer(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (value AuthKeySessionLayer, found bool, err error)
 	AdvanceSessionLayer(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, layer int, msgID int64) (current AuthKeySessionLayer, applied bool, err error)
+	GetAuthKeyLayerDefault(ctx context.Context, rawAuthKeyID [8]byte) (value AuthKeyLayerDefault, found bool, err error)
 	DeleteSessionLayer(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (deleted bool, err error)
 	DeleteExpiredSessionLayers(ctx context.Context, limit int) (deleted int, err error)
 }

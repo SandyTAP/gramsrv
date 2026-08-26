@@ -22,8 +22,8 @@ func (b *Bus) SendDeliveryBatch(ctx context.Context, target string, batch edgeco
 	if err := edgecontrol.ValidateDeliveryBatchEnvelope(batch); err != nil {
 		return edgecontrol.DeliveryAdmission{}, err
 	}
-	if !time.Now().Before(batch.NotAfter) {
-		return edgecontrol.DeliveryAdmission{}, fmt.Errorf("edge redis bus: delivery deadline elapsed")
+	if !time.Now().Before(batch.EvidenceDeadline) {
+		return edgecontrol.DeliveryAdmission{}, fmt.Errorf("edge redis bus: delivery evidence deadline elapsed")
 	}
 	mux, err := b.ensureAdmissionMux(ctx, batch.SourceInstanceID)
 	if err != nil {
@@ -87,7 +87,7 @@ func (b *Bus) SubscribeDeliveryBatches(ctx context.Context, instanceID string, h
 			if err != nil || batch.TargetInstanceID != instanceID {
 				continue
 			}
-			if !time.Now().Before(batch.NotAfter) {
+			if !time.Now().Before(batch.EvidenceDeadline) {
 				b.publishAdmission(ctx, batch, edgecontrol.DeliveryAdmission{Outcome: edgecontrol.AdmissionRejected, Detail: edgecontrol.DetailDeadline})
 				continue
 			}
@@ -140,7 +140,7 @@ func newDeliverySubscriberExecutor(ctx context.Context, bus *Bus, handle edgecon
 	return e
 }
 func (e *deliverySubscriberExecutor) submit(batch edgecontrol.DeliveryBatch, bytes int) error {
-	if !time.Now().Before(batch.NotAfter) {
+	if !time.Now().Before(batch.EvidenceDeadline) {
 		return context.DeadlineExceeded
 	}
 	if !reserveAtomicBytes(&e.used, e.maxBytes, bytes) {
@@ -165,9 +165,14 @@ func (e *deliverySubscriberExecutor) run(q <-chan deliverySubscriberTask) {
 		case <-e.stop:
 			return
 		case task := <-q:
-			deadline := time.Now().Add(defaultSubscriberCommandTime)
-			if task.batch.NotAfter.Before(deadline) {
-				deadline = task.batch.NotAfter
+			now := time.Now()
+			deadline := now.Add(defaultSubscriberCommandTime)
+			capDeadline := task.batch.NotAfter
+			if !now.Before(task.batch.NotAfter) {
+				capDeadline = task.batch.EvidenceDeadline
+			}
+			if capDeadline.Before(deadline) {
+				deadline = capDeadline
 			}
 			if !time.Now().Before(deadline) {
 				e.used.Add(-int64(task.bytes))

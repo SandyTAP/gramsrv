@@ -93,6 +93,40 @@ func TestSetAccountFrozenDryRunExecuteAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestAccountFreezeSendGateCachesNegativeAndInvalidatesExactly(t *testing.T) {
+	ctx := context.Background()
+	base := &fakeRestrictionStore{}
+	restrictions := &countingRestrictionStore{fakeRestrictionStore: base}
+	svc := NewService(Dependencies{Restrictions: restrictions})
+
+	if err := svc.CanSendMessages(ctx, 1001); err != nil {
+		t.Fatalf("first send gate: %v", err)
+	}
+	if err := svc.CanSendMessages(ctx, 1001); err != nil {
+		t.Fatalf("cached send gate: %v", err)
+	}
+	if restrictions.getCalls != 1 {
+		t.Fatalf("restriction reads=%d want one negative-cache load", restrictions.getCalls)
+	}
+
+	base.items = map[int64]domain.AccountFreeze{1001: {
+		UserID: 1001, Frozen: true, Since: fixedNow(), Until: fixedNow().Add(time.Hour),
+		AppealURL: "https://appeals.example.test/account/1001",
+	}}
+	// A direct backing-store change is deliberately invisible until the same
+	// user_visibility invalidation delivered by production PostgreSQL arrives.
+	if err := svc.CanSendMessages(ctx, 1001); err != nil {
+		t.Fatalf("pre-invalidation send gate: %v", err)
+	}
+	svc.InvalidateAccountFreezeReadModel(1001)
+	if err := svc.CanSendMessages(ctx, 1001); !errors.Is(err, domain.ErrUserFrozen) {
+		t.Fatalf("post-invalidation send gate=%v want frozen", err)
+	}
+	if restrictions.getCalls != 2 {
+		t.Fatalf("restriction reads=%d want exact invalidated reload", restrictions.getCalls)
+	}
+}
+
 func TestCreateBotReturnsTokenOnceWithoutPersistingCredential(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryCommandRepo()
@@ -878,6 +912,16 @@ func (f *fakeBotService) AdminExportBotToken(_ context.Context, _ int64) (string
 type fakeRestrictionStore struct {
 	items    map[int64]domain.AccountFreeze
 	setCalls int
+}
+
+type countingRestrictionStore struct {
+	*fakeRestrictionStore
+	getCalls int
+}
+
+func (s *countingRestrictionStore) GetAccountFreeze(ctx context.Context, userID int64) (domain.AccountFreeze, bool, error) {
+	s.getCalls++
+	return s.fakeRestrictionStore.GetAccountFreeze(ctx, userID)
 }
 
 func (f *fakeRestrictionStore) GetAccountFreeze(_ context.Context, userID int64) (domain.AccountFreeze, bool, error) {

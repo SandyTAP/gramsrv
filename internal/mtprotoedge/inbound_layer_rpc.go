@@ -671,21 +671,6 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 		}
 		current, err := s.commitLayerProfileEvidence(ctx, c, proof.profile, plan.items[index].msgID)
 		if err != nil {
-			if isLayerEvidenceDurabilityUnavailable(err) {
-				if _, localErr := c.freezeLayerProfileAt(proof.profile, plan.items[index].msgID); localErr != nil {
-					return fmt.Errorf("apply connection-local Layer evidence fallback: %w", localErr)
-				}
-				// The durable failure limits propagation, not validity of the
-				// selector on this physical connection. Keep fresh=true so an
-				// initConnection can initialize this Conn, enable updates and retain
-				// its device metadata. Only exact/auth-key/session publication is
-				// suppressed; a replacement connection must negotiate again.
-				evidence[index].publish = false
-				s.log.Error("Durable exact session Layer unavailable; using connection-local request profile",
-					zap.String("auth_key_id", c.authKeyHex), zap.Int64("session_id", c.sessionID),
-					zap.Int64("msg_id", plan.items[index].msgID), zap.Int("layer", int(proof.profile)), zap.Error(err))
-				continue
-			}
 			if isExactSessionProfileCapacityError(err) {
 				if profileCapacityItems == nil {
 					profileCapacityItems = make(map[int]struct{})
@@ -947,14 +932,7 @@ func (s *Server) admitInboundLayerRPCAt(c *Conn, msgID int64, body []byte) (tlpr
 	}
 	if profile, hasEvidence := request.ProfileEvidence(); hasEvidence {
 		if _, err := s.commitLayerProfileEvidence(context.Background(), c, profile, msgID); err != nil {
-			if !isLayerEvidenceDurabilityUnavailable(err) {
-				return tlprofile.Admission{}, method, err
-			}
-			if msgID > 0 {
-				if _, localErr := c.freezeLayerProfileAt(profile, msgID); localErr != nil {
-					return tlprofile.Admission{}, method, localErr
-				}
-			}
+			return tlprofile.Admission{}, method, err
 		}
 	}
 	return request, method, nil
@@ -1126,110 +1104,39 @@ func (s *Server) decodeInboundLayerRPCWithOptions(state LayerProfileSnapshot, bo
 // overwriting its local wire epoch. Older retained duplicates remain decodable
 // and request-bound, but cannot mutate session/profile state.
 func (s *Server) commitLayerProfileEvidence(ctx context.Context, c *Conn, profile tlprofile.Profile, msgID int64) (bool, error) {
-	if s == nil || c == nil {
+	if s == nil || c == nil || msgID <= 0 {
 		return false, fmt.Errorf("invalid layer profile evidence target")
 	}
-	if msgID > 0 {
-		if registry, ok := s.layerRPC.(LayerRPCDurableSessionProfileAdvancer); ok {
-			layer, authoritativeMsgID, publishShared, err := registry.AdvanceNegotiatedSessionLayerEvidence(
-				ctx, c.authKeyID, c.sessionID, int(profile), msgID,
-			)
-			if err != nil {
-				return false, fmt.Errorf("advance durable exact session Layer evidence: %w", err)
-			}
-			if layer <= 0 || authoritativeMsgID <= 0 {
-				return false, fmt.Errorf("%w: durable exact session evidence returned layer=%d msg_id=%d", ErrLayerProfileConflict, layer, authoritativeMsgID)
-			}
-			if s.conns != nil {
-				if _, err := s.conns.ApplyOrderedRawLayerForSession(c, c.authKeyID, c.sessionID, layer, authoritativeMsgID); err != nil {
-					return false, err
-				}
-			} else if _, err := c.freezeRawLayerProfileAt(layer, authoritativeMsgID); err != nil {
-				return false, err
-			}
-			authoritative, supported := tlprofile.ResolveProfile(layer)
-			return supported && authoritative == profile && authoritativeMsgID == msgID && publishShared, nil
-		}
-		if registry, ok := s.layerRPC.(LayerRPCOrderedSessionProfileRegistry); ok {
-			_, err := registry.FreezeNegotiatedSessionLayerAt(c.authKeyID, c.sessionID, int(profile), msgID)
-			if err != nil {
-				if isExactSessionProfileCapacityError(err) {
-					return false, fmt.Errorf("freeze ordered exact session registry capacity: %w", err)
-				}
-				return false, fmt.Errorf("%w: freeze ordered exact session registry: %w", ErrLayerProfileConflict, err)
-			}
-			// Always re-read and broadcast the authoritative registry value, even
-			// when this proof was stale/identical. Two physical generations may
-			// interleave registry commit and local publication; broadcasting the
-			// max cursor to every active/claim Conn makes their final state converge.
-			layer, authoritativeMsgID, found := registry.NegotiatedSessionLayerEvidence(c.authKeyID, c.sessionID)
-			if !found || authoritativeMsgID <= 0 {
-				return false, fmt.Errorf("%w: ordered exact session evidence disappeared after commit", ErrLayerProfileConflict)
-			}
-			authoritative, supported := tlprofile.ResolveProfile(layer)
-			if s.conns != nil {
-				if _, err := s.conns.ApplyOrderedRawLayerForSession(c, c.authKeyID, c.sessionID, layer, authoritativeMsgID); err != nil {
-					return false, err
-				}
-			} else if _, err := c.freezeRawLayerProfileAt(layer, authoritativeMsgID); err != nil {
-				return false, err
-			}
-			if !supported {
-				// A future durable Layer is an ordering watermark, not a codec this
-				// binary can use. Keep every Conn unknown and let a greater supported
-				// invokeWithLayer self-heal it.
-				return false, nil
-			}
-			return authoritative == profile && authoritativeMsgID == msgID, nil
-		}
-		// Older handlers without a persistent ordered registry still receive
-		// per-Conn replay protection. Production Router implements the interface.
-		applied, err := c.freezeLayerProfileAt(profile, msgID)
-		if err != nil || !applied {
-			return applied, err
-		}
-		if registry, ok := s.layerRPC.(LayerRPCSessionProfileRegistry); ok {
-			if err := registry.FreezeNegotiatedSessionLayer(c.authKeyID, c.sessionID, int(profile)); err != nil {
-				return false, fmt.Errorf("%w: freeze exact session registry: %v", ErrLayerProfileConflict, err)
-			}
-		}
-		if s.conns != nil {
-			s.conns.SeedInheritedLayerForRawAuthKey(c.authKeyID, int(profile))
-		}
-		return true, nil
+	registry, ok := s.layerRPC.(LayerRPCDurableSessionProfileAdvancer)
+	if !ok {
+		return false, fmt.Errorf("durable exact session Layer advancer is required")
 	}
-
-	// msgID==0 intentionally preserves the previous force semantics for direct
-	// admission tests. It is never used by the production batch path.
-	if registry, ok := s.layerRPC.(LayerRPCSessionProfileRegistry); ok {
-		if err := registry.FreezeNegotiatedSessionLayer(c.authKeyID, c.sessionID, int(profile)); err != nil {
-			return false, fmt.Errorf("%w: freeze exact session registry: %v", ErrLayerProfileConflict, err)
-		}
+	layer, authoritativeMsgID, publishShared, err := registry.AdvanceNegotiatedSessionLayerEvidence(
+		ctx, c.authKeyID, c.sessionID, int(profile), msgID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("advance durable exact session Layer evidence: %w", err)
 	}
-	if err := c.FreezeLayerProfile(profile); err != nil {
-		return false, err
+	if layer <= 0 || authoritativeMsgID <= 0 {
+		return false, fmt.Errorf("%w: durable exact session evidence returned layer=%d msg_id=%d", ErrLayerProfileConflict, layer, authoritativeMsgID)
 	}
 	if s.conns != nil {
-		s.conns.SeedInheritedLayerForRawAuthKey(c.authKeyID, int(profile))
+		if _, err := s.conns.ApplyOrderedRawLayerForSession(c, c.authKeyID, c.sessionID, layer, authoritativeMsgID); err != nil {
+			return false, err
+		}
+	} else if _, err := c.freezeRawLayerProfileAt(layer, authoritativeMsgID); err != nil {
+		return false, err
 	}
-	return true, nil
+	authoritative, supported := tlprofile.ResolveProfile(layer)
+	return supported && authoritative == profile && authoritativeMsgID == msgID && publishShared, nil
 }
 
 type exactSessionProfileCapacityMarker interface {
 	ExactSessionProfileCapacity()
 }
 
-type layerEvidenceDurabilityUnavailableMarker interface {
-	LayerEvidenceDurabilityUnavailable()
-}
-
 func isExactSessionProfileCapacityError(err error) bool {
 	var marker exactSessionProfileCapacityMarker
-	return errors.As(err, &marker)
-}
-
-func isLayerEvidenceDurabilityUnavailable(err error) bool {
-	var marker layerEvidenceDurabilityUnavailableMarker
 	return errors.As(err, &marker)
 }
 

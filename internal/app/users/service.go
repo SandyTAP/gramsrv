@@ -167,6 +167,14 @@ func (s *Service) PrivacyBaseUsers(ctx context.Context, userIDs []int64) ([]doma
 	return s.loadBaseUsersByIDs(ctx, userIDs)
 }
 
+// BaseUsersByIDs returns viewer-independent account identities through the
+// shared Redis base-user read model. It is the strict existence boundary for
+// write paths that must validate a peer but must not pay for, or accidentally
+// expose, a complete viewer-specific projection.
+func (s *Service) BaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	return s.loadBaseUsersByIDs(ctx, userIDs)
+}
+
 // ByIDs 批量返回指定用户。调用方必须已登录；缺失用户不会出现在结果中。
 func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int64) ([]domain.User, error) {
 	if currentUserID == 0 {

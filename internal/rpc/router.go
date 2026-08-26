@@ -112,11 +112,15 @@ type Config struct {
 // 与注册见 help.go / auth.go / users.go / updates.go。Router 本身只负责协议外壳：
 // 剥离 invokeWithLayer / initConnection / invokeWithoutUpdates / invokeAfter*，并兜底未注册 RPC。
 type Router struct {
-	cfg               Config
-	appLinks          links.AppLinkBuilder
-	log               *zap.Logger
-	clock             clock.Clock
-	deps              Deps
+	cfg      Config
+	appLinks links.AppLinkBuilder
+	log      *zap.Logger
+	clock    clock.Clock
+	deps     Deps
+	// outboxPresence is required only by the production Durable Egress
+	// projector. It resolves one complete batch snapshot; ordinary RPC routers
+	// continue to use their session controller's request-scoped presence path.
+	outboxPresence    UserLocationBatchProvider
 	dispatcher        *tlprofile.Dispatcher
 	clientInfoMu      sync.RWMutex
 	clientInfo        map[clientInfoSessionKey]clientSessionInfo
@@ -171,9 +175,11 @@ type Router struct {
 	storyPinnedCache             *storyPinnedAvailableCache
 	storyPinnedListCache         *storyPinnedStoriesCache
 	channelFullBotCache          *channelFullBotInfoCache
+	receiverUserProjectionCache  *receiverUserProjectionCache
 	userFullProjectionCache      *userFullProjectionCache
 	peerSettingsProjectionCache  *peerSettingsProjectionCache
 	channelFullProjectionCache   *channelFullProjectionCache
+	peerUsernameProjectionCache  *peerUsernameProjectionCache
 	availableReactionDocuments   availableReactionDocumentMapCache
 	emojiStickers                *emojiStickerIndex
 	notifySettings               *notifySettingsCache
@@ -257,7 +263,7 @@ func New(cfg Config, deps Deps, log *zap.Logger, clk clock.Clock) *Router {
 	if instanceID == "" {
 		instanceID = fmt.Sprintf("%016x", randomNonZeroInt64())
 	}
-	r := &Router{cfg: cfg, appLinks: appLinks, log: log, clock: clk, deps: deps, exactProfiles: make(map[clientInfoSessionKey]exactSessionProfileEntry), authLayerEvidence: make(map[[8]byte]authLayerDefaultEvidence), presence: newPresenceTracker(), callbacks: newCallbackRegistry(deps.BotCallbacks), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(deps.LoginTokens), botAPIUpdates: newBotAPIUpdateNotifier(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), accountFreezeWake: make(chan struct{}, 1), instanceID: instanceID}
+	r := &Router{cfg: cfg, appLinks: appLinks, log: log, clock: clk, deps: deps, exactProfiles: make(map[clientInfoSessionKey]exactSessionProfileEntry), authLayerEvidence: make(map[[8]byte]authLayerDefaultEvidence), presence: newPresenceTracker(), callbacks: newCallbackRegistry(deps.BotCallbacks), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(deps.LoginTokens), botAPIUpdates: newBotAPIUpdateNotifier(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), receiverUserProjectionCache: newReceiverUserProjectionCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), peerUsernameProjectionCache: newPeerUsernameProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), accountFreezeWake: make(chan struct{}, 1), instanceID: instanceID}
 	r.botAPIEnqueueQueue = newBotAPIEnqueueDispatcher(log, defaultBotAPIEnqueueBuffer)
 	r.webPageResolveSem = make(chan struct{}, webPageResolveConcurrency)
 	if cfg.DC > 0 {
@@ -399,8 +405,8 @@ func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, s
 	if hinted, ok := r.permanentAuthKeyIDFromIdentityHint(ctx, rawAuthKeyID, sessionID); ok {
 		return hinted, nil
 	}
-	if hinted, ok := r.cachedTempAuthKeyIDFromIdentityHint(ctx, rawAuthKeyID, sessionID); ok {
-		return hinted, nil
+	if hinted, handled, err := r.redisVerifiedTempAuthKeyIDFromIdentityHint(ctx, rawAuthKeyID, sessionID); handled {
+		return hinted, err
 	}
 	var (
 		cached    [8]byte
@@ -657,9 +663,9 @@ func (r *Router) invalidateAuthUserCache(authKeyID [8]byte) {
 	key := string(authKeyID[:])
 	r.authUserSF.Forget(key)
 	r.authUserSF.Forget(authKeyResolveSingleflightPrefix + key)
+	r.authUserSF.Forget(redisAuthKeyIdentitySingleflightPrefix + key)
 	r.authUserSF.Forget(authClientInfoSingleflightPrefix + key)
 	r.authUserSF.Forget(authKeyClientInfoSingleflightPrefix + key)
-	r.authUserSF.Forget(inheritedAuthKeyLayerSingleflightPrefix + key)
 	r.authUserSF.Forget(durableInheritedAuthKeyLayerSingleflightPrefix + key)
 }
 
@@ -1054,12 +1060,9 @@ func (r *Router) rememberClientLayerAt(ctx context.Context, layer int, msgID int
 			publishDefault = false
 		}
 	}
-	defaultChanged := false
 	if publishDefault {
-		defaultChanged = r.authClientLayerLocked(rawAuthKeyID) != layer
 		r.rememberAuthClientLayerLocked(rawAuthKeyID, layer)
 		if hasAuthKeyID {
-			defaultChanged = defaultChanged || r.authClientLayerLocked(authKeyID) != layer
 			r.rememberAuthClientLayerLocked(authKeyID, layer)
 		}
 	}
@@ -1068,12 +1071,6 @@ func (r *Router) rememberClientLayerAt(ctx context.Context, layer int, msgID int
 		if binder, ok := r.deps.Sessions.(ClientLayerBinder); ok {
 			binder.SetClientLayerForAuthKey(rawAuthKeyID, sessionID, layer)
 		}
-	}
-	// The newest explicit observation becomes the default for future sessions.
-	// A repeat from an older live session may legitimately move that default
-	// back without changing any sibling session's already-selected profile.
-	if publishDefault && (notifyConn || defaultChanged) {
-		r.persistAuthKeyClientInfo(ctx, clientSessionInfo{layer: layer})
 	}
 }
 
@@ -1748,7 +1745,6 @@ func mergeClientSessionInfo(base, fallback clientSessionInfo) clientSessionInfo 
 func clientSessionInfoFromAuthKeyClientInfo(item domain.AuthKeyClientInfo) clientSessionInfo {
 	info := clientSessionInfo{
 		authKeyInfoChecked: true,
-		layerObservationID: item.LayerObservationID,
 		clientInfo: ClientInfo{
 			APIID:         item.APIID,
 			DeviceModel:   item.DeviceModel,
@@ -1756,16 +1752,6 @@ func clientSessionInfoFromAuthKeyClientInfo(item domain.AuthKeyClientInfo) clien
 			AppVersion:    item.AppVersion,
 			Type:          ClientType(item.Platform),
 		},
-	}
-	if isSupportedLayer(item.Layer) {
-		info.layer = item.Layer
-	} else if item.Layer != 0 {
-		// A non-zero auth_keys.layer is primary even when this binary has not
-		// generated it. Mark the mirror checked so an older authorization.layer
-		// cannot silently downgrade the future value.
-		info.authorizationChecked = true
-		info.layerBlocked = true
-		info.layerBlockedByAuthKey = true
 	}
 	info.clientInfo = restoreClientInfo(info.clientInfo)
 	info.hasClientInfo = info.clientInfo.ClientType() != ClientTypeUnknown ||
@@ -1777,7 +1763,7 @@ func clientSessionInfoFromAuthKeyClientInfo(item domain.AuthKeyClientInfo) clien
 }
 
 func domainAuthKeyClientInfo(info clientSessionInfo) domain.AuthKeyClientInfo {
-	out := domain.AuthKeyClientInfo{Layer: info.layer}
+	out := domain.AuthKeyClientInfo{}
 	if info.hasClientInfo {
 		out.APIID = info.clientInfo.APIID
 		out.DeviceModel = info.clientInfo.DeviceModel

@@ -15,12 +15,36 @@ type serviceLimitDispatch struct{ store.DispatchOutboxStore }
 type serviceLimitAbsolute struct{ store.DeliveryOutboxStore }
 type serviceLimitChannel struct{ store.ChannelDeliveryStore }
 type serviceLimitPlanner struct{ edgecontrol.DeliveryPlanner }
+type serviceLimitMutations struct{}
+
+type serviceLimitReadModels struct{}
+
+func (serviceLimitReadModels) PublishReadModelInvalidations(context.Context, []store.ReadModelInvalidation) error {
+	return nil
+}
+
+func (*serviceLimitMutations) BindAttemptTargets(context.Context, store.OutboxQueueKind, []store.OutboxAttemptTargetSet) ([]store.OutboxBindTargetResult, error) {
+	return nil, nil
+}
+
+func (*serviceLimitMutations) RecordAttemptEvidenceBatch(context.Context, store.OutboxQueueKind, []store.OutboxAttemptEvidence) ([]store.OutboxEvidenceResult, error) {
+	return nil, nil
+}
+
+func (*serviceLimitMutations) ResolveTargetAttemptBatch(context.Context, store.OutboxQueueKind, []store.OutboxTargetAttemptResolution) ([]store.OutboxResolutionResult, error) {
+	return nil, nil
+}
+
+func (*serviceLimitMutations) ResolveOwnedAttemptBatch(context.Context, store.OutboxQueueKind, []store.OutboxOwnedAttemptResolution) ([]store.OutboxResolutionResult, error) {
+	return nil, nil
+}
 
 func newServiceForLimitTest(cfg Config) error {
 	_, err := NewService(
 		&serviceLimitEvents{}, &serviceLimitDispatch{}, &serviceLimitAbsolute{}, &serviceLimitChannel{},
-		&serviceLimitPlanner{},
+		&serviceLimitMutations{}, &serviceLimitPlanner{},
 		func(context.Context, []OutboxUpdateRequest) ([][]byte, error) { return nil, nil },
+		serviceLimitReadModels{},
 		func(context.Context, []ChannelUpdateRequest) ([][]byte, error) { return nil, nil },
 		nil, nil,
 		cfg,

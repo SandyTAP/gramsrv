@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
-	"sort"
+	"go.uber.org/zap"
+
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
-	"time"
 )
 
 func (s *MessageStore) Create(ctx context.Context, msg domain.Message) (domain.Message, error) {
@@ -248,6 +250,9 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	if !ok {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("send private text: db does not support transactions")
 	}
+	if plainHotPath && processPlainPrivateSendBatcher.Eligible(s) {
+		return processPlainPrivateSendBatcher.Submit(ctx, s, req, requestFingerprint)
+	}
 
 	var recipientBoxID, recipientPts int
 	selfMessage := req.RecipientUserID == req.SenderUserID
@@ -257,6 +262,38 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 		senderMeta.SavedPeerType = string(savedPeer.Type)
 		senderMeta.SavedPeerID = savedPeer.ID
 	}
+	// Box ids are monotonic Redis counters with a PostgreSQL recovery floor and
+	// explicitly allow gaps. Allocate them before BEGIN so a Redis round trip or
+	// cold-counter recovery never occupies a PostgreSQL connection or extends the
+	// ordered account advisory-lock lifetime. A later duplicate/rollback may burn
+	// ids, but it cannot reuse or move a user's box id backwards.
+	allocationUsers := []int64{req.SenderUserID}
+	if deliverRecipient {
+		allocationUsers = append(allocationUsers, req.RecipientUserID)
+	}
+	boxIDs, err := s.boxIDs.NextBoxIDs(ctx, allocationUsers)
+	if err != nil {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: %w", err)
+	}
+	senderBoxID := boxIDs[req.SenderUserID]
+	if senderBoxID <= 0 {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing sender result")
+	}
+	if deliverRecipient {
+		recipientBoxID = boxIDs[req.RecipientUserID]
+		if recipientBoxID <= 0 {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing recipient result")
+		}
+	}
+
+	lockUserIDs := make([]int64, 0, len(hooks.lockUserIDs)+2)
+	lockUserIDs = append(lockUserIDs, req.SenderUserID, req.RecipientUserID)
+	lockUserIDs = append(lockUserIDs, hooks.lockUserIDs...)
+	releaseAdmission, err := processAccountWriteAdmission.Acquire(ctx, lockUserIDs...)
+	if err != nil {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("admit private send transaction: %w", err)
+	}
+	defer releaseAdmission()
 
 	tx, err := beginner.Begin(ctx)
 	if err != nil {
@@ -275,9 +312,6 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	// Lock acquisition is a separate statement from all state reads. Under
 	// READ COMMITTED this guarantees TTL and message state use a snapshot taken
 	// after any conflicting writer releases the same ordered advisory locks.
-	lockUserIDs := make([]int64, 0, len(hooks.lockUserIDs)+2)
-	lockUserIDs = append(lockUserIDs, req.SenderUserID, req.RecipientUserID)
-	lockUserIDs = append(lockUserIDs, hooks.lockUserIDs...)
 	if err := lockUsersForUpdate(ctx, tx, lockUserIDs...); err != nil {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send users: %w", err)
 	}
@@ -367,25 +401,13 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 		return domain.SendPrivateTextResult{}, fmt.Errorf("create private message: %w", err)
 	}
 
-	allocationUsers := []int64{req.SenderUserID}
-	if deliverRecipient {
-		allocationUsers = append(allocationUsers, req.RecipientUserID)
-	}
-	boxIDs, err := s.boxIDs.NextBoxIDs(ctx, allocationUsers)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: %w", err)
-	}
-	senderBoxID := boxIDs[req.SenderUserID]
-	if senderBoxID <= 0 {
-		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing sender result")
-	}
-	if deliverRecipient {
-		recipientBoxID = boxIDs[req.RecipientUserID]
-		if recipientBoxID <= 0 {
-			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing recipient result")
-		}
-	}
 	if plainHotPath {
+		// The existing dispatch rows below carry the exact owner+peer cache key.
+		// Suppress only the rebuildable dialog_light trigger for this transaction;
+		// all dialog/message/PTS/outbox facts remain unchanged.
+		if _, err := tx.Exec(ctx, `SELECT set_config('telesrv.defer_dialog_light', 'on', true)`); err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("defer plain send dialog invalidation: %w", err)
+		}
 		projection, err := persistPlainPrivateSendProjection(
 			ctx,
 			tx,
@@ -409,6 +431,8 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 			return domain.SendPrivateTextResult{}, fmt.Errorf("commit send message tx: %w", err)
 		}
 		committed = true
+		releaseAdmission()
+		s.publishPrivateDialogInvalidations(result)
 		return result, nil
 	}
 	allocatedPts, err := s.reservePrivateSendPts(ctx, tx, allocationUsers)
@@ -661,7 +685,36 @@ WHERE sender_user_id = $1
 		return domain.SendPrivateTextResult{}, fmt.Errorf("commit send message tx: %w", err)
 	}
 	committed = true
+	releaseAdmission()
 	return result, nil
+}
+
+func (s *MessageStore) publishPrivateDialogInvalidations(result domain.SendPrivateTextResult) {
+	if s == nil || s.readModelInvalidations == nil {
+		return
+	}
+	events := []domain.UpdateEvent{result.SenderEvent, result.RecipientEvent}
+	items := make([]store.ReadModelInvalidation, 0, len(events))
+	for _, event := range events {
+		if event.UserID <= 0 || event.Pts <= 0 || event.Peer.ID <= 0 ||
+			(event.Peer.Type != domain.PeerTypeUser && event.Peer.Type != domain.PeerTypeChannel) {
+			continue
+		}
+		items = append(items, store.NewSequencedReadModelInvalidation(store.ReadModelKey{
+			Model: "dialog_light", OwnerUserID: event.UserID,
+			PeerType: event.Peer.Type, PeerID: event.Peer.ID,
+		}, int64(event.Pts)))
+	}
+	if len(items) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	err := s.readModelInvalidations.PublishReadModelInvalidations(ctx, items)
+	cancel()
+	if err != nil {
+		s.log.Warn("publish plain send dialog invalidation; durable Egress will retry",
+			zap.Int("items", len(items)), zap.Error(err))
+	}
 }
 
 // sendDraftClearEffects is the mandatory, strongly typed projection

@@ -52,6 +52,27 @@ type transientIndeterminatePlanner struct {
 	calls     int
 }
 
+type deadlineThenReplayPlanner struct {
+	edgecontrol.DeliveryPlanner
+	notAfter time.Time
+	mu       sync.Mutex
+	calls    []time.Time
+}
+
+func (p *deadlineThenReplayPlanner) AdmitPreparedDelivery(
+	ctx context.Context,
+	plan edgecontrol.FrozenDeliveryPlan,
+) (edgecontrol.FrozenDelivery, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, time.Now())
+	p.mu.Unlock()
+	if time.Now().Before(p.notAfter) {
+		<-ctx.Done()
+		return edgecontrol.FrozenDelivery{BatchID: plan.BatchID()}, edgecontrol.ErrDeliveryIndeterminate
+	}
+	return p.DeliveryPlanner.AdmitPreparedDelivery(ctx, plan)
+}
+
 func (p *transientIndeterminatePlanner) AdmitPreparedDelivery(
 	ctx context.Context,
 	plan edgecontrol.FrozenDeliveryPlan,
@@ -109,8 +130,17 @@ func (b *partialAdmissionBus) targets() []string {
 
 type pendingChannelStore struct {
 	store.DurableOutboxStateStore
-	bound []store.OutboxAttemptTargetSet
-	owned []store.OutboxOwnedAttemptResolution
+	bound        []store.OutboxAttemptTargetSet
+	owned        []store.OutboxOwnedAttemptResolution
+	finalizeCall int
+}
+
+type routeFirstDispatchStore struct{ store.DispatchOutboxStore }
+
+type ptsWindowProjectorFunc func(context.Context, store.OutboxClaimWindow) ([]projectedOutboxItem, error)
+
+func (f ptsWindowProjectorFunc) Project(ctx context.Context, window store.OutboxClaimWindow) ([]projectedOutboxItem, error) {
+	return f(ctx, window)
 }
 
 func (s *pendingChannelStore) BindAttemptTargets(_ context.Context, sets []store.OutboxAttemptTargetSet) ([]store.OutboxBindTargetResult, error) {
@@ -131,8 +161,79 @@ func (s *pendingChannelStore) ResolveOwnedAttemptBatch(_ context.Context, resolu
 	return results, nil
 }
 
-func (*pendingChannelStore) FinalizeAttempts(context.Context, []store.OutboxFinalizeRequest) (store.OutboxFinalizeBatch, error) {
+func (s *pendingChannelStore) FinalizeAttempts(context.Context, []store.OutboxFinalizeRequest) (store.OutboxFinalizeBatch, error) {
+	s.finalizeCall++
 	return store.OutboxFinalizeBatch{}, nil
+}
+
+func TestOwnedResolutionUsesMutationWriterWithoutSynchronousFinalize(t *testing.T) {
+	state := &pendingChannelStore{}
+	coordinator := &deliveryCoordinator{mutations: directMutations(nil, nil, state), metrics: nopMetrics{}, log: zaptest.NewLogger(t)}
+	coordinator.resolveItems(context.Background(), state, "egress-a/q3/w0", []store.OutboxClaimedItem{{
+		Ref: store.OutboxAttemptRef{
+			QueueKind: store.OutboxQueueChannelPTS, StreamID: 7001,
+			ItemID: 91, Sequence: 11, LeaseFence: 3, Attempt: 1,
+		},
+	}}, errActorCapacity, false)
+	if len(state.owned) != 1 || state.owned[0].Kind != store.OutboxResolutionRetry {
+		t.Fatalf("owned resolutions=%+v", state.owned)
+	}
+	if state.finalizeCall != 0 {
+		t.Fatalf("actor-owned resolution synchronously finalized %d times", state.finalizeCall)
+	}
+}
+
+func TestAccountRouteEmptySkipsPTSProjectionAndBindsExactAttempt(t *testing.T) {
+	ctx := context.Background()
+	excludeAuth := [8]byte{1, 2, 3}
+	const (
+		userID    = int64(77)
+		sessionID = int64(88)
+	)
+	bus := &v3TestDeliveryBus{}
+	fabric := edgecontrol.NewDeliveryFabric(edgecontrol.DeliveryFabricConfig{
+		InstanceID: "egress-a",
+		Registry: v3TestRegistry{records: []edgecontrol.LocationRecord{{
+			InstanceID: "edge-a", UserID: userID, RawAuthKeyID: excludeAuth,
+			SessionID: sessionID, ReceivesUpdates: true,
+		}}},
+		Bus: bus,
+	})
+	defer fabric.Close()
+	mutations := &mutationStoreCapture{}
+	projectionCalls := 0
+	notAfter := time.Now().Add(2 * time.Second).UTC()
+	window := store.OutboxClaimWindow{
+		QueueKind: store.OutboxQueueDispatchPTS, StreamID: userID, LeaseFence: 9,
+		Owner: "egress-a/q1/w0", LeaseUntil: notAfter.Add(2 * time.Second),
+		Items: []store.OutboxClaimedItem{{
+			Ref: store.OutboxAttemptRef{
+				QueueKind: store.OutboxQueueDispatchPTS, StreamID: userID,
+				ItemID: 101, Sequence: 1, LeaseFence: 9, Attempt: 1,
+			},
+			ExcludeAuthKeyID: excludeAuth, ExcludeSessionID: sessionID,
+			CommandNotAfter: notAfter, EvidenceDeadline: notAfter.Add(time.Second),
+		}},
+	}
+	coordinator := &deliveryCoordinator{
+		dispatch: &routeFirstDispatchStore{}, mutations: directMutations(mutations, nil, nil),
+		planner: fabric, instanceID: "egress-a", metrics: nopMetrics{}, log: zaptest.NewLogger(t),
+		ptsProjector: ptsWindowProjectorFunc(func(context.Context, store.OutboxClaimWindow) ([]projectedOutboxItem, error) {
+			projectionCalls++
+			return nil, errors.New("projection must not run for an empty frozen route")
+		}),
+	}
+	coordinator.processWindow(ctx, window)
+	mutations.mu.Lock()
+	bindCalls, maxBatch := mutations.bindCalls, mutations.maxBindBatch
+	bindSets := append([]store.OutboxAttemptTargetSet(nil), mutations.bindSets...)
+	mutations.mu.Unlock()
+	if projectionCalls != 0 || bindCalls != 1 || maxBatch != 1 || len(bus.snapshot()) != 0 {
+		t.Fatalf("projection=%d bind_calls=%d bind_batch=%d Redis_commands=%d", projectionCalls, bindCalls, maxBatch, len(bus.snapshot()))
+	}
+	if len(bindSets) != 1 || bindSets[0].Ref != window.Items[0].Ref || bindSets[0].SourceInstanceID != "egress-a" || len(bindSets[0].Targets) != 0 {
+		t.Fatalf("empty route bind=%+v want exact attempt/source with no targets", bindSets)
+	}
 }
 
 type physicalResolutionCapture struct {
@@ -192,9 +293,10 @@ func TestFrozenPlanRetriesExactAdmissionWithinOriginalDeadline(t *testing.T) {
 	})
 	defer fabric.Close()
 	notAfter := time.Now().Add(time.Second)
+	evidenceDeadline := notAfter.Add(time.Second)
 	payload := []byte{1, 2, 3}
 	plan, err := fabric.PrepareDelivery(context.Background(), edgecontrol.DeliveryRequest{
-		TargetUserID: 42, NotAfter: notAfter,
+		TargetUserID: 42, NotAfter: notAfter, EvidenceDeadline: evidenceDeadline,
 		Items: []edgecontrol.DeliveryItem{{
 			Ref: edgecontrol.DeliveryRef{
 				Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42},
@@ -208,7 +310,7 @@ func TestFrozenPlanRetriesExactAdmissionWithinOriginalDeadline(t *testing.T) {
 	}
 	planner := &transientIndeterminatePlanner{DeliveryPlanner: fabric, remaining: 2}
 	coordinator := &deliveryCoordinator{planner: planner}
-	if err := coordinator.admitFrozenPlan(context.Background(), plan, notAfter); err != nil {
+	if err := coordinator.admitFrozenPlan(context.Background(), context.Background(), plan, notAfter, evidenceDeadline); err != nil {
 		t.Fatalf("exact admission retry: %v", err)
 	}
 	if planner.calls != 3 {
@@ -216,6 +318,50 @@ func TestFrozenPlanRetriesExactAdmissionWithinOriginalDeadline(t *testing.T) {
 	}
 	if batches := bus.snapshot(); len(batches) != 1 {
 		t.Fatalf("published batches=%d want exactly one final accepted command", len(batches))
+	}
+}
+
+func TestFrozenPlanTransitionsToExactReceiptReplayAfterCommandDeadline(t *testing.T) {
+	bus := &v3TestDeliveryBus{}
+	fabric := edgecontrol.NewDeliveryFabric(edgecontrol.DeliveryFabricConfig{
+		InstanceID: "egress-a",
+		Registry: v3TestRegistry{records: []edgecontrol.LocationRecord{{
+			InstanceID: "edge-a", UserID: 42, ReceivesUpdates: true,
+		}}},
+		Bus: bus,
+	})
+	defer fabric.Close()
+	notAfter := time.Now().Add(40 * time.Millisecond)
+	evidenceDeadline := notAfter.Add(time.Second)
+	payload := []byte{4, 5, 6}
+	plan, err := fabric.PrepareDelivery(context.Background(), edgecontrol.DeliveryRequest{
+		TargetUserID: 42, NotAfter: notAfter, EvidenceDeadline: evidenceDeadline,
+		Items: []edgecontrol.DeliveryItem{{
+			Ref: edgecontrol.DeliveryRef{
+				Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42},
+				OutboxID: 2, TargetUserID: 42, PTS: 2, LeaseFence: 2, Attempt: 1,
+			},
+			MessageType: proto.MessageFromServer,
+			PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &deadlineThenReplayPlanner{DeliveryPlanner: fabric, notAfter: notAfter}
+	coordinator := &deliveryCoordinator{planner: planner}
+	if err := coordinator.admitFrozenPlan(context.Background(), context.Background(), plan, notAfter, evidenceDeadline); err != nil {
+		t.Fatalf("receipt replay transition: %v", err)
+	}
+	planner.mu.Lock()
+	calls := append([]time.Time(nil), planner.calls...)
+	planner.mu.Unlock()
+	if len(calls) != 2 || calls[0].After(notAfter) || calls[1].Before(notAfter) {
+		t.Fatalf("admission phases=%v not_after=%v", calls, notAfter)
+	}
+	batches := bus.snapshot()
+	if len(batches) != 1 || !batches[0].NotAfter.Equal(notAfter) || !batches[0].EvidenceDeadline.Equal(evidenceDeadline) {
+		t.Fatalf("receipt replay did not preserve exact command deadlines: %+v", batches)
 	}
 }
 
@@ -243,7 +389,7 @@ func TestAbsoluteDeliveryCompletesOnlyAfterPhysicalReceipt(t *testing.T) {
 	})
 	defer fabric.Close()
 	coordinator := &deliveryCoordinator{
-		absolute: queue, planner: fabric, metrics: nopMetrics{}, log: zaptest.NewLogger(t),
+		absolute: queue, mutations: directMutations(nil, queue, nil), planner: fabric, metrics: nopMetrics{}, log: zaptest.NewLogger(t),
 		instanceID: "egress-a",
 	}
 	coordinator.processWindow(ctx, windows[0])
@@ -260,7 +406,7 @@ func TestAbsoluteDeliveryCompletesOnlyAfterPhysicalReceipt(t *testing.T) {
 		t.Fatalf("claim after admission=%+v err=%v", claimed, err)
 	}
 	batch := batches[0]
-	results := applyPhysicalReceiptBatch(ctx, deliveryEvidenceStores{absolute: queue}, []edgecontrol.PhysicalReceipt{{
+	results := applyPhysicalReceiptBatch(ctx, deliveryEvidenceStores{absolute: queue, mutations: directMutations(nil, queue, nil)}, []edgecontrol.PhysicalReceipt{{
 		BatchID: batch.BatchID, CommandID: batch.CommandID,
 		SourceInstanceID: batch.SourceInstanceID, TargetInstanceID: batch.TargetInstanceID,
 		Ref: batch.Items[0].Ref, Outcome: edgecontrol.PhysicalWritten,
@@ -268,6 +414,20 @@ func TestAbsoluteDeliveryCompletesOnlyAfterPhysicalReceipt(t *testing.T) {
 	}})
 	if len(results) != 1 || results[0].Outcome != edgecontrol.PhysicalReceiptApplied {
 		t.Fatalf("physical results=%+v", results)
+	}
+	// The receipt RPC commits evidence only. Production PostgreSQL emits a
+	// transactional finalize wake; drive the same durable recovery contract
+	// explicitly for this in-memory store instead of relying on a synchronous
+	// per-receipt finalizer hidden inside the handler.
+	finalizable, err := queue.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
+	})
+	if err != nil || len(finalizable) != 1 {
+		t.Fatalf("RecoverFinalizableAttempts=%+v err=%v", finalizable, err)
+	}
+	finalized, err := queue.FinalizeAttempts(ctx, finalizable)
+	if err != nil || len(finalized.Results) != 1 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
+		t.Fatalf("FinalizeAttempts=%+v err=%v", finalized, err)
 	}
 	if next, ok, err := queue.NextReadyAt(ctx, store.OutboxQueueAbsoluteDelivery, 0, nil); err != nil || ok {
 		t.Fatalf("NextReadyAt=%+v ok=%v err=%v", next, ok, err)
@@ -293,15 +453,24 @@ func TestAuthoritativeNoTargetFinalizesWithoutRedisCommand(t *testing.T) {
 	})
 	defer fabric.Close()
 	coordinator := &deliveryCoordinator{
-		absolute: queue, planner: fabric, metrics: nopMetrics{}, log: zaptest.NewLogger(t),
+		absolute: queue, mutations: directMutations(nil, queue, nil), planner: fabric, metrics: nopMetrics{}, log: zaptest.NewLogger(t),
 		instanceID: "egress-a",
 	}
 	coordinator.processWindow(ctx, windows[0])
 	if got := len(bus.snapshot()); got != 0 {
 		t.Fatalf("Redis commands=%d want 0", got)
 	}
+	finalizable, err := queue.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
+		QueueKind: store.OutboxQueueAbsoluteDelivery, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,
+	})
+	if err != nil || len(finalizable) != 1 {
+		t.Fatalf("RecoverFinalizableAttempts=%+v err=%v", finalizable, err)
+	}
+	if finalized, err := queue.FinalizeAttempts(ctx, finalizable); err != nil || len(finalized.Results) != 1 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
+		t.Fatalf("FinalizeAttempts=%+v err=%v", finalized, err)
+	}
 	if _, ok, err := queue.NextReadyAt(ctx, store.OutboxQueueAbsoluteDelivery, 0, nil); err != nil || ok {
-		t.Fatalf("queue remained after authoritative empty evidence ok=%v err=%v", ok, err)
+		t.Fatalf("queue remained after durable finalizer ok=%v err=%v", ok, err)
 	}
 }
 
@@ -344,7 +513,7 @@ func TestMonoforumFrozenAudienceProjectsOneCommandPerEdge(t *testing.T) {
 		t.Fatal(err)
 	}
 	notAfter := time.Now().Add(time.Second)
-	request, err := coordinator.deliveryRequest(projected, 0, notAfter)
+	request, err := coordinator.deliveryRequest(projected, 0, notAfter, notAfter.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +575,7 @@ func TestPartialChannelAdmissionStaysBoundAndReplaysOldTopology(t *testing.T) {
 	defer fabric.Close()
 	state := &pendingChannelStore{}
 	coordinator := &deliveryCoordinator{
-		channel: state, planner: fabric, instanceID: "egress-a",
+		channel: state, mutations: directMutations(nil, nil, state), planner: fabric, instanceID: "egress-a",
 		metrics: nopMetrics{}, log: zaptest.NewLogger(t),
 		channelBuilder: func(_ context.Context, requests []ChannelUpdateRequest) ([][]byte, error) {
 			if len(requests) != 1 || requests[0].ChannelID != channelID || requests[0].PTS != 71 {
@@ -472,7 +641,7 @@ func TestPartialChannelAdmissionStaysBoundAndReplaysOldTopology(t *testing.T) {
 		t.Fatalf("live exact retry targets = %v, want frozen old topology", got)
 	}
 	bus.reset("")
-	if err := coordinator.replayBoundItems(context.Background(), projected, recovered.Items[0].CommandNotAfter, nil); err != nil {
+	if err := coordinator.replayBoundItems(context.Background(), context.Background(), projected, recovered.Items[0].CommandNotAfter, recovered.Items[0].EvidenceDeadline, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := bus.targets(); !slices.Equal(got, []string{"edge-a", "edge-b"}) {
@@ -511,7 +680,7 @@ func TestReplayBoundItemsRejectsWidenedPerItemTopology(t *testing.T) {
 		},
 	}
 	coordinator := &deliveryCoordinator{channel: &pendingChannelStore{}}
-	err := coordinator.replayBoundItems(context.Background(), items, now.Add(time.Second), nil)
+	err := coordinator.replayBoundItems(context.Background(), context.Background(), items, now.Add(time.Second), now.Add(2*time.Second), nil)
 	if err == nil || !strings.Contains(err.Error(), "topology differs") {
 		t.Fatalf("mismatched frozen topology error = %v", err)
 	}
@@ -629,9 +798,10 @@ func TestPhysicalRejectedUsesExactTargetIdentityAndRecoveryPolicy(t *testing.T) 
 	absoluteCapture := &physicalResolutionCapture{}
 	channelCapture := &physicalResolutionCapture{}
 	stores := deliveryEvidenceStores{
-		dispatch: dispatchCapture,
-		absolute: &physicalAbsoluteCapture{absoluteCapture},
-		channel:  channelCapture,
+		dispatch:  dispatchCapture,
+		absolute:  &physicalAbsoluteCapture{absoluteCapture},
+		channel:   channelCapture,
+		mutations: directMutations(dispatchCapture, &physicalAbsoluteCapture{absoluteCapture}, channelCapture),
 	}
 	var batch edgecontrol.BatchID
 	var command edgecontrol.CommandID

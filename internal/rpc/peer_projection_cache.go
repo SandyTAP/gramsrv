@@ -55,9 +55,10 @@ func (b *userProjectionRecoveryBudget) consume(items int) error {
 type viewerPeerCache struct {
 	r *Router
 
-	users        *peerview.BatchCache
-	channels     map[int64]map[int64]domain.Channel
-	missingChats map[int64]map[int64]struct{}
+	users                    *peerview.BatchCache
+	channels                 map[int64]map[int64]domain.Channel
+	missingChats             map[int64]map[int64]struct{}
+	outboxPresenceIsComplete bool
 }
 
 func newViewerPeerCache(r *Router) *viewerPeerCache {
@@ -122,10 +123,16 @@ func (c *viewerPeerCache) resolveUsersForIDs(ctx context.Context, viewerUserID i
 		}
 		users = append(users, batch...)
 	}
-	if c.r == nil {
+	if c.r == nil || c.outboxPresenceIsComplete {
 		return users, nil
 	}
 	return c.r.withUsersPresence(users), nil
+}
+
+func (c *viewerPeerCache) markOutboxPresenceComplete() {
+	if c != nil {
+		c.outboxPresenceIsComplete = true
+	}
 }
 
 func (c *viewerPeerCache) usersForIDBatch(ctx context.Context, viewerUserID int64, ids []int64, budget *userProjectionRecoveryBudget) ([]domain.User, error) {

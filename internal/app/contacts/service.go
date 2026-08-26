@@ -5,10 +5,12 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
+	"telesrv/internal/readmodelcache"
 	"telesrv/internal/store"
 )
 
@@ -20,6 +22,16 @@ var (
 
 const maxSearchLimit = 50
 const maxCloseFriendsCount = 5000
+
+const (
+	blockRelationshipCacheSize = 1 << 18
+	blockRelationshipCacheTTL  = 5 * time.Minute
+)
+
+type blockRelationshipKey struct {
+	ownerUserID   int64
+	blockedUserID int64
+}
 
 type phonePrivacyService interface {
 	userprojection.PrivacyEvaluator
@@ -38,6 +50,7 @@ type Service struct {
 	projector *userprojection.Projector
 	versions  store.ReadModelVersionStore
 	cache     *contactListReadModelCache
+	blocks    *readmodelcache.Cache[blockRelationshipKey, bool]
 }
 
 // Option adjusts optional contacts service dependencies.
@@ -68,7 +81,14 @@ func WithReadModelVersions(v store.ReadModelVersionStore) Option {
 
 // NewService 创建 contacts 服务。
 func NewService(contacts store.ContactStore, users ...store.UserStore) *Service {
-	s := &Service{contacts: contacts, cache: newContactListReadModelCache(defaultContactListReadModelTTL)}
+	s := &Service{
+		contacts: contacts,
+		cache:    newContactListReadModelCache(defaultContactListReadModelTTL),
+		blocks: readmodelcache.New(readmodelcache.Config[blockRelationshipKey, bool]{
+			MaxEntries: blockRelationshipCacheSize,
+			TTL:        blockRelationshipCacheTTL,
+		}),
+	}
 	if len(users) > 0 {
 		s.users = users[0]
 	}
@@ -741,6 +761,7 @@ func (s *Service) BlockContact(ctx context.Context, userID, peerUserID int64, da
 	}
 	changed, err := s.contacts.Block(ctx, userID, peerUserID, date)
 	if err == nil {
+		s.blocks.Invalidate(blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID})
 		s.InvalidateViewers(userID, peerUserID)
 	}
 	return changed, err
@@ -753,6 +774,7 @@ func (s *Service) UnblockContact(ctx context.Context, userID, peerUserID int64) 
 	}
 	changed, err := s.contacts.Unblock(ctx, userID, peerUserID)
 	if err == nil {
+		s.blocks.Invalidate(blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID})
 		s.InvalidateViewers(userID, peerUserID)
 	}
 	return changed, err
@@ -763,7 +785,10 @@ func (s *Service) IsBlocked(ctx context.Context, userID, peerUserID int64) (bool
 	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 {
 		return false, nil
 	}
-	return s.contacts.IsBlocked(ctx, userID, peerUserID)
+	key := blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID}
+	return s.blocks.GetOrLoad(ctx, key, func() (bool, error) {
+		return s.contacts.IsBlocked(ctx, userID, peerUserID)
+	})
 }
 
 // GetBlocked returns a bounded blocked contact page.

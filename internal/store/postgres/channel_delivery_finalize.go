@@ -52,194 +52,195 @@ func (s *ChannelDeliveryStore) FinalizeAttempts(ctx context.Context, requests []
 	}
 	sort.Slice(streams, func(i, j int) bool { return streams[i] < streams[j] })
 
-	for _, streamID := range streams {
-		_, err := func() (store.OutboxFinalizeBatch, error) {
+	for groupStart := 0; groupStart < len(streams); groupStart += outboxFinalizeTransactionLanes {
+		groupEnd := min(groupStart+outboxFinalizeTransactionLanes, len(streams))
+		group := streams[groupStart:groupEnd]
+		err := func() error {
 			tx, err := s.begin(ctx)
 			if err != nil {
-				return store.OutboxFinalizeBatch{}, err
+				return err
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			commit := func() (store.OutboxFinalizeBatch, error) {
-				if err := tx.Commit(ctx); err != nil {
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("finalize channel delivery lane %d: commit: %w", streamID, err)
-				}
-				return batch, nil
-			}
-			indices := validByStream[streamID]
-			var lane channelDeliveryLaneState
-			err = tx.QueryRow(ctx, `
-SELECT head_item_id, head_sequence, lease_fence, state, lease_owner, lease_until
-FROM channel_delivery_lanes
-WHERE channel_id = $1
-FOR UPDATE`, streamID).Scan(
-				&lane.headItemID,
-				&lane.headSequence,
-				&lane.leaseFence,
-				&lane.state,
-				&lane.owner,
-				&lane.leaseUntil,
-			)
-			if errors.Is(err, pgx.ErrNoRows) {
-				if err := classifyChannelFinalizeWithoutLane(ctx, tx, requests, indices, batch.Results); err != nil {
-					return store.OutboxFinalizeBatch{}, err
-				}
-				return commit()
-			}
-			if err != nil {
-				return store.OutboxFinalizeBatch{}, fmt.Errorf("lock channel delivery lane %d: %w", streamID, err)
-			}
-
-			attempts := make(map[int]channelDeliveryAttemptState, len(indices))
-			for _, idx := range indices {
-				state, err := loadChannelDeliveryAttemptForUpdate(ctx, tx, requests[idx].Ref)
-				if errors.Is(err, pgx.ErrNoRows) {
-					batch.Results[idx].Outcome = store.OutboxFinalizeFenced
-					continue
-				}
-				if err != nil {
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("load channel finalize attempt: %w", err)
-				}
-				attempts[idx] = state
-				if state.finalizedAt != nil {
-					batch.Results[idx].Outcome = store.OutboxFinalizeAlreadyFinalized
-					continue
-				}
-				if !exactChannelAttemptRef(requests[idx].Ref, state) {
-					batch.Results[idx].Outcome = store.OutboxFinalizeRejected
-					continue
-				}
-				if lane.leaseFence != int64(requests[idx].Ref.LeaseFence) {
-					batch.Results[idx].Outcome = store.OutboxFinalizeFenced
-					continue
-				}
-				if state.resolution == "pending" {
-					if requests[idx].Ref.ItemID == lane.headItemID {
-						batch.Results[idx].Outcome = store.OutboxFinalizeRejected
-					} else {
-						batch.Results[idx].Outcome = store.OutboxFinalizeWaitingForPredecessor
-					}
-				} else {
-					batch.Results[idx].Outcome = store.OutboxFinalizeWaitingForPredecessor
+			// Match private/absolute outbox finalization: acquire lane locks in
+			// stable order and amortize WAL flushes over a hard-bounded group. The
+			// bound prevents a stalled channel from retaining an unbounded set of
+			// unrelated lane locks.
+			for _, streamID := range group {
+				if err := finalizeChannelDeliveryStream(ctx, tx, streamID, requests, validByStream[streamID], &batch); err != nil {
+					return err
 				}
 			}
-
-			windowSize, byteLimit := normalizeChannelDeliveryWindow(requests[indices[0]].WindowSize, requests[indices[0]].WindowByteLimit)
-			terminal, err := listChannelTerminalPrefix(ctx, tx, streamID, lane, windowSize, byteLimit)
-			if err != nil {
-				return store.OutboxFinalizeBatch{}, err
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("finalize channel delivery lanes %d..%d: commit: %w", group[0], group[len(group)-1], err)
 			}
-			if len(terminal) == 0 {
-				return commit()
-			}
-			if terminal[0].resolution == "retry" {
-				if err := scheduleChannelRetry(ctx, tx, streamID, lane, terminal[0]); err != nil {
-					return store.OutboxFinalizeBatch{}, err
-				}
-				applyChannelFinalizeResults(requests, indices, attempts, map[int64]string{terminal[0].itemID: "scheduled_retry"}, batch.Results)
-				return commit()
-			}
-			completed := make(map[int64]string, len(terminal))
-			itemIDs := make([]int64, 0, len(terminal))
-			for _, item := range terminal {
-				if item.resolution == "retry" {
-					break
-				}
-				itemIDs = append(itemIDs, item.itemID)
-				completed[item.itemID] = channelFinalOutcome(item.resolution)
-			}
-			if len(itemIDs) == 0 {
-				return commit()
-			}
-			if _, err := tx.Exec(ctx, `
-UPDATE channel_delivery_attempts a
-SET finalized_at = clock_timestamp(),
-    final_outcome = CASE
-      WHEN a.lease_fence = $2 THEN CASE a.resolution
-        WHEN 'confirmed' THEN 'applied'
-        WHEN 'terminal_resync' THEN 'terminal_resync'
-		ELSE 'superseded'
-      END
-      ELSE 'superseded'
-    END
-WHERE a.item_id = ANY($1::bigint[]) AND a.finalized_at IS NULL`, itemIDs, lane.leaseFence); err != nil {
-				return store.OutboxFinalizeBatch{}, fmt.Errorf("write channel attempt tombstones: %w", err)
-			}
-			if _, err := tx.Exec(ctx, `
-DELETE FROM channel_delivery_events
-WHERE channel_id = $1 AND id = ANY($2::bigint[])`, streamID, itemIDs); err != nil {
-				return store.OutboxFinalizeBatch{}, fmt.Errorf("delete finalized channel delivery events: %w", err)
-			}
-
-			// This is intentionally a new statement after the blocking lane lock and
-			// deletes.  READ COMMITTED must observe any producer that committed while
-			// waiting for this lane, closing the empty -> non-empty race.
-			successorID, successorSequence, found, err := loadChannelDeliverySuccessor(ctx, tx, streamID)
-			if err != nil {
-				return store.OutboxFinalizeBatch{}, err
-			}
-			if !found {
-				if _, err := tx.Exec(ctx, `
-SELECT pg_advisory_xact_lock(outbox_lane_advisory_key('channel_pts', $1))`, streamID); err != nil {
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("lock empty channel delivery lane transition: %w", err)
-				}
-				successorID, successorSequence, found, err = loadChannelDeliverySuccessor(ctx, tx, streamID)
-				if err != nil {
-					return store.OutboxFinalizeBatch{}, err
-				}
-			}
-			if !found {
-				if _, err := tx.Exec(ctx, `DELETE FROM channel_delivery_lanes WHERE channel_id = $1`, streamID); err != nil {
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("delete empty channel delivery lane: %w", err)
-				}
-			} else {
-				if _, err := tx.Exec(ctx, `
-UPDATE channel_delivery_lanes
-SET head_item_id = $2, head_sequence = $3, updated_at = clock_timestamp()
-WHERE channel_id = $1`, streamID, successorID, successorSequence); err != nil {
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("advance channel delivery lane: %w", err)
-				}
-				var successorResolution string
-				err := tx.QueryRow(ctx, `
-SELECT resolution
-FROM channel_delivery_attempts
-WHERE item_id = $1 AND lease_fence = $2 AND finalized_at IS NULL`, successorID, lane.leaseFence).Scan(&successorResolution)
-				switch {
-				case err == nil && successorResolution == "retry":
-					successor := channelTerminalItem{itemID: successorID, minPTS: successorSequence, maxPTS: successorSequence, resolution: "retry"}
-					if err := scheduleChannelRetry(ctx, tx, streamID, lane, successor); err != nil {
-						return store.OutboxFinalizeBatch{}, err
-					}
-					completed[successorID] = "scheduled_retry"
-				case err == nil:
-					if !requests[indices[0]].RetainLease {
-						if err := releaseChannelLane(ctx, tx, streamID); err != nil {
-							return store.OutboxFinalizeBatch{}, err
-						}
-					}
-				case errors.Is(err, pgx.ErrNoRows):
-					if requests[indices[0]].RetainLease {
-						next, err := claimChannelSuccessorTx(ctx, tx, streamID, requests[indices[0]])
-						if err != nil {
-							return store.OutboxFinalizeBatch{}, err
-						}
-						if len(next.Items) > 0 {
-							batch.Next = append(batch.Next, next)
-						}
-					} else if err := releaseChannelLane(ctx, tx, streamID); err != nil {
-						return store.OutboxFinalizeBatch{}, err
-					}
-				default:
-					return store.OutboxFinalizeBatch{}, fmt.Errorf("load channel successor attempt: %w", err)
-				}
-			}
-			applyChannelFinalizeResults(requests, indices, attempts, completed, batch.Results)
-			return commit()
+			return nil
 		}()
 		if err != nil {
 			return store.OutboxFinalizeBatch{}, err
 		}
 	}
 	return batch, nil
+}
+
+func finalizeChannelDeliveryStream(ctx context.Context, tx pgx.Tx, streamID int64, requests []store.OutboxFinalizeRequest, indices []int, batch *store.OutboxFinalizeBatch) error {
+	var lane channelDeliveryLaneState
+	err := tx.QueryRow(ctx, `
+SELECT head_item_id, head_sequence, lease_fence, state, lease_owner, lease_until
+FROM channel_delivery_lanes
+WHERE channel_id = $1
+FOR UPDATE`, streamID).Scan(
+		&lane.headItemID,
+		&lane.headSequence,
+		&lane.leaseFence,
+		&lane.state,
+		&lane.owner,
+		&lane.leaseUntil,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return classifyChannelFinalizeWithoutLane(ctx, tx, requests, indices, batch.Results)
+	}
+	if err != nil {
+		return fmt.Errorf("lock channel delivery lane %d: %w", streamID, err)
+	}
+
+	attempts := make(map[int]channelDeliveryAttemptState, len(indices))
+	for _, idx := range indices {
+		state, err := loadChannelDeliveryAttemptForUpdate(ctx, tx, requests[idx].Ref)
+		if errors.Is(err, pgx.ErrNoRows) {
+			batch.Results[idx].Outcome = store.OutboxFinalizeFenced
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load channel finalize attempt: %w", err)
+		}
+		attempts[idx] = state
+		if !exactChannelAttemptRef(requests[idx].Ref, state) {
+			batch.Results[idx].Outcome = store.OutboxFinalizeRejected
+			continue
+		}
+		if lane.leaseFence != int64(requests[idx].Ref.LeaseFence) {
+			batch.Results[idx].Outcome = store.OutboxFinalizeFenced
+			continue
+		}
+		if state.resolution == "pending" {
+			if requests[idx].Ref.ItemID == lane.headItemID {
+				batch.Results[idx].Outcome = store.OutboxFinalizeRejected
+			} else {
+				batch.Results[idx].Outcome = store.OutboxFinalizeWaitingForPredecessor
+			}
+		} else {
+			batch.Results[idx].Outcome = store.OutboxFinalizeWaitingForPredecessor
+		}
+	}
+
+	windowSize, byteLimit := normalizeChannelDeliveryWindow(requests[indices[0]].WindowSize, requests[indices[0]].WindowByteLimit)
+	terminal, err := listChannelTerminalPrefix(ctx, tx, streamID, lane, windowSize, byteLimit)
+	if err != nil {
+		return err
+	}
+	if len(terminal) == 0 {
+		return nil
+	}
+	if terminal[0].resolution == "retry" {
+		if err := scheduleChannelRetry(ctx, tx, streamID, lane, terminal[0]); err != nil {
+			return err
+		}
+		applyChannelFinalizeResults(requests, indices, attempts, map[int64]string{terminal[0].itemID: "scheduled_retry"}, batch.Results)
+		return nil
+	}
+	completed := make(map[int64]string, len(terminal))
+	itemIDs := make([]int64, 0, len(terminal))
+	for _, item := range terminal {
+		if item.resolution == "retry" {
+			break
+		}
+		itemIDs = append(itemIDs, item.itemID)
+		completed[item.itemID] = channelFinalOutcome(item.resolution)
+	}
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+DELETE FROM channel_delivery_events
+WHERE channel_id = $1 AND id = ANY($2::bigint[])`, streamID, itemIDs); err != nil {
+		return fmt.Errorf("delete finalized channel delivery events: %w", err)
+	}
+
+	// This is intentionally a new statement after the blocking lane lock and
+	// deletes. READ COMMITTED must observe any producer that committed while
+	// waiting for this lane, closing the empty -> non-empty race.
+	successorID, successorSequence, found, err := loadChannelDeliverySuccessor(ctx, tx, streamID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		if _, err := tx.Exec(ctx, `
+SELECT pg_advisory_xact_lock(outbox_lane_advisory_key('channel_pts', $1))`, streamID); err != nil {
+			return fmt.Errorf("lock empty channel delivery lane transition: %w", err)
+		}
+		successorID, successorSequence, found, err = loadChannelDeliverySuccessor(ctx, tx, streamID)
+		if err != nil {
+			return err
+		}
+	}
+	if !found {
+		if _, err := tx.Exec(ctx, `DELETE FROM channel_delivery_lanes WHERE channel_id = $1`, streamID); err != nil {
+			return fmt.Errorf("delete empty channel delivery lane: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+UPDATE channel_delivery_lanes
+SET head_item_id = $2, head_sequence = $3, updated_at = clock_timestamp()
+WHERE channel_id = $1`, streamID, successorID, successorSequence); err != nil {
+			return fmt.Errorf("advance channel delivery lane: %w", err)
+		}
+		var successorResolution string
+		err := tx.QueryRow(ctx, `
+SELECT resolution
+FROM channel_delivery_attempts
+WHERE item_id = $1 AND lease_fence = $2`, successorID, lane.leaseFence).Scan(&successorResolution)
+		switch {
+		case err == nil && successorResolution == "retry":
+			successor := channelTerminalItem{itemID: successorID, minPTS: successorSequence, maxPTS: successorSequence, resolution: "retry"}
+			if err := scheduleChannelRetry(ctx, tx, streamID, lane, successor); err != nil {
+				return err
+			}
+			completed[successorID] = "scheduled_retry"
+		case err == nil:
+			if !requests[indices[0]].RetainLease {
+				if err := releaseChannelLane(ctx, tx, streamID); err != nil {
+					return err
+				}
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			if _, err := tx.Exec(ctx, `
+UPDATE channel_delivery_lanes
+SET retry_count = 0, updated_at = clock_timestamp()
+WHERE channel_id = $1`, streamID); err != nil {
+				return fmt.Errorf("reset channel successor attempt counter: %w", err)
+			}
+			if requests[indices[0]].RetainLease {
+				next, err := claimChannelSuccessorTx(ctx, tx, streamID, requests[indices[0]])
+				if err != nil {
+					return err
+				}
+				if len(next.Items) > 0 {
+					batch.Next = append(batch.Next, next)
+				}
+			} else if err := releaseChannelLane(ctx, tx, streamID); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("load channel successor attempt: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+DELETE FROM channel_delivery_attempts
+WHERE lease_fence = $2 AND item_id = ANY($1::bigint[])`, itemIDs, lane.leaseFence); err != nil {
+		return fmt.Errorf("delete finalized channel delivery attempts: %w", err)
+	}
+	applyChannelFinalizeResults(requests, indices, attempts, completed, batch.Results)
+	return nil
 }
 
 func loadChannelDeliverySuccessor(ctx context.Context, tx pgx.Tx, streamID int64) (int64, int, bool, error) {
@@ -275,17 +276,16 @@ func validateChannelFinalizeRequest(req store.OutboxFinalizeRequest) error {
 
 func classifyChannelFinalizeWithoutLane(ctx context.Context, tx pgx.Tx, requests []store.OutboxFinalizeRequest, indices []int, results []store.OutboxFinalizeResult) error {
 	for _, idx := range indices {
-		var finalizedAt *time.Time
 		var streamID, sequence int64
 		var attempt int
 		err := tx.QueryRow(ctx, `
-SELECT channel_id, max_pts, attempt_no, finalized_at
+SELECT channel_id, max_pts, attempt_no
 FROM channel_delivery_attempts
 WHERE item_id = $1 AND lease_fence = $2`, requests[idx].Ref.ItemID, int64(requests[idx].Ref.LeaseFence)).Scan(
-			&streamID, &sequence, &attempt, &finalizedAt,
+			&streamID, &sequence, &attempt,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			results[idx].Outcome = store.OutboxFinalizeRejected
+			results[idx].Outcome = store.OutboxFinalizeFenced
 			continue
 		}
 		if err != nil {
@@ -293,8 +293,6 @@ WHERE item_id = $1 AND lease_fence = $2`, requests[idx].Ref.ItemID, int64(reques
 		}
 		if streamID != requests[idx].Ref.StreamID || sequence != requests[idx].Ref.Sequence || attempt != requests[idx].Ref.Attempt {
 			results[idx].Outcome = store.OutboxFinalizeRejected
-		} else if finalizedAt != nil {
-			results[idx].Outcome = store.OutboxFinalizeAlreadyFinalized
 		} else {
 			results[idx].Outcome = store.OutboxFinalizeFenced
 		}
@@ -312,7 +310,7 @@ WITH RECURSIVE prefix AS (
 				+ 8 * cardinality(e.affected_user_ids))::bigint AS used_bytes
     FROM channel_delivery_events e
     JOIN channel_delivery_attempts a
-      ON a.item_id = e.id AND a.lease_fence = $3 AND a.finalized_at IS NULL
+      ON a.item_id = e.id AND a.lease_fence = $3
     WHERE e.channel_id = $1 AND e.id = $2
       AND a.resolution IN ('confirmed', 'retry', 'terminal_resync')
       AND (a.retry_at IS NULL OR a.retry_at <= clock_timestamp())
@@ -332,7 +330,7 @@ WITH RECURSIVE prefix AS (
         LIMIT 1
     ) n ON p.resolution <> 'retry'
     JOIN channel_delivery_attempts a
-      ON a.item_id = n.id AND a.lease_fence = $3 AND a.finalized_at IS NULL
+      ON a.item_id = n.id AND a.lease_fence = $3
      AND a.resolution IN ('confirmed', 'retry', 'terminal_resync')
      AND (a.retry_at IS NULL OR a.retry_at <= clock_timestamp())
     WHERE p.ordinal < $4
@@ -366,20 +364,14 @@ func scheduleChannelRetry(ctx context.Context, tx pgx.Tx, streamID int64, lane c
 	if err := tx.QueryRow(ctx, `
 SELECT retry_at
 FROM channel_delivery_attempts
-WHERE item_id = $1 AND lease_fence = $2 AND resolution = 'retry' AND finalized_at IS NULL
+WHERE item_id = $1 AND lease_fence = $2 AND resolution = 'retry'
 FOR UPDATE`, item.itemID, lane.leaseFence).Scan(&retryAt); err != nil {
 		return fmt.Errorf("load channel scheduled retry: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
-UPDATE channel_delivery_attempts
-SET finalized_at = clock_timestamp(),
-    final_outcome = CASE WHEN item_id = $1 THEN 'scheduled_retry' ELSE 'superseded' END,
-    resolution_error = CASE
-      WHEN item_id = $1 THEN resolution_error
-      ELSE COALESCE(NULLIF(resolution_error, ''), 'delivery plan superseded by predecessor retry')
-    END
-WHERE channel_id = $3 AND lease_fence = $2 AND finalized_at IS NULL`, item.itemID, lane.leaseFence, streamID); err != nil {
-		return fmt.Errorf("finalize channel retry window tombstones: %w", err)
+DELETE FROM channel_delivery_attempts
+WHERE channel_id = $1 AND lease_fence = $2`, streamID, lane.leaseFence); err != nil {
+		return fmt.Errorf("delete channel retry window attempts: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 UPDATE channel_delivery_lanes
@@ -391,7 +383,6 @@ SET head_item_id = $2,
     lease_until = NULL,
     window_tail_item_id = NULL,
     window_tail_sequence = NULL,
-    retry_count = retry_count + 1,
     updated_at = clock_timestamp()
 WHERE channel_id = $1`, streamID, item.itemID, item.minPTS, retryAt); err != nil {
 		return fmt.Errorf("schedule channel lane retry: %w", err)
@@ -428,7 +419,7 @@ func channelFinalOutcome(resolution string) string {
 func applyChannelFinalizeResults(requests []store.OutboxFinalizeRequest, indices []int, attempts map[int]channelDeliveryAttemptState, completed map[int64]string, results []store.OutboxFinalizeResult) {
 	for _, idx := range indices {
 		state, ok := attempts[idx]
-		if !ok || state.finalizedAt != nil || !exactChannelAttemptRef(requests[idx].Ref, state) {
+		if !ok || !exactChannelAttemptRef(requests[idx].Ref, state) {
 			continue
 		}
 		outcome, ok := completed[requests[idx].Ref.ItemID]
@@ -478,13 +469,14 @@ LIMIT 1`, streamID, int64(req.Ref.LeaseFence)).Scan(
 WITH current_lane AS MATERIALIZED (
     SELECT channel_id, head_item_id,
            nextval('public.channel_delivery_lease_fence_seq') AS lease_fence,
+           1::integer AS attempt_no,
            statement_timestamp() + ($3::bigint * interval '1 microsecond') AS lease_until,
            statement_timestamp() + ($6::bigint * interval '1 microsecond') AS command_not_after,
            statement_timestamp() + (($6::bigint + $7::bigint) * interval '1 microsecond') AS evidence_deadline
     FROM channel_delivery_lanes
     WHERE channel_id = $1
 ), window_items AS MATERIALIZED (
-    SELECT l.channel_id, l.lease_fence, l.lease_until,
+    SELECT l.channel_id, l.lease_fence, l.attempt_no, l.lease_until,
            l.command_not_after, l.evidence_deadline,
            e.id AS item_id, e.min_pts, e.max_pts, e.projection_kind,
 	           e.audience_kind, e.audience_user_ids, e.affected_user_ids, e.ordinal
@@ -523,9 +515,7 @@ WITH current_lane AS MATERIALIZED (
 	               affected_user_ids, ordinal FROM chain
     ) e
 ), numbered AS MATERIALIZED (
-    SELECT w.*, COALESCE((
-        SELECT max(a.attempt_no) FROM channel_delivery_attempts a WHERE a.item_id = w.item_id
-    ), 0) + 1 AS attempt_no
+    SELECT w.*
     FROM window_items w
 ), planned_tail AS MATERIALIZED (
     SELECT item_id, max_pts
@@ -536,6 +526,7 @@ WITH current_lane AS MATERIALIZED (
     UPDATE channel_delivery_lanes l
     SET state = 'leased',
         lease_fence = c.lease_fence,
+        retry_count = c.attempt_no,
         lease_owner = $2,
         lease_until = c.lease_until,
         window_tail_item_id = tail.item_id,

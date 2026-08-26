@@ -17,6 +17,7 @@ import (
 	usernamesapp "telesrv/internal/app/usernames"
 	"telesrv/internal/app/users"
 	"telesrv/internal/config"
+	"telesrv/internal/edgecontrol"
 	nodeprojection "telesrv/internal/node/projection"
 	"telesrv/internal/officialgifts"
 	"telesrv/internal/rpc"
@@ -28,7 +29,7 @@ type egressProjectionRuntime struct {
 	caches    postgres.ReadModelCacheSet
 }
 
-func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg config.EgressConfig, instanceID string, logger *zap.Logger) egressProjectionRuntime {
+func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg config.EgressConfig, instanceID string, presence edgecontrol.UserLocationBatchProvider, logger *zap.Logger) (egressProjectionRuntime, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -121,7 +122,7 @@ func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg confi
 	)
 	botsService.SetCustomVerification(botVerificationService)
 
-	projector := rpc.NewOutboxProjector(rpc.Config{
+	projector, err := rpc.NewOutboxProjector(rpc.Config{
 		DC:                            cfg.DC,
 		DefaultCountryCode:            cfg.DefaultCountryCode,
 		IP:                            cfg.AdvertiseIP,
@@ -137,6 +138,7 @@ func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg confi
 		AuthUserCacheTTL:              cfg.AuthUserCacheTTL,
 	}, rpc.OutboxProjectionDeps{
 		Users:            usersService,
+		Presence:         presence,
 		Usernames:        usernamesService,
 		Dialogs:          dialogsService,
 		Messages:         messagesService,
@@ -146,6 +148,9 @@ func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg confi
 		AccountRatings:   ratingService,
 		BotVerifications: botVerificationService,
 	}, logger.Named("rpc").Named("outbox-projector"), clock.System)
+	if err != nil {
+		return egressProjectionRuntime{}, err
+	}
 
 	return egressProjectionRuntime{
 		projector: projector,
@@ -160,5 +165,5 @@ func newEgressProjectionRuntime(pool *pgxpool.Pool, rdb *redis.Client, cfg confi
 			RPCProjections:     projector,
 			BotProfiles:        botsService,
 		}),
-	}
+	}, nil
 }

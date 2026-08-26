@@ -16,9 +16,13 @@ import (
 type deliveryPlanRegistry struct {
 	records        []LocationRecord
 	channelTargets []string
+	userCalls      *atomic.Int32
 }
 
 func (r deliveryPlanRegistry) ListUser(context.Context, int64) ([]LocationRecord, error) {
+	if r.userCalls != nil {
+		r.userCalls.Add(1)
+	}
 	return append([]LocationRecord(nil), r.records...), nil
 }
 func (deliveryPlanRegistry) ListBusinessAuthKey(context.Context, [8]byte) ([]LocationRecord, error) {
@@ -83,6 +87,21 @@ func (*deliveryPlanBus) SubscribeDeliveryBatches(context.Context, string, Delive
 }
 func (b *deliveryPlanBus) count() int { b.mu.Lock(); defer b.mu.Unlock(); return len(b.batches) }
 
+func testDeliveryRequestEvidence(request DeliveryRequest) DeliveryRequest {
+	request.EvidenceDeadline = request.NotAfter.Add(time.Second)
+	return request
+}
+
+func testDeliveryRouteEvidence(request AccountDeliveryRouteRequest) AccountDeliveryRouteRequest {
+	request.EvidenceDeadline = request.NotAfter.Add(time.Second)
+	return request
+}
+
+func testDeliveryBatchEvidence(batch DeliveryBatch) DeliveryBatch {
+	batch.EvidenceDeadline = batch.NotAfter.Add(time.Second)
+	return batch
+}
+
 func TestDeliveryFabricPrepareThenAdmitPreservesFrozenTargets(t *testing.T) {
 	bus := &deliveryPlanBus{}
 	fabric := NewDeliveryFabric(DeliveryFabricConfig{InstanceID: "egress-a", Registry: deliveryPlanRegistry{records: []LocationRecord{
@@ -94,7 +113,7 @@ func TestDeliveryFabricPrepareThenAdmitPreservesFrozenTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 91, TargetUserID: 42, PTS: 8, LeaseFence: 11, Attempt: 2}
-	plan, err := fabric.PrepareDelivery(context.Background(), DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}})
+	plan, err := fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}}))
 	if err != nil {
 		t.Fatalf("PrepareDelivery: %v", err)
 	}
@@ -119,6 +138,46 @@ func TestDeliveryFabricPrepareThenAdmitPreservesFrozenTargets(t *testing.T) {
 	}
 }
 
+func TestFrozenAccountRouteBindsPayloadWithoutSecondRegistryRead(t *testing.T) {
+	bus := &deliveryPlanBus{}
+	var calls atomic.Int32
+	fabric := NewDeliveryFabric(DeliveryFabricConfig{InstanceID: "egress-a", Registry: deliveryPlanRegistry{
+		userCalls: &calls,
+		records: []LocationRecord{
+			{InstanceID: "edge-b", UserID: 42, ReceivesUpdates: true},
+			{InstanceID: "edge-c", UserID: 42, ReceivesUpdates: true},
+		},
+	}, Bus: bus})
+	defer fabric.Close()
+	notAfter := time.Now().Add(time.Minute)
+	route, err := fabric.PrepareAccountDeliveryRoute(context.Background(), testDeliveryRouteEvidence(AccountDeliveryRouteRequest{
+		TargetUserID: 42, NotAfter: notAfter,
+	}))
+	if err != nil {
+		t.Fatalf("PrepareAccountDeliveryRoute: %v", err)
+	}
+	if calls.Load() != 1 || len(route.Targets()) != 2 {
+		t.Fatalf("registry calls=%d targets=%+v", calls.Load(), route.Targets())
+	}
+	raw, err := EncodeDeliveryUpdate(&tg.Updates{Date: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 91, TargetUserID: 42, PTS: 8, LeaseFence: 11, Attempt: 2}
+	plan, err := route.BindDelivery(testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 42, NotAfter: notAfter, Items: []DeliveryItem{{
+		Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw,
+	}}}))
+	if err != nil {
+		t.Fatalf("BindDelivery: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("payload bind repeated registry lookup: calls=%d", calls.Load())
+	}
+	if got, want := plan.Targets(), route.Targets(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("plan targets=%+v route targets=%+v", got, want)
+	}
+}
+
 func TestDeliveryFabricRejectsElapsedAbsoluteDeadlineBeforeRouting(t *testing.T) {
 	bus := &deliveryPlanBus{}
 	fabric := NewDeliveryFabric(DeliveryFabricConfig{InstanceID: "egress-a", Registry: deliveryPlanRegistry{records: []LocationRecord{{InstanceID: "edge-b", UserID: 42, ReceivesUpdates: true}}}, Bus: bus})
@@ -128,7 +187,7 @@ func TestDeliveryFabricRejectsElapsedAbsoluteDeadlineBeforeRouting(t *testing.T)
 		t.Fatal(err)
 	}
 	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 91, TargetUserID: 42, PTS: 8, LeaseFence: 11, Attempt: 2}
-	_, err = fabric.PrepareDelivery(context.Background(), DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(-time.Millisecond), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}})
+	_, err = fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(-time.Millisecond), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}}))
 	if err == nil {
 		t.Fatal("elapsed NotAfter was accepted")
 	}
@@ -150,10 +209,10 @@ func TestDeliveryFabricRejectsFarFutureDeadlineBeforeRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 91, TargetUserID: 42, PTS: 8, LeaseFence: 11, Attempt: 2}
-	_, err = fabric.PrepareDelivery(context.Background(), DeliveryRequest{
+	_, err = fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{
 		TargetUserID: 42, NotAfter: time.Now().Add(MaxDeliveryNotAfterHorizon + time.Second),
 		Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}},
-	})
+	}))
 	if err == nil {
 		t.Fatal("far-future NotAfter was accepted")
 	}
@@ -176,14 +235,14 @@ func TestDeliveryEnvelopeCountsExplicitChannelRouteBytes(t *testing.T) {
 			ChannelID: 99, Audience: ChannelAudienceMembers, AffectedUsers: []int64{42},
 		},
 	}
-	request := DeliveryRequest{TargetUserID: 0, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{item}}
+	request := testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 0, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{item}})
 	if err := validateDeliveryRequestEnvelope(request); err != nil {
 		t.Fatalf("exact request envelope limit rejected: %v", err)
 	}
-	batch := DeliveryBatch{
+	batch := testDeliveryBatchEvidence(DeliveryBatch{
 		BatchID: BatchID{1}, CommandID: CommandID{2}, SourceInstanceID: "egress-a",
 		TargetInstanceID: "edge-a", TargetUserID: 0, NotAfter: request.NotAfter, Items: request.Items,
-	}
+	})
 	if err := ValidateDeliveryBatchEnvelope(batch); err != nil {
 		t.Fatalf("exact batch envelope limit rejected: %v", err)
 	}
@@ -213,6 +272,7 @@ func TestDeliveryFabricRejectsUnencodableOrUnboundedTargetTopology(t *testing.T)
 			MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw,
 		}},
 	}
+	request.EvidenceDeadline = request.NotAfter.Add(time.Second)
 
 	t.Run("source identity", func(t *testing.T) {
 		fabric := NewDeliveryFabric(DeliveryFabricConfig{
@@ -347,13 +407,13 @@ func TestDeliveryFabricSameOwnerRehydrateAndDoesNotFilterSameNamedEdge(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{
+	request := testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{
 		Ref: DeliveryRef{
 			Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 92,
 			TargetUserID: 42, PTS: 9, LeaseFence: 12, Attempt: 3,
 		},
 		MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw,
-	}}}
+	}}})
 	prepared, err := preparer.PrepareDelivery(context.Background(), request)
 	if err != nil {
 		t.Fatalf("PrepareDelivery: %v", err)
@@ -421,10 +481,10 @@ func TestDeliveryFabricChannelPlanTargetsEdgesWithoutPerUserCommands(t *testing.
 		t.Fatal(err)
 	}
 	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueChannelPTS, StreamID: 99}, OutboxID: 91, TargetUserID: 0, PTS: 8, LeaseFence: 11, Attempt: 2}
-	request := DeliveryRequest{TargetUserID: 0, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{
+	request := testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 0, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{
 		Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw,
 		Channel: ChannelDeliveryRoute{ChannelID: 99, Audience: ChannelAudienceMembers, AffectedUsers: []int64{42}},
-	}}}
+	}}})
 	plan, err := fabric.PrepareDelivery(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +520,7 @@ func TestDeliveryFabricUsesFixedBoundedAdmissionActors(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: 42}, OutboxID: 1, TargetUserID: 42, PTS: 1, LeaseFence: 1, Attempt: 1}
-	plan, err := fabric.PrepareDelivery(context.Background(), DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}})
+	plan, err := fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,9 +570,9 @@ func TestDeliveryFabricAdmitsLargeMultiEdgePlanInBoundedByteWaves(t *testing.T) 
 		Bus: bus, ExecutorShards: 2, MailboxSize: 1, MailboxMaxBytes: int64(taskBytes),
 	})
 	defer fabric.Close()
-	plan, err := fabric.PrepareDelivery(context.Background(), DeliveryRequest{
+	plan, err := fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{
 		TargetUserID: 42, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{item},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +619,7 @@ func TestDeliveryFabricDoesNotSerializeDifferentDomainsForSameSlowEdge(t *testin
 	for i := range plans {
 		userID := int64(42 + i)
 		ref := DeliveryRef{Domain: OrderingDomain{Kind: QueueAccountPTS, StreamID: userID}, OutboxID: int64(i + 1), TargetUserID: userID, PTS: i + 1, LeaseFence: 1, Attempt: 1}
-		plans[i], err = fabric.PrepareDelivery(context.Background(), DeliveryRequest{TargetUserID: userID, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}})
+		plans[i], err = fabric.PrepareDelivery(context.Background(), testDeliveryRequestEvidence(DeliveryRequest{TargetUserID: userID, NotAfter: time.Now().Add(time.Minute), Items: []DeliveryItem{{Ref: ref, MessageType: proto.MessageFromServer, PayloadHash: DeliveryPayloadHash(raw), UpdateBytes: raw}}}))
 		if err != nil {
 			t.Fatal(err)
 		}

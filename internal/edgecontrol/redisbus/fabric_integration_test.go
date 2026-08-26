@@ -65,6 +65,7 @@ func TestRedisFabricRoutesV3DeliveryAdmissionAndSessionControl(t *testing.T) {
 		Ref:         edgecontrol.DeliveryRef{Domain: edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42}, OutboxID: 9901, TargetUserID: 42, PTS: 19, LeaseFence: 7, Attempt: 2},
 		MessageType: proto.MessageFromServer, PayloadHash: edgecontrol.DeliveryPayloadHash(payload), UpdateBytes: payload,
 	}}}
+	request.EvidenceDeadline = request.NotAfter.Add(time.Second)
 	plan, err := fabric.PrepareDelivery(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +92,74 @@ func TestRedisFabricRoutesV3DeliveryAdmissionAndSessionControl(t *testing.T) {
 
 	cancelSub()
 	waitRedisFabricSubscribers(t, errCh, 2)
+}
+
+func TestRedisSessionControlConcurrentCommandsShareOneAckSubscription(t *testing.T) {
+	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis fabric integration test")
+	}
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("redis ping: %v", err)
+	}
+	prefix := fmt.Sprintf("test:edge:session-ack-mux:%d", time.Now().UnixNano())
+	defer cleanupRedisPrefix(t, client, prefix)
+	bus := redisbus.New(client, redisbus.WithPrefix(prefix+":control"))
+
+	subCtx, cancelSub := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- bus.SubscribeSessionControls(subCtx, "edge-b", func(_ context.Context, cmd edgecontrol.SessionControlCommand) edgecontrol.SessionControlAck {
+			return edgecontrol.SessionControlAck{CommandID: cmd.CommandID, Affected: 1}
+		})
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	const commandCount = 256
+	start := make(chan struct{})
+	results := make(chan error, commandCount)
+	var wait sync.WaitGroup
+	wait.Add(commandCount)
+	for i := 0; i < commandCount; i++ {
+		i := i
+		go func() {
+			defer wait.Done()
+			<-start
+			commandCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			commandID := fmt.Sprintf("core-a/%04d", i)
+			ack, err := bus.SendSessionControl(commandCtx, "edge-b", edgecontrol.SessionControlCommand{
+				CommandID: commandID, SourceInstanceID: "core-a", TargetInstanceID: "edge-b",
+				Kind: edgecontrol.SessionControlAddUserChannelMembership, UserID: int64(i + 1), ChannelID: 99,
+			})
+			if err == nil && (ack.CommandID != commandID || ack.SourceInstanceID != "core-a" || ack.TargetInstanceID != "edge-b" || ack.Affected != 1) {
+				err = fmt.Errorf("ack identity mismatch: %+v", ack)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ackChannel := prefix + ":control:session:ack:core-a"
+	subscribers, err := client.PubSubNumSub(ctx, ackChannel).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := subscribers[ackChannel]; got != 1 {
+		t.Fatalf("shared ACK subscribers=%d want=1 for %d concurrent commands", got, commandCount)
+	}
+
+	cancelSub()
+	waitRedisFabricSubscribers(t, errCh, 1)
 }
 
 type redisFabricDeliveryCapture struct {

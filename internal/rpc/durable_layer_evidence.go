@@ -9,39 +9,14 @@ import (
 	"telesrv/internal/store"
 )
 
-type layerEvidenceDurabilityUnavailableError struct {
-	cause error
-}
-
-func (e *layerEvidenceDurabilityUnavailableError) Error() string {
-	return fmt.Sprintf("durable Layer evidence unavailable: %v", e.cause)
-}
-
-func (e *layerEvidenceDurabilityUnavailableError) Unwrap() error { return e.cause }
-
-// LayerEvidenceDurabilityUnavailable is a structural marker consumed by the
-// lower MTProto edge without importing rpc. It permits an explicit selector to
-// remain connection-local during a transient store outage; conflicts and
-// missing/destroyed auth keys never use this availability fallback.
-func (*layerEvidenceDurabilityUnavailableError) LayerEvidenceDurabilityUnavailable() {}
-
 func wrapLayerEvidenceStoreAvailability(err error) error {
-	if err == nil ||
-		errors.Is(err, store.ErrAuthKeySessionLayerConflict) ||
-		errors.Is(err, store.ErrAuthKeySessionLayerInvalid) ||
-		errors.Is(err, store.ErrAuthKeyNotFound) ||
-		errors.Is(err, store.ErrAuthKeyBindingInvalid) {
-		return err
-	}
-	return &layerEvidenceDurabilityUnavailableError{cause: err}
+	return err
 }
 
 // ResolveNegotiatedSessionLayerEvidence is the restart-safe resolver used by
-// the MTProto edge on a physical connection's first exact admission. When a
-// durable store is configured it is authoritative on every resolve: another
-// Router process may have advanced the same logical session since this
-// process cached it. The local registry is only the no-store implementation or
-// an availability fallback. A durable future Layer is returned verbatim but
+// the MTProto edge on a physical connection's first exact admission. Redis is
+// authoritative on every resolve: another Router process may have advanced the
+// same logical session since this process cached it. A future Layer is returned verbatim but
 // is not installed into the old binary's typed registry; the edge keeps its raw
 // msg_id watermark so a newer supported invokeWithLayer can self-heal.
 func (r *Router) ResolveNegotiatedSessionLayerEvidence(
@@ -53,19 +28,10 @@ func (r *Router) ResolveNegotiatedSessionLayerEvidence(
 		return 0, 0, false, nil
 	}
 	if r.deps.AuthKeySessionLayers == nil {
-		layer, msgID, found := r.NegotiatedSessionLayerEvidence(rawAuthKeyID, sessionID)
-		return layer, msgID, found, nil
+		return 0, 0, false, store.ErrAuthKeySessionLayerStoreRequired
 	}
-	localLayer, localMsgID, localFound := r.NegotiatedSessionLayerEvidence(rawAuthKeyID, sessionID)
 	value, found, err := r.deps.AuthKeySessionLayers.GetSessionLayer(ctx, rawAuthKeyID, sessionID)
 	if err != nil {
-		if localFound {
-			// This exact process observed the selector earlier. It is weaker than
-			// primary and is refreshed as soon as the store recovers, but remains a
-			// safe same-session availability fallback. Fresh explicit evidence still
-			// goes through durable Advance and becomes connection-local on failure.
-			return localLayer, localMsgID, true, nil
-		}
 		return 0, 0, false, wrapLayerEvidenceStoreAvailability(err)
 	}
 	if !found {
@@ -97,14 +63,7 @@ func (r *Router) AdvanceNegotiatedSessionLayerEvidence(
 		return 0, 0, false, store.ErrAuthKeySessionLayerInvalid
 	}
 	if r.deps.AuthKeySessionLayers == nil {
-		if _, err := r.FreezeNegotiatedSessionLayerAt(rawAuthKeyID, sessionID, layer, msgID); err != nil {
-			return 0, 0, false, err
-		}
-		currentLayer, currentMsgID, found := r.NegotiatedSessionLayerEvidence(rawAuthKeyID, sessionID)
-		if !found {
-			return 0, 0, false, fmt.Errorf("exact session Layer disappeared after in-memory advance")
-		}
-		return currentLayer, currentMsgID, currentLayer == layer && currentMsgID == msgID, nil
+		return 0, 0, false, store.ErrAuthKeySessionLayerStoreRequired
 	}
 	current, _, err := r.deps.AuthKeySessionLayers.AdvanceSessionLayer(
 		ctx,
@@ -190,10 +149,6 @@ func (r *Router) cacheResolvedDurableSessionLayer(
 					current.layer, current.msgID, entry.layer, entry.msgID)
 			}
 			// The store row may have an authoritative expiry refresh; replace it.
-		case entry.observationID <= 0 && current.msgID > entry.msgID:
-			// Defensive compatibility for an old custom store without observation
-			// ids. Production stores always take the branches above.
-			return nil
 		}
 	}
 	if _, exists := r.exactProfiles[key]; !exists && len(r.exactProfiles) >= maxExactSessionProfileEntries {
@@ -234,13 +189,12 @@ func (r *Router) DeleteNegotiatedSessionLayerEvidence(
 		return false, nil
 	}
 	_, _, inMemory := r.NegotiatedSessionLayerEvidence(rawAuthKeyID, sessionID)
-	deleted := false
-	if r.deps.AuthKeySessionLayers != nil {
-		var err error
-		deleted, err = r.deps.AuthKeySessionLayers.DeleteSessionLayer(ctx, rawAuthKeyID, sessionID)
-		if err != nil {
-			return false, err
-		}
+	if r.deps.AuthKeySessionLayers == nil {
+		return false, store.ErrAuthKeySessionLayerStoreRequired
+	}
+	deleted, err := r.deps.AuthKeySessionLayers.DeleteSessionLayer(ctx, rawAuthKeyID, sessionID)
+	if err != nil {
+		return false, err
 	}
 	r.ForgetNegotiatedSessionLayer(rawAuthKeyID, sessionID)
 	return deleted || inMemory, nil

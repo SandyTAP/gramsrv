@@ -64,12 +64,11 @@ WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
       AND head.lease_fence = l.lease_fence AND head.targets_bound
       AND head.command_not_after > clock_timestamp()
       AND head.evidence_deadline > clock_timestamp()
-      AND head.resolution = 'pending' AND head.finalized_at IS NULL
+      AND head.resolution = 'pending'
   )
   AND NOT EXISTS (
     SELECT 1 FROM channel_delivery_attempts invalid
     WHERE invalid.channel_id = l.channel_id AND invalid.lease_fence = l.lease_fence
-      AND invalid.finalized_at IS NULL
       AND (NOT invalid.targets_bound OR invalid.resolution <> 'pending'
            OR invalid.command_not_after <= clock_timestamp()
            OR invalid.evidence_deadline <= clock_timestamp())
@@ -113,7 +112,7 @@ WHERE channel_id = $1 AND lease_fence = $2
 		if _, err := tx.Exec(ctx, `
 UPDATE channel_delivery_attempts
 SET lease_until = GREATEST(lease_until, clock_timestamp() + ($3::bigint * interval '1 microsecond'))
-WHERE channel_id = $1 AND lease_fence = $2 AND finalized_at IS NULL`,
+WHERE channel_id = $1 AND lease_fence = $2`,
 			lane.channelID, lane.fence, req.LeaseDuration.Microseconds()); err != nil {
 			return nil, fmt.Errorf("renew exact-owner channel delivery attempts: %w", err)
 		}
@@ -149,7 +148,7 @@ SELECT l.channel_id, l.lease_fence, l.lease_until, l.head_item_id, l.head_sequen
 FROM channel_delivery_lanes l
 JOIN channel_delivery_attempts a
   ON a.channel_id = l.channel_id AND a.lease_fence = l.lease_fence
- AND a.targets_bound AND a.resolution = 'pending' AND a.finalized_at IS NULL
+ AND a.targets_bound AND a.resolution = 'pending'
 JOIN channel_delivery_events e ON e.channel_id = a.channel_id AND e.id = a.item_id
 LEFT JOIN channel_delivery_attempt_targets t
   ON t.item_id = a.item_id AND t.lease_fence = a.lease_fence
@@ -282,6 +281,9 @@ func (s *ChannelDeliveryStore) RecoverFinalizableAttempts(ctx context.Context, r
 	if req.QueueKind != store.OutboxQueueChannelPTS {
 		return nil, fmt.Errorf("recover finalizable channel attempts: queue kind %d is not channel PTS", req.QueueKind)
 	}
+	if req.AttemptLimit <= 0 || req.AttemptLimit > store.MaxDeliveryBatchItems {
+		return nil, fmt.Errorf("recover finalizable channel attempts: attempt limit must be between 1 and %d", store.MaxDeliveryBatchItems)
+	}
 	shards, scoped, err := normalizeChannelDeliveryShards(req.LogicalShardCount, req.LogicalShardIDs)
 	if err != nil {
 		return nil, fmt.Errorf("recover finalizable channel attempts: %w", err)
@@ -304,7 +306,7 @@ WITH picked AS MATERIALIZED (
       AND EXISTS (
         SELECT 1 FROM channel_delivery_attempts ready
         WHERE ready.channel_id = l.channel_id AND ready.lease_fence = l.lease_fence
-          AND ready.resolution <> 'pending' AND ready.finalized_at IS NULL
+          AND ready.resolution <> 'pending'
           AND (ready.retry_at IS NULL OR ready.retry_at <= clock_timestamp())
       )
     ORDER BY l.updated_at, l.channel_id
@@ -314,9 +316,10 @@ SELECT a.channel_id, a.item_id, a.max_pts, a.lease_fence, a.attempt_no
 FROM picked p
 JOIN channel_delivery_attempts a
   ON a.channel_id = p.channel_id AND a.lease_fence = p.lease_fence
-WHERE a.resolution <> 'pending' AND a.finalized_at IS NULL
+WHERE a.resolution <> 'pending'
   AND (a.retry_at IS NULL OR a.retry_at <= clock_timestamp())
-ORDER BY a.channel_id, a.window_ordinal`, scoped, shards, req.LaneLimit)
+ORDER BY a.channel_id, a.window_ordinal
+LIMIT $4`, scoped, shards, req.LaneLimit, req.AttemptLimit)
 	if err != nil {
 		return nil, fmt.Errorf("recover finalizable channel attempts: %w", err)
 	}
@@ -371,7 +374,7 @@ WITH candidates AS MATERIALIZED (
      AND l.head_item_id = a.item_id AND l.state = 'leased'
     WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
       AND a.evidence_deadline <= clock_timestamp()
-      AND a.resolution = 'pending' AND a.finalized_at IS NULL
+      AND a.resolution = 'pending'
     ORDER BY a.evidence_deadline, a.channel_id, a.item_id
     LIMIT $3
     FOR UPDATE OF a SKIP LOCKED
@@ -387,7 +390,7 @@ WITH candidates AS MATERIALIZED (
         resolved_at = clock_timestamp()
     FROM candidates c
     WHERE a.item_id = c.item_id AND a.lease_fence = c.lease_fence
-      AND a.resolution = 'pending' AND a.finalized_at IS NULL
+      AND a.resolution = 'pending'
     RETURNING a.channel_id, a.item_id, a.max_pts, a.lease_fence, a.attempt_no
 )
 SELECT channel_id, item_id, max_pts, lease_fence, attempt_no
