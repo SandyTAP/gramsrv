@@ -75,6 +75,12 @@ func (s *ChannelStore) sendChannelMessageOnce(ctx context.Context, req domain.Se
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	// Account-local side effects (notably clear-draft) share this transaction.
+	// Acquire the owner fence before channel/member rows so dialog mutations and
+	// message sends cannot form a channel-row -> owner-fence AB/BA cycle.
+	if err := lockUsersForUpdate(ctx, tx, req.UserID); err != nil {
+		return domain.SendChannelMessageResult{}, fmt.Errorf("lock channel sender: %w", err)
+	}
 	channel, member, err := s.getChannelForMember(ctx, tx, req.UserID, req.ChannelID)
 	if errors.Is(err, domain.ErrChannelPrivate) {
 		if candidate, candidateErr := s.channelByID(ctx, tx, req.ChannelID); candidateErr == nil {
@@ -347,8 +353,38 @@ WHERE channel_id = $1 AND user_id = $2 AND unread_mark`, req.ChannelID, req.User
 			return domain.SendChannelMessageResult{}, err
 		}
 	}
+	var draftEvent domain.UpdateEvent
+	if req.ClearDraft {
+		topMessageID := 0
+		if replyTo != nil && replyTo.TopMessageID > 0 {
+			topMessageID = replyTo.TopMessageID
+		}
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.UserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: req.ChannelID}, TopMessageID: topMessageID,
+		}
+		changed, err := NewDialogStore(tx).DeleteDraft(ctx, mutation.UserID, mutation.Peer, mutation.TopMessageID)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("clear channel draft in send transaction: %w", err)
+		}
+		snapshot := store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		effects, err := sendDraftClearEffects(snapshot)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(snapshot, effects); err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("validate channel send draft effects: %w", err)
+		}
+		allocated, err := applyDeliveryEffectsTx(ctx, tx, effects)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("apply channel send draft effects: %w", err)
+		}
+		if len(allocated) == 1 {
+			draftEvent = allocated[0].Event
+		}
+	}
 	txResult := domain.SendChannelMessageResult{
-		Channel: channel, Message: msg, Event: event, Discussion: discussion,
+		Channel: channel, Message: msg, Event: event, Discussion: discussion, DraftEvent: draftEvent,
 		MentionUserIDs:      append([]int64(nil), req.MentionUserIDs...),
 		SkipDeliveryUserIDs: append([]int64(nil), req.SkipDeliveryUserIDs...),
 	}

@@ -12,11 +12,6 @@ func (r *Router) suggestedPostApprovalUpdatesStrict(ctx context.Context, viewerU
 	return r.suggestedPostApprovalUpdatesWithPeerCacheAndOverlaysStrict(ctx, viewerUserID, result, nil, nil)
 }
 
-func (r *Router) suggestedPostApprovalUpdatesWithPeerCacheAndOverlays(ctx context.Context, viewerUserID int64, result domain.ToggleSuggestedPostApprovalResult, cache *viewerPeerCache, overlays *monoforumPeerOverlays) *tg.Updates {
-	updates, _ := r.suggestedPostApprovalUpdatesWithPeerCacheAndOverlaysStrict(ctx, viewerUserID, result, cache, overlays)
-	return updates
-}
-
 func (r *Router) suggestedPostApprovalUpdatesWithPeerCacheAndOverlaysStrict(ctx context.Context, viewerUserID int64, result domain.ToggleSuggestedPostApprovalResult, cache *viewerPeerCache, overlays *monoforumPeerOverlays) (*tg.Updates, error) {
 	updates := make([]tg.UpdateClass, 0, 4)
 	if result.OriginalEvent.Pts > 0 {
@@ -71,39 +66,9 @@ func (r *Router) suggestedPostApprovalUpdatesWithPeerCacheAndOverlaysStrict(ctx 
 	}, nil
 }
 
-func (r *Router) enqueueSuggestedPostApprovalFanout(ctx context.Context, originUserID int64, result domain.ToggleSuggestedPostApprovalResult) error {
-	monoOnly := result
-	monoOnly.Published = nil
-	nudge := max(result.OriginalEvent.Pts, result.ServiceEvent.Pts)
-	if nudge > 0 {
-		messages := make([]domain.ChannelMessage, 0, 2)
-		if monoOnly.OriginalMessage.ID != 0 {
-			messages = append(messages, monoOnly.OriginalMessage)
-		}
-		if monoOnly.ServiceMessage.ID != 0 {
-			messages = append(messages, monoOnly.ServiceMessage)
-		}
-		ownerIDs := monoforumSubscriberUserIDs([]domain.MonoforumDialog{{SavedPeer: monoOnly.SavedPeer}}, messages)
-		fanoutCache := newViewerPeerCache(r)
-		projectionPeers := monoforumProjectionPeers(monoOnly.Monoforum.ID, monoOnly.Parent.ID, ownerIDs)
-		var overlays *monoforumPeerOverlays
-		r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutExplicit, originUserID, result.Monoforum.ID, nudge, result.Recipients,
-			0,
-			func(bgCtx context.Context, viewers []int64) bool {
-				if !r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs) {
-					return false
-				}
-				overlays = r.loadMonoforumPeerOverlays(bgCtx, projectionPeers)
-				return true
-			},
-			func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
-				return r.suggestedPostApprovalUpdatesWithPeerCacheAndOverlays(bgCtx, viewerUserID, monoOnly, fanoutCache, overlays)
-			})
-	}
+func (r *Router) enqueueSuggestedPostBotAPIUpdate(ctx context.Context, originUserID int64, result domain.ToggleSuggestedPostApprovalResult) error {
 	if result.Published != nil && result.Published.Event.Pts > 0 {
-		if err := r.enqueueChannelMessageFanout(ctx, originUserID, *result.Published, nil); err != nil {
-			return err
-		}
+		return r.enqueueBotAPIChannelMessageUpdate(ctx, originUserID, *result.Published)
 	}
 	return nil
 }

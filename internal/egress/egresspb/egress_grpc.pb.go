@@ -19,139 +19,177 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	EgressAckService_GetInfo_FullMethodName           = "/telesrv.egress.v1.EgressAckService/GetInfo"
-	EgressAckService_AckOutboxDelivery_FullMethodName = "/telesrv.egress.v1.EgressAckService/AckOutboxDelivery"
+	EgressDeliveryService_GetInfo_FullMethodName                = "/telesrv.egress.v3.EgressDeliveryService/GetInfo"
+	EgressDeliveryService_ReportPhysicalReceipts_FullMethodName = "/telesrv.egress.v3.EgressDeliveryService/ReportPhysicalReceipts"
+	EgressDeliveryService_ReportClientAcks_FullMethodName       = "/telesrv.egress.v3.EgressDeliveryService/ReportClientAcks"
 )
 
-// EgressAckServiceClient is the client API for EgressAckService service.
+// EgressDeliveryServiceClient is the client API for EgressDeliveryService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-type EgressAckServiceClient interface {
+type EgressDeliveryServiceClient interface {
 	GetInfo(ctx context.Context, in *EgressInfoRequest, opts ...grpc.CallOption) (*EgressInfoResponse, error)
-	AckOutboxDelivery(ctx context.Context, in *OutboxClientAckRequest, opts ...grpc.CallOption) (*ErrorResponse, error)
+	ReportPhysicalReceipts(ctx context.Context, in *PhysicalReceiptBatchRequest, opts ...grpc.CallOption) (*DeliveryEvidenceBatchResponse, error)
+	ReportClientAcks(ctx context.Context, in *ClientAckBatchRequest, opts ...grpc.CallOption) (*DeliveryEvidenceBatchResponse, error)
 }
 
-type egressAckServiceClient struct {
+type egressDeliveryServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewEgressAckServiceClient(cc grpc.ClientConnInterface) EgressAckServiceClient {
-	return &egressAckServiceClient{cc}
+func NewEgressDeliveryServiceClient(cc grpc.ClientConnInterface) EgressDeliveryServiceClient {
+	return &egressDeliveryServiceClient{cc}
 }
 
-func (c *egressAckServiceClient) GetInfo(ctx context.Context, in *EgressInfoRequest, opts ...grpc.CallOption) (*EgressInfoResponse, error) {
+func (c *egressDeliveryServiceClient) GetInfo(ctx context.Context, in *EgressInfoRequest, opts ...grpc.CallOption) (*EgressInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EgressInfoResponse)
-	err := c.cc.Invoke(ctx, EgressAckService_GetInfo_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, EgressDeliveryService_GetInfo_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *egressAckServiceClient) AckOutboxDelivery(ctx context.Context, in *OutboxClientAckRequest, opts ...grpc.CallOption) (*ErrorResponse, error) {
+func (c *egressDeliveryServiceClient) ReportPhysicalReceipts(ctx context.Context, in *PhysicalReceiptBatchRequest, opts ...grpc.CallOption) (*DeliveryEvidenceBatchResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ErrorResponse)
-	err := c.cc.Invoke(ctx, EgressAckService_AckOutboxDelivery_FullMethodName, in, out, cOpts...)
+	out := new(DeliveryEvidenceBatchResponse)
+	err := c.cc.Invoke(ctx, EgressDeliveryService_ReportPhysicalReceipts_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// EgressAckServiceServer is the server API for EgressAckService service.
-// All implementations must embed UnimplementedEgressAckServiceServer
-// for forward compatibility.
-type EgressAckServiceServer interface {
-	GetInfo(context.Context, *EgressInfoRequest) (*EgressInfoResponse, error)
-	AckOutboxDelivery(context.Context, *OutboxClientAckRequest) (*ErrorResponse, error)
-	mustEmbedUnimplementedEgressAckServiceServer()
+func (c *egressDeliveryServiceClient) ReportClientAcks(ctx context.Context, in *ClientAckBatchRequest, opts ...grpc.CallOption) (*DeliveryEvidenceBatchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeliveryEvidenceBatchResponse)
+	err := c.cc.Invoke(ctx, EgressDeliveryService_ReportClientAcks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// UnimplementedEgressAckServiceServer must be embedded to have
+// EgressDeliveryServiceServer is the server API for EgressDeliveryService service.
+// All implementations must embed UnimplementedEgressDeliveryServiceServer
+// for forward compatibility.
+type EgressDeliveryServiceServer interface {
+	GetInfo(context.Context, *EgressInfoRequest) (*EgressInfoResponse, error)
+	ReportPhysicalReceipts(context.Context, *PhysicalReceiptBatchRequest) (*DeliveryEvidenceBatchResponse, error)
+	ReportClientAcks(context.Context, *ClientAckBatchRequest) (*DeliveryEvidenceBatchResponse, error)
+	mustEmbedUnimplementedEgressDeliveryServiceServer()
+}
+
+// UnimplementedEgressDeliveryServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedEgressAckServiceServer struct{}
+type UnimplementedEgressDeliveryServiceServer struct{}
 
-func (UnimplementedEgressAckServiceServer) GetInfo(context.Context, *EgressInfoRequest) (*EgressInfoResponse, error) {
+func (UnimplementedEgressDeliveryServiceServer) GetInfo(context.Context, *EgressInfoRequest) (*EgressInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetInfo not implemented")
 }
-func (UnimplementedEgressAckServiceServer) AckOutboxDelivery(context.Context, *OutboxClientAckRequest) (*ErrorResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method AckOutboxDelivery not implemented")
+func (UnimplementedEgressDeliveryServiceServer) ReportPhysicalReceipts(context.Context, *PhysicalReceiptBatchRequest) (*DeliveryEvidenceBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportPhysicalReceipts not implemented")
 }
-func (UnimplementedEgressAckServiceServer) mustEmbedUnimplementedEgressAckServiceServer() {}
-func (UnimplementedEgressAckServiceServer) testEmbeddedByValue()                          {}
+func (UnimplementedEgressDeliveryServiceServer) ReportClientAcks(context.Context, *ClientAckBatchRequest) (*DeliveryEvidenceBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportClientAcks not implemented")
+}
+func (UnimplementedEgressDeliveryServiceServer) mustEmbedUnimplementedEgressDeliveryServiceServer() {}
+func (UnimplementedEgressDeliveryServiceServer) testEmbeddedByValue()                               {}
 
-// UnsafeEgressAckServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to EgressAckServiceServer will
+// UnsafeEgressDeliveryServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to EgressDeliveryServiceServer will
 // result in compilation errors.
-type UnsafeEgressAckServiceServer interface {
-	mustEmbedUnimplementedEgressAckServiceServer()
+type UnsafeEgressDeliveryServiceServer interface {
+	mustEmbedUnimplementedEgressDeliveryServiceServer()
 }
 
-func RegisterEgressAckServiceServer(s grpc.ServiceRegistrar, srv EgressAckServiceServer) {
-	// If the following call pancis, it indicates UnimplementedEgressAckServiceServer was
+func RegisterEgressDeliveryServiceServer(s grpc.ServiceRegistrar, srv EgressDeliveryServiceServer) {
+	// If the following call pancis, it indicates UnimplementedEgressDeliveryServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&EgressAckService_ServiceDesc, srv)
+	s.RegisterService(&EgressDeliveryService_ServiceDesc, srv)
 }
 
-func _EgressAckService_GetInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _EgressDeliveryService_GetInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(EgressInfoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(EgressAckServiceServer).GetInfo(ctx, in)
+		return srv.(EgressDeliveryServiceServer).GetInfo(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: EgressAckService_GetInfo_FullMethodName,
+		FullMethod: EgressDeliveryService_GetInfo_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EgressAckServiceServer).GetInfo(ctx, req.(*EgressInfoRequest))
+		return srv.(EgressDeliveryServiceServer).GetInfo(ctx, req.(*EgressInfoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _EgressAckService_AckOutboxDelivery_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(OutboxClientAckRequest)
+func _EgressDeliveryService_ReportPhysicalReceipts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PhysicalReceiptBatchRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(EgressAckServiceServer).AckOutboxDelivery(ctx, in)
+		return srv.(EgressDeliveryServiceServer).ReportPhysicalReceipts(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: EgressAckService_AckOutboxDelivery_FullMethodName,
+		FullMethod: EgressDeliveryService_ReportPhysicalReceipts_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EgressAckServiceServer).AckOutboxDelivery(ctx, req.(*OutboxClientAckRequest))
+		return srv.(EgressDeliveryServiceServer).ReportPhysicalReceipts(ctx, req.(*PhysicalReceiptBatchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// EgressAckService_ServiceDesc is the grpc.ServiceDesc for EgressAckService service.
+func _EgressDeliveryService_ReportClientAcks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClientAckBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EgressDeliveryServiceServer).ReportClientAcks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EgressDeliveryService_ReportClientAcks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EgressDeliveryServiceServer).ReportClientAcks(ctx, req.(*ClientAckBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// EgressDeliveryService_ServiceDesc is the grpc.ServiceDesc for EgressDeliveryService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var EgressAckService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "telesrv.egress.v1.EgressAckService",
-	HandlerType: (*EgressAckServiceServer)(nil),
+var EgressDeliveryService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "telesrv.egress.v3.EgressDeliveryService",
+	HandlerType: (*EgressDeliveryServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "GetInfo",
-			Handler:    _EgressAckService_GetInfo_Handler,
+			Handler:    _EgressDeliveryService_GetInfo_Handler,
 		},
 		{
-			MethodName: "AckOutboxDelivery",
-			Handler:    _EgressAckService_AckOutboxDelivery_Handler,
+			MethodName: "ReportPhysicalReceipts",
+			Handler:    _EgressDeliveryService_ReportPhysicalReceipts_Handler,
+		},
+		{
+			MethodName: "ReportClientAcks",
+			Handler:    _EgressDeliveryService_ReportClientAcks_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

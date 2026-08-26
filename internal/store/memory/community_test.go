@@ -6,7 +6,19 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
+
+func memoryCommunityTestEffects(snapshot storepkg.CommunityDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Targets))
+	for _, target := range snapshot.Targets {
+		effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: target.TargetUserID, Payload: []byte{1},
+			RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
+}
 
 func mustCommunityTestUser(t *testing.T, store *UserStore, firstName, phone string) domain.User {
 	t.Helper()
@@ -43,7 +55,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 	member := mustCommunityTestUser(t, users, "Alice Searchable", "15551000002")
 	channels := NewChannelStore()
 	initial := mustCommunityTestChannel(t, channels, owner, "Initial", member)
-	store := NewCommunityStore(users, channels, nil, nil)
+	store := NewCommunityStore(users, channels, nil, nil, NewDeliveryOutboxStore())
 
 	created, err := store.CreateCommunity(ctx, domain.CreateCommunityRequest{
 		CreatorUserID: owner.ID,
@@ -86,7 +98,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 		Peer:        domain.Peer{Type: domain.PeerTypeChannel, ID: owned.ID},
 		Visibility:  domain.CommunityPeerVisible,
 		Date:        1_800_000_003,
-	})
+	}, memoryCommunityTestEffects)
 	if err != nil || !requested.RequestCreated {
 		t.Fatalf("link request = %+v, err=%v, want pending request", requested, err)
 	}
@@ -94,7 +106,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 	if err != nil || page.TotalCount != 1 || len(page.Requests) != 1 || page.Requests[0].RequestedBy != member.ID {
 		t.Fatalf("request page = %+v, err=%v", page, err)
 	}
-	approved, err := store.DecideCommunityPeerLinkRequest(ctx, owner.ID, created.Community.ID, requested.Peer, false, 1_800_000_004)
+	approved, err := store.DecideCommunityPeerLinkRequest(ctx, owner.ID, created.Community.ID, requested.Peer, false, 1_800_000_004, memoryCommunityTestEffects)
 	if err != nil || approved.Link == nil || approved.RequestedBy != member.ID || approved.ServiceMessage == nil {
 		t.Fatalf("approved request = %+v, err=%v", approved, err)
 	}
@@ -114,7 +126,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 		Peer:        domain.Peer{Type: domain.PeerTypeChannel, ID: privateVisible.ID},
 		Visibility:  domain.CommunityPeerVisible,
 		Date:        1_800_000_004,
-	})
+	}, memoryCommunityTestEffects)
 	if err != nil || linked.Link == nil {
 		t.Fatalf("link private visible channel = %+v, err=%v", linked, err)
 	}
@@ -141,7 +153,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 		Peer:        approved.Peer,
 		Visibility:  domain.CommunityPeerHidden,
 		Date:        1_800_000_005,
-	})
+	}, memoryCommunityTestEffects)
 	if !errors.Is(err, domain.ErrCommunityPeerLinked) {
 		t.Fatalf("change visibility in place error = %v, want unlink/relink requirement", err)
 	}
@@ -171,7 +183,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 		t.Fatalf("outsider Community admins error = %v, want private", err)
 	}
 
-	ban, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, created.Community.ID, member.ID, false, 1_800_000_006)
+	ban, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, created.Community.ID, member.ID, false, 1_800_000_006, memoryCommunityTestEffects)
 	if err != nil {
 		t.Fatalf("ban community participant: %v", err)
 	}
@@ -195,7 +207,7 @@ func TestCommunityLifecycleRequestsSearchAndModeration(t *testing.T) {
 	if _, err := store.GetCommunity(ctx, member.ID, created.Community.ID); !errors.Is(err, domain.ErrCommunityPrivate) {
 		t.Fatalf("banned member get community error = %v, want private", err)
 	}
-	repeated, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, created.Community.ID, member.ID, false, 1_800_000_007)
+	repeated, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, created.Community.ID, member.ID, false, 1_800_000_007, memoryCommunityTestEffects)
 	if err != nil || repeated.Changed || len(repeated.ChannelBans) != 0 || len(repeated.RemovedLinks) != 0 {
 		t.Fatalf("repeated ban = %+v err=%v, want idempotent no-op", repeated, err)
 	}
@@ -206,7 +218,7 @@ func TestCommunityCollapsedPinAndMixedOrder(t *testing.T) {
 	users := NewUserStore()
 	owner := mustCommunityTestUser(t, users, "Owner", "15551000011")
 	channels := NewChannelStore()
-	store := NewCommunityStore(users, channels, nil, nil)
+	store := NewCommunityStore(users, channels, nil, nil, NewDeliveryOutboxStore())
 
 	makeCommunity := func(title string) domain.CommunityView {
 		channel := mustCommunityTestChannel(t, channels, owner, title+" Channel")
@@ -220,7 +232,7 @@ func TestCommunityCollapsedPinAndMixedOrder(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create %s: %v", title, err)
 		}
-		if _, changed, err := store.SetCommunityCollapsed(ctx, owner.ID, view.Community.ID, true); err != nil || !changed {
+		if _, changed, err := store.SetCommunityCollapsed(ctx, owner.ID, view.Community.ID, true, memoryCommunityTestEffects); err != nil || !changed {
 			t.Fatalf("collapse %s: changed=%v err=%v", title, changed, err)
 		}
 		if changed, err := store.SetCommunityPinned(ctx, owner.ID, view.Community.ID, true); err != nil || !changed {
@@ -244,9 +256,56 @@ func TestCommunityCollapsedPinAndMixedOrder(t *testing.T) {
 	if !oneView.State.Pinned || !twoView.State.Pinned || oneView.State.PinnedOrder <= twoView.State.PinnedOrder {
 		t.Fatalf("pinned orders one=%+v two=%+v, want global mixed order preserved", oneView.State, twoView.State)
 	}
-	uncollapsed, changed, err := store.SetCommunityCollapsed(ctx, owner.ID, one.Community.ID, false)
+	uncollapsed, changed, err := store.SetCommunityCollapsed(ctx, owner.ID, one.Community.ID, false, memoryCommunityTestEffects)
 	if err != nil || !changed || uncollapsed.State.Pinned {
 		t.Fatalf("uncollapse state = %+v changed=%v err=%v, want pin cleared", uncollapsed.State, changed, err)
+	}
+}
+
+func TestCommunityDeliveryFailureRollsBackAndNoopDoesNotEnqueue(t *testing.T) {
+	ctx := context.Background()
+	users := NewUserStore()
+	owner := mustCommunityTestUser(t, users, "Atomic Owner", "15551000031")
+	channels := NewChannelStore()
+	initial := mustCommunityTestChannel(t, channels, owner, "Atomic Initial")
+	outbox := NewDeliveryOutboxStore()
+	communities := NewCommunityStore(users, channels, nil, nil, outbox)
+	created, err := communities.CreateCommunity(ctx, domain.CreateCommunityRequest{
+		CreatorUserID: owner.ID,
+		Title:         "Before",
+		InitialPeer:   domain.Peer{Type: domain.PeerTypeChannel, ID: initial.ID},
+		Visibility:    domain.CommunityPeerVisible,
+		Date:          1_800_000_300,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildErr := errors.New("encode delivery failed")
+	if _, _, err := communities.EditCommunityTitle(ctx, owner.ID, created.Community.ID, "Must Roll Back", func(storepkg.CommunityDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("edit title error = %v, want builder failure", err)
+	}
+	view, err := communities.GetCommunity(ctx, owner.ID, created.Community.ID)
+	if err != nil || view.Community.Title != "Before" {
+		t.Fatalf("community after failed delivery = %+v err=%v", view.Community, err)
+	}
+	if items := outbox.Snapshot(); len(items) != 0 {
+		t.Fatalf("outbox after rolled-back mutation = %+v", items)
+	}
+
+	if _, changed, err := communities.EditCommunityTitle(ctx, owner.ID, created.Community.ID, "After", memoryCommunityTestEffects); err != nil || !changed {
+		t.Fatalf("successful edit changed=%v err=%v", changed, err)
+	}
+	if items := outbox.Snapshot(); len(items) != 1 || items[0].TargetUserID != owner.ID {
+		t.Fatalf("outbox after successful mutation = %+v", items)
+	}
+	if _, changed, err := communities.EditCommunityTitle(ctx, owner.ID, created.Community.ID, "After", memoryCommunityTestEffects); err != nil || changed {
+		t.Fatalf("idempotent edit changed=%v err=%v", changed, err)
+	}
+	if items := outbox.Snapshot(); len(items) != 1 {
+		t.Fatalf("idempotent edit appended delivery = %+v", items)
 	}
 }
 
@@ -255,13 +314,14 @@ func TestCommunityCanUseOwnedBotAsInitialPeer(t *testing.T) {
 	users := NewUserStore()
 	owner := mustCommunityTestUser(t, users, "Bot Owner", "15551000021")
 	bots := NewBotStore(users)
-	bot, _, err := bots.CreateBotAccount(ctx, domain.User{
+	bots.AttachDeliveryDependencies(NewDialogStore(), NewDeliveryOutboxStore())
+	bot, _, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 		AccessHash: 91, FirstName: "Community Bot", Username: "community_bot",
-	}, domain.BotProfile{OwnerUserID: owner.ID})
+	}, domain.BotProfile{OwnerUserID: owner.ID}, testBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
-	store := NewCommunityStore(users, NewChannelStore(), bots, nil)
+	store := NewCommunityStore(users, NewChannelStore(), bots, nil, NewDeliveryOutboxStore())
 	created, err := store.CreateCommunity(ctx, domain.CreateCommunityRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Bot Community",

@@ -23,6 +23,7 @@ var (
 	// older connection profile epoch. It is deliberately non-terminal: discard
 	// the online accelerator and let durable difference recovery fill the gap.
 	ErrOutboundLayerProfileStale = errors.New("outbound exact layer profile epoch is stale")
+	errLayerUpdatesFanoutClosed  = errors.New("exact layer updates fanout is closed")
 )
 
 type outboundLayerBindingKind uint8
@@ -46,9 +47,10 @@ type outboundLayerBinding struct {
 }
 
 type preparedLayerUpdates struct {
-	done    chan struct{}
-	encoded *encodedOutboundMessage
-	err     error
+	done          chan struct{}
+	encoded       *encodedOutboundMessage
+	err           error
+	retainedBytes int
 }
 
 // layerUpdatesFanout is one immutable canonical Updates snapshot plus a
@@ -59,20 +61,50 @@ type layerUpdatesFanout struct {
 	frozen *tlprofile.FrozenObject
 	size   int
 
+	// Durable delivery supplies a process-wide retained-byte budget. The frozen
+	// canonical snapshot and every cached exact-profile body remain charged until
+	// the cache drops ownership. Ordinary request-scoped fanout leaves these nil
+	// because its completed bodies are transferred to the per-connection budget.
+	retainBytes   func(int) bool
+	releaseBytes  func(int)
+	frozenBytes   int
+	preparedLimit int
+
 	mu       sync.Mutex
 	prepared map[tlprofile.Profile]*preparedLayerUpdates
+	closed   bool
 }
 
 func newLayerUpdatesFanout(value tg.UpdatesClass) (*layerUpdatesFanout, error) {
+	return newRetainedLayerUpdatesFanout(value, nil, nil, 0)
+}
+
+func newRetainedLayerUpdatesFanout(
+	value tg.UpdatesClass,
+	retain func(int) bool,
+	release func(int),
+	preparedLimit int,
+) (*layerUpdatesFanout, error) {
+	if (retain == nil) != (release == nil) {
+		return nil, errors.New("exact layer updates retained budget is incomplete")
+	}
 	frozen, err := tlprofile.FreezeObject(value)
 	if err != nil {
 		return nil, fmt.Errorf("freeze exact layer updates: %w", err)
 	}
-	return &layerUpdatesFanout{
-		frozen:   frozen,
-		size:     frozen.CanonicalSize(),
+	size := frozen.CanonicalSize()
+	u := &layerUpdatesFanout{
+		frozen: frozen, size: size,
+		retainBytes: retain, releaseBytes: release, preparedLimit: preparedLimit,
 		prepared: make(map[tlprofile.Profile]*preparedLayerUpdates),
-	}, nil
+	}
+	if retain != nil && size > 0 {
+		if !retain(size) {
+			return nil, fmt.Errorf("%w: frozen exact layer updates bytes=%d", ErrOutboundTrackedBudget, size)
+		}
+		u.frozenBytes = size
+	}
+	return u, nil
 }
 
 func (u *layerUpdatesFanout) canonicalSize() int {
@@ -112,22 +144,52 @@ func (u *layerUpdatesFanout) prepare(ctx context.Context, profile tlprofile.Prof
 		ctx = context.Background()
 	}
 	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return nil, errLayerUpdatesFanoutClosed
+	}
 	entry := u.prepared[profile]
 	if entry == nil {
+		var released int
+		if u.preparedLimit > 0 && len(u.prepared) >= u.preparedLimit {
+			released = u.evictCompletedPreparedLocked(profile)
+			if len(u.prepared) >= u.preparedLimit {
+				u.mu.Unlock()
+				u.releaseRetained(released)
+				return nil, fmt.Errorf("%w: concurrent exact layer profile cache is full", ErrOutboundTrackedBudget)
+			}
+		}
 		entry = &preparedLayerUpdates{done: make(chan struct{})}
 		u.prepared[profile] = entry
+		frozen := u.frozen
+		retain := u.retainBytes
 		u.mu.Unlock()
+		u.releaseRetained(released)
 
-		entry.encoded, entry.err = prepareFrozenLayerUpdatesContext(ctx, profile, u.frozen)
+		encoded, prepareErr := prepareFrozenLayerUpdatesContext(ctx, profile, frozen, retain)
+		retained := 0
+		if prepareErr == nil && encoded != nil && retain != nil {
+			retained = len(encoded.body)
+		}
+		u.mu.Lock()
+		if u.closed && prepareErr == nil {
+			prepareErr = errLayerUpdatesFanoutClosed
+			encoded = nil
+		}
+		entry.encoded, entry.err, entry.retainedBytes = encoded, prepareErr, retained
+		if prepareErr != nil && u.prepared[profile] == entry {
+			delete(u.prepared, profile)
+		}
+		if prepareErr != nil {
+			entry.retainedBytes = 0
+		}
+		// Publish completion while holding the same mutex used by close. This
+		// prevents close from observing an in-progress entry immediately before
+		// completion and leaking its retained-byte reservation.
 		close(entry.done)
-		if entry.err != nil {
-			// Context/encode admission failure is attempt-local. Do not poison this
-			// semantic update for every later connection or pending-flush retry.
-			u.mu.Lock()
-			if u.prepared[profile] == entry {
-				delete(u.prepared, profile)
-			}
-			u.mu.Unlock()
+		u.mu.Unlock()
+		if prepareErr != nil && retained > 0 {
+			u.releaseRetained(retained)
 		}
 	} else {
 		u.mu.Unlock()
@@ -154,6 +216,7 @@ func (u *layerUpdatesFanout) discardPrepared(profile tlprofile.Profile, encoded 
 		return
 	}
 	u.mu.Lock()
+	released := 0
 	entry := u.prepared[profile]
 	if entry != nil {
 		select {
@@ -163,17 +226,78 @@ func (u *layerUpdatesFanout) discardPrepared(profile tlprofile.Profile, encoded 
 				entry.encoded.layer.profile == encoded.layer.profile &&
 				sameBacking(entry.encoded.body, encoded.body)) {
 				delete(u.prepared, profile)
+				released = entry.retainedBytes
+				entry.retainedBytes = 0
 			}
 		default:
 		}
 	}
 	u.mu.Unlock()
+	u.releaseRetained(released)
+}
+
+func (u *layerUpdatesFanout) evictCompletedPreparedLocked(keep tlprofile.Profile) int {
+	released := 0
+	for profile, entry := range u.prepared {
+		if profile == keep || entry == nil {
+			continue
+		}
+		select {
+		case <-entry.done:
+			delete(u.prepared, profile)
+			released += entry.retainedBytes
+			entry.retainedBytes = 0
+		default:
+		}
+	}
+	return released
+}
+
+func (u *layerUpdatesFanout) releaseRetained(bytes int) {
+	if u != nil && bytes > 0 && u.releaseBytes != nil {
+		u.releaseBytes(bytes)
+	}
+}
+
+// close releases only this cache's ownership. Bodies already admitted to Conn
+// actors remain independently covered by their per-connection tracked budgets.
+func (u *layerUpdatesFanout) close() {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return
+	}
+	u.closed = true
+	released := u.frozenBytes
+	u.frozenBytes = 0
+	u.frozen = nil
+	for profile, entry := range u.prepared {
+		if entry == nil {
+			delete(u.prepared, profile)
+			continue
+		}
+		select {
+		case <-entry.done:
+			delete(u.prepared, profile)
+			released += entry.retainedBytes
+			entry.retainedBytes = 0
+		default:
+			// The encoder observes closed before publishing and releases its own
+			// reservation. Keeping the entry until then preserves waiter wakeup.
+		}
+	}
+	u.mu.Unlock()
+	u.releaseRetained(released)
 }
 
 func prepareFrozenLayerUpdatesContext(
 	ctx context.Context,
 	profile tlprofile.Profile,
 	frozen *tlprofile.FrozenObject,
+	retain func(int) bool,
 ) (*encodedOutboundMessage, error) {
 	var encoded *encodedOutboundMessage
 	err := withOutboundEncodeSlot(ctx, nil, func() error {
@@ -188,6 +312,10 @@ func prepareFrozenLayerUpdatesContext(
 		encoded = &encodedOutboundMessage{
 			body: body.Copy(), typeID: id,
 			layer: &outboundLayerBinding{profile: profile},
+		}
+		if retain != nil && len(encoded.body) > 0 && !retain(len(encoded.body)) {
+			encoded = nil
+			return fmt.Errorf("%w: prepared exact layer updates", ErrOutboundTrackedBudget)
 		}
 		return nil
 	})

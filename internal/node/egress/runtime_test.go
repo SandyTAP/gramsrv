@@ -9,8 +9,8 @@ import (
 
 func TestValidateEgressConfigRequiresAckBoundary(t *testing.T) {
 	base := config.EgressConfig{
-		EgressAckGRPCAddr: "127.0.0.1:2450",
-		EgressAckToken:    "egress-secret",
+		EgressDeliveryGRPCAddr: "127.0.0.1:2450",
+		EgressDeliveryToken:    "egress-secret",
 	}
 	if err := validateEgressConfig(base); err != nil {
 		t.Fatalf("base config rejected: %v", err)
@@ -21,8 +21,8 @@ func TestValidateEgressConfigRequiresAckBoundary(t *testing.T) {
 		mutate  func(*config.EgressConfig)
 		wantErr string
 	}{
-		{name: "addr", mutate: func(cfg *config.EgressConfig) { cfg.EgressAckGRPCAddr = " " }, wantErr: "TELESRV_EGRESS_ACK_GRPC_ADDR"},
-		{name: "token", mutate: func(cfg *config.EgressConfig) { cfg.EgressAckToken = " " }, wantErr: "TELESRV_EGRESS_ACK_TOKEN"},
+		{name: "addr", mutate: func(cfg *config.EgressConfig) { cfg.EgressDeliveryGRPCAddr = " " }, wantErr: "TELESRV_EGRESS_DELIVERY_GRPC_ADDR"},
+		{name: "token", mutate: func(cfg *config.EgressConfig) { cfg.EgressDeliveryToken = " " }, wantErr: "TELESRV_EGRESS_DELIVERY_TOKEN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

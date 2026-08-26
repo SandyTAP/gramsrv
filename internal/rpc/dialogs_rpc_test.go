@@ -4,7 +4,6 @@ import (
 	"context"
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
 	"reflect"
@@ -179,11 +178,11 @@ func TestDialogSettingRPCsRecordDurableUpdates(t *testing.T) {
 	if ok, err := r.onMessagesToggleDialogPin(ctx, toggle); err != nil || !ok {
 		t.Fatalf("toggle pin = %v, %v", ok, err)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogPinned || updates.events[0].Peer != peer || !updates.events[0].Bool || updates.excludeSessionID != 55 {
+	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogPinned || updates.events[0].Peer != peer || !updates.events[0].Bool || updates.excludeSessionID != 0 {
 		t.Fatalf("pin event = %+v, want durable dialog_pinned", updates.events)
 	}
-	if updates.authKeyID != authKeyID || updates.excludeAuthKeyID != rawAuthKeyID {
-		t.Fatalf("durable update keys = state:%x exclude:%x, want business:%x raw:%x", updates.authKeyID, updates.excludeAuthKeyID, authKeyID, rawAuthKeyID)
+	if updates.authKeyID != authKeyID || updates.excludeAuthKeyID != ([8]byte{}) {
+		t.Fatalf("durable update keys = state:%x exclude:%x, want state:%x and no current-session exclusion", updates.authKeyID, updates.excludeAuthKeyID, authKeyID)
 	}
 
 	if ok, err := r.onMessagesReorderPinnedDialogs(ctx, &tg.MessagesReorderPinnedDialogsRequest{Order: []tg.InputDialogPeerClass{dialogPeer}}); err != nil || !ok {
@@ -356,7 +355,7 @@ func TestDialogFolderRPCsPersistAndRecordUpdates(t *testing.T) {
 	if dialogs.savedFolder.ID != 2 || dialogs.savedFolder.Title != "Work" || !dialogs.savedFolder.Contacts || len(dialogs.savedFolder.IncludePeers) != 1 {
 		t.Fatalf("saved folder = %+v, want parsed dialog folder", dialogs.savedFolder)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogFilter || updates.events[0].FilterID != 2 || updates.excludeSessionID != 66 {
+	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogFilter || updates.events[0].FilterID != 2 || updates.excludeSessionID != 0 || updates.excludeAuthKeyID != ([8]byte{}) {
 		t.Fatalf("filter event = %+v, want durable dialog_filter", updates.events)
 	}
 
@@ -406,7 +405,7 @@ func TestFoldersEditPeerFoldersPersistsArchiveAndReturnsPtsUpdate(t *testing.T) 
 	}
 }
 
-func TestDialogSettingRPCsSkipManualPushWhenReliableDispatch(t *testing.T) {
+func TestDialogSettingRPCsUseDurableDispatchForEverySession(t *testing.T) {
 	var authKeyID [8]byte
 	authKeyID[0] = 11
 	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), 1000000001), authKeyID), 55)
@@ -424,23 +423,15 @@ func TestDialogSettingRPCsSkipManualPushWhenReliableDispatch(t *testing.T) {
 	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogPinned {
 		t.Fatalf("events = %+v, want durable event recorded", updates.events)
 	}
-	// reliable outbox 仍是 update 本体的唯一在线投递者；当前 session 只
-	// 收到一条纯 pts 簿记信封（outbox 排除了它，事件占用的账号 pts 必须
-	// 显式同步，否则当前设备水位落后）。
-	got := sessions.snapshot()
-	if got.message == nil {
-		t.Fatalf("manual push = nil, want pts bookkeeping envelope for the current session")
+	if updates.excludeAuthKeyID != ([8]byte{}) || updates.excludeSessionID != 0 {
+		t.Fatalf("durable dispatch exclusion = %x/%d, want none so current and other sessions share one event", updates.excludeAuthKeyID, updates.excludeSessionID)
 	}
-	envelope, ok := got.message.(*tg.Updates)
-	if !ok || len(envelope.Updates) != 1 {
-		t.Fatalf("manual push = %T %+v, want a single bookkeeping update", got.message, got.message)
-	}
-	if bookkeeping, ok := envelope.Updates[0].(*tg.UpdateDeleteMessages); !ok || len(bookkeeping.Messages) != 0 {
-		t.Fatalf("manual push update = %#v, want empty updateDeleteMessages bookkeeping", envelope.Updates[0])
+	if got := sessions.snapshot(); got.message != nil {
+		t.Fatalf("Core direct push = %T %+v, want none", got.message, got.message)
 	}
 }
 
-func TestMessagesSaveDraftRecordsDurableEventAndBookkeepsCurrentSession(t *testing.T) {
+func TestMessagesSaveDraftDurableDispatchIncludesCurrentSession(t *testing.T) {
 	const (
 		userID = int64(1000000001)
 		peerID = int64(1000000002)
@@ -480,30 +471,15 @@ func TestMessagesSaveDraftRecordsDurableEventAndBookkeepsCurrentSession(t *testi
 	if dialogs.savedDraft.Message != "1111" || len(dialogs.savedDraft.Entities) != 1 {
 		t.Fatalf("saved draft = %+v, want persisted message and entities", dialogs.savedDraft)
 	}
-	if updateStore.excludeSessionID != 66 {
-		t.Fatalf("exclude session = %d, want current session", updateStore.excludeSessionID)
+	if updateStore.excludeSessionID != 0 || updateStore.excludeAuthKeyID != ([8]byte{}) {
+		t.Fatalf("durable exclusion = %x/%d, want none", updateStore.excludeAuthKeyID, updateStore.excludeSessionID)
 	}
 	if msg := sessions.lastUserPush(); msg != nil {
 		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
 	}
 
-	got := sessions.snapshot()
-	if got.sessionID != 66 || got.messageType != proto.MessageFromServer {
-		t.Fatalf("current-session push = session %d type %v, want current/from_server", got.sessionID, got.messageType)
-	}
-	if gotAuthKeyID := sessions.scopedAuthKey(); gotAuthKeyID != authKeyID {
-		t.Fatalf("current auth_key_id = %x, want %x", gotAuthKeyID, authKeyID)
-	}
-	bookkeeping, ok := got.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("bookkeeping message = %T, want *tg.Updates", got.message)
-	}
-	if len(bookkeeping.Updates) != 1 {
-		t.Fatalf("bookkeeping updates = %+v, want one update", bookkeeping.Updates)
-	}
-	deleteUpdate, ok := bookkeeping.Updates[0].(*tg.UpdateDeleteMessages)
-	if !ok || len(deleteUpdate.Messages) != 0 || deleteUpdate.Pts != 17 || deleteUpdate.PtsCount != 1 {
-		t.Fatalf("bookkeeping update = %#v, want empty updateDeleteMessages pts=17", bookkeeping.Updates[0])
+	if got := sessions.snapshot(); got.message != nil {
+		t.Fatalf("current-session direct push = %T %+v, want none", got.message, got.message)
 	}
 }
 
@@ -746,7 +722,7 @@ func TestMessagesGetDialogsIncludesCloudDraft(t *testing.T) {
 	}
 }
 
-func TestMessagesClearAllDraftsRecordsDurableEventsAndBookkeepsCurrentSession(t *testing.T) {
+func TestMessagesClearAllDraftsDurableDispatchIncludesCurrentSession(t *testing.T) {
 	const (
 		userID = int64(1000000001)
 		peerID = int64(1000000002)
@@ -777,14 +753,11 @@ func TestMessagesClearAllDraftsRecordsDurableEventsAndBookkeepsCurrentSession(t 
 	if msg := sessions.lastUserPush(); msg != nil {
 		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
 	}
-	got := sessions.snapshot()
-	bookkeeping, ok := got.message.(*tg.Updates)
-	if !ok || len(bookkeeping.Updates) != 1 {
-		t.Fatalf("pushed = %T %+v, want one update", got.message, got.message)
+	if updateStore.excludeSessionID != 0 || updateStore.excludeAuthKeyID != ([8]byte{}) {
+		t.Fatalf("durable exclusion = %x/%d, want none", updateStore.excludeAuthKeyID, updateStore.excludeSessionID)
 	}
-	deleteUpdate, ok := bookkeeping.Updates[0].(*tg.UpdateDeleteMessages)
-	if !ok || len(deleteUpdate.Messages) != 0 || deleteUpdate.Pts != 21 || deleteUpdate.PtsCount != 1 {
-		t.Fatalf("bookkeeping update = %#v, want empty updateDeleteMessages pts=21", bookkeeping.Updates[0])
+	if got := sessions.snapshot(); got.message != nil {
+		t.Fatalf("current-session direct push = %T %+v, want none", got.message, got.message)
 	}
 	if len(dialogs.drafts) != 0 {
 		t.Fatalf("capture drafts = %+v, want cleared", dialogs.drafts)

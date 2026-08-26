@@ -149,7 +149,7 @@ RETURNING id`, pre0062.SenderUserID, pre0062.RecipientUserID, pre0062.RandomID, 
 	}
 	insertLegacyBoxes(pre0062ID, 1, 1, pre0062.Date, pre0062.Message)
 	assertLegacyPrivateSendSentinels(t, ctx, tx, pre0062ID, false)
-	if _, err := NewMessageStore(tx).SendPrivateText(ctx, pre0062); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
+	if _, err := newTestMessageStore(tx).SendPrivateText(ctx, pre0062); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
 		t.Fatalf("pre-0062 unknown replay err = %v, want ErrMessageRandomIDDuplicate", err)
 	}
 
@@ -173,7 +173,7 @@ RETURNING id`, era0062.SenderUserID, era0062.RecipientUserID, era0062.RandomID,
 	}
 	insertLegacyBoxes(era0062ID, 2, 2, era0062.Date, era0062.Message)
 	assertLegacyPrivateSendSentinels(t, ctx, tx, era0062ID, true)
-	if _, err := NewMessageStore(tx).SendPrivateText(ctx, era0062); err == nil ||
+	if _, err := newTestMessageStore(tx).SendPrivateText(ctx, era0062); err == nil ||
 		errors.Is(err, domain.ErrMessageRandomIDDuplicate) ||
 		!strings.Contains(err.Error(), "invalid immutable sender receipt") {
 		t.Fatalf("0062-era unknown receipt err = %v, want explicit invalid receipt failure", err)

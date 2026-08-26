@@ -74,7 +74,7 @@ func (r *Router) handleRemoteInlineBotQuery(ctx context.Context, event store.Bot
 	if date <= 0 {
 		date = int(r.clock.Now().Unix())
 	}
-	r.pushUserMessage(ctx, event.BotUserID, "push remote bot inline query", &tg.Updates{
+	r.pushUserMessageTransient(ctx, event.BotUserID, "push remote bot inline query", &tg.Updates{
 		Updates: []tg.UpdateClass{update},
 		Date:    date,
 	})

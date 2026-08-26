@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"telesrv/internal/domain"
-	"telesrv/internal/store/postgres/sqlcgen"
 )
 
 func (s *ChannelStore) eventForChannelMessage(ctx context.Context, channelID int64, messageID int) (domain.ChannelUpdateEvent, error) {
@@ -187,22 +186,4 @@ func collectChannelMessageRefs(msg domain.ChannelMessage, currentChannelID int64
 			}
 		}
 	}
-}
-
-type pgChannelMessageIDAllocator struct {
-	db sqlcgen.DBTX
-}
-
-func (a pgChannelMessageIDAllocator) NextChannelMessageID(ctx context.Context, channelID int64) (int, error) {
-	current, err := a.CurrentChannelMessageID(ctx, channelID)
-	if err != nil {
-		return 0, err
-	}
-	return current + 1, nil
-}
-
-func (a pgChannelMessageIDAllocator) CurrentChannelMessageID(ctx context.Context, channelID int64) (int, error) {
-	var id int
-	err := a.db.QueryRow(ctx, `SELECT COALESCE(MAX(id), 0) FROM channel_messages WHERE channel_id = $1`, channelID).Scan(&id)
-	return id, err
 }

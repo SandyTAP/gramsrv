@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 
 	"go.uber.org/zap"
 	xdraw "golang.org/x/image/draw"
@@ -26,26 +27,6 @@ import (
 
 // 头像使用真实的 's'(≤150)/'a'(≤160)/'c'(原图) rendition；图片消息使用
 // 'm' 缩略与 'x' 大图。每个头像 location_key 的元数据尺寸必须与实际 blob 一致。
-
-// UploadProfilePhoto 把已上传文件组装成头像 Photo，落 blob/photos/profile_photos，并设为当前头像。
-func (s *Service) UploadProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64, file domain.UploadedFileRef, date int) (domain.Photo, error) {
-	return s.UploadProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, file, date)
-}
-
-// UploadProfilePhotoKind stores a profile or fallback photo and makes it current for that kind.
-func (s *Service) UploadProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, file domain.UploadedFileRef, date int) (domain.Photo, error) {
-	if date == 0 {
-		date = int(time.Now().Unix())
-	}
-	photo, err := s.CreateAvatarFromUpload(ctx, file)
-	if err != nil {
-		return domain.Photo{}, err
-	}
-	if err := s.media.AddProfilePhotoKind(ctx, ownerType, ownerID, kind, photo.ID, date); err != nil {
-		return domain.Photo{}, err
-	}
-	return photo, nil
-}
 
 // CreatePhotoFromUpload 把已上传文件组装成 Photo（不绑定 profile_photos），用于频道头像 / 图片消息。
 func (s *Service) CreatePhotoFromUpload(ctx context.Context, file domain.UploadedFileRef) (domain.Photo, error) {
@@ -582,23 +563,16 @@ func (s *Service) CreateDocumentFromBytes(ctx context.Context, data []byte, spec
 }
 
 // SetCurrentProfilePhoto 把已存在的 photo 设为当前头像（updateProfilePhoto 选历史头像）。
-func (s *Service) SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int) (domain.Photo, bool, error) {
-	return s.SetCurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date)
+func (s *Service) SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error) {
+	return s.SetCurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date, effects)
 }
 
 // SetCurrentProfilePhotoKind sets an existing photo as current for profile or fallback history.
-func (s *Service) SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error) {
-	photo, ok, err := s.media.GetPhoto(ctx, photoID)
-	if err != nil || !ok {
-		return domain.Photo{}, ok, err
-	}
+func (s *Service) SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error) {
 	if date == 0 {
 		date = int(time.Now().Unix())
 	}
-	if err := s.media.AddProfilePhotoKind(ctx, ownerType, ownerID, kind, photoID, date); err != nil {
-		return domain.Photo{}, false, err
-	}
-	return photo, true, nil
+	return s.media.SetProfilePhotoKindWithDelivery(ctx, ownerType, ownerID, kind, photoID, date, effects)
 }
 
 // CurrentProfilePhoto 返回某 owner 的当前头像 Photo。
@@ -626,17 +600,13 @@ func (s *Service) GetProfilePhotosKind(ctx context.Context, ownerType domain.Pee
 }
 
 // DeleteProfilePhotos 停用指定头像，返回成功停用数量。
-func (s *Service) DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64) (int, error) {
-	return s.DeleteProfilePhotosKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoIDs)
+func (s *Service) DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error) {
+	return s.DeleteProfilePhotosKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoIDs, effects)
 }
 
 // DeleteProfilePhotosKind disables profile/fallback photos of the selected kind.
-func (s *Service) DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64) (int, error) {
-	deleted, err := s.media.DeleteProfilePhotosKind(ctx, ownerType, ownerID, kind, photoIDs)
-	if err != nil {
-		return 0, err
-	}
-	return len(deleted), nil
+func (s *Service) DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error) {
+	return s.media.DeleteProfilePhotosKindWithDelivery(ctx, ownerType, ownerID, kind, photoIDs, effects)
 }
 
 // createPhoto 把字节落 blob（每个尺寸一个 location_key，指向同一内容）并写 photos 表。

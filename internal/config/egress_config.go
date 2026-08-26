@@ -14,11 +14,13 @@ type EgressConfigYAML struct {
 }
 
 type EgressYAML struct {
-	AckServer           GRPCServerYAML `yaml:"ack_server"`
-	Workers             *int           `yaml:"workers"`
-	Batch               *int           `yaml:"batch"`
-	LeaseTimeout        string         `yaml:"lease_timeout"`
-	OutboundPushTimeout string         `yaml:"outbound_push_timeout"`
+	DeliveryServer             GRPCServerYAML `yaml:"delivery_server"`
+	Workers                    *int           `yaml:"workers"`
+	Batch                      *int           `yaml:"batch"`
+	LeaseTimeout               string         `yaml:"lease_timeout"`
+	OutboundPushTimeout        string         `yaml:"outbound_push_timeout"`
+	DeliveryAttemptTimeout     string         `yaml:"delivery_attempt_timeout"`
+	DeliveryClockSkewAllowance string         `yaml:"delivery_clock_skew_allowance"`
 }
 
 // LoadEgress reads the Egress role YAML config and returns the runtime snapshot used by the Egress process.
@@ -27,13 +29,19 @@ func LoadEgress() (EgressConfig, error) {
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}
-		applyEgressAckServerYAML(b, y.Egress.AckServer)
+		applyEgressDeliveryServerYAML(b, y.Egress.DeliveryServer)
 		b.setInt("TELESRV_OUTBOX_WORKERS", y.Egress.Workers)
 		b.setInt("TELESRV_OUTBOX_BATCH", y.Egress.Batch)
 		if err := b.setDuration("TELESRV_OUTBOX_LEASE_TIMEOUT", y.Egress.LeaseTimeout); err != nil {
 			return err
 		}
-		return b.setDuration("TELESRV_OUTBOUND_PUSH_TIMEOUT", y.Egress.OutboundPushTimeout)
+		if err := b.setDuration("TELESRV_OUTBOUND_PUSH_TIMEOUT", y.Egress.OutboundPushTimeout); err != nil {
+			return err
+		}
+		if err := b.setDuration("TELESRV_DELIVERY_ATTEMPT_TIMEOUT", y.Egress.DeliveryAttemptTimeout); err != nil {
+			return err
+		}
+		return b.setDuration("TELESRV_DELIVERY_CLOCK_SKEW_ALLOWANCE", y.Egress.DeliveryClockSkewAllowance)
 	})
 	if err != nil {
 		return EgressConfig{}, err
@@ -60,15 +68,17 @@ type EgressConfig struct {
 	RedisPassword      string
 	RedisDB            int
 
-	EgressAckGRPCAddr            string
-	EgressAckGRPCTLSCertFile     string
-	EgressAckGRPCTLSKeyFile      string
-	EgressAckGRPCTLSClientCAFile string
-	EgressAckToken               string
-	OutboxWorkers                int
-	OutboxBatch                  int
-	OutboxLeaseTimeout           time.Duration
-	OutboundPushTimeout          time.Duration
+	EgressDeliveryGRPCAddr            string
+	EgressDeliveryGRPCTLSCertFile     string
+	EgressDeliveryGRPCTLSKeyFile      string
+	EgressDeliveryGRPCTLSClientCAFile string
+	EgressDeliveryToken               string
+	OutboxWorkers                     int
+	OutboxBatch                       int
+	OutboxLeaseTimeout                time.Duration
+	OutboundPushTimeout               time.Duration
+	DeliveryAttemptTimeout            time.Duration
+	DeliveryClockSkewAllowance        time.Duration
 
 	ChannelRowCacheMaxEntries         int
 	ChannelMemberCacheMaxEntries      int
@@ -126,10 +136,11 @@ func egressConfigFromConfig(c Config) EgressConfig {
 		DC: c.DC, DefaultCountryCode: c.DefaultCountryCode, AdvertiseIP: c.AdvertiseIP, AdvertisePort: c.AdvertisePort, InstanceID: c.InstanceID,
 		PostgresDSN: c.PostgresDSN, PostgresMaxConns: c.PostgresMaxConns, PostgresMinConns: c.PostgresMinConns,
 		RedisAddr: c.RedisAddr, RedisPassword: c.RedisPassword, RedisDB: c.RedisDB,
-		EgressAckGRPCAddr: c.EgressAckGRPCAddr, EgressAckGRPCTLSCertFile: c.EgressAckGRPCTLSCertFile,
-		EgressAckGRPCTLSKeyFile: c.EgressAckGRPCTLSKeyFile, EgressAckGRPCTLSClientCAFile: c.EgressAckGRPCTLSClientCAFile,
-		EgressAckToken: c.EgressAckToken, OutboxWorkers: c.OutboxWorkers, OutboxBatch: c.OutboxBatch,
+		EgressDeliveryGRPCAddr: c.EgressDeliveryGRPCAddr, EgressDeliveryGRPCTLSCertFile: c.EgressDeliveryGRPCTLSCertFile,
+		EgressDeliveryGRPCTLSKeyFile: c.EgressDeliveryGRPCTLSKeyFile, EgressDeliveryGRPCTLSClientCAFile: c.EgressDeliveryGRPCTLSClientCAFile,
+		EgressDeliveryToken: c.EgressDeliveryToken, OutboxWorkers: c.OutboxWorkers, OutboxBatch: c.OutboxBatch,
 		OutboxLeaseTimeout: c.OutboxLeaseTimeout, OutboundPushTimeout: c.OutboundPushTimeout,
+		DeliveryAttemptTimeout: c.DeliveryAttemptTimeout, DeliveryClockSkewAllowance: c.DeliveryClockSkewAllowance,
 		ChannelRowCacheMaxEntries: c.ChannelRowCacheMaxEntries, ChannelMemberCacheMaxEntries: c.ChannelMemberCacheMaxEntries,
 		ChannelDialogCacheMaxEntries: c.ChannelDialogCacheMaxEntries, ChannelBoostCacheMaxEntries: c.ChannelBoostCacheMaxEntries,
 		ChannelBoostCacheTTL: c.ChannelBoostCacheTTL, OfficialGiftsDir: c.OfficialGiftsDir, PublicBaseURL: c.PublicBaseURL,

@@ -6,7 +6,20 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
+
+func postgresCommunityTestEffects(snapshot storepkg.CommunityDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Targets))
+	for _, target := range snapshot.Targets {
+		effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID:   target.TargetUserID,
+			Payload:        []byte{1},
+			RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
+}
 
 func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 	pool := testPool(t)
@@ -21,7 +34,7 @@ func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create member: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	initial, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Community Initial " + suffix,
@@ -62,7 +75,8 @@ func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id=ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	store := NewCommunityStore(pool, nil, nil)
+	allocators := testAllocatorsFor(pool)
+	store := NewCommunityStore(pool, allocators.channelIDs, allocators.channelMessageIDs)
 	created, err := store.CreateCommunity(ctx, domain.CreateCommunityRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Postgres Community " + suffix,
@@ -88,11 +102,11 @@ func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 		Peer:        domain.Peer{Type: domain.PeerTypeChannel, ID: owned.Channel.ID},
 		Visibility:  domain.CommunityPeerVisible,
 		Date:        1_800_200_003,
-	})
+	}, postgresCommunityTestEffects)
 	if err != nil || !requested.RequestCreated {
 		t.Fatalf("create peer link request = %+v err=%v", requested, err)
 	}
-	approved, err := store.DecideCommunityPeerLinkRequest(ctx, owner.ID, communityID, requested.Peer, false, 1_800_200_004)
+	approved, err := store.DecideCommunityPeerLinkRequest(ctx, owner.ID, communityID, requested.Peer, false, 1_800_200_004, postgresCommunityTestEffects)
 	if err != nil || approved.Link == nil || approved.RequestedBy != member.ID || approved.ServiceMessage == nil {
 		t.Fatalf("approve link request = %+v err=%v", approved, err)
 	}
@@ -149,7 +163,7 @@ func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ban, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, communityID, member.ID, false, 1_800_200_005)
+	ban, err := store.ToggleCommunityParticipantBanned(ctx, owner.ID, communityID, member.ID, false, 1_800_200_005, postgresCommunityTestEffects)
 	if err != nil {
 		t.Fatalf("ban participant: %v", err)
 	}
@@ -165,5 +179,34 @@ func TestCommunityStoreLifecycleIsAtomicInPostgres(t *testing.T) {
 	}
 	if _, err := store.GetCommunity(ctx, member.ID, communityID); !errors.Is(err, domain.ErrCommunityPrivate) {
 		t.Fatalf("banned member get community error = %v, want private", err)
+	}
+
+	var beforeDeliveries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, owner.ID).Scan(&beforeDeliveries); err != nil {
+		t.Fatal(err)
+	}
+	buildErr := errors.New("community payload encoding failed")
+	if _, _, err := store.EditCommunityTitle(ctx, owner.ID, communityID, "must roll back", func(storepkg.CommunityDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("failed delivery edit error = %v", err)
+	}
+	var persistedTitle string
+	if err := pool.QueryRow(ctx, `SELECT title FROM communities WHERE id=$1`, communityID).Scan(&persistedTitle); err != nil || persistedTitle == "must roll back" {
+		t.Fatalf("title after failed delivery = %q err=%v", persistedTitle, err)
+	}
+	var afterFailedDeliveries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, owner.ID).Scan(&afterFailedDeliveries); err != nil || afterFailedDeliveries != beforeDeliveries {
+		t.Fatalf("deliveries after rollback = %d err=%v, want %d", afterFailedDeliveries, err, beforeDeliveries)
+	}
+	if _, changed, err := store.EditCommunityTitle(ctx, owner.ID, communityID, "atomic title", postgresCommunityTestEffects); err != nil || !changed {
+		t.Fatalf("successful delivery edit changed=%v err=%v", changed, err)
+	}
+	if _, changed, err := store.EditCommunityTitle(ctx, owner.ID, communityID, "atomic title", postgresCommunityTestEffects); err != nil || changed {
+		t.Fatalf("idempotent delivery edit changed=%v err=%v", changed, err)
+	}
+	var afterSuccessDeliveries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, owner.ID).Scan(&afterSuccessDeliveries); err != nil || afterSuccessDeliveries != beforeDeliveries+1 {
+		t.Fatalf("deliveries after success+noop = %d err=%v, want %d", afterSuccessDeliveries, err, beforeDeliveries+1)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -101,27 +102,31 @@ func TestQuickRepliesLifecycle(t *testing.T) {
 	if err != nil || !available {
 		t.Fatalf("CheckQuickReplyShortcut available=%v err=%v", available, err)
 	}
-	mutation, err := svc.SaveQuickReplyText(ctx, userID, "hello", domain.QuickReplyMessage{
-		RandomID: 11,
-		Date:     123,
-		Message:  "First template",
-		Entities: []domain.MessageEntity{{Type: domain.MessageEntityItalic, Offset: 0, Length: 5}},
-	})
+	first, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountSaveText, UserID: userID, Date: 123, Shortcut: "hello",
+		Message: domain.QuickReplyMessage{
+			RandomID: 11,
+			Date:     123,
+			Message:  "First template",
+			Entities: []domain.MessageEntity{{Type: domain.MessageEntityItalic, Offset: 0, Length: 5}},
+		},
+	}, accountQuickReplyTestEffects)
 	if err != nil {
 		t.Fatalf("SaveQuickReplyText first: %v", err)
 	}
+	mutation := first.Result
 	if mutation.Kind != domain.QuickReplyMutationNew || mutation.ShortcutID == 0 || mutation.Message.ID == 0 {
 		t.Fatalf("first mutation = %+v", mutation)
 	}
 	shortcutID := mutation.ShortcutID
-	second, err := svc.SaveQuickReplyText(ctx, userID, "hello", domain.QuickReplyMessage{
-		RandomID: 12,
-		Date:     124,
-		Message:  "Second template",
-	})
+	secondSnapshot, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountSaveText, UserID: userID, Date: 124, Shortcut: "hello",
+		Message: domain.QuickReplyMessage{RandomID: 12, Date: 124, Message: "Second template"},
+	}, accountQuickReplyTestEffects)
 	if err != nil {
 		t.Fatalf("SaveQuickReplyText second: %v", err)
 	}
+	second := secondSnapshot.Result
 	if second.Kind != domain.QuickReplyMutationMessage || second.ShortcutID != shortcutID {
 		t.Fatalf("second mutation = %+v", second)
 	}
@@ -136,23 +141,59 @@ func TestQuickRepliesLifecycle(t *testing.T) {
 	if err != nil || msgs.Count != 2 || len(msgs.Messages) != 2 || msgs.Hash == 0 {
 		t.Fatalf("GetQuickReplyMessages = %+v err=%v", msgs, err)
 	}
-	if _, err := svc.RenameQuickReplyShortcut(ctx, userID, shortcutID, "renamed"); err != nil {
+	if _, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountRenameShortcut, UserID: userID, Date: 125, ShortcutID: shortcutID, Shortcut: "renamed",
+	}, accountQuickReplyTestEffects); err != nil {
 		t.Fatalf("RenameQuickReplyShortcut: %v", err)
 	}
-	if _, err := svc.ReorderQuickReplies(ctx, userID, []int{shortcutID}); err != nil {
+	if _, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountReorder, UserID: userID, Date: 126, Order: []int{shortcutID},
+	}, accountQuickReplyTestEffects); err != nil {
 		t.Fatalf("ReorderQuickReplies: %v", err)
 	}
-	deleteMutation, err := svc.DeleteQuickReplyMessages(ctx, userID, shortcutID, []int{msgs.Messages[0].ID})
+	deletedMessages, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountDeleteMessages, UserID: userID, Date: 127,
+		ShortcutID: shortcutID, MessageIDs: []int{msgs.Messages[0].ID},
+	}, accountQuickReplyTestEffects)
 	if err != nil {
 		t.Fatalf("DeleteQuickReplyMessages: %v", err)
 	}
+	deleteMutation := deletedMessages.Result
 	if deleteMutation.Kind != domain.QuickReplyMutationIDs || len(deleteMutation.MessageIDs) != 1 {
 		t.Fatalf("delete mutation = %+v", deleteMutation)
 	}
-	if _, err := svc.DeleteQuickReplyShortcut(ctx, userID, shortcutID); err != nil {
+	if _, err := svc.MutateQuickReplies(ctx, storepkg.QuickReplyAccountMutation{
+		Kind: storepkg.QuickReplyAccountDeleteShortcut, UserID: userID, Date: 128, ShortcutID: shortcutID,
+	}, accountQuickReplyTestEffects); err != nil {
 		t.Fatalf("DeleteQuickReplyShortcut: %v", err)
 	}
 	if _, err := svc.GetQuickReplyMessages(ctx, userID, shortcutID, nil); !errors.Is(err, domain.ErrShortcutInvalid) {
 		t.Fatalf("GetQuickReplyMessages deleted err = %v, want ErrShortcutInvalid", err)
 	}
+}
+
+func accountQuickReplyTestEffects(snapshot storepkg.QuickReplyAccountMutationSnapshot) ([]storepkg.DeliveryEffect, error) {
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	result := snapshot.Result
+	event := domain.UpdateEvent{
+		Date: snapshot.Mutation.Date, PtsCount: 1, MaxID: result.ShortcutID,
+		QuickReplies: append([]domain.QuickReply(nil), result.List.QuickReplies...),
+		QuickReply:   result.QuickReply, QuickReplyMessage: result.Message,
+		MessageIDs: append([]int(nil), result.MessageIDs...),
+	}
+	switch result.Kind {
+	case domain.QuickReplyMutationNew:
+		event.Type = domain.UpdateEventNewQuickReply
+	case domain.QuickReplyMutationMessage:
+		event.Type = domain.UpdateEventQuickReplyMessage
+	case domain.QuickReplyMutationDelete:
+		event.Type = domain.UpdateEventDeleteQuickReply
+	case domain.QuickReplyMutationIDs:
+		event.Type = domain.UpdateEventDeleteQuickReplyMessages
+	default:
+		event.Type = domain.UpdateEventQuickReplies
+	}
+	return []storepkg.DeliveryEffect{storepkg.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }

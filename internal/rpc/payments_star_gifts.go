@@ -17,6 +17,7 @@ import (
 
 	"telesrv/internal/branding"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // Star gift（payments.* 礼物 RPC）：目录 / 购买表单 / 发送 / 收礼列表 / 展示切换 / 转换回 Stars。
@@ -114,11 +115,10 @@ func (r *Router) onPaymentsGetGiveawayInfo(ctx context.Context, req *tg.Payments
 	if peer.Type != domain.PeerTypeChannel || peer.ID <= 0 {
 		return nil, peerIDInvalidErr()
 	}
-	service, ok := r.deps.Stars.(starsGiveawayInfoService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
-	info, err := service.GetGiveawayInfo(ctx, userID, peer.ID, req.MsgID, int(r.clock.Now().Unix()))
+	info, err := r.deps.Stars.GetGiveawayInfo(ctx, userID, peer.ID, req.MsgID, int(r.clock.Now().Unix()))
 	if err != nil {
 		if errors.Is(err, domain.ErrMessageIDInvalid) {
 			return nil, messageIDInvalidErr()
@@ -144,16 +144,47 @@ func (r *Router) onPaymentsGetGiveawayInfo(ctx context.Context, req *tg.Payments
 	return out, nil
 }
 
-type starsPurchaseService interface {
-	IssuePurchaseForm(context.Context, domain.StarsPurchaseForm) (domain.StarsPurchaseForm, error)
-	Purchase(context.Context, domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error)
-}
-
-type starsGiveawayInfoService interface {
-	GetGiveawayInfo(context.Context, int64, int64, int, int) (domain.StarsGiveawayInfo, error)
-}
-
 func userGiftUnavailableErr() error { return tgerr.New(400, "USER_GIFT_UNAVAILABLE") }
+
+func (r *Router) starsPurchaseDeliveryEffects(req domain.StarsPurchaseRequest) store.DeliveryEffectsBuilder[domain.StarsPurchaseResult] {
+	return func(result domain.StarsPurchaseResult) ([]store.DeliveryEffect, error) {
+		if result.Balance.UserID == 0 {
+			return nil, nil
+		}
+		var excludeAuthKeyID [8]byte
+		var excludeSessionID int64
+		if result.Balance.UserID == req.BuyerUserID {
+			excludeAuthKeyID = req.OriginAuthKeyID
+			excludeSessionID = req.OriginSessionID
+		}
+		return r.starsBalanceDeliveryEffects(result.Balance, excludeAuthKeyID, excludeSessionID)
+	}
+}
+
+func (r *Router) starGiftPurchaseDeliveryEffects(req domain.StarGiftPurchaseRequest) store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult] {
+	return func(result domain.StarGiftPurchaseResult) ([]store.DeliveryEffect, error) {
+		if result.Balance.UserID != req.BuyerUserID {
+			return nil, fmt.Errorf("star gift purchase balance owner %d does not match buyer %d", result.Balance.UserID, req.BuyerUserID)
+		}
+		return r.starsBalanceDeliveryEffects(result.Balance, req.OriginAuthKeyID, req.OriginSessionID)
+	}
+}
+
+func (r *Router) starGiftConvertDeliveryEffects(result domain.StarGiftConvertResult) ([]store.DeliveryEffect, error) {
+	switch result.Saved.Owner.Type {
+	case domain.PeerTypeUser:
+		if result.Saved.ConvertStars <= 0 {
+			return nil, nil
+		}
+		return r.starsBalanceDeliveryEffects(domain.StarsBalance{
+			UserID: result.Saved.Owner.ID, Balance: result.OwnerBalance,
+		}, [8]byte{}, 0)
+	case domain.PeerTypeChannel:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("star gift conversion owner is invalid")
+	}
+}
 
 func (r *Router) onPaymentsGetStarsGiftOptions(ctx context.Context, req *tg.PaymentsGetStarsGiftOptionsRequest) ([]tg.StarsGiftOption, error) {
 	userID, _, err := r.currentUserID(ctx)
@@ -315,12 +346,11 @@ func (r *Router) starsGiveawayPaymentForm(ctx context.Context, buyerUserID int64
 	if err != nil {
 		return nil, err
 	}
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
 	now := int(r.clock.Now().Unix())
-	form, err := service.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
+	form, err := r.deps.Stars.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
 		Kind: domain.StarsPurchaseGiveaway, BuyerUserID: buyerUserID, Giveaway: giveaway,
 		Stars: purpose.Stars, Currency: purpose.Currency, Amount: purpose.Amount,
 		IssuedAt: now, ExpiresAt: now + 600,
@@ -541,12 +571,11 @@ func (r *Router) starsGiftPaymentForm(ctx context.Context, buyerUserID int64, pu
 	if err != nil {
 		return nil, err
 	}
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
 	now := int(r.clock.Now().Unix())
-	form, err := service.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
+	form, err := r.deps.Stars.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
 		Kind: domain.StarsPurchaseGift, BuyerUserID: buyerUserID, RecipientUserID: recipient.ID,
 		Stars: purpose.Stars, Currency: purpose.Currency, Amount: purpose.Amount,
 		IssuedAt: now, ExpiresAt: now + 600,
@@ -669,21 +698,12 @@ func (r *Router) onPaymentsSendStarsForm(ctx context.Context, req *tg.PaymentsSe
 			return nil, err
 		}
 	}
-	if capability, ok := r.deps.Gifts.(interface{ AtomicPurchaseConfigured() bool }); ok && !capability.AtomicPurchaseConfigured() {
-		if err := r.deps.Gifts.ValidatePurchaseForm(ctx, purchaseReq); err != nil {
-			return nil, starGiftLifecycleErr(err)
-		}
-		if _, err := r.deps.Stars.GetBalance(ctx, userID); err != nil {
-			return nil, starsErr(err)
-		}
-		return r.sendStarGiftMemoryPurchase(ctx, userID, peer, gift, inv, giftMessage, giftMessageEntities, upgradeStars)
-	}
 	if _, err := r.deps.Stars.GetBalance(ctx, userID); err != nil {
 		return nil, starsErr(err)
 	}
 	purchaseReq.RecipientBlocked = recipientBlocked
 	purchaseReq.RecipientUnsaved = recipientUnsaved
-	result, err := r.deps.Gifts.Purchase(ctx, purchaseReq)
+	result, err := r.deps.Gifts.PurchaseWithDelivery(ctx, purchaseReq, r.starGiftPurchaseDeliveryEffects(purchaseReq))
 	if err != nil {
 		return nil, starGiftLifecycleErr(err)
 	}
@@ -744,18 +764,18 @@ func (r *Router) sendStarsGiftPurchase(ctx context.Context, buyerUserID, formID 
 	if err != nil {
 		return nil, err
 	}
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
-	result, err := service.Purchase(ctx, domain.StarsPurchaseRequest{
+	purchaseReq := domain.StarsPurchaseRequest{
 		StarsPurchaseForm: domain.StarsPurchaseForm{
 			FormID: formID, Kind: domain.StarsPurchaseGift, BuyerUserID: buyerUserID, RecipientUserID: recipient.ID,
 			Stars: purpose.Stars, Currency: purpose.Currency, Amount: purpose.Amount,
 		},
 		Date: int(r.clock.Now().Unix()), OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
 		OriginSessionID: sessionIDOrZero(ctx),
-	})
+	}
+	result, err := r.deps.Stars.PurchaseWithDelivery(ctx, purchaseReq, r.starsPurchaseDeliveryEffects(purchaseReq))
 	if err != nil {
 		return nil, starsPurchaseErr(err)
 	}
@@ -771,18 +791,18 @@ func (r *Router) sendStarsGiveawayPurchase(ctx context.Context, buyerUserID, for
 	if err != nil {
 		return nil, err
 	}
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
-	result, err := service.Purchase(ctx, domain.StarsPurchaseRequest{
+	purchaseReq := domain.StarsPurchaseRequest{
 		StarsPurchaseForm: domain.StarsPurchaseForm{
 			FormID: formID, Kind: domain.StarsPurchaseGiveaway, BuyerUserID: buyerUserID, Giveaway: giveaway,
 			Stars: purpose.Stars, Currency: purpose.Currency, Amount: purpose.Amount,
 		},
 		Date: int(r.clock.Now().Unix()), OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
 		OriginSessionID: sessionIDOrZero(ctx),
-	})
+	}
+	result, err := r.deps.Stars.PurchaseWithDelivery(ctx, purchaseReq, r.starsPurchaseDeliveryEffects(purchaseReq))
 	if err != nil {
 		if errors.Is(err, domain.ErrChannelInvalid) || errors.Is(err, domain.ErrChannelPrivate) ||
 			errors.Is(err, domain.ErrChannelWriteForbidden) || errors.Is(err, domain.ErrChannelAdminRequired) ||
@@ -796,10 +816,10 @@ func (r *Router) sendStarsGiveawayPurchase(ctx context.Context, buyerUserID, for
 		updates = &tg.Updates{Date: int(r.clock.Now().Unix())}
 	}
 	if !result.Duplicate {
-		if err := r.enqueueChannelMessageFanout(ctx, buyerUserID, result.ChannelSend, nil); err != nil {
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, buyerUserID, result.ChannelSend); err != nil {
 			return nil, internalErr()
 		}
-		if err := r.pushChannelDiscussionUpdate(ctx, buyerUserID, result.ChannelSend.Discussion); err != nil {
+		if err := r.enqueueBotAPIChannelDiscussionUpdate(ctx, buyerUserID, result.ChannelSend.Discussion); err != nil {
 			return nil, internalErr()
 		}
 	}
@@ -817,33 +837,6 @@ func starsPurchaseErr(err error) error {
 	default:
 		return internalErr()
 	}
-}
-
-func (r *Router) sendStarGiftMemoryPurchase(ctx context.Context, userID int64, peer domain.Peer, gift domain.StarGift,
-	inv *tg.InputInvoiceStarGift, giftMessage string, giftMessageEntities []domain.MessageEntity, upgradeStars int64) (tg.PaymentsPaymentResultClass, error) {
-	purchaseStars := gift.Stars + upgradeStars
-	balance, err := r.deps.Stars.Debit(ctx, userID, purchaseStars, domain.StarsReasonGift, peer, "Star gift", gift.Title)
-	if err != nil {
-		return nil, starsErr(err)
-	}
-	var updates *tg.Updates
-	switch peer.Type {
-	case domain.PeerTypeUser:
-		_, updates, err = r.sendStarGiftToUser(ctx, userID, peer.ID, gift, inv.HideName, giftMessage, giftMessageEntities, upgradeStars)
-	case domain.PeerTypeChannel:
-		_, updates, err = r.sendStarGiftToChannel(ctx, userID, peer.ID, gift, inv.HideName, giftMessage, giftMessageEntities, upgradeStars)
-	default:
-		err = domain.ErrStarGiftInvalid
-	}
-	if err != nil {
-		r.refundStarGift(ctx, userID, peer, gift, purchaseStars)
-		return nil, internalErr()
-	}
-	if updates == nil {
-		updates = emptyGiftUpdates(r.clock.Now().Unix())
-	}
-	appendStarGiftBalanceUpdate(updates, domain.StarGiftCurrencyStars, balance.Balance)
-	return &tg.PaymentsPaymentResult{Updates: updates}, nil
 }
 
 func starsTopupPurpose(inv *tg.InputInvoiceStars) (*tg.InputStorePaymentStarsTopup, bool) {
@@ -882,8 +875,7 @@ func (r *Router) validateStarsTopupPurpose(ctx context.Context, userID int64, pu
 }
 
 func (r *Router) starsTopupPaymentForm(ctx context.Context, userID int64, purpose *tg.InputStorePaymentStarsTopup) (tg.PaymentsPaymentFormClass, error) {
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
 	_, peer, err := r.validateStarsTopupPurpose(ctx, userID, purpose)
@@ -891,7 +883,7 @@ func (r *Router) starsTopupPaymentForm(ctx context.Context, userID int64, purpos
 		return nil, err
 	}
 	now := int(r.clock.Now().Unix())
-	form, err := service.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
+	form, err := r.deps.Stars.IssuePurchaseForm(ctx, domain.StarsPurchaseForm{
 		Kind: domain.StarsPurchaseTopup, BuyerUserID: userID,
 		SpendPurposePeer: peer,
 		Stars:            purpose.Stars, Currency: purpose.Currency, Amount: purpose.Amount,
@@ -913,15 +905,14 @@ func (r *Router) sendStarsTopupForm(ctx context.Context, userID, formID int64, i
 	if formID == 0 {
 		return nil, formIDEmptyErr()
 	}
-	service, ok := r.deps.Stars.(starsPurchaseService)
-	if !ok {
+	if r.deps.Stars == nil {
 		return nil, notImplementedErr()
 	}
 	_, peer, err := r.validateStarsTopupPurpose(ctx, userID, purpose)
 	if err != nil {
 		return nil, err
 	}
-	result, err := service.Purchase(ctx, domain.StarsPurchaseRequest{
+	purchaseReq := domain.StarsPurchaseRequest{
 		StarsPurchaseForm: domain.StarsPurchaseForm{
 			FormID: formID, Kind: domain.StarsPurchaseTopup, BuyerUserID: userID,
 			SpendPurposePeer: peer,
@@ -929,7 +920,8 @@ func (r *Router) sendStarsTopupForm(ctx context.Context, userID, formID int64, i
 		},
 		Date: int(r.clock.Now().Unix()), OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
 		OriginSessionID: sessionIDOrZero(ctx),
-	})
+	}
+	result, err := r.deps.Stars.PurchaseWithDelivery(ctx, purchaseReq, r.starsPurchaseDeliveryEffects(purchaseReq))
 	if err != nil {
 		return nil, starsPurchaseErr(err)
 	}
@@ -1079,13 +1071,6 @@ func (r *Router) deliverStarGift(ctx context.Context, senderID, recipientID int6
 		OriginSessionID:  sessionID,
 		RecipientBlocked: recipientBlocked,
 	})
-}
-
-// refundStarGift 补偿退款（投递/记账失败时把已 Debit 的星退回）。
-func (r *Router) refundStarGift(ctx context.Context, userID int64, peer domain.Peer, gift domain.StarGift, amount int64) {
-	if _, err := r.deps.Stars.Credit(ctx, userID, amount, domain.StarsReasonGift, peer, "Star gift refund", gift.Title); err != nil {
-		r.log.Error("star gift refund failed", zap.Int64("user_id", userID), zap.Int64("gift_id", gift.ID), zap.Error(err))
-	}
 }
 
 // onPaymentsGetSavedStarGifts 返回某 peer 收到的礼物列表（末页省略 next_offset）。
@@ -1246,39 +1231,11 @@ func (r *Router) onPaymentsConvertStarGift(ctx context.Context, ref tg.InputSave
 	if err := r.ensureCanManageStarGiftOwner(ctx, userID, dref.Owner); err != nil {
 		return false, err
 	}
-	// The isolated memory RPC adapter intentionally has no aggregate store. Keep
-	// its conversion primitive usable for tests, but never use this split write
-	// path when the production lifecycle coordinator is configured. Channel
-	// balances have no memory adapter because crediting an administrator would
-	// violate owner-scoped accounting.
-	if converter, ok := r.deps.Gifts.(interface {
-		AtomicPurchaseConfigured() bool
-		Convert(context.Context, domain.SavedStarGiftRef) (domain.SavedStarGift, error)
-	}); ok && !converter.AtomicPurchaseConfigured() {
-		if dref.Owner.Type != domain.PeerTypeUser || dref.Owner.ID != userID {
-			return false, notImplementedErr()
-		}
-		updated, convertErr := converter.Convert(ctx, dref)
-		if convertErr != nil {
-			if errors.Is(convertErr, domain.ErrStarGiftNotFound) || errors.Is(convertErr, domain.ErrStarGiftAlreadyConverted) {
-				return false, starGiftInvalidErr()
-			}
-			return false, internalErr()
-		}
-		if updated.ConvertStars > 0 {
-			if _, creditErr := r.deps.Stars.Credit(ctx, userID, updated.ConvertStars, domain.StarsReasonGift,
-				dref.Owner, "Star gift conversion", "Converted Star Gift"); creditErr != nil {
-				return false, internalErr()
-			}
-		}
-		r.invalidateStarGiftOwnerProjection(dref.Owner)
-		return true, nil
-	}
-	result, err := r.deps.Gifts.ConvertAggregate(ctx, domain.StarGiftConvertRequest{
+	result, err := r.deps.Gifts.ConvertAggregateWithDelivery(ctx, domain.StarGiftConvertRequest{
 		ActorUserID: userID,
 		Ref:         dref,
 		Date:        int(r.clock.Now().Unix()),
-	})
+	}, r.starGiftConvertDeliveryEffects)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrStarGiftNotFound),

@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -101,6 +102,40 @@ RETURNING balance, granted`, userID, amount).Scan(&out.Balance, &out.Granted); e
 	return out, nil
 }
 
+func (s *StarsStore) CreditWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if userID == 0 || amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	out := domain.StarsBalance{UserID: userID}
+	err := withTx(ctx, s.db, "credit stars with delivery", func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+INSERT INTO stars_balances (user_id, balance, updated_at) VALUES ($1, $2, now())
+ON CONFLICT (user_id) DO UPDATE SET balance = stars_balances.balance + EXCLUDED.balance, updated_at = now()
+RETURNING balance, granted`, userID, amount).Scan(&out.Balance, &out.Granted); err != nil {
+			return fmt.Errorf("credit stars balance: %w", err)
+		}
+		if err := insertStarsTxn(ctx, tx, userID, amount, reason, peer, date, title, desc); err != nil {
+			return err
+		}
+		intents, err := effects(out)
+		if err != nil {
+			return fmt.Errorf("build stars credit delivery: %w", err)
+		}
+		if err := store.ValidateStarsBalanceDeliveryEffects(userID, intents); err != nil {
+			return err
+		}
+		_, err = applyDeliveryEffectsTx(ctx, tx, intents)
+		return err
+	})
+	if err != nil {
+		return domain.StarsBalance{}, err
+	}
+	return out, nil
+}
+
 func (s *StarsStore) Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string) (domain.StarsBalance, error) {
 	if userID == 0 || amount <= 0 {
 		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
@@ -123,6 +158,69 @@ func (s *StarsStore) Debit(ctx context.Context, userID, amount int64, reason dom
 		}
 		out.Granted = granted
 		return insertStarsTxn(ctx, tx, userID, -amount, reason, peer, date, title, desc)
+	})
+	if err != nil {
+		return domain.StarsBalance{}, err
+	}
+	return out, nil
+}
+
+func (s *StarsStore) DebitWithDelivery(ctx context.Context, userID, amount, startingGrant int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if userID == 0 || amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	out := domain.StarsBalance{UserID: userID, Granted: true}
+	err := withTx(ctx, s.db, "debit stars with delivery", func(tx pgx.Tx) error {
+		var balance int64
+		var granted bool
+		err := tx.QueryRow(ctx, `SELECT balance, granted FROM stars_balances WHERE user_id = $1 FOR UPDATE`, userID).
+			Scan(&balance, &granted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if startingGrant <= 0 {
+				return domain.ErrStarsInsufficient
+			}
+			balance, granted = startingGrant, true
+			if _, err := tx.Exec(ctx, `INSERT INTO stars_balances (user_id, balance, granted, updated_at) VALUES ($1,$2,true,now())`, userID, balance); err != nil {
+				return fmt.Errorf("insert stars balance grant: %w", err)
+			}
+			if err := insertStarsTxn(ctx, tx, userID, startingGrant, domain.StarsReasonGrant, domain.Peer{}, date, "", ""); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return fmt.Errorf("select stars balance for debit: %w", err)
+		} else if !granted && startingGrant > 0 {
+			balance += startingGrant
+			granted = true
+			if _, err := tx.Exec(ctx, `UPDATE stars_balances SET balance=$2,granted=true,updated_at=now() WHERE user_id=$1`, userID, balance); err != nil {
+				return fmt.Errorf("apply stars starting grant: %w", err)
+			}
+			if err := insertStarsTxn(ctx, tx, userID, startingGrant, domain.StarsReasonGrant, domain.Peer{}, date, "", ""); err != nil {
+				return err
+			}
+		}
+		if balance < amount {
+			return domain.ErrStarsInsufficient
+		}
+		if err := tx.QueryRow(ctx, `UPDATE stars_balances SET balance = balance - $2, updated_at = now() WHERE user_id = $1 RETURNING balance`,
+			userID, amount).Scan(&out.Balance); err != nil {
+			return fmt.Errorf("update stars balance debit: %w", err)
+		}
+		out.Granted = granted
+		if err := insertStarsTxn(ctx, tx, userID, -amount, reason, peer, date, title, desc); err != nil {
+			return err
+		}
+		intents, err := effects(out)
+		if err != nil {
+			return fmt.Errorf("build stars debit delivery: %w", err)
+		}
+		if err := store.ValidateStarsBalanceDeliveryEffects(userID, intents); err != nil {
+			return err
+		}
+		_, err = applyDeliveryEffectsTx(ctx, tx, intents)
+		return err
 	})
 	if err != nil {
 		return domain.StarsBalance{}, err

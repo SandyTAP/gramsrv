@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -172,79 +175,150 @@ func (s *MessageStore) ListSavedDialogsByPeers(ctx context.Context, userID int64
 	return out, nil
 }
 
-// ToggleSavedDialogPin 翻转一个子会话的置顶状态；新置顶插到最前。
-// 返回状态是否实际变化。
-func (s *MessageStore) ToggleSavedDialogPin(ctx context.Context, userID int64, peer domain.Peer, pinned bool) (bool, error) {
-	if userID == 0 || peer.Type == "" || peer.ID == 0 {
-		return false, fmt.Errorf("toggle saved dialog pin: invalid input")
+func (s *MessageStore) MutateSavedDialogs(ctx context.Context, mutation store.SavedDialogMutation, effects store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error) {
+	if err := mutation.Validate(); err != nil {
+		return store.SavedDialogMutationSnapshot{}, err
 	}
-	if !pinned {
-		rows, err := s.q.DeleteSavedDialogPin(ctx, sqlcgen.DeleteSavedDialogPinParams{
-			UserID:   userID,
-			PeerType: string(peer.Type),
-			PeerID:   peer.ID,
-		})
-		if err != nil {
-			return false, fmt.Errorf("delete saved dialog pin: %w", err)
+	if effects == nil {
+		return store.SavedDialogMutationSnapshot{}, store.ErrDeliveryOutboxRequired
+	}
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("mutate saved dialogs: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("begin saved dialog mutation: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
 		}
-		return rows > 0, nil
+	}()
+	if err := lockUsersForUpdate(ctx, tx, mutation.UserID); err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("lock saved dialog owner: %w", err)
 	}
-	count, err := s.q.CountSavedDialogPins(ctx, userID)
+	before, err := loadSavedDialogPinOrderTx(ctx, tx, mutation.UserID)
 	if err != nil {
-		return false, fmt.Errorf("count saved dialog pins: %w", err)
+		return store.SavedDialogMutationSnapshot{}, err
 	}
-	if int(count) >= domain.MaxPinnedSavedDialogs {
-		return false, domain.ErrPinnedSavedDialogsTooMuch
+	after := append([]domain.Peer(nil), before...)
+	switch mutation.Kind {
+	case store.SavedDialogSetPinned:
+		index := savedDialogPeerIndex(after, mutation.Peer)
+		if mutation.Pinned && index < 0 {
+			if len(after) >= domain.MaxPinnedSavedDialogs {
+				return store.SavedDialogMutationSnapshot{}, domain.ErrPinnedSavedDialogsTooMuch
+			}
+			after = append([]domain.Peer{mutation.Peer}, after...)
+		} else if !mutation.Pinned && index >= 0 {
+			after = append(after[:index], after[index+1:]...)
+		}
+	case store.SavedDialogReorder:
+		after = append([]domain.Peer(nil), mutation.Order...)
+		if !mutation.Force {
+			seen := make(map[domain.Peer]struct{}, len(after))
+			for _, peer := range after {
+				seen[peer] = struct{}{}
+			}
+			for _, peer := range before {
+				if _, exists := seen[peer]; !exists {
+					after = append(after, peer)
+				}
+			}
+		}
+		if len(after) > domain.MaxPinnedSavedDialogs {
+			return store.SavedDialogMutationSnapshot{}, domain.ErrPinnedSavedDialogsTooMuch
+		}
 	}
-	rows, err := s.q.UpsertSavedDialogPinFront(ctx, sqlcgen.UpsertSavedDialogPinFrontParams{
-		UserID:   userID,
-		PeerType: string(peer.Type),
-		PeerID:   peer.ID,
-	})
+	changed := !savedDialogPeerOrderEqual(before, after)
+	if changed {
+		if err := rewriteSavedDialogPinOrderTx(ctx, tx, mutation.UserID, after); err != nil {
+			return store.SavedDialogMutationSnapshot{}, err
+		}
+	}
+	snapshot := store.SavedDialogMutationSnapshot{Mutation: mutation, Changed: changed, Order: append([]domain.Peer(nil), after...)}
+	intents, err := effects(snapshot)
 	if err != nil {
-		return false, fmt.Errorf("upsert saved dialog pin: %w", err)
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("build saved dialog delivery effects: %w", err)
 	}
-	return rows > 0, nil
+	if err := store.ValidateSavedDialogEffects(snapshot, intents); err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("validate saved dialog delivery effects: %w", err)
+	}
+	allocated, err := applyDeliveryEffectsTx(ctx, tx, intents)
+	if err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("apply saved dialog delivery effects: %w", err)
+	}
+	snapshot.Effects = allocated
+	if err := tx.Commit(ctx); err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("commit saved dialog mutation: %w", err)
+	}
+	committed = true
+	return snapshot, nil
 }
 
-// ReorderPinnedSavedDialogs 全量重排置顶顺序；force 时清掉不在 order 中的
-// 既有置顶（与 messages.reorderPinnedDialogs 的 force 语义一致）。
-func (s *MessageStore) ReorderPinnedSavedDialogs(ctx context.Context, userID int64, order []domain.Peer, force bool) error {
-	if userID == 0 {
-		return fmt.Errorf("reorder pinned saved dialogs: missing user id")
+func loadSavedDialogPinOrderTx(ctx context.Context, tx pgx.Tx, userID int64) ([]domain.Peer, error) {
+	rows, err := tx.Query(ctx, `SELECT peer_type, peer_id FROM saved_dialog_pins WHERE user_id=$1 ORDER BY pinned_order, peer_type, peer_id FOR UPDATE`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("load saved dialog pin order: %w", err)
 	}
-	if len(order) > domain.MaxPinnedSavedDialogs {
-		return domain.ErrPinnedSavedDialogsTooMuch
-	}
-	peerTypes := make([]string, 0, len(order))
-	peerIDs := make([]int64, 0, len(order))
-	for _, peer := range order {
-		if peer.Type == "" || peer.ID == 0 {
-			continue
+	defer rows.Close()
+	var order []domain.Peer
+	for rows.Next() {
+		var peerType string
+		var peerID int64
+		if err := rows.Scan(&peerType, &peerID); err != nil {
+			return nil, err
 		}
-		peerTypes = append(peerTypes, string(peer.Type))
-		peerIDs = append(peerIDs, peer.ID)
+		order = append(order, domain.Peer{Type: domain.PeerType(peerType), ID: peerID})
 	}
-	if force {
-		if err := s.q.ClearSavedDialogPinsNotInOrder(ctx, sqlcgen.ClearSavedDialogPinsNotInOrderParams{
-			UserID:    userID,
-			PeerTypes: peerTypes,
-			PeerIds:   peerIDs,
-		}); err != nil {
-			return fmt.Errorf("clear saved dialog pins not in order: %w", err)
-		}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	if len(peerTypes) == 0 {
+	return order, nil
+}
+
+func rewriteSavedDialogPinOrderTx(ctx context.Context, tx pgx.Tx, userID int64, order []domain.Peer) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM saved_dialog_pins WHERE user_id=$1`, userID); err != nil {
+		return fmt.Errorf("clear saved dialog pin order: %w", err)
+	}
+	if len(order) == 0 {
 		return nil
 	}
-	if err := s.q.ReorderSavedDialogPins(ctx, sqlcgen.ReorderSavedDialogPinsParams{
-		UserID:    userID,
-		PeerTypes: peerTypes,
-		PeerIds:   peerIDs,
-	}); err != nil {
-		return fmt.Errorf("reorder saved dialog pins: %w", err)
+	peerTypes := make([]string, len(order))
+	peerIDs := make([]int64, len(order))
+	for i, peer := range order {
+		peerTypes[i], peerIDs[i] = string(peer.Type), peer.ID
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO saved_dialog_pins(user_id, peer_type, peer_id, pinned_order)
+SELECT $1, input.peer_type, input.peer_id, (input.ordinality - 1)::int
+FROM unnest($2::text[], $3::bigint[]) WITH ORDINALITY AS input(peer_type, peer_id, ordinality)`, userID, peerTypes, peerIDs); err != nil {
+		return fmt.Errorf("write saved dialog pin order: %w", err)
 	}
 	return nil
+}
+
+func savedDialogPeerIndex(peers []domain.Peer, target domain.Peer) int {
+	for i, peer := range peers {
+		if peer == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func savedDialogPeerOrderEqual(a, b []domain.Peer) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteSavedHistory 删除 self-chat 中一个 saved 子会话的消息（单批，

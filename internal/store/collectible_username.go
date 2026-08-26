@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 
 	"telesrv/internal/domain"
 )
@@ -58,4 +59,72 @@ type CollectibleUsernameStore interface {
 	ListCollectibleUsernames(ctx context.Context, filter domain.CollectibleUsernameFilter) ([]domain.CollectibleUsername, error)
 	// CollectibleUsernameTransfers returns the provenance log, newest first.
 	CollectibleUsernameTransfers(ctx context.Context, collectibleID int64, limit int) ([]domain.CollectibleUsernameTransfer, error)
+}
+
+// UsernameAudienceDeliverySnapshot freezes every affected user peer and its
+// bounded known-viewer audience while the username aggregate transaction is
+// still open. Channel peers are intentionally absent: their delivery belongs to
+// the channel aggregate/order domain.
+type UsernameAudienceDeliverySnapshot struct {
+	Users []UserAudienceDeliverySnapshot
+}
+
+type UsernameRegistryDeliveryStore interface {
+	SetUsernameActiveWithDelivery(ctx context.Context, peer domain.Peer, username string, active bool, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (bool, error)
+	ReorderUsernamesWithDelivery(ctx context.Context, peer domain.Peer, order []string, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (bool, error)
+	DeactivateAllUsernamesWithDelivery(ctx context.Context, peer domain.Peer, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (bool, error)
+}
+
+type CollectibleUsernameDeliveryStore interface {
+	MintCollectibleUsernameWithDelivery(ctx context.Context, req domain.MintCollectibleUsernameRequest, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (asset domain.CollectibleUsername, created bool, err error)
+	TransferCollectibleUsernameWithDelivery(ctx context.Context, req domain.TransferCollectibleUsernameRequest, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (asset domain.CollectibleUsername, changed bool, err error)
+	RevokeCollectibleUsernameWithDelivery(ctx context.Context, req domain.RevokeCollectibleUsernameRequest, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (asset domain.CollectibleUsername, changed bool, err error)
+	DeleteCollectibleUsernameWithDelivery(ctx context.Context, req domain.DeleteCollectibleUsernameRequest, effects DeliveryEffectsBuilder[UsernameAudienceDeliverySnapshot]) (deleted bool, err error)
+}
+
+func ValidateUsernameAudienceDeliveryEffects(snapshot UsernameAudienceDeliverySnapshot, effects []DeliveryEffect) error {
+	want := make(map[int64]int)
+	expected := 0
+	seenUsers := make(map[int64]struct{}, len(snapshot.Users))
+	for index, user := range snapshot.Users {
+		if user.User.ID <= 0 {
+			return fmt.Errorf("username delivery snapshot %d has invalid user", index)
+		}
+		if _, duplicate := seenUsers[user.User.ID]; duplicate {
+			return fmt.Errorf("username delivery snapshot duplicates user %d", user.User.ID)
+		}
+		seenUsers[user.User.ID] = struct{}{}
+		seenAudience := make(map[int64]struct{}, len(user.Audience))
+		for _, viewerID := range user.Audience {
+			if viewerID <= 0 {
+				return fmt.Errorf("username delivery snapshot contains invalid viewer")
+			}
+			if _, duplicate := seenAudience[viewerID]; duplicate {
+				return fmt.Errorf("username delivery snapshot duplicates viewer %d", viewerID)
+			}
+			seenAudience[viewerID] = struct{}{}
+			want[viewerID]++
+			expected++
+		}
+	}
+	if len(effects) != expected {
+		return fmt.Errorf("username delivery requires %d effects, got %d", expected, len(effects))
+	}
+	got := make(map[int64]int, len(want))
+	for index := range effects {
+		effect := effects[index]
+		if err := effect.Validate(); err != nil {
+			return fmt.Errorf("username delivery effect %d: %w", index, err)
+		}
+		if effect.Kind != DeliveryEffectAbsolute || want[effect.TargetUserID] == 0 {
+			return fmt.Errorf("username delivery effect %d has unexpected target", index)
+		}
+		got[effect.TargetUserID]++
+	}
+	for target, count := range want {
+		if got[target] != count {
+			return fmt.Errorf("username delivery target %d count %d, want %d", target, got[target], count)
+		}
+	}
+	return nil
 }

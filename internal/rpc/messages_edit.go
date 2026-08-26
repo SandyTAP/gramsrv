@@ -140,9 +140,7 @@ func (r *Router) onMessagesEditMessage(ctx context.Context, req *tg.MessagesEdit
 			return nil, channelEditErr(err)
 		}
 		updates := r.channelEditMessageUpdates(ctx, userID, res)
-		// 编辑 fan-out 异步化 + 跨 viewer 投影预热（设计 Phase 0/Phase 1；P1-x bot 高频 editMessage
-		// 是稳态放大源）。同步 echo 仍走上面单 viewer 的 channelEditMessageUpdates。
-		if err := r.enqueueChannelEditMessageFanout(ctx, userID, res); err != nil {
+		if err := r.enqueueBotAPIChannelEditMessageUpdate(ctx, userID, res); err != nil {
 			return nil, internalErr()
 		}
 		return updates, nil

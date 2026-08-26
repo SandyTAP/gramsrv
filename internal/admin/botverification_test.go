@@ -97,11 +97,11 @@ func (f *fakeBotVerificationService) VerifierSettings(_ context.Context, botID i
 	return f.verifier, nil
 }
 
-func (f *fakeBotVerificationService) GrantVerifier(_ context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+func (f *fakeBotVerificationService) GrantVerifierWithDelivery(_ context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, bool, error) {
 	f.grantCalls++
 	f.granted = settings
 	if f.writeErr != nil {
-		return domain.BotVerifierSettings{}, f.writeErr
+		return domain.BotVerifierSettings{}, false, f.writeErr
 	}
 	settings.Version++
 	if settings.Version == 0 {
@@ -109,22 +109,25 @@ func (f *fakeBotVerificationService) GrantVerifier(_ context.Context, settings d
 	}
 	f.verifier = settings
 	f.hasRow = true
-	return settings, nil
+	return settings, true, nil
 }
 
-func (f *fakeBotVerificationService) SetVerifierEnabled(_ context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+func (f *fakeBotVerificationService) SetVerifierEnabledWithDelivery(_ context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, bool, error) {
 	f.setEnabledCalls++
 	f.setEnabledValue = enabled
 	if f.writeErr != nil {
-		return domain.BotVerifierSettings{}, f.writeErr
+		return domain.BotVerifierSettings{}, false, f.writeErr
 	}
+	changed := f.verifier.Enabled != enabled
 	f.verifier.BotID = botID
 	f.verifier.Enabled = enabled
-	f.verifier.Version++
-	return f.verifier, nil
+	if changed {
+		f.verifier.Version++
+	}
+	return f.verifier, changed, nil
 }
 
-func (f *fakeBotVerificationService) RevokeVerifier(context.Context, int64) (bool, error) {
+func (f *fakeBotVerificationService) RevokeVerifierWithDelivery(context.Context, int64) (bool, error) {
 	f.revokeVerifCalls++
 	if f.writeErr != nil {
 		return false, f.writeErr

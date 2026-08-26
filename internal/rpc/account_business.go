@@ -494,13 +494,9 @@ func (r *Router) recordConnectedBusinessPeerSettings(ctx context.Context, userID
 		return nil
 	}
 	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	event, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, rawAuthKeyIDForOrigin(ctx), sessionID)
+	event, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, [8]byte{}, 0)
 	if err != nil {
 		return err
-	}
-	if sessionID != 0 {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
 	}
 	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return nil

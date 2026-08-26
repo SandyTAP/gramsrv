@@ -851,6 +851,19 @@ func (s *countingOutboxUsersService) ByIDs(_ context.Context, viewerUserID int64
 	return out, nil
 }
 
+func (s *countingOutboxUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	user := s.users[userID]
+	user.ID = userID
+	user = testUserWithEmojiStatus(user, status)
+	return user, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s *countingOutboxUsersService) UpdatePersonalChannelWithDelivery(_ context.Context, userID, channelID int64, _ store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	user := s.users[userID]
+	user.ID, user.PersonalChannelID = userID, channelID
+	return user, nil
+}
+
 type viewerSpecificOutboxUsersService struct {
 	calls         []outboxUsersCall
 	sparseCalls   int
@@ -892,6 +905,15 @@ func (s *viewerSpecificOutboxUsersService) ByIDs(_ context.Context, viewerUserID
 		out = append(out, domain.User{ID: userID, FirstName: viewerSpecificName(viewerUserID)})
 	}
 	return out, nil
+}
+
+func (s *viewerSpecificOutboxUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	user := testUserWithEmojiStatus(domain.User{ID: userID}, status)
+	return user, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s *viewerSpecificOutboxUsersService) UpdatePersonalChannelWithDelivery(_ context.Context, userID, channelID int64, _ store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	return domain.User{ID: userID, PersonalChannelID: channelID}, nil
 }
 
 func viewerSpecificName(viewerUserID int64) string {

@@ -8,16 +8,17 @@ import (
 	"telesrv/internal/domain"
 )
 
-// 群通话推送策略（updateGroupCall / updateGroupCallParticipants / connection 均无
-// pts，不进 getDifference）：扇出对象统一为「在线群成员」（OnlineChannelMemberUserIDs，
+// 群通话瞬时信令策略（updateGroupCall / updateGroupCallParticipants / connection 均无
+// pts，不进 channel difference）：对象统一为「在线群成员」（OnlineChannelMemberUserIDs，
 // MaxChannelRealtimeFanout 封顶）——覆盖未入会的面板观察者（Android 点 banner 的
-// 参与者列表靠它增量刷新）。离线一致性三板斧：服务消息带频道 pts 可补收；banner 靠
+// 参与者列表靠它增量刷新）。带频道 PTS 的 service message 不进入此路径，只由 Egress
+// durable channel lane 投递；banner 靠
 // channel.call_active/call_not_empty flag（拉 dialogs/getFullChannel 重建）；房间内
 // 状态靠 checkGroupCall 与 version 跳号触发 getGroupParticipants 全量 reload 自愈。
 
 // groupCallOnlineRecipients 返回在线群成员（含 originUserID 本人，推送时由
 // pushUserMessage 的 ctx except 排除发起 session、保留其它设备）。
-// 在线索引候选必须过一次 PG active 复核（与 channelFanoutRecipients 同款纵深）：
+// 在线索引候选必须过一次 PG active 复核（与 channelTransientRecipients 同款纵深）：
 // 索引 stale（如踢人窗口）时不得把通话状态/参与者名单继续推给已非成员者。
 func (r *Router) groupCallOnlineRecipients(ctx context.Context, channelID int64) []int64 {
 	provider, ok := r.deps.Sessions.(OnlineUserProvider)
@@ -77,7 +78,7 @@ func (r *Router) pushGroupCallUpdate(ctx context.Context, channel domain.Channel
 		}
 		update := &tg.UpdateGroupCall{Call: tgGroupCall(viewerCall, viewerID, false, r.cfg.PublicBaseURL)}
 		update.SetPeer(&tg.PeerChannel{ChannelID: channel.ID})
-		r.pushUserMessage(ctx, viewerID, "group call update",
+		r.pushUserMessageTransient(ctx, viewerID, "group call update",
 			r.groupCallUpdateContainer(ctx, viewerID, channel, update, []int64{call.CreatorUserID}))
 	}
 }
@@ -103,7 +104,7 @@ func (r *Router) pushGroupCallParticipantsUpdate(ctx context.Context, channel do
 			Participants: tgGroupCallParticipants(rows, viewerID),
 			Version:      call.Version,
 		}
-		r.pushUserMessage(ctx, viewerID, "group call participants",
+		r.pushUserMessageTransient(ctx, viewerID, "group call participants",
 			r.groupCallUpdateContainer(ctx, viewerID, channel, update, userIDs))
 	}
 }
@@ -139,7 +140,7 @@ func (r *Router) pushConferenceGroupCallUpdateTo(ctx context.Context, call domai
 	recipients := r.conferenceCallRecipientsWith(ctx, call.ID, extraUserIDs)
 	for _, viewerID := range recipients {
 		update := &tg.UpdateGroupCall{Call: tgGroupCall(call, viewerID, viewerID == call.CreatorUserID, r.cfg.PublicBaseURL)}
-		r.pushUserMessage(ctx, viewerID, "conference call update",
+		r.pushUserMessageTransient(ctx, viewerID, "conference call update",
 			r.groupCallUpdateContainer(ctx, viewerID, domain.Channel{}, update, []int64{call.CreatorUserID}))
 	}
 }
@@ -159,26 +160,9 @@ func (r *Router) pushConferenceGroupCallParticipantsUpdate(ctx context.Context, 
 			Participants: tgGroupCallParticipants(rows, viewerID),
 			Version:      call.Version,
 		}
-		r.pushUserMessage(ctx, viewerID, "conference call participants",
+		r.pushUserMessageTransient(ctx, viewerID, "conference call participants",
 			r.groupCallUpdateContainer(ctx, viewerID, domain.Channel{}, update, userIDs))
 	}
-}
-
-// pushGroupCallServiceMessage 把 started/ended/invite 服务消息（带频道 pts）推给
-// 活跃成员（res.Recipients）。复用 channelOperationUpdates 的 per-viewer 构建。
-func (r *Router) pushGroupCallServiceMessage(ctx context.Context, originUserID int64, res domain.SendChannelMessageResult) {
-	if res.Event.Pts == 0 {
-		return
-	}
-	op := domain.CreateChannelResult{
-		Channel:    res.Channel,
-		Message:    res.Message,
-		Event:      res.Event,
-		Recipients: res.Recipients,
-	}
-	r.pushChannelUpdates(ctx, originUserID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, op)
-	})
 }
 
 // groupCallMutationFanout 是参与者维度变更后的统一扇出：participants 增量 +
@@ -196,7 +180,7 @@ func (r *Router) groupCallMutationFanout(ctx context.Context, channel domain.Cha
 		if err == nil {
 			channel = updated
 			r.pushGroupCallUpdate(ctx, channel, mut.Call)
-			r.pushChannelStateToMembers(ctx, 0, channel)
+			r.pushTransientChannelStateInvalidation(ctx, 0, channel)
 		}
 	} else {
 		r.pushGroupCallUpdate(ctx, channel, mut.Call)

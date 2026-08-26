@@ -102,29 +102,37 @@ func TestSweepExpiredPremium(t *testing.T) {
 
 func TestUpdateEmojiStatusPremiumGate(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewUserStore()
-	u, _ := store.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000104", FirstName: "S"})
-	svc := NewService(store)
+	users := memory.NewUserStore()
+	events := memory.NewUpdateEventStore()
+	users.AttachUpdateEventStore(events)
+	u, _ := users.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000104", FirstName: "S"})
+	svc := NewService(users)
 
 	// 非会员设置被拒（PREMIUM_ACCOUNT_REQUIRED）。
-	if _, err := svc.UpdateEmojiStatus(ctx, u.ID, domain.UserEmojiStatus{DocumentID: 42}); !errors.Is(err, domain.ErrPremiumRequired) {
+	if _, _, err := svc.UpdateEmojiStatusWithEvent(ctx, u.ID, domain.UserEmojiStatus{DocumentID: 42}, int(time.Now().Unix())); !errors.Is(err, domain.ErrPremiumRequired) {
 		t.Fatalf("non-premium set err = %v, want ErrPremiumRequired", err)
 	}
 
 	// 会员可设置；到期清理后残值不再下发，但显式清除仍允许。
-	if _, err := store.SetPremiumUntil(ctx, u.ID, int(time.Now().Add(time.Hour).Unix())); err != nil {
+	if _, err := users.SetPremiumUntil(ctx, u.ID, int(time.Now().Add(time.Hour).Unix())); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
-	set, err := svc.UpdateEmojiStatus(ctx, u.ID, domain.UserEmojiStatus{DocumentID: 42})
+	set, event, err := svc.UpdateEmojiStatusWithEvent(ctx, u.ID, domain.UserEmojiStatus{DocumentID: 42}, int(time.Now().Unix()))
 	if err != nil || set.EmojiStatusDocumentID != 42 {
 		t.Fatalf("premium set = %+v err %v, want document 42", set, err)
 	}
-	if _, err := store.SetPremiumUntil(ctx, u.ID, 0); err != nil {
+	if event.Pts != 1 || event.PtsCount != 1 {
+		t.Fatalf("premium set event = %+v, want allocated pts 1", event)
+	}
+	if _, err := users.SetPremiumUntil(ctx, u.ID, 0); err != nil {
 		t.Fatalf("downgrade: %v", err)
 	}
-	cleared, err := svc.UpdateEmojiStatus(ctx, u.ID, domain.UserEmojiStatus{})
+	cleared, event, err := svc.UpdateEmojiStatusWithEvent(ctx, u.ID, domain.UserEmojiStatus{}, int(time.Now().Unix()))
 	if err != nil || cleared.EmojiStatusDocumentID != 0 {
 		t.Fatalf("clear after downgrade = %+v err %v, want cleared", cleared, err)
+	}
+	if event.Pts != 2 || event.PtsCount != 1 {
+		t.Fatalf("clear event = %+v, want allocated pts 2", event)
 	}
 }
 

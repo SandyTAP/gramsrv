@@ -170,11 +170,14 @@ func (s *Service) Balance(ctx context.Context, userID int64) (domain.StarsBalanc
 	return s.stars.GetBalance(ctx, userID)
 }
 
-func (s *Service) Purchase(ctx context.Context, req domain.PremiumPurchaseRequest) (domain.PremiumPurchaseResult, error) {
+func (s *Service) PurchaseWithDelivery(ctx context.Context, req domain.PremiumPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error) {
 	if s == nil || s.store == nil {
 		return domain.PremiumPurchaseResult{}, domain.ErrPremiumPlanUnavailable
 	}
-	return s.store.PurchasePremium(ctx, req)
+	if effects == nil {
+		return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.store.PurchasePremiumWithDelivery(ctx, req, effects)
 }
 
 func (s *Service) ActiveEntitlements(ctx context.Context, userID int64, now int) ([]domain.PremiumEntitlement, error) {
@@ -212,11 +215,33 @@ func (s *Service) SweepExpired(ctx context.Context, now, limit int) ([]domain.Us
 	return s.store.SweepPremiumEntitlements(ctx, now, limit)
 }
 
+func (s *Service) SweepExpiredWithDelivery(ctx context.Context, now, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	if s == nil || s.store == nil || effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	delivery, ok := s.store.(store.PremiumExpiryDeliveryStore)
+	if !ok {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	return delivery.SweepPremiumEntitlementsWithDelivery(ctx, now, limit, effects)
+}
+
 func (s *Service) Grant(ctx context.Context, req domain.PremiumAdminGrantRequest) (domain.PremiumEntitlement, domain.User, error) {
 	if s == nil || s.store == nil {
 		return domain.PremiumEntitlement{}, domain.User{}, domain.ErrPremiumPlanUnavailable
 	}
 	return s.store.GrantPremiumEntitlement(ctx, req)
+}
+
+func (s *Service) GrantWithDelivery(ctx context.Context, req domain.PremiumAdminGrantRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.PremiumEntitlement, domain.User, error) {
+	if s == nil || s.store == nil || effects == nil {
+		return domain.PremiumEntitlement{}, domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	delivery, ok := s.store.(store.PremiumAdminDeliveryStore)
+	if !ok {
+		return domain.PremiumEntitlement{}, domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	return delivery.GrantPremiumEntitlementWithDelivery(ctx, req, effects)
 }
 
 func (s *Service) Revoke(ctx context.Context, req domain.PremiumAdminRevokeRequest) (domain.User, error) {
@@ -226,9 +251,31 @@ func (s *Service) Revoke(ctx context.Context, req domain.PremiumAdminRevokeReque
 	return s.store.RevokePremiumEntitlements(ctx, req)
 }
 
+func (s *Service) RevokeWithDelivery(ctx context.Context, req domain.PremiumAdminRevokeRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.User, error) {
+	if s == nil || s.store == nil || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	delivery, ok := s.store.(store.PremiumAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	return delivery.RevokePremiumEntitlementsWithDelivery(ctx, req, effects)
+}
+
 func (s *Service) Refund(ctx context.Context, req domain.PremiumRefundRequest) (domain.PremiumPurchaseResult, error) {
 	if s == nil || s.store == nil {
 		return domain.PremiumPurchaseResult{}, domain.ErrPremiumPaymentNotFound
 	}
 	return s.store.RefundPremiumPayment(ctx, req)
+}
+
+func (s *Service) RefundWithDelivery(ctx context.Context, req domain.PremiumRefundRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error) {
+	if s == nil || s.store == nil || effects == nil {
+		return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	delivery, ok := s.store.(store.PremiumAdminDeliveryStore)
+	if !ok {
+		return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return delivery.RefundPremiumPaymentWithDelivery(ctx, req, effects)
 }

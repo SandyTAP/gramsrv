@@ -7,7 +7,18 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
+
+func postgresPremiumPurchaseEffects(authKeyID [8]byte, sessionID int64) store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult] {
+	return func(result domain.PremiumPurchaseResult) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: result.User.ID, ExcludeAuthKeyID: authKeyID,
+			ExcludeSessionID: sessionID, Payload: []byte{1},
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
 
 func TestPremiumPlanAdminOverrideSurvivesConfigSync(t *testing.T) {
 	pool := testPool(t)
@@ -96,6 +107,7 @@ func TestPremiumPurchaseAtomicConcurrentIdempotentRefundAndExpiry(t *testing.T) 
 	}
 	ids := []int64{buyer.ID, recipient.ID}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id=ANY($1::bigint[])", ids)
 		_, _ = pool.Exec(ctx, `DELETE FROM premium_audit_events
 WHERE target_user_id=ANY($1::bigint[]) OR actor_user_id=ANY($1::bigint[])`, ids)
 		_, _ = pool.Exec(ctx, "DELETE FROM premium_entitlements WHERE user_id=ANY($1::bigint[]) OR source_user_id=ANY($1::bigint[])", ids)
@@ -117,7 +129,7 @@ WHERE target_user_id=ANY($1::bigint[]) OR actor_user_id=ANY($1::bigint[])`, ids)
 		!applied || balance.Balance != 5000 {
 		t.Fatalf("fund buyer = %+v applied=%v err=%v", balance, applied, err)
 	}
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	premium := NewPremiumStore(pool, messages, domain.PremiumBotConfiguredUserID())
 	if err := premium.EnsurePremiumBotIdentity(ctx, "premiumbot"); err != nil {
 		t.Fatalf("ensure Premium bot: %v", err)
@@ -193,6 +205,40 @@ VALUES('occupiedbot','occupiedbot','user',$1,true,true,0)`, buyer.ID); err != ni
 		RecipientUserID: recipient.ID, Months: form.Months, PlanVersion: form.PlanVersion,
 		Message: form.Message, Date: now + 1, CommandKey: "premium-integration-concurrent",
 	}
+	purchaseAuthKeyID := [8]byte{9, 1, 0, 1}
+	request.OriginAuthKeyID = purchaseAuthKeyID
+	request.OriginSessionID = 91
+	wantBuildErr := errors.New("encode premium update failed")
+	if _, err := premium.PurchasePremiumWithDelivery(ctx, request, func(domain.PremiumPurchaseResult) ([]store.DeliveryEffect, error) {
+		return nil, wantBuildErr
+	}); !errors.Is(err, wantBuildErr) {
+		t.Fatalf("failed purchase delivery err=%v, want %v", err, wantBuildErr)
+	}
+	failedBalance, err := stars.GetBalance(ctx, buyer.ID)
+	if err != nil || failedBalance.Balance != 5000 {
+		t.Fatalf("balance after failed delivery = %+v err=%v, want 5000", failedBalance, err)
+	}
+	failedRecipient, recipientFound, err := users.ByID(ctx, recipient.ID)
+	if err != nil || !recipientFound || failedRecipient.PremiumUntil != 0 {
+		t.Fatalf("recipient after failed delivery = %+v found=%v err=%v", failedRecipient, recipientFound, err)
+	}
+	var failedIntentStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM premium_payment_intents WHERE form_id=$1`, form.ID).Scan(&failedIntentStatus); err != nil || failedIntentStatus != string(domain.PremiumPaymentPending) {
+		t.Fatalf("intent after failed delivery status=%q err=%v, want pending", failedIntentStatus, err)
+	}
+	var failedEntitlements, failedDebits, failedMessages, failedDeliveries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM premium_entitlements WHERE user_id=$1`, recipient.ID).Scan(&failedEntitlements); err != nil || failedEntitlements != 0 {
+		t.Fatalf("entitlements after failed delivery=%d err=%v, want 0", failedEntitlements, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stars_transactions WHERE premium_payment_intent_id=(SELECT id FROM premium_payment_intents WHERE form_id=$1)`, form.ID).Scan(&failedDebits); err != nil || failedDebits != 0 {
+		t.Fatalf("debits after failed delivery=%d err=%v, want 0", failedDebits, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM private_messages WHERE sender_user_id=$1 AND recipient_user_id=$2`, buyer.ID, recipient.ID).Scan(&failedMessages); err != nil || failedMessages != 0 {
+		t.Fatalf("messages after failed delivery=%d err=%v, want 0", failedMessages, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, recipient.ID).Scan(&failedDeliveries); err != nil || failedDeliveries != 0 {
+		t.Fatalf("deliveries after failed purchase=%d err=%v, want 0", failedDeliveries, err)
+	}
 
 	results := make([]domain.PremiumPurchaseResult, 2)
 	errs := make([]error, 2)
@@ -203,7 +249,7 @@ VALUES('occupiedbot','occupiedbot','user',$1,true,true,0)`, buyer.ID); err != ni
 		go func(index int) {
 			defer wg.Done()
 			<-start
-			results[index], errs[index] = premium.PurchasePremium(ctx, request)
+			results[index], errs[index] = premium.PurchasePremiumWithDelivery(ctx, request, postgresPremiumPurchaseEffects(purchaseAuthKeyID, 91))
 		}(i)
 	}
 	close(start)
@@ -215,6 +261,25 @@ VALUES('occupiedbot','occupiedbot','user',$1,true,true,0)`, buyer.ID); err != ni
 	}
 	if results[0].Duplicate == results[1].Duplicate {
 		t.Fatalf("duplicate flags = %v/%v, want exactly one replay", results[0].Duplicate, results[1].Duplicate)
+	}
+	replay, err := premium.PurchasePremiumWithDelivery(ctx, request, func(domain.PremiumPurchaseResult) ([]store.DeliveryEffect, error) {
+		t.Fatal("idempotent premium replay invoked delivery builder")
+		return nil, nil
+	})
+	if err != nil || !replay.Duplicate {
+		t.Fatalf("sequential premium replay = %+v err=%v, want duplicate", replay, err)
+	}
+	var purchaseDeliveries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, recipient.ID).Scan(&purchaseDeliveries); err != nil || purchaseDeliveries != 1 {
+		t.Fatalf("purchase deliveries after replays=%d err=%v, want 1", purchaseDeliveries, err)
+	}
+	var storedAuthKey []byte
+	var storedSession int64
+	if err := pool.QueryRow(ctx, `SELECT exclude_auth_key_id,exclude_session_id FROM edge_delivery_outbox WHERE target_user_id=$1`, recipient.ID).Scan(&storedAuthKey, &storedSession); err != nil {
+		t.Fatalf("load premium purchase exclusion: %v", err)
+	}
+	if string(storedAuthKey) != string(purchaseAuthKeyID[:]) || storedSession != 91 {
+		t.Fatalf("premium purchase exclusion=%x/%d, want %x/91", storedAuthKey, storedSession, purchaseAuthKeyID)
 	}
 	if _, err := premium.IssuePremiumPaymentForm(ctx, formRequest); !errors.Is(err, domain.ErrPremiumInvoiceAlreadyPaid) {
 		t.Fatalf("paid invoice reissue err=%v, want ErrPremiumInvoiceAlreadyPaid", err)
@@ -308,12 +373,12 @@ WHERE sender_user_id=$1 AND recipient_user_id=$2`, buyer.ID, recipient.ID).
 		go func(index int) {
 			defer wg.Done()
 			<-startExtensions
-			_, extensionErrs[index] = premium.PurchasePremium(ctx, domain.PremiumPurchaseRequest{
+			_, extensionErrs[index] = premium.PurchasePremiumWithDelivery(ctx, domain.PremiumPurchaseRequest{
 				BuyerUserID: buyer.ID, FormID: additionalForms[index].ID,
 				Kind: domain.PremiumPurchaseGift, RecipientUserID: recipient.ID,
 				Months: plan.Months, PlanVersion: plan.Version, Date: now + 3,
 				CommandKey: "premium-integration-extension-" + string(rune('a'+index)),
-			})
+			}, postgresPremiumPurchaseEffects([8]byte{}, 0))
 		}(i)
 	}
 	close(startExtensions)
@@ -384,11 +449,11 @@ VALUES($1,true) ON CONFLICT(user_id) DO UPDATE SET disallow_premium_gifts=true`,
 	if err != nil {
 		t.Fatalf("issue privacy-restricted form: %v", err)
 	}
-	if _, err := premium.PurchasePremium(ctx, domain.PremiumPurchaseRequest{
+	if _, err := premium.PurchasePremiumWithDelivery(ctx, domain.PremiumPurchaseRequest{
 		BuyerUserID: buyer.ID, FormID: restrictedForm.ID, Kind: domain.PremiumPurchaseGift,
 		RecipientUserID: recipient.ID, Months: plan.Months, PlanVersion: plan.Version,
 		Date: now + 6, CommandKey: "premium-integration-restricted-purchase",
-	}); !errors.Is(err, domain.ErrPremiumRecipientRestricted) {
+	}, postgresPremiumPurchaseEffects([8]byte{}, 0)); !errors.Is(err, domain.ErrPremiumRecipientRestricted) {
 		t.Fatalf("privacy-restricted purchase err=%v", err)
 	}
 	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 3500 {
@@ -414,11 +479,11 @@ VALUES($1,true) ON CONFLICT(user_id) DO UPDATE SET disallow_premium_gifts=true`,
 	if err != nil {
 		t.Fatalf("issue self form: %v", err)
 	}
-	selfPurchase, err := premium.PurchasePremium(ctx, domain.PremiumPurchaseRequest{
+	selfPurchase, err := premium.PurchasePremiumWithDelivery(ctx, domain.PremiumPurchaseRequest{
 		BuyerUserID: buyer.ID, FormID: selfForm.ID, Kind: domain.PremiumPurchaseSelf,
 		RecipientUserID: buyer.ID, Months: plan.Months, PlanVersion: plan.Version,
 		Date: now + 6, CommandKey: "premium-integration-self-purchase",
-	})
+	}, postgresPremiumPurchaseEffects([8]byte{}, 0))
 	if err != nil || selfPurchase.Duplicate || !selfPurchase.User.PremiumActiveAt(int64(now+6)) ||
 		selfPurchase.Balance.Balance != 2750 {
 		t.Fatalf("self purchase = %+v err=%v", selfPurchase, err)
@@ -438,7 +503,24 @@ WHERE sender_user_id=$1 AND recipient_user_id=$2`,
 	if err != nil || !grantedUser.PremiumActiveAt(int64(now+7)) {
 		t.Fatalf("admin grant = %+v user=%+v err=%v", grant, grantedUser, err)
 	}
-	expiredUsers, err := premium.SweepPremiumEntitlements(ctx, grant.ExpiresAt, 10)
+	wantErr := errors.New("encode expiry failed")
+	if _, err := premium.SweepPremiumEntitlementsWithDelivery(ctx, grant.ExpiresAt, 10, func([]domain.User) ([]store.DeliveryEffect, error) {
+		return nil, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("failed expiry sweep error = %v", err)
+	}
+	if current, found, err := users.ByID(ctx, recipient.ID); err != nil || !found || current.PremiumUntil == 0 {
+		t.Fatalf("failed expiry sweep changed user=%+v found=%v err=%v", current, found, err)
+	}
+	expiredUsers, err := premium.SweepPremiumEntitlementsWithDelivery(ctx, grant.ExpiresAt, 10, func(changed []domain.User) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, 0, len(changed))
+		for _, user := range changed {
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: user.ID, Payload: []byte{2}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
+	})
 	if err != nil {
 		t.Fatalf("expiry sweep = %+v err=%v", expiredUsers, err)
 	}
@@ -451,5 +533,9 @@ WHERE sender_user_id=$1 AND recipient_user_id=$2`,
 	}
 	if _, found := expiredByID[recipient.ID]; !found {
 		t.Fatalf("expiry sweep did not report recipient: %+v", expiredUsers)
+	}
+	var expiryDeliveries int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1 AND payload=$2", recipient.ID, []byte{2}).Scan(&expiryDeliveries); err != nil || expiryDeliveries != 1 {
+		t.Fatalf("premium expiry deliveries=%d err=%v, want 1", expiryDeliveries, err)
 	}
 }

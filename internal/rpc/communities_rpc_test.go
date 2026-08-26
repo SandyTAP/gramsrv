@@ -16,8 +16,86 @@ import (
 	appstories "telesrv/internal/app/stories"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+func rpcCommunityTestEffects(snapshot storepkg.CommunityDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Targets))
+	for _, target := range snapshot.Targets {
+		effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID:   target.TargetUserID,
+			Payload:        []byte{1},
+			RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
+}
+
+func TestCommunityDeliveryEffectsEncodeViewerStateAndOriginExclusion(t *testing.T) {
+	r := New(Config{}, Deps{}, zaptest.NewLogger(t), clock.System)
+	authKeyID := [8]byte{7, 6, 5}
+	requestCtx := WithSessionID(WithRawAuthKeyID(WithUserID(context.Background(), 1001), authKeyID), 77)
+	community := domain.Community{ID: 3001, AccessHash: 9001, CreatorUserID: 1001, Title: "Atomic Community", Date: 123}
+	effects, err := r.communityDeliveryEffects(requestCtx, 1001, 456)(storepkg.CommunityDeliverySnapshot{Targets: []storepkg.CommunityDeliveryTarget{
+		{
+			TargetUserID: 1001,
+			View: domain.CommunityView{
+				Community: community,
+				Self:      domain.CommunityMember{CommunityID: community.ID, UserID: 1001, Role: domain.CommunityRoleCreator, Status: domain.CommunityMemberActive},
+				Channels:  []domain.Channel{{ID: 42, AccessHash: 4200, Title: "Linked", Megagroup: true}},
+			},
+		},
+		{
+			TargetUserID: 2002,
+			View: domain.CommunityView{
+				Community: community,
+				Self:      domain.CommunityMember{CommunityID: community.ID, UserID: 2002},
+				Forbidden: true,
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effects) != 2 {
+		t.Fatalf("effects = %+v, want two viewer projections", effects)
+	}
+	byTarget := map[int64]storepkg.DeliveryEffect{}
+	for _, effect := range effects {
+		byTarget[effect.TargetUserID] = effect
+	}
+	actor := byTarget[1001]
+	if actor.ExcludeAuthKeyID != authKeyID || actor.ExcludeSessionID != 77 {
+		t.Fatalf("actor exclusion = %x/%d", actor.ExcludeAuthKeyID, actor.ExcludeSessionID)
+	}
+	requester := byTarget[2002]
+	if requester.ExcludeAuthKeyID != ([8]byte{}) || requester.ExcludeSessionID != 0 {
+		t.Fatalf("cross-user exclusion leaked origin identity = %x/%d", requester.ExcludeAuthKeyID, requester.ExcludeSessionID)
+	}
+	actorDecoded, err := decodeDeliveryUpdate(actor.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorUpdates, ok := actorDecoded.(*tg.Updates)
+	if !ok || actorUpdates.Date != 456 || len(actorUpdates.Chats) != 2 {
+		t.Fatalf("actor payload = %#v", actorDecoded)
+	}
+	if _, ok := actorUpdates.Chats[0].(*tg.Community); !ok {
+		t.Fatalf("actor community = %#v, want full Community", actorUpdates.Chats[0])
+	}
+	requesterDecoded, err := decodeDeliveryUpdate(requester.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requesterUpdates, ok := requesterDecoded.(*tg.Updates)
+	if !ok || len(requesterUpdates.Chats) != 1 {
+		t.Fatalf("requester payload = %#v", requesterDecoded)
+	}
+	if _, ok := requesterUpdates.Chats[0].(*tg.CommunityForbidden); !ok {
+		t.Fatalf("requester community = %#v, want CommunityForbidden", requesterUpdates.Chats[0])
+	}
+}
 
 func communityRPCChannel(t *testing.T, service *appchannels.Service, creator domain.User, title string, members ...domain.User) domain.Channel {
 	t.Helper()
@@ -47,7 +125,7 @@ func TestCommunityDialogsSharePinnedLimit(t *testing.T) {
 	}
 	channels := memory.NewChannelStore()
 	channelService := appchannels.NewService(channels)
-	communityService := appcommunities.NewService(memory.NewCommunityStore(users, channels, nil, nil))
+	communityService := appcommunities.NewService(memory.NewCommunityStore(users, channels, nil, nil, memory.NewDeliveryOutboxStore()))
 	r := New(Config{}, Deps{
 		Users: appusers.NewService(users), Channels: channelService,
 		Communities: communityService, Dialogs: appdialogs.NewService(memory.NewDialogStore(), channels),
@@ -63,7 +141,7 @@ func TestCommunityDialogsSharePinnedLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create community %d: %v", i, err)
 		}
-		if _, _, err := communityService.SetCollapsed(ctx, owner.ID, view.Community.ID, true); err != nil {
+		if _, _, err := communityService.SetCollapsed(ctx, owner.ID, view.Community.ID, true, rpcCommunityTestEffects); err != nil {
 			t.Fatalf("collapse community %d: %v", i, err)
 		}
 		inputs = append(inputs, &tg.InputChannel{ChannelID: view.Community.ID, AccessHash: view.Community.AccessHash})
@@ -138,7 +216,7 @@ func TestCommunitiesRPCLayer228Lifecycle(t *testing.T) {
 	channelStore := memory.NewChannelStore()
 	channelService := appchannels.NewService(channelStore)
 	initial := communityRPCChannel(t, channelService, owner, "Initial", member)
-	communityService := appcommunities.NewService(memory.NewCommunityStore(userStore, channelStore, nil, nil))
+	communityService := appcommunities.NewService(memory.NewCommunityStore(userStore, channelStore, nil, nil, memory.NewDeliveryOutboxStore()))
 	storyStore := memory.NewStoryStore()
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
 		Owner: domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}, ID: 1,

@@ -31,7 +31,7 @@ func TestChannelRowCacheInvalidatesOnNotify(t *testing.T) {
 	}
 
 	cache := NewChannelRowCache(1000)
-	channels := NewChannelStore(pool, WithChannelRowCache(cache))
+	channels := newTestChannelStore(pool, WithChannelRowCache(cache))
 
 	var channelID int64
 	t.Cleanup(func() {

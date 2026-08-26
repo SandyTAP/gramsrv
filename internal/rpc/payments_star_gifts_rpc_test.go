@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,15 +22,18 @@ import (
 	appstars "telesrv/internal/app/stars"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 type starsTopupRPCStore struct {
 	*memory.StarsStore
+	mu         sync.Mutex
 	nextFormID int64
 	forms      map[int64]domain.StarsPurchaseForm
 	settled    map[int64]domain.StarsPurchaseResult
 	channel    domain.Channel
+	outbox     *memory.DeliveryOutboxStore
 }
 
 func devStarsCredentials(formID int64) *tg.InputPaymentCredentials {
@@ -37,20 +41,31 @@ func devStarsCredentials(formID int64) *tg.InputPaymentCredentials {
 }
 
 func newStarsTopupRPCStore() *starsTopupRPCStore {
+	starsStore := memory.NewStarsStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	starsStore.AttachDeliveryOutbox(outbox)
 	return &starsTopupRPCStore{
-		StarsStore: memory.NewStarsStore(), nextFormID: 91000,
+		StarsStore: starsStore, nextFormID: 91000,
 		forms: make(map[int64]domain.StarsPurchaseForm), settled: make(map[int64]domain.StarsPurchaseResult),
+		outbox: outbox,
 	}
 }
 
 func (s *starsTopupRPCStore) IssueStarsPurchaseForm(_ context.Context, form domain.StarsPurchaseForm) (domain.StarsPurchaseForm, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.nextFormID++
 	form.FormID = s.nextFormID
 	s.forms[form.FormID] = form
 	return form, nil
 }
 
-func (s *starsTopupRPCStore) PurchaseStars(ctx context.Context, req domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error) {
+func (s *starsTopupRPCStore) PurchaseStarsWithDelivery(ctx context.Context, req domain.StarsPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
+	if effects == nil {
+		return domain.StarsPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	form, ok := s.forms[req.FormID]
 	if !ok || form.Kind != req.Kind || form.BuyerUserID != req.BuyerUserID ||
 		form.RecipientUserID != req.RecipientUserID || form.SpendPurposePeer != req.SpendPurposePeer ||
@@ -78,18 +93,28 @@ func (s *starsTopupRPCStore) PurchaseStars(ctx context.Context, req domain.Stars
 			Event: domain.ChannelUpdateEvent{ChannelID: g.BoostPeer.ID, Type: domain.ChannelUpdateNewMessage, Pts: 9, PtsCount: 1, Date: req.Date},
 		}
 		result.ChannelSend.Event.Message = result.ChannelSend.Message
+		intents, err := effects(result)
+		if err != nil {
+			return domain.StarsPurchaseResult{}, err
+		}
+		if err := store.ValidateStarsPurchaseDeliveryEffects(result, intents); err != nil {
+			return domain.StarsPurchaseResult{}, err
+		}
 		s.settled[req.FormID] = result
 		return result, nil
 	}
 	if req.Kind != domain.StarsPurchaseTopup {
 		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
 	}
-	balance, err := s.StarsStore.Credit(ctx, req.BuyerUserID, req.Stars, domain.StarsReasonTopup,
-		req.SpendPurposePeer, req.Date, "Stars top-up", "test purchase")
+	transactionID := fmt.Sprintf("stars-topup-test:%d", req.FormID)
+	balance, err := s.StarsStore.CreditWithDelivery(ctx, req.BuyerUserID, req.Stars, domain.StarsReasonTopup,
+		req.SpendPurposePeer, req.Date, "Stars top-up", "test purchase", func(balance domain.StarsBalance) ([]store.DeliveryEffect, error) {
+			return effects(domain.StarsPurchaseResult{Balance: balance, TransactionID: transactionID})
+		})
 	if err != nil {
 		return domain.StarsPurchaseResult{}, err
 	}
-	result := domain.StarsPurchaseResult{Balance: balance, TransactionID: fmt.Sprintf("stars-topup-test:%d", req.FormID)}
+	result := domain.StarsPurchaseResult{Balance: balance, TransactionID: transactionID}
 	s.settled[req.FormID] = result
 	return result, nil
 }
@@ -99,6 +124,299 @@ func (s *starsTopupRPCStore) GetStarsGiveawayInfo(_ context.Context, viewerUserI
 		return domain.StarsGiveawayInfo{}, domain.ErrMessageIDInvalid
 	}
 	return domain.StarsGiveawayInfo{StartDate: 1_700_000_200, Participating: true}, nil
+}
+
+// starGiftAggregateRPCService is an explicit test implementation of the same
+// checkout aggregate required in production. It stages and validates the
+// mandatory balance delivery before mutating the memory stores, serializes form
+// settlement/replay under one owner lock, and never exposes a legacy
+// mutation-only purchase or conversion capability.
+type starGiftAggregateRPCService struct {
+	*appstargifts.Service
+
+	mu            sync.Mutex
+	stars         *memory.StarsStore
+	outbox        *memory.DeliveryOutboxStore
+	messages      *memory.MessageStore
+	channels      *memory.ChannelStore
+	nextFormID    int64
+	forms         map[int64]domain.StarGiftPurchaseForm
+	receipts      map[int64]domain.StarGiftPurchaseResult
+	converted     map[int64]domain.StarGiftConvertResult
+	convertedSeen map[int64]bool
+	startingGrant int64
+}
+
+func newStarGiftAggregateRPCService(base *appstargifts.Service, stars *memory.StarsStore, messages *memory.MessageStore, channels *memory.ChannelStore, startingGrant int64) *starGiftAggregateRPCService {
+	return &starGiftAggregateRPCService{
+		Service: base, stars: stars, messages: messages, channels: channels,
+		nextFormID: 92000, forms: make(map[int64]domain.StarGiftPurchaseForm),
+		receipts: make(map[int64]domain.StarGiftPurchaseResult), converted: make(map[int64]domain.StarGiftConvertResult),
+		convertedSeen: make(map[int64]bool),
+		startingGrant: startingGrant,
+	}
+}
+
+func (s *starGiftAggregateRPCService) IssuePurchaseForm(_ context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error) {
+	if form.FormID != 0 || form.BuyerUserID <= 0 || form.To.ID <= 0 ||
+		(form.To.Type != domain.PeerTypeUser && form.To.Type != domain.PeerTypeChannel) ||
+		form.GiftID <= 0 || form.RevisionID <= 0 || form.ChargeStars <= 0 || form.IssuedAt <= 0 ||
+		form.ExpiresAt != form.IssuedAt+600 || !(domain.PremiumGiftMessage{Text: form.Message, Entities: form.MessageEntities}).Valid() {
+		return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftFormPurposeInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextFormID++
+	form.FormID = s.nextFormID
+	form.MessageEntities = append([]domain.MessageEntity(nil), form.MessageEntities...)
+	s.forms[form.FormID] = form
+	return form, nil
+}
+
+func (s *starGiftAggregateRPCService) PurchaseWithDelivery(ctx context.Context, req domain.StarGiftPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error) {
+	if effects == nil || s == nil || s.Service == nil || s.stars == nil || req.CommandKey == "" {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	form, ok := s.forms[req.FormID]
+	if !ok {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftFormExpired
+	}
+	if form.BuyerUserID != req.BuyerUserID || form.To != req.To || form.GiftID != req.GiftID ||
+		form.RevisionID != req.RevisionID || form.IncludeUpgrade != req.IncludeUpgrade || form.HideName != req.HideName ||
+		form.Message != req.Message || !reflect.DeepEqual(form.MessageEntities, req.MessageEntities) || form.ChargeStars != req.ChargeStars {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftFormPurposeInvalid
+	}
+	if replay, found := s.receipts[req.FormID]; found {
+		replay.Duplicate = true
+		return replay, nil
+	}
+	if req.Date <= 0 || form.ExpiresAt < req.Date {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftFormExpired
+	}
+	gift, found, err := s.Service.GiftRevisionByID(ctx, req.RevisionID)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+	if !found || gift.ID != req.GiftID || (gift.RequirePremium && !req.BuyerPremium) {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftInvalid
+	}
+	upgradeStars := req.ChargeStars - gift.Stars
+	if upgradeStars < 0 || req.IncludeUpgrade != (upgradeStars > 0) || (req.IncludeUpgrade && upgradeStars != gift.UpgradeStars) {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftFormAmountMismatch
+	}
+	current, err := s.stars.GetBalance(ctx, req.BuyerUserID)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+	if !current.Granted && s.startingGrant > 0 {
+		current.Balance += s.startingGrant
+		current.Granted = true
+	}
+	if current.Balance < req.ChargeStars {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarsInsufficient
+	}
+	prepaidHash := ""
+	if !req.IncludeUpgrade && gift.UpgradeStars > 0 {
+		prepaidHash = fmt.Sprintf("rpc-prepaid-%d", req.FormID)
+	}
+	saved := domain.SavedStarGift{
+		Owner: req.To, FromUserID: req.BuyerUserID, GiftID: gift.ID, RevisionID: gift.RevisionID,
+		Date: req.Date, NameHidden: req.HideName, Unsaved: req.RecipientUnsaved,
+		ConvertStars: gift.ConvertStars, PrepaidUpgradeStars: upgradeStars, PrepaidUpgradeHash: prepaidHash,
+		Message: req.Message, MessageEntities: append([]domain.MessageEntity(nil), req.MessageEntities...),
+	}
+	staged := domain.StarGiftPurchaseResult{
+		Gift: gift, Saved: saved,
+		Balance: domain.StarsBalance{UserID: req.BuyerUserID, Balance: current.Balance - req.ChargeStars, Granted: current.Granted},
+	}
+	intents, err := effects(staged)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+	if err := store.ValidateStarGiftPurchaseDeliveryEffects(staged, intents); err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+
+	if req.To.Type == domain.PeerTypeUser {
+		if s.messages == nil {
+			return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftUnavailable
+		}
+		sticker := gift.Sticker
+		sent, err := s.messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
+			SenderUserID: req.BuyerUserID, RecipientUserID: req.To.ID, RandomID: req.FormID, Date: req.Date,
+			OriginUserID: req.BuyerUserID, OriginAuthKeyID: req.OriginAuthKeyID, OriginSessionID: req.OriginSessionID,
+			RecipientBlocked: req.RecipientBlocked,
+			Media: &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
+				Kind: domain.MessageServiceActionStarGift,
+				StarGift: &domain.MessageStarGiftAction{
+					GiftID: gift.ID, Stars: gift.Stars, ConvertStars: gift.ConvertStars, Title: gift.Title, Sticker: &sticker,
+					Message: req.Message, MessageEntities: append([]domain.MessageEntity(nil), req.MessageEntities...),
+					FromUserID: req.BuyerUserID, PeerUserID: req.To.ID, To: req.To, NameHidden: req.HideName, Saved: true,
+					CanUpgrade: gift.UpgradeStars > 0, PrepaidUpgrade: upgradeStars > 0, PrepaidUpgradeHash: prepaidHash,
+					UpgradePriceStars: gift.UpgradeStars, UpgradeStars: upgradeStars,
+				},
+			}},
+		})
+		if err != nil {
+			return domain.StarGiftPurchaseResult{}, err
+		}
+		staged.Send = sent
+		staged.Saved.MsgID = sent.RecipientMessage.ID
+	} else if s.channels == nil {
+		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftUnavailable
+	}
+	savedID, err := s.Service.RecordSavedGift(ctx, staged.Saved)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+	staged.Saved.ID = savedID
+	if req.To.Type == domain.PeerTypeChannel {
+		staged.Saved.SavedID = savedID
+		sticker := gift.Sticker
+		action := domain.ChannelMessageAction{Type: domain.ChannelActionStarGift, StarGift: &domain.MessageStarGiftAction{
+			GiftID: gift.ID, Stars: gift.Stars, ConvertStars: gift.ConvertStars, Title: gift.Title, Sticker: &sticker,
+			Message: req.Message, MessageEntities: append([]domain.MessageEntity(nil), req.MessageEntities...),
+			FromUserID: req.BuyerUserID, PeerChannelID: req.To.ID, SavedID: savedID, NameHidden: req.HideName,
+			Saved: true, CanUpgrade: gift.UpgradeStars > 0, PrepaidUpgrade: upgradeStars > 0,
+			PrepaidUpgradeHash: prepaidHash, UpgradePriceStars: gift.UpgradeStars, UpgradeStars: upgradeStars,
+		}}
+		if err := s.channels.AppendStarGiftAdminLog(ctx, req.To.ID, req.BuyerUserID, savedID, req.Date, action); err != nil {
+			return domain.StarGiftPurchaseResult{}, err
+		}
+	}
+	balance, err := s.stars.DebitWithDelivery(ctx, req.BuyerUserID, req.ChargeStars, s.startingGrant,
+		domain.StarsReasonGift, req.To, req.Date, "Star gift", gift.Title,
+		func(domain.StarsBalance) ([]store.DeliveryEffect, error) {
+			return append([]store.DeliveryEffect(nil), intents...), nil
+		})
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, err
+	}
+	staged.Balance = balance
+	s.receipts[req.FormID] = staged
+	return staged, nil
+}
+
+func (s *starGiftAggregateRPCService) ConvertAggregateWithDelivery(ctx context.Context, req domain.StarGiftConvertRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftConvertResult]) (domain.StarGiftConvertResult, error) {
+	if effects == nil || s == nil || s.Service == nil || s.stars == nil {
+		return domain.StarGiftConvertResult{}, domain.ErrStarGiftUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	saved, found, err := s.Service.GetSaved(ctx, req.Ref)
+	if err != nil || !found {
+		if err != nil {
+			return domain.StarGiftConvertResult{}, err
+		}
+		return domain.StarGiftConvertResult{}, domain.ErrStarGiftNotFound
+	}
+	if _, converted := s.converted[saved.ID]; converted {
+		return domain.StarGiftConvertResult{}, domain.ErrStarGiftAlreadyConverted
+	}
+	if saved.UniqueGiftID != 0 {
+		return domain.StarGiftConvertResult{}, domain.ErrStarGiftAlreadyUpgraded
+	}
+	if saved.Owner.Type == domain.PeerTypeUser && saved.Owner.ID != req.ActorUserID {
+		return domain.StarGiftConvertResult{}, domain.ErrStarGiftOwnerInvalid
+	}
+	result := domain.StarGiftConvertResult{Saved: saved}
+	result.Saved.Converted = true
+	result.Saved.LifecycleStatus = domain.StarGiftLifecycleConverted
+	result.Saved.Unsaved = true
+	result.Saved.PinnedOrder = 0
+	result.Saved.CollectionIDs = nil
+	if saved.Owner.Type == domain.PeerTypeUser {
+		balance, err := s.stars.GetBalance(ctx, saved.Owner.ID)
+		if err != nil {
+			return domain.StarGiftConvertResult{}, err
+		}
+		result.OwnerBalance = balance.Balance + saved.ConvertStars
+	}
+	intents, err := effects(result)
+	if err != nil {
+		return domain.StarGiftConvertResult{}, err
+	}
+	if err := store.ValidateStarGiftConvertDeliveryEffects(result, intents); err != nil {
+		return domain.StarGiftConvertResult{}, err
+	}
+	if saved.Owner.Type == domain.PeerTypeUser && saved.ConvertStars > 0 {
+		balance, err := s.stars.CreditWithDelivery(ctx, saved.Owner.ID, saved.ConvertStars, domain.StarsReasonGift,
+			domain.Peer{Type: domain.PeerTypeUser, ID: saved.FromUserID}, req.Date, "Star gift conversion", "Converted Star Gift",
+			func(domain.StarsBalance) ([]store.DeliveryEffect, error) {
+				return append([]store.DeliveryEffect(nil), intents...), nil
+			})
+		if err != nil {
+			return domain.StarGiftConvertResult{}, err
+		}
+		result.OwnerBalance = balance.Balance
+	}
+	s.converted[saved.ID] = result
+	s.convertedSeen[saved.ID] = !saved.Unsaved
+	return result, nil
+}
+
+func (s *starGiftAggregateRPCService) ListSavedFiltered(ctx context.Context, filter domain.SavedStarGiftFilter) (domain.SavedStarGiftPage, error) {
+	page, err := s.Service.ListSavedFiltered(ctx, filter)
+	if err != nil {
+		return domain.SavedStarGiftPage{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	filtered := page.Gifts[:0]
+	for _, gift := range page.Gifts {
+		if _, converted := s.converted[gift.ID]; converted {
+			page.Count--
+			continue
+		}
+		filtered = append(filtered, gift)
+	}
+	page.Gifts = filtered
+	if page.Count < 0 {
+		page.Count = 0
+	}
+	if len(page.Gifts) == 0 {
+		page.NextOffset = ""
+	}
+	return page, nil
+}
+
+func (s *starGiftAggregateRPCService) ListSaved(ctx context.Context, owner domain.Peer, excludeUnsaved bool, offset string, limit int) (domain.SavedStarGiftPage, error) {
+	return s.ListSavedFiltered(ctx, domain.SavedStarGiftFilter{Owner: owner, ExcludeUnsaved: excludeUnsaved, Offset: offset, Limit: limit})
+}
+
+func (s *starGiftAggregateRPCService) CountSaved(ctx context.Context, owner domain.Peer) (int, error) {
+	count, err := s.Service.CountSaved(ctx, owner)
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, converted := range s.converted {
+		if converted.Saved.Owner == owner && s.convertedSeen[id] {
+			count--
+		}
+	}
+	if count < 0 {
+		count = 0
+	}
+	return count, nil
+}
+
+func (s *starGiftAggregateRPCService) ToggleSaved(ctx context.Context, ref domain.SavedStarGiftRef, unsaved bool) (bool, error) {
+	s.mu.Lock()
+	saved, found, err := s.Service.GetSaved(ctx, ref)
+	if err != nil || !found {
+		s.mu.Unlock()
+		return false, err
+	}
+	_, converted := s.converted[saved.ID]
+	s.mu.Unlock()
+	if converted {
+		return false, domain.ErrStarGiftAlreadyConverted
+	}
+	return s.Service.ToggleSaved(ctx, ref, unsaved)
 }
 
 func starGiftTestRouter(t *testing.T) (*Router, domain.User, domain.User, domain.StarGift) {
@@ -126,8 +444,10 @@ func starGiftTestRouterWithPremium(t *testing.T, requirePremium bool) (*Router, 
 	}
 	giftStore := memory.NewStarGiftStore()
 	giftStore.SeedCatalog([]domain.StarGift{gift})
-	gifts := appstargifts.NewService(giftStore, nil, 2)
 	starsStore := newStarsTopupRPCStore()
+	baseGifts := appstargifts.NewService(giftStore, nil, 2)
+	gifts := newStarGiftAggregateRPCService(baseGifts, starsStore.StarsStore, msgStore, channelStore, 1000)
+	gifts.outbox = starsStore.outbox
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398, PublicBaseURL: "https://links.example.test"}, Deps{
 		Users:    appusers.NewService(users),
 		Messages: appmessages.NewService(msgStore, dialogs),
@@ -309,10 +629,10 @@ func TestStarGiftUserInputResolvesOnlyExplicitChannelNotificationAlias(t *testin
 	if err != nil || !ok || resolved != channelRef {
 		t.Fatalf("channel notification alias = %+v ok=%v err=%v", resolved, ok, err)
 	}
-	fallback, ok, err := r.starGiftRefFromInput(context.Background(), 7102, &tg.InputSavedStarGiftUser{MsgID: 45})
-	wantFallback := domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: 7102}, MsgID: 45}
-	if err != nil || !ok || fallback != wantFallback {
-		t.Fatalf("unknown notification alias = %+v ok=%v err=%v, want user fallback %+v", fallback, ok, err, wantFallback)
+	directUserRef, ok, err := r.starGiftRefFromInput(context.Background(), 7102, &tg.InputSavedStarGiftUser{MsgID: 45})
+	wantDirectUserRef := domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: 7102}, MsgID: 45}
+	if err != nil || !ok || directUserRef != wantDirectUserRef {
+		t.Fatalf("unknown notification alias = %+v ok=%v err=%v, want direct user ref %+v", directUserRef, ok, err, wantDirectUserRef)
 	}
 }
 
@@ -1119,10 +1439,11 @@ func TestStarGiftCollectiblePreviewUpgradeFormUniqueAndServiceProjection(t *test
 	r, sender, owner, gift := starGiftTestRouter(t)
 	ctx := context.Background()
 	ownerCtx := WithUserID(ctx, owner.ID)
-	giftService, ok := r.deps.Gifts.(*appstargifts.Service)
+	aggregate, ok := r.deps.Gifts.(*starGiftAggregateRPCService)
 	if !ok {
 		t.Fatalf("gift service = %T", r.deps.Gifts)
 	}
+	giftService := aggregate.Service
 	model := collectibleRPCAttribute(domain.StarGiftCollectibleModel, 8101, "Aurora")
 	modelTwo := collectibleRPCAttribute(domain.StarGiftCollectibleModel, 8104, "Aurora Two")
 	crafted := collectibleRPCAttribute(domain.StarGiftCollectibleModel, 8103, "Crafted Aurora")
@@ -1251,10 +1572,11 @@ func TestStarGiftCollectiblePreviewUpgradeFormUniqueAndServiceProjection(t *test
 func TestStarGiftUpgradePreviewBoundsRandomSampleWithoutShrinkingFullAttributes(t *testing.T) {
 	r, _, owner, gift := starGiftTestRouter(t)
 	ctx := WithUserID(context.Background(), owner.ID)
-	giftService, ok := r.deps.Gifts.(*appstargifts.Service)
+	aggregate, ok := r.deps.Gifts.(*starGiftAggregateRPCService)
 	if !ok {
 		t.Fatalf("gift service = %T", r.deps.Gifts)
 	}
+	giftService := aggregate.Service
 
 	models := make([]domain.StarGiftCollectibleAttribute, 0, 7)
 	patterns := make([]domain.StarGiftCollectibleAttribute, 0, 6)
@@ -1684,7 +2006,7 @@ func TestStarGiftChannelSaga(t *testing.T) {
 	channel := created.Channel
 	channelPeer := &tg.InputPeerChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash}
 	channelInput := &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash}
-	giftService := r.deps.Gifts.(*appstargifts.Service)
+	giftService := r.deps.Gifts.(*starGiftAggregateRPCService).Service
 	if _, err := giftService.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
 		GiftID: gift.ID, UpgradeStars: 75, SupplyTotal: 10, SlugPrefix: "channel-cake",
 		Models: []domain.StarGiftCollectibleAttribute{
@@ -1903,11 +2225,15 @@ func TestStarGiftInsufficientBalance(t *testing.T) {
 		Sticker: domain.Document{ID: 701, AccessHash: 7, DCID: 2, MimeType: "application/x-tgsticker", Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrSticker}}}}
 	giftStore := memory.NewStarGiftStore()
 	giftStore.SeedCatalog([]domain.StarGift{gift})
+	starsStore := memory.NewStarsStore()
+	starsStore.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
+	baseGifts := appstargifts.NewService(giftStore, nil, 2)
+	gifts := newStarGiftAggregateRPCService(baseGifts, starsStore, msgStore, nil, 1000)
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398, PublicBaseURL: "https://links.example.test"}, Deps{
 		Users:    appusers.NewService(users),
 		Messages: appmessages.NewService(msgStore, dialogs),
-		Stars:    appstars.NewService(memory.NewStarsStore(), appstars.WithStartingGrant(1000)), // < 5000
-		Gifts:    appstargifts.NewService(giftStore, nil, 2),
+		Stars:    appstars.NewService(starsStore, appstars.WithStartingGrant(1000)), // < 5000
+		Gifts:    gifts,
 	}, zaptest.NewLogger(t), clock.System)
 	senderCtx := WithUserID(ctx, sender.ID)
 	inv := &tg.InputInvoiceStarGift{Peer: &tg.InputPeerUser{UserID: recipient.ID, AccessHash: recipient.AccessHash}, GiftID: gift.ID}
@@ -1982,10 +2308,12 @@ func TestStarGiftCanPurchaseSameCatalogGiftTwice(t *testing.T) {
 	}
 }
 
-func TestStarsTopupInvoiceFallbackCreditsBalance(t *testing.T) {
+func TestStarsTopupInvoiceAggregateCreditsBalance(t *testing.T) {
 	r, sender, _, _ := starGiftTestRouter(t)
 	ctx := context.Background()
-	senderCtx := WithUserID(ctx, sender.ID)
+	originAuthKeyID := [8]byte{0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98}
+	const originSessionID int64 = 20991
+	senderCtx := WithRawAuthKeyID(WithSessionID(WithUserID(ctx, sender.ID), originSessionID), originAuthKeyID)
 	opt := devStarsTopupOptions()[1]
 	inv := &tg.InputInvoiceStars{Purpose: &tg.InputStorePaymentStarsTopup{
 		Stars:    opt.Stars,
@@ -2085,6 +2413,12 @@ func TestStarsTopupInvoiceFallbackCreditsBalance(t *testing.T) {
 	}
 	if bal, _ := r.deps.Stars.GetBalance(ctx, sender.ID); bal.Balance != 3500 {
 		t.Fatalf("balance after exact replay = %d, want 3500", bal.Balance)
+	}
+	aggregate := r.deps.Gifts.(*starGiftAggregateRPCService)
+	items := aggregate.outbox.Snapshot()
+	if len(items) != 1 || items[0].TargetUserID != sender.ID ||
+		items[0].ExcludeAuthKeyID != originAuthKeyID || items[0].ExcludeSessionID != originSessionID {
+		t.Fatalf("topup delivery = %+v, want one current-origin-excluded balance update", items)
 	}
 	page, err := r.deps.Stars.ListTransactions(ctx, sender.ID, domain.StarsTransactionQuery{Limit: 10})
 	if err != nil {

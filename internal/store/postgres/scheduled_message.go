@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 const maxScheduledMessagePage = 100
@@ -20,7 +21,7 @@ const maxScheduledMessagePage = 100
 // 认领，避免对端注销等永久失败的到期消息每秒被反复 claim+send。
 const scheduledRetryBackoffSeconds = 30
 
-func (s *MessageStore) CreateScheduledMessage(ctx context.Context, req domain.ScheduleMessageRequest) (domain.ScheduledMessage, error) {
+func (s *MessageStore) CreateScheduledMessage(ctx context.Context, req domain.ScheduleMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
 	if req.OwnerUserID == 0 || req.Peer.ID == 0 || req.ScheduleDate <= 0 {
 		return domain.ScheduledMessage{}, fmt.Errorf("create scheduled message: invalid request")
 	}
@@ -29,6 +30,9 @@ func (s *MessageStore) CreateScheduledMessage(ctx context.Context, req domain.Sc
 	}
 	if req.Message == "" && req.Media.IsZero() && req.RichMessage.IsZero() {
 		return domain.ScheduledMessage{}, fmt.Errorf("create scheduled message: empty message")
+	}
+	if effects == nil {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
@@ -124,6 +128,40 @@ INSERT INTO scheduled_messages (
 	if !ok {
 		return domain.ScheduledMessage{}, fmt.Errorf("create scheduled message: inserted row missing")
 	}
+	var draftEffects []store.DeliveryEffect
+	if req.ClearDraft {
+		topMessageID := 0
+		if req.ReplyTo != nil && req.ReplyTo.TopMessageID > 0 {
+			topMessageID = req.ReplyTo.TopMessageID
+		}
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.OwnerUserID, Date: req.Date,
+			Peer: req.Peer, TopMessageID: topMessageID,
+		}
+		changed, err := NewDialogStore(tx).DeleteDraft(ctx, mutation.UserID, mutation.Peer, mutation.TopMessageID)
+		if err != nil {
+			return domain.ScheduledMessage{}, fmt.Errorf("clear draft in scheduled-message transaction: %w", err)
+		}
+		snapshot := store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		draftEffects, err = sendDraftClearEffects(snapshot)
+		if err != nil {
+			return domain.ScheduledMessage{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(snapshot, draftEffects); err != nil {
+			return domain.ScheduledMessage{}, fmt.Errorf("validate scheduled-message draft effects: %w", err)
+		}
+	}
+	intents, err := effects(msg)
+	if err != nil {
+		return domain.ScheduledMessage{}, fmt.Errorf("build create scheduled delivery effects: %w", err)
+	}
+	if len(intents) == 0 {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+	}
+	intents = append(intents, draftEffects...)
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.ScheduledMessage{}, fmt.Errorf("apply create scheduled delivery effects: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.ScheduledMessage{}, fmt.Errorf("commit create scheduled message: %w", err)
 	}
@@ -135,12 +173,15 @@ func (s *MessageStore) ListScheduledMessages(ctx context.Context, filter domain.
 	return listScheduledMessages(ctx, s.db, filter, false)
 }
 
-func (s *MessageStore) EditScheduledMessage(ctx context.Context, req domain.EditScheduledMessageRequest) (domain.ScheduledMessage, error) {
+func (s *MessageStore) EditScheduledMessage(ctx context.Context, req domain.EditScheduledMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
 	if req.OwnerUserID == 0 || req.Peer.ID == 0 || req.ID <= 0 || req.ScheduleDate <= 0 {
 		return domain.ScheduledMessage{}, domain.ErrMessageIDInvalid
 	}
 	if req.Peer.Type != domain.PeerTypeUser && req.Peer.Type != domain.PeerTypeChannel {
 		return domain.ScheduledMessage{}, domain.ErrMessageIDInvalid
+	}
+	if effects == nil {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
@@ -210,6 +251,16 @@ RETURNING `+scheduledMessageSelectColumns(), req.OwnerUserID, string(req.Peer.Ty
 		}
 		return domain.ScheduledMessage{}, err
 	}
+	intents, err := effects(msg)
+	if err != nil {
+		return domain.ScheduledMessage{}, fmt.Errorf("build edit scheduled delivery effects: %w", err)
+	}
+	if len(intents) == 0 {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.ScheduledMessage{}, fmt.Errorf("apply edit scheduled delivery effects: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.ScheduledMessage{}, fmt.Errorf("commit edit scheduled message: %w", err)
 	}
@@ -221,9 +272,12 @@ func (s *MessageStore) GetScheduledMessages(ctx context.Context, filter domain.S
 	return listScheduledMessages(ctx, s.db, filter, true)
 }
 
-func (s *MessageStore) DeleteScheduledMessages(ctx context.Context, filter domain.ScheduledMessageFilter, date int) ([]domain.ScheduledMessage, error) {
+func (s *MessageStore) DeleteScheduledMessages(ctx context.Context, filter domain.ScheduledMessageFilter, date int, effects store.DeliveryEffectsBuilder[[]domain.ScheduledMessage]) ([]domain.ScheduledMessage, error) {
 	if filter.OwnerUserID == 0 || filter.Peer.ID == 0 || len(filter.IDs) == 0 {
 		return nil, nil
+	}
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -261,6 +315,18 @@ RETURNING `+scheduledMessageSelectColumns(), filter.OwnerUserID, string(filter.P
 	}
 	if err := refreshHasScheduledTx(ctx, tx, filter.OwnerUserID, filter.Peer); err != nil {
 		return nil, err
+	}
+	if len(deleted) > 0 {
+		intents, err := effects(deleted)
+		if err != nil {
+			return nil, fmt.Errorf("build delete scheduled delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return nil, store.ErrDeliveryOutboxRequired
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return nil, fmt.Errorf("apply delete scheduled delivery effects: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit delete scheduled messages: %w", err)
@@ -342,9 +408,12 @@ RETURNING `+scheduledMessageSelectColumnsFor("sm"), now, limit, leaseSeconds, re
 	return scanScheduledMessages(rows)
 }
 
-func (s *MessageStore) MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int) error {
+func (s *MessageStore) MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) error {
 	if ownerUserID == 0 || id <= 0 {
 		return nil
+	}
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -371,17 +440,26 @@ SET state = 'sent',
     updated_at = $4
 WHERE owner_user_id = $1
   AND scheduled_id = $2
-RETURNING peer_type, peer_id`, ownerUserID, id, sentMessageID, date)
-	var peerType string
-	var peerID int64
-	if err := row.Scan(&peerType, &peerID); err != nil {
-		if err == pgx.ErrNoRows {
+RETURNING `+scheduledMessageSelectColumns(), ownerUserID, id, sentMessageID, date)
+	msg, err := scanScheduledMessage(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
 		return fmt.Errorf("mark scheduled sent: %w", err)
 	}
-	if err := refreshHasScheduledTx(ctx, tx, ownerUserID, domain.Peer{Type: domain.PeerType(peerType), ID: peerID}); err != nil {
+	if err := refreshHasScheduledTx(ctx, tx, ownerUserID, msg.Peer); err != nil {
 		return err
+	}
+	intents, err := effects(msg)
+	if err != nil {
+		return fmt.Errorf("build mark scheduled sent delivery effects: %w", err)
+	}
+	if len(intents) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply mark scheduled sent delivery effects: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit mark scheduled sent: %w", err)

@@ -69,6 +69,7 @@ func (s *PrivacyStore) SetPrivacyRulesWithDelivery(ctx context.Context, rules do
 			ExcludeAuthKeyID: excludeAuthKeyID,
 			ExcludeSessionID: excludeSessionID,
 			Payload:          payload,
+			RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 		}); err != nil {
 			return err
 		}

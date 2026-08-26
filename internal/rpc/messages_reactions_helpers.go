@@ -9,12 +9,16 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesUpdateSavedReactionTag(ctx context.Context, req *tg.MessagesUpdateSavedReactionTagRequest) (bool, error) {
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return false, internalErr()
+	}
+	if err := r.requireAccountDelivery(userID, "messages.updateSavedReactionTag"); err != nil {
+		return false, err
 	}
 	reaction, err := domainMessageReactionFromTL(req.Reaction)
 	if err != nil {
@@ -30,20 +34,29 @@ func (r *Router) onMessagesUpdateSavedReactionTag(ctx context.Context, req *tg.M
 	if utf8.RuneCountInString(title) > maxSavedReactionTagTitle {
 		return false, limitInvalidErr()
 	}
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateSavedReactionTags{}},
+		Date:    int(r.clock.Now().Unix()),
+		Seq:     0,
+	})
+	if err != nil {
+		return false, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
 	if r.deps.Messages != nil {
 		if err := r.deps.Messages.UpdateSavedReactionTag(ctx, userID, domain.SavedReactionTag{
 			UserID:   userID,
 			Reaction: reaction,
 			Title:    title,
+		}, func(domain.SavedReactionTag) ([]store.DeliveryEffect, error) {
+			return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+				Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})}, nil
 		}); err != nil {
 			return false, messageReactionErr(err)
 		}
 	}
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateSavedReactionTags{}},
-		Date:    int(r.clock.Now().Unix()),
-		Seq:     0,
-	})
 	return true, nil
 }
 

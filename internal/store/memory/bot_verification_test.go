@@ -8,7 +8,56 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
+
+func botVerificationUserDeliveryEffects(snapshot storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Audience))
+	for _, viewerID := range snapshot.Audience {
+		effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID:   viewerID,
+			Payload:        []byte{1},
+			RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
+}
+
+// Test-only adapters keep the long storage invariant suite readable while
+// exercising the production WithDelivery methods. They are not compiled into
+// the server and therefore cannot recreate a delivery-free write path.
+func (s *BotVerificationStore) swapBotVerifierTestOutbox() func() {
+	s.mu.Lock()
+	original := s.deliveryOutbox
+	s.deliveryOutbox = NewDeliveryOutboxStore()
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.deliveryOutbox = original
+		s.mu.Unlock()
+	}
+}
+
+func (s *BotVerificationStore) UpsertBotVerifierSettings(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+	restore := s.swapBotVerifierTestOutbox()
+	defer restore()
+	mutation, err := s.UpsertBotVerifierSettingsWithDelivery(ctx, settings, botVerificationUserDeliveryEffects)
+	return mutation.Settings, err
+}
+
+func (s *BotVerificationStore) SetBotVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+	restore := s.swapBotVerifierTestOutbox()
+	defer restore()
+	mutation, err := s.SetBotVerifierEnabledWithDelivery(ctx, botID, enabled, botVerificationUserDeliveryEffects)
+	return mutation.Settings, err
+}
+
+func (s *BotVerificationStore) DeleteBotVerifierSettings(ctx context.Context, botID int64) (bool, error) {
+	restore := s.swapBotVerifierTestOutbox()
+	defer restore()
+	mutation, err := s.DeleteBotVerifierSettingsWithDelivery(ctx, botID, botVerificationUserDeliveryEffects)
+	return mutation.Changed, err
+}
 
 func botVerificationUserPeer(id int64) domain.Peer {
 	return domain.Peer{Type: domain.PeerTypeUser, ID: id}
@@ -48,6 +97,239 @@ func botVerificationTestRequest(verifier, applicant int64, peer domain.Peer, use
 		Reason:               "we run the official account for this brand",
 		RequestedDescription: "official brand account",
 		CorrelationID:        fmt.Sprintf("corr-%d", peer.ID),
+	}
+}
+
+func TestBotVerificationUserDeliveryAtomicMemory(t *testing.T) {
+	ctx := context.Background()
+	st := NewBotVerificationStore()
+	outbox := NewDeliveryOutboxStore()
+	st.AttachDeliveryOutbox(outbox)
+	const verifierID, targetID = int64(7101), int64(7102)
+	botVerificationTestVerifier(t, st, verifierID, 8801)
+	mark := domain.CustomVerification{
+		VerifierBotID: verifierID, Peer: botVerificationUserPeer(targetID),
+		IconDocumentID: 8801, Description: "verified", GrantedByUserID: verifierID,
+	}
+	fail := func(storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, errors.New("projection failed")
+	}
+	if _, _, err := st.GrantCustomVerificationWithDelivery(ctx, mark, fail); err == nil {
+		t.Fatal("grant builder failure returned nil")
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, mark.Peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("mark after failed grant = %v, want not found", err)
+	}
+	if got := len(outbox.Snapshot()); got != 0 {
+		t.Fatalf("outbox after failed grant = %d, want 0", got)
+	}
+
+	stored, created, err := st.GrantCustomVerificationWithDelivery(ctx, mark, botVerificationUserDeliveryEffects)
+	if err != nil || !created {
+		t.Fatalf("grant = %+v/%v/%v", stored, created, err)
+	}
+	if got := len(outbox.Snapshot()); got != 1 {
+		t.Fatalf("outbox after grant = %d, want 1", got)
+	}
+	// Exact command replay is a no-op and must not duplicate the effect.
+	replayed, created, err := st.GrantCustomVerificationWithDelivery(ctx, mark, botVerificationUserDeliveryEffects)
+	if err != nil || created || replayed.Version != stored.Version {
+		t.Fatalf("replayed grant = %+v/%v/%v", replayed, created, err)
+	}
+	if got := len(outbox.Snapshot()); got != 1 {
+		t.Fatalf("outbox after grant replay = %d, want 1", got)
+	}
+
+	if _, err := st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, fail); err == nil {
+		t.Fatal("revoke builder failure returned nil")
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, mark.Peer); err != nil {
+		t.Fatalf("failed revoke removed mark: %v", err)
+	}
+	if got := len(outbox.Snapshot()); got != 1 {
+		t.Fatalf("outbox after failed revoke = %d, want 1", got)
+	}
+	removed, err := st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, botVerificationUserDeliveryEffects)
+	if err != nil || !removed {
+		t.Fatalf("revoke = %v/%v", removed, err)
+	}
+	if got := len(outbox.Snapshot()); got != 2 {
+		t.Fatalf("outbox after revoke = %d, want 2", got)
+	}
+	removed, err = st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, botVerificationUserDeliveryEffects)
+	if err != nil || removed || len(outbox.Snapshot()) != 2 {
+		t.Fatalf("replayed revoke = %v/%v, outbox=%d", removed, err, len(outbox.Snapshot()))
+	}
+}
+
+func TestBotVerificationUserDeliveryRequiresAttachedOutboxMemory(t *testing.T) {
+	ctx := context.Background()
+	st := NewBotVerificationStore()
+	const verifierID, targetID = int64(7151), int64(7152)
+	botVerificationTestVerifier(t, st, verifierID, 8851)
+	mark := domain.CustomVerification{
+		VerifierBotID: verifierID, Peer: botVerificationUserPeer(targetID),
+		IconDocumentID: 8851, Description: "verified", GrantedByUserID: verifierID,
+	}
+	if _, _, err := st.GrantCustomVerificationWithDelivery(ctx, mark, botVerificationUserDeliveryEffects); !errors.Is(err, storepkg.ErrDeliveryOutboxRequired) {
+		t.Fatalf("grant without outbox = %v, want ErrDeliveryOutboxRequired", err)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, mark.Peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("unwired grant committed mark: %v", err)
+	}
+}
+
+func TestBotVerifierSettingsDeliveryAtomicMixedMemory(t *testing.T) {
+	ctx := context.Background()
+	st := NewBotVerificationStore()
+	outbox := NewDeliveryOutboxStore()
+	st.AttachDeliveryOutbox(outbox)
+	const verifierID, userID, channelID = int64(7161), int64(7162), int64(7163)
+	current := botVerificationTestVerifier(t, st, verifierID, 8861)
+	for _, peer := range []domain.Peer{botVerificationUserPeer(userID), botVerificationChannelPeer(channelID)} {
+		if _, _, err := st.GrantCustomVerification(ctx, domain.CustomVerification{
+			VerifierBotID: verifierID, Peer: peer, IconDocumentID: 8861,
+			Description: "verified", GrantedByUserID: verifierID,
+		}); err != nil {
+			t.Fatalf("seed mark %v: %v", peer, err)
+		}
+	}
+
+	desired := current
+	desired.CompanyName = "renamed verifier"
+	mutation, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, desired, botVerificationUserDeliveryEffects)
+	if err != nil || !mutation.Changed || len(mutation.AffectedChannelIDs) != 1 || mutation.AffectedChannelIDs[0] != channelID {
+		t.Fatalf("update mutation = %+v/%v", mutation, err)
+	}
+	if got := len(outbox.Snapshot()); got != 2 {
+		t.Fatalf("settings update effects = %d, want verifier + marked user", got)
+	}
+	// The same desired state is an idempotent replay even though its version is
+	// now stale; it neither invokes another append nor emits channel work.
+	replayed, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, desired, botVerificationUserDeliveryEffects)
+	if err != nil || replayed.Changed || len(replayed.AffectedChannelIDs) != 0 || len(outbox.Snapshot()) != 2 {
+		t.Fatalf("replay = %+v/%v, effects=%d", replayed, err, len(outbox.Snapshot()))
+	}
+
+	failing := mutation.Settings
+	failing.CompanyName = "must roll back"
+	buildErr := errors.New("cannot project")
+	if _, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, failing, func(storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("failing update = %v, want builder error", err)
+	}
+	stored, err := st.BotVerifierSettings(ctx, verifierID)
+	if err != nil || stored.CompanyName != mutation.Settings.CompanyName || stored.Version != mutation.Settings.Version || len(outbox.Snapshot()) != 2 {
+		t.Fatalf("state after rollback = %+v/%v, effects=%d", stored, err, len(outbox.Snapshot()))
+	}
+
+	removed, err := st.DeleteBotVerifierSettingsWithDelivery(ctx, verifierID, botVerificationUserDeliveryEffects)
+	if err != nil || !removed.Changed || len(removed.AffectedChannelIDs) != 1 || removed.AffectedChannelIDs[0] != channelID {
+		t.Fatalf("delete mutation = %+v/%v", removed, err)
+	}
+	if got := len(outbox.Snapshot()); got != 4 {
+		t.Fatalf("delete effects = %d, want two additional user effects", got)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, botVerificationUserPeer(userID)); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("user mark survived verifier delete: %v", err)
+	}
+}
+
+func TestBotVerifierSettingsDeliveryFailsClosedWithoutDependenciesMemory(t *testing.T) {
+	ctx := context.Background()
+	settings := domain.BotVerifierSettings{
+		BotID: 7171, IconDocumentID: 8871, CompanyName: "Verifier",
+		Enabled: true, GrantedBy: "operator", GrantReason: "test",
+	}
+	st := NewBotVerificationStore()
+	if _, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, settings, botVerificationUserDeliveryEffects); !errors.Is(err, storepkg.ErrDeliveryOutboxRequired) {
+		t.Fatalf("missing outbox = %v", err)
+	}
+	if _, err := st.BotVerifierSettings(ctx, settings.BotID); !errors.Is(err, domain.ErrVerifierNotFound) {
+		t.Fatalf("missing-outbox mutation committed: %v", err)
+	}
+	st.AttachDeliveryOutbox(NewDeliveryOutboxStore())
+	if _, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, settings, nil); !errors.Is(err, storepkg.ErrDeliveryOutboxRequired) {
+		t.Fatalf("missing builder = %v", err)
+	}
+}
+
+func TestBotVerifierSettingsDeliveryBoundsRollbackMemory(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		peerType domain.PeerType
+		count    int
+	}{
+		{name: "users", peerType: domain.PeerTypeUser, count: storepkg.MaxBotVerifierSettingsDeliveryEffects},
+		{name: "channels", peerType: domain.PeerTypeChannel, count: storepkg.MaxBotVerifierSettingsChannelInvalidations + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := NewBotVerificationStore()
+			outbox := NewDeliveryOutboxStore()
+			st.AttachDeliveryOutbox(outbox)
+			const verifierID = int64(7181)
+			current := botVerificationTestVerifier(t, st, verifierID, 8881)
+			st.mu.Lock()
+			for i := 0; i < test.count; i++ {
+				id := int64(i + 10000)
+				markID := int64(i + 1)
+				peer := domain.Peer{Type: test.peerType, ID: id}
+				mark := domain.CustomVerification{ID: markID, VerifierBotID: verifierID, Peer: peer, IconDocumentID: 8881}
+				st.marks[markID] = mark
+				st.marksByPeer[customVerificationKeyOf(verifierID, peer)] = markID
+			}
+			st.markCounts[verifierID] = test.count
+			st.mu.Unlock()
+
+			if _, err := st.SetBotVerifierEnabledWithDelivery(ctx, verifierID, false, botVerificationUserDeliveryEffects); err == nil {
+				t.Fatal("over-bound mutation returned nil")
+			}
+			stored, err := st.BotVerifierSettings(ctx, verifierID)
+			if err != nil || !stored.Enabled || stored.Version != current.Version || len(outbox.Snapshot()) != 0 {
+				t.Fatalf("over-bound rollback = %+v/%v, effects=%d", stored, err, len(outbox.Snapshot()))
+			}
+		})
+	}
+}
+
+func TestBotVerificationUserDecisionDeliveryRollbackMemory(t *testing.T) {
+	ctx := context.Background()
+	st := NewBotVerificationStore()
+	outbox := NewDeliveryOutboxStore()
+	st.AttachDeliveryOutbox(outbox)
+	const verifierID, applicantID, targetID = int64(7201), int64(7202), int64(7203)
+	botVerificationTestVerifier(t, st, verifierID, 8901)
+	filed, err := st.CreateCustomVerificationRequest(ctx,
+		botVerificationTestRequest(verifierID, applicantID, botVerificationUserPeer(targetID), "target"))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	fail := func(storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, errors.New("projection failed")
+	}
+	_, _, err = st.DecideCustomVerificationRequest(ctx, filed.ID, filed.Version,
+		domain.CustomVerificationApproved, "operator", "ok", "",
+		func(ctx context.Context, req domain.CustomVerificationRequest) error {
+			_, _, err := st.GrantCustomVerificationWithDelivery(ctx, domain.CustomVerification{
+				VerifierBotID: req.VerifierBotID, Peer: req.Peer,
+				IconDocumentID: 8901, Description: "verified", GrantedByUserID: verifierID,
+			}, fail)
+			return err
+		})
+	if err == nil {
+		t.Fatal("decision builder failure returned nil")
+	}
+	current, readErr := st.CustomVerificationRequest(ctx, filed.ID)
+	if readErr != nil || current.Status != domain.CustomVerificationPending || current.Version != filed.Version {
+		t.Fatalf("request after rollback = %+v/%v", current, readErr)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, filed.Peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("mark after decision rollback = %v", err)
+	}
+	if got := len(outbox.Snapshot()); got != 0 {
+		t.Fatalf("outbox after decision rollback = %d, want 0", got)
 	}
 }
 

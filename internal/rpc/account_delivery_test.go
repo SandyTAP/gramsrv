@@ -5,7 +5,6 @@ import (
 
 	"github.com/iamxvbaba/td/tg"
 
-	"telesrv/internal/edgecontrol"
 	"telesrv/internal/store/memory"
 )
 
@@ -27,7 +26,7 @@ func lastQueuedDeliveryUpdates(t *testing.T, delivery *memory.DeliveryOutboxStor
 	if len(items) == 0 {
 		t.Fatal("delivery outbox is empty")
 	}
-	decoded, err := edgecontrol.DecodeOutboxUpdate(items[len(items)-1].Payload)
+	decoded, err := decodeDeliveryUpdate(items[len(items)-1].Payload)
 	if err != nil {
 		t.Fatalf("decode delivery payload: %v", err)
 	}

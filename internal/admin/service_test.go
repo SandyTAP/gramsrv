@@ -17,6 +17,7 @@ import (
 	usernamesapp "telesrv/internal/app/usernames"
 	"telesrv/internal/domain"
 	"telesrv/internal/officialgifts"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -96,7 +97,7 @@ func TestCreateBotReturnsTokenOnceWithoutPersistingCredential(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryCommandRepo()
 	bots := &fakeBotService{token: "test-one-time-bot-credential"}
-	svc := NewService(Dependencies{Commands: repo, Bots: bots, Now: fixedNow})
+	svc := NewService(Dependencies{Commands: repo, Bots: bots, UserAudienceDelivery: testUserAudienceDelivery, Now: fixedNow})
 	req := CreateBotRequest{
 		CommandMeta: CommandMeta{CommandID: "create-bot-once", Actor: "ops", Reason: "requested"},
 		OwnerUserID: 1001,
@@ -128,6 +129,34 @@ func TestCreateBotReturnsTokenOnceWithoutPersistingCredential(t *testing.T) {
 	}
 }
 
+func TestBotLifecycleDeliveryFailsClosedAndDeleteReplayIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	missingDeliveryBots := &fakeBotService{}
+	missingDelivery := NewService(Dependencies{Commands: newMemoryCommandRepo(), Bots: missingDeliveryBots, Now: fixedNow})
+	if _, err := missingDelivery.CreateBot(ctx, CreateBotRequest{
+		CommandMeta: CommandMeta{CommandID: "create-bot-missing-delivery", Actor: "ops", Reason: "test"},
+		OwnerUserID: 1001, Name: "Missing Delivery", Username: "missing_delivery_bot",
+	}); err == nil || missingDeliveryBots.createCalls != 0 {
+		t.Fatalf("missing delivery create err=%v calls=%d", err, missingDeliveryBots.createCalls)
+	}
+
+	repo := newMemoryCommandRepo()
+	bots := &fakeBotService{}
+	svc := NewService(Dependencies{Commands: repo, Bots: bots, UserAudienceDelivery: testUserAudienceDelivery, Now: fixedNow})
+	req := DeleteBotRequest{
+		CommandMeta: CommandMeta{CommandID: "delete-bot-once", Actor: "ops", Reason: "requested"},
+		BotUserID:   2001,
+	}
+	first, err := svc.DeleteBot(ctx, req)
+	if err != nil || bots.deleteCalls != 1 {
+		t.Fatalf("DeleteBot result=%+v calls=%d err=%v", first, bots.deleteCalls, err)
+	}
+	replay, err := svc.DeleteBot(ctx, req)
+	if err != nil || !replay.AlreadyExecuted || bots.deleteCalls != 1 {
+		t.Fatalf("DeleteBot replay=%+v calls=%d err=%v", replay, bots.deleteCalls, err)
+	}
+}
+
 func TestModerationFlagsRejectImpossibleScamFakeState(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryCommandRepo()
@@ -155,19 +184,16 @@ func TestModerationFlagsRejectImpossibleScamFakeState(t *testing.T) {
 	}
 }
 
-func TestSetUserFlagsUsesNonPTSModerationNotifier(t *testing.T) {
+func TestSetUserFlagsUsesAtomicAudienceDelivery(t *testing.T) {
 	ctx := context.Background()
 	users := &fakeUsersService{users: map[int64]domain.User{
 		1001: {ID: 1001, FirstName: "Alice"},
 	}}
-	ordinaryNotifier := &fakeUserNotifier{}
-	moderationNotifier := &fakeUserModerationNotifier{}
 	svc := NewService(Dependencies{
-		Commands:               newMemoryCommandRepo(),
-		Users:                  users,
-		UserNotifier:           ordinaryNotifier,
-		UserModerationNotifier: moderationNotifier,
-		Now:                    fixedNow,
+		Commands:             newMemoryCommandRepo(),
+		Users:                users,
+		UserAudienceDelivery: testUserAudienceDelivery,
+		Now:                  fixedNow,
 	})
 
 	if _, err := svc.SetUserFlags(ctx, SetUserFlagsRequest{
@@ -179,12 +205,6 @@ func TestSetUserFlagsUsesNonPTSModerationNotifier(t *testing.T) {
 	}
 	if got := users.users[1001]; !got.Scam || got.Fake {
 		t.Fatalf("updated user = %+v", got)
-	}
-	if len(moderationNotifier.users) != 1 || moderationNotifier.users[0] != 1001 {
-		t.Fatalf("moderation notifications = %v", moderationNotifier.users)
-	}
-	if len(ordinaryNotifier.users) != 0 {
-		t.Fatalf("ordinary notifications = %v, want dedicated non-PTS path", ordinaryNotifier.users)
 	}
 }
 
@@ -311,12 +331,13 @@ func TestGrantPremiumDryRunExecuteAndIdempotency(t *testing.T) {
 	users := &fakeUsersService{users: map[int64]domain.User{
 		1001: {ID: 1001, FirstName: "Alice"},
 	}}
-	notifier := &fakeUserNotifier{}
+	premium := &fakePremiumService{user: domain.User{ID: 1001, FirstName: "Alice", PremiumUntil: int(fixedNow().AddDate(0, 2, 0).Unix())}, entitlementID: 1}
 	svc := NewService(Dependencies{
-		Commands:     newMemoryCommandRepo(),
-		Users:        users,
-		UserNotifier: notifier,
-		Now:          fixedNow,
+		Commands:            newMemoryCommandRepo(),
+		Users:               users,
+		Premium:             premium,
+		PremiumUserDelivery: testUserBatchDelivery,
+		Now:                 fixedNow,
 	})
 
 	dry, err := svc.GrantPremium(ctx, GrantPremiumRequest{
@@ -327,8 +348,8 @@ func TestGrantPremiumDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry-run premium: %v", err)
 	}
-	if !dry.DryRun || users.grantCalls != 0 || len(notifier.users) != 0 {
-		t.Fatalf("dry=%+v grantCalls=%d notified=%v, want no mutation", dry, users.grantCalls, notifier.users)
+	if !dry.DryRun || premium.grantCalls != 0 {
+		t.Fatalf("dry=%+v grantCalls=%d, want no mutation", dry, premium.grantCalls)
 	}
 
 	req := GrantPremiumRequest{
@@ -340,15 +361,15 @@ func TestGrantPremiumDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute premium: %v", err)
 	}
-	if exec.Status != string(domain.AdminCommandCompleted) || users.grantCalls != 1 || users.lastMonths != 2 || len(notifier.users) != 1 {
-		t.Fatalf("exec=%+v grantCalls=%d months=%d notified=%v", exec, users.grantCalls, users.lastMonths, notifier.users)
+	if exec.Status != string(domain.AdminCommandCompleted) || premium.grantCalls != 1 {
+		t.Fatalf("exec=%+v grantCalls=%d", exec, premium.grantCalls)
 	}
 	again, err := svc.GrantPremium(ctx, req)
 	if err != nil {
 		t.Fatalf("duplicate premium: %v", err)
 	}
-	if !again.AlreadyExecuted || users.grantCalls != 1 || len(notifier.users) != 1 {
-		t.Fatalf("again=%+v grantCalls=%d notified=%v, want idempotent replay", again, users.grantCalls, notifier.users)
+	if !again.AlreadyExecuted || premium.grantCalls != 1 {
+		t.Fatalf("again=%+v grantCalls=%d, want idempotent replay", again, premium.grantCalls)
 	}
 }
 
@@ -356,7 +377,7 @@ func TestGrantPremiumReturnsAndRevokesExactEntitlement(t *testing.T) {
 	ctx := context.Background()
 	users := &fakeUsersService{users: map[int64]domain.User{1001: {ID: 1001, FirstName: "Alice"}}}
 	premium := &fakePremiumService{user: users.users[1001], entitlementID: 77}
-	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Users: users, Premium: premium, Now: fixedNow})
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Users: users, Premium: premium, PremiumUserDelivery: testUserBatchDelivery, Now: fixedNow})
 
 	grant, err := svc.GrantPremium(ctx, GrantPremiumRequest{
 		CommandMeta: CommandMeta{CommandID: "premium-grant-77", Actor: "bot", Reason: "purchase"},
@@ -382,12 +403,11 @@ func TestGrantStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	stars := &fakeStarsService{balances: map[int64]domain.StarsBalance{
 		1001: {UserID: 1001, Balance: 1000, Granted: true},
 	}}
-	notifier := &fakeStarsNotifier{}
 	svc := NewService(Dependencies{
 		Commands:      newMemoryCommandRepo(),
 		Users:         users,
 		Stars:         stars,
-		StarsNotifier: notifier,
+		StarsDelivery: testStarsDelivery,
 		Now:           fixedNow,
 	})
 
@@ -399,8 +419,8 @@ func TestGrantStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry-run stars: %v", err)
 	}
-	if !dry.DryRun || stars.creditCalls != 0 || len(notifier.balances) != 0 {
-		t.Fatalf("dry=%+v creditCalls=%d notified=%v, want no mutation", dry, stars.creditCalls, notifier.balances)
+	if !dry.DryRun || stars.creditCalls != 0 {
+		t.Fatalf("dry=%+v creditCalls=%d, want no mutation", dry, stars.creditCalls)
 	}
 
 	req := GrantStarsRequest{
@@ -412,8 +432,8 @@ func TestGrantStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute stars: %v", err)
 	}
-	if exec.Status != string(domain.AdminCommandCompleted) || stars.creditCalls != 1 || stars.lastAmount != 250 || stars.lastReason != domain.StarsReasonAdjust || len(notifier.balances) != 1 {
-		t.Fatalf("exec=%+v creditCalls=%d amount=%d reason=%s notified=%v", exec, stars.creditCalls, stars.lastAmount, stars.lastReason, notifier.balances)
+	if exec.Status != string(domain.AdminCommandCompleted) || stars.creditCalls != 1 || stars.lastAmount != 250 || stars.lastReason != domain.StarsReasonAdjust {
+		t.Fatalf("exec=%+v creditCalls=%d amount=%d reason=%s", exec, stars.creditCalls, stars.lastAmount, stars.lastReason)
 	}
 	if exec.Details["updated_balance"] != int64(1250) {
 		t.Fatalf("updated_balance=%v, want 1250", exec.Details["updated_balance"])
@@ -422,8 +442,8 @@ func TestGrantStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("duplicate stars: %v", err)
 	}
-	if !again.AlreadyExecuted || stars.creditCalls != 1 || len(notifier.balances) != 1 {
-		t.Fatalf("again=%+v creditCalls=%d notified=%v, want idempotent replay", again, stars.creditCalls, notifier.balances)
+	if !again.AlreadyExecuted || stars.creditCalls != 1 {
+		t.Fatalf("again=%+v creditCalls=%d, want idempotent replay", again, stars.creditCalls)
 	}
 }
 
@@ -431,8 +451,7 @@ func TestDebitStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	ctx := context.Background()
 	users := &fakeUsersService{users: map[int64]domain.User{1001: {ID: 1001, Username: "alice"}}}
 	stars := &fakeStarsService{balances: map[int64]domain.StarsBalance{1001: {UserID: 1001, Balance: 1000, Granted: true}}}
-	notifier := &fakeStarsNotifier{}
-	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Users: users, Stars: stars, StarsNotifier: notifier, Now: fixedNow})
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Users: users, Stars: stars, StarsDelivery: testStarsDelivery, Now: fixedNow})
 
 	dry, err := svc.DebitStars(ctx, DebitStarsRequest{
 		CommandMeta: CommandMeta{CommandID: "dry-debit-stars", Actor: "bot", Reason: "refund", DryRun: true},
@@ -446,12 +465,12 @@ func TestDebitStarsDryRunExecuteAndIdempotency(t *testing.T) {
 		UserID:      1001, Amount: 20,
 	}
 	result, err := svc.DebitStars(ctx, req)
-	if err != nil || stars.debitCalls != 1 || result.Details["updated_balance"] != int64(980) || len(notifier.balances) != 1 {
-		t.Fatalf("result=%+v debitCalls=%d notified=%v err=%v", result, stars.debitCalls, notifier.balances, err)
+	if err != nil || stars.debitCalls != 1 || result.Details["updated_balance"] != int64(980) {
+		t.Fatalf("result=%+v debitCalls=%d err=%v", result, stars.debitCalls, err)
 	}
 	replay, err := svc.DebitStars(ctx, req)
-	if err != nil || !replay.AlreadyExecuted || stars.debitCalls != 1 || len(notifier.balances) != 1 {
-		t.Fatalf("replay=%+v debitCalls=%d notified=%v err=%v", replay, stars.debitCalls, notifier.balances, err)
+	if err != nil || !replay.AlreadyExecuted || stars.debitCalls != 1 {
+		t.Fatalf("replay=%+v debitCalls=%d err=%v", replay, stars.debitCalls, err)
 	}
 }
 
@@ -460,12 +479,11 @@ func TestSetVerifiedDryRunExecuteAndIdempotency(t *testing.T) {
 	users := &fakeUsersService{users: map[int64]domain.User{
 		1001: {ID: 1001, FirstName: "Alice"},
 	}}
-	notifier := &fakeUserNotifier{}
 	svc := NewService(Dependencies{
-		Commands:     newMemoryCommandRepo(),
-		Users:        users,
-		UserNotifier: notifier,
-		Now:          fixedNow,
+		Commands:             newMemoryCommandRepo(),
+		Users:                users,
+		UserAudienceDelivery: testUserAudienceDelivery,
+		Now:                  fixedNow,
 	})
 
 	dry, err := svc.SetVerified(ctx, SetVerifiedRequest{
@@ -476,8 +494,8 @@ func TestSetVerifiedDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry-run verified: %v", err)
 	}
-	if !dry.DryRun || users.verifiedCalls != 0 || len(notifier.users) != 0 {
-		t.Fatalf("dry=%+v verifiedCalls=%d notified=%v, want no mutation", dry, users.verifiedCalls, notifier.users)
+	if !dry.DryRun || users.verifiedCalls != 0 {
+		t.Fatalf("dry=%+v verifiedCalls=%d, want no mutation", dry, users.verifiedCalls)
 	}
 
 	req := SetVerifiedRequest{
@@ -489,15 +507,15 @@ func TestSetVerifiedDryRunExecuteAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute verified: %v", err)
 	}
-	if exec.Status != string(domain.AdminCommandCompleted) || users.verifiedCalls != 1 || !users.users[1001].Verified || len(notifier.users) != 1 {
-		t.Fatalf("exec=%+v verifiedCalls=%d user=%+v notified=%v", exec, users.verifiedCalls, users.users[1001], notifier.users)
+	if exec.Status != string(domain.AdminCommandCompleted) || users.verifiedCalls != 1 || !users.users[1001].Verified {
+		t.Fatalf("exec=%+v verifiedCalls=%d user=%+v", exec, users.verifiedCalls, users.users[1001])
 	}
 	again, err := svc.SetVerified(ctx, req)
 	if err != nil {
 		t.Fatalf("duplicate verified: %v", err)
 	}
-	if !again.AlreadyExecuted || users.verifiedCalls != 1 || len(notifier.users) != 1 {
-		t.Fatalf("again=%+v verifiedCalls=%d notified=%v, want idempotent replay", again, users.verifiedCalls, notifier.users)
+	if !again.AlreadyExecuted || users.verifiedCalls != 1 {
+		t.Fatalf("again=%+v verifiedCalls=%d, want idempotent replay", again, users.verifiedCalls)
 	}
 }
 
@@ -835,14 +853,22 @@ type fakeBotService struct {
 	deleteCalls int
 }
 
-func (f *fakeBotService) CreateBot(_ context.Context, _ int64, name, username string) (domain.User, string, error) {
+func (f *fakeBotService) CreateBotWithDelivery(_ context.Context, ownerUserID int64, name, username string, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, string, error) {
 	f.createCalls++
-	return domain.User{ID: 2001, FirstName: name, Username: username, Bot: true}, f.token, nil
+	bot := domain.User{ID: 2001, FirstName: name, Username: username, Bot: true}
+	if _, err := effects(store.BotLifecycleDeliverySnapshot{Bot: bot, OwnerUserID: ownerUserID}); err != nil {
+		return domain.User{}, "", err
+	}
+	return bot, f.token, nil
 }
 
-func (f *fakeBotService) DeleteBot(_ context.Context, botUserID int64) (domain.User, error) {
+func (f *fakeBotService) DeleteBotWithDelivery(_ context.Context, botUserID int64, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, error) {
 	f.deleteCalls++
-	return domain.User{ID: botUserID, Bot: true, Deleted: true}, nil
+	bot := domain.User{ID: botUserID, Bot: true, Deleted: true}
+	if _, err := effects(store.BotLifecycleDeliverySnapshot{Bot: bot, OwnerUserID: 1, Deleted: true}); err != nil {
+		return domain.User{}, err
+	}
+	return bot, nil
 }
 
 func (f *fakeBotService) AdminExportBotToken(_ context.Context, _ int64) (string, error) {
@@ -1017,49 +1043,61 @@ func (f *fakeUsersService) GrantPremium(_ context.Context, userID int64, months 
 	return u, nil
 }
 
-func (f *fakeUsersService) SetVerified(_ context.Context, userID int64, verified bool) (domain.User, error) {
+func (f *fakeUsersService) SetVerifiedWithDelivery(_ context.Context, userID int64, verified bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	f.verifiedCalls++
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Verified = verified
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) SetScamFake(_ context.Context, userID int64, scam, fake bool) (domain.User, error) {
+func (f *fakeUsersService) SetScamFakeWithDelivery(_ context.Context, userID int64, scam, fake bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Scam = scam
 	u.Fake = fake
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) SetSupport(_ context.Context, userID int64, support bool) (domain.User, error) {
+func (f *fakeUsersService) SetSupportWithDelivery(_ context.Context, userID int64, support bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Support = support
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) UpdateUsername(_ context.Context, userID int64, username string) (domain.User, error) {
+func (f *fakeUsersService) AdminUpdateUsernameWithDelivery(_ context.Context, userID int64, username string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Username = username
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) UpdateColor(_ context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error) {
+func (f *fakeUsersService) AdminUpdateColorWithDelivery(_ context.Context, userID int64, forProfile bool, color domain.PeerColor, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
@@ -1069,20 +1107,29 @@ func (f *fakeUsersService) UpdateColor(_ context.Context, userID int64, forProfi
 	} else {
 		u.Color = color
 	}
-	f.users[userID] = u
-	return u, nil
-}
-
-func (f *fakeUsersService) UpdateEmojiStatus(_ context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error) {
-	u, ok := f.users[userID]
-	if !ok {
-		return domain.User{}, domain.ErrUserNotFound
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
 	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) UpdateProfile(_ context.Context, userID int64, update domain.UserProfileUpdate) (domain.User, error) {
+func (f *fakeUsersService) AdminUpdateEmojiStatusWithDelivery(_ context.Context, userID int64, status domain.UserEmojiStatus, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	u, ok := f.users[userID]
+	if !ok {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	u.EmojiStatusDocumentID = status.DocumentID
+	u.EmojiStatusUntil = status.Until
+	u.EmojiStatusCollectible = status.Collectible
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
+	f.users[userID] = u
+	return u, nil
+}
+
+func (f *fakeUsersService) AdminUpdateProfileWithDelivery(_ context.Context, userID int64, update domain.UserProfileUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
@@ -1093,16 +1140,25 @@ func (f *fakeUsersService) UpdateProfile(_ context.Context, userID int64, update
 	if update.HasLastName {
 		u.LastName = update.LastName
 	}
+	if update.HasAbout {
+		u.About = update.About
+	}
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
 
-func (f *fakeUsersService) SetPhone(_ context.Context, userID int64, phone string) (domain.User, error) {
+func (f *fakeUsersService) AdminSetPhoneWithDelivery(_ context.Context, userID int64, phone string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	u, ok := f.users[userID]
 	if !ok {
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	u.Phone = phone
+	if _, err := effects(store.UserAudienceDeliverySnapshot{User: u, Audience: []int64{userID}}); err != nil {
+		return domain.User{}, err
+	}
 	f.users[userID] = u
 	return u, nil
 }
@@ -1122,6 +1178,7 @@ type fakeStarsService struct {
 type fakePremiumService struct {
 	user          domain.User
 	entitlementID int64
+	grantCalls    int
 	revokeCalls   int
 	lastRevoke    domain.PremiumAdminRevokeRequest
 }
@@ -1139,19 +1196,52 @@ func (f *fakePremiumService) Entitlements(context.Context, int64, int) ([]domain
 func (f *fakePremiumService) Payment(context.Context, int64) (domain.PremiumPaymentDetails, bool, error) {
 	return domain.PremiumPaymentDetails{}, false, nil
 }
-func (f *fakePremiumService) Grant(_ context.Context, req domain.PremiumAdminGrantRequest) (domain.PremiumEntitlement, domain.User, error) {
+func (f *fakePremiumService) GrantWithDelivery(_ context.Context, req domain.PremiumAdminGrantRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.PremiumEntitlement, domain.User, error) {
+	f.grantCalls++
+	if _, err := effects([]domain.User{f.user}); err != nil {
+		return domain.PremiumEntitlement{}, domain.User{}, err
+	}
 	return domain.PremiumEntitlement{ID: f.entitlementID, UserID: req.UserID}, f.user, nil
 }
-func (f *fakePremiumService) Revoke(_ context.Context, req domain.PremiumAdminRevokeRequest) (domain.User, error) {
-	f.revokeCalls++
-	f.lastRevoke = req
-	return f.user, nil
-}
-func (f *fakePremiumService) Refund(context.Context, domain.PremiumRefundRequest) (domain.PremiumPurchaseResult, error) {
-	return domain.PremiumPurchaseResult{}, nil
+
+func testStarsDelivery(balance domain.StarsBalance) ([]store.DeliveryEffect, error) {
+	return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+		TargetUserID: balance.UserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	})}, nil
 }
 
-func (f *fakeStarsService) Credit(_ context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error) {
+func testUserBatchDelivery(users []domain.User) ([]store.DeliveryEffect, error) {
+	effects := make([]store.DeliveryEffect, 0, len(users))
+	for _, user := range users {
+		effect, _ := testStarsDelivery(domain.StarsBalance{UserID: user.ID})
+		effects = append(effects, effect...)
+	}
+	return effects, nil
+}
+
+func testUserAudienceDelivery(snapshot store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	effects := make([]store.DeliveryEffect, 0, len(snapshot.Audience))
+	for _, viewerID := range snapshot.Audience {
+		effect, _ := testStarsDelivery(domain.StarsBalance{UserID: viewerID})
+		effects = append(effects, effect...)
+	}
+	return effects, nil
+}
+func (f *fakePremiumService) RevokeWithDelivery(_ context.Context, req domain.PremiumAdminRevokeRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.User, error) {
+	f.revokeCalls++
+	f.lastRevoke = req
+	if _, err := effects([]domain.User{f.user}); err != nil {
+		return domain.User{}, err
+	}
+	return f.user, nil
+}
+func (f *fakePremiumService) RefundWithDelivery(_ context.Context, _ domain.PremiumRefundRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error) {
+	result := domain.PremiumPurchaseResult{User: f.user, Balance: domain.StarsBalance{UserID: f.user.ID}}
+	_, err := effects(result)
+	return result, err
+}
+
+func (f *fakeStarsService) CreditWithDelivery(_ context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
 	f.creditCalls++
 	f.lastUserID = userID
 	f.lastAmount = amount
@@ -1168,11 +1258,14 @@ func (f *fakeStarsService) Credit(_ context.Context, userID, amount int64, reaso
 	balance := f.balances[userID]
 	balance.UserID = userID
 	balance.Balance += amount
+	if _, err := effects(balance); err != nil {
+		return domain.StarsBalance{}, err
+	}
 	f.balances[userID] = balance
 	return balance, nil
 }
 
-func (f *fakeStarsService) Debit(_ context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error) {
+func (f *fakeStarsService) DebitWithDelivery(_ context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
 	f.debitCalls++
 	f.lastUserID = userID
 	f.lastAmount = amount
@@ -1189,6 +1282,9 @@ func (f *fakeStarsService) Debit(_ context.Context, userID, amount int64, reason
 	}
 	balance.UserID = userID
 	balance.Balance -= amount
+	if _, err := effects(balance); err != nil {
+		return domain.StarsBalance{}, err
+	}
 	f.balances[userID] = balance
 	return balance, nil
 }
@@ -1199,24 +1295,6 @@ type fakeStarsNotifier struct {
 
 func (f *fakeStarsNotifier) NotifyStarsBalanceChanged(_ context.Context, balance domain.StarsBalance) error {
 	f.balances = append(f.balances, balance)
-	return nil
-}
-
-type fakeUserNotifier struct {
-	users []int64
-}
-
-func (f *fakeUserNotifier) NotifyUserChanged(_ context.Context, u domain.User) error {
-	f.users = append(f.users, u.ID)
-	return nil
-}
-
-type fakeUserModerationNotifier struct {
-	users []int64
-}
-
-func (f *fakeUserModerationNotifier) NotifyUserModerationFlagsChanged(_ context.Context, u domain.User) error {
-	f.users = append(f.users, u.ID)
 	return nil
 }
 

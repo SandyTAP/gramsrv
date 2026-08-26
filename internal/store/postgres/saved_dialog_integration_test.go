@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // TestMessageStoreSavedDialogsLifecycle 覆盖收藏夹分会话 PG 主链路：
@@ -29,7 +30,7 @@ func TestMessageStoreSavedDialogsLifecycle(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM saved_dialog_pins WHERE user_id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	selfPeer := domain.Peer{Type: domain.PeerTypeUser, ID: alice.ID}
 	bobPeer := domain.Peer{Type: domain.PeerTypeUser, ID: bob.ID}
 
@@ -119,12 +120,17 @@ func TestMessageStoreSavedDialogsLifecycle(t *testing.T) {
 	}
 
 	// 置顶：self 置顶后首页在前、exclude 口径、ByPeers/pinned 一致。
-	changed, err := messages.ToggleSavedDialogPin(ctx, alice.ID, selfPeer, true)
-	if err != nil || !changed {
-		t.Fatalf("pin self = %v err %v", changed, err)
+	mutated, err := messages.MutateSavedDialogs(ctx, store.SavedDialogMutation{
+		Kind: store.SavedDialogSetPinned, UserID: alice.ID, Date: 1700000705, Peer: selfPeer, Pinned: true,
+	}, savedDialogLifecycleEffects)
+	if err != nil || !mutated.Changed {
+		t.Fatalf("pin self = %v err %v", mutated.Changed, err)
 	}
-	if changed, err = messages.ToggleSavedDialogPin(ctx, alice.ID, selfPeer, true); err != nil || changed {
-		t.Fatalf("re-pin self = %v err %v, want no-op", changed, err)
+	mutated, err = messages.MutateSavedDialogs(ctx, store.SavedDialogMutation{
+		Kind: store.SavedDialogSetPinned, UserID: alice.ID, Date: 1700000706, Peer: selfPeer, Pinned: true,
+	}, savedDialogLifecycleEffects)
+	if err != nil || mutated.Changed {
+		t.Fatalf("re-pin self = %v err %v, want no-op", mutated.Changed, err)
 	}
 	list, err = messages.ListSavedDialogs(ctx, alice.ID, domain.SavedDialogsFilter{Limit: 20})
 	if err != nil || len(list.Dialogs) != 2 || list.Dialogs[0].Peer != selfPeer || !list.Dialogs[0].Pinned {
@@ -144,10 +150,15 @@ func TestMessageStoreSavedDialogsLifecycle(t *testing.T) {
 	}
 
 	// reorder：bob 也置顶后强排为 bob→self。
-	if _, err := messages.ToggleSavedDialogPin(ctx, alice.ID, bobPeer, true); err != nil {
+	if _, err := messages.MutateSavedDialogs(ctx, store.SavedDialogMutation{
+		Kind: store.SavedDialogSetPinned, UserID: alice.ID, Date: 1700000707, Peer: bobPeer, Pinned: true,
+	}, savedDialogLifecycleEffects); err != nil {
 		t.Fatalf("pin bob: %v", err)
 	}
-	if err := messages.ReorderPinnedSavedDialogs(ctx, alice.ID, []domain.Peer{bobPeer, selfPeer}, true); err != nil {
+	if _, err := messages.MutateSavedDialogs(ctx, store.SavedDialogMutation{
+		Kind: store.SavedDialogReorder, UserID: alice.ID, Date: 1700000708,
+		Order: []domain.Peer{bobPeer, selfPeer}, Force: true,
+	}, savedDialogLifecycleEffects); err != nil {
 		t.Fatalf("reorder: %v", err)
 	}
 	pinned, err = messages.ListPinnedSavedDialogs(ctx, alice.ID)
@@ -183,6 +194,23 @@ func TestMessageStoreSavedDialogsLifecycle(t *testing.T) {
 	if err != nil || len(pinned.Dialogs) != 1 || pinned.Dialogs[0].Peer != selfPeer {
 		t.Fatalf("pins after delete = %+v err %v, want bob pin cleared", pinned.Dialogs, err)
 	}
+}
+
+func savedDialogLifecycleEffects(snapshot store.SavedDialogMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	event := domain.UpdateEvent{Date: snapshot.Mutation.Date, PtsCount: 1}
+	switch snapshot.Mutation.Kind {
+	case store.SavedDialogSetPinned:
+		event.Type = domain.UpdateEventSavedDialogPinned
+		event.Peer = snapshot.Mutation.Peer
+		event.Bool = snapshot.Mutation.Pinned
+	case store.SavedDialogReorder:
+		event.Type = domain.UpdateEventPinnedSavedDialogs
+		event.Peers = append([]domain.Peer(nil), snapshot.Order...)
+	}
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }
 
 // TestSavedDialogsBackfillRule 验证 0087 回填 CASE 规则与 TDLib 语义对齐：
@@ -248,7 +276,7 @@ WHERE peer_type = 'user'
 		t.Fatalf("replay backfill: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	list, err := messages.ListSavedDialogs(ctx, owner.ID, domain.SavedDialogsFilter{Limit: 20})
 	if err != nil {
 		t.Fatalf("list after backfill: %v", err)

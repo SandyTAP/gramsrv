@@ -77,7 +77,7 @@ func (r *Router) BotAPIGiftPremiumSubscription(
 	if err != nil {
 		return false, errors.New("PAYMENT_FORM_INVALID")
 	}
-	result, err := r.deps.Premium.Purchase(ctx, domain.PremiumPurchaseRequest{
+	result, err := r.deps.Premium.PurchaseWithDelivery(ctx, domain.PremiumPurchaseRequest{
 		BuyerUserID:     botID,
 		FormID:          form.ID,
 		Kind:            form.Kind,
@@ -87,7 +87,7 @@ func (r *Router) BotAPIGiftPremiumSubscription(
 		Message:         form.Message,
 		Date:            now,
 		CommandKey:      idempotencyKey,
-	})
+	}, r.premiumPurchaseDeliveryEffects([8]byte{}, 0))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrStarsInsufficient):
@@ -104,7 +104,6 @@ func (r *Router) BotAPIGiftPremiumSubscription(
 	}
 	r.invalidatePremiumUserCaches(ctx, result.User.ID)
 	r.invalidateRPCProjectionForUser(result.User.ID)
-	r.pushPremiumStatusUpdate(ctx, result.User)
 	return true, nil
 }
 
@@ -760,10 +759,10 @@ func (r *Router) botAPISendChannelMessage(ctx context.Context, botID, channelID 
 		return domain.Message{}, botAPIChannelSendErr(err)
 	}
 	if !res.Duplicate {
-		if err := r.enqueueChannelMessageFanout(ctx, botID, res, nil); err != nil {
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, botID, res); err != nil {
 			return domain.Message{}, err
 		}
-		if err := r.pushChannelDiscussionUpdate(ctx, botID, res.Discussion); err != nil {
+		if err := r.enqueueBotAPIChannelDiscussionUpdate(ctx, botID, res.Discussion); err != nil {
 			return domain.Message{}, err
 		}
 		r.maybeEnqueueWebPageResolve(botID, domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}, res.Message.ID, res.Message.Media)
@@ -1016,7 +1015,7 @@ func (r *Router) BotAPIEditRichMessage(ctx context.Context, botID, chatID int64,
 		if err != nil {
 			return domain.Message{}, channelEditErr(err)
 		}
-		if err := r.enqueueChannelEditMessageFanout(ctx, botID, res); err != nil {
+		if err := r.enqueueBotAPIChannelEditMessageUpdate(ctx, botID, res); err != nil {
 			return domain.Message{}, err
 		}
 		return botAPIMessageFromChannel(botID, res.Message), nil

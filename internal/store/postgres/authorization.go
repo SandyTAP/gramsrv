@@ -38,6 +38,26 @@ func (s *AuthorizationStore) Bind(ctx context.Context, a domain.Authorization) e
 	return nil
 }
 
+func (s *AuthorizationStore) BindWithDelivery(ctx context.Context, a domain.Authorization, user domain.User, build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if user.ID <= 0 || (a.UserID != 0 && a.UserID != user.ID) {
+		return fmt.Errorf("bind authorization with delivery: user snapshot mismatch")
+	}
+	if a.Hash == 0 {
+		a.Hash = authorizationHash(a.AuthKeyID)
+	}
+	a.UserID = user.ID
+	err := withAuthIdentityTx(ctx, s.db, "bind authorization with delivery", func(tx pgx.Tx) error {
+		return bindAuthorizationTransition(ctx, tx, a, user, build, true)
+	})
+	if err != nil {
+		return fmt.Errorf("upsert authorization with delivery: %w", err)
+	}
+	return nil
+}
+
 // bindAuthorization 把 auth_key→user 绑定和设备 update baseline 作为同一个状态边界提交。
 //
 // 锁顺序固定为：目标 user advisory/row → auth_keys 母行 →
@@ -49,6 +69,17 @@ func (s *AuthorizationStore) Bind(ctx context.Context, a domain.Authorization) e
 // 要么先提交并被随后删除事务撤销，要么等删除提交后看见 tombstone 并拒绝，不能在
 // 删除事务枚举 authorization 之后重新绑定账号。
 func bindAuthorization(ctx context.Context, db sqlcgen.DBTX, a domain.Authorization) error {
+	return bindAuthorizationTransition(ctx, db, a, domain.User{}, nil, false)
+}
+
+func bindAuthorizationTransition(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	a domain.Authorization,
+	user domain.User,
+	build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot],
+	idempotentDelivery bool,
+) error {
 	keyID := authKeyIDToInt64(a.AuthKeyID)
 	tx, ok := db.(pgx.Tx)
 	if !ok {
@@ -95,6 +126,26 @@ FOR UPDATE`, keyID).Scan(&lockedKeyID, &expiresAt, &authLayer, &layerObservation
 			"authorization auth-key layer invariant violation: auth key %x has layer %d observation %d",
 			a.AuthKeyID, authLayer, layerObservationID,
 		)
+	}
+
+	var currentUserID int64
+	var currentPasswordPending, currentFound bool
+	if idempotentDelivery {
+		if err := db.QueryRow(ctx, `
+SELECT user_id, password_pending
+FROM authorizations
+WHERE auth_key_id = $1`, keyID).Scan(&currentUserID, &currentPasswordPending); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("read current authorization: %w", err)
+			}
+		} else {
+			currentFound = true
+		}
+	}
+	if idempotentDelivery && currentFound && currentUserID == a.UserID && currentPasswordPending == a.PasswordPending {
+		// The fully-authorized replay already owns its immutable notification;
+		// pending replay likewise preserves the original password challenge age.
+		return nil
 	}
 
 	if _, err := db.Exec(ctx, `
@@ -186,6 +237,19 @@ ON CONFLICT (auth_key_id) DO UPDATE SET
 	); err != nil {
 		return fmt.Errorf("write authorization: %w", err)
 	}
+	if idempotentDelivery && !a.PasswordPending && (!currentFound || currentUserID != a.UserID || currentPasswordPending) {
+		a.Layer = authLayer
+		effects, err := build(store.AuthorizationDeliverySnapshot{Authorization: a, User: user})
+		if err != nil {
+			return fmt.Errorf("build authorization delivery: %w", err)
+		}
+		if err := store.ValidateAuthorizationDeliveryEffects(a.UserID, effects); err != nil {
+			return fmt.Errorf("validate authorization delivery: %w", err)
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, effects); err != nil {
+			return fmt.Errorf("write authorization delivery: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -237,6 +301,99 @@ func (s *AuthorizationStore) MarkPasswordPassed(ctx context.Context, id [8]byte,
 	}
 	if tag.RowsAffected() != 1 {
 		return store.ErrAuthorizationStateChanged
+	}
+	return nil
+}
+
+func (s *AuthorizationStore) MarkPasswordPassedWithDelivery(ctx context.Context, id [8]byte, expectedUser domain.User, build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if expectedUser.ID <= 0 {
+		return store.ErrAuthorizationStateChanged
+	}
+	err := withAuthIdentityTx(ctx, s.db, "complete password authorization with delivery", func(tx pgx.Tx) error {
+		if err := lockUsersForUpdate(ctx, tx, expectedUser.ID); err != nil {
+			return fmt.Errorf("lock password authorization user: %w", err)
+		}
+		var active bool
+		if err := tx.QueryRow(ctx, `
+SELECT deleted_at IS NULL
+FROM users
+WHERE id = $1
+FOR UPDATE`, expectedUser.ID).Scan(&active); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrUserNotFound
+			}
+			return fmt.Errorf("lock password authorization user row: %w", err)
+		}
+		if !active {
+			return domain.ErrAccountDeleted
+		}
+		keyID := authKeyIDToInt64(id)
+		if err := lockPermanentAuthIdentities(ctx, tx, []int64{keyID}); err != nil {
+			return err
+		}
+		var lockedKeyID int64
+		if err := tx.QueryRow(ctx, `
+SELECT auth_key_id
+FROM auth_keys
+WHERE auth_key_id = $1
+FOR UPDATE`, keyID).Scan(&lockedKeyID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.ErrAuthorizationStateChanged
+			}
+			return fmt.Errorf("lock password authorization auth key: %w", err)
+		}
+
+		a := domain.Authorization{AuthKeyID: id}
+		if err := tx.QueryRow(ctx, `
+SELECT user_id, hash, layer, device_model, platform, system_version, api_id,
+       app_version, ip, password_pending, created_at, active_at
+FROM authorizations
+WHERE auth_key_id = $1
+FOR UPDATE`, keyID).Scan(
+			&a.UserID, &a.Hash, &a.Layer, &a.DeviceModel, &a.Platform, &a.SystemVersion,
+			&a.APIID, &a.AppVersion, &a.IP, &a.PasswordPending, &a.CreatedAt, &a.ActiveAt,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.ErrAuthorizationStateChanged
+			}
+			return fmt.Errorf("lock password authorization: %w", err)
+		}
+		if a.UserID != expectedUser.ID {
+			return store.ErrAuthorizationStateChanged
+		}
+		if !a.PasswordPending {
+			// Same-user completion replay is already committed and must not append
+			// another absolute notification.
+			return nil
+		}
+		tag, err := tx.Exec(ctx, `
+UPDATE authorizations
+SET password_pending = false, created_at = now(), active_at = now()
+WHERE auth_key_id = $1 AND user_id = $2 AND password_pending`, keyID, expectedUser.ID)
+		if err != nil {
+			return fmt.Errorf("mark authorization password passed: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return store.ErrAuthorizationStateChanged
+		}
+		a.PasswordPending = false
+		effects, err := build(store.AuthorizationDeliverySnapshot{Authorization: a, User: expectedUser})
+		if err != nil {
+			return fmt.Errorf("build password authorization delivery: %w", err)
+		}
+		if err := store.ValidateAuthorizationDeliveryEffects(expectedUser.ID, effects); err != nil {
+			return fmt.Errorf("validate password authorization delivery: %w", err)
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, effects); err != nil {
+			return fmt.Errorf("write password authorization delivery: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("complete password authorization with delivery: %w", err)
 	}
 	return nil
 }

@@ -12,6 +12,161 @@ import (
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
+var errUserStarGiftProjectionLockScopeChanged = errors.New("user star gift projection lock scope changed")
+
+// userStarGiftProjectionLockScope is the complete user lock set for retiring
+// every private-message alias of one user-owned gift. It must be loaded before
+// a mutation transaction starts, acquired before any row lock, and validated
+// again immediately after the advisory locks are held. A changed scope fails
+// closed; callers must not continue with a partial set or retry inside the same
+// transaction.
+type userStarGiftProjectionLockScope struct {
+	OwnerUserID  int64
+	SavedGiftID  int64
+	MsgID        int
+	UpgradeMsgID int
+	UserIDs      []int64
+}
+
+func loadUserStarGiftProjectionLockScope(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	ownerUserID, savedGiftID int64,
+	msgID, upgradeMsgID int,
+) (userStarGiftProjectionLockScope, error) {
+	scope := userStarGiftProjectionLockScope{
+		OwnerUserID:  ownerUserID,
+		SavedGiftID:  savedGiftID,
+		MsgID:        msgID,
+		UpgradeMsgID: upgradeMsgID,
+	}
+	if db == nil || ownerUserID <= 0 || savedGiftID <= 0 || msgID < 0 || upgradeMsgID < 0 {
+		return userStarGiftProjectionLockScope{}, errUserStarGiftProjectionLockScopeChanged
+	}
+	var err error
+	scope.UserIDs, err = userStarGiftProjectionUserIDs(ctx, db, ownerUserID, savedGiftID, msgID, upgradeMsgID)
+	if err != nil {
+		return userStarGiftProjectionLockScope{}, fmt.Errorf("load user star gift projection lock scope: %w", err)
+	}
+	return scope, nil
+}
+
+func loadSavedUserStarGiftProjectionLockScope(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	saved domain.SavedStarGift,
+) (userStarGiftProjectionLockScope, error) {
+	if saved.Owner.Type != domain.PeerTypeUser {
+		return userStarGiftProjectionLockScope{}, errUserStarGiftProjectionLockScopeChanged
+	}
+	return loadUserStarGiftProjectionLockScope(ctx, db, saved.Owner.ID, saved.ID, saved.MsgID, saved.UpgradeMsgID)
+}
+
+func userStarGiftProjectionUserIDs(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	ownerUserID, savedGiftID int64,
+	msgID, upgradeMsgID int,
+) ([]int64, error) {
+	userIDs := []int64{ownerUserID}
+	rows, err := db.Query(ctx, `SELECT DISTINCT m.peer_id
+FROM message_boxes m
+WHERE m.owner_user_id=$1 AND m.peer_type='user' AND m.peer_id>0 AND NOT m.deleted
+  AND (m.box_id=$3 OR m.box_id=$4 OR EXISTS (
+      SELECT 1 FROM star_gift_user_message_refs r
+      WHERE r.owner_user_id=$1 AND r.saved_gift_id=$2 AND r.msg_id=m.box_id
+  ))
+ORDER BY m.peer_id`, ownerUserID, savedGiftID, msgID, upgradeMsgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	deduped := userIDs[:0]
+	for _, userID := range userIDs {
+		if len(deduped) == 0 || deduped[len(deduped)-1] != userID {
+			deduped = append(deduped, userID)
+		}
+	}
+	return deduped, nil
+}
+
+func validateUserStarGiftProjectionLockScope(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	scope userStarGiftProjectionLockScope,
+) error {
+	if scope.OwnerUserID <= 0 || scope.SavedGiftID <= 0 || len(scope.UserIDs) == 0 {
+		return errUserStarGiftProjectionLockScopeChanged
+	}
+	current, err := userStarGiftProjectionUserIDs(ctx, db, scope.OwnerUserID, scope.SavedGiftID, scope.MsgID, scope.UpgradeMsgID)
+	if err != nil {
+		return fmt.Errorf("validate user star gift projection lock scope: %w", err)
+	}
+	if !equalUserIDSets(current, scope.UserIDs) {
+		return errUserStarGiftProjectionLockScopeChanged
+	}
+	return nil
+}
+
+// lockUserStarGiftProjectionUsers is the first locking operation for direct
+// lifecycle transactions. CompleteStarGiftWithdrawal deliberately separates
+// this advisory fence from validation so a completion racing an already
+// committed idempotent replay can inspect status before deleted aliases make
+// the old preflight scope differ.
+func lockUserStarGiftProjectionUsers(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope userStarGiftProjectionLockScope,
+) error {
+	if scope.OwnerUserID <= 0 || scope.SavedGiftID <= 0 || len(scope.UserIDs) == 0 {
+		return errUserStarGiftProjectionLockScopeChanged
+	}
+	return lockUsersForUpdate(ctx, tx, scope.UserIDs...)
+}
+
+// lockUserStarGiftProjectionScope acquires and immediately validates the full
+// scope for direct mutations without a terminal replay row. Private-send
+// mutations pass UserIDs to the send hook and validate as the hook's first
+// operation.
+func lockUserStarGiftProjectionScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope userStarGiftProjectionLockScope,
+) error {
+	if err := lockUserStarGiftProjectionUsers(ctx, tx, scope); err != nil {
+		return err
+	}
+	return validateUserStarGiftProjectionLockScope(ctx, tx, scope)
+}
+
+func (scope userStarGiftProjectionLockScope) matches(saved domain.SavedStarGift) bool {
+	return saved.Owner == (domain.Peer{Type: domain.PeerTypeUser, ID: scope.OwnerUserID}) &&
+		saved.ID == scope.SavedGiftID && saved.MsgID == scope.MsgID && saved.UpgradeMsgID == scope.UpgradeMsgID
+}
+
+func equalUserIDSets(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // retireUserStarGiftMessagesTx closes every user-scoped unique-gift action
 // emitted for the source ownership epoch. Ownership moves and terminal export
 // must not leave an older chat card with Craft/transfer/resale capabilities.
@@ -22,10 +177,12 @@ func (s *StarGiftLifecycleStore) retireUserStarGiftMessagesTx(
 	tx pgx.Tx,
 	source domain.SavedStarGift,
 	current domain.UniqueStarGift,
+	lockScope userStarGiftProjectionLockScope,
 	date int,
 ) ([]domain.EditedMessageForUser, error) {
 	if s == nil || s.messages == nil || source.Owner.Type != domain.PeerTypeUser || source.Owner.ID <= 0 ||
-		source.ID <= 0 || source.UniqueGiftID <= 0 || current.ID != source.UniqueGiftID || date <= 0 {
+		source.ID <= 0 || source.UniqueGiftID <= 0 || current.ID != source.UniqueGiftID || date <= 0 ||
+		!lockScope.matches(source) {
 		return nil, domain.ErrStarGiftTransferUnavailable
 	}
 
@@ -166,9 +323,9 @@ WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, box.OwnerUserID, box.BoxI
 			if err := appendUserUpdateEvent(ctx, tx, q, msg.OwnerUserID, event); err != nil {
 				return nil, fmt.Errorf("append retired star gift edit event: %w", err)
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID: msg.OwnerUserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
-				ExcludeAuthKeyID: 0, ExcludeSessionID: 0,
+				ExcludeAuthKeyID: [8]byte{}, ExcludeSessionID: 0,
 			}); err != nil {
 				return nil, fmt.Errorf("enqueue retired star gift edit: %w", err)
 			}
@@ -319,9 +476,9 @@ WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID, sharedMed
 		if err := appendUserUpdateEvent(ctx, tx, q, ref.UserID, event); err != nil {
 			return nil, fmt.Errorf("append retired channel star gift edit event: %w", err)
 		}
-		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 			TargetUserID: ref.UserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
-			ExcludeAuthKeyID: 0, ExcludeSessionID: 0,
+			ExcludeAuthKeyID: [8]byte{}, ExcludeSessionID: 0,
 		}); err != nil {
 			return nil, fmt.Errorf("enqueue retired channel star gift edit: %w", err)
 		}

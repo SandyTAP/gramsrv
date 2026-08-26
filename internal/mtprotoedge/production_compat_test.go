@@ -303,7 +303,7 @@ func (m *SessionManager) queueLocked(key sessionKey, t proto.MessageType, msg tg
 		return false
 	}
 	defer reservation.release()
-	return m.queuePreparedLocked(key, t, updates, reservation, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{})
+	return m.queuePreparedLocked(key, t, updates, reservation, edgecontrol.ChannelDeliveryWatermark{})
 }
 
 func (cs *connState) track(msgID int64, seqNo int32, content bool, state byte) {

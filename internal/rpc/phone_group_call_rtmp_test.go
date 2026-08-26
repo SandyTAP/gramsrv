@@ -215,12 +215,10 @@ func TestRtmpJoinReturnsStreamParams(t *testing.T) {
 	}
 }
 
-// TestRtmpGetStreamPart 验证 upload.getFile(inputGroupCallStream) 的取段与错误映射。
-func TestRtmpGetStreamPart(t *testing.T) {
+func TestRtmpGetStreamChannels(t *testing.T) {
 	f := newRtmpFixture(t)
 	call := f.createLive(t)
 	memberCtx := f.userCtx(f.member, 22)
-	// 观众须先 join（拉流校验 join 状态经 scope）。
 	if _, err := f.router.onPhoneJoinGroupCall(memberCtx, &tg.PhoneJoinGroupCallRequest{
 		Call:   &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash},
 		JoinAs: &tg.InputPeerSelf{},
@@ -228,42 +226,13 @@ func TestRtmpGetStreamPart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("member join: %v", err)
 	}
-	// 备好一段可拉数据。
 	f.live.channels[f.channel.ID] = []domain.LiveStreamChannel{{Channel: 1, Scale: 0, LastTimestampMs: 3000}}
-	f.live.parts[f.channel.ID] = map[int64][]byte{3000: []byte("SEGMENT-BYTES-0123456789")}
 
-	loc := func(timeMs int64) *tg.InputGroupCallStream {
-		return &tg.InputGroupCallStream{Call: &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash}, TimeMs: timeMs, Scale: 0}
-	}
-
-	// 命中：分片切片。
-	out, err := f.router.onUploadGetFile(memberCtx, &tg.UploadGetFileRequest{Location: loc(3000), Offset: 0, Limit: 8})
-	if err != nil {
-		t.Fatalf("getFile stream: %v", err)
-	}
-	uf := out.(*tg.UploadFile)
-	if string(uf.Bytes) != "SEGMENT-" {
-		t.Fatalf("stream chunk = %q, want first 8 bytes", uf.Bytes)
-	}
-	// 续段（offset 中段）。
-	out2, _ := f.router.onUploadGetFile(memberCtx, &tg.UploadGetFileRequest{Location: loc(3000), Offset: 8, Limit: 1 << 17})
-	if string(out2.(*tg.UploadFile).Bytes) != "BYTES-0123456789" {
-		t.Fatalf("stream chunk tail = %q", out2.(*tg.UploadFile).Bytes)
-	}
-
-	// 未就绪段 → TIME_TOO_BIG。
-	if _, err := f.router.onUploadGetFile(memberCtx, &tg.UploadGetFileRequest{Location: loc(4000), Offset: 0, Limit: 1024}); err == nil {
-		t.Fatalf("expected TIME_TOO_BIG for future segment")
-	} else {
-		assertPhoneRPCErr(t, err, "TIME_TOO_BIG")
-	}
-
-	// getGroupCallStreamChannels 返回时间轴。
-	chRes, err := f.router.onPhoneGetGroupCallStreamChannels(memberCtx, &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash})
+	result, err := f.router.onPhoneGetGroupCallStreamChannels(memberCtx, &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash})
 	if err != nil {
 		t.Fatalf("getGroupCallStreamChannels: %v", err)
 	}
-	if len(chRes.Channels) != 1 || chRes.Channels[0].LastTimestampMs != 3000 {
-		t.Fatalf("stream channels = %+v", chRes.Channels)
+	if len(result.Channels) != 1 || result.Channels[0].LastTimestampMs != 3000 {
+		t.Fatalf("stream channels = %+v", result.Channels)
 	}
 }

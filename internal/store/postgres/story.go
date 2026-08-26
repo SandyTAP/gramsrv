@@ -162,7 +162,7 @@ func storyBaseVisiblePredicateFor(alias, viewerParam string) string {
 )`
 }
 
-func (s *StoryStore) CreateStory(ctx context.Context, req domain.StoryCreateRequest) (domain.StoryCreateResult, error) {
+func (s *StoryStore) createStory(ctx context.Context, req domain.StoryCreateRequest) (domain.StoryCreateResult, error) {
 	if err := validatePGStoryPeer(req.Owner); err != nil {
 		return domain.StoryCreateResult{}, err
 	}
@@ -933,7 +933,7 @@ ORDER BY recent.ord ASC`, peerTypes, peerIDs, int32(now), viewerUserID)
 	return out, nil
 }
 
-func (s *StoryStore) MarkRead(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error) {
+func (s *StoryStore) markRead(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error) {
 	if viewerUserID == 0 {
 		return domain.StoryReadResult{}, domain.ErrStoryPeerInvalid
 	}
@@ -1015,7 +1015,7 @@ SELECT count(*)::int FROM inserted`, viewerUserID, string(peer.Type), peer.ID, i
 	return created, nil
 }
 
-func (s *StoryStore) SetReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error) {
+func (s *StoryStore) setReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error) {
 	if viewerUserID == 0 {
 		return domain.StoryReactionResult{}, domain.ErrStoryPeerInvalid
 	}
@@ -1447,7 +1447,7 @@ ON CONFLICT (owner_peer_type, owner_peer_id, story_id, viewer_user_id) DO UPDATE
 	return nil
 }
 
-func (s *StoryStore) EditStory(ctx context.Context, req domain.StoryEditRequest) (domain.StoryEditResult, error) {
+func (s *StoryStore) editStory(ctx context.Context, req domain.StoryEditRequest) (domain.StoryEditResult, error) {
 	if err := validatePGStoryIdentity(req.Owner, req.ID); err != nil {
 		return domain.StoryEditResult{}, err
 	}
@@ -1529,7 +1529,7 @@ RETURNING `+storyReturningColumns,
 	return domain.StoryEditResult{Story: out, Previous: clonePGStory(current)}, nil
 }
 
-func (s *StoryStore) DeleteStories(ctx context.Context, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error) {
+func (s *StoryStore) deleteStories(ctx context.Context, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error) {
 	_ = date
 	if err := validatePGStoryPeer(peer); err != nil {
 		return domain.StoryMutationResult{}, err
@@ -1583,7 +1583,7 @@ RETURNING `+storyReturningColumns, string(peer.Type), peer.ID, int32s(ids))
 	return domain.StoryMutationResult{Peer: peer, IDs: append([]int(nil), ids...), Stories: stories, Previous: previous}, nil
 }
 
-func (s *StoryStore) TogglePinned(ctx context.Context, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error) {
+func (s *StoryStore) togglePinned(ctx context.Context, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error) {
 	_ = date
 	if err := validatePGStoryPeer(peer); err != nil {
 		return domain.StoryMutationResult{}, err

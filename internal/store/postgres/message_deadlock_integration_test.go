@@ -45,7 +45,7 @@ func TestMessageStoreBidirectionalConcurrencyNoDeadlock(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	date := int(time.Now().Unix())
 
 	var ridMu sync.Mutex
@@ -145,7 +145,7 @@ func TestMessageStoreBidirectionalRevokeDeleteNoDeadlock(t *testing.T) {
 		_, _ = pool.Exec(baseCtx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	date := int(time.Now().Unix())
 	type pair struct {
 		senderBoxID    int

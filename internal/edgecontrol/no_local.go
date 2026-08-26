@@ -115,6 +115,5 @@ func (*NoLocalController) OnlineChannelSubscriberUserIDsExcluding(int64, map[int
 	return nil
 }
 func (*NoLocalController) OnlineChannelIDsSnapshot() []int64 { return nil }
-func (*NoLocalController) ActiveRawAuthKeyIDs() [][8]byte    { return nil }
 
 var _ FullController = (*NoLocalController)(nil)

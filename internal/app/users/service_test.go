@@ -301,21 +301,29 @@ func TestServiceUpdateBirthday(t *testing.T) {
 
 func TestServiceUpdatePersonalChannel(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewUserStore()
-	owner, err := store.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000011", FirstName: "Owner"})
+	users := memory.NewUserStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	users.AttachDeliveryOutbox(outbox)
+	owner, err := users.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000011", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	svc := NewService(store)
+	svc := NewService(users)
+	effects := func(snapshot store.UserDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.User.ID,
+			Payload:      []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
 
-	u, err := svc.UpdatePersonalChannel(ctx, owner.ID, 4242)
+	u, err := svc.UpdatePersonalChannelWithDelivery(ctx, owner.ID, 4242, effects)
 	if err != nil {
-		t.Fatalf("UpdatePersonalChannel: %v", err)
+		t.Fatalf("UpdatePersonalChannelWithDelivery: %v", err)
 	}
 	if u.PersonalChannelID != 4242 {
 		t.Fatalf("personal channel = %d, want 4242", u.PersonalChannelID)
 	}
-	u, err = svc.UpdatePersonalChannel(ctx, owner.ID, 0)
+	u, err = svc.UpdatePersonalChannelWithDelivery(ctx, owner.ID, 0, effects)
 	if err != nil {
 		t.Fatalf("clear personal channel: %v", err)
 	}

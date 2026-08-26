@@ -122,11 +122,11 @@ func (s *UpdateEventStore) appendInTx(ctx context.Context, db sqlcgen.DBTX, q *s
 		return domain.UpdateEvent{}, fmt.Errorf("append update event: %w", err)
 	}
 	if dispatch {
-		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 			TargetUserID:     userID,
 			Pts:              int32(event.Pts),
 			EventType:        string(event.Type),
-			ExcludeAuthKeyID: authKeyIDToInt64(excludeAuthKeyID),
+			ExcludeAuthKeyID: excludeAuthKeyID,
 			ExcludeSessionID: excludeSessionID,
 		}); err != nil {
 			return domain.UpdateEvent{}, fmt.Errorf("enqueue dispatch: %w", err)
@@ -233,6 +233,7 @@ func appendUserUpdateEvent(ctx context.Context, db sqlcgen.DBTX, q *sqlcgen.Quer
 		ReactionPayload:    reactionPayload,
 		EmojiStatusPayload: emojiStatusPayload,
 		MaxID:              pgInt32NonNegative(event.MaxID),
+		TopMsgID:           pgInt32NonNegative(event.TopMsgID),
 		StillUnreadCount:   int32(event.StillUnreadCount),
 		ChannelPts:         int32(event.ChannelPts),
 		FilterID:           pgInt32NonNegative(event.FilterID),
@@ -279,43 +280,299 @@ WHERE user_id = $1
 	return nil
 }
 
-func (s *UpdateEventStore) hydrateQuickReplyEvent(ctx context.Context, event *domain.UpdateEvent) error {
-	if event == nil {
-		return nil
-	}
-	switch event.Type {
+type updateEventCursor struct {
+	userID int64
+	pts    int
+}
+
+type quickReplyEventPayload struct {
+	replies []domain.QuickReply
+	message domain.QuickReplyMessage
+}
+
+func needsQuickReplyEventPayload(eventType domain.UpdateEventType) bool {
+	switch eventType {
 	case domain.UpdateEventQuickReplies,
 		domain.UpdateEventNewQuickReply,
-		domain.UpdateEventQuickReplyMessage,
-		domain.UpdateEventDeleteQuickReply:
+		domain.UpdateEventQuickReplyMessage:
+		return true
 	default:
+		return false
+	}
+}
+
+func (s *UpdateEventStore) hydrateQuickReplyEvents(ctx context.Context, events []domain.UpdateEvent) error {
+	if len(events) == 0 {
 		return nil
 	}
-	var repliesJSON, messageJSON string
-	if err := s.db.QueryRow(ctx, `
-SELECT
-  COALESCE(quick_replies::text, '[]')::text,
-  COALESCE(quick_reply_message::text, '{}')::text
-FROM user_update_events
-WHERE user_id = $1
-  AND pts = $2`, event.UserID, event.Pts).Scan(&repliesJSON, &messageJSON); err != nil {
-		return fmt.Errorf("get quick reply update payload: %w", err)
+	requested := make(map[updateEventCursor]struct{})
+	userIDs := make([]int64, 0)
+	ptsList := make([]int32, 0)
+	for i := range events {
+		if !needsQuickReplyEventPayload(events[i].Type) {
+			continue
+		}
+		key := updateEventCursor{userID: events[i].UserID, pts: events[i].Pts}
+		if key.userID <= 0 || key.pts <= 0 {
+			return fmt.Errorf("hydrate quick reply update payload: invalid cursor user_id=%d pts=%d", key.userID, key.pts)
+		}
+		if _, duplicate := requested[key]; duplicate {
+			continue
+		}
+		requested[key] = struct{}{}
+		userIDs = append(userIDs, key.userID)
+		ptsList = append(ptsList, int32(key.pts))
 	}
-	if err := json.Unmarshal([]byte(repliesJSON), &event.QuickReplies); err != nil {
-		return fmt.Errorf("decode quick replies: %w", err)
+	if len(requested) == 0 {
+		return nil
 	}
-	if err := json.Unmarshal([]byte(messageJSON), &event.QuickReplyMessage); err != nil {
-		return fmt.Errorf("decode quick reply message: %w", err)
+	rows, err := s.q.BatchGetQuickReplyUpdatePayloads(ctx, sqlcgen.BatchGetQuickReplyUpdatePayloadsParams{
+		UserIds: userIDs,
+		PtsList: ptsList,
+	})
+	if err != nil {
+		return fmt.Errorf("batch get quick reply update payloads: %w", err)
 	}
-	if event.Type == domain.UpdateEventNewQuickReply && event.QuickReply.ID == 0 {
+	payloads := make(map[updateEventCursor]quickReplyEventPayload, len(rows))
+	for _, row := range rows {
+		key := updateEventCursor{userID: row.UserID, pts: int(row.Pts)}
+		if _, ok := requested[key]; !ok {
+			return fmt.Errorf("batch get quick reply update payloads: unexpected cursor user_id=%d pts=%d", key.userID, key.pts)
+		}
+		if _, duplicate := payloads[key]; duplicate {
+			return fmt.Errorf("batch get quick reply update payloads: duplicate cursor user_id=%d pts=%d", key.userID, key.pts)
+		}
+		var payload quickReplyEventPayload
+		if err := json.Unmarshal([]byte(row.QuickRepliesJson), &payload.replies); err != nil {
+			return fmt.Errorf("decode quick replies for user_id=%d pts=%d: %w", key.userID, key.pts, err)
+		}
+		if err := json.Unmarshal([]byte(row.QuickReplyMessageJson), &payload.message); err != nil {
+			return fmt.Errorf("decode quick reply message for user_id=%d pts=%d: %w", key.userID, key.pts, err)
+		}
+		payloads[key] = payload
+	}
+	if len(payloads) != len(requested) {
+		return fmt.Errorf("batch get quick reply update payloads: got %d payloads, want %d", len(payloads), len(requested))
+	}
+	for i := range events {
+		event := &events[i]
+		if !needsQuickReplyEventPayload(event.Type) {
+			continue
+		}
+		payload := payloads[updateEventCursor{userID: event.UserID, pts: event.Pts}]
+		event.QuickReplies = payload.replies
+		event.QuickReplyMessage = payload.message
+		if event.Type != domain.UpdateEventNewQuickReply {
+			continue
+		}
 		for _, item := range event.QuickReplies {
 			if item.ID == event.MaxID {
 				event.QuickReply = item
 				break
 			}
 		}
+		if event.QuickReply.ID == 0 {
+			return fmt.Errorf("hydrate new quick reply user_id=%d pts=%d: shortcut_id %d missing from durable payload",
+				event.UserID, event.Pts, event.MaxID)
+		}
 	}
 	return nil
+}
+
+type updateEventPayloadMask uint16
+
+const updateEventPayloadNone updateEventPayloadMask = 0
+
+const (
+	updateEventPayloadMessage updateEventPayloadMask = 1 << iota
+	updateEventPayloadPeers
+	updateEventPayloadPeerSettings
+	updateEventPayloadMessageIDs
+	updateEventPayloadDialogFilter
+	updateEventPayloadFilterOrder
+	updateEventPayloadFolderPeers
+	updateEventPayloadStory
+	updateEventPayloadReaction
+	updateEventPayloadEmojiStatus
+)
+
+func updateEventPayloadMaskFor(eventType domain.UpdateEventType) updateEventPayloadMask {
+	switch eventType {
+	case domain.UpdateEventNewMessage,
+		domain.UpdateEventEditMessage,
+		domain.UpdateEventWebPage,
+		domain.UpdateEventMessagePoll:
+		return updateEventPayloadMessage
+	case domain.UpdateEventPinnedDialogs, domain.UpdateEventPinnedSavedDialogs:
+		return updateEventPayloadPeers
+	case domain.UpdateEventPeerSettings:
+		return updateEventPayloadPeerSettings
+	case domain.UpdateEventDeleteMessages,
+		domain.UpdateEventPinnedMessages,
+		domain.UpdateEventReadMessageContents,
+		domain.UpdateEventDeleteQuickReplyMessages:
+		return updateEventPayloadMessageIDs
+	case domain.UpdateEventDialogFilter:
+		return updateEventPayloadDialogFilter
+	case domain.UpdateEventDialogFilterOrder:
+		return updateEventPayloadFilterOrder
+	case domain.UpdateEventFolderPeers:
+		return updateEventPayloadFolderPeers
+	case domain.UpdateEventStory:
+		return updateEventPayloadStory
+	case domain.UpdateEventSentStoryReaction, domain.UpdateEventNewStoryReaction:
+		return updateEventPayloadStory | updateEventPayloadReaction
+	case domain.UpdateEventUserEmojiStatus:
+		return updateEventPayloadEmojiStatus
+	default:
+		return updateEventPayloadNone
+	}
+}
+
+type updateEventPayloadColumns struct {
+	messageEntities      string
+	silent               bool
+	noforwards           bool
+	replyToMsgID         int32
+	replyToPeerType      string
+	replyToPeerID        int64
+	replyToTopID         int32
+	replyToStoryID       int32
+	quoteText            string
+	quoteEntities        string
+	quoteOffset          int32
+	fwdFromPeerType      string
+	fwdFromPeerID        int64
+	fwdFromName          string
+	fwdDate              int32
+	fwdSavedFromPeerType string
+	fwdSavedFromPeerID   int64
+	fwdSavedFromMsgID    int32
+	eventPeers           string
+	peerSettings         string
+	messageIDs           string
+	dialogFilter         string
+	filterOrder          string
+	folderPeers          string
+	story                string
+	reaction             string
+	emojiStatus          string
+	media                string
+	replyMarkup          string
+	richMessage          string
+}
+
+type decodedUpdateEventPayload struct {
+	entities     []domain.MessageEntity
+	silent       bool
+	noforwards   bool
+	reply        *domain.MessageReply
+	forward      *domain.MessageForward
+	peers        []domain.Peer
+	settings     domain.PeerSettings
+	messageIDs   []int
+	dialogFilter *domain.DialogFolder
+	filterOrder  []int
+	folderPeers  []domain.FolderPeerUpdate
+	story        domain.Story
+	reaction     *domain.MessageReaction
+	emojiStatus  domain.UserEmojiStatus
+	media        *domain.MessageMedia
+	markup       *domain.MessageReplyMarkup
+	rich         *domain.MessageRichMessage
+}
+
+// decodeUpdateEventPayload decodes only the payload family owned by the
+// durable event type. Irrelevant JSON columns are deliberately ignored, while
+// malformed data in the relevant family remains a hard error.
+func decodeUpdateEventPayload(eventType domain.UpdateEventType, columns updateEventPayloadColumns) (decodedUpdateEventPayload, error) {
+	var out decodedUpdateEventPayload
+	var err error
+	mask := updateEventPayloadMaskFor(eventType)
+	if mask == updateEventPayloadNone {
+		return out, nil
+	}
+	if mask&updateEventPayloadMessage != 0 {
+		out.entities, err = decodeMessageEntities(columns.messageEntities)
+		if err != nil {
+			return out, fmt.Errorf("message entities: %w", err)
+		}
+		out.silent, out.noforwards, out.reply, out.forward, err = messageMetadataFromFields(
+			columns.silent, columns.noforwards,
+			columns.replyToMsgID, columns.replyToPeerType, columns.replyToPeerID,
+			columns.replyToTopID, columns.replyToStoryID,
+			columns.quoteText, columns.quoteEntities, columns.quoteOffset,
+			columns.fwdFromPeerType, columns.fwdFromPeerID, columns.fwdFromName, columns.fwdDate,
+			columns.fwdSavedFromPeerType, columns.fwdSavedFromPeerID, columns.fwdSavedFromMsgID,
+		)
+		if err != nil {
+			return out, fmt.Errorf("message metadata: %w", err)
+		}
+		if out.media, err = decodeMessageMedia(columns.media); err != nil {
+			return out, fmt.Errorf("message media: %w", err)
+		}
+		if out.markup, err = decodeReplyMarkup(columns.replyMarkup); err != nil {
+			return out, fmt.Errorf("message reply markup: %w", err)
+		}
+		if out.rich, err = decodeRichMessage(columns.richMessage); err != nil {
+			return out, fmt.Errorf("message rich message: %w", err)
+		}
+	}
+	if mask&updateEventPayloadPeers != 0 {
+		out.peers, err = decodeEventPeers(columns.eventPeers)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadPeerSettings != 0 {
+		out.settings, err = decodePeerSettings(columns.peerSettings)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadMessageIDs != 0 {
+		out.messageIDs, err = decodeEventMessageIDs(columns.messageIDs)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadDialogFilter != 0 {
+		out.dialogFilter, err = decodeEventDialogFilter(columns.dialogFilter)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadFilterOrder != 0 {
+		out.filterOrder, err = decodeEventFilterOrder(columns.filterOrder)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadFolderPeers != 0 {
+		out.folderPeers, err = decodeEventFolderPeers(columns.folderPeers)
+		if err != nil {
+			return out, err
+		}
+	}
+	if mask&updateEventPayloadStory != 0 {
+		out.story, err = decodeEventStory(columns.story)
+		if err != nil {
+			return out, fmt.Errorf("story: %w", err)
+		}
+	}
+	if mask&updateEventPayloadReaction != 0 {
+		out.reaction, err = decodeEventReaction(columns.reaction)
+		if err != nil {
+			return out, fmt.Errorf("reaction: %w", err)
+		}
+	}
+	if mask&updateEventPayloadEmojiStatus != 0 {
+		out.emojiStatus, err = decodeEventEmojiStatus(columns.emojiStatus)
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, limit int) ([]domain.UpdateEvent, error) {
@@ -332,104 +589,48 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 	}
 	out := make([]domain.UpdateEvent, 0, len(rows))
 	for _, row := range rows {
-		entities, err := decodeMessageEntities(row.MessageEntitiesJson)
+		eventType := domain.UpdateEventType(row.EventType)
+		payload, err := decodeUpdateEventPayload(eventType, updateEventPayloadColumns{
+			messageEntities: row.MessageEntitiesJson,
+			silent:          row.Silent, noforwards: row.Noforwards,
+			replyToMsgID: row.ReplyToMsgID, replyToPeerType: row.ReplyToPeerType, replyToPeerID: row.ReplyToPeerID,
+			replyToTopID: row.ReplyToTopID, replyToStoryID: row.ReplyToStoryID,
+			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset,
+			fwdFromPeerType: row.FwdFromPeerType, fwdFromPeerID: row.FwdFromPeerID, fwdFromName: row.FwdFromName, fwdDate: row.FwdDate,
+			fwdSavedFromPeerType: row.FwdSavedFromPeerType, fwdSavedFromPeerID: row.FwdSavedFromPeerID, fwdSavedFromMsgID: row.FwdSavedFromMsgID,
+			eventPeers: row.EventPeersJson, peerSettings: row.PeerSettingsJson, messageIDs: row.MessageIdsJson,
+			dialogFilter: row.DialogFilterJson, filterOrder: row.FilterOrderJson, folderPeers: row.FolderPeersJson,
+			story: row.StoryPayloadJson, reaction: row.ReactionPayloadJson, emojiStatus: row.EmojiStatusPayloadJson,
+			media: row.MediaJson, replyMarkup: row.ReplyMarkupJson, richMessage: row.RichMessageJson,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("decode message entities: %w", err)
-		}
-		silent, noforwards, reply, forward, err := messageMetadataFromFields(
-			row.Silent,
-			row.Noforwards,
-			row.ReplyToMsgID,
-			row.ReplyToPeerType,
-			row.ReplyToPeerID,
-			row.ReplyToTopID,
-			row.ReplyToStoryID,
-			row.QuoteText,
-			row.QuoteEntitiesJson,
-			row.QuoteOffset,
-			row.FwdFromPeerType,
-			row.FwdFromPeerID,
-			row.FwdFromName,
-			row.FwdDate,
-			row.FwdSavedFromPeerType,
-			row.FwdSavedFromPeerID,
-			row.FwdSavedFromMsgID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("decode message metadata: %w", err)
-		}
-		peers, err := decodeEventPeers(row.EventPeersJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode event peers: %w", err)
-		}
-		settings, err := decodePeerSettings(row.PeerSettingsJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode peer settings: %w", err)
-		}
-		messageIDs, err := decodeEventMessageIDs(row.MessageIdsJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message ids: %w", err)
-		}
-		dialogFilter, err := decodeEventDialogFilter(row.DialogFilterJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode dialog filter: %w", err)
-		}
-		filterOrder, err := decodeEventFilterOrder(row.FilterOrderJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode filter order: %w", err)
-		}
-		folderPeers, err := decodeEventFolderPeers(row.FolderPeersJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode folder peers: %w", err)
-		}
-		story, err := decodeEventStory(row.StoryPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode story payload: %w", err)
-		}
-		reaction, err := decodeEventReaction(row.ReactionPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode reaction payload: %w", err)
-		}
-		emojiStatus, err := decodeEventEmojiStatus(row.EmojiStatusPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode emoji status payload: %w", err)
-		}
-		media, err := decodeMessageMedia(row.MediaJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message media: %w", err)
-		}
-		markup, err := decodeReplyMarkup(row.ReplyMarkupJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message reply markup: %w", err)
-		}
-		rich, err := decodeRichMessage(row.RichMessageJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message rich message: %w", err)
+			return nil, fmt.Errorf("decode %s update event payload: %w", eventType, err)
 		}
 		event := domain.UpdateEvent{
 			UserID:           row.UserID,
-			Type:             domain.UpdateEventType(row.EventType),
+			Type:             eventType,
 			Pts:              int(row.Pts),
 			PtsCount:         int(row.PtsCount),
 			Date:             int(row.Date),
 			Peer:             domain.Peer{Type: domain.PeerType(row.EventPeerType), ID: row.EventPeerID},
-			Story:            story,
-			Peers:            peers,
+			Story:            payload.story,
+			Peers:            payload.peers,
 			Bool:             row.EventBool,
 			Phone:            row.EventPhone,
-			Settings:         settings,
-			MessageIDs:       messageIDs,
+			Settings:         payload.settings,
+			MessageIDs:       payload.messageIDs,
 			MaxID:            int(row.MaxID),
+			TopMsgID:         int(row.TopMsgID),
 			StillUnreadCount: int(row.StillUnreadCount),
 			ChannelPts:       int(row.ChannelPts),
 			FilterID:         int(row.FilterID),
-			DialogFilter:     dialogFilter,
-			FilterOrder:      filterOrder,
-			FolderPeers:      folderPeers,
+			DialogFilter:     payload.dialogFilter,
+			FilterOrder:      payload.filterOrder,
+			FolderPeers:      payload.folderPeers,
 			TagsEnabled:      row.TagsEnabled,
 			FolderID:         int(row.FolderID),
-			Reaction:         reaction,
-			EmojiStatus:      emojiStatus,
+			Reaction:         payload.reaction,
+			EmojiStatus:      payload.emojiStatus,
 			Message: domain.Message{
 				ID:             int(row.MessageID),
 				UID:            row.PrivateMessageID,
@@ -440,15 +641,15 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 				EditDate:       int(row.EditDate),
 				HideEdited:     row.HideEdited,
 				Out:            row.Outgoing,
-				Silent:         silent,
-				NoForwards:     noforwards,
+				Silent:         payload.silent,
+				NoForwards:     payload.noforwards,
 				Body:           row.Body,
-				Entities:       entities,
-				ReplyTo:        reply,
-				Forward:        forward,
-				Media:          media,
-				ReplyMarkup:    markup,
-				RichMessage:    rich,
+				Entities:       payload.entities,
+				ReplyTo:        payload.reply,
+				Forward:        payload.forward,
+				Media:          payload.media,
+				ReplyMarkup:    payload.markup,
+				RichMessage:    payload.rich,
 				MediaUnread:    row.MediaUnread,
 				ReactionUnread: row.ReactionUnread,
 				ViaBotID:       row.ViaBotID,
@@ -462,10 +663,10 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 			},
 			Users: usersFromUpdateEventRow(row),
 		}
-		if err := s.hydrateQuickReplyEvent(ctx, &event); err != nil {
-			return nil, err
-		}
 		out = append(out, event)
+	}
+	if err := s.hydrateQuickReplyEvents(ctx, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -532,104 +733,48 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 	}
 	out := make([]domain.UpdateEvent, 0, len(rows))
 	for _, row := range rows {
-		entities, err := decodeMessageEntities(row.MessageEntitiesJson)
+		eventType := domain.UpdateEventType(row.EventType)
+		payload, err := decodeUpdateEventPayload(eventType, updateEventPayloadColumns{
+			messageEntities: row.MessageEntitiesJson,
+			silent:          row.Silent, noforwards: row.Noforwards,
+			replyToMsgID: row.ReplyToMsgID, replyToPeerType: row.ReplyToPeerType, replyToPeerID: row.ReplyToPeerID,
+			replyToTopID: row.ReplyToTopID, replyToStoryID: row.ReplyToStoryID,
+			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset,
+			fwdFromPeerType: row.FwdFromPeerType, fwdFromPeerID: row.FwdFromPeerID, fwdFromName: row.FwdFromName, fwdDate: row.FwdDate,
+			fwdSavedFromPeerType: row.FwdSavedFromPeerType, fwdSavedFromPeerID: row.FwdSavedFromPeerID, fwdSavedFromMsgID: row.FwdSavedFromMsgID,
+			eventPeers: row.EventPeersJson, peerSettings: row.PeerSettingsJson, messageIDs: row.MessageIdsJson,
+			dialogFilter: row.DialogFilterJson, filterOrder: row.FilterOrderJson, folderPeers: row.FolderPeersJson,
+			story: row.StoryPayloadJson, reaction: row.ReactionPayloadJson, emojiStatus: row.EmojiStatusPayloadJson,
+			media: row.MediaJson, replyMarkup: row.ReplyMarkupJson, richMessage: row.RichMessageJson,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("decode message entities: %w", err)
-		}
-		silent, noforwards, reply, forward, err := messageMetadataFromFields(
-			row.Silent,
-			row.Noforwards,
-			row.ReplyToMsgID,
-			row.ReplyToPeerType,
-			row.ReplyToPeerID,
-			row.ReplyToTopID,
-			row.ReplyToStoryID,
-			row.QuoteText,
-			row.QuoteEntitiesJson,
-			row.QuoteOffset,
-			row.FwdFromPeerType,
-			row.FwdFromPeerID,
-			row.FwdFromName,
-			row.FwdDate,
-			row.FwdSavedFromPeerType,
-			row.FwdSavedFromPeerID,
-			row.FwdSavedFromMsgID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("decode message metadata: %w", err)
-		}
-		peers, err := decodeEventPeers(row.EventPeersJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode event peers: %w", err)
-		}
-		settings, err := decodePeerSettings(row.PeerSettingsJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode peer settings: %w", err)
-		}
-		messageIDs, err := decodeEventMessageIDs(row.MessageIdsJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message ids: %w", err)
-		}
-		dialogFilter, err := decodeEventDialogFilter(row.DialogFilterJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode dialog filter: %w", err)
-		}
-		filterOrder, err := decodeEventFilterOrder(row.FilterOrderJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode filter order: %w", err)
-		}
-		folderPeers, err := decodeEventFolderPeers(row.FolderPeersJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode folder peers: %w", err)
-		}
-		story, err := decodeEventStory(row.StoryPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode story payload: %w", err)
-		}
-		reaction, err := decodeEventReaction(row.ReactionPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode reaction payload: %w", err)
-		}
-		emojiStatus, err := decodeEventEmojiStatus(row.EmojiStatusPayloadJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode emoji status payload: %w", err)
-		}
-		media, err := decodeMessageMedia(row.MediaJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message media: %w", err)
-		}
-		markup, err := decodeReplyMarkup(row.ReplyMarkupJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message reply markup: %w", err)
-		}
-		rich, err := decodeRichMessage(row.RichMessageJson)
-		if err != nil {
-			return nil, fmt.Errorf("decode message rich message: %w", err)
+			return nil, fmt.Errorf("decode %s update event payload: %w", eventType, err)
 		}
 		event := domain.UpdateEvent{
 			UserID:           row.UserID,
-			Type:             domain.UpdateEventType(row.EventType),
+			Type:             eventType,
 			Pts:              int(row.Pts),
 			PtsCount:         int(row.PtsCount),
 			Date:             int(row.Date),
 			Peer:             domain.Peer{Type: domain.PeerType(row.EventPeerType), ID: row.EventPeerID},
-			Story:            story,
-			Peers:            peers,
+			Story:            payload.story,
+			Peers:            payload.peers,
 			Bool:             row.EventBool,
 			Phone:            row.EventPhone,
-			Settings:         settings,
-			MessageIDs:       messageIDs,
+			Settings:         payload.settings,
+			MessageIDs:       payload.messageIDs,
 			MaxID:            int(row.MaxID),
+			TopMsgID:         int(row.TopMsgID),
 			StillUnreadCount: int(row.StillUnreadCount),
 			ChannelPts:       int(row.ChannelPts),
 			FilterID:         int(row.FilterID),
-			DialogFilter:     dialogFilter,
-			FilterOrder:      filterOrder,
-			FolderPeers:      folderPeers,
+			DialogFilter:     payload.dialogFilter,
+			FilterOrder:      payload.filterOrder,
+			FolderPeers:      payload.folderPeers,
 			TagsEnabled:      row.TagsEnabled,
 			FolderID:         int(row.FolderID),
-			Reaction:         reaction,
-			EmojiStatus:      emojiStatus,
+			Reaction:         payload.reaction,
+			EmojiStatus:      payload.emojiStatus,
 			Message: domain.Message{
 				ID:             int(row.MessageID),
 				UID:            row.PrivateMessageID,
@@ -640,15 +785,15 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 				EditDate:       int(row.EditDate),
 				HideEdited:     row.HideEdited,
 				Out:            row.Outgoing,
-				Silent:         silent,
-				NoForwards:     noforwards,
+				Silent:         payload.silent,
+				NoForwards:     payload.noforwards,
 				Body:           row.Body,
-				Entities:       entities,
-				ReplyTo:        reply,
-				Forward:        forward,
-				Media:          media,
-				ReplyMarkup:    markup,
-				RichMessage:    rich,
+				Entities:       payload.entities,
+				ReplyTo:        payload.reply,
+				Forward:        payload.forward,
+				Media:          payload.media,
+				ReplyMarkup:    payload.markup,
+				RichMessage:    payload.rich,
 				MediaUnread:    row.MediaUnread,
 				ReactionUnread: row.ReactionUnread,
 				ViaBotID:       row.ViaBotID,
@@ -662,10 +807,10 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 			},
 			Users: usersFromBatchDispatchRow(row),
 		}
-		if err := s.hydrateQuickReplyEvent(ctx, &event); err != nil {
-			return nil, err
-		}
 		out = append(out, event)
+	}
+	if err := s.hydrateQuickReplyEvents(ctx, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -854,7 +999,7 @@ func encodeEventPeers(peers []domain.Peer) ([]byte, error) {
 }
 
 func decodeEventPeers(raw string) ([]domain.Peer, error) {
-	if raw == "" {
+	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil
 	}
 	var wire []eventPeerJSON
@@ -883,7 +1028,7 @@ func encodeEventMessageIDs(ids []int) ([]byte, error) {
 }
 
 func decodeEventMessageIDs(raw string) ([]int, error) {
-	if raw == "" {
+	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil
 	}
 	var ids []int
@@ -927,7 +1072,7 @@ func encodeEventFilterOrder(order []int) ([]byte, error) {
 }
 
 func decodeEventFilterOrder(raw string) ([]int, error) {
-	if raw == "" {
+	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil
 	}
 	var order []int
@@ -949,7 +1094,7 @@ func encodeEventFolderPeers(peers []domain.FolderPeerUpdate) ([]byte, error) {
 }
 
 func decodeEventFolderPeers(raw string) ([]domain.FolderPeerUpdate, error) {
-	if raw == "" {
+	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil
 	}
 	var peers []domain.FolderPeerUpdate
@@ -1052,7 +1197,7 @@ func encodePeerSettings(settings domain.PeerSettings) ([]byte, error) {
 }
 
 func decodePeerSettings(raw string) (domain.PeerSettings, error) {
-	if raw == "" {
+	if raw == "" || raw == "{}" || raw == "null" {
 		return domain.PeerSettings{}, nil
 	}
 	var wire peerSettingsJSON

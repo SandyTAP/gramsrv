@@ -751,7 +751,7 @@ func (s *MediaStore) PutStickerSet(ctx context.Context, set domain.StickerSet) e
 	})
 }
 
-func (s *MediaStore) CreateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error {
+func (s *MediaStore) AdminCreateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error {
 	err := withTx(ctx, s.db, "create sticker set", func(tx pgx.Tx) error {
 		if err := insertStickerSet(ctx, tx, set); err != nil {
 			return err
@@ -780,7 +780,57 @@ func (s *MediaStore) CreateStickerSet(ctx context.Context, set domain.StickerSet
 	return nil
 }
 
-func (s *MediaStore) UpdateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error {
+func (s *MediaStore) CreateInstalledStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, docs []domain.Document, installation domain.UserStickerSet, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) error {
+	if effects == nil || installation.OwnerUserID <= 0 || installation.StickerSetID != set.ID || !validInstalledStickerSetKind(installation.Kind) {
+		return store.ErrDeliveryOutboxRequired
+	}
+	err := withTx(ctx, s.db, "create installed sticker set with delivery", func(tx pgx.Tx) error {
+		if err := insertStickerSet(ctx, tx, set); err != nil {
+			return err
+		}
+		qtx := s.q.WithTx(tx)
+		for _, doc := range docs {
+			params, err := putDocumentParams(doc)
+			if err != nil {
+				return err
+			}
+			if err := qtx.PutDocument(ctx, params); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO user_sticker_sets (owner_user_id, sticker_set_id, set_kind, archived, installed_date, order_value, updated_at)
+VALUES ($1, $2, $3, $4, $5::integer, (($5::integer)::bigint << 32), now())`,
+			installation.OwnerUserID, installation.StickerSetID, string(installation.Kind),
+			installation.Archived, installation.InstalledDate); err != nil {
+			return fmt.Errorf("install created sticker set: %w", err)
+		}
+		installed := installation
+		intents, err := effects(store.StickerSetMutation{Set: set, Installation: &installed})
+		if err != nil {
+			return fmt.Errorf("build create sticker set delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply create sticker set delivery effects: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		if stickerSetShortNameConflict(err) {
+			return domain.ErrStickerSetShortNameOccupied
+		}
+		return err
+	}
+	for _, doc := range docs {
+		s.documents.put(doc.ID, doc)
+	}
+	return nil
+}
+
+func (s *MediaStore) AdminUpdateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error {
 	err := withTx(ctx, s.db, "update sticker set", func(tx pgx.Tx) error {
 		if err := updateStickerSet(ctx, tx, set); err != nil {
 			return err
@@ -806,22 +856,75 @@ func (s *MediaStore) UpdateStickerSet(ctx context.Context, set domain.StickerSet
 	return nil
 }
 
-func (s *MediaStore) DeleteStickerSet(ctx context.Context, setID int64, creatorUserID int64) error {
-	return withTx(ctx, s.db, "delete sticker set", func(tx pgx.Tx) error {
+func (s *MediaStore) UpdateStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, docs []domain.Document, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	err := withTx(ctx, s.db, "update sticker set with delivery", func(tx pgx.Tx) error {
+		if err := updateStickerSet(ctx, tx, set); err != nil {
+			return err
+		}
+		qtx := s.q.WithTx(tx)
+		for _, doc := range docs {
+			params, err := putDocumentParams(doc)
+			if err != nil {
+				return err
+			}
+			if err := qtx.PutDocument(ctx, params); err != nil {
+				return err
+			}
+		}
+		intents, err := effects(store.StickerSetMutation{Set: set})
+		if err != nil {
+			return fmt.Errorf("build update sticker set delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply update sticker set delivery effects: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, doc := range docs {
+		s.documents.put(doc.ID, doc)
+	}
+	return nil
+}
+
+func (s *MediaStore) DeleteStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) error {
+	if effects == nil || set.ID <= 0 || set.CreatorUserID <= 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	return withTx(ctx, s.db, "delete sticker set with delivery", func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 UPDATE sticker_sets
 SET deleted = true, updated_at = now()
-WHERE id = $1
-  AND creator_user_id = $2
-  AND deleted = false`, setID, creatorUserID)
+WHERE id = $1 AND creator_user_id = $2 AND deleted = false`, set.ID, set.CreatorUserID)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
 			return domain.ErrStickerSetInvalid
 		}
-		_, err = tx.Exec(ctx, `DELETE FROM user_sticker_sets WHERE sticker_set_id = $1`, setID)
-		return err
+		if _, err := tx.Exec(ctx, `DELETE FROM user_sticker_sets WHERE sticker_set_id = $1`, set.ID); err != nil {
+			return err
+		}
+		set.Deleted = true
+		intents, err := effects(store.StickerSetMutation{Set: set, Deleted: true})
+		if err != nil {
+			return fmt.Errorf("build delete sticker set delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply delete sticker set delivery effects: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -1499,6 +1602,98 @@ RETURNING photo_id
 		return nil, err
 	}
 	return deleted, nil
+}
+
+func (s *MediaStore) SetProfilePhotoKindWithDelivery(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error) {
+	var result store.ProfilePhotoMutation
+	found := false
+	err := withTx(ctx, s.db, "set profile photo with delivery", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, ownerID); err != nil {
+			return fmt.Errorf("lock profile photo owner: %w", err)
+		}
+		txStore := NewMediaStore(tx)
+		photo, ok, err := txStore.GetPhoto(ctx, photoID)
+		if err != nil {
+			return fmt.Errorf("get selected profile photo: %w", err)
+		}
+		if !ok {
+			return nil
+		}
+		found = true
+		if err := txStore.AddProfilePhotoKind(ctx, ownerType, ownerID, kind, photoID, date); err != nil {
+			return fmt.Errorf("set selected profile photo: %w", err)
+		}
+		result = store.ProfilePhotoMutation{
+			OwnerType: ownerType, OwnerID: ownerID, Kind: normalizeProfilePhotoKind(kind),
+			Current: photo, HasCurrent: true,
+		}
+		return applyProfilePhotoEffects(ctx, tx, result, effects)
+	})
+	if err != nil {
+		return store.ProfilePhotoMutation{}, false, err
+	}
+	return result, found, nil
+}
+
+func (s *MediaStore) DeleteProfilePhotosKindWithDelivery(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error) {
+	if len(photoIDs) == 0 {
+		return store.ProfilePhotoMutation{OwnerType: ownerType, OwnerID: ownerID, Kind: normalizeProfilePhotoKind(kind)}, nil
+	}
+	var result store.ProfilePhotoMutation
+	err := withTx(ctx, s.db, "delete profile photos with delivery", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, ownerID); err != nil {
+			return fmt.Errorf("lock profile photo owner: %w", err)
+		}
+		txStore := NewMediaStore(tx)
+		deleted, err := txStore.DeleteProfilePhotosKind(ctx, ownerType, ownerID, kind, photoIDs)
+		if err != nil {
+			return fmt.Errorf("delete profile photos: %w", err)
+		}
+		result = store.ProfilePhotoMutation{
+			OwnerType: ownerType, OwnerID: ownerID, Kind: normalizeProfilePhotoKind(kind),
+			DeletedIDs: append([]int64(nil), deleted...),
+		}
+		if len(deleted) == 0 {
+			return nil
+		}
+		currentID, ok, err := txStore.CurrentProfilePhotoKind(ctx, ownerType, ownerID, kind)
+		if err != nil {
+			return fmt.Errorf("get current profile photo after delete: %w", err)
+		}
+		if ok {
+			current, found, err := txStore.GetPhoto(ctx, currentID)
+			if err != nil {
+				return fmt.Errorf("load current profile photo after delete: %w", err)
+			}
+			if !found {
+				return fmt.Errorf("current profile photo %d is missing", currentID)
+			}
+			result.Current = current
+			result.HasCurrent = true
+		}
+		return applyProfilePhotoEffects(ctx, tx, result, effects)
+	})
+	if err != nil {
+		return store.ProfilePhotoMutation{}, err
+	}
+	return result, nil
+}
+
+func applyProfilePhotoEffects(ctx context.Context, tx pgx.Tx, snapshot store.ProfilePhotoMutation, build store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return fmt.Errorf("build profile photo delivery effects: %w", err)
+	}
+	if len(effects) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, effects); err != nil {
+		return fmt.Errorf("apply profile photo delivery effects: %w", err)
+	}
+	return nil
 }
 
 func (s *MediaStore) nextProfilePhotoOrder(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (int64, error) {

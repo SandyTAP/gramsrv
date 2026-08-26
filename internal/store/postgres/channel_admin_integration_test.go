@@ -37,7 +37,7 @@ func TestChannelStoreEditAboutPersistsAndChecksPermission(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "About " + suffix,
@@ -109,7 +109,7 @@ func TestChannelStoreCreatorCanEditOwnAdminRights(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, admin.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Creator Self " + suffix,
@@ -208,7 +208,7 @@ func TestChannelStoreAdminLogFiltersAndSearch(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID, invited.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Admin Log " + suffix,
@@ -329,7 +329,7 @@ func TestChannelStoreListSendAsChannelsPostgres(t *testing.T) {
 		t.Fatalf("create host: %v", err)
 	}
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	channelIDs := make([]int64, 0, 5)
 	t.Cleanup(func() {
 		for _, id := range channelIDs {
@@ -412,7 +412,7 @@ func TestChannelStoreCommonChannelsOnlySharedMegagroups(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID, other.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	create := func(title string, broadcast bool, memberIDs []int64, date int) domain.CreateChannelResult {
 		t.Helper()
 		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
@@ -497,7 +497,7 @@ func TestChannelStoreListActiveChannelIDsForUserUsesMembershipIndexState(t *test
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	create := func(title string, date int) domain.CreateChannelResult {
 		t.Helper()
 		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
@@ -587,7 +587,7 @@ func TestChannelStoreUserChannelMemberIndexListPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	publicCandidate, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "index public " + suffix,
@@ -697,7 +697,7 @@ func TestChannelStoreListStoryPostableChannelsPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, admin.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	owned, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: admin.ID,
 		Title:         "pg owned story " + suffix,
@@ -791,7 +791,7 @@ func TestChannelStoreLeftChannelsReturnsPagedLeftMemberships(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	create := func(title string, broadcast bool, date int) domain.CreateChannelResult {
 		t.Helper()
 		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
@@ -861,7 +861,7 @@ func TestChannelStoreDiscussionGroupLinksAreBidirectional(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	create := func(title string, broadcast bool, date int) domain.CreateChannelResult {
 		t.Helper()
 		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{

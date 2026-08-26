@@ -638,12 +638,15 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 61, Phone: "15550002301", FirstName: "Owner"})
 	requester, _ := userStore.Create(ctx, domain.User{AccessHash: 62, Phone: "15550002302", FirstName: "Requester"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	moderationStore := memory.NewModerationReportStore()
 	userService := appusers.NewService(userStore)
 	channelService := appchannels.NewService(channelStore)
 	r := New(Config{}, Deps{
-		Users:    userService,
-		Channels: channelService,
+		Users:          userService,
+		Channels:       channelService,
+		DeliveryOutbox: deliveryOutbox,
 		Moderation: appmoderation.NewService(
 			moderationStore,
 			appmoderation.WithMessageReaders(nil, channelService),

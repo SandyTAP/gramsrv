@@ -43,7 +43,10 @@ func runProcess(logger *zap.Logger, cfg config.EdgeConfig, buildMeta common.Buil
 	if err := validateEdgeConfig(cfg); err != nil {
 		return err
 	}
-	instanceID := config.ResolveInstanceID(cfg.InstanceID)
+	instanceID, err := config.RequireInstanceID(cfg.InstanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance id: %w", err)
+	}
 	if err := common.ConfigureProcessGlobals(cfg); err != nil {
 		return err
 	}
@@ -188,30 +191,48 @@ func runWithConfig(
 		Logger:     logger.Named("coreexec").Named("auth-key-cache"),
 	})
 
-	egressAckGRPCTargets, err := egresssvc.ParseGRPCAckTargetsForResolver(cfg.EgressAckGRPCTargets, cfg.EgressAckGRPCResolver)
+	egressDeliveryGRPCTargets, err := egresssvc.ParseGRPCDeliveryTargetsForResolver(cfg.EgressDeliveryGRPCTargets, cfg.EgressDeliveryGRPCResolver)
 	if err != nil {
-		return fmt.Errorf("parse TELESRV_EGRESS_ACK_GRPC_TARGETS: %w", err)
+		return fmt.Errorf("parse TELESRV_EGRESS_DELIVERY_GRPC_TARGETS: %w", err)
 	}
-	egressAckRemote, egressAckConn, err := egresssvc.DialGRPCAckRemote(ctx, egresssvc.GRPCAckClientConfig{
-		Targets:        egressAckGRPCTargets,
-		ResolverKind:   cfg.EgressAckGRPCResolver,
-		Token:          cfg.EgressAckToken,
-		Logger:         logger.Named("egress").Named("ack").Named("grpc").Named("client"),
-		TLSCAFile:      cfg.EgressAckGRPCTLSCAFile,
-		TLSServerName:  cfg.EgressAckGRPCTLSServerName,
-		TLSCertFile:    cfg.EgressAckGRPCTLSClientCertFile,
-		TLSKeyFile:     cfg.EgressAckGRPCTLSClientKeyFile,
-		RequestTimeout: cfg.EgressAckGRPCRequestTimeout,
+	egressDeliveryRemote, egressDeliveryConn, err := egresssvc.DialGRPCDeliveryRemote(ctx, egresssvc.GRPCDeliveryClientConfig{
+		Targets:        egressDeliveryGRPCTargets,
+		ResolverKind:   cfg.EgressDeliveryGRPCResolver,
+		Token:          cfg.EgressDeliveryToken,
+		Logger:         logger.Named("egress").Named("delivery").Named("grpc").Named("client"),
+		TLSCAFile:      cfg.EgressDeliveryGRPCTLSCAFile,
+		TLSServerName:  cfg.EgressDeliveryGRPCTLSServerName,
+		TLSCertFile:    cfg.EgressDeliveryGRPCTLSClientCertFile,
+		TLSKeyFile:     cfg.EgressDeliveryGRPCTLSClientKeyFile,
+		RequestTimeout: cfg.EgressDeliveryGRPCRequestTimeout,
 	})
 	if err != nil {
-		return fmt.Errorf("connect egress ack grpc: %w", err)
+		return fmt.Errorf("connect egress delivery grpc: %w", err)
 	}
-	defer func() { _ = egressAckConn.Close() }()
-	outboxClientAckReporter := newOutboxClientAckReporter(egressAckRemote, cfg.EgressAckGRPCRequestTimeout, logger.Named("egress").Named("client-ack-reporter"))
-	go outboxClientAckReporter.Run(ctx)
-	logger.Info("egress ack grpc health check passed",
-		zap.String("resolver", cfg.EgressAckGRPCResolver),
-		zap.Strings("targets", egressAckGRPCTargets))
+	defer func() { _ = egressDeliveryConn.Close() }()
+	physicalReceiptReporter := newPhysicalReceiptReporter(egressDeliveryRemote, cfg.EgressDeliveryGRPCRequestTimeout, logger.Named("egress").Named("physical-receipt-reporter"))
+	// Reporter lifecycle is closed explicitly after the delivery executor. Do
+	// not let the shared serve context stop it before executor shutdown commits
+	// every pre-reserved receipt slot.
+	go physicalReceiptReporter.Run(context.Background())
+	defer func() {
+		physicalReceiptReporter.Close()
+		physicalReceiptReporter.Wait()
+	}()
+	if err := activeSessions.SetPhysicalReceiptSink(physicalReceiptReporter); err != nil {
+		return fmt.Errorf("install physical receipt sink: %w", err)
+	}
+	defer activeSessions.CloseDeliveryExecutor()
+
+	clientAckReporter := newDeliveryClientAckReporter(egressDeliveryRemote, instanceID, cfg.EgressDeliveryGRPCRequestTimeout, logger.Named("egress").Named("client-ack-reporter"))
+	go clientAckReporter.Run(context.Background())
+	defer func() {
+		clientAckReporter.Close()
+		clientAckReporter.Wait()
+	}()
+	logger.Info("egress delivery grpc health check passed",
+		zap.String("resolver", cfg.EgressDeliveryGRPCResolver),
+		zap.Strings("targets", egressDeliveryGRPCTargets))
 
 	logger.Info("edge location registry enabled",
 		zap.String("instance_id", instanceID),
@@ -221,7 +242,7 @@ func runWithConfig(
 	if err := activeSessions.StartLocationRegistry(ctx, edgeLocationRegistry, instanceID, cfg.EdgeLocationTTL, cfg.EdgeLocationHeartbeatInterval); err != nil {
 		return fmt.Errorf("start edge location registry: %w", err)
 	}
-	go edgecontrol.RunOutboxPushSubscriber(ctx, edgeCommandBus, instanceID, activeSessions)
+	go edgecontrol.RunDeliveryBatchSubscriber(ctx, edgeCommandBus, instanceID, activeSessions)
 	go edgecontrol.RunSessionControlSubscriber(ctx, edgeCommandBus, instanceID, localEdgeControl)
 	go authKeyStore.RunAuthKeyInvalidationSubscriber(ctx, authInvalidationBroker, instanceID, activeSessions, logger.Named("coreexec").Named("auth-key-invalidation"))
 	go activeSessions.RunPendingSweeper(ctx, time.Minute)
@@ -256,7 +277,7 @@ func runWithConfig(
 		OutboundControlQueueSize:      cfg.MTProtoOutboundControlQueueSize,
 		OutboundTrackedGlobalMaxBytes: cfg.MTProtoOutboundTrackedGlobalMaxBytes,
 		OutboundWriteGlobalMaxBytes:   cfg.MTProtoOutboundWriteGlobalMaxBytes,
-		OutboxClientAcked:             outboxClientAckReporter.Submit,
+		DeliveryClientAcked:           clientAckReporter.Observe,
 		OnServing: func(_ net.Addr) {
 			logger.Info("telesrv edge ready",
 				zap.String("listen", cfg.ListenAddr),
@@ -265,8 +286,8 @@ func runWithConfig(
 				zap.String("core_exec_grpc_resolver", cfg.CoreExecGRPCResolver),
 				zap.Strings("file_grpc_targets", fileDataGRPCTargets),
 				zap.String("file_grpc_resolver", cfg.FileGRPCResolver),
-				zap.Strings("egress_ack_grpc_targets", egressAckGRPCTargets),
-				zap.String("egress_ack_grpc_resolver", cfg.EgressAckGRPCResolver),
+				zap.Strings("egress_delivery_grpc_targets", egressDeliveryGRPCTargets),
+				zap.String("egress_delivery_grpc_resolver", cfg.EgressDeliveryGRPCResolver),
 				zap.Int("pid", os.Getpid()),
 				zap.String("instance_id", instanceID),
 				zap.String("git_commit", buildMeta.Commit),
@@ -327,14 +348,14 @@ func validateEdgeConfig(cfg config.EdgeConfig) error {
 	if strings.TrimSpace(cfg.FileToken) == "" {
 		return fmt.Errorf("TELESRV_FILE_TOKEN is required by cmd/telesrv-edge and cmd/telesrv-file")
 	}
-	if strings.TrimSpace(cfg.EgressAckGRPCTargets) == "" {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TARGETS is required by cmd/telesrv-edge")
+	if strings.TrimSpace(cfg.EgressDeliveryGRPCTargets) == "" {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_TARGETS is required by cmd/telesrv-edge")
 	}
-	if _, err := egresssvc.ParseGRPCAckTargetsForResolver(cfg.EgressAckGRPCTargets, cfg.EgressAckGRPCResolver); err != nil {
-		return fmt.Errorf("parse TELESRV_EGRESS_ACK_GRPC_TARGETS: %w", err)
+	if _, err := egresssvc.ParseGRPCDeliveryTargetsForResolver(cfg.EgressDeliveryGRPCTargets, cfg.EgressDeliveryGRPCResolver); err != nil {
+		return fmt.Errorf("parse TELESRV_EGRESS_DELIVERY_GRPC_TARGETS: %w", err)
 	}
-	if strings.TrimSpace(cfg.EgressAckToken) == "" {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_TOKEN is required by cmd/telesrv-edge and cmd/telesrv-egress")
+	if strings.TrimSpace(cfg.EgressDeliveryToken) == "" {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_TOKEN is required by cmd/telesrv-edge and cmd/telesrv-egress")
 	}
 	return nil
 }

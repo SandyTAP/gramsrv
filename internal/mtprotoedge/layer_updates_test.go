@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,6 +158,64 @@ func TestLayerUpdatesFanoutFreezesDefensivelyAndSharesPreparedProfile(t *testing
 	status := decoded.(*tg.UpdateShort).Update.(*tg.UpdateUserStatus).Status.(*tg.UserStatusOnline)
 	if status.Expires != 123 {
 		t.Fatalf("frozen value mutated: expires=%d", status.Expires)
+	}
+}
+
+func TestRetainedLayerUpdatesFanoutChargesFrozenAndOnlyOnePreparedProfile(t *testing.T) {
+	var used atomic.Int64
+	const maxBytes = int64(1 << 20)
+	retain := func(bytes int) bool { return reserveDeliveryBytes(&used, maxBytes, bytes) }
+	release := func(bytes int) { used.Add(-int64(bytes)) }
+
+	fanout, err := newRetainedLayerUpdatesFanout(testLayerUpdatesValue(123), retain, release, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := used.Load(), int64(fanout.canonicalSize()); got != want {
+		t.Fatalf("frozen retained bytes = %d, want %d", got, want)
+	}
+	first, err := fanout.prepareForConn(context.Background(), testConnWithLayerProfile(t, tlprofile.Profile225))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := used.Load(), int64(fanout.canonicalSize()+len(first.body)); got != want {
+		t.Fatalf("first profile retained bytes = %d, want %d", got, want)
+	}
+	second, err := fanout.prepareForConn(context.Background(), testConnWithLayerProfile(t, tlprofile.Profile227))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := used.Load(), int64(fanout.canonicalSize()+len(second.body)); got != want {
+		t.Fatalf("second profile retained bytes = %d, want one-profile cache %d", got, want)
+	}
+	fanout.close()
+	if got := used.Load(); got != 0 {
+		t.Fatalf("retained bytes after close = %d, want 0", got)
+	}
+}
+
+func TestRetainedLayerUpdatesFanoutRejectsUnbudgetedPreparedBody(t *testing.T) {
+	probe, err := newLayerUpdatesFanout(testLayerUpdatesValue(123))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var used atomic.Int64
+	maxBytes := int64(probe.canonicalSize())
+	retain := func(bytes int) bool { return reserveDeliveryBytes(&used, maxBytes, bytes) }
+	release := func(bytes int) { used.Add(-int64(bytes)) }
+	fanout, err := newRetainedLayerUpdatesFanout(testLayerUpdatesValue(123), retain, release, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fanout.prepareForConn(context.Background(), testConnWithLayerProfile(t, tlprofile.Profile225)); !errors.Is(err, ErrOutboundTrackedBudget) {
+		t.Fatalf("prepare error = %v, want ErrOutboundTrackedBudget", err)
+	}
+	if got := used.Load(); got != maxBytes {
+		t.Fatalf("retained bytes after rejected profile = %d, want frozen %d", got, maxBytes)
+	}
+	fanout.close()
+	if got := used.Load(); got != 0 {
+		t.Fatalf("retained bytes after close = %d, want 0", got)
 	}
 }
 

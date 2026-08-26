@@ -7,20 +7,44 @@ import (
 	"sort"
 	"sync"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
+	"time"
 )
 
 // ContactStore 是 store.ContactStore 的内存实现。
 type ContactStore struct {
-	mu     sync.RWMutex
-	m      map[int64]domain.ContactList
-	blocks map[int64]map[int64]domain.BlockedContact
+	mu             sync.RWMutex
+	m              map[int64]domain.ContactList
+	blocks         map[int64]map[int64]domain.BlockedContact
+	deliveryOutbox *DeliveryOutboxStore
+	updateEvents   *UpdateEventStore
+	privacy        *PrivacyStore
+}
+
+func (s *ContactStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
+}
+
+func (s *ContactStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	s.mu.Lock()
+	s.updateEvents = events
+	s.mu.Unlock()
+}
+
+func (s *ContactStore) AttachPrivacyStore(privacy *PrivacyStore) {
+	s.mu.Lock()
+	s.privacy = privacy
+	s.mu.Unlock()
 }
 
 // NewContactStore 创建内存 ContactStore。
 func NewContactStore() *ContactStore {
 	return &ContactStore{
-		m:      make(map[int64]domain.ContactList),
-		blocks: make(map[int64]map[int64]domain.BlockedContact),
+		m:            make(map[int64]domain.ContactList),
+		blocks:       make(map[int64]map[int64]domain.BlockedContact),
+		updateEvents: NewUpdateEventStore(),
 	}
 }
 
@@ -340,20 +364,45 @@ func (s *ContactStore) SetCloseFriends(_ context.Context, userID int64, contactU
 	return result, nil
 }
 
-func (s *ContactStore) SetPersonalPhoto(_ context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
+func (s *ContactStore) SetPersonalPhotoWithDelivery(ctx context.Context, viewerUserID, contactUserID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
 	_ = date
+	if viewerUserID <= 0 || contactUserID <= 0 || effects == nil {
+		return domain.Contact{}, false, store.ErrDeliveryOutboxRequired
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	list := s.m[userID]
+	outbox := s.deliveryOutbox
+	if outbox == nil {
+		return domain.Contact{}, false, store.ErrDeliveryOutboxRequired
+	}
+	list := s.m[viewerUserID]
 	for i := range list.Contacts {
 		if list.Contacts[i].User.ID != contactUserID {
 			continue
 		}
-		list.Contacts[i].User.PhotoID = photoID
-		list.Contacts[i].User.PhotoPersonal = photoID != 0
+		contact := cloneContact(list.Contacts[i])
+		contact.User.PhotoID = photoID
+		contact.User.PhotoPersonal = photoID != 0
+		snapshot := store.ContactPersonalPhotoDeliverySnapshot{
+			ViewerUserID: viewerUserID, ContactUserID: contactUserID,
+			Contact: contact, PhotoID: photoID,
+		}
+		intents, err := effects(snapshot)
+		if err != nil {
+			return domain.Contact{}, false, err
+		}
+		if err := store.ValidateContactPersonalPhotoDeliveryEffects(snapshot, intents); err != nil {
+			return domain.Contact{}, false, err
+		}
+		outbox.mu.Lock()
+		defer outbox.mu.Unlock()
+		if err := appendAbsoluteDeliveryEffectsLocked(outbox, intents, time.Now()); err != nil {
+			return domain.Contact{}, false, err
+		}
+		list.Contacts[i] = contact
 		list.Hash = contactListHash(list.Contacts)
-		s.m[userID] = list
-		return cloneContact(list.Contacts[i]), true, nil
+		s.m[viewerUserID] = list
+		return cloneContact(contact), true, nil
 	}
 	return domain.Contact{}, false, nil
 }

@@ -60,6 +60,9 @@ func (s *ChannelStore) SendMonoforumMessage(ctx context.Context, req domain.Send
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if err := lockUsersForUpdate(ctx, tx, req.SenderUserID); err != nil {
+		return domain.SendChannelMessageResult{}, fmt.Errorf("lock monoforum sender: %w", err)
+	}
 	channel, err := getChannelByID(ctx, tx, req.MonoforumID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -260,13 +263,43 @@ ORDER BY user_id`, parent.ID)
 		return domain.SendChannelMessageResult{}, err
 	}
 	rows.Close()
+	var draftEvent domain.UpdateEvent
+	if req.ClearDraft {
+		topMessageID := 0
+		if req.ReplyTo != nil && req.ReplyTo.TopMessageID > 0 {
+			topMessageID = req.ReplyTo.TopMessageID
+		}
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.SenderUserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: req.MonoforumID}, TopMessageID: topMessageID,
+		}
+		changed, err := NewDialogStore(tx).DeleteDraft(ctx, mutation.UserID, mutation.Peer, mutation.TopMessageID)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("clear monoforum draft in send transaction: %w", err)
+		}
+		snapshot := store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		effects, err := sendDraftClearEffects(snapshot)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(snapshot, effects); err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("validate monoforum send draft effects: %w", err)
+		}
+		allocated, err := applyDeliveryEffectsTx(ctx, tx, effects)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("apply monoforum send draft effects: %w", err)
+		}
+		if len(allocated) == 1 {
+			draftEvent = allocated[0].Event
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.SendChannelMessageResult{}, fmt.Errorf("commit send monoforum: %w", err)
 	}
 	committed = true
 	channel.TopMessageID = msgID
 	channel.Pts = pts
-	return domain.SendChannelMessageResult{Channel: channel, Message: msg, Event: event, Recipients: uniqueChannelUserIDs(recipients, 0), SenderStarsBalance: senderBalance}, nil
+	return domain.SendChannelMessageResult{Channel: channel, Message: msg, Event: event, Recipients: uniqueChannelUserIDs(recipients, 0), SenderStarsBalance: senderBalance, DraftEvent: draftEvent}, nil
 }
 
 // ListMonoforumHistory 拉取某订阅者(saved_peer)在 monoforum 内的私信历史,id 倒序分页。

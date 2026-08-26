@@ -79,15 +79,8 @@ func (r *Router) onMessagesCreateChat(ctx context.Context, req *tg.MessagesCreat
 			updates.Updates = append(updates.Updates, inviteUpdates.Updates...)
 		}
 	}
-	// The rpc_result reaches only the calling session. Keep the creator's other
-	// sessions in sync with the same canonical channel state; compatibility-only
-	// legacy chat projection is needed solely by the synchronous create callback.
-	r.pushUserUpdates(ctx, userID, canonicalUpdates)
-	if inviteRes.Event.Pts != 0 {
-		r.pushChannelExplicitUpdates(ctx, userID, inviteRes.Channel.ID, memberIDs, func(viewerUserID int64) *tg.Updates {
-			return r.channelOperationUpdatesWithPeerCache(ctx, viewerUserID, inviteRes, cache)
-		})
-	}
+	// Both channel transactions committed their channel_pts delivery signals.
+	// Core only returns the caller projection; Egress owns all other sessions.
 	return &tg.MessagesInvitedUsers{Updates: updates, MissingInvitees: missingInvitees}, nil
 }
 
@@ -252,12 +245,10 @@ func (r *Router) onMessagesEditChatAbout(ctx context.Context, req *tg.MessagesEd
 		if err != nil {
 			return false, err
 		}
-		view, changed, err := r.deps.Communities.EditAbout(ctx, userID, community.Community.ID, req.About)
+		date := int(r.clock.Now().Unix())
+		_, _, err := r.deps.Communities.EditAbout(ctx, userID, community.Community.ID, req.About, r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return false, communityErr(err)
-		}
-		if changed {
-			r.pushCommunityState(ctx, userID, view)
 		}
 		return true, nil
 	}
@@ -277,7 +268,7 @@ func (r *Router) onMessagesEditChatAbout(ctx context.Context, req *tg.MessagesEd
 	if err != nil {
 		return false, channelAdminErr(err)
 	}
-	r.pushChannelStateToMembers(ctx, userID, channel)
+	r.pushTransientChannelStateInvalidation(ctx, userID, channel)
 	return true, nil
 }
 
@@ -293,11 +284,12 @@ func (r *Router) onMessagesEditChatDefaultBannedRights(ctx context.Context, req 
 		if err != nil {
 			return nil, err
 		}
-		view, changed, err := r.deps.Communities.EditDefaultBannedRights(ctx, userID, community.Community.ID, domainChannelBannedRights(req.BannedRights))
+		date := int(r.clock.Now().Unix())
+		view, _, err := r.deps.Communities.EditDefaultBannedRights(ctx, userID, community.Community.ID, domainChannelBannedRights(req.BannedRights), r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, communityErr(err)
 		}
-		return r.communityMutationUpdates(ctx, userID, view, changed), nil
+		return r.communityUpdates(view), nil
 	}
 	if r.deps.Channels == nil {
 		return nil, channelInvalidErr(domain.ErrChannelInvalid)
@@ -374,9 +366,6 @@ func (r *Router) onMessagesEditChatCreator(ctx context.Context, req *tg.Messages
 	r.addOnlineChannelMemberships(res.Channel.ID, res.OldOwner.UserID, res.NewOwner.UserID)
 	cache := newViewerPeerCache(r)
 	updates := r.channelOwnershipTransferUpdatesWithPeerCache(ctx, userID, userID, res, cache)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOwnershipTransferUpdatesWithPeerCache(ctx, viewerUserID, userID, res, cache)
-	})
 	return updates, nil
 }
 
@@ -447,9 +436,6 @@ func (r *Router) onMessagesEditChatParticipantRank(ctx context.Context, req *tg.
 	}
 	cache := newViewerPeerCache(r)
 	updates := r.channelParticipantUpdatesWithPeerCache(ctx, userID, userID, res.Channel, res.Previous, res.Participant, res.Date, cache)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, userID, res.Channel, res.Previous, res.Participant, res.Date, cache)
-	})
 	return updates, nil
 }
 
@@ -573,13 +559,6 @@ func (r *Router) onMessagesSetChatWallPaper(ctx context.Context, req *tg.Message
 			return nil, channelAdminErr(err)
 		}
 		r.invalidateRPCProjectionForChannel(res.Channel.ID)
-		if res.Changed && res.Event.Pts != 0 {
-			r.enqueueChannelWallpaperFanout(ctx, userID, res)
-		} else if res.Changed {
-			r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-				return r.channelWallpaperUpdatesWithPeerCache(ctx, viewerUserID, res, nil)
-			})
-		}
 		return r.channelWallpaperUpdatesWithPeerCache(ctx, userID, res, nil), nil
 	default:
 		return nil, peerIDInvalidErr()
@@ -605,25 +584,6 @@ func (r *Router) channelWallpaperUpdatesWithPeerCache(ctx context.Context, viewe
 		Date:    int(r.clock.Now().Unix()),
 		Seq:     0,
 	}
-}
-
-func (r *Router) enqueueChannelWallpaperFanout(ctx context.Context, originUserID int64, res domain.SetChannelWallpaperResult) {
-	sendRes := domain.SendChannelMessageResult{
-		Channel:    res.Channel,
-		Message:    res.Message,
-		Event:      res.Event,
-		Recipients: res.Recipients,
-	}
-	fanoutCache := newViewerPeerCache(r)
-	ownerIDs := channelMessageFanoutOwnerIDs(sendRes, nil)
-	r.enqueueChannelFanoutWithPrefetch(ctx, channelFanoutMessageBox, originUserID, res.Channel.ID, res.Event.Pts, res.Recipients,
-		0,
-		func(bgCtx context.Context, viewers []int64) bool {
-			return r.prefetchChannelFanoutUsers(bgCtx, fanoutCache, viewers, ownerIDs)
-		},
-		func(bgCtx context.Context, viewerUserID int64) *tg.Updates {
-			return r.channelWallpaperUpdatesWithPeerCache(bgCtx, viewerUserID, res, fanoutCache)
-		})
 }
 
 func (r *Router) onMessagesSetChatAvailableReactions(ctx context.Context, req *tg.MessagesSetChatAvailableReactionsRequest) (tg.UpdatesClass, error) {

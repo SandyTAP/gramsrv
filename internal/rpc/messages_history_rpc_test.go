@@ -49,7 +49,7 @@ func TestMessagesSearchGlobalRestrictsCommunityScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	communityService := appcommunities.NewService(memory.NewCommunityStore(users, channels, nil, nil))
+	communityService := appcommunities.NewService(memory.NewCommunityStore(users, channels, nil, nil, memory.NewDeliveryOutboxStore()))
 	community, err := communityService.Create(ctx, owner.ID, domain.CreateCommunityRequest{
 		Title: "Scope", InitialPeer: domain.Peer{Type: domain.PeerTypeChannel, ID: linked.Channel.ID},
 		Visibility: domain.CommunityPeerVisible, Date: 102,
@@ -62,7 +62,7 @@ func TestMessagesSearchGlobalRestrictsCommunityScope(t *testing.T) {
 		Peer:        domain.Peer{Type: domain.PeerTypeChannel, ID: publicPreview.Channel.ID},
 		Visibility:  domain.CommunityPeerVisible,
 		Date:        103,
-	}); err != nil {
+	}, rpcCommunityTestEffects); err != nil {
 		t.Fatal(err)
 	}
 	r := New(Config{}, Deps{Users: appusers.NewService(users), Channels: channelService, Communities: communityService}, zaptest.NewLogger(t), clock.System)

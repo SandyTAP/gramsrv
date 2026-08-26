@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"time"
 )
 
@@ -276,9 +277,12 @@ func (s *ChannelStore) CheckInvite(_ context.Context, userID int64, hash string,
 	}, nil
 }
 
-func (s *ChannelStore) ImportInvite(_ context.Context, req domain.ImportChannelInviteRequest) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) ImportInvite(ctx context.Context, req domain.ImportChannelInviteRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if req.UserID == 0 || strings.TrimSpace(req.Hash) == "" {
 		return domain.CreateChannelResult{}, domain.ErrInviteHashEmpty
+	}
+	if effects == nil || s.deliveryOutbox == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -294,10 +298,19 @@ func (s *ChannelStore) ImportInvite(_ context.Context, req domain.ImportChannelI
 		return domain.CreateChannelResult{}, domain.ErrInviteHashInvalid
 	}
 	if invite.RequestNeeded {
+		rollback := s.deliveryRollbackLocked(invite.ChannelID)
 		if err := s.recordPendingInviteRequestLocked(invite, req.UserID, req.Date); err != nil {
 			return domain.CreateChannelResult{}, err
 		}
+		snapshot := s.pendingJoinDeliverySnapshotLocked(channel)
+		if err := applyMemoryPendingJoinDelivery(ctx, s.deliveryOutbox, snapshot, effects); err != nil {
+			s.restoreDeliveryRollbackLocked(invite.ChannelID, rollback)
+			return domain.CreateChannelResult{}, err
+		}
 		return domain.CreateChannelResult{Channel: channel}, domain.ErrInviteRequestSent
+	}
+	if err := applyMemoryPendingJoinDelivery(ctx, s.deliveryOutbox, store.ChannelPendingJoinDeliverySnapshot{}, effects); err != nil {
+		return domain.CreateChannelResult{}, err
 	}
 	return s.approveInviteImporterLocked(channel, invite, req.UserID, 0, req.Date)
 }
@@ -634,9 +647,12 @@ func (s *ChannelStore) PendingJoinRequests(_ context.Context, channelID int64, l
 	}, nil
 }
 
-func (s *ChannelStore) HideAllChatJoinRequests(_ context.Context, req domain.HideChannelJoinRequestsRequest) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) HideAllChatJoinRequests(ctx context.Context, req domain.HideChannelJoinRequestsRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil || s.deliveryOutbox == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -673,6 +689,13 @@ func (s *ChannelStore) HideAllChatJoinRequests(_ context.Context, req domain.Hid
 			break
 		}
 	}
+	rollback := s.deliveryRollbackLocked(req.ChannelID)
+	committed := false
+	defer func() {
+		if !committed {
+			s.restoreDeliveryRollbackLocked(req.ChannelID, rollback)
+		}
+	}()
 	var result domain.CreateChannelResult
 	for _, importer := range targets {
 		invite := domain.ChannelInvite{ChannelID: req.ChannelID, AdminUserID: req.UserID}
@@ -697,6 +720,14 @@ func (s *ChannelStore) HideAllChatJoinRequests(_ context.Context, req domain.Hid
 	if result.Channel.ID == 0 {
 		result = domain.CreateChannelResult{Channel: channel, Recipients: s.activeMemberIDsLocked(req.ChannelID, 0, 0)}
 	}
+	snapshot := store.ChannelPendingJoinDeliverySnapshot{}
+	if len(targets) != 0 {
+		snapshot = s.pendingJoinDeliverySnapshotLocked(result.Channel)
+	}
+	if err := applyMemoryPendingJoinDelivery(ctx, s.deliveryOutbox, snapshot, effects); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	committed = true
 	return result, nil
 }
 

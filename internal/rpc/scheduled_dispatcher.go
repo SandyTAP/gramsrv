@@ -52,12 +52,8 @@ func (d *ScheduledDispatcher) DispatchOnce(ctx context.Context) bool {
 	if d == nil || d.router == nil || d.router.deps.Messages == nil {
 		return false
 	}
-	scheduledSvc, ok := d.router.deps.Messages.(scheduledMessagesService)
-	if !ok {
-		return false
-	}
 	now := int(d.router.clock.Now().Unix())
-	items, err := scheduledSvc.ClaimDueScheduledMessages(ctx, now, d.batch, d.leaseSeconds)
+	items, err := d.router.deps.Messages.ClaimDueScheduledMessages(ctx, now, d.batch, d.leaseSeconds)
 	if err != nil {
 		d.log.Warn("claim due scheduled messages", zap.Error(err))
 		return false

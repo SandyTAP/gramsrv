@@ -2,7 +2,22 @@ package store
 
 import (
 	"context"
-	"time"
+	"errors"
+
+	"telesrv/internal/deliverycontract"
+)
+
+var ErrDeliveryOutboxRequired = errors.New("absolute delivery outbox is required")
+
+// MaxDeliveryBatchBytes is the hard payload boundary shared by durable
+// absolute delivery persistence and the Edge delivery protocol. Window byte
+// budgets may be smaller, but a legal head item is always claimable alone.
+const (
+	MaxDeliveryBatchBytes      = deliverycontract.MaxBatchBytes
+	MaxDeliveryBatchItems      = deliverycontract.MaxBatchItems
+	MaxDeliveryTargets         = deliverycontract.MaxTargets
+	MaxDeliveryInstanceIDBytes = deliverycontract.MaxInstanceIDBytes
+	MaxDeliveryLeaseOwnerBytes = deliverycontract.MaxLeaseOwnerBytes
 )
 
 // DeliveryOutboxItem is a durable non-PTS online delivery task. Payload is an
@@ -12,8 +27,8 @@ type DeliveryOutboxItem struct {
 	TargetUserID     int64
 	ExcludeAuthKeyID [8]byte
 	ExcludeSessionID int64
-	Attempts         int
 	Payload          []byte
+	RecoveryPolicy   OutboxRecoveryPolicy
 }
 
 type DeliveryOutboxEnqueue struct {
@@ -21,28 +36,11 @@ type DeliveryOutboxEnqueue struct {
 	ExcludeAuthKeyID [8]byte
 	ExcludeSessionID int64
 	Payload          []byte
-}
-
-type DeliveryOutboxClientAck struct {
-	OutboxID     int64
-	TargetUserID int64
-	Attempt      int
-	AuthKeyID    [8]byte
-	SessionID    int64
-	ServerMsgID  int64
-	AckedAt      time.Time
+	RecoveryPolicy   OutboxRecoveryPolicy
 }
 
 // DeliveryOutboxStore persists non-PTS delivery facts for independent Egress.
 type DeliveryOutboxStore interface {
 	Enqueue(ctx context.Context, item DeliveryOutboxEnqueue) (DeliveryOutboxItem, error)
-	ClaimPending(ctx context.Context, limit int) ([]DeliveryOutboxItem, error)
-	MarkDelivered(ctx context.Context, item DeliveryOutboxItem) error
-	MarkAbandoned(ctx context.Context, item DeliveryOutboxItem, lastError string) error
-	MarkFailed(ctx context.Context, item DeliveryOutboxItem, lastError string) error
-	DeleteFailed(ctx context.Context, olderThan time.Duration, limit int) (int, error)
-}
-
-type DeliveryOutboxClientAckStore interface {
-	MarkClientAcked(ctx context.Context, ack DeliveryOutboxClientAck) error
+	DurableOutboxStateStore
 }

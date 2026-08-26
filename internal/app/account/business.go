@@ -10,6 +10,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/links"
+	"telesrv/internal/store"
 )
 
 const (
@@ -250,16 +251,6 @@ func (s *Service) CheckQuickReplyShortcut(ctx context.Context, userID int64, sho
 	return s.business.CheckQuickReplyShortcut(ctx, userID, shortcut)
 }
 
-func (s *Service) SaveQuickReplyText(ctx context.Context, userID int64, shortcut string, msg domain.QuickReplyMessage) (domain.QuickReplyMutation, error) {
-	if s == nil || s.business == nil || userID == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrPremiumRequired
-	}
-	if msg.Message == "" || utf8.RuneCountInString(msg.Message) > domain.MaxMessageTextLength || len(msg.Entities) > domain.MaxMessageEntityCount {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	return s.business.SaveQuickReplyText(ctx, userID, shortcut, msg)
-}
-
 func (s *Service) GetQuickReplyMessages(ctx context.Context, userID int64, shortcutID int, ids []int) (domain.QuickReplyMessages, error) {
 	if s == nil || s.business == nil || userID == 0 {
 		return domain.QuickReplyMessages{}, domain.ErrShortcutInvalid
@@ -267,32 +258,15 @@ func (s *Service) GetQuickReplyMessages(ctx context.Context, userID int64, short
 	return s.business.GetQuickReplyMessages(ctx, userID, shortcutID, ids)
 }
 
-func (s *Service) RenameQuickReplyShortcut(ctx context.Context, userID int64, shortcutID int, shortcut string) (domain.QuickReplyMutation, error) {
-	if s == nil || s.business == nil || userID == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrPremiumRequired
+func (s *Service) MutateQuickReplies(ctx context.Context, mutation store.QuickReplyAccountMutation, effects store.DeliveryEffectsBuilder[store.QuickReplyAccountMutationSnapshot]) (store.QuickReplyAccountMutationSnapshot, error) {
+	if s == nil || s.business == nil || mutation.UserID == 0 {
+		return store.QuickReplyAccountMutationSnapshot{}, domain.ErrPremiumRequired
 	}
-	return s.business.RenameQuickReplyShortcut(ctx, userID, shortcutID, shortcut)
-}
-
-func (s *Service) ReorderQuickReplies(ctx context.Context, userID int64, order []int) (domain.QuickReplyMutation, error) {
-	if s == nil || s.business == nil || userID == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrPremiumRequired
+	if mutation.Kind == store.QuickReplyAccountSaveText &&
+		(mutation.Message.Message == "" || utf8.RuneCountInString(mutation.Message.Message) > domain.MaxMessageTextLength || len(mutation.Message.Entities) > domain.MaxMessageEntityCount) {
+		return store.QuickReplyAccountMutationSnapshot{}, domain.ErrShortcutInvalid
 	}
-	return s.business.ReorderQuickReplies(ctx, userID, append([]int(nil), order...))
-}
-
-func (s *Service) DeleteQuickReplyShortcut(ctx context.Context, userID int64, shortcutID int) (domain.QuickReplyMutation, error) {
-	if s == nil || s.business == nil || userID == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	return s.business.DeleteQuickReplyShortcut(ctx, userID, shortcutID)
-}
-
-func (s *Service) DeleteQuickReplyMessages(ctx context.Context, userID int64, shortcutID int, ids []int) (domain.QuickReplyMutation, error) {
-	if s == nil || s.business == nil || userID == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	return s.business.DeleteQuickReplyMessages(ctx, userID, shortcutID, append([]int(nil), ids...))
+	return s.business.MutateQuickReplies(ctx, mutation, effects)
 }
 
 func (s *Service) businessProfileForUpdate(ctx context.Context, userID int64) (domain.BusinessProfile, error) {

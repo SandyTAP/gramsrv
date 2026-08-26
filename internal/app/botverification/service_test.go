@@ -8,8 +8,25 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+// These test-only spellings keep the older scenario table compact while every
+// call still crosses the production hard-cut delivery boundary.
+func (s *Service) GrantVerifier(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+	stored, _, err := s.GrantVerifierWithDelivery(ctx, settings)
+	return stored, err
+}
+
+func (s *Service) SetVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+	stored, _, err := s.SetVerifierEnabledWithDelivery(ctx, botID, enabled)
+	return stored, err
+}
+
+func (s *Service) RevokeVerifier(ctx context.Context, botID int64) (bool, error) {
+	return s.RevokeVerifierWithDelivery(ctx, botID)
+}
 
 // The fixtures are one deployment: a verifier bot owned by one account, a second
 // bot owned by the same account, a stranger, a plain user peer and a channel that
@@ -154,9 +171,19 @@ func (f *fakeMarkApplier) GrantCustomVerification(ctx context.Context, mark doma
 	return f.store.GrantCustomVerification(ctx, mark)
 }
 
+func (f *fakeMarkApplier) GrantCustomVerificationWithDelivery(ctx context.Context, mark domain.CustomVerification, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error) {
+	f.grants++
+	return f.store.GrantCustomVerificationWithDelivery(ctx, mark, effects)
+}
+
 func (f *fakeMarkApplier) RevokeCustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (bool, error) {
 	f.revokes++
 	return f.store.RevokeCustomVerification(ctx, verifierBotID, peer)
+}
+
+func (f *fakeMarkApplier) RevokeCustomVerificationWithDelivery(ctx context.Context, verifierBotID int64, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (bool, error) {
+	f.revokes++
+	return f.store.RevokeCustomVerificationWithDelivery(ctx, verifierBotID, peer, effects)
 }
 
 func customEmojiDocument(id int64) domain.Document {
@@ -176,6 +203,7 @@ type harness struct {
 	t         *testing.T
 	svc       *Service
 	store     *memory.BotVerificationStore
+	outbox    *memory.DeliveryOutboxStore
 	dir       *fakeDirectory
 	peers     *fakePeerNotifier
 	docs      *fakeIconResolver
@@ -210,16 +238,31 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		applicant: &fakeApplicantNotifier{},
 		limiter:   &fakeLimiter{allow: true},
 	}
+	h.outbox = memory.NewDeliveryOutboxStore()
+	h.store.AttachDeliveryOutbox(h.outbox)
 	base := []Option{
 		WithStore(h.store),
 		WithPeerDirectory(h.dir),
 		WithPeerNotifier(h.peers),
 		WithIconResolver(h.docs),
 		WithApplicantNotifier(h.applicant),
+		WithUserAudienceDelivery(testUserAudienceDeliveryEffects),
 		WithRateLimiter(h.limiter, 5, 24*time.Hour),
 	}
 	h.svc = NewService(append(base, opts...)...)
 	return h
+}
+
+func testUserAudienceDeliveryEffects(snapshot store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	effects := make([]store.DeliveryEffect, 0, len(snapshot.Audience))
+	for _, viewerID := range snapshot.Audience {
+		effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID:   viewerID,
+			Payload:        []byte{1},
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
 }
 
 // seedIcon writes a catalogue entry straight to the store, so a test can set up
@@ -255,11 +298,16 @@ func verifierSettings(enabled, canModify bool) domain.BotVerifierSettings {
 // GrantVerifier's own checks.
 func (h *harness) seedVerifier(settings domain.BotVerifierSettings) domain.BotVerifierSettings {
 	h.t.Helper()
-	stored, err := h.store.UpsertBotVerifierSettings(context.Background(), settings)
+	// Fixture setup still crosses the strict aggregate, but uses an isolated
+	// outbox so scenario assertions only observe effects produced by the action
+	// under test.
+	h.store.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
+	defer h.store.AttachDeliveryOutbox(h.outbox)
+	mutation, err := h.store.UpsertBotVerifierSettingsWithDelivery(context.Background(), settings, testUserAudienceDeliveryEffects)
 	if err != nil {
 		h.t.Fatalf("seed verifier: %v", err)
 	}
-	return stored
+	return mutation.Settings
 }
 
 func (h *harness) mark(verifierBotID int64, peer domain.Peer) (domain.CustomVerification, bool) {
@@ -361,6 +409,12 @@ func TestSetCustomVerificationAcceptsOwnerCaller(t *testing.T) {
 	}
 	if mark.GrantedByUserID != fixtureOwner {
 		t.Fatalf("GrantedByUserID = %d, want the calling owner %d", mark.GrantedByUserID, fixtureOwner)
+	}
+	if h.peers.count() != 0 {
+		t.Fatalf("user mark used post-commit peer notifier: %v", h.peers.peers)
+	}
+	if items := h.outbox.Snapshot(); len(items) != 1 || items[0].TargetUserID != fixtureUserPeer {
+		t.Fatalf("user mark delivery = %+v, want one target-user effect", items)
 	}
 }
 
@@ -690,7 +744,7 @@ func TestGrantVerifierRefusesBeforeWriting(t *testing.T) {
 	}
 }
 
-func TestGrantVerifierStoresAndPushesTheBot(t *testing.T) {
+func TestGrantVerifierStoresAndQueuesTheBotReliably(t *testing.T) {
 	h := newHarness(t)
 	h.seedIcon(fixtureIconDoc, 0, true)
 	ctx := context.Background()
@@ -705,10 +759,11 @@ func TestGrantVerifierStoresAndPushesTheBot(t *testing.T) {
 	if h.docs.calls != 1 {
 		t.Fatalf("icon resolver calls = %d, want 1", h.docs.calls)
 	}
-	// Only the verifier's own botInfo is pushed; its marked peers converge on their
-	// next authoritative read.
-	if h.peers.count() != 1 || h.peers.peers[0] != userPeer(fixtureVerifierBot) {
-		t.Fatalf("peer pushes = %v, want exactly one for the bot itself", h.peers.peers)
+	if h.peers.count() != 0 {
+		t.Fatalf("post-commit peer pushes = %v, want none for reliable user delivery", h.peers.peers)
+	}
+	if got := len(h.outbox.Snapshot()); got != 1 {
+		t.Fatalf("durable effects = %d, want one for the verifier account", got)
 	}
 
 	// The built-in @verifierbot is the one system account this status exists for.
@@ -724,14 +779,15 @@ func TestSetVerifierEnabledAndRevoke(t *testing.T) {
 	h.seedIcon(fixtureIconDoc, 0, true)
 	granted := h.seedVerifier(verifierSettings(true, true))
 	ctx := context.Background()
+	initialEffects := len(h.outbox.Snapshot())
 
 	// A flip to the value already stored burns no version and pushes nothing.
 	same, err := h.svc.SetVerifierEnabled(ctx, fixtureVerifierBot, true)
 	if err != nil {
 		t.Fatalf("SetVerifierEnabled(no-op): %v", err)
 	}
-	if same.Version != granted.Version || h.peers.count() != 0 {
-		t.Fatalf("no-op flip: version %d->%d, pushes %d", granted.Version, same.Version, h.peers.count())
+	if same.Version != granted.Version || h.peers.count() != 0 || len(h.outbox.Snapshot()) != initialEffects {
+		t.Fatalf("no-op flip: version %d->%d, pushes %d, effects %d->%d", granted.Version, same.Version, h.peers.count(), initialEffects, len(h.outbox.Snapshot()))
 	}
 
 	disabled, err := h.svc.SetVerifierEnabled(ctx, fixtureVerifierBot, false)
@@ -741,8 +797,8 @@ func TestSetVerifierEnabledAndRevoke(t *testing.T) {
 	if disabled.Enabled || disabled.Version == granted.Version {
 		t.Fatalf("disabled = %+v, want enabled=false at a new version", disabled)
 	}
-	if h.peers.count() != 1 || h.peers.peers[0] != userPeer(fixtureVerifierBot) {
-		t.Fatalf("peer pushes = %v, want one for the bot", h.peers.peers)
+	if h.peers.count() != 0 || len(h.outbox.Snapshot()) != initialEffects+1 {
+		t.Fatalf("disable post-commit pushes/effects = %v/%d, want none/%d", h.peers.peers, len(h.outbox.Snapshot()), initialEffects+1)
 	}
 
 	removed, err := h.svc.RevokeVerifier(ctx, fixtureVerifierBot)
@@ -757,8 +813,60 @@ func TestSetVerifierEnabledAndRevoke(t *testing.T) {
 	if err != nil || removed {
 		t.Fatalf("repeat RevokeVerifier = %v/%v, want false/nil", removed, err)
 	}
-	if h.peers.count() != 2 {
-		t.Fatalf("peer pushes = %d, want 2 (disable + revoke)", h.peers.count())
+	if h.peers.count() != 0 || len(h.outbox.Snapshot()) != initialEffects+2 {
+		t.Fatalf("disable+revoke post-commit pushes/effects = %d/%d, want 0/%d", h.peers.count(), len(h.outbox.Snapshot()), initialEffects+2)
+	}
+}
+
+func TestVerifierSettingsUsesReliableUsersAndTransientChannels(t *testing.T) {
+	h := newHarness(t)
+	h.seedIcon(fixtureIconDoc, 0, true)
+	current := h.seedVerifier(verifierSettings(true, true))
+	ctx := context.Background()
+
+	for _, peer := range []domain.Peer{userPeer(fixtureUserPeer), chanPeer(fixtureChannel)} {
+		if _, _, err := h.store.GrantCustomVerification(ctx, domain.CustomVerification{
+			VerifierBotID: fixtureVerifierBot, Peer: peer,
+			IconDocumentID: fixtureIconDoc, Description: "verified",
+			GrantedByUserID: fixtureOwner,
+		}); err != nil {
+			t.Fatalf("seed mark %v: %v", peer, err)
+		}
+	}
+	h.peers.peers = nil
+	baseline := len(h.outbox.Snapshot())
+	desired := current
+	desired.CompanyName = "Acme renamed"
+	stored, changed, err := h.svc.GrantVerifierWithDelivery(ctx, desired)
+	if err != nil || !changed || stored.CompanyName != desired.CompanyName {
+		t.Fatalf("GrantVerifierWithDelivery = %+v/%v/%v", stored, changed, err)
+	}
+	if got := len(h.outbox.Snapshot()) - baseline; got != 2 {
+		t.Fatalf("new durable user effects = %d, want verifier + marked user", got)
+	}
+	if h.peers.count() != 1 || h.peers.peers[0] != chanPeer(fixtureChannel) {
+		t.Fatalf("transient channel invalidations = %v", h.peers.peers)
+	}
+	h.peers.peers = nil
+	baseline = len(h.outbox.Snapshot())
+	if replayed, changed, err := h.svc.GrantVerifierWithDelivery(ctx, desired); err != nil || changed || replayed.Version != stored.Version || len(h.outbox.Snapshot()) != baseline || h.peers.count() != 0 {
+		t.Fatalf("settings replay = %+v/%v/%v, effects=%d/%d, channels=%v", replayed, changed, err, baseline, len(h.outbox.Snapshot()), h.peers.peers)
+	}
+
+	// A transient channel push failure cannot roll back or masquerade as the
+	// reliable user side. The store result still commits and a later authoritative
+	// channel read observes it.
+	h.peers.err = errors.New("edge unavailable")
+	h.peers.peers = nil
+	baseline = len(h.outbox.Snapshot())
+	desired = stored
+	desired.CompanyName = "Acme final"
+	final, changed, err := h.svc.GrantVerifierWithDelivery(ctx, desired)
+	if err != nil || !changed || final.CompanyName != desired.CompanyName {
+		t.Fatalf("GrantVerifierWithDelivery with transient failure = %+v/%v/%v", final, changed, err)
+	}
+	if len(h.outbox.Snapshot())-baseline != 2 || h.peers.count() != 1 {
+		t.Fatalf("transient failure durable/transient counts = %d/%d", len(h.outbox.Snapshot())-baseline, h.peers.count())
 	}
 }
 
@@ -1072,6 +1180,100 @@ func TestApproveGrantsMarkAndNotifiesOnce(t *testing.T) {
 	}
 }
 
+func TestUserDecisionUsesAtomicDeliveryWithoutPeerNotifier(t *testing.T) {
+	h := newHarness(t)
+	h.seedIcon(fixtureIconDoc, 0, true)
+	h.seedVerifier(verifierSettings(true, true))
+	ctx := context.Background()
+	filed, err := h.createRequest(fixtureUserPeer, userPeer(fixtureUserPeer), "")
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	approved, changed, err := h.svc.Approve(ctx, filed.ID, filed.Version, "operator", "ok", "")
+	if err != nil || !changed {
+		t.Fatalf("Approve = %+v/%v/%v", approved, changed, err)
+	}
+	if h.peers.count() != 0 {
+		t.Fatalf("user approval used peer notifier: %v", h.peers.peers)
+	}
+	if got := len(h.outbox.Snapshot()); got != 1 {
+		t.Fatalf("outbox after approval = %d, want 1", got)
+	}
+	if _, changed, err := h.svc.Approve(ctx, approved.ID, approved.Version, "operator", "ok", ""); err != nil || changed {
+		t.Fatalf("replayed approval = %v/%v", changed, err)
+	}
+	if got := len(h.outbox.Snapshot()); got != 1 {
+		t.Fatalf("outbox after approval replay = %d, want 1", got)
+	}
+	revoked, changed, err := h.svc.RevokeRequest(ctx, approved.ID, approved.Version, "operator", "ended", "")
+	if err != nil || !changed {
+		t.Fatalf("RevokeRequest = %+v/%v/%v", revoked, changed, err)
+	}
+	if h.peers.count() != 0 {
+		t.Fatalf("user revocation used peer notifier: %v", h.peers.peers)
+	}
+	if got := len(h.outbox.Snapshot()); got != 2 {
+		t.Fatalf("outbox after revocation = %d, want 2", got)
+	}
+}
+
+func TestUserMarkBuilderFailureRollsBackService(t *testing.T) {
+	h := newHarness(t, WithUserAudienceDelivery(func(store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return nil, errors.New("projection failed")
+	}))
+	h.seedIcon(fixtureIconDoc, 0, true)
+	h.seedVerifier(verifierSettings(true, true))
+	_, err := h.svc.SetCustomVerification(context.Background(), domain.SetCustomVerificationRequest{
+		VerifierBotID: fixtureVerifierBot,
+		Peer:          userPeer(fixtureUserPeer),
+		Enabled:       true,
+		CallerUserID:  fixtureVerifierBot,
+	})
+	if err == nil {
+		t.Fatal("builder failure returned nil")
+	}
+	if _, found := h.mark(fixtureVerifierBot, userPeer(fixtureUserPeer)); found {
+		t.Fatal("builder failure committed user mark")
+	}
+	if got := len(h.outbox.Snapshot()); got != 0 {
+		t.Fatalf("outbox after builder failure = %d, want 0", got)
+	}
+}
+
+func TestUserMarkRequiresDeliveryBuilderButChannelDoesNot(t *testing.T) {
+	h := newHarness(t)
+	h.svc = NewService(
+		WithStore(h.store),
+		WithPeerDirectory(h.dir),
+		WithPeerNotifier(h.peers),
+		WithIconResolver(h.docs),
+		WithApplicantNotifier(h.applicant),
+	)
+	h.seedIcon(fixtureIconDoc, 0, true)
+	h.seedVerifier(verifierSettings(true, true))
+	ctx := context.Background()
+	_, err := h.svc.SetCustomVerification(ctx, domain.SetCustomVerificationRequest{
+		VerifierBotID: fixtureVerifierBot, Peer: userPeer(fixtureUserPeer),
+		Enabled: true, CallerUserID: fixtureVerifierBot,
+	})
+	if !errors.Is(err, store.ErrDeliveryOutboxRequired) {
+		t.Fatalf("user grant without builder = %v, want ErrDeliveryOutboxRequired", err)
+	}
+	if _, found := h.mark(fixtureVerifierBot, userPeer(fixtureUserPeer)); found {
+		t.Fatal("unwired user grant committed")
+	}
+	changed, err := h.svc.SetCustomVerification(ctx, domain.SetCustomVerificationRequest{
+		VerifierBotID: fixtureVerifierBot, Peer: chanPeer(fixtureChannel),
+		Enabled: true, CallerUserID: fixtureVerifierBot,
+	})
+	if err != nil || !changed {
+		t.Fatalf("channel grant without user builder = %v/%v", changed, err)
+	}
+	if h.peers.count() != 1 || h.peers.peers[0] != chanPeer(fixtureChannel) {
+		t.Fatalf("channel notifier = %v", h.peers.peers)
+	}
+}
+
 func TestApproveRefusesDisabledVerifier(t *testing.T) {
 	h := newHarness(t)
 	h.seedIcon(fixtureIconDoc, 0, true)
@@ -1171,6 +1373,7 @@ func TestDecisionsWriteThroughTheMarkApplier(t *testing.T) {
 		WithApplicantNotifier(h.applicant),
 		WithRateLimiter(h.limiter, 5, 24*time.Hour),
 		WithMarkApplier(applier),
+		WithUserAudienceDelivery(testUserAudienceDeliveryEffects),
 	)
 	h.seedIcon(fixtureIconDoc, 0, true)
 	h.seedVerifier(verifierSettings(true, true))
@@ -1518,10 +1721,11 @@ func TestNilAndUnconfiguredServiceAreSafe(t *testing.T) {
 // cannot run refuses instead of passing.
 func TestSetCustomVerificationWithoutDirectoryFails(t *testing.T) {
 	st := memory.NewBotVerificationStore()
+	st.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
 	if _, err := st.UpsertVerificationIcon(context.Background(), domain.VerificationIcon{DocumentID: fixtureIconDoc, Name: "Acme", Active: true}); err != nil {
 		t.Fatalf("seed icon: %v", err)
 	}
-	if _, err := st.UpsertBotVerifierSettings(context.Background(), verifierSettings(true, true)); err != nil {
+	if _, err := st.UpsertBotVerifierSettingsWithDelivery(context.Background(), verifierSettings(true, true), testUserAudienceDeliveryEffects); err != nil {
 		t.Fatalf("seed verifier: %v", err)
 	}
 	svc := NewService(WithStore(st))

@@ -52,31 +52,28 @@ func (r *Router) onMessagesDeleteHistory(ctx context.Context, req *tg.MessagesDe
 		return nil, err
 	}
 	if peer.Type == domain.PeerTypeChannel {
+		if err := r.requireAccountDelivery(userID, "messages.deleteHistory"); err != nil {
+			return nil, err
+		}
 		if r.deps.Channels == nil {
 			return r.affectedHistory(ctx, authKeyID, userID, 0)
 		}
 		if req.MaxID < 0 || req.MaxID > domain.MaxMessageBoxID {
 			return nil, messageIDInvalidErr()
 		}
+		date := int(r.clock.Now().Unix())
 		res, err := r.deps.Channels.DeleteHistory(ctx, userID, domain.DeleteChannelHistoryRequest{
 			UserID:      userID,
 			ChannelID:   peer.ID,
 			MaxID:       req.MaxID,
 			ForEveryone: req.GetRevoke(),
-			Date:        int(r.clock.Now().Unix()),
-		})
+			Date:        date,
+		}, r.channelAvailableMinDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, channelDeleteErr(err)
 		}
 		if res.Event.Pts != 0 {
-			r.enqueueChannelFanout(ctx, channelFanoutMessageBox, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-				return r.channelDeleteMessagesUpdates(viewerUserID, res.Channel, res.Event)
-			})
 			return &tg.MessagesAffectedHistory{Pts: res.Event.Pts, PtsCount: res.Event.PtsCount, Offset: res.Offset}, nil
-		}
-		if res.AvailableMinChanged && res.AvailableMinID > 0 {
-			updates := r.channelAvailableMessagesUpdates(userID, res.Channel, res.AvailableMinID)
-			r.pushUserUpdates(ctx, userID, updates)
 		}
 		// messages.affectedHistory.pts is the caller's account-state snapshot.
 		// The local channel clear itself consumes no account/channel pts.

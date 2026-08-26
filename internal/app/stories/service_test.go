@@ -7,8 +7,17 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+func storyTestDeliveryEffects(snapshot storepkg.StoryMutationSnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Required))
+	for _, required := range snapshot.Required {
+		effects = append(effects, storepkg.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, [8]byte{}, 0))
+	}
+	return effects, nil
+}
 
 func TestReadStoriesClampsFutureMaxIDToVisibleActiveStory(t *testing.T) {
 	ctx := context.Background()
@@ -28,7 +37,7 @@ func TestReadStoriesClampsFutureMaxIDToVisibleActiveStory(t *testing.T) {
 		}
 	}
 
-	read, err := service.ReadStories(ctx, viewerID, owner, 99, 200)
+	read, err := service.ReadStories(ctx, viewerID, owner, 99, 200, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("read stories: %v", err)
 	}
@@ -61,7 +70,7 @@ func TestReadStoriesWithoutVisibleActiveStoryDoesNotWriteFutureBoundary(t *testi
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
 	viewerID := int64(2001)
 
-	read, err := service.ReadStories(ctx, viewerID, owner, 99, 200)
+	read, err := service.ReadStories(ctx, viewerID, owner, 99, 200, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("read stories: %v", err)
 	}
@@ -99,7 +108,7 @@ func TestReadStoriesWithoutStoreIsNoop(t *testing.T) {
 	service := NewService(nil)
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
 
-	read, err := service.ReadStories(ctx, 2001, owner, 99, 200)
+	read, err := service.ReadStories(ctx, 2001, owner, 99, 200, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("read stories without store: %v", err)
 	}
@@ -122,10 +131,10 @@ func TestGetStoryReactionsListRequiresChannelInteractionGrant(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("upsert story: %v", err)
 	}
-	if _, err := store.SetReaction(ctx, 2001, owner, 1, &domain.MessageReaction{
+	if _, err := store.SetReactionWithDelivery(ctx, 2001, owner, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
-	}, 110); err != nil {
+	}, 110, storyTestDeliveryEffects); err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
 
@@ -268,7 +277,7 @@ func TestStoryMutationsDedupeIDsBeforeStore(t *testing.T) {
 	service := NewService(nil)
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
 
-	pinned, err := service.TogglePinned(ctx, owner.ID, owner, []int{3, 3, 4}, true, 100)
+	pinned, err := service.TogglePinned(ctx, owner.ID, owner, []int{3, 3, 4}, true, 100, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("toggle pinned: %v", err)
 	}
@@ -276,7 +285,7 @@ func TestStoryMutationsDedupeIDsBeforeStore(t *testing.T) {
 		t.Fatalf("pinned ids = %v, want %v", got, want)
 	}
 
-	emptyPinned, err := service.TogglePinned(ctx, owner.ID, owner, nil, true, 100)
+	emptyPinned, err := service.TogglePinned(ctx, owner.ID, owner, nil, true, 100, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("empty toggle pinned: %v", err)
 	}
@@ -284,7 +293,7 @@ func TestStoryMutationsDedupeIDsBeforeStore(t *testing.T) {
 		t.Fatalf("empty pinned = %+v, want no-op", emptyPinned)
 	}
 
-	deleted, err := service.DeleteStories(ctx, owner.ID, owner, []int{4, 3, 4}, 101)
+	deleted, err := service.DeleteStories(ctx, owner.ID, owner, []int{4, 3, 4}, 101, storyTestDeliveryEffects)
 	if err != nil {
 		t.Fatalf("delete stories: %v", err)
 	}

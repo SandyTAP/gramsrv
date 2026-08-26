@@ -48,17 +48,17 @@ func TestAlbumGroupReservationConvergesAcrossPostgresInstances(t *testing.T) {
 		pgAlbumItem(76002, "two"),
 		pgAlbumItem(76003, "three"),
 	}
-	firstStore := NewMessageStore(pool)
+	firstStore := newTestMessageStore(pool)
 	groupedID, err := firstStore.ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 761, full...))
 	if err != nil || groupedID != 761 {
 		t.Fatalf("reserve full = %d err=%v, want 761", groupedID, err)
 	}
 	// 新 store 实例模拟另一进程；失败子集必须恢复首次整包的组。
-	replayed, err := NewMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 762, full[1:]...))
+	replayed, err := newTestMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 762, full[1:]...))
 	if err != nil || replayed != groupedID {
 		t.Fatalf("reserve subset = %d err=%v, want %d", replayed, err, groupedID)
 	}
-	if _, err := NewMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 763, pgAlbumItem(76002, "changed"))); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
+	if _, err := newTestMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 763, pgAlbumItem(76002, "changed"))); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
 		t.Fatalf("changed intent err=%v, want ErrMessageRandomIDDuplicate", err)
 	}
 
@@ -83,7 +83,7 @@ func TestAlbumGroupReservationConvergesAcrossPostgresInstances(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			results[i], errs[i] = NewMessageStore(pool).ReserveAlbumGroup(ctx, requests[i])
+			results[i], errs[i] = newTestMessageStore(pool).ReserveAlbumGroup(ctx, requests[i])
 		}(i)
 	}
 	close(start)
@@ -92,7 +92,7 @@ func TestAlbumGroupReservationConvergesAcrossPostgresInstances(t *testing.T) {
 		t.Fatalf("concurrent groups=%v errs=%v, want one non-zero group", results, errs)
 	}
 	for _, item := range []domain.AlbumGroupReservationItem{left.Items[0], left.Items[1], right.Items[1]} {
-		got, err := NewMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 767, item))
+		got, err := newTestMessageStore(pool).ReserveAlbumGroup(ctx, pgAlbumReq(sender.ID, privatePeer, 767, item))
 		if err != nil || got != results[0] {
 			t.Fatalf("verify random_id %d = %d err=%v, want %d", item.RandomID, got, err, results[0])
 		}

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *ChannelStore) DeleteChannelMessages(_ context.Context, req domain.DeleteChannelMessagesRequest) (domain.DeleteChannelMessagesResult, error) {
@@ -62,9 +63,12 @@ func (s *ChannelStore) DeleteChannelMessages(_ context.Context, req domain.Delet
 	}, nil
 }
 
-func (s *ChannelStore) DeleteChannelHistory(_ context.Context, req domain.DeleteChannelHistoryRequest) (domain.DeleteChannelHistoryResult, error) {
+func (s *ChannelStore) DeleteChannelHistory(ctx context.Context, req domain.DeleteChannelHistoryRequest, effects store.DeliveryEffectsBuilder[store.ChannelAvailableMinDeliverySnapshot]) (domain.DeleteChannelHistoryResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.DeleteChannelHistoryResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil || s.deliveryOutbox == nil {
+		return domain.DeleteChannelHistoryResult{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,6 +88,7 @@ func (s *ChannelStore) DeleteChannelHistory(_ context.Context, req domain.Delete
 	}
 	member := s.members[req.ChannelID][req.UserID]
 	if !req.ForEveryone {
+		rollback := s.deliveryRollbackLocked(req.ChannelID)
 		appliedMinID := maxInt(member.AvailableMinID, maxID)
 		changed := appliedMinID > member.AvailableMinID
 		if changed {
@@ -114,6 +119,14 @@ func (s *ChannelStore) DeleteChannelHistory(_ context.Context, req domain.Delete
 			s.dialogs[req.UserID] = make(map[int64]domain.ChannelDialog)
 		}
 		s.dialogs[req.UserID][req.ChannelID] = s.dialogForUserLocked(req.UserID, channel)
+		snapshot := store.ChannelAvailableMinDeliverySnapshot{}
+		if changed {
+			snapshot = store.ChannelAvailableMinDeliverySnapshot{TargetUserID: req.UserID, Channel: channel, AvailableMinID: appliedMinID}
+		}
+		if err := applyMemoryAvailableMinDelivery(ctx, s.deliveryOutbox, snapshot, effects); err != nil {
+			s.restoreDeliveryRollbackLocked(req.ChannelID, rollback)
+			return domain.DeleteChannelHistoryResult{}, err
+		}
 		return domain.DeleteChannelHistoryResult{
 			Channel:             channel,
 			AvailableMinID:      appliedMinID,
@@ -122,6 +135,9 @@ func (s *ChannelStore) DeleteChannelHistory(_ context.Context, req domain.Delete
 	}
 	if !canDeleteAnyChannelMessage(member) {
 		return domain.DeleteChannelHistoryResult{}, domain.ErrChannelAdminRequired
+	}
+	if err := applyMemoryAvailableMinDelivery(ctx, s.deliveryOutbox, store.ChannelAvailableMinDeliverySnapshot{}, effects); err != nil {
+		return domain.DeleteChannelHistoryResult{}, err
 	}
 	// id=1 是建群服务消息，全员清空必须保留：它是清空后会话仅剩的
 	// top message，没有它客户端会把 lastMessage 视为空并从聊天列表

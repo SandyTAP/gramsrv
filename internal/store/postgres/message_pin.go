@@ -141,11 +141,11 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 			dispatchAuthKeyID = req.OriginAuthKeyID
 			dispatchSessionID = req.OriginSessionID
 		}
-		if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 			TargetUserID:     side.userID,
 			Pts:              int32(pts),
 			EventType:        string(domain.UpdateEventPinnedMessages),
-			ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+			ExcludeAuthKeyID: dispatchAuthKeyID,
 			ExcludeSessionID: dispatchSessionID,
 		}); err != nil {
 			return res, fmt.Errorf("enqueue pinned messages dispatch: %w", err)
@@ -286,11 +286,11 @@ func (s *MessageStore) UnpinAllPrivateMessages(ctx context.Context, req domain.U
 			dispatchAuthKeyID = req.OriginAuthKeyID
 			dispatchSessionID = req.OriginSessionID
 		}
-		if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 			TargetUserID:     side.userID,
 			Pts:              int32(pts),
 			EventType:        string(domain.UpdateEventPinnedMessages),
-			ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+			ExcludeAuthKeyID: dispatchAuthKeyID,
 			ExcludeSessionID: dispatchSessionID,
 		}); err != nil {
 			return res, fmt.Errorf("enqueue unpin all dispatch: %w", err)

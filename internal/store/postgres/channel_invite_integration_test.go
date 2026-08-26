@@ -32,7 +32,7 @@ func TestChannelStoreCreateChannelCreatesPermanentInviteAndHasLink(t *testing.T)
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Linked On Create " + suffix,
@@ -108,7 +108,7 @@ func TestChannelStoreJoinRejectsKickedMember(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID, helper.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Ban Join " + suffix,
@@ -157,7 +157,7 @@ func TestChannelStoreJoinRejectsKickedMember(t *testing.T) {
 	if len(banDiff.Events) != 1 || banDiff.Pts != ptsFloor+1 {
 		t.Fatalf("difference after kick = %+v, want only the kick service message at pts %d", banDiff, ptsFloor+1)
 	}
-	if _, err := channels.JoinChannel(ctx, channelID, member.ID, 1700000307); !errors.Is(err, domain.ErrChannelUserBanned) {
+	if _, err := channels.JoinChannel(ctx, channelID, member.ID, 1700000307, testPendingJoinEffects); !errors.Is(err, domain.ErrChannelUserBanned) {
 		t.Fatalf("kicked JoinChannel err = %v, want ErrChannelUserBanned", err)
 	}
 	if _, err := channels.InviteToChannel(ctx, channelID, helper.ID, []int64{member.ID}, 1700000308); !errors.Is(err, domain.ErrUserKicked) {
@@ -216,7 +216,7 @@ func TestChannelStoreImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, first.ID, second.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Invite Errors " + suffix,
@@ -241,7 +241,7 @@ func TestChannelStoreImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) 
 		UserID: first.ID,
 		Hash:   requested.Invite.Hash,
 		Date:   1700000342,
-	}); !errors.Is(err, domain.ErrInviteRequestSent) {
+	}, testPendingJoinEffects); !errors.Is(err, domain.ErrInviteRequestSent) {
 		t.Fatalf("import request-needed err = %v, want ErrInviteRequestSent", err)
 	}
 	limited, err := channels.ExportInvite(ctx, domain.ExportChannelInviteRequest{
@@ -258,14 +258,14 @@ func TestChannelStoreImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) 
 		UserID: first.ID,
 		Hash:   limited.Invite.Hash,
 		Date:   1700000344,
-	}); err != nil {
+	}, testPendingJoinEffects); err != nil {
 		t.Fatalf("first import limited invite: %v", err)
 	}
 	if _, err := channels.ImportInvite(ctx, domain.ImportChannelInviteRequest{
 		UserID: second.ID,
 		Hash:   limited.Invite.Hash,
 		Date:   1700000345,
-	}); !errors.Is(err, domain.ErrUsersTooMuch) {
+	}, testPendingJoinEffects); !errors.Is(err, domain.ErrUsersTooMuch) {
 		t.Fatalf("second import limited invite err = %v, want ErrUsersTooMuch", err)
 	}
 }
@@ -307,7 +307,7 @@ func TestChannelStorePendingJoinRequestsSummaryAndInviteAdmins(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", userIDs)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Pending Summary " + suffix,
@@ -356,7 +356,7 @@ func TestChannelStorePendingJoinRequestsSummaryAndInviteAdmins(t *testing.T) {
 			UserID: requester.ID,
 			Hash:   invite.Invite.Hash,
 			Date:   1700000370 + i,
-		})
+		}, testPendingJoinEffects)
 		if !errors.Is(err, domain.ErrInviteRequestSent) {
 			t.Fatalf("import pending %d err = %v, want ErrInviteRequestSent", i, err)
 		}
@@ -412,7 +412,7 @@ func TestChannelStoreImportInviteUsageLimitSeesConcurrentIncrement(t *testing.T)
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, joiner.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Invite Limit Race " + suffix,
@@ -454,7 +454,7 @@ WHERE channel_id = $1 AND invite_id = $2`, channelID, invite.Invite.InviteID); e
 			UserID: joiner.ID,
 			Hash:   invite.Invite.Hash,
 			Date:   1700000352,
-		})
+		}, testPendingJoinEffects)
 		errCh <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -504,7 +504,7 @@ func TestChannelStoreEnsurePermanentInvite(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, outsider.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Ensure Permanent " + suffix,

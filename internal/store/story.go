@@ -8,7 +8,7 @@ import (
 
 // StoryStore persists story snapshots and per-viewer story state.
 type StoryStore interface {
-	CreateStory(ctx context.Context, req domain.StoryCreateRequest) (domain.StoryCreateResult, error)
+	CreateStoryWithDelivery(ctx context.Context, actorUserID int64, req domain.StoryCreateRequest, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryCreateResult, error)
 	UpsertStory(ctx context.Context, req domain.UpsertStoryRequest) (domain.Story, error)
 	ListActiveStories(ctx context.Context, viewerUserID int64, hidden bool, now, limit int) (domain.StoryList, error)
 	ListActiveStoriesPage(ctx context.Context, viewerUserID int64, hidden bool, now int, cursor domain.StoryListCursor, limit int) (domain.StoryList, error)
@@ -23,16 +23,16 @@ type StoryStore interface {
 	GetPeerMaxIDs(ctx context.Context, viewerUserID int64, peers []domain.Peer, now int) ([]domain.RecentStory, error)
 	GetPeerHiddenStates(ctx context.Context, viewerUserID int64, peers []domain.Peer) (map[domain.Peer]bool, error)
 	GetPeerStoryProjections(ctx context.Context, viewerUserID int64, peers []domain.Peer, now int) ([]domain.PeerStoryProjection, error)
-	MarkRead(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error)
+	MarkReadWithDelivery(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryReadResult, error)
 	IncrementViews(ctx context.Context, viewerUserID int64, peer domain.Peer, ids []int, date int) (int, error)
-	SetReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error)
+	SetReactionWithDelivery(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryReactionResult, error)
 	ListStoryViews(ctx context.Context, req domain.StoryViewListRequest) (domain.StoryViewList, error)
 	ListStoryReactions(ctx context.Context, req domain.StoryReactionListRequest) (domain.StoryReactionList, error)
 	ListStoryPublicForwards(ctx context.Context, req domain.StoryPublicForwardListRequest) (domain.StoryPublicForwardList, error)
 	ListStoryViewerIDs(ctx context.Context, owner domain.Peer, storyID, limit int) ([]int64, error)
-	EditStory(ctx context.Context, req domain.StoryEditRequest) (domain.StoryEditResult, error)
-	DeleteStories(ctx context.Context, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error)
-	TogglePinned(ctx context.Context, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error)
+	EditStoryWithDelivery(ctx context.Context, actorUserID int64, req domain.StoryEditRequest, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryEditResult, error)
+	DeleteStoriesWithDelivery(ctx context.Context, actorUserID int64, peer domain.Peer, ids []int, date int, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryMutationResult, error)
+	TogglePinnedWithDelivery(ctx context.Context, actorUserID int64, peer domain.Peer, ids []int, pinned bool, date int, effects DeliveryEffectsBuilder[StoryMutationSnapshot]) (domain.StoryMutationResult, error)
 	TogglePinnedToTop(ctx context.Context, peer domain.Peer, ids []int) error
 	SetPeerHidden(ctx context.Context, viewerUserID int64, peer domain.Peer, hidden bool) error
 }

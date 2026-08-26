@@ -42,10 +42,6 @@ type usernameAvailabilityStore interface {
 	CheckUsername(ctx context.Context, userID int64, username string) (bool, error)
 }
 
-type moderationFlagAudienceStore interface {
-	ModerationFlagAudience(ctx context.Context, userID int64, limit int) ([]int64, error)
-}
-
 // Option 调整用户服务可选依赖。
 type Option func(*Service)
 
@@ -356,6 +352,45 @@ func (s *Service) UpdateUsernameWithDelivery(ctx context.Context, userID int64, 
 	return u, nil
 }
 
+// AdminUpdateUsernameWithDelivery is the operator aggregate boundary. The
+// updated identity and every frozen known-viewer updateUser effect commit
+// together; the admin path has no originating client session to exclude.
+func (s *Service) AdminUpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	username = normalizeUsername(username)
+	if username != "" {
+		if !validUsername(username) {
+			return domain.User{}, domain.ErrUsernameInvalid
+		}
+		ok, err := s.checkUsernameAvailable(ctx, self.ID, username)
+		if err != nil {
+			return domain.User{}, err
+		}
+		if !ok {
+			return domain.User{}, domain.ErrUsernameOccupied
+		}
+	}
+	if self.Username == username {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.AdminUpdateUsernameWithDelivery(ctx, self.ID, username, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
 // UpdateProfile 修改当前用户的基础资料。未设置的字段保持原值。
 func (s *Service) UpdateProfile(ctx context.Context, userID int64, update domain.UserProfileUpdate) (domain.User, error) {
 	self, err := s.loadSelf(ctx, userID)
@@ -440,6 +475,49 @@ func (s *Service) UpdateProfileWithDelivery(ctx context.Context, userID int64, u
 	return u, nil
 }
 
+func (s *Service) AdminUpdateProfileWithDelivery(ctx context.Context, userID int64, update domain.UserProfileUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	firstName, lastName, about := self.FirstName, self.LastName, self.About
+	if update.HasFirstName {
+		firstName = strings.TrimSpace(update.FirstName)
+	}
+	if update.HasLastName {
+		lastName = strings.TrimSpace(update.LastName)
+	}
+	if update.HasAbout {
+		about = strings.TrimSpace(update.About)
+	}
+	if firstName == "" || utf8.RuneCountInString(firstName) > maxProfileNameRunes || utf8.RuneCountInString(lastName) > maxProfileNameRunes {
+		return domain.User{}, domain.ErrFirstNameInvalid
+	}
+	aboutLimit := maxProfileAboutRunes
+	if self.PremiumActiveAt(time.Now().Unix()) {
+		aboutLimit = maxProfileAboutRunesPremium
+	}
+	if utf8.RuneCountInString(about) > aboutLimit {
+		return domain.User{}, domain.ErrAboutTooLong
+	}
+	if firstName == self.FirstName && lastName == self.LastName && about == self.About {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.AdminUpdateProfileWithDelivery(ctx, self.ID, firstName, lastName, about, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
 // SetPhone force-sets the authoritative phone for the trusted admin path. It
 // remains a non-PTS profile mutation because updateUserPhone and updateUser
 // carry no pts/pts_count in every admitted exact layer.
@@ -469,6 +547,41 @@ func (s *Service) SetPhone(ctx context.Context, userID int64, phone string) (dom
 	}
 	s.refreshCachedUsers(ctx, u)
 	return s.projectOne(ctx, self.ID, u)
+}
+
+func (s *Service) AdminSetPhoneWithDelivery(ctx context.Context, userID int64, phone string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if self.Bot || domain.IsSystemUserID(self.ID) {
+		return domain.User{}, domain.ErrPhoneChangeForbidden
+	}
+	phone = domain.NormalizePhone(strings.TrimSpace(phone))
+	if !domain.ValidPhone(phone) {
+		return domain.User{}, domain.ErrPhoneNumberInvalid
+	}
+	if phone == self.Phone {
+		return self, nil
+	}
+	if existing, found, err := s.users.ByPhone(ctx, phone); err != nil {
+		return domain.User{}, err
+	} else if found && existing.ID != self.ID {
+		return domain.User{}, domain.ErrPhoneNumberOccupied
+	}
+	writer, ok := s.users.(store.UserAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.AdminUpdatePhoneWithDelivery(ctx, self.ID, phone, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
 }
 
 // UpdateLastSeen records the latest visible account activity time.
@@ -559,6 +672,35 @@ func (s *Service) SetVerified(ctx context.Context, userID int64, verified bool) 
 	return updated, nil
 }
 
+func (s *Service) SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if userID == 0 {
+		return domain.User{}, ErrNotAuthorized
+	}
+	if domain.IsSystemUserID(userID) && !verified {
+		return domain.User{}, ErrSystemUserImmutable
+	}
+	current, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if !found {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if current.Verified == verified {
+		return current, nil
+	}
+	delivery, ok := s.users.(store.UserModerationDeliveryStore)
+	if !ok || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	updated, err := delivery.SetVerifiedWithDelivery(ctx, userID, verified, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, updated)
+	return updated, nil
+}
+
 // SetScamFake 设置/取消用户的 scam 与 fake 标记（bot 复用同一路径）。scam/fake
 // 是账号基础事实，所有 user 投影统一消费；写后刷新基础缓存以便投影即时可见。
 func (s *Service) SetScamFake(ctx context.Context, userID int64, scam, fake bool) (domain.User, error) {
@@ -586,21 +728,33 @@ func (s *Service) SetScamFake(ctx context.Context, userID int64, scam, fake bool
 	return updated, nil
 }
 
-// ModerationFlagAudience returns the bounded set of existing viewers that may
-// need an immediate updateUser after SCAM/FAKE changes. This is an online
-// accelerator only: it does not allocate PTS or create durable update events.
-func (s *Service) ModerationFlagAudience(ctx context.Context, userID int64, limit int) ([]int64, error) {
+func (s *Service) SetScamFakeWithDelivery(ctx context.Context, userID int64, scam, fake bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
 	if userID == 0 {
-		return nil, ErrNotAuthorized
+		return domain.User{}, ErrNotAuthorized
 	}
-	if limit <= 0 || limit > 4096 {
-		limit = 4096
+	if scam && fake {
+		return domain.User{}, domain.ErrPeerModerationFlagsInvalid
 	}
-	audience, ok := s.users.(moderationFlagAudienceStore)
-	if !ok {
-		return []int64{userID}, nil
+	current, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
 	}
-	return audience.ModerationFlagAudience(ctx, userID, limit)
+	if !found {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if current.Scam == scam && current.Fake == fake {
+		return current, nil
+	}
+	delivery, ok := s.users.(store.UserModerationDeliveryStore)
+	if !ok || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	updated, err := delivery.SetScamFakeWithDelivery(ctx, userID, scam, fake, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, updated)
+	return updated, nil
 }
 
 // SetSupport 设置/取消用户的 support 标记（官方客服账号）。写后刷新基础缓存。
@@ -626,6 +780,32 @@ func (s *Service) SetSupport(ctx context.Context, userID int64, support bool) (d
 	return updated, nil
 }
 
+func (s *Service) SetSupportWithDelivery(ctx context.Context, userID int64, support bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if userID == 0 {
+		return domain.User{}, ErrNotAuthorized
+	}
+	current, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if !found {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if current.Support == support {
+		return current, nil
+	}
+	delivery, ok := s.users.(store.UserModerationDeliveryStore)
+	if !ok || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	updated, err := delivery.SetSupportWithDelivery(ctx, userID, support, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, updated)
+	return updated, nil
+}
+
 // SweepExpiredPremium 清理到期会员（store 把过期行清 NULL）并失效用户缓存，
 // 返回清理后的用户，供 RPC 层向本人在线 session 推 updateUser。premium 下发
 // 正确性由读取路径即时派生保证，这里只做收尾与通知。
@@ -642,14 +822,39 @@ func (s *Service) SweepExpiredPremium(ctx context.Context, now int64, limit int)
 	return users, nil
 }
 
-// UpdateEmojiStatus 更新当前用户 emoji status（premium 专属；零值清除）。
-// 清除不要求会员（到期降级后客户端仍可显式清掉残留状态）。
-func (s *Service) UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error) {
+func (s *Service) SweepExpiredPremiumWithDelivery(ctx context.Context, now int64, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	delivery, ok := s.users.(store.UserPremiumDeliveryStore)
+	if !ok || effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	users, err := delivery.SweepExpiredPremiumWithDelivery(ctx, now, limit, effects)
+	if err != nil || len(users) == 0 {
+		return users, err
+	}
+	ids := make([]int64, 0, len(users))
+	for _, user := range users {
+		ids = append(ids, user.ID)
+	}
+	s.dropCachedUsers(ctx, ids...)
+	return users, nil
+}
+
+func (s *Service) AdminUpdateEmojiStatusWithDelivery(ctx context.Context, userID int64, status domain.UserEmojiStatus, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
 	self, err := s.validateEmojiStatusUpdate(ctx, userID, status)
 	if err != nil {
 		return domain.User{}, err
 	}
-	u, err := s.users.UpdateEmojiStatus(ctx, self.ID, status)
+	if self.EmojiStatus() == status {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.AdminUpdateEmojiStatusWithDelivery(ctx, self.ID, status, effects)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -657,19 +862,12 @@ func (s *Service) UpdateEmojiStatus(ctx context.Context, userID int64, status do
 	return u, nil
 }
 
-// UpdateEmojiStatusWithEvent uses the store's aggregate transaction when it
-// is available. The bool reports whether the returned event was durably
-// appended with dispatch; lightweight memory/test wiring reports false before
-// any state write so the caller can choose an explicit durable Updates path or
-// fail closed without exposing an online-only mutation.
-func (s *Service) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, bool, error) {
+// UpdateEmojiStatusWithEvent is the mandatory account aggregate. State,
+// account-PTS event and dispatch are one write in every supported store.
+func (s *Service) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
 	self, err := s.validateEmojiStatusUpdate(ctx, userID, status)
 	if err != nil {
-		return domain.User{}, domain.UpdateEvent{}, false, err
-	}
-	writer, ok := s.users.(store.UserEmojiStatusEventStore)
-	if !ok {
-		return self, domain.UpdateEvent{}, false, nil
+		return domain.User{}, domain.UpdateEvent{}, err
 	}
 	event := domain.UpdateEvent{
 		Type:        domain.UpdateEventUserEmojiStatus,
@@ -678,12 +876,12 @@ func (s *Service) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, 
 		Date:        date,
 		PtsCount:    1,
 	}
-	u, event, err := writer.UpdateEmojiStatusWithEvent(ctx, self.ID, status, event, excludeAuthKeyID, excludeSessionID)
+	u, event, err := s.users.UpdateEmojiStatusWithEvent(ctx, self.ID, status, event)
 	if err != nil {
-		return domain.User{}, domain.UpdateEvent{}, false, err
+		return domain.User{}, domain.UpdateEvent{}, err
 	}
 	s.refreshCachedUsers(ctx, u)
-	return u, event, true, nil
+	return u, event, nil
 }
 
 func (s *Service) validateEmojiStatusUpdate(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error) {
@@ -751,14 +949,20 @@ func (s *Service) UpdateBirthdayWithDelivery(ctx context.Context, userID int64, 
 	return u, nil
 }
 
-// UpdatePersonalChannel 设置/清除资料页个人频道（account.updatePersonalChannel）；
-// channelID=0 表示清除。频道存在性与「调用者是其成员」由 RPC 层在调用前校验。
-func (s *Service) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
+// UpdatePersonalChannelWithDelivery sets/clears the profile personal channel
+// and commits its owner absolute reload in the same aggregate transaction.
+func (s *Service) UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
 	self, err := s.loadSelf(ctx, userID)
 	if err != nil {
 		return domain.User{}, err
 	}
-	u, err := s.users.UpdatePersonalChannel(ctx, self.ID, channelID)
+	if self.PersonalChannelID == channelID {
+		return self, nil
+	}
+	u, err := s.users.UpdatePersonalChannelWithDelivery(ctx, self.ID, channelID, effects)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -796,6 +1000,29 @@ func (s *Service) UpdateColorWithDelivery(ctx context.Context, userID int64, for
 		return domain.User{}, ErrDeliveryRequired
 	}
 	u, err := writer.UpdateColorWithDelivery(ctx, self.ID, forProfile, color, build, excludeAuthKeyID, excludeSessionID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+func (s *Service) AdminUpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if (!forProfile && self.Color == color) || (forProfile && self.ProfileColor == color) {
+		return self, nil
+	}
+	writer, ok := s.users.(store.UserAdminDeliveryStore)
+	if !ok {
+		return domain.User{}, ErrDeliveryRequired
+	}
+	u, err := writer.AdminUpdateColorWithDelivery(ctx, self.ID, forProfile, color, effects)
 	if err != nil {
 		return domain.User{}, err
 	}

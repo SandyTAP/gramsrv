@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"context"
-	"time"
 
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
@@ -18,6 +17,8 @@ import (
 func TestMessagesDeleteHistoryChannelLocalClearReturnsAccountStateWithoutPTS(t *testing.T) {
 	ctx := context.Background()
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	created, err := channelStore.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 7,
 		Title:         "local clear no pts",
@@ -44,14 +45,14 @@ func TestMessagesDeleteHistoryChannelLocalClearReturnsAccountStateWithoutPTS(t *
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Channels: appchannels.NewService(channelStore),
-		Updates:  updateSvc,
-		Sessions: sessions,
+		Channels:       appchannels.NewService(channelStore),
+		Updates:        updateSvc,
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
-	cancel := startChannelFanoutForTest(t, r)
-	defer cancel()
-
-	affected, err := r.onMessagesDeleteHistory(WithUserID(ctx, 7), &tg.MessagesDeleteHistoryRequest{
+	authKeyID := [8]byte{7, 1}
+	requestCtx := WithSessionID(WithRawAuthKeyID(WithUserID(ctx, 7), authKeyID), 701)
+	affected, err := r.onMessagesDeleteHistory(requestCtx, &tg.MessagesDeleteHistoryRequest{
 		Peer:  &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
 		MaxID: sent.Message.ID,
 	})
@@ -68,18 +69,23 @@ func TestMessagesDeleteHistoryChannelLocalClearReturnsAccountStateWithoutPTS(t *
 	if stateAfter.Pts != stateBefore.Pts {
 		t.Fatalf("local channel clear advanced account pts: before=%d after=%d", stateBefore.Pts, stateAfter.Pts)
 	}
-	var pushed captureSessionsSnapshot
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		pushed = sessions.snapshot()
-		if pushed.message != nil {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
+	if pushed := sessions.snapshot(); pushed.message != nil {
+		t.Fatalf("Core directly pushed local clear: %T", pushed.message)
 	}
-	updates, ok := pushed.message.(*tg.Updates)
+	outbox := deliveryOutbox.Snapshot()
+	if len(outbox) != 1 {
+		t.Fatalf("delivery outbox rows = %d, want 1", len(outbox))
+	}
+	if outbox[0].TargetUserID != 7 || outbox[0].ExcludeAuthKeyID != authKeyID || outbox[0].ExcludeSessionID != 701 {
+		t.Fatalf("delivery identity/exclusion = %+v", outbox[0])
+	}
+	durable, err := decodeDeliveryUpdate(outbox[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, ok := durable.(*tg.Updates)
 	if !ok || len(updates.Updates) != 1 {
-		t.Fatalf("pushed local clear = %T %+v, want one available update", pushed.message, pushed.message)
+		t.Fatalf("durable local clear = %T %+v, want one available update", durable, durable)
 	}
 	available, ok := updates.Updates[0].(*tg.UpdateChannelAvailableMessages)
 	if !ok || available.ChannelID != created.Channel.ID || available.AvailableMinID != sent.Message.ID {
@@ -93,6 +99,8 @@ func TestMessagesDeleteHistoryChannelReturnsOffsetForBoundedPage(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 45, Phone: "15550002145", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 46, Phone: "15550002146", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	created, err := channelStore.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Delete History Offset",
@@ -117,12 +125,10 @@ func TestMessagesDeleteHistoryChannelReturnsOffsetForBoundedPage(t *testing.T) {
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Channels: appchannels.NewService(channelStore),
-		Sessions: sessions,
+		Channels:       appchannels.NewService(channelStore),
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
-	cancel := startChannelFanoutForTest(t, r)
-	defer cancel()
-
 	req := &tg.MessagesDeleteHistoryRequest{
 		Peer:  &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
 		MaxID: 0,
@@ -135,25 +141,11 @@ func TestMessagesDeleteHistoryChannelReturnsOffsetForBoundedPage(t *testing.T) {
 	if affected.Offset != 1 || affected.PtsCount != domain.MaxDeleteHistoryBatch {
 		t.Fatalf("affected history = %+v, want offset=1 pts_count=%d", affected, domain.MaxDeleteHistoryBatch)
 	}
-	var pushed captureSessionsSnapshot
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		pushed = sessions.snapshot()
-		if pushed.message != nil {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
+	if pushed := sessions.snapshot(); pushed.message != nil {
+		t.Fatalf("Core pushed durable bounded delete directly: %T", pushed.message)
 	}
-	updates, ok := pushed.message.(*tg.Updates)
-	if !ok || len(updates.Updates) != 1 {
-		t.Fatalf("pushed update = %T %+v, want one bounded delete update", pushed.message, pushed.message)
-	}
-	deleted, ok := updates.Updates[0].(*tg.UpdateDeleteChannelMessages)
-	if !ok {
-		t.Fatalf("pushed update[0] = %T, want updateDeleteChannelMessages", updates.Updates[0])
-	}
-	if len(deleted.Messages) != domain.MaxDeleteHistoryBatch || deleted.PtsCount != domain.MaxDeleteHistoryBatch {
-		t.Fatalf("delete update len=%d pts_count=%d, want bounded %d", len(deleted.Messages), deleted.PtsCount, domain.MaxDeleteHistoryBatch)
+	if got := len(deliveryOutbox.Snapshot()); got != 0 {
+		t.Fatalf("for-everyone delete wrote %d absolute outbox rows", got)
 	}
 }
 

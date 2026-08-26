@@ -54,29 +54,12 @@ func (r *Router) NotifyPeerBotVerification(ctx context.Context, peer domain.Peer
 	}
 }
 
-// notifyUserBotVerification covers ordinary accounts and bots alike: a marked bot is
-// a user#b1b8cc83 with bot_verification_icon:flags2.14, so it takes the same
-// audience-wide updateUser fan-out the moderation flags use (the peer itself plus
-// every online account that already sees it).
+// notifyUserBotVerification is cache invalidation only. The mark mutation and
+// its frozen audience-wide updateUser effects have already committed together;
+// producing another update here would recreate the forbidden post-commit gap.
 func (r *Router) notifyUserBotVerification(ctx context.Context, userID int64) error {
-	// Invalidate first and unconditionally: a committed mark whose projection still
-	// says "unmarked" would keep serving the stale badge state even if the push below
-	// cannot run.
 	r.invalidateRPCProjectionForUser(userID)
-	if r.deps.Users == nil {
-		return nil
-	}
-	user, found, err := r.verificationUser(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("notify peer bot verification: load user %d: %w", userID, err)
-	}
-	if !found || user.ID == 0 {
-		return fmt.Errorf("notify peer bot verification: user %d not found", userID)
-	}
-	// NotifyUserModerationFlagsChanged re-projects the peer per recipient, so the
-	// snapshot handed in only carries identity; the pushed tg.User is always built
-	// from a fresh read and therefore picks the icon up from the batch overlay.
-	return r.NotifyUserModerationFlagsChanged(ctx, user)
+	return nil
 }
 
 // notifyChannelBotVerification reuses the channel state-mutation path, which

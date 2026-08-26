@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 var validRichMessageBlocks = []byte{
@@ -283,7 +284,7 @@ func TestMessageStoreRequestedPeerDisclosureSnapshotRoundTrip(t *testing.T) {
 
 func TestMessageStorePrivateMessageReactionsAreSharedAcrossOwnerBoxes(t *testing.T) {
 	ctx := context.Background()
-	messages := NewMessageStore()
+	messages := newMessageStoreWithDelivery()
 	aliceID := int64(1000000001)
 	bobID := int64(1000000002)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
@@ -306,7 +307,8 @@ func TestMessageStorePrivateMessageReactionsAreSharedAcrossOwnerBoxes(t *testing
 		},
 		Big:  true,
 		Date: 1700000200,
-	})
+	}, testPrivateReactionEffects)
+
 	if err != nil {
 		t.Fatalf("SetMessageReactions: %v", err)
 	}
@@ -379,7 +381,7 @@ func TestMessageStorePrivateMessageReactionsAreSharedAcrossOwnerBoxes(t *testing
 func TestMessageStorePrivateReactionEnrichesDialogTopMessages(t *testing.T) {
 	ctx := context.Background()
 	dialogs := NewDialogStore()
-	messages := NewMessageStore(dialogs)
+	messages := newMessageStoreWithDelivery(dialogs)
 	aliceID := int64(1000000001)
 	bobID := int64(1000000002)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
@@ -401,7 +403,7 @@ func TestMessageStorePrivateReactionEnrichesDialogTopMessages(t *testing.T) {
 			reaction,
 		},
 		Date: 1700000310,
-	}); err != nil {
+	}, testPrivateReactionEffects); err != nil {
 		t.Fatalf("SetMessageReactions: %v", err)
 	}
 
@@ -632,10 +634,13 @@ func TestMessageStoreReadHistoryEmitsInboxAndOutboxReceipts(t *testing.T) {
 		t.Fatalf("SendPrivateText: %v", err)
 	}
 
+	originAuthKeyID := [8]byte{1, 2, 3}
 	read, err := messages.ReadHistory(ctx, domain.ReadHistoryRequest{
-		OwnerUserID: recipientID,
-		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: senderID},
-		Date:        1700000200,
+		OwnerUserID:     recipientID,
+		Peer:            domain.Peer{Type: domain.PeerTypeUser, ID: senderID},
+		Date:            1700000200,
+		OriginAuthKeyID: originAuthKeyID,
+		OriginSessionID: 77,
 	})
 	if err != nil {
 		t.Fatalf("ReadHistory: %v", err)
@@ -653,6 +658,25 @@ func TestMessageStoreReadHistoryEmitsInboxAndOutboxReceipts(t *testing.T) {
 	})
 	if err != nil || date != 1700000200 {
 		t.Fatalf("outbox read date = %d err=%v, want read date", date, err)
+	}
+	events := messages.updateEvents
+	events.mu.RLock()
+	recipientEvents := append([]domain.UpdateEvent(nil), events.events[recipientID]...)
+	senderEvents := append([]domain.UpdateEvent(nil), events.events[senderID]...)
+	recipientDispatches := append([]memoryUpdateDispatch(nil), events.dispatches[recipientID]...)
+	senderDispatches := append([]memoryUpdateDispatch(nil), events.dispatches[senderID]...)
+	events.mu.RUnlock()
+	if got := recipientEvents[len(recipientEvents)-1]; got.Type != domain.UpdateEventReadHistoryInbox || got.Pts != read.InboxEvent.Pts {
+		t.Fatalf("recipient durable event = %+v, want read inbox pts %d", got, read.InboxEvent.Pts)
+	}
+	if got := recipientDispatches[len(recipientDispatches)-1]; got.Pts != read.InboxEvent.Pts || got.ExcludeAuthKeyID != originAuthKeyID || got.ExcludeSessionID != 77 {
+		t.Fatalf("recipient dispatch = %+v, want origin exclusion and pts %d", got, read.InboxEvent.Pts)
+	}
+	if got := senderEvents[len(senderEvents)-1]; got.Type != domain.UpdateEventReadHistoryOutbox || got.Pts != read.OutboxEvent.Pts {
+		t.Fatalf("sender durable event = %+v, want read outbox pts %d", got, read.OutboxEvent.Pts)
+	}
+	if got := senderDispatches[len(senderDispatches)-1]; got.Pts != read.OutboxEvent.Pts || got.ExcludeAuthKeyID != ([8]byte{}) || got.ExcludeSessionID != 0 {
+		t.Fatalf("sender dispatch = %+v, want zero exclusion and pts %d", got, read.OutboxEvent.Pts)
 	}
 }
 
@@ -1002,10 +1026,13 @@ func TestMessageStoreReadMessageContentsNotifiesVoiceSender(t *testing.T) {
 		t.Fatalf("photo media_unread sender=%v recipient=%v, want false: only voice/round carry unread payload",
 			photo.SenderMessage.MediaUnread, photo.RecipientMessage.MediaUnread)
 	}
+	originAuthKeyID := [8]byte{9, 8, 7}
 	read, err := messages.ReadMessageContents(ctx, domain.ReadMessageContentsRequest{
-		OwnerUserID: 1002,
-		IDs:         []int{sent.RecipientMessage.ID},
-		Date:        1700000400,
+		OwnerUserID:     1002,
+		IDs:             []int{sent.RecipientMessage.ID},
+		Date:            1700000400,
+		OriginAuthKeyID: originAuthKeyID,
+		OriginSessionID: 88,
 	})
 	if err != nil {
 		t.Fatalf("ReadMessageContents: %v", err)
@@ -1023,6 +1050,25 @@ func TestMessageStoreReadMessageContentsNotifiesVoiceSender(t *testing.T) {
 	if receipt.Date != 1700000400 {
 		t.Fatalf("receipt date = %d, want read time 1700000400", receipt.Date)
 	}
+	events := messages.updateEvents
+	events.mu.RLock()
+	readerEvents := append([]domain.UpdateEvent(nil), events.events[1002]...)
+	senderEvents := append([]domain.UpdateEvent(nil), events.events[1001]...)
+	readerDispatches := append([]memoryUpdateDispatch(nil), events.dispatches[1002]...)
+	senderDispatches := append([]memoryUpdateDispatch(nil), events.dispatches[1001]...)
+	events.mu.RUnlock()
+	if got := readerEvents[len(readerEvents)-1]; got.Type != domain.UpdateEventReadMessageContents || got.Pts != read.Event.Pts {
+		t.Fatalf("reader durable event = %+v, want content-read pts %d", got, read.Event.Pts)
+	}
+	if got := readerDispatches[len(readerDispatches)-1]; got.Pts != read.Event.Pts || got.ExcludeAuthKeyID != originAuthKeyID || got.ExcludeSessionID != 88 {
+		t.Fatalf("reader dispatch = %+v, want origin exclusion and pts %d", got, read.Event.Pts)
+	}
+	if got := senderEvents[len(senderEvents)-1]; got.Type != domain.UpdateEventReadMessageContents || got.Pts != receipt.Pts {
+		t.Fatalf("sender durable event = %+v, want content-read receipt pts %d", got, receipt.Pts)
+	}
+	if got := senderDispatches[len(senderDispatches)-1]; got.Pts != receipt.Pts || got.ExcludeAuthKeyID != ([8]byte{}) || got.ExcludeSessionID != 0 {
+		t.Fatalf("sender dispatch = %+v, want zero exclusion and pts %d", got, receipt.Pts)
+	}
 	repeat, err := messages.ReadMessageContents(ctx, domain.ReadMessageContentsRequest{
 		OwnerUserID: 1002,
 		IDs:         []int{sent.RecipientMessage.ID},
@@ -1033,6 +1079,42 @@ func TestMessageStoreReadMessageContentsNotifiesVoiceSender(t *testing.T) {
 	}
 	if len(repeat.SenderEvents) != 0 {
 		t.Fatalf("repeat SenderEvents = %+v, want none", repeat.SenderEvents)
+	}
+}
+
+func TestMessageStoreReadMutationsFailClosedBeforeStateChangeWithoutDurableEvents(t *testing.T) {
+	ctx := context.Background()
+	dialogs := NewDialogStore()
+	messages := NewMessageStore(dialogs)
+	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
+		SenderUserID: 1001, RecipientUserID: 1002, RandomID: 9901,
+		Media: &domain.MessageMedia{Kind: domain.MessageMediaKindDocument, Voice: true},
+		Date:  1700000600,
+	})
+	if err != nil {
+		t.Fatalf("SendPrivateText: %v", err)
+	}
+	messages.mu.Lock()
+	messages.updateEvents = nil
+	messages.mu.Unlock()
+	if _, err := messages.ReadMessageContents(ctx, domain.ReadMessageContentsRequest{
+		OwnerUserID: 1002, IDs: []int{sent.RecipientMessage.ID}, Date: 1700000700,
+	}); !errors.Is(err, store.ErrDeliveryOutboxRequired) {
+		t.Fatalf("ReadMessageContents error = %v, want durable event dependency failure", err)
+	}
+	boxes, err := messages.GetByIDs(ctx, 1002, []int{sent.RecipientMessage.ID})
+	if err != nil || len(boxes.Messages) != 1 || !boxes.Messages[0].MediaUnread {
+		t.Fatalf("recipient content state after failed read = %+v err=%v, want media_unread preserved", boxes.Messages, err)
+	}
+	if _, err := messages.ReadHistory(ctx, domain.ReadHistoryRequest{
+		OwnerUserID: 1002, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 1001},
+		MaxID: sent.RecipientMessage.ID, Date: 1700000701,
+	}); !errors.Is(err, store.ErrDeliveryOutboxRequired) {
+		t.Fatalf("ReadHistory error = %v, want durable event dependency failure", err)
+	}
+	list, err := dialogs.ListByUser(ctx, 1002, domain.DialogFilter{Limit: 10})
+	if err != nil || len(list.Dialogs) != 1 || list.Dialogs[0].ReadInboxMaxID != 0 || list.Dialogs[0].UnreadCount != 1 {
+		t.Fatalf("dialog state after failed read = %+v err=%v, want unread mutation rolled back", list.Dialogs, err)
 	}
 }
 

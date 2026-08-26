@@ -749,7 +749,11 @@ func (r *Router) onAccountVerifyEmail(ctx context.Context, req *tg.AccountVerify
 				SentCode: tgEmailSentCode(p.PhoneCodeHash, domain.MaskEmail(email), len(strings.TrimSpace(code)), r.loginEmailResetAvailable()),
 			}, nil
 		}
-		u, _, needSignUp, signInErr := r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), p.PhoneNumber, p.PhoneCodeHash, code)
+		delivery, deliveryErr := r.signInDeliveryEffects(ctx)
+		if deliveryErr != nil {
+			return nil, internalErr()
+		}
+		u, _, needSignUp, signInErr := r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), p.PhoneNumber, p.PhoneCodeHash, code, delivery)
 		authorization, err := r.finishAuthSignIn(ctx, u, needSignUp, signInErr)
 		if err != nil {
 			return nil, err
@@ -1360,7 +1364,6 @@ func privacyErr(err error) error {
 
 type accountReactionSettingsService interface {
 	accountReactionSettingsReader
-	SetReactionsNotifySettings(ctx context.Context, userID int64, settings domain.ReactionsNotifySettings) (domain.AccountReactionSettings, error)
 }
 
 // accountSettingsService 是账号级单例设置（全局隐私/TTL/敏感内容/注册通知）持久化的
@@ -1458,14 +1461,14 @@ func (r *Router) onAccountSetReactionsNotifySettings(ctx context.Context, settin
 		return nil, internalErr()
 	}
 	notify := domainReactionsNotifySettings(settings)
-	if svc, ok := r.deps.Account.(accountReactionSettingsService); ok {
-		next, err := svc.SetReactionsNotifySettings(ctx, userID, notify)
-		if err != nil {
-			return nil, internalErr()
-		}
-		return tgReactionsNotifySettings(next.Notify), nil
+	if r.deps.Account == nil {
+		return nil, internalErr()
 	}
-	return tgReactionsNotifySettings(notify), nil
+	next, err := r.deps.Account.SetReactionsNotifySettings(ctx, userID, notify)
+	if err != nil {
+		return nil, internalErr()
+	}
+	return tgReactionsNotifySettings(next.Notify), nil
 }
 
 func domainReactionsNotifySettings(settings tg.ReactionsNotifySettings) domain.ReactionsNotifySettings {
@@ -1684,9 +1687,11 @@ func (r *Router) onAccountUpdatePersonalChannel(ctx context.Context, channel tg.
 	if err != nil {
 		return false, internalErr()
 	}
-	svc, ok := r.deps.Users.(UserIdentityService)
-	if !ok {
+	if r.deps.Users == nil {
 		return false, internalErr()
+	}
+	if err := r.requireAccountDelivery(userID, "account.updatePersonalChannel"); err != nil {
+		return false, err
 	}
 	var channelID int64
 	switch channel.(type) {
@@ -1705,7 +1710,7 @@ func (r *Router) onAccountUpdatePersonalChannel(ctx context.Context, channel tg.
 		}
 		channelID = view.Channel.ID
 	}
-	u, err := svc.UpdatePersonalChannel(ctx, userID, channelID)
+	u, err := r.deps.Users.UpdatePersonalChannelWithDelivery(ctx, userID, channelID, r.selfUserAbsoluteReloadEffects(ctx))
 	if err != nil {
 		return false, internalErr()
 	}
@@ -1722,8 +1727,7 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 	if err != nil {
 		return false, internalErr()
 	}
-	svc, ok := r.deps.Users.(UserPremiumService)
-	if !ok {
+	if r.deps.Users == nil {
 		r.log.Error("account.updateEmojiStatus requires durable-capable user service", zap.Int64("user_id", userID))
 		return false, internalErr()
 	}
@@ -1731,57 +1735,17 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 	if err != nil {
 		return false, err
 	}
-	var (
-		u            domain.User
-		event        domain.UpdateEvent
-		durableWrite bool
-	)
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	if durable, ok := r.deps.Users.(UserEmojiStatusDurableService); ok {
-		u, event, durableWrite, err = durable.UpdateEmojiStatusWithEvent(
-			ctx, userID, value, int(r.clock.Now().Unix()), rawAuthKeyIDForOrigin(ctx), sessionID,
-		)
-		if err != nil {
-			if errors.Is(err, domain.ErrPremiumRequired) {
-				return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
-			}
-			if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
-				return false, tgerr400("COLLECTIBLE_INVALID")
-			}
-			return false, internalErr()
+	u, _, err := r.deps.Users.UpdateEmojiStatusWithEvent(ctx, userID, value, int(r.clock.Now().Unix()))
+	if err != nil {
+		if errors.Is(err, domain.ErrPremiumRequired) {
+			return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
 		}
-	}
-	if !durableWrite {
-		updates, ok := r.deps.Updates.(UserEmojiStatusUpdatesService)
-		if !ok {
-			r.log.Error("account.updateEmojiStatus missing durable update event service", zap.Int64("user_id", userID))
-			return false, internalErr()
+		if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
+			return false, tgerr400("COLLECTIBLE_INVALID")
 		}
-		u, err = svc.UpdateEmojiStatus(ctx, userID, value)
-		if err != nil {
-			if errors.Is(err, domain.ErrPremiumRequired) {
-				return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
-			}
-			if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
-				return false, tgerr400("COLLECTIBLE_INVALID")
-			}
-			return false, internalErr()
-		}
-		event, _, err = updates.RecordUserEmojiStatus(ctx, authKeyID, userID, value, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
+		return false, internalErr()
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	update := &tg.UpdateUserEmojiStatus{UserID: u.ID, EmojiStatus: tgUserEmojiStatusValue(value)}
-	self := r.tgSelfUserWithUsernames(ctx, u)
-	if sessionID != 0 {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	}
-	r.requireReliableDispatchForUserUpdate(ctx, u.ID, &tg.Updates{
-		Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
-	})
 	return true, nil
 }
 
@@ -1895,11 +1859,11 @@ func accountUpdateColorIDAllowed(forProfile bool, colorID int) bool {
 
 // onAccountGetDefaultEmojiStatuses 返回默认 emoji status 列表，与
 // inputStickerSetEmojiDefaultStatuses 系统集同源同序（选择器主体由该系统集
-// 经 messages.getStickerSet 填充，这里是顶部"默认状态"行）。资源未合成时回退
-// 空 stub，与其它 sticker 资源 RPC 的降级路径一致。
+// 经 messages.getStickerSet 填充，这里是顶部"默认状态"行）。该系统集是生产
+// 依赖，缺失时失败，不合成空目录。
 func (r *Router) onAccountGetDefaultEmojiStatuses(ctx context.Context, hash int64) (tg.AccountEmojiStatusesClass, error) {
 	if r.deps.Files == nil {
-		return tdesktop.DefaultEmojiStatuses(), nil
+		return nil, internalErr()
 	}
 	set, _, found, err := r.deps.Files.ResolveStickerSet(ctx, domain.StickerSetRef{
 		Kind:      domain.StickerSetRefBySystem,
@@ -1909,10 +1873,10 @@ func (r *Router) onAccountGetDefaultEmojiStatuses(ctx context.Context, hash int6
 		return nil, internalErr()
 	}
 	if !found || len(set.DocumentIDs) == 0 {
-		return tdesktop.DefaultEmojiStatuses(), nil
+		return nil, internalErr()
 	}
 	catalogHash := mediaCatalogHash(set.DocumentIDs)
-	if hash == catalogHash {
+	if hash != 0 && hash == catalogHash {
 		return &tg.AccountEmojiStatusesNotModified{}, nil
 	}
 	statuses := make([]tg.EmojiStatusClass, 0, len(set.DocumentIDs))

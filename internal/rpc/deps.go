@@ -22,18 +22,18 @@ type AuthService interface {
 	ResolveAuthKey(ctx context.Context, authKeyID [8]byte) ([8]byte, bool, error)
 	UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
 	PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
-	CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64) error
+	CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error
 	SendCode(ctx context.Context, phone string) (string, error)
 	CodeDelivery(ctx context.Context, phoneCodeHash string) (domain.AuthCodeDelivery, bool, error)
 	ResendCode(ctx context.Context, phone, phoneCodeHash string) (string, error)
 	CancelCode(ctx context.Context, phone, phoneCodeHash string) error
-	SignIn(ctx context.Context, a domain.Authorization, phone, phoneCodeHash, code string) (domain.User, domain.Message, bool, error)
+	SignIn(ctx context.Context, a domain.Authorization, phone, phoneCodeHash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error)
 	// SignInWithEmail 处理带 email_verification 的 auth.signIn（登录邮箱路径）。
-	SignInWithEmail(ctx context.Context, a domain.Authorization, phone, phoneCodeHash, code string) (domain.User, domain.Message, bool, error)
+	SignInWithEmail(ctx context.Context, a domain.Authorization, phone, phoneCodeHash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error)
 	SignUp(ctx context.Context, a domain.Authorization, phone, phoneCodeHash, firstName, lastName string) (domain.User, domain.Message, error)
-	AcceptLoginToken(ctx context.Context, a domain.Authorization, userID int64) (domain.Authorization, error)
+	AcceptLoginToken(ctx context.Context, a domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.Authorization, error)
 	// BindVerifiedLogin 绑定一个已由外部强因子(passkey)验证身份的用户,直接完成授权。
-	BindVerifiedLogin(ctx context.Context, a domain.Authorization, userID int64) (domain.User, error)
+	BindVerifiedLogin(ctx context.Context, a domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, error)
 	// SignInBot 校验 bot token 并绑定授权（auth.importBotAuthorization）；
 	// 校验失败返回 domain.ErrBotTokenInvalid。
 	SignInBot(ctx context.Context, a domain.Authorization, token string) (domain.User, error)
@@ -79,7 +79,6 @@ type LayerAwareTransientPusher = edgecontrol.LayerAwareTransientPusher
 type OnlineUserProvider = edgecontrol.OnlineUserProvider
 type ChannelSubscriptionProvider = edgecontrol.ChannelSubscriptionProvider
 type ChannelNudgeProvider = edgecontrol.ChannelNudgeProvider
-type ChannelFanoutRecoverySessionProvider = edgecontrol.ChannelFanoutRecoverySessionProvider
 type EdgeLocationRecord = edgecontrol.LocationRecord
 type UserLocationBatchProvider = edgecontrol.UserLocationBatchProvider
 type ChannelDeliveryKind = edgecontrol.ChannelDeliveryKind
@@ -94,13 +93,6 @@ const (
 
 type SemanticTransientSessionBinder = edgecontrol.SemanticTransientPusher
 
-// ChannelFanoutRecoveryPtsProvider reloads the authoritative channel pts after in-memory fan-out
-// saturation. Production channels.Service implements it through the channel store; keeping this
-// separate from ChannelsService avoids burdening lightweight RPC fakes that never run the worker.
-type ChannelFanoutRecoveryPtsProvider interface {
-	MaxChannelPtsBatch(ctx context.Context, channelIDs []int64) (map[int64]int, error)
-}
-
 // RateLimiter 抽象 RPC 高频写操作限流。
 type RateLimiter interface {
 	Allow(ctx context.Context, key string, limit int, window time.Duration) (allowed bool, retryAfterSeconds int, err error)
@@ -112,6 +104,8 @@ type UsersService interface {
 	Self(ctx context.Context, userID int64) (domain.User, error)
 	ByID(ctx context.Context, currentUserID, userID int64) (domain.User, bool, error)
 	ByIDs(ctx context.Context, currentUserID int64, userIDs []int64) ([]domain.User, error)
+	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error)
+	UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error)
 }
 
 type CollectiblePhoneService interface {
@@ -136,15 +130,6 @@ type TelegramLoginService interface {
 	RevokeAllWebAuthorizations(ctx context.Context, userID int64) (int64, error)
 }
 
-// BatchViewerUsersResolver 是 UsersService 的可选能力：跨多个 viewer 一次性投影同一组 user
-// （fan-out 模板化，把 per-recipient 的 ByIDs(=ForViewer) 折叠成 O(owner) 查询）。结果按 viewer
-// 与 ByIDs(viewer, ids) 字节等价，包含 viewer-specific personal photo overlay。
-// 声明需要 fan-out 预热的路径必须具备该能力；缺失或失败时在线 fan-out fail-closed，不得
-// 在同一请求里改走逐 recipient 查询。
-type BatchViewerUsersResolver interface {
-	ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error)
-}
-
 // SparseBatchViewerUsersResolver projects only the explicitly supplied
 // viewer->user edges. Durable private-message outbox projection uses this
 // instead of widening a claim into viewers x union(users).
@@ -158,13 +143,13 @@ type BotsService interface {
 	BotInfo(ctx context.Context, botUserID int64) (domain.BotProfile, bool, error)
 	OwnsBot(ctx context.Context, ownerUserID, botUserID int64) (bool, error)
 	CheckUsername(ctx context.Context, ownerUserID int64, username string) (bool, error)
-	CreateBot(ctx context.Context, ownerUserID int64, name, username string) (domain.User, string, error)
+	CreateBotWithDelivery(ctx context.Context, ownerUserID int64, name, username string, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, string, error)
 	ListOwnedBots(ctx context.Context, ownerUserID int64) ([]domain.User, error)
 	ExportBotToken(ctx context.Context, ownerUserID, botUserID int64, revoke bool) (string, error)
 	SetBotCommands(ctx context.Context, botUserID int64, commands []domain.BotCommand) (int, error)
 	GetBotCommands(ctx context.Context, botUserID int64) ([]domain.BotCommand, error)
-	SetBotInfo(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate) (int, error)
-	GetBotInfo(ctx context.Context, botUserID int64) (name, about, description string, err error)
+	SetBotInfoWithDelivery(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (int, error)
+	GetBotInfo(ctx context.Context, botUserID int64, langCode string) (domain.BotInfoValues, error)
 	SetBotMenuButton(ctx context.Context, botUserID int64, button domain.BotMenuButton) (int, error)
 	GetBotMenuButton(ctx context.Context, botUserID int64) (domain.BotMenuButton, error)
 	SetInlinePlaceholder(ctx context.Context, botUserID int64, placeholder string) (int, error)
@@ -185,7 +170,7 @@ type BotsService interface {
 	GetAttachMenuBot(ctx context.Context, botUserID int64) (domain.BotAttachMenuBot, bool, error)
 	ListAttachMenuBots(ctx context.Context) ([]domain.BotAttachMenuBot, error)
 	GetAttachMenuState(ctx context.Context, userID, botUserID int64) (domain.BotAttachMenuState, bool, error)
-	SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState) (domain.BotAttachMenuState, error)
+	SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState, effects store.DeliveryEffectsBuilder[domain.BotAttachMenuState]) (domain.BotAttachMenuState, error)
 	SaveRequestedWebViewButton(ctx context.Context, button domain.BotRequestedWebViewButton) (domain.BotRequestedWebViewButton, error)
 	GetRequestedWebViewButton(ctx context.Context, botUserID, userID int64, reqID string) (domain.BotRequestedWebViewButton, bool, error)
 	DeleteRequestedWebViewButton(ctx context.Context, botUserID, userID int64, reqID string) error
@@ -228,7 +213,6 @@ type UserIdentityService interface {
 	UpdateProfile(ctx context.Context, userID int64, update domain.UserProfileUpdate) (domain.User, error)
 	UpdateUsername(ctx context.Context, userID int64, username string) (domain.User, error)
 	UpdateBirthday(ctx context.Context, userID int64, birthday domain.Birthday) (domain.User, error)
-	UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error)
 	ResolveUsername(ctx context.Context, currentUserID int64, username string) (domain.User, bool, error)
 	ResolvePhone(ctx context.Context, currentUserID int64, phone string) (domain.User, bool, error)
 }
@@ -249,14 +233,7 @@ type UserProfileDeliveryService interface {
 type UserPremiumService interface {
 	GrantPremium(ctx context.Context, userID int64, months int) (domain.User, error)
 	SweepExpiredPremium(ctx context.Context, now int64, limit int) ([]domain.User, error)
-	UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error)
-}
-
-// UserEmojiStatusDurableService exposes the aggregate state+event write used
-// by account.updateEmojiStatus. The bool is false for lightweight stores that
-// require the RPC Updates service to append the event separately.
-type UserEmojiStatusDurableService interface {
-	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, bool, error)
+	SweepExpiredPremiumWithDelivery(ctx context.Context, now int64, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error)
 }
 
 // UserPremiumStatusService 暴露轻量会员判断（基础用户缓存路径，不做 viewer
@@ -268,7 +245,7 @@ type UserPremiumStatusService interface {
 // AccountService 抽象账号设置查询。
 type AccountService interface {
 	SendChangePhoneCode(ctx context.Context, userID int64, authKeyID [8]byte, sessionID int64, phone string) (string, domain.AuthCodeDelivery, error)
-	ChangePhone(ctx context.Context, userID int64, authKeyID, originRawAuthKeyID [8]byte, sessionID int64, phone, phoneCodeHash, code string, date int) (domain.PhoneChangeResult, error)
+	ChangePhoneWithDelivery(ctx context.Context, userID int64, authKeyID, originRawAuthKeyID [8]byte, sessionID int64, phone, phoneCodeHash, code string, date int, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.PhoneChangeResult, error)
 	GetPassword(ctx context.Context, userID int64) (domain.PasswordSettings, error)
 	GetPasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck) (domain.PrivatePasswordSettings, error)
 	UpdatePasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck, input domain.PasswordInputSettings) error
@@ -293,6 +270,12 @@ type AccountService interface {
 	ListSavedMusicIDs(ctx context.Context, userID int64, limit int) ([]int64, error)
 	ListSavedMusic(ctx context.Context, userID int64, offset, limit int) (domain.SavedMusicList, error)
 	GetSavedMusicByIDs(ctx context.Context, userID int64, ids []int64) (domain.SavedMusicList, error)
+	MutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, effects store.DeliveryEffectsBuilder[domain.StickerCollectionMutation]) error
+	ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error)
+	MutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation, effects store.DeliveryEffectsBuilder[domain.UserStickerSetMutation]) error
+	ListUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error)
+	ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot]) error
+	SetReactionsNotifySettings(ctx context.Context, userID int64, settings domain.ReactionsNotifySettings) (domain.AccountReactionSettings, error)
 }
 
 // AccountBusinessAutomationService 是账号业务自动化的可选扩展。
@@ -311,12 +294,8 @@ type AccountBusinessAutomationService interface {
 	ResolveBusinessChatLink(ctx context.Context, slug string, bumpViews bool) (domain.BusinessChatLink, bool, error)
 	ListQuickReplies(ctx context.Context, userID int64) (domain.QuickReplyList, error)
 	CheckQuickReplyShortcut(ctx context.Context, userID int64, shortcut string) (bool, error)
-	SaveQuickReplyText(ctx context.Context, userID int64, shortcut string, msg domain.QuickReplyMessage) (domain.QuickReplyMutation, error)
 	GetQuickReplyMessages(ctx context.Context, userID int64, shortcutID int, ids []int) (domain.QuickReplyMessages, error)
-	RenameQuickReplyShortcut(ctx context.Context, userID int64, shortcutID int, shortcut string) (domain.QuickReplyMutation, error)
-	ReorderQuickReplies(ctx context.Context, userID int64, order []int) (domain.QuickReplyMutation, error)
-	DeleteQuickReplyShortcut(ctx context.Context, userID int64, shortcutID int) (domain.QuickReplyMutation, error)
-	DeleteQuickReplyMessages(ctx context.Context, userID int64, shortcutID int, ids []int) (domain.QuickReplyMutation, error)
+	MutateQuickReplies(ctx context.Context, mutation store.QuickReplyAccountMutation, effects store.DeliveryEffectsBuilder[store.QuickReplyAccountMutationSnapshot]) (store.QuickReplyAccountMutationSnapshot, error)
 	GetConnectedBusinessBot(ctx context.Context, ownerUserID int64) (domain.ConnectedBusinessBot, bool, error)
 	SaveConnectedBusinessBot(ctx context.Context, ownerUserID int64, bot domain.ConnectedBusinessBot) (domain.ConnectedBusinessBot, error)
 	DeleteConnectedBusinessBot(ctx context.Context, ownerUserID, botUserID int64) (bool, error)
@@ -365,10 +344,8 @@ type UpdatesService interface {
 	RecordReadStories(ctx context.Context, stateAuthKeyID [8]byte, userID int64, read domain.StoryReadResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordSentStoryReaction(ctx context.Context, stateAuthKeyID [8]byte, userID int64, reaction domain.StoryReactionResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordNewStoryReaction(ctx context.Context, stateAuthKeyID [8]byte, ownerUserID int64, reaction domain.StoryReactionResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordQuickReplyMutation(ctx context.Context, stateAuthKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordReadHistory(ctx context.Context, stateAuthKeyID [8]byte, userID int64, read domain.ReadHistoryResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordContactsReset(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelState(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordDialogPinned(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, folderID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordPinnedDialogs(ctx context.Context, stateAuthKeyID [8]byte, userID int64, folderID int, order []domain.Peer, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordSavedDialogPinned(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
@@ -380,31 +357,23 @@ type UpdatesService interface {
 	RecordDialogFilterOrder(ctx context.Context, stateAuthKeyID [8]byte, userID int64, order []int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordDialogFiltersReload(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordFolderPeers(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peers []domain.FolderPeerUpdate, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelViewForumAsMessages(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, enabled bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordChannelDiscussionInbox(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, topicID, maxID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordDraftMessage(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, topMsgID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-}
-
-// UserEmojiStatusUpdatesService is the optional durable settings-update
-// extension used by account.updateEmojiStatus. Keeping it separate preserves
-// lightweight test/service implementations of the core UpdatesService.
-type UserEmojiStatusUpdatesService interface {
-	RecordUserEmojiStatus(ctx context.Context, stateAuthKeyID [8]byte, userID int64, status domain.UserEmojiStatus, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 }
 
 // ContactsService 抽象通讯录查询。
 type ContactsService interface {
 	GetContacts(ctx context.Context, userID int64, hash int64) (domain.ContactList, bool, error)
 	ContactIDs(ctx context.Context, userID int64, hash int64) ([]int, bool, error)
-	AddContact(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error)
-	AcceptContact(ctx context.Context, userID, contactUserID int64) (domain.Contact, error)
-	ImportContacts(ctx context.Context, userID int64, inputs []domain.ContactInput) (domain.ImportContactsResult, error)
+	AddContactWithDelivery(ctx context.Context, userID int64, input domain.ContactInput, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error)
+	AcceptContactWithDelivery(ctx context.Context, userID, contactUserID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error)
+	ImportContactsWithDelivery(ctx context.Context, userID int64, inputs []domain.ContactInput, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.ImportContactsResult, error)
 	Search(ctx context.Context, userID int64, query string, limit int) (domain.UserSearchResult, error)
-	DeleteContacts(ctx context.Context, userID int64, contactUserIDs []int64) (int, error)
+	DeleteContactsWithDelivery(ctx context.Context, userID int64, contactUserIDs []int64, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (int, error)
 	EditCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error)
-	UpdateContactNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, error)
-	SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photo domain.Photo, date int) (domain.Contact, error)
-	ClearPersonalPhoto(ctx context.Context, userID, contactUserID int64, date int) (domain.Contact, error)
+	UpdateContactNoteWithDelivery(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error)
+	SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, photo domain.Photo, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, error)
+	ClearPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, error)
 	PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error)
 	GetPeerSettings(ctx context.Context, userID int64, peer domain.Peer) (domain.PeerSettings, error)
 	BlockContact(ctx context.Context, userID, peerUserID int64, date int) (bool, error)
@@ -415,6 +384,7 @@ type ContactsService interface {
 
 // DialogsService 抽象会话列表查询。
 type DialogsService interface {
+	MutateAccountDialogs(ctx context.Context, mutation store.DialogAccountMutation, effects store.DeliveryEffectsBuilder[store.DialogAccountMutationSnapshot]) (store.DialogAccountMutationSnapshot, error)
 	GetDialogsHash(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogHashCheck, error)
 	GetDialogs(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogList, error)
 	GetPeerDialogs(ctx context.Context, userID int64, peers []domain.Peer) (domain.DialogList, error)
@@ -455,6 +425,22 @@ type ChatlistsService interface {
 
 // MessagesService 抽象消息历史、搜索与已读。
 type MessagesService interface {
+	ScheduleMessage(ctx context.Context, userID int64, req domain.ScheduleMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error)
+	EditScheduledMessage(ctx context.Context, userID int64, req domain.EditScheduledMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error)
+	ListScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error)
+	GetScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error)
+	DeleteScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter, date int, effects store.DeliveryEffectsBuilder[[]domain.ScheduledMessage]) ([]domain.ScheduledMessage, error)
+	ClaimScheduledMessages(ctx context.Context, userID int64, claim domain.ScheduledMessageClaim) ([]domain.ScheduledMessage, error)
+	ClaimDueScheduledMessages(ctx context.Context, now, limit, leaseSeconds int) ([]domain.ScheduledMessage, error)
+	MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) error
+	ReleaseScheduledMessage(ctx context.Context, ownerUserID int64, id int, errText string) error
+	HasScheduledMessages(ctx context.Context, userID int64, peer domain.Peer) (bool, error)
+	GetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer) (int, error)
+	SetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer, period int, effects store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult]) error
+	DefaultHistoryTTL(ctx context.Context, userID int64) (int, error)
+	SetDefaultHistoryTTL(ctx context.Context, userID int64, period int) error
+	ClaimExpiredPrivateMessages(ctx context.Context, now, limit int) ([]domain.DeleteMessagesRequest, error)
+
 	SendPrivateText(ctx context.Context, userID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error)
 	SetChatTheme(ctx context.Context, userID int64, req domain.SetPrivateChatThemeRequest) (domain.SetPrivateChatThemeResult, error)
 	ForwardPrivateMessages(ctx context.Context, userID int64, req domain.ForwardPrivateMessagesRequest) (domain.ForwardPrivateMessagesResult, error)
@@ -466,12 +452,12 @@ type MessagesService interface {
 	ReadHistory(ctx context.Context, userID int64, req domain.ReadHistoryRequest) (domain.ReadHistoryResult, error)
 	ReadMessageContents(ctx context.Context, userID int64, req domain.ReadMessageContentsRequest) (domain.ReadMessageContentsResult, error)
 	GetOutboxReadDate(ctx context.Context, userID int64, req domain.OutboxReadDateRequest) (int, error)
-	SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error)
+	SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error)
 	GetMessageReactions(ctx context.Context, userID int64, req domain.PrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error)
 	SavedReactionTags(ctx context.Context, userID int64, savedPeer domain.Peer, limit int) ([]domain.SavedReactionTag, error)
-	UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag) error
-	VoteMessagePoll(ctx context.Context, userID int64, req domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error)
-	CloseMessagePoll(ctx context.Context, userID int64, req domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error)
+	UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag, effects store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error
+	VoteMessagePoll(ctx context.Context, userID int64, req domain.VotePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error)
+	CloseMessagePoll(ctx context.Context, userID int64, req domain.ClosePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error)
 	ListUnreadReactionMessages(ctx context.Context, userID int64, peer domain.Peer, limit int) ([]domain.Message, error)
 	ReadPeerReactions(ctx context.Context, userID int64, peer domain.Peer) (int, error)
 	EditMessage(ctx context.Context, userID int64, req domain.EditMessageRequest) (domain.EditMessageResult, error)
@@ -482,8 +468,7 @@ type MessagesService interface {
 	GetSavedDialogs(ctx context.Context, userID int64, filter domain.SavedDialogsFilter) (domain.SavedDialogList, error)
 	GetPinnedSavedDialogs(ctx context.Context, userID int64) (domain.SavedDialogList, error)
 	GetSavedDialogsByPeers(ctx context.Context, userID int64, peers []domain.Peer) (domain.SavedDialogList, error)
-	ToggleSavedDialogPin(ctx context.Context, userID int64, peer domain.Peer, pinned bool) (bool, error)
-	ReorderPinnedSavedDialogs(ctx context.Context, userID int64, order []domain.Peer, force bool) error
+	MutateSavedDialogs(ctx context.Context, userID int64, mutation store.SavedDialogMutation, effects store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error)
 	DeleteSavedHistory(ctx context.Context, userID int64, req domain.DeleteSavedHistoryRequest) (domain.DeleteSavedHistoryResult, error)
 }
 
@@ -511,7 +496,7 @@ type AlbumGroupService interface {
 
 // StoriesService 抽象 story 读取、已读、观看与 reaction 状态。
 type StoriesService interface {
-	CreateStory(ctx context.Context, userID int64, req domain.StoryCreateRequest) (domain.StoryCreateResult, error)
+	CreateStory(ctx context.Context, userID int64, req domain.StoryCreateRequest, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryCreateResult, error)
 	GetAllStories(ctx context.Context, viewerUserID int64, hidden bool, now, limit int) (domain.StoryList, error)
 	GetAllStoriesPage(ctx context.Context, viewerUserID int64, hidden bool, now int, cursor domain.StoryListCursor, limit int) (domain.StoryList, error)
 	GetAllStoriesDigest(ctx context.Context, viewerUserID int64, hidden bool, now int) (domain.StoryListDigest, error)
@@ -525,17 +510,17 @@ type StoriesService interface {
 	GetPeerMaxIDs(ctx context.Context, viewerUserID int64, peers []domain.Peer, now int) ([]domain.RecentStory, error)
 	GetPeerHiddenStates(ctx context.Context, viewerUserID int64, peers []domain.Peer) (map[domain.Peer]bool, error)
 	GetPeerStoryProjections(ctx context.Context, viewerUserID int64, peers []domain.Peer, now int) ([]domain.PeerStoryProjection, error)
-	ReadStories(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error)
+	ReadStories(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryReadResult, error)
 	IncrementViews(ctx context.Context, viewerUserID int64, peer domain.Peer, ids []int, date int) (int, error)
-	SendReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error)
+	SendReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryReactionResult, error)
 	GetStoryViewsList(ctx context.Context, viewerUserID int64, req domain.StoryViewListRequest) (domain.StoryViewList, error)
 	GetStoryReactionsList(ctx context.Context, viewerUserID int64, req domain.StoryReactionListRequest) (domain.StoryReactionList, error)
 	GetStoryPublicForwards(ctx context.Context, viewerUserID int64, req domain.StoryPublicForwardListRequest) (domain.StoryPublicForwardList, error)
 	CanViewStoryStats(ctx context.Context, userID int64, peer domain.Peer) error
 	ListStoryViewerIDs(ctx context.Context, userID int64, owner domain.Peer, storyID, limit int) ([]int64, error)
-	EditStory(ctx context.Context, userID int64, req domain.StoryEditRequest) (domain.StoryEditResult, error)
-	DeleteStories(ctx context.Context, userID int64, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error)
-	TogglePinned(ctx context.Context, userID int64, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error)
+	EditStory(ctx context.Context, userID int64, req domain.StoryEditRequest, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryEditResult, error)
+	DeleteStories(ctx context.Context, userID int64, peer domain.Peer, ids []int, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryMutationResult, error)
+	TogglePinned(ctx context.Context, userID int64, peer domain.Peer, ids []int, pinned bool, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryMutationResult, error)
 	TogglePinnedToTop(ctx context.Context, userID int64, peer domain.Peer, ids []int) error
 	TogglePeerStoriesHidden(ctx context.Context, viewerUserID int64, peer domain.Peer, hidden bool) error
 	CanSendStory(ctx context.Context, viewerUserID int64, peer domain.Peer) (int, error)
@@ -555,7 +540,7 @@ type ChannelsService interface {
 	GetParticipant(ctx context.Context, userID, channelID, participantUserID int64) (domain.ChannelMember, error)
 	FutureCreatorAfterLeave(ctx context.Context, userID, channelID int64) (domain.ChannelMember, error)
 	InviteToChannel(ctx context.Context, userID, channelID int64, userIDs []int64, date int) (domain.CreateChannelResult, error)
-	JoinChannel(ctx context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error)
+	JoinChannel(ctx context.Context, userID, channelID int64, date int, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	LeaveChannel(ctx context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error)
 	EditTitle(ctx context.Context, userID int64, req domain.EditChannelTitleRequest) (domain.EditChannelTitleResult, error)
 	SetWallpaper(ctx context.Context, userID int64, req domain.SetChannelWallpaperRequest) (domain.SetChannelWallpaperResult, error)
@@ -609,7 +594,7 @@ type ChannelsService interface {
 	GetPremiumMyBoosts(ctx context.Context, userID int64, now, premiumUntil int) (domain.PremiumMyBoosts, error)
 	ApplyPremiumBoost(ctx context.Context, userID, channelID int64, slots []int, now, premiumUntil int) (domain.PremiumMyBoosts, error)
 	GetPremiumUserBoosts(ctx context.Context, userID, channelID, targetUserID int64, now int) (domain.PremiumBoostList, error)
-	ReadMessageContents(ctx context.Context, userID int64, req domain.ReadChannelMessageContentsRequest) (domain.ReadChannelMessageContentsResult, error)
+	ReadMessageContents(ctx context.Context, userID int64, req domain.ReadChannelMessageContentsRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelMessageContentsResult]) (domain.ReadChannelMessageContentsResult, error)
 	GetMessageAuthor(ctx context.Context, userID int64, req domain.GetChannelMessageAuthorRequest) (domain.GetChannelMessageAuthorResult, error)
 	CreateForumTopic(ctx context.Context, userID int64, req domain.CreateChannelForumTopicRequest) (domain.CreateChannelForumTopicResult, error)
 	EditForumTopic(ctx context.Context, userID int64, req domain.EditChannelForumTopicRequest) (domain.EditChannelForumTopicResult, error)
@@ -624,14 +609,14 @@ type ChannelsService interface {
 	ListStoryMessageForwards(ctx context.Context, userID int64, req domain.StoryMessageForwardListRequest) (domain.StoryMessageForwardList, error)
 	EditInlineBotMessage(ctx context.Context, botID int64, req domain.EditChannelMessageRequest) (domain.EditChannelMessageResult, error)
 	DeleteMessages(ctx context.Context, userID int64, req domain.DeleteChannelMessagesRequest) (domain.DeleteChannelMessagesResult, error)
-	DeleteHistory(ctx context.Context, userID int64, req domain.DeleteChannelHistoryRequest) (domain.DeleteChannelHistoryResult, error)
+	DeleteHistory(ctx context.Context, userID int64, req domain.DeleteChannelHistoryRequest, effects store.DeliveryEffectsBuilder[store.ChannelAvailableMinDeliverySnapshot]) (domain.DeleteChannelHistoryResult, error)
 	DeleteParticipantHistory(ctx context.Context, userID int64, req domain.DeleteChannelParticipantHistoryRequest) (domain.DeleteChannelHistoryResult, error)
 	UpdatePinnedMessage(ctx context.Context, userID int64, req domain.UpdateChannelPinnedMessageRequest) (domain.UpdateChannelPinnedMessageResult, error)
 	UnpinAllMessages(ctx context.Context, userID int64, req domain.UnpinAllChannelMessagesRequest) (domain.UpdateChannelPinnedMessageResult, error)
 	ClearDanglingPinnedMessage(ctx context.Context, channelID int64, messageID int) error
 	ExportInvite(ctx context.Context, userID int64, req domain.ExportChannelInviteRequest) (domain.ExportChannelInviteResult, error)
 	CheckInvite(ctx context.Context, userID int64, hash string, date int) (domain.CheckChannelInviteResult, error)
-	ImportInvite(ctx context.Context, userID int64, req domain.ImportChannelInviteRequest) (domain.CreateChannelResult, error)
+	ImportInvite(ctx context.Context, userID int64, req domain.ImportChannelInviteRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	ListExportedInvites(ctx context.Context, userID int64, req domain.ChannelInviteListRequest) (domain.ChannelInviteList, error)
 	GetExportedInvite(ctx context.Context, userID int64, req domain.GetChannelInviteRequest) (domain.ChannelInvite, error)
 	EditExportedInvite(ctx context.Context, userID int64, req domain.EditChannelInviteRequest) (domain.EditChannelInviteResult, error)
@@ -640,15 +625,14 @@ type ChannelsService interface {
 	ListAdminsWithInvites(ctx context.Context, userID, channelID int64) ([]domain.ChannelAdminInviteCount, error)
 	ListInviteImporters(ctx context.Context, userID int64, req domain.ChannelInviteImportersRequest) (domain.ChannelInviteImporterList, error)
 	PendingJoinRequests(ctx context.Context, channelID int64, limit int) (domain.ChannelPendingJoinRequests, error)
-	HideChatJoinRequest(ctx context.Context, userID int64, req domain.HideChannelJoinRequestRequest) (domain.CreateChannelResult, error)
-	HideAllChatJoinRequests(ctx context.Context, userID int64, req domain.HideChannelJoinRequestsRequest) (domain.CreateChannelResult, error)
+	HideChatJoinRequest(ctx context.Context, userID int64, req domain.HideChannelJoinRequestRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
+	HideAllChatJoinRequests(ctx context.Context, userID int64, req domain.HideChannelJoinRequestsRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	CommonChannels(ctx context.Context, userID int64, req domain.CommonChannelsRequest) (domain.CommonChannelsResult, error)
 	LeftChannels(ctx context.Context, userID int64, offset, limit int) (domain.LeftChannelsResult, error)
 	InactiveChannels(ctx context.Context, userID int64, limit int) (domain.ChannelDialogList, error)
 	ChannelRecommendations(ctx context.Context, userID int64, req domain.ChannelRecommendationsRequest) (domain.ChannelRecommendationsResult, error)
 	DiscussionGroups(ctx context.Context, userID int64, limit int) ([]domain.Channel, error)
 	SetDiscussionGroup(ctx context.Context, userID, broadcastID, groupID int64) (domain.DiscussionGroupUpdateResult, error)
-	SetViewForumAsMessages(ctx context.Context, userID, channelID int64, enabled bool) (bool, error)
 	GetHistory(ctx context.Context, userID int64, filter domain.ChannelHistoryFilter) (domain.ChannelHistory, error)
 	SearchChannelMedia(ctx context.Context, userID, channelID int64, req domain.MediaSearchRequest) (domain.ChannelHistory, error)
 	CountChannelMediaCategories(ctx context.Context, userID, channelID int64) (domain.MediaCategoryCounts, error)
@@ -658,7 +642,6 @@ type ChannelsService interface {
 	SearchPosts(ctx context.Context, userID int64, req domain.ChannelSearchPostsRequest) (domain.ChannelHistory, error)
 	SearchJoinedMessages(ctx context.Context, userID int64, req domain.ChannelGlobalSearchRequest) (domain.ChannelHistory, error)
 	GetMessages(ctx context.Context, userID, channelID int64, ids []int) (domain.ChannelHistory, error)
-	ChannelPollFanoutViews(ctx context.Context, channelID int64, msgID int, viewers []int64, now int) (map[int64]*domain.MessagePoll, error)
 	GetReplies(ctx context.Context, userID int64, filter domain.ChannelRepliesFilter) (domain.ChannelHistory, error)
 	GetUnreadMentions(ctx context.Context, userID int64, filter domain.ChannelUnreadMentionsFilter) (domain.ChannelHistory, error)
 	ReadMentions(ctx context.Context, userID int64, req domain.ReadChannelMentionsRequest) (domain.ReadChannelMentionsResult, error)
@@ -669,8 +652,8 @@ type ChannelsService interface {
 	ListMonoforumHistory(ctx context.Context, filter domain.MonoforumHistoryFilter) (domain.ChannelHistory, error)
 	ListMonoforumDialogs(ctx context.Context, filter domain.MonoforumDialogsFilter) (domain.MonoforumDialogList, error)
 	ResolveMonoforumSend(ctx context.Context, viewerUserID, monoforumID int64) (domain.Channel, bool, error)
-	ReadHistory(ctx context.Context, userID int64, req domain.ReadChannelHistoryRequest) (domain.ReadChannelHistoryResult, error)
-	ReadTopicHistory(ctx context.Context, userID int64, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error)
+	ReadHistory(ctx context.Context, userID int64, req domain.ReadChannelHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelHistoryResult]) (domain.ReadChannelHistoryResult, error)
+	ReadTopicHistory(ctx context.Context, userID int64, req domain.ReadChannelTopicHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelTopicHistoryResult]) (domain.ReadChannelTopicHistoryResult, error)
 	GeneralForumTopic(ctx context.Context, userID, channelID int64) (domain.ChannelForumTopic, error)
 	GetMessageReadParticipants(ctx context.Context, userID int64, req domain.ChannelReadParticipantsRequest) (domain.ChannelReadParticipantsResult, error)
 	GetDifference(ctx context.Context, userID int64, req domain.ChannelDifferenceRequest) (domain.ChannelDifference, error)
@@ -681,13 +664,12 @@ type ChannelsService interface {
 	SetActiveCall(ctx context.Context, channelID, callID, callAccessHash int64, notEmpty bool) (domain.Channel, error)
 	AppendCallServiceMessage(ctx context.Context, channelID, senderUserID int64, date int, action domain.ChannelMessageAction) (domain.SendChannelMessageResult, error)
 	AppendStarGiftAdminLog(ctx context.Context, channelID, senderUserID int64, savedID int64, date int, action domain.ChannelMessageAction) error
-	InviteAdminMemberIDs(ctx context.Context, channelID int64, limit int) ([]int64, error)
 	FilterActiveMemberIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
 }
 
-// ChannelMessageAudienceService is the optional production authorization
-// boundary for public short-poll subscribers. Lightweight test/domain adapters
-// that only model joined members may omit it and retain member-only behavior.
+// ChannelMessageAudienceService authorizes bounded online candidates for
+// transient viewer-scoped signalling. Without this capability Core does not
+// widen delivery beyond explicitly affected users.
 type ChannelMessageAudienceService interface {
 	FilterMessageAudienceIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
 }
@@ -705,20 +687,20 @@ type CommunitiesService interface {
 	Get(ctx context.Context, userID, communityID int64) (domain.CommunityView, error)
 	GetMany(ctx context.Context, userID int64, ids []int64) ([]domain.CommunityView, error)
 	ListJoined(ctx context.Context, userID int64) ([]domain.CommunityView, error)
-	TogglePeerLink(ctx context.Context, userID int64, req domain.CommunityTogglePeerLinkRequest) (domain.CommunityTogglePeerLinkResult, error)
-	SetCollapsed(ctx context.Context, userID, communityID int64, collapsed bool) (domain.CommunityView, bool, error)
+	TogglePeerLink(ctx context.Context, userID int64, req domain.CommunityTogglePeerLinkRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error)
+	SetCollapsed(ctx context.Context, userID, communityID int64, collapsed bool, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
 	ListPeerLinkRequests(ctx context.Context, userID, communityID int64, offset string, limit int) (domain.CommunityPeerLinkRequestPage, error)
-	DecidePeerLinkRequest(ctx context.Context, userID, communityID int64, peer domain.Peer, reject bool, date int) (domain.CommunityTogglePeerLinkResult, error)
-	DecideAllPeerLinkRequests(ctx context.Context, userID, communityID int64, reject bool, date int) ([]domain.CommunityTogglePeerLinkResult, error)
-	ToggleParticipantBanned(ctx context.Context, userID, communityID, participantUserID int64, unban bool, date int) (domain.CommunityParticipantBanResult, error)
+	DecidePeerLinkRequest(ctx context.Context, userID, communityID int64, peer domain.Peer, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error)
+	DecideAllPeerLinkRequests(ctx context.Context, userID, communityID int64, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) ([]domain.CommunityTogglePeerLinkResult, error)
+	ToggleParticipantBanned(ctx context.Context, userID, communityID, participantUserID int64, unban bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityParticipantBanResult, error)
 	ParticipantJoinedChats(ctx context.Context, userID, communityID, participantUserID int64) (domain.CommunityParticipantJoinedChats, error)
 	Participants(ctx context.Context, userID, communityID int64, filter domain.ChannelParticipantsFilter, offset, limit int) (domain.CommunityParticipantList, error)
-	EditTitle(ctx context.Context, userID, communityID int64, title string) (domain.CommunityView, bool, error)
-	EditAbout(ctx context.Context, userID, communityID int64, about string) (domain.CommunityView, bool, error)
-	EditAdmin(ctx context.Context, userID int64, req domain.CommunityEditAdminRequest) (domain.CommunityView, bool, error)
-	EditDefaultBannedRights(ctx context.Context, userID, communityID int64, rights domain.ChannelBannedRights) (domain.CommunityView, bool, error)
-	SetPhoto(ctx context.Context, userID, communityID int64, photo *domain.Photo, date int) (domain.CommunityView, bool, error)
-	Delete(ctx context.Context, userID, communityID int64, date int) (domain.CommunityView, []domain.Peer, error)
+	EditTitle(ctx context.Context, userID, communityID int64, title string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
+	EditAbout(ctx context.Context, userID, communityID int64, about string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
+	EditAdmin(ctx context.Context, userID int64, req domain.CommunityEditAdminRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
+	EditDefaultBannedRights(ctx context.Context, userID, communityID int64, rights domain.ChannelBannedRights, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
+	SetPhoto(ctx context.Context, userID, communityID int64, photo *domain.Photo, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error)
+	Delete(ctx context.Context, userID, communityID int64, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, []domain.Peer, error)
 	SetPinned(ctx context.Context, userID, communityID int64, pinned bool) (bool, error)
 	ReorderPinned(ctx context.Context, userID int64, order []domain.Peer, force bool) (bool, error)
 	SearchScope(ctx context.Context, userID, communityID int64) (domain.CommunitySearchScope, error)
@@ -743,13 +725,13 @@ type FilesService interface {
 	ListStickerSets(ctx context.Context, kind domain.StickerSetKind) ([]domain.StickerSet, error)
 	CheckStickerSetShortName(ctx context.Context, shortName string) (bool, error)
 	SuggestStickerSetShortName(ctx context.Context, title string, userID int64) (string, error)
-	CreateStickerSet(ctx context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error)
+	CreateInstalledStickerSet(ctx context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
 	ListCreatedStickerSets(ctx context.Context, userID int64, offsetID int64, limit int) ([]domain.StickerSet, int, error)
-	AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error)
-	RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64) (domain.StickerSet, []domain.Document, error)
-	ChangeStickerPosition(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, position int) (domain.StickerSet, []domain.Document, error)
-	RenameStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, title string) (domain.StickerSet, []domain.Document, error)
-	DeleteStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef) (domain.StickerSetKind, error)
+	AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
+	RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
+	ChangeStickerPosition(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, position int, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
+	RenameStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, title string, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
+	DeleteStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSetKind, error)
 	// 头像（profile photo）与消息媒体组装。
 	CreatePhotoFromUpload(ctx context.Context, file domain.UploadedFileRef) (domain.Photo, error)
 	CreatePhotoFromBytes(ctx context.Context, data []byte) (domain.Photo, error)
@@ -773,16 +755,14 @@ type FilesService interface {
 	CreateDocumentFromBytes(ctx context.Context, data []byte, spec domain.DocumentSpec) (domain.Document, error)
 	GetPhoto(ctx context.Context, id int64) (domain.Photo, bool, error)
 	GetDocument(ctx context.Context, id int64) (domain.Document, bool, error)
-	UploadProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64, file domain.UploadedFileRef, date int) (domain.Photo, error)
-	UploadProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, file domain.UploadedFileRef, date int) (domain.Photo, error)
-	SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int) (domain.Photo, bool, error)
-	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error)
+	SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error)
+	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error)
 	CurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64) (domain.Photo, bool, error)
 	CurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (domain.Photo, bool, error)
 	GetProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, offset, limit int, maxID int64) (photos []domain.Photo, total int, err error)
 	GetProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, offset, limit int, maxID int64) (photos []domain.Photo, total int, err error)
-	DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64) (int, error)
-	DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64) (int, error)
+	DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error)
+	DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error)
 }
 
 // LangPackService 抽象客户端语言包查询。
@@ -798,10 +778,10 @@ type LangPackService interface {
 type AIComposeService interface {
 	ListTones(ctx context.Context, userID, hash int64) (domain.AIComposeTones, bool, error)
 	GetTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef) (domain.AIComposeTones, error)
-	CreateTone(ctx context.Context, input domain.AIComposeToneInput) (domain.AIComposeTone, error)
-	UpdateTone(ctx context.Context, update domain.AIComposeToneUpdate) (domain.AIComposeTone, error)
-	SaveTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, unsave bool) error
-	DeleteTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef) error
+	CreateTone(ctx context.Context, input domain.AIComposeToneInput, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) (domain.AIComposeTone, error)
+	UpdateTone(ctx context.Context, update domain.AIComposeToneUpdate, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) (domain.AIComposeTone, error)
+	SaveTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, unsave bool, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error
+	DeleteTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error
 	GetToneExample(ctx context.Context, userID int64, ref domain.AIComposeToneRef, num int) (domain.AIComposeToneExample, error)
 	Compose(ctx context.Context, req domain.AIComposeRequest) (domain.AIComposeResult, error)
 }
@@ -1041,7 +1021,7 @@ type GiftsService interface {
 	ResolveSavedIDs(ctx context.Context, owner domain.Peer, refs []domain.SavedStarGiftRef) ([]int64, error)
 	CountSaved(ctx context.Context, owner domain.Peer) (int, error)
 	ToggleSaved(ctx context.Context, ref domain.SavedStarGiftRef, unsaved bool) (bool, error)
-	ConvertAggregate(ctx context.Context, req domain.StarGiftConvertRequest) (domain.StarGiftConvertResult, error)
+	ConvertAggregateWithDelivery(ctx context.Context, req domain.StarGiftConvertRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftConvertResult]) (domain.StarGiftConvertResult, error)
 	ListCollections(ctx context.Context, owner domain.Peer) ([]domain.StarGiftCollection, error)
 	CreateCollection(ctx context.Context, owner domain.Peer, title string, savedGiftIDs []int64) (domain.StarGiftCollection, error)
 	UpdateCollection(ctx context.Context, owner domain.Peer, collectionID int, patch domain.StarGiftCollectionPatch) (domain.StarGiftCollection, error)
@@ -1069,8 +1049,7 @@ type GiftsService interface {
 	TonBalance(ctx context.Context, userID int64) (int64, error)
 	TonTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error)
 	IssuePurchaseForm(ctx context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error)
-	ValidatePurchaseForm(ctx context.Context, req domain.StarGiftPurchaseRequest) error
-	Purchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error)
+	PurchaseWithDelivery(ctx context.Context, req domain.StarGiftPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error)
 }
 
 // StarsService 抽象 Stars 本地账本（app/stars）：余额查询、贷记/借记、流水分页。
@@ -1078,9 +1057,10 @@ type GiftsService interface {
 // 映射为 BALANCE_TOO_LOW）。getStarsStatus 首读时惰性授予起始余额。
 type StarsService interface {
 	GetBalance(ctx context.Context, userID int64) (domain.StarsBalance, error)
-	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
-	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	ListTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error)
+	IssuePurchaseForm(ctx context.Context, form domain.StarsPurchaseForm) (domain.StarsPurchaseForm, error)
+	PurchaseWithDelivery(ctx context.Context, req domain.StarsPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error)
+	GetGiveawayInfo(ctx context.Context, viewerUserID, channelID int64, messageID, date int) (domain.StarsGiveawayInfo, error)
 }
 
 // PremiumService is the domain-only boundary for catalog reads, payment form
@@ -1091,10 +1071,10 @@ type PremiumService interface {
 	Plans(ctx context.Context) ([]domain.PremiumPlan, error)
 	Plan(ctx context.Context, months int) (domain.PremiumPlan, error)
 	IssuePaymentForm(ctx context.Context, form domain.PremiumPaymentForm) (domain.PremiumPaymentForm, error)
-	Purchase(ctx context.Context, req domain.PremiumPurchaseRequest) (domain.PremiumPurchaseResult, error)
+	PurchaseWithDelivery(ctx context.Context, req domain.PremiumPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error)
 	ActiveEntitlements(ctx context.Context, userID int64, now int) ([]domain.PremiumEntitlement, error)
 	PurchaseHistory(ctx context.Context, userID int64, limit int) ([]domain.PremiumEntitlement, error)
-	SweepExpired(ctx context.Context, now, limit int) ([]domain.User, error)
+	SweepExpiredWithDelivery(ctx context.Context, now, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error)
 	Grant(ctx context.Context, req domain.PremiumAdminGrantRequest) (domain.PremiumEntitlement, domain.User, error)
 	Revoke(ctx context.Context, req domain.PremiumAdminRevokeRequest) (domain.User, error)
 	Refund(ctx context.Context, req domain.PremiumRefundRequest) (domain.PremiumPurchaseResult, error)

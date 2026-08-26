@@ -31,7 +31,7 @@ func TestChannelStoreResolvePublicUsernameRejectsStaleIndex(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, viewer.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "resolve public " + suffix,
@@ -89,7 +89,7 @@ func TestPeerUsernameNamespaceIsGlobal(t *testing.T) {
 	ctx := context.Background()
 	suffix := randomSuffix(t)
 	users := NewUserStore(pool)
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	bots := NewBotStore(pool)
 
 	owner := createTestUser(t, ctx, users, "+1886"+suffix+"81", "GlobalOwner", "")
@@ -137,13 +137,13 @@ func TestPeerUsernameNamespaceIsGlobal(t *testing.T) {
 	}); !errors.Is(err, domain.ErrUsernameOccupied) {
 		t.Fatalf("create user with channel username err = %v, want username occupied", err)
 	}
-	if _, _, err := bots.CreateBotAccount(ctx, domain.User{
+	if _, _, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 		AccessHash:     9002,
 		FirstName:      "GlobalBot",
 		Username:       channelUsername,
 		Bot:            true,
 		BotInfoVersion: 1,
-	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "secret"}); !errors.Is(err, domain.ErrUsernameOccupied) {
+	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "secret"}, testBotLifecycleEffects); !errors.Is(err, domain.ErrUsernameOccupied) {
 		t.Fatalf("create bot with channel username err = %v, want username occupied", err)
 	}
 

@@ -33,7 +33,7 @@ func TestMessageStoreResolveWebPageIntegration(t *testing.T) {
 	urlHash := domain.WebPageURLHash(url)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: recipient.ID}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID: sender.ID, RecipientUserID: recipient.ID, RandomID: 778811,
 		Message: "see " + url, Date: 1700000300,

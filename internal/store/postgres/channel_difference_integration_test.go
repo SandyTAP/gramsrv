@@ -45,7 +45,7 @@ func TestChannelStoreDifferenceStartsAtMemberAvailableMinPts(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID, joiner.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "PTS Floor " + suffix,
@@ -85,7 +85,7 @@ func TestChannelStoreDifferenceStartsAtMemberAvailableMinPts(t *testing.T) {
 	if len(adminDiff.Events) != 0 || adminDiff.Pts != ptsFloor {
 		t.Fatalf("difference after promote = %+v, want no durable participant event at pts %d", adminDiff, ptsFloor)
 	}
-	joined, err := channels.JoinChannel(ctx, channelID, joiner.ID, 1700000352)
+	joined, err := channels.JoinChannel(ctx, channelID, joiner.ID, 1700000352, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("join channel: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestChannelStorePublicPreviewDifferenceReplaysVisibleMessages(t *testing.T)
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, viewer.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Preview Difference " + suffix,
@@ -266,7 +266,7 @@ func TestChannelStoreDifferenceUsesDurableMessageSnapshots(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Snapshot Diff " + suffix,
@@ -409,7 +409,7 @@ func TestChannelStoreSendFailureBeforePtsAllocationDoesNotRecordNoopGap(t *testi
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, outsider.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Noop Gap " + suffix,
@@ -491,7 +491,7 @@ func TestChannelDifferenceStopsAtPtsHole(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Channel Hole " + suffix,
@@ -561,7 +561,7 @@ func TestReserveChannelPtsRollsBackWithTransaction(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Channel Pts Rollback " + suffix,
@@ -634,7 +634,7 @@ func TestChannelStoreDifferenceTooLongSnapshot(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "TooLong Snapshot " + suffix,

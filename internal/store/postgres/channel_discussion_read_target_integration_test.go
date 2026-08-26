@@ -31,7 +31,7 @@ func TestResolveDiscussionReadTargetPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create subscriber: %v", err)
 	}
-	channels := NewChannelStore(pool,
+	channels := newTestChannelStore(pool,
 		WithChannelRowCache(NewChannelRowCache(32)),
 		WithChannelMemberCache(NewChannelMemberCache(64)))
 	var channelIDs []int64
@@ -127,7 +127,8 @@ SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2
 		ChannelID: group.Channel.ID,
 		MaxID:     rootID,
 		Date:      1700002903,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil || !read.Changed {
 		t.Fatalf("read linked group = %+v err %v, want changed", read, err)
 	}

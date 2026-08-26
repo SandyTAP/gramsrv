@@ -3,7 +3,6 @@ package filedata
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"time"
@@ -140,7 +139,7 @@ func (s *grpcServer) GetFile(ctx context.Context, req *filedatapb.GetFileRequest
 	}
 	return &filedatapb.GetFileResponse{
 		Found:    found,
-		Data:     append([]byte(nil), chunk.Bytes...),
+		Data:     chunk.Bytes,
 		MimeType: chunk.MimeType,
 		Total:    chunk.Total,
 	}, nil
@@ -162,7 +161,7 @@ func (s *grpcServer) GetFileHashes(ctx context.Context, req *filedatapb.GetFileH
 		res.Hashes = append(res.Hashes, &filedatapb.FileHash{
 			Offset: hash.Offset,
 			Limit:  int32(hash.Limit),
-			Hash:   append([]byte(nil), hash.Hash...),
+			Hash:   hash.Hash,
 		})
 	}
 	return res, nil
@@ -179,7 +178,7 @@ func (s *grpcServer) MaterializeUploadBlob(ctx context.Context, req *filedatapb.
 	return &filedatapb.MaterializeUploadBlobResponse{
 		ObjectKey: blob.ObjectKey,
 		Size:      blob.Size,
-		Sha256:    append([]byte(nil), blob.SHA256...),
+		Sha256:    blob.SHA256,
 	}, nil
 }
 
@@ -187,39 +186,33 @@ func (s *grpcServer) PutBlob(stream grpc.ClientStreamingServer[filedatapb.PutBlo
 	if s == nil || s.blobs == nil {
 		return status.Error(codes.Internal, ErrMissingDependency.Error())
 	}
-	pr, pw := io.Pipe()
-	recvErr := make(chan error, 1)
-	go func() {
-		defer close(recvErr)
-		for {
-			chunk, err := stream.Recv()
-			if err == io.EOF {
-				recvErr <- pw.Close()
-				return
-			}
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				recvErr <- err
-				return
-			}
-			data := chunk.GetData()
-			if len(data) == 0 {
-				continue
-			}
-			if _, err := pw.Write(data); err != nil {
-				recvErr <- err
-				return
-			}
-		}
-	}()
-	key, size, sum, err := s.blobs.PutReader(stream.Context(), pr)
-	if recv := <-recvErr; err == nil && recv != nil {
-		err = recv
-	}
+	key, size, sum, err := s.blobs.PutReader(stream.Context(), &putBlobStreamReader{stream: stream})
 	if err != nil {
 		return stream.SendAndClose(&filedatapb.BlobObjectResponse{Error: err.Error(), ErrorKind: errorKind(err)})
 	}
-	return stream.SendAndClose(&filedatapb.BlobObjectResponse{ObjectKey: key, Size: size, Sha256: append([]byte(nil), sum...)})
+	return stream.SendAndClose(&filedatapb.BlobObjectResponse{ObjectKey: key, Size: size, Sha256: sum})
+}
+
+type putBlobStreamReader struct {
+	stream  grpc.ClientStreamingServer[filedatapb.PutBlobChunk, filedatapb.BlobObjectResponse]
+	pending []byte
+}
+
+func (r *putBlobStreamReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	for len(r.pending) == 0 {
+		chunk, err := r.stream.Recv()
+		if err != nil {
+			return 0, err
+		}
+		r.pending = chunk.Data
+		chunk.Data = nil
+	}
+	n := copy(dst, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
 }
 
 func (s *grpcServer) GetBlobRange(ctx context.Context, req *filedatapb.GetBlobRangeRequest) (*filedatapb.GetBlobRangeResponse, error) {
@@ -230,7 +223,7 @@ func (s *grpcServer) GetBlobRange(ctx context.Context, req *filedatapb.GetBlobRa
 	if err != nil {
 		return &filedatapb.GetBlobRangeResponse{Error: err.Error(), ErrorKind: errorKind(err)}, nil
 	}
-	return &filedatapb.GetBlobRangeResponse{Data: append([]byte(nil), data...), Total: total}, nil
+	return &filedatapb.GetBlobRangeResponse{Data: data, Total: total}, nil
 }
 
 func (s *grpcServer) PutUploadPart(ctx context.Context, req *filedatapb.PutUploadPartRequest) (*filedatapb.UploadPartObjectResponse, error) {
@@ -245,7 +238,7 @@ func (s *grpcServer) PutUploadPart(ctx context.Context, req *filedatapb.PutUploa
 		Backend:   string(obj.Backend),
 		ObjectKey: obj.ObjectKey,
 		Size:      obj.Size,
-		Sha256:    append([]byte(nil), obj.SHA256...),
+		Sha256:    obj.SHA256,
 	}, nil
 }
 
@@ -257,7 +250,7 @@ func (s *grpcServer) GetUploadPart(ctx context.Context, req *filedatapb.GetUploa
 	if err != nil {
 		return &filedatapb.GetUploadPartResponse{Error: err.Error(), ErrorKind: errorKind(err)}, nil
 	}
-	return &filedatapb.GetUploadPartResponse{Data: append([]byte(nil), data...)}, nil
+	return &filedatapb.GetUploadPartResponse{Data: data}, nil
 }
 
 func (s *grpcServer) DeleteUploadPart(ctx context.Context, req *filedatapb.DeleteUploadPartRequest) (*filedatapb.ErrorResponse, error) {

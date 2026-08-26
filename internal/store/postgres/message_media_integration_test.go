@@ -37,7 +37,7 @@ func TestSendPrivateMediaSurvivesUpdateEvent(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 
 	media := &domain.MessageMedia{
 		Kind: domain.MessageMediaKindDocument,
@@ -121,7 +121,7 @@ func TestEditPrivateTodoMediaByParticipantPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	base := &domain.MessageMedia{
 		Kind: domain.MessageMediaKindTodo,
 		Todo: &domain.MessageTodo{
@@ -202,7 +202,7 @@ func TestEditChannelTodoMediaByParticipantPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Todo Channel " + suffix,
@@ -338,7 +338,7 @@ func TestSendChannelMediaSurvivesDifference(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Media Difference " + suffix,

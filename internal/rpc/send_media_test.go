@@ -18,6 +18,7 @@ import (
 	appstories "telesrv/internal/app/stories"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -26,6 +27,7 @@ type fakeFiles struct {
 	docs               map[int64]domain.Document
 	photos             map[int64]domain.Photo
 	profile            map[fakeProfilePhotoKey]int64
+	deliveryOutbox     *memory.DeliveryOutboxStore
 	reactions          []domain.AvailableReaction
 	effects            []domain.AvailableEffect
 	sets               map[domain.StickerSetKind][]domain.StickerSet
@@ -187,7 +189,7 @@ func (f *fakeFiles) SuggestStickerSetShortName(ctx context.Context, title string
 	}
 	return "", domain.ErrStickerSetShortNameOccupied
 }
-func (f *fakeFiles) CreateStickerSet(_ context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+func (f *fakeFiles) CreateInstalledStickerSet(ctx context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	if f.sets == nil {
 		f.sets = map[domain.StickerSetKind][]domain.StickerSet{}
 	}
@@ -235,7 +237,6 @@ func (f *fakeFiles) CreateStickerSet(_ context.Context, req domain.CreateSticker
 			doc.Attributes[0].Kind = domain.DocAttrCustomEmoji
 			doc.Attributes[0].TextColor = req.TextColor
 		}
-		f.docs[item.DocumentID] = doc
 		docs = append(docs, doc)
 	}
 	set := domain.StickerSet{
@@ -254,6 +255,15 @@ func (f *fakeFiles) CreateStickerSet(_ context.Context, req domain.CreateSticker
 		DocumentIDs:   docIDs,
 		Packs:         packs,
 		Keywords:      keywords,
+		Installed:     true,
+		InstalledDate: req.Date,
+	}
+	installation := domain.UserStickerSet{OwnerUserID: req.CreatorUserID, StickerSetID: set.ID, Kind: kind, InstalledDate: req.Date}
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set, Installation: &installation}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
+	for _, doc := range docs {
+		f.docs[doc.ID] = doc
 	}
 	f.sets[kind] = append(f.sets[kind], set)
 	return set, docs, nil
@@ -284,7 +294,7 @@ func (f *fakeFiles) ListCreatedStickerSets(_ context.Context, userID int64, offs
 	}
 	return all, total, nil
 }
-func (f *fakeFiles) AddStickerToSet(_ context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+func (f *fakeFiles) AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	kind, idx, ok := f.fakeStickerSetIndex(ref)
 	if !ok {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetInvalid
@@ -308,7 +318,6 @@ func (f *fakeFiles) AddStickerToSet(_ context.Context, actorUserID int64, ref do
 		return domain.StickerSet{}, nil, domain.ErrStickerSetEmojiInvalid
 	}
 	doc = fakeAttachStickerSet(doc, set, emoji)
-	f.docs[doc.ID] = doc
 	set.DocumentIDs = append(set.DocumentIDs, doc.ID)
 	set.Count = len(set.DocumentIDs)
 	set.Packs = fakeAddStickerPackDoc(set.Packs, emoji, doc.ID)
@@ -316,10 +325,14 @@ func (f *fakeFiles) AddStickerToSet(_ context.Context, actorUserID int64, ref do
 		set.Keywords = fakeUpsertStickerKeyword(set.Keywords, domain.StickerKeyword{DocumentID: doc.ID, Keywords: []string{kw}})
 	}
 	set.Hash++
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
+	f.docs[doc.ID] = doc
 	f.sets[kind][idx] = set
 	return set, f.fakeStickerSetDocs(set), nil
 }
-func (f *fakeFiles) RemoveStickerFromSet(_ context.Context, actorUserID int64, documentID int64, accessHash int64) (domain.StickerSet, []domain.Document, error) {
+func (f *fakeFiles) RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	doc, ok := f.docs[documentID]
 	if !ok || doc.AccessHash != accessHash || !doc.IsStickerLike() {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetFileInvalid
@@ -346,11 +359,14 @@ func (f *fakeFiles) RemoveStickerFromSet(_ context.Context, actorUserID int64, d
 	set.Keywords = fakeRemoveStickerKeyword(set.Keywords, documentID)
 	set.Hash++
 	doc = fakeDetachStickerSet(doc)
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
 	f.docs[doc.ID] = doc
 	f.sets[kind][idx] = set
 	return set, f.fakeStickerSetDocs(set), nil
 }
-func (f *fakeFiles) ChangeStickerPosition(_ context.Context, actorUserID int64, documentID int64, accessHash int64, position int) (domain.StickerSet, []domain.Document, error) {
+func (f *fakeFiles) ChangeStickerPosition(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, position int, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	doc, ok := f.docs[documentID]
 	if !ok || doc.AccessHash != accessHash || !doc.IsStickerLike() {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetFileInvalid
@@ -376,10 +392,13 @@ func (f *fakeFiles) ChangeStickerPosition(_ context.Context, actorUserID int64, 
 	}
 	set.DocumentIDs = fakeMoveInt64(set.DocumentIDs, from, position)
 	set.Hash++
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
 	f.sets[kind][idx] = set
 	return set, f.fakeStickerSetDocs(set), nil
 }
-func (f *fakeFiles) RenameStickerSet(_ context.Context, actorUserID int64, ref domain.StickerSetRef, title string) (domain.StickerSet, []domain.Document, error) {
+func (f *fakeFiles) RenameStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, title string, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	kind, idx, ok := f.fakeStickerSetIndex(ref)
 	if !ok {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetInvalid
@@ -394,10 +413,13 @@ func (f *fakeFiles) RenameStickerSet(_ context.Context, actorUserID int64, ref d
 	}
 	set.Title = title
 	set.Hash++
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
 	f.sets[kind][idx] = set
 	return set, f.fakeStickerSetDocs(set), nil
 }
-func (f *fakeFiles) DeleteStickerSet(_ context.Context, actorUserID int64, ref domain.StickerSetRef) (domain.StickerSetKind, error) {
+func (f *fakeFiles) DeleteStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSetKind, error) {
 	kind, idx, ok := f.fakeStickerSetIndex(ref)
 	if !ok {
 		return "", domain.ErrStickerSetInvalid
@@ -407,8 +429,45 @@ func (f *fakeFiles) DeleteStickerSet(_ context.Context, actorUserID int64, ref d
 		return "", domain.ErrStickerSetNotOwned
 	}
 	set.Deleted = true
+	if err := f.enqueueStickerMutationEffects(ctx, effects, store.StickerSetMutation{Set: set, Deleted: true}); err != nil {
+		return "", err
+	}
 	f.sets[kind][idx] = set
 	return kind, nil
+}
+
+func (f *fakeFiles) enqueueStickerMutationEffects(ctx context.Context, effects store.DeliveryEffectsBuilder[store.StickerSetMutation], mutation store.StickerSetMutation) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(mutation)
+	if err != nil {
+		return err
+	}
+	if len(intents) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if f.deliveryOutbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	for i := range intents {
+		if err := intents[i].Validate(); err != nil {
+			return err
+		}
+		if intents[i].Kind != store.DeliveryEffectAbsolute {
+			return store.ErrDeliveryOutboxRequired
+		}
+	}
+	for i := range intents {
+		if _, err := f.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID: intents[i].TargetUserID, ExcludeAuthKeyID: intents[i].ExcludeAuthKeyID,
+			ExcludeSessionID: intents[i].ExcludeSessionID, Payload: intents[i].Payload,
+			RecoveryPolicy: intents[i].RecoveryPolicy,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (f *fakeFiles) fakeStickerSetIndex(ref domain.StickerSetRef) (domain.StickerSetKind, int, bool) {
 	for kind, sets := range f.sets {
@@ -644,30 +703,30 @@ func (f *fakeFiles) GetDocument(_ context.Context, id int64) (domain.Document, b
 	d, ok := f.docs[id]
 	return d, ok, nil
 }
-func (f *fakeFiles) UploadProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64, file domain.UploadedFileRef, date int) (domain.Photo, error) {
-	return f.UploadProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, file, date)
+func (f *fakeFiles) SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error) {
+	return f.SetCurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date, effects)
 }
-func (f *fakeFiles) UploadProfilePhotoKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, _ domain.UploadedFileRef, _ int) (domain.Photo, error) {
-	photo, _ := f.CreateAvatarFromUpload(context.Background(), domain.UploadedFileRef{})
-	if f.profile == nil {
-		f.profile = map[fakeProfilePhotoKey]int64{}
-	}
-	f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}] = photo.ID
-	return photo, nil
-}
-func (f *fakeFiles) SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int) (domain.Photo, bool, error) {
-	return f.SetCurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date)
-}
-func (f *fakeFiles) SetCurrentProfilePhotoKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, _ int) (domain.Photo, bool, error) {
+func (f *fakeFiles) SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, _ int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error) {
 	photo, ok := f.photos[photoID]
 	if !ok {
-		return domain.Photo{}, false, nil
+		return store.ProfilePhotoMutation{}, false, nil
 	}
 	if f.profile == nil {
 		f.profile = map[fakeProfilePhotoKey]int64{}
 	}
-	f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}] = photoID
-	return photo, true, nil
+	key := fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}
+	previous, hadPrevious := f.profile[key]
+	f.profile[key] = photoID
+	result := store.ProfilePhotoMutation{OwnerType: ownerType, OwnerID: ownerID, Kind: kind, Current: photo, HasCurrent: true}
+	if err := f.applyProfilePhotoEffects(ctx, result, effects); err != nil {
+		if hadPrevious {
+			f.profile[key] = previous
+		} else {
+			delete(f.profile, key)
+		}
+		return store.ProfilePhotoMutation{}, false, err
+	}
+	return result, true, nil
 }
 func (f *fakeFiles) CurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64) (domain.Photo, bool, error) {
 	return f.CurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile)
@@ -715,22 +774,68 @@ func (f *fakeFiles) GetProfilePhotosKind(_ context.Context, _ domain.PeerType, _
 	f.lastProfileMaxID = maxID
 	return append([]domain.Photo(nil), f.profilePhotos...), f.profilePhotosTotal, nil
 }
-func (f *fakeFiles) DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64) (int, error) {
-	return f.DeleteProfilePhotosKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoIDs)
+func (f *fakeFiles) DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error) {
+	return f.DeleteProfilePhotosKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoIDs, effects)
 }
-func (f *fakeFiles) DeleteProfilePhotosKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64) (int, error) {
-	deleted := 0
+func (f *fakeFiles) DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, error) {
+	deleted := make([]int64, 0, len(photoIDs))
 	key := fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}
+	previous, hadPrevious := f.profile[key]
 	for _, id := range photoIDs {
-		if _, ok := f.photos[id]; !ok {
+		if _, ok := f.photos[id]; !ok || f.profile[key] != id {
 			continue
 		}
-		deleted++
-		if f.profile[key] == id {
-			delete(f.profile, key)
+		deleted = append(deleted, id)
+		delete(f.profile, key)
+	}
+	result := store.ProfilePhotoMutation{OwnerType: ownerType, OwnerID: ownerID, Kind: kind, DeletedIDs: deleted}
+	if currentID := f.profile[key]; currentID != 0 {
+		result.Current, result.HasCurrent = f.photos[currentID]
+	}
+	if len(deleted) > 0 {
+		if err := f.applyProfilePhotoEffects(ctx, result, effects); err != nil {
+			if hadPrevious {
+				f.profile[key] = previous
+			}
+			return store.ProfilePhotoMutation{}, err
 		}
 	}
-	return deleted, nil
+	return result, nil
+}
+
+func (f *fakeFiles) applyProfilePhotoEffects(ctx context.Context, snapshot store.ProfilePhotoMutation, build store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return err
+	}
+	if len(effects) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if f.deliveryOutbox == nil {
+		f.deliveryOutbox = memory.NewDeliveryOutboxStore()
+	}
+	for _, effect := range effects {
+		if err := effect.Validate(); err != nil {
+			return err
+		}
+		if _, err := f.deliveryOutbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID: effect.TargetUserID, ExcludeAuthKeyID: effect.ExcludeAuthKeyID,
+			ExcludeSessionID: effect.ExcludeSessionID, Payload: effect.Payload, RecoveryPolicy: effect.RecoveryPolicy,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeFiles) delivery() *memory.DeliveryOutboxStore {
+	if f.deliveryOutbox == nil {
+		f.deliveryOutbox = memory.NewDeliveryOutboxStore()
+	}
+	return f.deliveryOutbox
 }
 
 func newMediaTestRouter(t *testing.T) (*Router, domain.User, domain.User) {
@@ -741,6 +846,8 @@ func newMediaTestRouter(t *testing.T) (*Router, domain.User, domain.User) {
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 12, Phone: "15550009002", FirstName: "Friend"})
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	messageStore.AttachDeliveryOutbox(deliveryOutbox)
 	pollStore := memory.NewPollStore()
 	messageStore.AttachPollStore(pollStore)
 	files := &fakeFiles{
@@ -753,14 +860,16 @@ func newMediaTestRouter(t *testing.T) (*Router, domain.User, domain.User) {
 				Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrSticker, Alt: "\U0001f600", StickerSetID: 99, StickerSetAccessHash: 7}},
 			},
 		},
-		photos: map[int64]domain.Photo{},
+		photos:         map[int64]domain.Photo{},
+		deliveryOutbox: deliveryOutbox,
 	}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore),
-		Messages: appmessages.NewService(messageStore, dialogStore),
-		Files:    files,
-		Polls:    apppolls.NewService(pollStore),
-		Sessions: &captureSessions{},
+		Users:          appusers.NewService(userStore),
+		Messages:       appmessages.NewService(messageStore, dialogStore),
+		Files:          files,
+		Polls:          apppolls.NewService(pollStore),
+		Sessions:       &captureSessions{},
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	return r, owner, friend
 }

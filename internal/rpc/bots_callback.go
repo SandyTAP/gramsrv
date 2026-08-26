@@ -128,7 +128,7 @@ func (r *Router) onMessagesGetBotCallbackAnswer(ctx context.Context, req *tg.Mes
 		direct.SetData(data)
 		update = direct
 	}
-	r.pushUserMessage(ctx, botUserID, "push bot callback query", &tg.Updates{
+	r.pushUserMessageTransient(ctx, botUserID, "push bot callback query", &tg.Updates{
 		Updates: []tg.UpdateClass{update},
 		Date:    int(r.clock.Now().Unix()),
 	})

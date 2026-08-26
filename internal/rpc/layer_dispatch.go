@@ -277,20 +277,27 @@ func (r *Router) DispatchAdmitted(
 	result, err := r.dispatchGeneratedSafely(ctx, method, request)
 	dur := time.Since(start)
 	dbDelta := dbtrace.SnapshotFromContext(ctx).Sub(dbBefore)
-	fields := append([]zap.Field{
-		zap.String("method", method),
-		zap.String("type_id", fmt.Sprintf("%#x", call.WireID())),
-		zap.Int("profile", int(call.Profile())),
-		zap.Duration("dur", dur),
-	}, r.contextLogFields(ctx)...)
-	fields = dbtrace.AppendZapFields(fields, "handler_", dbDelta)
+	logLevel := zap.DebugLevel
 	if err != nil || dur > 100*time.Millisecond {
-		if err != nil {
-			fields = append(fields, zap.Error(err))
+		// Errors and slow requests remain visible at Info even when Debug is off.
+		logLevel = zap.InfoLevel
+	}
+	if r.log != nil {
+		if checked := r.log.Check(logLevel, "RPC inner handled"); checked != nil {
+			// contextLogFields includes hex formatting and a variable-length field
+			// slice. Build it only after the selected level is confirmed enabled.
+			fields := append([]zap.Field{
+				zap.String("method", method),
+				zap.String("type_id", fmt.Sprintf("%#x", call.WireID())),
+				zap.Int("profile", int(call.Profile())),
+				zap.Duration("dur", dur),
+			}, r.contextLogFields(ctx)...)
+			fields = dbtrace.AppendZapFields(fields, "handler_", dbDelta)
+			if err != nil {
+				fields = append(fields, zap.Error(err))
+			}
+			checked.Write(fields...)
 		}
-		r.log.Info("RPC inner handled", fields...)
-	} else {
-		r.log.Debug("RPC inner handled", fields...)
 	}
 	if err == nil && result != nil {
 		if !profileKnown || !profileEvidenceFresh {

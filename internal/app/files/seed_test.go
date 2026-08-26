@@ -15,31 +15,35 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
 
 // fakeMediaStore 是 store.MediaStore 的内存替身，用于在无 PG 时验证 seed 导入器。
 type fakeMediaStore struct {
-	mu        sync.Mutex
-	blobs     map[string]domain.FileBlob
-	docs      map[int64]domain.Document
-	photos    map[int64]domain.Photo
-	sets      map[int64]domain.StickerSet
-	reactions []domain.AvailableReaction
-	parts     map[string][]domain.UploadPart
-	webPages  map[int64]domain.MessageWebPage
-	seedState map[string]string
-	receipts  map[string]domain.UploadedMediaReceipt
+	mu              sync.Mutex
+	blobs           map[string]domain.FileBlob
+	docs            map[int64]domain.Document
+	photos          map[int64]domain.Photo
+	sets            map[int64]domain.StickerSet
+	reactions       []domain.AvailableReaction
+	parts           map[string][]domain.UploadPart
+	webPages        map[int64]domain.MessageWebPage
+	seedState       map[string]string
+	receipts        map[string]domain.UploadedMediaReceipt
+	deliveryEffects []storepkg.DeliveryEffect
+	installations   map[int64]map[int64]domain.UserStickerSet
 }
 
 func newFakeMediaStore() *fakeMediaStore {
 	return &fakeMediaStore{
-		blobs:     map[string]domain.FileBlob{},
-		docs:      map[int64]domain.Document{},
-		photos:    map[int64]domain.Photo{},
-		sets:      map[int64]domain.StickerSet{},
-		parts:     map[string][]domain.UploadPart{},
-		seedState: map[string]string{},
-		receipts:  map[string]domain.UploadedMediaReceipt{},
+		blobs:         map[string]domain.FileBlob{},
+		docs:          map[int64]domain.Document{},
+		photos:        map[int64]domain.Photo{},
+		sets:          map[int64]domain.StickerSet{},
+		parts:         map[string][]domain.UploadPart{},
+		seedState:     map[string]string{},
+		receipts:      map[string]domain.UploadedMediaReceipt{},
+		installations: map[int64]map[int64]domain.UserStickerSet{},
 	}
 }
 
@@ -240,9 +244,18 @@ func (f *fakeMediaStore) PutStickerSet(_ context.Context, set domain.StickerSet)
 	f.sets[set.ID] = set
 	return nil
 }
-func (f *fakeMediaStore) CreateStickerSet(_ context.Context, set domain.StickerSet, docs []domain.Document) error {
+func (f *fakeMediaStore) AdminCreateStickerSet(_ context.Context, set domain.StickerSet, docs []domain.Document) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.sets == nil {
+		f.sets = map[int64]domain.StickerSet{}
+	}
+	if f.docs == nil {
+		f.docs = map[int64]domain.Document{}
+	}
+	if f.installations == nil {
+		f.installations = map[int64]map[int64]domain.UserStickerSet{}
+	}
 	for _, existing := range f.sets {
 		if existing.ShortName != "" && strings.EqualFold(existing.ShortName, set.ShortName) {
 			return domain.ErrStickerSetShortNameOccupied
@@ -257,7 +270,41 @@ func (f *fakeMediaStore) CreateStickerSet(_ context.Context, set domain.StickerS
 	}
 	return nil
 }
-func (f *fakeMediaStore) UpdateStickerSet(_ context.Context, set domain.StickerSet, docs []domain.Document) error {
+func (f *fakeMediaStore) CreateInstalledStickerSetWithDelivery(_ context.Context, set domain.StickerSet, docs []domain.Document, installation domain.UserStickerSet, effects storepkg.DeliveryEffectsBuilder[storepkg.StickerSetMutation]) error {
+	intents, err := fakeStickerDeliveryEffects(effects, storepkg.StickerSetMutation{Set: set, Installation: &installation})
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sets == nil {
+		f.sets = map[int64]domain.StickerSet{}
+	}
+	if f.docs == nil {
+		f.docs = map[int64]domain.Document{}
+	}
+	if f.installations == nil {
+		f.installations = map[int64]map[int64]domain.UserStickerSet{}
+	}
+	for _, existing := range f.sets {
+		if existing.ShortName != "" && strings.EqualFold(existing.ShortName, set.ShortName) {
+			return domain.ErrStickerSetShortNameOccupied
+		}
+	}
+	f.sets[set.ID] = set
+	for _, doc := range docs {
+		f.docs[doc.ID] = doc
+	}
+	sets := f.installations[installation.OwnerUserID]
+	if sets == nil {
+		sets = map[int64]domain.UserStickerSet{}
+		f.installations[installation.OwnerUserID] = sets
+	}
+	sets[installation.StickerSetID] = installation
+	f.deliveryEffects = append(f.deliveryEffects, intents...)
+	return nil
+}
+func (f *fakeMediaStore) AdminUpdateStickerSet(_ context.Context, set domain.StickerSet, docs []domain.Document) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.sets[set.ID]; !ok {
@@ -272,16 +319,75 @@ func (f *fakeMediaStore) UpdateStickerSet(_ context.Context, set domain.StickerS
 	}
 	return nil
 }
-func (f *fakeMediaStore) DeleteStickerSet(_ context.Context, setID int64, creatorUserID int64) error {
+func (f *fakeMediaStore) UpdateStickerSetWithDelivery(_ context.Context, set domain.StickerSet, docs []domain.Document, effects storepkg.DeliveryEffectsBuilder[storepkg.StickerSetMutation]) error {
+	intents, err := fakeStickerDeliveryEffects(effects, storepkg.StickerSetMutation{Set: set})
+	if err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	set, ok := f.sets[setID]
-	if !ok || set.Deleted || set.CreatorUserID != creatorUserID {
+	if _, ok := f.sets[set.ID]; !ok {
 		return domain.ErrStickerSetInvalid
 	}
-	set.Deleted = true
-	f.sets[setID] = set
+	f.sets[set.ID] = set
+	for _, doc := range docs {
+		f.docs[doc.ID] = doc
+	}
+	f.deliveryEffects = append(f.deliveryEffects, intents...)
 	return nil
+}
+func (f *fakeMediaStore) DeleteStickerSetWithDelivery(_ context.Context, set domain.StickerSet, effects storepkg.DeliveryEffectsBuilder[storepkg.StickerSetMutation]) error {
+	set.Deleted = true
+	intents, err := fakeStickerDeliveryEffects(effects, storepkg.StickerSetMutation{Set: set, Deleted: true})
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	current, ok := f.sets[set.ID]
+	if !ok || current.Deleted || current.CreatorUserID != set.CreatorUserID {
+		return domain.ErrStickerSetInvalid
+	}
+	current.Deleted = true
+	f.sets[set.ID] = current
+	for owner, sets := range f.installations {
+		delete(sets, set.ID)
+		f.installations[owner] = sets
+	}
+	f.deliveryEffects = append(f.deliveryEffects, intents...)
+	return nil
+}
+
+func fakeStickerDeliveryEffects(effects storepkg.DeliveryEffectsBuilder[storepkg.StickerSetMutation], mutation storepkg.StickerSetMutation) ([]storepkg.DeliveryEffect, error) {
+	if effects == nil {
+		return nil, storepkg.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(mutation)
+	if err != nil {
+		return nil, err
+	}
+	if len(intents) == 0 {
+		return nil, storepkg.ErrDeliveryOutboxRequired
+	}
+	for i := range intents {
+		if err := intents[i].Validate(); err != nil {
+			return nil, err
+		}
+		if intents[i].Kind != storepkg.DeliveryEffectAbsolute {
+			return nil, storepkg.ErrDeliveryOutboxRequired
+		}
+	}
+	return intents, nil
+}
+
+func testStickerSetDeliveryEffects(snapshot storepkg.StickerSetMutation) ([]storepkg.DeliveryEffect, error) {
+	return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+		TargetUserID: snapshot.Set.CreatorUserID, Payload: []byte{1}, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+	})}, nil
+}
+
+func createStickerSetForTest(ctx context.Context, svc *Service, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+	return svc.CreateInstalledStickerSet(ctx, req, testStickerSetDeliveryEffects)
 }
 func (f *fakeMediaStore) AdminDeleteStickerSet(_ context.Context, setID int64) error {
 	f.mu.Lock()
@@ -420,6 +526,13 @@ func (f *fakeMediaStore) DeleteProfilePhotos(_ context.Context, _ domain.PeerTyp
 }
 func (f *fakeMediaStore) DeleteProfilePhotosKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _ []int64) ([]int64, error) {
 	return nil, nil
+}
+func (f *fakeMediaStore) SetProfilePhotoKindWithDelivery(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, _ int, _ storepkg.DeliveryEffectsBuilder[storepkg.ProfilePhotoMutation]) (storepkg.ProfilePhotoMutation, bool, error) {
+	photo, ok := f.photos[photoID]
+	return storepkg.ProfilePhotoMutation{OwnerType: ownerType, OwnerID: ownerID, Kind: kind, Current: photo, HasCurrent: ok}, ok, nil
+}
+func (f *fakeMediaStore) DeleteProfilePhotosKindWithDelivery(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, _ []int64, _ storepkg.DeliveryEffectsBuilder[storepkg.ProfilePhotoMutation]) (storepkg.ProfilePhotoMutation, error) {
+	return storepkg.ProfilePhotoMutation{OwnerType: ownerType, OwnerID: ownerID, Kind: kind}, nil
 }
 
 func TestSeedMediaRepairsPartialReactionBlobs(t *testing.T) {

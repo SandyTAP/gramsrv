@@ -36,7 +36,7 @@ func TestMessageStoreSendPrivateTextRoundTrip(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	var originAuthKeyID [8]byte
 	originAuthKeyID[0] = 5
 	req := domain.SendPrivateTextRequest{
@@ -94,14 +94,14 @@ func TestMessageStoreSendPrivateTextRoundTrip(t *testing.T) {
 		SELECT count(*)
 		FROM dispatch_outbox
 		WHERE target_user_id = ANY($1::bigint[])
-		  AND status = 'pending'
 	`, []int64{sender.ID, recipient.ID}).Scan(&pendingOutbox); err != nil {
 		t.Fatalf("count dispatch outbox: %v", err)
 	}
 	if pendingOutbox != 2 {
 		t.Fatalf("pending outbox = %d, want sender + recipient dispatch rows", pendingOutbox)
 	}
-	var excludeAuthKeyID, excludeSessionID int64
+	var excludeAuthKeyID []byte
+	var excludeSessionID int64
 	if err := pool.QueryRow(ctx, `
 		SELECT exclude_auth_key_id, exclude_session_id
 		FROM dispatch_outbox
@@ -109,8 +109,9 @@ func TestMessageStoreSendPrivateTextRoundTrip(t *testing.T) {
 	`, sender.ID).Scan(&excludeAuthKeyID, &excludeSessionID); err != nil {
 		t.Fatalf("sender dispatch outbox: %v", err)
 	}
-	if excludeAuthKeyID != authKeyIDToInt64(originAuthKeyID) || excludeSessionID != 77 {
-		t.Fatalf("sender dispatch exclude = auth %d session %d, want origin auth/session", excludeAuthKeyID, excludeSessionID)
+	storedAuthKeyID, authErr := outboxAuthKeyID(excludeAuthKeyID)
+	if authErr != nil || storedAuthKeyID != originAuthKeyID || excludeSessionID != 77 {
+		t.Fatalf("sender dispatch exclude = auth %x session %d, want origin auth/session (err=%v)", excludeAuthKeyID, excludeSessionID, authErr)
 	}
 
 	dup, err := messages.SendPrivateText(ctx, req)
@@ -119,6 +120,71 @@ func TestMessageStoreSendPrivateTextRoundTrip(t *testing.T) {
 	}
 	if !dup.Duplicate || dup.SenderMessage.ID != got.SenderMessage.ID || dup.RecipientMessage.ID != got.RecipientMessage.ID {
 		t.Fatalf("duplicate = %+v, want original message boxes", dup)
+	}
+}
+
+func TestMessageStoreServiceMessageZeroExclusionIsDurableAndIdempotent(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	users := NewUserStore(pool)
+	sender := createTestUser(t, ctx, users, "+1666"+suffix+"03", "SuggestSender", "")
+	recipient := createTestUser(t, ctx, users, "+1666"+suffix+"04", "SuggestRecipient", "")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
+	})
+
+	messages := newTestMessageStore(pool)
+	photo := domain.Photo{ID: 91001}
+	req := domain.SendPrivateTextRequest{
+		SenderUserID: sender.ID, RecipientUserID: recipient.ID,
+		RandomID: 91002, Date: 1_700_002_500,
+		Media: &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
+			Kind: domain.MessageServiceActionSuggestProfilePhoto, Photo: &photo,
+		}},
+	}
+	first, err := messages.SendPrivateText(ctx, req)
+	if err != nil {
+		t.Fatalf("send service message: %v", err)
+	}
+	replay, err := messages.SendPrivateText(ctx, req)
+	if err != nil {
+		t.Fatalf("replay service message: %v", err)
+	}
+	if !replay.Duplicate || replay.SenderMessage.ID != first.SenderMessage.ID || replay.RecipientMessage.ID != first.RecipientMessage.ID {
+		t.Fatalf("replay = %+v, want original message boxes", replay)
+	}
+
+	adjacent := req
+	adjacent.RandomID++
+	adjacent.Date++
+	if _, err := messages.SendPrivateText(ctx, adjacent); err != nil {
+		t.Fatalf("send adjacent service message: %v", err)
+	}
+
+	for _, userID := range []int64{sender.ID, recipient.ID} {
+		var eventCount, outboxCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM user_update_events WHERE user_id=$1`, userID).Scan(&eventCount); err != nil {
+			t.Fatalf("count events for %d: %v", userID, err)
+		}
+		if err := pool.QueryRow(ctx, `
+SELECT count(*)::int
+FROM dispatch_outbox
+WHERE target_user_id=$1
+  AND exclude_auth_key_id=decode('0000000000000000','hex')
+  AND exclude_session_id=0`, userID).Scan(&outboxCount); err != nil {
+			t.Fatalf("count no-exclusion outbox for %d: %v", userID, err)
+		}
+		if eventCount != 2 || outboxCount != 2 {
+			t.Fatalf("user %d rows = events %d outbox %d, want 2/2 (replay adds none)", userID, eventCount, outboxCount)
+		}
+		difference, err := NewUpdateEventStore(pool).ListAfter(ctx, userID, 0, 10)
+		if err != nil {
+			t.Fatalf("difference for %d: %v", userID, err)
+		}
+		if len(difference) != 2 || difference[0].Pts != 1 || difference[1].Pts != 2 {
+			t.Fatalf("difference for %d = %+v, want pts 1,2", userID, difference)
+		}
 	}
 }
 
@@ -134,7 +200,7 @@ func TestMessageStoreWebViewDataServiceActionRoundTrip(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	req := domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -221,7 +287,7 @@ func TestMessageStoreRequestedPeerDisclosureSnapshotRoundTrip(t *testing.T) {
 	photo := domain.Photo{ID: 8201, Sizes: []domain.PhotoSize{{
 		Kind: domain.PhotoSizeKindDefault, Type: "m", W: 320, H: 320, Size: 4096,
 	}}}
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	got, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID: sender.ID, RecipientUserID: recipient.ID, RandomID: 9002, Date: 1700000212,
 		Media: &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
@@ -282,7 +348,7 @@ func TestMessageStorePhoneCallServiceFirstMessageFeedsDialogsAndUpdates(t *testi
 	})
 
 	const callID int64 = 0x1020304050607080
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    caller.ID,
 		RecipientUserID: callee.ID,
@@ -394,7 +460,7 @@ func TestUpdateEventStorePreservesChannelForwardRefsWithoutChannelSnapshot(t *te
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: sender.ID,
 		Title:         "forward source " + suffix,
 		Broadcast:     true,
@@ -406,7 +472,7 @@ func TestUpdateEventStorePreservesChannelForwardRefsWithoutChannelSnapshot(t *te
 	source := created.Channel
 	channelIDs = append(channelIDs, source.ID)
 
-	sent, err := NewMessageStore(pool).SendPrivateText(ctx, domain.SendPrivateTextRequest{
+	sent, err := newTestMessageStore(pool).SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
 		RandomID:        123466,
@@ -467,7 +533,7 @@ func TestMessageStoreSendPrivateTextDuplicateDoesNotAppendPts(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	req := domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -564,7 +630,7 @@ func TestMessageStoreSendPrivateTextRecomputesInboxUnreadFromReadMax(t *testing.
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
 	first, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
@@ -656,7 +722,7 @@ func TestMessageStoreSendPrivateTextRollbackDoesNotAdvancePts(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -667,7 +733,7 @@ func TestMessageStoreSendPrivateTextRollbackDoesNotAdvancePts(t *testing.T) {
 		t.Fatalf("seed SendPrivateText: %v", err)
 	}
 
-	failing := NewMessageStore(pool, WithMessageAllocators(fixedBoxIDAllocator{next: 1}))
+	failing := newTestMessageStore(pool, WithMessageAllocators(fixedBoxIDAllocator{next: 1}))
 	_, err = failing.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -727,7 +793,7 @@ func TestMessageStoreConcurrentRandomIDIdempotent(t *testing.T) {
 	})
 
 	boxCounters := &perUserCounterAllocator{}
-	messages := NewMessageStore(pool, WithMessageAllocators(boxCounters))
+	messages := newTestMessageStore(pool, WithMessageAllocators(boxCounters))
 	req := domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,

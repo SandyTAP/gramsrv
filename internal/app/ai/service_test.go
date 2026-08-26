@@ -8,8 +8,17 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+func testAIComposeEffects(userID int64) storepkg.DeliveryEffectsBuilder[domain.AIComposeTone] {
+	return func(domain.AIComposeTone) ([]storepkg.DeliveryEffect, error) {
+		return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{1}, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
 
 type fakeProvider struct {
 	name string
@@ -208,7 +217,7 @@ func TestGetToneExampleUsesProviderForCustomTone(t *testing.T) {
 		UserID: 1001,
 		Title:  "Crisp",
 		Prompt: "Make it very crisp.",
-	})
+	}, testAIComposeEffects(1001))
 	if err != nil {
 		t.Fatalf("CreateTone: %v", err)
 	}
@@ -358,7 +367,7 @@ func TestCustomToneCRUDAndSave(t *testing.T) {
 		DisplayAuthor: true,
 		Title:         "Sharp",
 		Prompt:        "Make it direct and crisp.",
-	})
+	}, testAIComposeEffects(1001))
 	if err != nil {
 		t.Fatalf("CreateTone: %v", err)
 	}
@@ -374,14 +383,14 @@ func TestCustomToneCRUDAndSave(t *testing.T) {
 			AccessHash: tone.AccessHash,
 		},
 		Title: &newTitle,
-	})
+	}, testAIComposeEffects(1001))
 	if err != nil {
 		t.Fatalf("UpdateTone: %v", err)
 	}
 	if updated.Title != newTitle {
 		t.Fatalf("updated title = %q, want %q", updated.Title, newTitle)
 	}
-	if err := svc.SaveTone(context.Background(), 2002, domain.AIComposeToneRef{Kind: domain.AIComposeToneRefSlug, Slug: tone.Slug}, false); err != nil {
+	if err := svc.SaveTone(context.Background(), 2002, domain.AIComposeToneRef{Kind: domain.AIComposeToneRefSlug, Slug: tone.Slug}, false, testAIComposeEffects(2002)); err != nil {
 		t.Fatalf("SaveTone: %v", err)
 	}
 	other, _, err := svc.ListTones(context.Background(), 2002, 0)
@@ -397,7 +406,7 @@ func TestCustomToneCRUDAndSave(t *testing.T) {
 	if !found {
 		t.Fatalf("saved tone not visible for other user: %#v", other.Tones)
 	}
-	if err := svc.DeleteTone(context.Background(), 1001, domain.AIComposeToneRef{Kind: domain.AIComposeToneRefID, ID: tone.ID, AccessHash: tone.AccessHash}); err != nil {
+	if err := svc.DeleteTone(context.Background(), 1001, domain.AIComposeToneRef{Kind: domain.AIComposeToneRefID, ID: tone.ID, AccessHash: tone.AccessHash}, testAIComposeEffects(1001)); err != nil {
 		t.Fatalf("DeleteTone: %v", err)
 	}
 	if _, err := svc.GetTone(context.Background(), 1001, domain.AIComposeToneRef{Kind: domain.AIComposeToneRefSlug, Slug: tone.Slug}); !errors.Is(err, domain.ErrAIComposeToneNotFound) {

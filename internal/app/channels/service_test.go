@@ -19,7 +19,7 @@ type testBotProfiles map[int64]domain.BotProfile
 
 func TestServiceSendMessageHonorsSendPermissionGate(t *testing.T) {
 	ctx := context.Background()
-	svc := NewService(memory.NewChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
+	svc := NewService(newServiceTestChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
 	if _, err := svc.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
 		UserID:    1001,
 		ChannelID: 2001,
@@ -32,7 +32,7 @@ func TestServiceSendMessageHonorsSendPermissionGate(t *testing.T) {
 
 func TestServiceChannelReplayPrecedesCurrentSendPermissionGate(t *testing.T) {
 	ctx := context.Background()
-	channels := memory.NewChannelStore()
+	channels := newServiceTestChannelStore()
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1001,
 		Title:         "replay gate",
@@ -72,7 +72,7 @@ func TestServiceChannelReplayPrecedesCurrentSendPermissionGate(t *testing.T) {
 
 func TestServiceSendMonoforumMessageHonorsSendPermissionGate(t *testing.T) {
 	ctx := context.Background()
-	svc := NewService(memory.NewChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
+	svc := NewService(newServiceTestChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
 	if _, err := svc.SendMonoforumMessage(ctx, domain.SendMonoforumMessageRequest{
 		MonoforumID:  2001,
 		SenderUserID: 1001,
@@ -86,7 +86,7 @@ func TestServiceSendMonoforumMessageHonorsSendPermissionGate(t *testing.T) {
 
 func TestServiceMonoforumReplayPrecedesCurrentSendPermissionGate(t *testing.T) {
 	ctx := context.Background()
-	channels := memory.NewChannelStore()
+	channels := newServiceTestChannelStore()
 	parent, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1001,
 		Title:         "direct messages",
@@ -225,7 +225,7 @@ func TestChannelFullViewReadModelCacheDefaultTTLIsLongLived(t *testing.T) {
 func TestGetChannelCachesFullViewByCompositeReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:     "Cached Full",
@@ -275,7 +275,7 @@ func TestGetChannelCachesFullViewByCompositeReadModelHash(t *testing.T) {
 func TestResolveChannelCachesAccessViewByCompositeReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:     "Cached Resolve",
@@ -334,7 +334,7 @@ func TestResolveChannelCachesAccessViewByCompositeReadModelHash(t *testing.T) {
 func TestActiveChannelIDsForUserCachesPageByReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	firstChannel, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:     "Active One",
@@ -388,7 +388,7 @@ func TestActiveChannelIDsForUserCachesPageByReadModelHash(t *testing.T) {
 func TestActiveChannelIDsForUserCachesEmptyMissingReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base, WithReadModelVersions(&fakeReadModelVersions{}))
 
 	first, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
@@ -437,7 +437,7 @@ func TestActiveChannelIDsForUserCachesEmptyMissingReadModelHash(t *testing.T) {
 
 func TestActiveBotMemberIDsCachesAndInvalidatesOnMembershipWrite(t *testing.T) {
 	ctx := context.Background()
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	bots := testBotProfiles{
 		1003: {BotUserID: 1003},
 		1004: {BotUserID: 1004},
@@ -489,7 +489,7 @@ func TestActiveBotMemberIDsCachesAndInvalidatesOnMembershipWrite(t *testing.T) {
 
 func TestActiveBotMemberIDsReloadsOnReadModelHashChange(t *testing.T) {
 	ctx := context.Background()
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	bots := testBotProfiles{1003: {BotUserID: 1003}}
 	creator := NewService(base, WithBotProfileResolver(bots))
 	created, err := creator.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
@@ -534,7 +534,7 @@ func TestActiveBotMemberIDsReloadsOnReadModelHashChange(t *testing.T) {
 func TestActiveChannelIDsCacheInvalidatesOnMembershipWrite(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	key := store.ReadModelKey{Model: readmodel.ModelChannelActiveIDs, OwnerUserID: ownerID, PeerType: domain.PeerTypeUser, PeerID: ownerID}
 	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{key: 301}}
 	service := NewService(base, WithReadModelVersions(versions))
@@ -580,7 +580,7 @@ func TestResolveChannelSingleflightsConcurrentMiss(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	base := &countingChannelStore{
-		ChannelStore:   memory.NewChannelStore(),
+		ChannelStore:   newServiceTestChannelStore(),
 		resolveStarted: started,
 		resolveRelease: release,
 	}
@@ -635,7 +635,7 @@ func TestResolveChannelSingleflightsConcurrentMiss(t *testing.T) {
 func TestCountChannelMediaCategoriesCachesByCompositeReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:     "Media Counts",
@@ -688,7 +688,7 @@ func TestCountChannelMediaCategoriesCachesByCompositeReadModelHash(t *testing.T)
 func TestGetParticipantsCachesPageByCompositeReadModelHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:         "Participants",
@@ -759,7 +759,7 @@ func TestGetParticipantsCachesPageByCompositeReadModelHash(t *testing.T) {
 func TestGetParticipantsCacheInvalidatesAfterAdminMutation(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
-	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	base := &countingChannelStore{ChannelStore: newServiceTestChannelStore()}
 	service := NewService(base)
 	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
 		Title:         "Admin Cache",
@@ -816,7 +816,7 @@ func TestGetParticipantsCacheInvalidatesAfterAdminMutation(t *testing.T) {
 
 func TestFullMegagroupAdminGrantFillsManageRanks(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Full Admin",
 		Megagroup:     true,
@@ -858,7 +858,7 @@ func TestFullMegagroupAdminGrantFillsManageRanks(t *testing.T) {
 
 func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	service := NewService(store)
 
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
@@ -938,7 +938,7 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 		t.Fatalf("future pts diff err = %v, want persistent timestamp invalid", err)
 	}
 
-	read, err := service.ReadHistory(ctx, 1002, domain.ReadChannelHistoryRequest{ChannelID: created.Channel.ID, MaxID: 2})
+	read, err := service.ReadHistory(ctx, 1002, domain.ReadChannelHistoryRequest{ChannelID: created.Channel.ID, MaxID: 2}, testChannelReadEffects)
 	if err != nil {
 		t.Fatalf("ReadHistory: %v", err)
 	}
@@ -959,7 +959,7 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 
 func TestSetChannelPhotoCreatesServiceMessagesAndDifference(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Avatar Team",
@@ -1036,7 +1036,7 @@ func TestSetChannelPhotoCreatesServiceMessagesAndDifference(t *testing.T) {
 
 func TestGroupBotPolicies(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	bots := testBotProfiles{
 		1003: {BotUserID: 1003, ChatHistory: false, Nochats: false},
 		1004: {BotUserID: 1004, ChatHistory: false, Nochats: true},
@@ -1156,7 +1156,7 @@ func TestGroupBotPolicies(t *testing.T) {
 // 失明、客户端缓存残留"未删"态。修复后删除事件直接放行(与在线推送一致,删除 id 不泄漏内容)。
 func TestPrivacyBotReceivesDeleteEventsInDifference(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	bots := testBotProfiles{
 		1003: {BotUserID: 1003, ChatHistory: false, Nochats: false},
 	}
@@ -1228,7 +1228,7 @@ func testContainsInt64(ids []int64, target int64) bool {
 
 func TestChannelUnreadMentionsArePagedAndCleared(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	service := NewService(store)
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Mentions",
@@ -1326,7 +1326,7 @@ func TestChannelUnreadMentionsArePagedAndCleared(t *testing.T) {
 
 func TestServiceRejectsMismatchedUserContextForStateReads(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Context Guard",
 		MemberUserIDs: []int64{1002},
@@ -1348,7 +1348,7 @@ func TestServiceRejectsMismatchedUserContextForStateReads(t *testing.T) {
 		UserID:    1002,
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
-	}); !errors.Is(err, domain.ErrChannelInvalid) {
+	}, testChannelReadEffects); !errors.Is(err, domain.ErrChannelInvalid) {
 		t.Fatalf("ReadHistory mismatched user err = %v, want ErrChannelInvalid", err)
 	}
 	if _, err := service.GetMessageReadParticipants(ctx, 1001, domain.ChannelReadParticipantsRequest{
@@ -1368,7 +1368,7 @@ func TestServiceRejectsMismatchedUserContextForStateReads(t *testing.T) {
 }
 
 func TestServiceRejectsHugeChannelDialogVector(t *testing.T) {
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	ids := make([]int64, domain.MaxDialogFolderPeers+1)
 	for i := range ids {
 		ids[i] = int64(i + 1)
@@ -1380,7 +1380,7 @@ func TestServiceRejectsHugeChannelDialogVector(t *testing.T) {
 
 func TestChannelHistorySearchQueryIsBounded(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	service := NewService(store)
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		CreatorUserID: 1001,
@@ -1402,7 +1402,7 @@ func TestChannelHistorySearchQueryIsBounded(t *testing.T) {
 
 func TestChannelHistorySupportsOffsetDateOnly(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	service := NewService(store)
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		CreatorUserID: 1001,
@@ -1444,7 +1444,7 @@ func TestChannelHistorySupportsOffsetDateOnly(t *testing.T) {
 
 func TestChannelDifferenceTooLongReturnsLatestSnapshot(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewChannelStore()
+	store := newServiceTestChannelStore()
 	service := NewService(store)
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		CreatorUserID: 1001,
@@ -1486,7 +1486,7 @@ func TestChannelDifferenceTooLongReturnsLatestSnapshot(t *testing.T) {
 
 func TestGetParticipantsCapsDeepOffset(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002, 1003},
@@ -1506,7 +1506,7 @@ func TestGetParticipantsCapsDeepOffset(t *testing.T) {
 
 func TestDefaultBannedRightsRestrictMemberSendAndInvite(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Permissions",
 		MemberUserIDs: []int64{1002},
@@ -1589,7 +1589,7 @@ func TestDefaultBannedRightsRestrictMemberSendAndInvite(t *testing.T) {
 
 func TestSendPlainRightsRestrictTextMessages(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Plain Text Gate",
 		MemberUserIDs: []int64{1002},
@@ -1655,7 +1655,7 @@ func TestSendPlainRightsRestrictTextMessages(t *testing.T) {
 
 func TestFineGrainedBannedRightsRestrictMediaReactionsAndTopics(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Fine Rights",
 		MemberUserIDs: []int64{1002},
@@ -1796,7 +1796,7 @@ func TestFineGrainedBannedRightsRestrictMediaReactionsAndTopics(t *testing.T) {
 
 func TestSendMessageResolvesChannelReplyTopID(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Replies",
@@ -1886,7 +1886,7 @@ func TestSendMessageResolvesChannelReplyTopID(t *testing.T) {
 
 func TestGetMessageReadParticipantsUsesChannelReadWatermark(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Readers",
@@ -1909,7 +1909,7 @@ func TestGetMessageReadParticipantsUsesChannelReadWatermark(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
 		Date:      20,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("ReadHistory: %v", err)
 	}
 
@@ -1928,7 +1928,7 @@ func TestGetMessageReadParticipantsUsesChannelReadWatermark(t *testing.T) {
 
 func TestParticipantsHiddenHidesMemberListAndReadParticipants(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Hidden Members",
@@ -1951,7 +1951,7 @@ func TestParticipantsHiddenHidesMemberListAndReadParticipants(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
 		Date:      20,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("ReadHistory: %v", err)
 	}
 	hidden, err := service.SetParticipantsHidden(ctx, 1001, created.Channel.ID, true)
@@ -1993,7 +1993,7 @@ func TestParticipantsHiddenHidesMemberListAndReadParticipants(t *testing.T) {
 
 func TestAnonymousAdminHiddenFromRegularParticipantLists(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Anonymous Admins",
 		MemberUserIDs: []int64{1002, 1003},
@@ -2048,7 +2048,7 @@ func containsChannelParticipant(participants []domain.ChannelMember, userID int6
 
 func TestBroadcastRejectsMemberPost(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 
 	created, err := service.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "News",
@@ -2089,7 +2089,7 @@ func TestBroadcastRejectsMemberPost(t *testing.T) {
 
 func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2146,7 +2146,7 @@ func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 		t.Fatalf("diff after edit/delete = %+v, want edit then delete through channel pts", diff)
 	}
 
-	clear, err := service.DeleteHistory(ctx, 1002, domain.DeleteChannelHistoryRequest{ChannelID: created.Channel.ID, MaxID: 6})
+	clear, err := service.DeleteHistory(ctx, 1002, domain.DeleteChannelHistoryRequest{ChannelID: created.Channel.ID, MaxID: 6}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("DeleteHistory local: %v", err)
 	}
@@ -2164,7 +2164,7 @@ func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 
 func TestDeleteParticipantHistoryDeletesOneBoundedSenderPage(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2222,7 +2222,7 @@ func TestDeleteParticipantHistoryDeletesOneBoundedSenderPage(t *testing.T) {
 
 func TestTransferOwnershipDoesNotAdvanceChannelPts(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Transfer",
 		MemberUserIDs: []int64{1002},
@@ -2276,7 +2276,7 @@ func TestTransferOwnershipDoesNotAdvanceChannelPts(t *testing.T) {
 
 func TestChannelAdminTitlePinAndInvite(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2369,7 +2369,7 @@ func TestChannelAdminTitlePinAndInvite(t *testing.T) {
 	if checked.Already || checked.Channel.ID != created.Channel.ID {
 		t.Fatalf("checked invite = %+v, want preview for non-member", checked)
 	}
-	joined, err := service.ImportInvite(ctx, 1003, domain.ImportChannelInviteRequest{Hash: invite.Invite.Hash, Date: 17})
+	joined, err := service.ImportInvite(ctx, 1003, domain.ImportChannelInviteRequest{Hash: invite.Invite.Hash, Date: 17}, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("ImportInvite: %v", err)
 	}
@@ -2441,7 +2441,7 @@ func TestChannelAdminTitlePinAndInvite(t *testing.T) {
 
 func TestChannelAboutRequiresChangeInfo(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2503,7 +2503,7 @@ func TestChannelAboutRequiresChangeInfo(t *testing.T) {
 
 func TestChannelBanAndDeletePermissions(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2556,7 +2556,7 @@ func TestChannelBanAndDeletePermissions(t *testing.T) {
 	if _, err := service.GetHistory(ctx, 1002, domain.ChannelHistoryFilter{ChannelID: created.Channel.ID, Limit: 10}); !errors.Is(err, domain.ErrChannelUserBanned) {
 		t.Fatalf("banned GetHistory err = %v, want ErrChannelUserBanned", err)
 	}
-	if _, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 13); !errors.Is(err, domain.ErrChannelUserBanned) {
+	if _, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 13, testPendingJoinEffects); !errors.Is(err, domain.ErrChannelUserBanned) {
 		t.Fatalf("kicked JoinChannel err = %v, want ErrChannelUserBanned", err)
 	}
 	deleted, err := service.DeleteChannel(ctx, 1001, domain.DeleteChannelRequest{ChannelID: created.Channel.ID, Date: 13})
@@ -2570,7 +2570,7 @@ func TestChannelBanAndDeletePermissions(t *testing.T) {
 
 func TestChannelInviteCannotBypassKickedMemberWithoutBanRight(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Invite Kicked",
 		MemberUserIDs: []int64{1002, 1003},
@@ -2610,7 +2610,7 @@ func TestChannelInviteCannotBypassKickedMemberWithoutBanRight(t *testing.T) {
 
 func TestChannelLeaveAndRejoinRestoresParticipantCountAndNotifiesLeaver(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Leave Rejoin",
 		MemberUserIDs: []int64{1002},
@@ -2636,21 +2636,21 @@ func TestChannelLeaveAndRejoinRestoresParticipantCountAndNotifiesLeaver(t *testi
 	if !hasLeaverRecipient {
 		t.Fatalf("leave recipients = %+v, want leaver included for other sessions", left.Recipients)
 	}
-	rejoined, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 12)
+	rejoined, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 12, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("JoinChannel after leave: %v", err)
 	}
 	if rejoined.Members[0].Status != domain.ChannelMemberActive || rejoined.Channel.ParticipantsCount != 2 {
 		t.Fatalf("rejoined result = %+v, want active member and participants=2", rejoined)
 	}
-	if _, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 13); !errors.Is(err, domain.ErrUserAlreadyParticipant) {
+	if _, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 13, testPendingJoinEffects); !errors.Is(err, domain.ErrUserAlreadyParticipant) {
 		t.Fatalf("duplicate JoinChannel err = %v, want ErrUserAlreadyParticipant", err)
 	}
 }
 
 func TestChannelUsernameAndSignatures(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Team",
 		MemberUserIDs: []int64{1002},
@@ -2718,7 +2718,7 @@ func TestChannelUsernameAndSignatures(t *testing.T) {
 
 func TestListStoryPostableChannelsFiltersPostStoryRights(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	userID := int64(1001)
 	creatorID := int64(2001)
 	created, err := service.CreateChannel(ctx, userID, domain.CreateChannelRequest{
@@ -2800,7 +2800,7 @@ func TestListStoryPostableChannelsFiltersPostStoryRights(t *testing.T) {
 
 func TestListSendAsChannelsFiltersPostMessageRights(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	userID := int64(1001)
 	creatorID := int64(2001)
 
@@ -2904,7 +2904,7 @@ func TestListSendAsChannelsFiltersPostMessageRights(t *testing.T) {
 
 func TestPublicChannelSearchAndResolveUsername(t *testing.T) {
 	ctx := context.Background()
-	channelStore := memory.NewChannelStore()
+	channelStore := newServiceTestChannelStore()
 	registry := memory.NewCollectibleUsernameStore()
 	channelStore.AttachUsernameRegistry(registry)
 	service := NewService(channelStore)
@@ -2999,7 +2999,7 @@ func TestPublicChannelSearchAndResolveUsername(t *testing.T) {
 
 func TestPublicChannelPreviewAllowsNonMemberHistory(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	const (
 		ownerID  = 1001
 		viewerID = 1002
@@ -3077,7 +3077,7 @@ func TestPublicChannelPreviewAllowsNonMemberHistory(t *testing.T) {
 	if err != nil || len(audience) != 2 {
 		t.Fatalf("public message audience = %v err %v, want owner and preview viewer", audience, err)
 	}
-	if _, err := service.JoinChannel(ctx, viewerID, public.ID, 21); err != nil {
+	if _, err := service.JoinChannel(ctx, viewerID, public.ID, 21, testPendingJoinEffects); err != nil {
 		t.Fatalf("JoinChannel public preview viewer: %v", err)
 	}
 	if _, err := service.LeaveChannel(ctx, viewerID, public.ID, 22); err != nil {
@@ -3129,7 +3129,7 @@ func TestPublicChannelPreviewAllowsNonMemberHistory(t *testing.T) {
 
 func TestChannelDifferenceStartsAtMemberAvailableMinPts(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Visible PTS",
 		MemberUserIDs: []int64{1002},
@@ -3153,7 +3153,7 @@ func TestChannelDifferenceStartsAtMemberAvailableMinPts(t *testing.T) {
 	if promoted.Event.Pts != 0 || promoted.Channel.Pts != ptsFloor {
 		t.Fatalf("promoted = %+v, want transient admin event and unchanged pts %d", promoted, ptsFloor)
 	}
-	joined, err := service.JoinChannel(ctx, 1003, created.Channel.ID, 12)
+	joined, err := service.JoinChannel(ctx, 1003, created.Channel.ID, 12, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("JoinChannel: %v", err)
 	}
@@ -3181,7 +3181,7 @@ func TestChannelDifferenceStartsAtMemberAvailableMinPts(t *testing.T) {
 
 func TestChannelPreHistoryAndSlowMode(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title:         "Settings Team",
 		MemberUserIDs: []int64{1002},
@@ -3204,7 +3204,7 @@ func TestChannelPreHistoryAndSlowMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("owner send before new member: %v", err)
 	}
-	if _, err := service.JoinChannel(ctx, 1003, created.Channel.ID, 95); err != nil {
+	if _, err := service.JoinChannel(ctx, 1003, created.Channel.ID, 95, testPendingJoinEffects); err != nil {
 		t.Fatalf("new member JoinChannel: %v", err)
 	}
 	visibleMsg, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{ChannelID: created.Channel.ID, RandomID: 100, Message: "after new member", Date: 96})
@@ -3301,7 +3301,7 @@ func TestChannelPreHistoryAndSlowMode(t *testing.T) {
 
 func TestImportInviteRespectsPreHistoryHidden(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
 		Title:     "Private Invite",
 		Megagroup: true,
@@ -3333,7 +3333,7 @@ func TestImportInviteRespectsPreHistoryHidden(t *testing.T) {
 	joined, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{
 		Hash: invite.Invite.Hash,
 		Date: 13,
-	})
+	}, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("ImportInvite: %v", err)
 	}
@@ -3357,7 +3357,7 @@ func TestImportInviteRespectsPreHistoryHidden(t *testing.T) {
 
 func TestImportInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title: "Import Watermark",
 		Date:  10,
@@ -3385,7 +3385,7 @@ func TestImportInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 	joined, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{
 		Hash: invite.Invite.Hash,
 		Date: 13,
-	})
+	}, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("ImportInvite: %v", err)
 	}
@@ -3431,7 +3431,7 @@ func TestImportInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 
 func TestImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title: "Invite Errors",
 		Date:  10,
@@ -3448,7 +3448,7 @@ func TestImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExportInvite request needed: %v", err)
 	}
-	if _, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{Hash: requested.Invite.Hash, Date: 12}); !errors.Is(err, domain.ErrInviteRequestSent) {
+	if _, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{Hash: requested.Invite.Hash, Date: 12}, testPendingJoinEffects); !errors.Is(err, domain.ErrInviteRequestSent) {
 		t.Fatalf("ImportInvite request-needed err = %v, want ErrInviteRequestSent", err)
 	}
 	limited, err := service.ExportInvite(ctx, 1001, domain.ExportChannelInviteRequest{
@@ -3460,17 +3460,17 @@ func TestImportInviteRequestNeededAndUsageLimitErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExportInvite limited: %v", err)
 	}
-	if _, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{Hash: limited.Invite.Hash, Date: 14}); err != nil {
+	if _, err := service.ImportInvite(ctx, 1002, domain.ImportChannelInviteRequest{Hash: limited.Invite.Hash, Date: 14}, testPendingJoinEffects); err != nil {
 		t.Fatalf("ImportInvite first limited: %v", err)
 	}
-	if _, err := service.ImportInvite(ctx, 1003, domain.ImportChannelInviteRequest{Hash: limited.Invite.Hash, Date: 15}); !errors.Is(err, domain.ErrUsersTooMuch) {
+	if _, err := service.ImportInvite(ctx, 1003, domain.ImportChannelInviteRequest{Hash: limited.Invite.Hash, Date: 15}, testPendingJoinEffects); !errors.Is(err, domain.ErrUsersTooMuch) {
 		t.Fatalf("ImportInvite usage-limit err = %v, want ErrUsersTooMuch", err)
 	}
 }
 
 func TestInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title: "Invite Watermark",
 		Date:  10,
@@ -3516,7 +3516,7 @@ func TestInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 
 func TestJoinChannelInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 	ctx := context.Background()
-	service := NewService(memory.NewChannelStore())
+	service := NewService(newServiceTestChannelStore())
 	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
 		Title: "Join Watermark",
 		Date:  10,
@@ -3533,7 +3533,7 @@ func TestJoinChannelInitialReadWatermarkSkipsExistingHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("send existing message: %v", err)
 	}
-	joined, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 12)
+	joined, err := service.JoinChannel(ctx, 1002, created.Channel.ID, 12, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("JoinChannel: %v", err)
 	}

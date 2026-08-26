@@ -24,13 +24,3 @@ func (p *DistributedActiveRawAuthKeys) ActiveRawAuthKeySnapshot(ctx context.Cont
 	}
 	return p.Registry.ListActiveRawAuthKeyIDs(ctx)
 }
-
-// ActiveRawAuthKeyIDs satisfies the legacy in-process provider interface. The
-// retention worker uses the error-aware snapshot method above when present.
-func (p *DistributedActiveRawAuthKeys) ActiveRawAuthKeyIDs() [][8]byte {
-	ids, err := p.ActiveRawAuthKeySnapshot(context.Background())
-	if err != nil {
-		return nil
-	}
-	return ids
-}

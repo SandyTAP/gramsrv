@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 const (
@@ -285,11 +286,11 @@ func (s *Service) GetAttachMenuState(ctx context.Context, userID, botUserID int6
 	return s.bots.GetAttachMenuState(ctx, userID, botUserID)
 }
 
-func (s *Service) SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState) (domain.BotAttachMenuState, error) {
+func (s *Service) SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState, effects store.DeliveryEffectsBuilder[domain.BotAttachMenuState]) (domain.BotAttachMenuState, error) {
 	if s == nil || s.bots == nil {
 		return domain.BotAttachMenuState{}, domain.ErrBotAttachMenuInvalid
 	}
-	return s.bots.SetAttachMenuState(ctx, state)
+	return s.bots.SetAttachMenuState(ctx, state, effects)
 }
 
 func (s *Service) SaveRequestedWebViewButton(ctx context.Context, button domain.BotRequestedWebViewButton) (domain.BotRequestedWebViewButton, error) {

@@ -5,9 +5,10 @@ import (
 	"strings"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
-func (s *Service) AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+func (s *Service) AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	set, docs, err := s.resolveOwnedStickerSet(ctx, actorUserID, ref)
 	if err != nil {
 		return domain.StickerSet{}, nil, err
@@ -43,10 +44,10 @@ func (s *Service) AddStickerToSet(ctx context.Context, actorUserID int64, ref do
 	}
 	set.Hash = stickerSetHash(set)
 	docs = append(docs, doc)
-	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{doc})
+	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{doc}, effects)
 }
 
-func (s *Service) RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64) (domain.StickerSet, []domain.Document, error) {
+func (s *Service) RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	doc, err := s.loadStickerInputDocument(ctx, documentID, accessHash)
 	if err != nil {
 		return domain.StickerSet{}, nil, err
@@ -79,10 +80,10 @@ func (s *Service) RemoveStickerFromSet(ctx context.Context, actorUserID int64, d
 		}
 	}
 	set.Hash = stickerSetHash(set)
-	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{doc})
+	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{doc}, effects)
 }
 
-func (s *Service) ChangeStickerPosition(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, position int) (domain.StickerSet, []domain.Document, error) {
+func (s *Service) ChangeStickerPosition(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, position int, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	doc, err := s.loadStickerInputDocument(ctx, documentID, accessHash)
 	if err != nil {
 		return domain.StickerSet{}, nil, err
@@ -105,10 +106,10 @@ func (s *Service) ChangeStickerPosition(ctx context.Context, actorUserID int64, 
 	set.DocumentIDs = moveInt64(set.DocumentIDs, from, position)
 	docs = orderDocuments(docs, set.DocumentIDs)
 	set.Hash = stickerSetHash(set)
-	return s.persistStickerSetMutation(ctx, set, docs, nil)
+	return s.persistStickerSetMutation(ctx, set, docs, nil, effects)
 }
 
-func (s *Service) RenameStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, title string) (domain.StickerSet, []domain.Document, error) {
+func (s *Service) RenameStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, title string, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	set, docs, err := s.resolveOwnedStickerSet(ctx, actorUserID, ref)
 	if err != nil {
 		return domain.StickerSet{}, nil, err
@@ -119,15 +120,15 @@ func (s *Service) RenameStickerSet(ctx context.Context, actorUserID int64, ref d
 	}
 	set.Title = title
 	set.Hash = stickerSetHash(set)
-	return s.persistStickerSetMutation(ctx, set, docs, nil)
+	return s.persistStickerSetMutation(ctx, set, docs, nil, effects)
 }
 
-func (s *Service) DeleteStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef) (domain.StickerSetKind, error) {
+func (s *Service) DeleteStickerSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSetKind, error) {
 	set, _, err := s.resolveOwnedStickerSet(ctx, actorUserID, ref)
 	if err != nil {
 		return "", err
 	}
-	if err := s.media.DeleteStickerSet(ctx, set.ID, actorUserID); err != nil {
+	if err := s.media.DeleteStickerSetWithDelivery(ctx, set, effects); err != nil {
 		return "", err
 	}
 	s.deleteCachedStickerSet(set)
@@ -148,7 +149,7 @@ func (s *Service) AdminSetStickerSetArchived(ctx context.Context, setID int64, a
 		return false, nil
 	}
 	set.Archived = archived
-	if err := s.media.UpdateStickerSet(ctx, set, nil); err != nil {
+	if err := s.media.AdminUpdateStickerSet(ctx, set, nil); err != nil {
 		return false, err
 	}
 	s.deleteCachedStickerSet(set)
@@ -170,7 +171,7 @@ func (s *Service) AdminSetStickerSetSortOrder(ctx context.Context, setID int64, 
 		return false, nil
 	}
 	set.SortOrder = order
-	if err := s.media.UpdateStickerSet(ctx, set, nil); err != nil {
+	if err := s.media.AdminUpdateStickerSet(ctx, set, nil); err != nil {
 		return false, err
 	}
 	s.deleteCachedStickerSet(set)
@@ -192,7 +193,7 @@ func (s *Service) AdminRenameStickerSet(ctx context.Context, setID int64, title 
 	}
 	set.Title = title
 	set.Hash = stickerSetHash(set)
-	if err := s.media.UpdateStickerSet(ctx, set, nil); err != nil {
+	if err := s.media.AdminUpdateStickerSet(ctx, set, nil); err != nil {
 		return domain.StickerSet{}, err
 	}
 	s.deleteCachedStickerSet(set)
@@ -268,8 +269,20 @@ func (s *Service) loadStickerMaterialDocument(ctx context.Context, documentID in
 	return docs[0], nil
 }
 
-func (s *Service) persistStickerSetMutation(ctx context.Context, set domain.StickerSet, docs []domain.Document, changedDocs []domain.Document) (domain.StickerSet, []domain.Document, error) {
-	if err := s.media.UpdateStickerSet(ctx, set, changedDocs); err != nil {
+func (s *Service) persistStickerSetMutation(ctx context.Context, set domain.StickerSet, docs []domain.Document, changedDocs []domain.Document, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
+	if effects == nil {
+		return domain.StickerSet{}, nil, store.ErrDeliveryOutboxRequired
+	}
+	if err := s.media.UpdateStickerSetWithDelivery(ctx, set, changedDocs, effects); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
+	ordered := orderDocuments(docs, set.DocumentIDs)
+	s.cacheStickerSet(set, ordered)
+	return set, ordered, nil
+}
+
+func (s *Service) persistAdminStickerSetMutation(ctx context.Context, set domain.StickerSet, docs []domain.Document, changedDocs []domain.Document) (domain.StickerSet, []domain.Document, error) {
+	if err := s.media.AdminUpdateStickerSet(ctx, set, changedDocs); err != nil {
 		return domain.StickerSet{}, nil, err
 	}
 	ordered := orderDocuments(docs, set.DocumentIDs)

@@ -37,7 +37,7 @@ func TestSetMessageReactionsPeerViewpoint(t *testing.T) {
 		}
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	now := int(time.Now().Unix())
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    owner.ID,
@@ -60,7 +60,8 @@ func TestSetMessageReactionsPeerViewpoint(t *testing.T) {
 		MessageID: sent.RecipientMessage.ID,
 		Reactions: []domain.MessageReaction{{Type: domain.MessageReactionEmoji, Emoticon: "\U0001F44D"}},
 		Date:      now + 1,
-	})
+	}, testPrivateReactionEffects)
+
 	if err != nil {
 		t.Fatalf("set message reactions: %v", err)
 	}

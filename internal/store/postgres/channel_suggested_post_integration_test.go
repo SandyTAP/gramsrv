@@ -25,7 +25,7 @@ func TestSuggestedPostLifecyclePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner.ID, Title: "Suggested " + suffix, Broadcast: true, Date: 1_700_000_000})
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestSuggestedPostApprovalAcceptsDelayedSchedulePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Delayed Suggested " + suffix, Broadcast: true, Date: 1_700_020_000,
 	})
@@ -402,7 +402,7 @@ func TestSuggestedPostLifecyclePostgresIsolatesPoisonedAggregate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Retry Suggested " + suffix, Broadcast: true, Date: 1_700_030_000,
 	})

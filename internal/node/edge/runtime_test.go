@@ -36,15 +36,15 @@ func TestServeUntilLocationRegistryFatalPreservesServerError(t *testing.T) {
 
 func TestValidateEdgeConfigDoesNotRequireCoreSFUControlAuth(t *testing.T) {
 	cfg := config.EdgeConfig{
-		CoreExecGRPCTargets:   "127.0.0.1:2440",
-		CoreExecGRPCResolver:  "static",
-		CoreExecToken:         "coreexec-secret",
-		FileGRPCTargets:       "127.0.0.1:2460",
-		FileGRPCResolver:      "static",
-		FileToken:             "file-secret",
-		EgressAckGRPCTargets:  "127.0.0.1:2450",
-		EgressAckGRPCResolver: "static",
-		EgressAckToken:        "egress-secret",
+		CoreExecGRPCTargets:        "127.0.0.1:2440",
+		CoreExecGRPCResolver:       "static",
+		CoreExecToken:              "coreexec-secret",
+		FileGRPCTargets:            "127.0.0.1:2460",
+		FileGRPCResolver:           "static",
+		FileToken:                  "file-secret",
+		EgressDeliveryGRPCTargets:  "127.0.0.1:2450",
+		EgressDeliveryGRPCResolver: "static",
+		EgressDeliveryToken:        "egress-secret",
 	}
 	if err := validateEdgeConfig(cfg); err != nil {
 		t.Fatalf("edge config rejected: %v", err)
@@ -64,17 +64,17 @@ func TestEdgeRuntimeDoesNotDependOnPostgresStore(t *testing.T) {
 	}
 }
 
-func TestValidateEdgeConfigRequiresEgressAckBoundary(t *testing.T) {
+func TestValidateEdgeConfigRequiresEgressDeliveryBoundary(t *testing.T) {
 	base := config.EdgeConfig{
-		CoreExecGRPCTargets:   "127.0.0.1:2440",
-		CoreExecGRPCResolver:  "static",
-		CoreExecToken:         "coreexec-secret",
-		FileGRPCTargets:       "127.0.0.1:2460",
-		FileGRPCResolver:      "static",
-		FileToken:             "file-secret",
-		EgressAckGRPCTargets:  "127.0.0.1:2450",
-		EgressAckGRPCResolver: "static",
-		EgressAckToken:        "egress-secret",
+		CoreExecGRPCTargets:        "127.0.0.1:2440",
+		CoreExecGRPCResolver:       "static",
+		CoreExecToken:              "coreexec-secret",
+		FileGRPCTargets:            "127.0.0.1:2460",
+		FileGRPCResolver:           "static",
+		FileToken:                  "file-secret",
+		EgressDeliveryGRPCTargets:  "127.0.0.1:2450",
+		EgressDeliveryGRPCResolver: "static",
+		EgressDeliveryToken:        "egress-secret",
 	}
 	if err := validateEdgeConfig(base); err != nil {
 		t.Fatalf("base config rejected: %v", err)
@@ -88,8 +88,8 @@ func TestValidateEdgeConfigRequiresEgressAckBoundary(t *testing.T) {
 		{name: "coreexec token", mutate: func(cfg *config.EdgeConfig) { cfg.CoreExecToken = " " }, wantErr: "TELESRV_CORE_EXEC_TOKEN"},
 		{name: "file targets", mutate: func(cfg *config.EdgeConfig) { cfg.FileGRPCTargets = " " }, wantErr: "TELESRV_FILE_GRPC_TARGETS"},
 		{name: "file token", mutate: func(cfg *config.EdgeConfig) { cfg.FileToken = " " }, wantErr: "TELESRV_FILE_TOKEN"},
-		{name: "targets", mutate: func(cfg *config.EdgeConfig) { cfg.EgressAckGRPCTargets = " " }, wantErr: "TELESRV_EGRESS_ACK_GRPC_TARGETS"},
-		{name: "token", mutate: func(cfg *config.EdgeConfig) { cfg.EgressAckToken = " " }, wantErr: "TELESRV_EGRESS_ACK_TOKEN"},
+		{name: "targets", mutate: func(cfg *config.EdgeConfig) { cfg.EgressDeliveryGRPCTargets = " " }, wantErr: "TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"},
+		{name: "token", mutate: func(cfg *config.EdgeConfig) { cfg.EgressDeliveryToken = " " }, wantErr: "TELESRV_EGRESS_DELIVERY_TOKEN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -499,9 +499,12 @@ func TestChannelAdminPinInviteRPC(t *testing.T) {
 	joiner, _ := userStore.Create(ctx, domain.User{AccessHash: 53, Phone: "15550002203", FirstName: "Joiner"})
 	invited, _ := userStore.Create(ctx, domain.User{AccessHash: 54, Phone: "15550002204", FirstName: "Invited"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},

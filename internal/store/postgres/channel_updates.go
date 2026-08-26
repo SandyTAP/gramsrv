@@ -413,6 +413,9 @@ ON CONFLICT (channel_id) DO UPDATE SET
     updated_at = now()`, event.ChannelID, event.Date, event.Pts); err != nil {
 		return fmt.Errorf("upsert channel update checkpoint: %w", err)
 	}
+	if err := insertChannelDeliverySignalTx(ctx, tx, event); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -8,16 +8,20 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 func newTestService(t *testing.T) (*Service, *memory.UserStore, *memory.BotStore, *memory.MessageStore) {
 	t.Helper()
 	users := memory.NewUserStore()
-	bots := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	bots := memory.NewBotStore(users)
+	bots.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messages := memory.NewMessageStore(dialogs)
-	return NewService(users, bots, messages), users, bots, messages
+	svc := NewService(users, bots, messages)
+	svc.SetRouterHooks(&captureRevoker{})
+	return svc, users, bots, messages
 }
 
 func newOwner(t *testing.T, users *memory.UserStore, phone string) domain.User {
@@ -101,6 +105,9 @@ func TestBotFatherNewBotFlow(t *testing.T) {
 	if fmt.Sprintf("%d", created.ID) != match[1] || profile.TokenSecret != match[2] {
 		t.Fatalf("token %q does not match stored bot %d/%q", match[0], created.ID, profile.TokenSecret)
 	}
+	if items := bots.DeliveryOutbox().Snapshot(); len(items) != 1 || items[0].TargetUserID != owner.ID {
+		t.Fatalf("BotFather lifecycle delivery = %+v", items)
+	}
 	// 状态机已复位：普通文本回兜底提示。
 	if reply := sendToBotFather(t, svc, messages, owner, "hello"); !strings.Contains(reply, "/help") {
 		t.Fatalf("post-done reply = %q, want fallback", reply)
@@ -109,14 +116,17 @@ func TestBotFatherNewBotFlow(t *testing.T) {
 
 func TestBotProfileCacheCachesPositiveAndNegativeProfiles(t *testing.T) {
 	users := memory.NewUserStore()
-	botsStore := &countingBotStore{BotStore: memory.NewBotStore(users)}
 	dialogs := memory.NewDialogStore()
+	botMemoryStore := memory.NewBotStore(users)
+	botMemoryStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
+	botsStore := &countingBotStore{BotStore: botMemoryStore}
 	messages := memory.NewMessageStore(dialogs)
 	svc := NewService(users, botsStore, messages)
+	svc.SetRouterHooks(&captureRevoker{})
 	owner := newOwner(t, users, "+1090")
 	ctx := context.Background()
 
-	bot, _, err := svc.CreateBot(ctx, owner.ID, "Cache Bot", "cache_test_bot")
+	bot, _, err := svc.CreateBotWithDelivery(ctx, owner.ID, "Cache Bot", "cache_test_bot", appBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -199,9 +209,9 @@ func (s *countingBotStore) GetBots(ctx context.Context, botUserIDs []int64) (map
 	return s.BotStore.GetBots(ctx, botUserIDs)
 }
 
-func (s *countingBotStore) DeleteBotAccount(_ context.Context, botUserID int64) (domain.User, error) {
+func (s *countingBotStore) DeleteBotAccountWithDelivery(ctx context.Context, botUserID int64, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, error) {
 	s.deleteCalls++
-	return domain.User{ID: botUserID, Bot: true, Deleted: true}, nil
+	return s.BotStore.DeleteBotAccountWithDelivery(ctx, botUserID, effects)
 }
 
 func TestBotFatherCancelAndUnknown(t *testing.T) {
@@ -228,7 +238,7 @@ func TestBotFatherUsernameTaken(t *testing.T) {
 	svc, users, _, messages := newTestService(t)
 	owner := newOwner(t, users, "+1002")
 
-	if _, _, err := svc.CreateBot(context.Background(), owner.ID, "First", "taken_bot"); err != nil {
+	if _, _, err := svc.CreateBotWithDelivery(context.Background(), owner.ID, "First", "taken_bot", appBotLifecycleEffects); err != nil {
 		t.Fatalf("seed first bot: %v", err)
 	}
 	sendToBotFather(t, svc, messages, owner, "/newbot")
@@ -254,6 +264,7 @@ func TestCheckUsernameRejectsUserAndPublicChannelCollision(t *testing.T) {
 	users := memory.NewUserStore()
 	botsStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	botsStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messages := memory.NewMessageStore(dialogs)
 	svc := NewService(users, botsStore, messages, WithPublicChannelUsernameResolver(usernameResolverStub{taken: "channel_bot"}))
 	owner := newOwner(t, users, "+1012")
@@ -262,7 +273,7 @@ func TestCheckUsernameRejectsUserAndPublicChannelCollision(t *testing.T) {
 	if ok, err := svc.CheckUsername(ctx, owner.ID, "fresh_bot"); err != nil || !ok {
 		t.Fatalf("fresh username = %v,%v, want true,nil", ok, err)
 	}
-	if _, _, err := svc.CreateBot(ctx, owner.ID, "Taken", "user_taken_bot"); err != nil {
+	if _, _, err := svc.CreateBotWithDelivery(ctx, owner.ID, "Taken", "user_taken_bot", appBotLifecycleEffects); err != nil {
 		t.Fatalf("seed bot: %v", err)
 	}
 	if ok, err := svc.CheckUsername(ctx, owner.ID, "user_taken_bot"); err != nil || ok {
@@ -271,7 +282,7 @@ func TestCheckUsernameRejectsUserAndPublicChannelCollision(t *testing.T) {
 	if ok, err := svc.CheckUsername(ctx, owner.ID, "channel_bot"); err != nil || ok {
 		t.Fatalf("channel collision = %v,%v, want false,nil", ok, err)
 	}
-	if _, _, err := svc.CreateBot(ctx, owner.ID, "Channel Collision", "channel_bot"); err != domain.ErrUsernameOccupied {
+	if _, _, err := svc.CreateBotWithDelivery(ctx, owner.ID, "Channel Collision", "channel_bot", appBotLifecycleEffects); err != domain.ErrUsernameOccupied {
 		t.Fatalf("create channel collision err = %v, want ErrUsernameOccupied", err)
 	}
 	if _, err := svc.CheckUsername(ctx, owner.ID, "notvalid"); err != domain.ErrBotUsernameInvalid {
@@ -284,7 +295,7 @@ func TestBotFatherTokenAndRevoke(t *testing.T) {
 	owner := newOwner(t, users, "+1003")
 	ctx := context.Background()
 
-	created, token, err := svc.CreateBot(ctx, owner.ID, "Token Bot", "tok_test_bot")
+	created, token, err := svc.CreateBotWithDelivery(ctx, owner.ID, "Token Bot", "tok_test_bot", appBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -328,14 +339,14 @@ func TestBotFatherMyBotsAndLimit(t *testing.T) {
 		t.Fatalf("empty /mybots reply = %q", reply)
 	}
 	for i := 0; i < domain.MaxBotsPerOwner; i++ {
-		if _, _, err := svc.CreateBot(ctx, owner.ID, fmt.Sprintf("Bot %d", i), fmt.Sprintf("limit%d_bot", i)); err != nil {
+		if _, _, err := svc.CreateBotWithDelivery(ctx, owner.ID, fmt.Sprintf("Bot %d", i), fmt.Sprintf("limit%d_bot", i), appBotLifecycleEffects); err != nil {
 			t.Fatalf("create bot %d: %v", i, err)
 		}
 	}
 	if reply := sendToBotFather(t, svc, messages, owner, "/mybots"); !strings.Contains(reply, "@limit0_bot") {
 		t.Fatalf("/mybots reply = %q, want bot list", reply)
 	}
-	if _, _, err := svc.CreateBot(ctx, owner.ID, "One Too Many", "toomany_bot"); err != domain.ErrBotsTooMany {
+	if _, _, err := svc.CreateBotWithDelivery(ctx, owner.ID, "One Too Many", "toomany_bot", appBotLifecycleEffects); err != domain.ErrBotsTooMany {
 		t.Fatalf("create over limit err = %v, want ErrBotsTooMany", err)
 	}
 	if reply := sendToBotFather(t, svc, messages, owner, "/newbot"); !strings.Contains(reply, "limit") {

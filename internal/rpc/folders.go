@@ -7,6 +7,7 @@ import (
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) registerFolders(d *tlprofile.Dispatcher) {
@@ -44,29 +45,23 @@ func (r *Router) onFoldersEditPeerFolders(ctx context.Context, folderPeers []tg.
 	if len(updates) == 0 {
 		return &tg.Updates{Date: int(r.clock.Now().Unix()), Seq: 0}, nil
 	}
-	if r.deps.Dialogs != nil {
-		if err := r.deps.Dialogs.EditPeerFolders(ctx, userID, updates); err != nil {
-			return nil, internalErr()
-		}
+	if r.deps.Dialogs == nil {
+		return nil, internalErr()
 	}
-	event := domain.UpdateEvent{
-		Type:        domain.UpdateEventFolderPeers,
-		FolderPeers: updates,
-		PtsCount:    1,
-		Date:        int(r.clock.Now().Unix()),
+	result, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountEditPeerFolders, UserID: userID,
+		Date: int(r.clock.Now().Unix()), FolderPeers: updates,
+	}, dialogAccountDeliveryEffects)
+	if err != nil {
+		return nil, internalErr()
 	}
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordFolderPeers(ctx, authKeyID, userID, updates, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return nil, internalErr()
-		}
+	event := allocatedDialogEvent(result)
+	if event.Pts == 0 {
+		return &tg.Updates{Date: int(r.clock.Now().Unix()), Seq: 0}, nil
 	}
 	out := tgUpdateForOutboxEvent(event)
 	if out == nil {
 		out = &tg.Updates{Date: event.Date, Seq: 0}
 	}
-	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }

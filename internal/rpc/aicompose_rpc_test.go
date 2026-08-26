@@ -16,8 +16,10 @@ import (
 
 func newAIComposeTestRouter(t *testing.T) *Router {
 	t.Helper()
+	st := memory.NewAIComposeStore()
 	return New(Config{}, Deps{
-		AICompose: aiapp.NewService(memory.NewAIComposeStore()),
+		AICompose:      aiapp.NewService(st),
+		DeliveryOutbox: st.DeliveryOutbox(),
 	}, zaptest.NewLogger(t), clock.System)
 }
 
@@ -191,10 +193,10 @@ func TestAIComposeToneLimitUsesClientError(t *testing.T) {
 }
 
 func TestAIComposeToneMutationPushesRefreshUpdate(t *testing.T) {
-	sessions := &captureSessions{}
+	st := memory.NewAIComposeStore()
 	r := New(Config{}, Deps{
-		AICompose: aiapp.NewService(memory.NewAIComposeStore()),
-		Sessions:  sessions,
+		AICompose:      aiapp.NewService(st),
+		DeliveryOutbox: st.DeliveryOutbox(),
 	}, zaptest.NewLogger(t), clock.System)
 	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), 1001), [8]byte{1}), 77)
 
@@ -204,7 +206,14 @@ func TestAIComposeToneMutationPushesRefreshUpdate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("createTone: %v", err)
 	}
-	got := sessions.lastUserPush()
+	items := st.DeliveryOutbox().Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("outbox items = %d, want 1", len(items))
+	}
+	got, err := decodeDeliveryUpdate(items[0].Payload)
+	if err != nil {
+		t.Fatalf("decode delivery update: %v", err)
+	}
 	short, ok := got.(*tg.UpdateShort)
 	if !ok {
 		t.Fatalf("pushed update = %T, want *tg.UpdateShort", got)
@@ -212,7 +221,7 @@ func TestAIComposeToneMutationPushesRefreshUpdate(t *testing.T) {
 	if _, ok := short.Update.(*tg.UpdateAiComposeTones); !ok {
 		t.Fatalf("pushed short update = %T, want *tg.UpdateAiComposeTones", short.Update)
 	}
-	if snap := sessions.snapshot(); snap.sessionID != 77 {
-		t.Fatalf("excluded session = %d, want 77", snap.sessionID)
+	if items[0].ExcludeSessionID != 77 || items[0].ExcludeAuthKeyID != ([8]byte{1}) {
+		t.Fatalf("delivery exclusion = %x/%d, want auth key 01/session 77", items[0].ExcludeAuthKeyID, items[0].ExcludeSessionID)
 	}
 }

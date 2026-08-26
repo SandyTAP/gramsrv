@@ -31,18 +31,19 @@ func TestUpdateEmojiStatusWithEventIsAtomic(t *testing.T) {
 		Date:        int(time.Now().Unix()),
 		PtsCount:    1,
 	}
-	// A nonzero session without its auth-key half violates the outbox
-	// exclusion-pair invariant. The event failure must roll back the users row.
-	if _, _, err := users.UpdateEmojiStatusWithEvent(ctx, u.ID, status, event, [8]byte{}, 77); err == nil {
-		t.Fatal("UpdateEmojiStatusWithEvent unexpectedly accepted a partial exclusion pair")
+	// Callers cannot supply an origin exclusion. A preallocated event is an
+	// invalid aggregate input and its failure must roll back the users row.
+	invalidEvent := event
+	invalidEvent.Pts = 77
+	if _, _, err := users.UpdateEmojiStatusWithEvent(ctx, u.ID, status, invalidEvent); err == nil {
+		t.Fatal("UpdateEmojiStatusWithEvent unexpectedly accepted a preallocated event")
 	}
 	got, found, err := users.ByID(ctx, u.ID)
 	if err != nil || !found || !got.EmojiStatus().Empty() {
 		t.Fatalf("failed aggregate write leaked user state: user=%+v found=%v err=%v", got, found, err)
 	}
 
-	authKeyID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	got, storedEvent, err := users.UpdateEmojiStatusWithEvent(ctx, u.ID, status, event, authKeyID, 77)
+	got, storedEvent, err := users.UpdateEmojiStatusWithEvent(ctx, u.ID, status, event)
 	if err != nil {
 		t.Fatalf("UpdateEmojiStatusWithEvent: %v", err)
 	}
@@ -56,7 +57,8 @@ func TestUpdateEmojiStatusWithEventIsAtomic(t *testing.T) {
 	var outboxCount int
 	if err := pool.QueryRow(ctx, `
 SELECT COUNT(*) FROM dispatch_outbox
-WHERE target_user_id=$1 AND pts=$2 AND event_type='user_emoji_status'`, u.ID, storedEvent.Pts).Scan(&outboxCount); err != nil || outboxCount != 1 {
+WHERE target_user_id=$1 AND pts=$2 AND event_type='user_emoji_status'
+  AND exclude_auth_key_id IS NULL AND exclude_session_id=0`, u.ID, storedEvent.Pts).Scan(&outboxCount); err != nil || outboxCount != 1 {
 		t.Fatalf("dispatch outbox count=%d err=%v", outboxCount, err)
 	}
 }

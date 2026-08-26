@@ -218,20 +218,20 @@ func savedPeerFromFields(savedPeerType string, savedPeerID int64) domain.Peer {
 	return domain.Peer{Type: domain.PeerType(savedPeerType), ID: savedPeerID}
 }
 
-func (a pgBoxIDAllocator) NextBoxID(ctx context.Context, userID int64) (int, error) {
-	cur, err := a.CurrentBoxID(ctx, userID)
-	if err != nil {
-		return 0, err
+func uniquePositiveUserIDs(userIDs []int64) ([]int64, error) {
+	unique := make([]int64, 0, len(userIDs))
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			return nil, fmt.Errorf("message box ids: invalid user id %d", userID)
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		unique = append(unique, userID)
 	}
-	return cur + 1, nil
-}
-
-func (a pgBoxIDAllocator) CurrentBoxID(ctx context.Context, userID int64) (int, error) {
-	v, err := a.s.q.MaxMessageBoxID(ctx, userID)
-	if err != nil {
-		return 0, err
-	}
-	return int(v), nil
+	return unique, nil
 }
 
 type messageEntityJSON struct {
@@ -284,7 +284,7 @@ func encodeMessageEntities(entities []domain.MessageEntity) ([]byte, error) {
 }
 
 func decodeMessageEntities(raw string) ([]domain.MessageEntity, error) {
-	if raw == "" {
+	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil
 	}
 	var wire []messageEntityJSON

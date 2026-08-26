@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *ChannelStore) ListInviteImporters(ctx context.Context, req domain.ChannelInviteImportersRequest) (domain.ChannelInviteImporterList, error) {
@@ -106,16 +108,40 @@ LIMIT $2`, channelID, limit)
 	return out, nil
 }
 
-func (s *ChannelStore) HideAllChatJoinRequests(ctx context.Context, req domain.HideChannelJoinRequestsRequest) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) HideAllChatJoinRequests(ctx context.Context, req domain.HideChannelJoinRequestsRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = nowUnix()
 	}
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.CreateChannelResult{}, fmt.Errorf("hide all channel join requests: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.CreateChannelResult{}, fmt.Errorf("begin hide all channel join requests: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	channel, member, err := s.getChannelForMember(ctx, tx, req.UserID, req.ChannelID)
+	if err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	if !canExportChannelInvite(member) {
+		return domain.CreateChannelResult{}, domain.ErrChannelAdminRequired
+	}
 	var inviteID int64
 	if req.Hash != "" {
-		invite, err := s.GetExportedInvite(ctx, domain.GetChannelInviteRequest{UserID: req.UserID, ChannelID: req.ChannelID, Hash: req.Hash})
+		invite, err := s.getInviteByChannelHash(ctx, tx, req.ChannelID, req.Hash, true)
 		if err != nil {
 			return domain.CreateChannelResult{}, err
 		}
@@ -125,52 +151,70 @@ func (s *ChannelStore) HideAllChatJoinRequests(ctx context.Context, req domain.H
 	if limit <= 0 || limit > domain.MaxChannelHideJoinRequests {
 		limit = domain.MaxChannelHideJoinRequests
 	}
-	rows, err := s.db.Query(ctx, `
-SELECT user_id
+	rows, err := tx.Query(ctx, `
+SELECT user_id, invite_id
 FROM channel_invite_importers
 WHERE channel_id = $1 AND requested AND ($2::bigint = 0 OR invite_id = $2)
 ORDER BY date ASC, user_id ASC
-LIMIT $3`, req.ChannelID, inviteID, limit)
+LIMIT $3
+FOR UPDATE`, req.ChannelID, inviteID, limit)
 	if err != nil {
 		return domain.CreateChannelResult{}, err
 	}
-	targets := make([]int64, 0, limit)
+	targets := make([]domain.ChannelInviteImporter, 0, limit)
 	for rows.Next() {
-		var userID int64
-		if err := rows.Scan(&userID); err != nil {
+		var importer domain.ChannelInviteImporter
+		if err := rows.Scan(&importer.UserID, &importer.InviteID); err != nil {
 			rows.Close()
 			return domain.CreateChannelResult{}, err
 		}
-		targets = append(targets, userID)
+		importer.ChannelID = req.ChannelID
+		importer.Requested = true
+		targets = append(targets, importer)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return domain.CreateChannelResult{}, err
 	}
 	rows.Close()
-	var result domain.CreateChannelResult
-	for _, target := range targets {
-		next, err := s.HideChatJoinRequest(ctx, domain.HideChannelJoinRequestRequest{
-			UserID:       req.UserID,
-			ChannelID:    req.ChannelID,
-			TargetUserID: target,
-			Approved:     req.Approved,
-			Date:         req.Date,
-		})
+	result := domain.CreateChannelResult{Channel: channel}
+	for _, importer := range targets {
+		invite := domain.ChannelInvite{ChannelID: req.ChannelID, AdminUserID: req.UserID}
+		if importer.InviteID != 0 {
+			invite, err = s.getInviteByID(ctx, tx, req.ChannelID, importer.InviteID, true)
+			if err != nil {
+				return domain.CreateChannelResult{}, err
+			}
+		}
+		if !req.Approved {
+			if err := deletePendingInviteImporterTx(ctx, tx, invite, importer.UserID); err != nil {
+				return domain.CreateChannelResult{}, err
+			}
+			continue
+		}
+		next, err := s.approveInviteImporterTx(ctx, tx, channel, invite, importer.UserID, req.UserID, req.Date)
 		if err != nil {
 			return domain.CreateChannelResult{}, err
 		}
 		result = next
+		channel = next.Channel
 	}
-	if result.Channel.ID == 0 {
-		ch, _, err := s.getChannelForMember(ctx, s.db, req.UserID, req.ChannelID)
+	result.Channel = channel
+	snapshot := store.ChannelPendingJoinDeliverySnapshot{}
+	if len(targets) != 0 {
+		snapshot, err = pendingJoinDeliverySnapshotTx(ctx, tx, channel)
 		if err != nil {
 			return domain.CreateChannelResult{}, err
 		}
-		result.Channel = ch
-		recipients, _ := s.ListActiveChannelMemberIDs(ctx, req.UserID, req.ChannelID, 0)
-		result.Recipients = recipients
 	}
+	if err := applyPendingJoinDeliveryTx(ctx, tx, snapshot, effects); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.CreateChannelResult{}, fmt.Errorf("commit hide all channel join requests: %w", err)
+	}
+	committed = true
+	result.Recipients, _ = s.ListActiveChannelMemberIDs(ctx, req.UserID, req.ChannelID, 0)
 	return result, nil
 }
 

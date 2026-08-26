@@ -195,7 +195,7 @@ func (s *Service) GetTone(ctx context.Context, userID int64, ref domain.AICompos
 	return out.Clone(), nil
 }
 
-func (s *Service) CreateTone(ctx context.Context, in domain.AIComposeToneInput) (domain.AIComposeTone, error) {
+func (s *Service) CreateTone(ctx context.Context, in domain.AIComposeToneInput, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) (domain.AIComposeTone, error) {
 	if !s.ready() || !s.enabled || in.UserID == 0 {
 		return domain.AIComposeTone{}, domain.ErrAIComposeToneInvalid
 	}
@@ -226,7 +226,7 @@ func (s *Service) CreateTone(ctx context.Context, in domain.AIComposeToneInput) 
 		if in.DisplayAuthor {
 			tone.AuthorID = in.UserID
 		}
-		if err := s.store.CreateAIComposeTone(ctx, tone); err != nil {
+		if err := s.store.CreateAIComposeTone(ctx, tone, effects); err != nil {
 			if errors.Is(err, domain.ErrAIComposeToneInvalid) {
 				continue
 			}
@@ -237,7 +237,7 @@ func (s *Service) CreateTone(ctx context.Context, in domain.AIComposeToneInput) 
 	return domain.AIComposeTone{}, domain.ErrAIComposeToneInvalid
 }
 
-func (s *Service) UpdateTone(ctx context.Context, update domain.AIComposeToneUpdate) (domain.AIComposeTone, error) {
+func (s *Service) UpdateTone(ctx context.Context, update domain.AIComposeToneUpdate, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) (domain.AIComposeTone, error) {
 	if !s.ready() || !s.enabled || update.UserID == 0 {
 		return domain.AIComposeTone{}, domain.ErrAIComposeToneInvalid
 	}
@@ -274,7 +274,7 @@ func (s *Service) UpdateTone(ctx context.Context, update domain.AIComposeToneUpd
 		tone.Prompt = prompt
 	}
 	tone.UpdatedAt = s.now().Unix()
-	if err := s.store.UpdateAIComposeTone(ctx, tone); err != nil {
+	if err := s.store.UpdateAIComposeTone(ctx, tone, effects); err != nil {
 		return domain.AIComposeTone{}, err
 	}
 	tone.Creator = true
@@ -282,7 +282,7 @@ func (s *Service) UpdateTone(ctx context.Context, update domain.AIComposeToneUpd
 	return tone.Clone(), nil
 }
 
-func (s *Service) SaveTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, unsave bool) error {
+func (s *Service) SaveTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, unsave bool, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	if !s.ready() || !s.enabled || userID == 0 {
 		return domain.ErrAIComposeToneInvalid
 	}
@@ -297,17 +297,17 @@ func (s *Service) SaveTone(ctx context.Context, userID int64, ref domain.AICompo
 		return nil
 	}
 	if unsave {
-		return s.store.UnsaveAIComposeTone(ctx, userID, tone.ID)
+		return s.store.UnsaveAIComposeTone(ctx, userID, tone.ID, effects)
 	}
 	if !tone.Creator && !tone.Saved {
 		if err := s.ensureToneLimit(ctx, userID, tone.ID); err != nil {
 			return err
 		}
 	}
-	return s.store.SaveAIComposeTone(ctx, userID, tone.ID)
+	return s.store.SaveAIComposeTone(ctx, userID, tone.ID, effects)
 }
 
-func (s *Service) DeleteTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef) error {
+func (s *Service) DeleteTone(ctx context.Context, userID int64, ref domain.AIComposeToneRef, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	if !s.ready() || !s.enabled || userID == 0 {
 		return domain.ErrAIComposeToneInvalid
 	}
@@ -318,7 +318,7 @@ func (s *Service) DeleteTone(ctx context.Context, userID int64, ref domain.AICom
 	if !ok || tone.Default || tone.OwnerUserID != userID {
 		return domain.ErrAIComposeToneInvalid
 	}
-	return s.store.DeleteAIComposeTone(ctx, userID, tone.ID)
+	return s.store.DeleteAIComposeTone(ctx, userID, tone.ID, effects)
 }
 
 func (s *Service) GetToneExample(ctx context.Context, userID int64, ref domain.AIComposeToneRef, num int) (domain.AIComposeToneExample, error) {

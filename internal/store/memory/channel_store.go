@@ -74,15 +74,18 @@ func (w channelReadWatermark) advance(userID int64, maxID int) channelReadWaterm
 
 // ChannelStore is an in-memory channel/supergroup store for tests and local development.
 type ChannelStore struct {
-	mu        sync.RWMutex
-	nextID    int64
-	nextHash  int64
-	channels  map[int64]domain.Channel
-	members   map[int64]map[int64]domain.ChannelMember
-	dialogs   map[int64]map[int64]domain.ChannelDialog
-	topics    map[int64]map[int]domain.ChannelForumTopic
-	messages  map[int64][]domain.ChannelMessage
-	reactions map[int64]map[int]map[int64][]domain.ChannelMessagePeerReaction
+	dialogAggregateMu sync.RWMutex
+	dialogAggregate   *DialogStore
+	accountEvents     *UpdateEventStore
+	mu                sync.RWMutex
+	nextID            int64
+	nextHash          int64
+	channels          map[int64]domain.Channel
+	members           map[int64]map[int64]domain.ChannelMember
+	dialogs           map[int64]map[int64]domain.ChannelDialog
+	topics            map[int64]map[int]domain.ChannelForumTopic
+	messages          map[int64][]domain.ChannelMessage
+	reactions         map[int64]map[int]map[int64][]domain.ChannelMessagePeerReaction
 	// paidReactions 是 per-(channel,message,user) 付费 reaction 累计星数 + 匿名标志。
 	paidReactions        map[int64]map[int]map[int64]memoryPaidReaction
 	paidReactionCommands map[paidReactionCommandKey]memoryPaidReactionReceipt
@@ -123,11 +126,35 @@ type ChannelStore struct {
 	// polls 是共享 poll 权威（与 MessageStore 同一实例）；nil 时 poll 链路按未接入处理。
 	polls            *PollStore
 	usernameRegistry *CollectibleUsernameStore
+	deliveryOutbox   *DeliveryOutboxStore
+}
+
+// AttachDialogAccountAggregate binds the account-owned dialog/event
+// participants required by ClearDraft channel sends. A clear-draft request
+// fails closed until both are attached.
+func (s *ChannelStore) AttachDialogAccountAggregate(dialogs *DialogStore, events *UpdateEventStore) {
+	if s == nil {
+		return
+	}
+	s.dialogAggregateMu.Lock()
+	s.dialogAggregate, s.accountEvents = dialogs, events
+	s.dialogAggregateMu.Unlock()
 }
 
 // AttachPollStore 注入共享 poll 权威。
 func (s *ChannelStore) AttachPollStore(polls *PollStore) {
 	s.polls = polls
+}
+
+// AttachDeliveryOutbox wires the production-shaped absolute delivery queue
+// used by channel-local non-PTS mutations in tests.
+func (s *ChannelStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	if s == nil || outbox == nil {
+		return
+	}
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
 }
 
 // AttachUsernameRegistry gives the memory backend the same global username

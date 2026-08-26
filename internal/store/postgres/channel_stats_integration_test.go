@@ -18,7 +18,7 @@ func TestChannelStatsPostgresAggregatesAndPagesPublicForwards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	channelIDs := make([]int64, 0, 3)
 	t.Cleanup(func() {
 		if len(channelIDs) > 0 {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // TestStarGiftStorePostgres 回归迁移 0089：目录不可变版本与用户收到礼物实例对真实 PG 的 CRUD
@@ -17,6 +18,7 @@ func TestStarGiftStorePostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	st := NewStarGiftStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, newTestMessageStore(pool), 0)
 
 	users := NewUserStore(pool)
 	suffix := randomSuffix(t)
@@ -45,7 +47,10 @@ func TestStarGiftStorePostgres(t *testing.T) {
 		t.Fatalf("create catalog gift: %v", err)
 	}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id=$1", owner.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM peer_star_gifts WHERE owner_peer_id IN ($1, $2)", owner.ID, int64(987654321))
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_transactions WHERE user_id=$1", owner.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_balances WHERE user_id=$1", owner.ID)
 		tx, _ := pool.Begin(ctx)
 		if tx != nil {
 			_, _ = tx.Exec(ctx, "DELETE FROM star_gift_catalog WHERE gift_id=$1", entry.Gift.ID)
@@ -181,12 +186,46 @@ func TestStarGiftStorePostgres(t *testing.T) {
 		t.Fatalf("get = %+v found %v err %v", g, found, err)
 	}
 
-	// 转换 msg_id=100 → converted，从列表消失；重复转换被拒。
-	conv, err := st.MarkConverted(ctx, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 100})
-	if err != nil || conv.ConvertStars != 50 || !conv.Converted {
-		t.Fatalf("convert = %+v err %v, want ConvertStars 50 converted", conv, err)
+	// 转换 msg_id=100 必须走唯一 lifecycle 聚合，使 saved-gift、余额、流水和
+	// absolute delivery 同生共死；builder 或 outbox 写失败时全部回滚。
+	convertReq := domain.StarGiftConvertRequest{
+		ActorUserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 100}, Date: 1700000200,
 	}
-	if _, err := st.MarkConverted(ctx, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 100}); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
+	convertBuilderErr := errors.New("injected star gift conversion builder failure")
+	if _, err := lifecycle.ConvertStarGiftWithDelivery(ctx, convertReq, func(domain.StarGiftConvertResult) ([]store.DeliveryEffect, error) {
+		return nil, convertBuilderErr
+	}); !errors.Is(err, convertBuilderErr) {
+		t.Fatalf("conversion builder failure = %v, want injected error", err)
+	}
+	failingDB := &failStarsPurchaseOutboxDB{Pool: pool}
+	if _, err := NewStarGiftLifecycleStore(failingDB, newTestMessageStore(failingDB), 0).
+		ConvertStarGiftWithDelivery(ctx, convertReq, starGiftConvertTestEffects); !errors.Is(err, errInjectedStarsPurchaseOutbox) {
+		t.Fatalf("conversion outbox failure = %v, want injected error", err)
+	}
+	afterFailures, found, err := st.GetByRef(ctx, convertReq.Ref)
+	if err != nil || !found || afterFailures.Converted {
+		t.Fatalf("gift after failed conversion = %+v found=%v err=%v", afterFailures, found, err)
+	}
+	var failedBalance, failedTransactions, failedConversions, failedDeliveries int64
+	if err := pool.QueryRow(ctx, `SELECT
+COALESCE((SELECT balance FROM stars_balances WHERE user_id=$1),0),
+(SELECT count(*) FROM stars_transactions WHERE user_id=$1),
+(SELECT count(*) FROM star_gift_conversions WHERE saved_gift_id=$2),
+(SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1)`, owner.ID, savedIDs[0]).
+		Scan(&failedBalance, &failedTransactions, &failedConversions, &failedDeliveries); err != nil {
+		t.Fatalf("load failed conversion footprint: %v", err)
+	}
+	if failedBalance != 0 || failedTransactions != 0 || failedConversions != 0 || failedDeliveries != 0 {
+		t.Fatalf("failed conversion leaked balance=%d txns=%d conversions=%d deliveries=%d",
+			failedBalance, failedTransactions, failedConversions, failedDeliveries)
+	}
+	converted, err := lifecycle.ConvertStarGiftWithDelivery(ctx, convertReq, starGiftConvertTestEffects)
+	if err != nil || converted.Saved.ConvertStars != 50 || !converted.Saved.Converted || converted.OwnerBalance != 50 {
+		t.Fatalf("convert = %+v err %v, want ConvertStars 50 converted balance 50", converted, err)
+	}
+	if _, err := lifecycle.ConvertStarGiftWithDelivery(ctx, domain.StarGiftConvertRequest{
+		ActorUserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 100}, Date: 1700000201,
+	}, starGiftConvertTestEffects); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
 		t.Fatalf("double convert err = %v, want ErrStarGiftAlreadyConverted", err)
 	}
 	full, _ := st.ListByOwner(ctx, ownerPeer, false, "", 100)
@@ -194,7 +233,9 @@ func TestStarGiftStorePostgres(t *testing.T) {
 		t.Fatalf("count after convert = %d, want 2", full.Count)
 	}
 	// 转换不存在的礼物。
-	if _, err := st.MarkConverted(ctx, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 999}); !errors.Is(err, domain.ErrStarGiftNotFound) {
+	if _, err := lifecycle.ConvertStarGiftWithDelivery(ctx, domain.StarGiftConvertRequest{
+		ActorUserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: 999}, Date: 1700000202,
+	}, starGiftConvertTestEffects); !errors.Is(err, domain.ErrStarGiftNotFound) {
 		t.Fatalf("convert missing err = %v, want ErrStarGiftNotFound", err)
 	}
 

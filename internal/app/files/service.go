@@ -377,7 +377,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 	}
 	if blob.Size > 0 && blob.Size <= blobBytesCacheMaxEntryBytes {
 		cacheLog.byteCacheEligible = true
-		if data, ok := s.byteCache.get(blob.ObjectKey); ok {
+		if data, ok := s.byteCache.getShared(blob.ObjectKey); ok {
 			cacheLog.byteCacheHit = true
 			cacheLog.source = "byte_cache"
 			return domain.FileChunk{
@@ -388,7 +388,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		}
 		// 同一 object_key 的小 blob 并发首访合并成一次 backend 全量读 + 一次 byteCache 填充。
 		v, err, shared := s.blobBytesSF.Do(blob.ObjectKey, func() (any, error) {
-			if cached, ok := s.byteCache.get(blob.ObjectKey); ok {
+			if cached, ok := s.byteCache.getShared(blob.ObjectKey); ok {
 				return blobBytesResult{data: cached, total: int64(len(cached)), cacheable: true, cacheHit: true}, nil
 			}
 			data, total, err := s.blobs.GetRange(ctx, blob.ObjectKey, 0, blobBytesCacheMaxEntryBytes+1)
@@ -396,7 +396,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 				return blobBytesResult{}, err
 			}
 			if total <= blobBytesCacheMaxEntryBytes && int64(len(data)) == total {
-				s.byteCache.put(blob.ObjectKey, data)
+				s.byteCache.putOwned(blob.ObjectKey, data)
 				return blobBytesResult{data: data, total: total, cacheable: true, cacheFilled: true}, nil
 			}
 			return blobBytesResult{cacheable: false}, nil
@@ -701,7 +701,8 @@ func (s *Service) readUploadBytes(ctx context.Context, ownerUserID, fileID int64
 type AssembledUploadBlob struct {
 	ObjectKey string
 	Size      int64
-	SHA256    []byte
+	// SHA256 is exclusively owned by this value and may move into a wire response.
+	SHA256 []byte
 }
 
 // assembleUploadBlob 把上传分片流式写入正式 blob。调用方应在 durable media 元数据

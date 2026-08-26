@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
@@ -23,6 +24,27 @@ var sessionControlSeq atomic.Uint64
 var ErrControlFabricControllerRequired = errors.New("edgecontrol: local session controller is required")
 var ErrSessionControlFabricRequired = errors.New("edgecontrol: session-control fabric is required")
 var ErrSessionControlFabricDependenciesRequired = errors.New("edgecontrol: session-control fabric dependencies are required")
+
+// EncodeDeliveryUpdate and DecodeDeliveryUpdate are the transient
+// session-control codecs. Durable DeliveryFabric treats TL as opaque bytes;
+// its encode/decode boundaries live in RPC and MTProto Edge respectively.
+func EncodeDeliveryUpdate(update tg.UpdatesClass) ([]byte, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil delivery update")
+	}
+	var b bin.Buffer
+	if err := update.Encode(&b); err != nil {
+		return nil, err
+	}
+	return b.Raw(), nil
+}
+
+func DecodeDeliveryUpdate(raw []byte) (tg.UpdatesClass, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty delivery update")
+	}
+	return tg.DecodeUpdates(&bin.Buffer{Buf: raw})
+}
 
 type SessionControlFabricConfig struct {
 	InstanceID     string
@@ -382,7 +404,7 @@ func (f *SessionControlFabric) pushSession(ctx context.Context, kind SessionCont
 	if len(targets) == 0 {
 		return nil
 	}
-	updateBytes, err := EncodeOutboxUpdate(msg)
+	updateBytes, err := EncodeDeliveryUpdate(msg)
 	if err != nil {
 		return err
 	}
@@ -423,7 +445,7 @@ func (f *SessionControlFabric) pushUser(ctx context.Context, kind SessionControl
 	if len(targets) == 0 {
 		return sent, nil
 	}
-	updateBytes, err := EncodeOutboxUpdate(msg)
+	updateBytes, err := EncodeDeliveryUpdate(msg)
 	if err != nil {
 		return sent, err
 	}
@@ -485,7 +507,7 @@ func (f *SessionControlFabric) sessionControlPushBatchesByTarget(pushes []Locati
 		if push.TargetUserID == 0 || push.Update == nil || len(push.Locations) == 0 {
 			continue
 		}
-		updateBytes, err := EncodeOutboxUpdate(push.Update)
+		updateBytes, err := EncodeDeliveryUpdate(push.Update)
 		if err != nil {
 			return nil, err
 		}
@@ -497,11 +519,7 @@ func (f *SessionControlFabric) sessionControlPushBatchesByTarget(pushes []Locati
 			UpdateBytes:     updateBytes,
 			ChannelDelivery: push.ChannelDelivery,
 		}
-		targets := remoteOutboxTargets(f.instanceID, OutboxPushRequest{
-			TargetUserID:     push.TargetUserID,
-			ExcludeAuthKeyID: push.ExcludeAuthKeyID,
-			ExcludeSessionID: push.ExcludeSessionID,
-		}, push.Locations)
+		targets := remoteDeliveryTargets(f.instanceID, push.TargetUserID, push.ExcludeAuthKeyID, push.ExcludeSessionID, push.Locations)
 		for _, target := range targets {
 			byTarget[target] = append(byTarget[target], entry)
 		}
@@ -554,7 +572,7 @@ func (f *SessionControlFabric) pushBusinessAuthKey(ctx context.Context, kind Ses
 	if len(targets) == 0 {
 		return sent, nil
 	}
-	updateBytes, err := EncodeOutboxUpdate(msg)
+	updateBytes, err := EncodeDeliveryUpdate(msg)
 	if err != nil {
 		return sent, err
 	}
@@ -585,7 +603,7 @@ func (f *SessionControlFabric) PushToUserExceptBusinessAuthKey(ctx context.Conte
 	if len(targets) == 0 {
 		return sent, nil
 	}
-	updateBytes, err := EncodeOutboxUpdate(msg)
+	updateBytes, err := EncodeDeliveryUpdate(msg)
 	if err != nil {
 		return sent, err
 	}
@@ -622,7 +640,7 @@ func (f *SessionControlFabric) pushUserTransientCompatible(ctx context.Context, 
 	if len(targets) == 0 {
 		return sent, nil
 	}
-	updateBytes, err := EncodeOutboxUpdate(msg)
+	updateBytes, err := EncodeDeliveryUpdate(msg)
 	if err != nil {
 		return sent, err
 	}
@@ -996,37 +1014,18 @@ func (f *SessionControlFabric) CloseSessionsForRawAuthKeyExceptBounded(ctx conte
 func (f *SessionControlFabric) rawSessionTargets(rawAuthKeyID [8]byte, sessionID int64) []string {
 	records := f.rawAuthKeyRecords(rawAuthKeyID)
 	filtered := make([]LocationRecord, 0, len(records))
-	var newestRevision, newestUpdatedAt int64
+	var newestRevision int64
 	for _, record := range records {
-		if record.SessionID != sessionID {
+		if record.SessionID != sessionID || record.LocationRevision <= 0 {
 			continue
 		}
-		if record.LocationRevision > 0 {
-			if newestRevision == 0 || record.LocationRevision > newestRevision {
-				filtered = filtered[:0]
-				filtered = append(filtered, record)
-				newestRevision = record.LocationRevision
-				continue
-			}
-			if record.LocationRevision == newestRevision {
-				filtered = append(filtered, record)
-			}
-			continue
-		}
-		if newestRevision > 0 {
-			continue
-		}
-		updatedAt := record.UpdatedAtUnixNano
-		if updatedAt == 0 {
-			updatedAt = record.UpdatedAtUnix * int64(time.Second)
-		}
-		if len(filtered) == 0 || updatedAt > newestUpdatedAt {
+		if newestRevision == 0 || record.LocationRevision > newestRevision {
 			filtered = filtered[:0]
 			filtered = append(filtered, record)
-			newestUpdatedAt = updatedAt
+			newestRevision = record.LocationRevision
 			continue
 		}
-		if updatedAt == newestUpdatedAt {
+		if record.LocationRevision == newestRevision {
 			filtered = append(filtered, record)
 		}
 	}
@@ -1091,11 +1090,7 @@ func (f *SessionControlFabric) liveUserTargets(userID int64, excludeAuthKeyID [8
 	if err != nil {
 		return nil, err
 	}
-	return remoteOutboxTargets(f.instanceID, OutboxPushRequest{
-		TargetUserID:     userID,
-		ExcludeAuthKeyID: excludeAuthKeyID,
-		ExcludeSessionID: excludeSessionID,
-	}, records), nil
+	return remoteDeliveryTargets(f.instanceID, userID, excludeAuthKeyID, excludeSessionID, records), nil
 }
 
 func (f *SessionControlFabric) userControlTargets(userID int64) []string {
@@ -1367,7 +1362,7 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 	case SessionControlClearRawLayer:
 		ack.Affected = local.ClearInheritedLayerForRawAuthKey(cmd.RawAuthKeyID)
 	case SessionControlPushSession:
-		update, err := DecodeOutboxUpdate(cmd.UpdateBytes)
+		update, err := DecodeDeliveryUpdate(cmd.UpdateBytes)
 		if err != nil {
 			ack.Error = err.Error()
 			return ack
@@ -1378,7 +1373,7 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 		}
 		ack.Affected = 1
 	case SessionControlPushSessionImmediate:
-		update, err := DecodeOutboxUpdate(cmd.UpdateBytes)
+		update, err := DecodeDeliveryUpdate(cmd.UpdateBytes)
 		if err != nil {
 			ack.Error = err.Error()
 			return ack
@@ -1401,7 +1396,7 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 				}
 				continue
 			}
-			update, err := DecodeOutboxUpdate(entry.UpdateBytes)
+			update, err := DecodeDeliveryUpdate(entry.UpdateBytes)
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
@@ -1436,7 +1431,7 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 			ack.Error = firstErr.Error()
 		}
 	case SessionControlPushUser, SessionControlPushUserBounded, SessionControlPushUserTransient, SessionControlPushUserAuthKey, SessionControlPushUserAuthKeyTransient, SessionControlPushUserExceptBusinessAuthKey, SessionControlPushUserTransientAtLeastLayer, SessionControlPushUserAuthKeyTransientAtLeastLayer:
-		update, err := DecodeOutboxUpdate(cmd.UpdateBytes)
+		update, err := DecodeDeliveryUpdate(cmd.UpdateBytes)
 		if err != nil {
 			ack.Error = err.Error()
 			return ack
@@ -1547,7 +1542,7 @@ func RunSessionControlSubscriber(ctx context.Context, bus SessionControlCommandB
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(outboxPushSubscribeRetry):
+		case <-time.After(deliverySubscribeRetry):
 		}
 	}
 }

@@ -29,15 +29,17 @@ type BotVerificationStore interface {
 
 	// --- verifier status ---
 
-	// UpsertBotVerifierSettings grants or updates verifier status. Optimistic
-	// locking on the stored version keeps two operators from clobbering each other.
-	UpsertBotVerifierSettings(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error)
-	// SetBotVerifierEnabled flips the operator kill switch. Existing marks stay,
-	// but the verifier can grant nothing new and its settings stop being projected.
-	SetBotVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error)
-	// DeleteBotVerifierSettings removes verifier status; its marks cascade away with
-	// it, because a mark whose verifier no longer exists has nothing to render.
-	DeleteBotVerifierSettings(ctx context.Context, botID int64) (bool, error)
+	// UpsertBotVerifierSettingsWithDelivery grants or updates verifier status and
+	// atomically appends the bounded updateUser effects for the verifier and every
+	// user peer carrying one of its marks. Channel peers are returned separately as
+	// transient authoritative-reload invalidations; they never become account PTS
+	// or one durable account row per channel member.
+	UpsertBotVerifierSettingsWithDelivery(ctx context.Context, settings domain.BotVerifierSettings, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (BotVerifierSettingsMutation, error)
+	// SetBotVerifierEnabledWithDelivery is the matching kill-switch aggregate.
+	SetBotVerifierEnabledWithDelivery(ctx context.Context, botID int64, enabled bool, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (BotVerifierSettingsMutation, error)
+	// DeleteBotVerifierSettingsWithDelivery removes verifier status, cascades its
+	// marks, and commits all reliable user effects in the same transaction.
+	DeleteBotVerifierSettingsWithDelivery(ctx context.Context, botID int64, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (BotVerifierSettingsMutation, error)
 	// BotVerifierSettings reads one verifier's status, enabled or not.
 	BotVerifierSettings(ctx context.Context, botID int64) (domain.BotVerifierSettings, error)
 	// BotVerifierSettingsBatch resolves several bots in one round trip for the
@@ -54,9 +56,17 @@ type BotVerificationStore interface {
 	// has already resolved the description through
 	// domain.BotVerifierSettings.DescriptionFor.
 	GrantCustomVerification(ctx context.Context, mark domain.CustomVerification) (domain.CustomVerification, bool, error)
+	// GrantCustomVerificationWithDelivery is the user-peer write boundary. The
+	// mark and the frozen audience's absolute updateUser effects commit as one
+	// unit; channel peers keep using GrantCustomVerification because their
+	// aggregate owns a different notification/fanout boundary.
+	GrantCustomVerificationWithDelivery(ctx context.Context, mark domain.CustomVerification, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error)
 	// RevokeCustomVerification removes this verifier's mark from the peer and
 	// reports whether anything was removed, so a repeated revoke is a no-op.
 	RevokeCustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (bool, error)
+	// RevokeCustomVerificationWithDelivery is the matching user-peer revoke
+	// boundary. A missing mark is a true no-op and emits no duplicate effect.
+	RevokeCustomVerificationWithDelivery(ctx context.Context, verifierBotID int64, peer domain.Peer, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (bool, error)
 	// CustomVerification reads one verifier's mark on a peer.
 	CustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (domain.CustomVerification, error)
 	// PeerVerification returns the peer's single mark. Missing marks report
@@ -95,3 +105,29 @@ type BotVerificationStore interface {
 	// CustomVerificationRequestCounts is the queue summary by status.
 	CustomVerificationRequestCounts(ctx context.Context) (map[domain.CustomVerificationRequestStatus]int64, error)
 }
+
+// BotVerifierSettingsMutation is the committed verifier aggregate result.
+// AffectedChannelIDs contains only channel/supergroup projection invalidations;
+// callers may emit bounded transient updateChannel hints after commit, but must
+// never treat those hints as reliable delivery.
+type BotVerifierSettingsMutation struct {
+	Settings           domain.BotVerifierSettings
+	Changed            bool
+	AffectedChannelIDs []int64
+}
+
+const (
+	// MaxBotVerificationUserAudience bounds one user mark mutation. The frozen
+	// set is intentionally identical to moderation updateUser fanout: self,
+	// contacts and existing private-dialog counterparts, deduplicated before
+	// persistence.
+	MaxBotVerificationUserAudience = 4096
+	// MaxBotVerifierSettingsDeliveryEffects bounds the complete reliable append
+	// set of one verifier configuration transaction, across the verifier account
+	// and every affected user mark.
+	MaxBotVerifierSettingsDeliveryEffects = 4096
+	// MaxBotVerifierSettingsChannelInvalidations bounds post-commit transient
+	// cache invalidation. Exceeding it fails the owning mutation closed instead of
+	// silently refreshing only a prefix.
+	MaxBotVerifierSettingsChannelInvalidations = 4096
+)

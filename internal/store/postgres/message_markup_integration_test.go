@@ -40,7 +40,7 @@ func TestSendPrivateReplyMarkupSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 
 	rawData := []byte{0x00, 0x01, 0xFF, 0x80, 'd', 'a', 't', 'a'}
 	markup := &domain.MessageReplyMarkup{Inline: [][]domain.MarkupButton{{
@@ -172,7 +172,7 @@ func TestSendPrivateViaBotIDSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	viaBotID := int64(770000000001)
 	randomID := time.Now().UnixNano()
 	res, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{

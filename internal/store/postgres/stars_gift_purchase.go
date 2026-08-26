@@ -72,8 +72,8 @@ ON CONFLICT DO NOTHING`, form.BuyerUserID, formID, string(form.Kind), starsPurch
 
 var errStarsPurchaseReplay = errors.New("stars purchase replay")
 
-func (s *StarsPurchaseStore) PurchaseStars(ctx context.Context, req domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error) {
-	if s == nil || s.db == nil || req.FormID == 0 || req.Date <= 0 || !validStarsPurchaseCommand(req.StarsPurchaseForm) {
+func (s *StarsPurchaseStore) PurchaseStarsWithDelivery(ctx context.Context, req domain.StarsPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
+	if s == nil || s.db == nil || effects == nil || req.FormID == 0 || req.Date <= 0 || !validStarsPurchaseCommand(req.StarsPurchaseForm) {
 		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
 	}
 	fingerprint := starsPurchaseFingerprint(req)
@@ -89,9 +89,9 @@ func (s *StarsPurchaseStore) PurchaseStars(ctx context.Context, req domain.Stars
 	}
 	switch req.Kind {
 	case domain.StarsPurchaseTopup:
-		return s.purchaseStarsTopup(ctx, req, fingerprint)
+		return s.purchaseStarsTopup(ctx, req, fingerprint, effects)
 	case domain.StarsPurchaseGiveaway:
-		return s.purchaseStarsGiveaway(ctx, req, fingerprint)
+		return s.purchaseStarsGiveaway(ctx, req, fingerprint, effects)
 	}
 	if s.messages == nil {
 		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
@@ -152,7 +152,7 @@ VALUES($1,$2,$3,$4,$5,NULL,NULL,'{}'::jsonb,$6,$7,$8,$9,$10,$11)`, req.BuyerUser
 				return fmt.Errorf("insert stars gift purchase command: %w", err)
 			}
 			result.Send = sent
-			return nil
+			return applyStarsPurchaseDeliveryEffectsTx(ctx, tx, result, effects)
 		},
 	}
 	sent, err := s.messages.sendPrivateTextWithHooks(ctx, messageReq, hooks)
@@ -168,7 +168,7 @@ VALUES($1,$2,$3,$4,$5,NULL,NULL,'{}'::jsonb,$6,$7,$8,$9,$10,$11)`, req.BuyerUser
 	return result, nil
 }
 
-func (s *StarsPurchaseStore) purchaseStarsTopup(ctx context.Context, req domain.StarsPurchaseRequest, fingerprint [32]byte) (domain.StarsPurchaseResult, error) {
+func (s *StarsPurchaseStore) purchaseStarsTopup(ctx context.Context, req domain.StarsPurchaseRequest, fingerprint [32]byte, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
 	transactionID := fmt.Sprintf("stars-topup:%d:%d", req.BuyerUserID, req.FormID)
 	result := domain.StarsPurchaseResult{TransactionID: transactionID}
 	err := withTx(ctx, s.db, "settle stars topup", func(tx pgx.Tx) error {
@@ -202,7 +202,7 @@ VALUES($1,$2,$3,$4,NULL,$5,$6,'{}'::jsonb,$7,$8,$9,$10,$11,$12)`, req.BuyerUserI
 		if err != nil {
 			return fmt.Errorf("insert stars topup command: %w", err)
 		}
-		return nil
+		return applyStarsPurchaseDeliveryEffectsTx(ctx, tx, result, effects)
 	})
 	if errors.Is(err, errStarsPurchaseReplay) {
 		if replay, found, replayErr := s.loadStarsPurchaseReplay(ctx, req, fingerprint); replayErr != nil || found {
@@ -215,7 +215,7 @@ VALUES($1,$2,$3,$4,NULL,$5,$6,'{}'::jsonb,$7,$8,$9,$10,$11,$12)`, req.BuyerUserI
 	return result, nil
 }
 
-func (s *StarsPurchaseStore) purchaseStarsGiveaway(ctx context.Context, req domain.StarsPurchaseRequest, fingerprint [32]byte) (domain.StarsPurchaseResult, error) {
+func (s *StarsPurchaseStore) purchaseStarsGiveaway(ctx context.Context, req domain.StarsPurchaseRequest, fingerprint [32]byte, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
 	if s.channels == nil || req.Giveaway == nil {
 		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
 	}
@@ -271,7 +271,7 @@ VALUES($1,$2,$3,$4,NULL,NULL,NULL,$5,$6,$7,$8,0,$9,$10)`,
 				return fmt.Errorf("insert stars giveaway purchase command: %w", err)
 			}
 			result.ChannelSend = sent
-			return nil
+			return applyStarsPurchaseDeliveryEffectsTx(ctx, tx, result, effects)
 		},
 	}
 	sent, err := s.channels.sendChannelMessageWithHooks(ctx, sendReq, hooks)
@@ -291,6 +291,20 @@ VALUES($1,$2,$3,$4,NULL,NULL,NULL,$5,$6,$7,$8,0,$9,$10)`,
 	}
 	result.ChannelSend = sent
 	return result, nil
+}
+
+func applyStarsPurchaseDeliveryEffectsTx(ctx context.Context, tx pgx.Tx, result domain.StarsPurchaseResult, build store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) error {
+	intents, err := build(result)
+	if err != nil {
+		return fmt.Errorf("build stars purchase delivery: %w", err)
+	}
+	if err := store.ValidateStarsPurchaseDeliveryEffects(result, intents); err != nil {
+		return err
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply stars purchase delivery: %w", err)
+	}
+	return nil
 }
 
 func starsGiveawayChannelIDs(giveaway domain.StarsGiveawayPurchase) []int64 {
@@ -625,4 +639,3 @@ FROM users u WHERE u.id=$1`, viewerUserID).Scan(&country); err != nil {
 }
 
 var _ store.StarsPurchaseStore = (*StarsPurchaseStore)(nil)
-var _ store.StarsGiveawayStore = (*StarsPurchaseStore)(nil)

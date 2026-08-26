@@ -9,20 +9,21 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
 // 私聊消息 poll 投票/关闭：消息可见性在 message_boxes 校验（与 reaction 同款 SELECT FOR
 // UPDATE 定位），poll 级语义委托 poll.go 的共享 SQL（polls 行 FOR UPDATE 防 quiz 并发双投）。
 
-func (s *MessageStore) VoteMessagePoll(ctx context.Context, req domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
-	return s.mutateMessagePoll(ctx, req.UserID, req.Peer, req.MessageID, req.Date, func(ctx context.Context, tx pgx.Tx, def domain.PollDefinition, date int) error {
+func (s *MessageStore) VoteMessagePoll(ctx context.Context, req domain.VotePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
+	return s.mutateMessagePoll(ctx, req.UserID, req.Peer, req.MessageID, req.Date, effects, func(ctx context.Context, tx pgx.Tx, def domain.PollDefinition, date int) error {
 		return applyPollVote(ctx, tx, def, req.UserID, req.Options, date)
 	})
 }
 
-func (s *MessageStore) CloseMessagePoll(ctx context.Context, req domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
-	return s.mutateMessagePoll(ctx, req.UserID, req.Peer, req.MessageID, req.Date, func(ctx context.Context, tx pgx.Tx, def domain.PollDefinition, _ int) error {
+func (s *MessageStore) CloseMessagePoll(ctx context.Context, req domain.ClosePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
+	return s.mutateMessagePoll(ctx, req.UserID, req.Peer, req.MessageID, req.Date, effects, func(ctx context.Context, tx pgx.Tx, def domain.PollDefinition, _ int) error {
 		return closePollAsCreator(ctx, tx, def, req.UserID)
 	})
 }
@@ -33,10 +34,14 @@ func (s *MessageStore) mutateMessagePoll(
 	peer domain.Peer,
 	messageID int,
 	date int,
+	effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult],
 	mutate func(ctx context.Context, tx pgx.Tx, def domain.PollDefinition, date int) error,
 ) (domain.PrivateMessagePollResult, error) {
 	if userID == 0 || peer.Type != domain.PeerTypeUser || peer.ID == 0 || messageID <= 0 || messageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
+	}
+	if effects == nil {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if date == 0 {
 		date = int(time.Now().Unix())
@@ -114,6 +119,16 @@ LIMIT 1`, userID, int32(messageID), string(peer.Type), peer.ID).Scan(&target.pri
 	// poll enrichment（按各 box owner 视角）由 enrichPrivateMessageReactions 统一挂载。
 	if err := s.enrichPrivateMessageReactions(ctx, tx, userID, res.Messages); err != nil {
 		return domain.PrivateMessagePollResult{}, err
+	}
+	intents, err := effects(res)
+	if err != nil {
+		return domain.PrivateMessagePollResult{}, fmt.Errorf("build message poll delivery effects: %w", err)
+	}
+	if len(intents) == 0 && len(res.Messages) > 0 {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.PrivateMessagePollResult{}, fmt.Errorf("apply message poll delivery effects: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.PrivateMessagePollResult{}, fmt.Errorf("commit message poll tx: %w", err)

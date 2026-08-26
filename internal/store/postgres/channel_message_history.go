@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -913,7 +914,7 @@ WHERE (
 	return out, nil
 }
 
-func (s *ChannelStore) readChannelHistoryOnce(ctx context.Context, req domain.ReadChannelHistoryRequest) (domain.ReadChannelHistoryResult, error) {
+func (s *ChannelStore) readChannelHistoryOnce(ctx context.Context, req domain.ReadChannelHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelHistoryResult]) (domain.ReadChannelHistoryResult, error) {
 	channel, _, readOnly, err := s.getChannelForViewer(ctx, s.db, req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.ReadChannelHistoryResult{}, err
@@ -935,7 +936,7 @@ func (s *ChannelStore) readChannelHistoryOnce(ctx context.Context, req domain.Re
 	if err != nil {
 		return domain.ReadChannelHistoryResult{}, fmt.Errorf("read channel member state: %w", err)
 	}
-	if maxID <= previous && !unreadMark {
+	if maxID <= previous && !unreadMark && !channel.Forum {
 		return domain.ReadChannelHistoryResult{
 			ChannelID: req.ChannelID,
 			MaxID:     maxID,
@@ -958,12 +959,21 @@ func (s *ChannelStore) readChannelHistoryOnce(ctx context.Context, req domain.Re
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	if err := tx.QueryRow(ctx, `SELECT read_inbox_max_id FROM channel_members WHERE channel_id = $1 AND user_id = $2`, req.ChannelID, req.UserID).Scan(&previous); err != nil {
+	// Follow the global channel -> member lock order used by send/membership
+	// mutations, then recompute both read fields inside this transaction. The
+	// optimistic precheck above is only an admission fast path; it must never
+	// decide whether the committed mutation emits a durable effect.
+	var lockedChannelID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM channels WHERE id = $1 FOR UPDATE`, req.ChannelID).Scan(&lockedChannelID); err != nil {
+		return domain.ReadChannelHistoryResult{}, fmt.Errorf("lock channel read aggregate: %w", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT read_inbox_max_id, unread_mark FROM channel_members WHERE channel_id = $1 AND user_id = $2 FOR UPDATE`, req.ChannelID, req.UserID).Scan(&previous, &unreadMark); err != nil {
 		return domain.ReadChannelHistoryResult{}, fmt.Errorf("read channel member state: %w", err)
 	}
-	changed := maxID > previous
+	watermarkChanged := maxID > previous
+	changed := watermarkChanged || unreadMark
 	var outboxUpdates []domain.ChannelReadOutboxUpdate
-	if changed {
+	if watermarkChanged {
 		// 先碰 channels 行再碰 channel_members：send 路径的顺序是
 		// channels→members，read 路径必须同序，否则并发 send+read 形成
 		// AB-BA 死锁（PG 1s 检测击杀后整个事务回滚）。
@@ -1002,7 +1012,7 @@ WHERE channel_id = $1 AND user_id = $2`, req.ChannelID, req.UserID, maxID, req.D
 		return domain.ReadChannelHistoryResult{}, fmt.Errorf("update channel member read: %w", err)
 	}
 	msg, _ := s.getChannelMessage(ctx, tx, req.ChannelID, channel.TopMessageID)
-	if changed {
+	if watermarkChanged {
 		outboxUpdates, err = advanceChannelReadOutboxTx(ctx, tx, channel, msg, req.UserID, previous, maxID)
 		if err != nil {
 			return domain.ReadChannelHistoryResult{}, err
@@ -1011,24 +1021,45 @@ WHERE channel_id = $1 AND user_id = $2`, req.ChannelID, req.UserID, maxID, req.D
 	if err := upsertChannelDialogTx(ctx, tx, req.UserID, channel, msg, maxID, 0); err != nil {
 		return domain.ReadChannelHistoryResult{}, err
 	}
+	var general *domain.ReadChannelTopicHistoryResult
+	if channel.Forum && maxID > 0 {
+		result, err := s.readChannelTopicHistoryTx(ctx, tx, domain.ReadChannelTopicHistoryRequest{
+			UserID: req.UserID, ChannelID: req.ChannelID, TopicID: domain.ForumGeneralTopicID,
+			MaxID: maxID, Date: req.Date,
+		})
+		if err != nil {
+			return domain.ReadChannelHistoryResult{}, fmt.Errorf("advance forum general read in channel tx: %w", err)
+		}
+		if result.Changed {
+			general = &result
+		}
+	}
+	dialog, err := s.getChannelDialog(ctx, tx, req.UserID, channel)
+	if err != nil {
+		return domain.ReadChannelHistoryResult{}, err
+	}
+	result := domain.ReadChannelHistoryResult{
+		ChannelID: req.ChannelID, MaxID: maxID, StillUnreadCount: dialog.UnreadCount,
+		Changed: changed, Pts: channel.Pts, Forum: channel.Forum, Dialog: dialog,
+		OutboxUpdates: outboxUpdates, GeneralTopic: general,
+	}
+	if result.Changed || result.GeneralTopic != nil {
+		intents, err := effects(result)
+		if err != nil {
+			return domain.ReadChannelHistoryResult{}, fmt.Errorf("build channel read delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return domain.ReadChannelHistoryResult{}, store.ErrDeliveryOutboxRequired
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return domain.ReadChannelHistoryResult{}, fmt.Errorf("apply channel read delivery effects: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.ReadChannelHistoryResult{}, fmt.Errorf("commit read channel history: %w", err)
 	}
 	committed = true
-	dialog, err := s.getChannelDialog(ctx, s.db, req.UserID, channel)
-	if err != nil {
-		return domain.ReadChannelHistoryResult{}, err
-	}
-	return domain.ReadChannelHistoryResult{
-		ChannelID:        req.ChannelID,
-		MaxID:            maxID,
-		StillUnreadCount: dialog.UnreadCount,
-		Changed:          changed,
-		Pts:              channel.Pts,
-		Forum:            channel.Forum,
-		Dialog:           dialog,
-		OutboxUpdates:    outboxUpdates,
-	}, nil
+	return result, nil
 }
 
 func (s *ChannelStore) channelReadHistoryState(ctx context.Context, channelID, userID int64) (readInboxMaxID int, unreadMark bool, err error) {

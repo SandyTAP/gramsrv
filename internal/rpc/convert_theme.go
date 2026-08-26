@@ -33,7 +33,9 @@ func themesListHash(themes []tg.Theme) (int64, error) {
 		if err := theme.Encode(&b); err != nil {
 			return 0, fmt.Errorf("encode theme %d for hash: %w", theme.ID, err)
 		}
-		encoded = append(encoded, b.Copy())
+		// b is local to this iteration; transfer its owned encoding into the sort
+		// set instead of cloning the complete theme body.
+		encoded = append(encoded, b.Raw())
 	}
 	sort.Slice(encoded, func(i, j int) bool {
 		return bytes.Compare(encoded[i], encoded[j]) < 0

@@ -12,8 +12,27 @@ import (
 	botsapp "telesrv/internal/app/bots"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+func lastProfilePhotoDelivery(t *testing.T, files *fakeFiles) (store.DeliveryOutboxItem, *tg.Updates) {
+	t.Helper()
+	items := files.delivery().Snapshot()
+	if len(items) == 0 {
+		t.Fatal("profile photo delivery outbox is empty")
+	}
+	item := items[len(items)-1]
+	decoded, err := decodeDeliveryUpdate(item.Payload)
+	if err != nil {
+		t.Fatalf("decode profile photo delivery: %v", err)
+	}
+	updates, ok := decoded.(*tg.Updates)
+	if !ok {
+		t.Fatalf("profile photo delivery = %T, want *tg.Updates", decoded)
+	}
+	return item, updates
+}
 
 // TestUploadProfilePhotoPushesUpdateToOtherDevices 守护审计修复：换头像后必须向该账号其它在线
 // 设备推送（updateUser 信号 + Updates.Users 带新 self user），否则其它设备头像不刷新。
@@ -26,9 +45,10 @@ func TestUploadProfilePhotoPushesUpdateToOtherDevices(t *testing.T) {
 	sessions := &captureSessions{}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore),
-		Files:    files,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Files:          files,
+		Sessions:       sessions,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	req := &tg.PhotosUploadProfilePhotoRequest{}
@@ -42,13 +62,9 @@ func TestUploadProfilePhotoPushesUpdateToOtherDevices(t *testing.T) {
 		t.Fatalf("returned self photo = %+v, want photo_id=778 dc_id=2", firstPhotosUser(t, got).Photo)
 	}
 
-	snap := sessions.snapshot()
-	if snap.userID != owner.ID {
-		t.Fatalf("push target user = %d, want %d", snap.userID, owner.ID)
-	}
-	updates, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", snap.message)
+	item, updates := lastProfilePhotoDelivery(t, files)
+	if item.TargetUserID != owner.ID {
+		t.Fatalf("delivery target user = %d, want %d", item.TargetUserID, owner.ID)
 	}
 	hasUserUpdate := false
 	for _, u := range updates.Updates {
@@ -84,11 +100,11 @@ func TestUploadProfilePhotoEchoesUpdateToCurrentSession(t *testing.T) {
 	sessions := &captureSessions{}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Files:    files,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Files:          files,
+		Sessions:       sessions,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
-	r.selfPhotoEchoPushDelay = 0 // 测试同步回显
 
 	const currentSessionID = int64(424242)
 	reqCtx := WithSessionID(WithUserID(ctx, owner.ID), currentSessionID)
@@ -107,14 +123,9 @@ func TestUploadProfilePhotoEchoesUpdateToCurrentSession(t *testing.T) {
 		t.Fatalf("returned first size = %+v, want real s=150 transient response location", returned.Sizes[0])
 	}
 
-	// PushToSession 在 PushToUserExceptSession 之后调用，snapshot().message 即当前 session 回显。
-	snap := sessions.snapshot()
-	if snap.sessionID != currentSessionID {
-		t.Fatalf("echo session = %d, want %d", snap.sessionID, currentSessionID)
-	}
-	echoed, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("echoed message = %T, want *tg.Updates", snap.message)
+	item, echoed := lastProfilePhotoDelivery(t, files)
+	if item.ExcludeSessionID != 0 || item.ExcludeAuthKeyID != ([8]byte{}) {
+		t.Fatalf("photo delivery unexpectedly excluded current session: %x/%d", item.ExcludeAuthKeyID, item.ExcludeSessionID)
 	}
 	hasUserUpdate := false
 	for _, u := range echoed.Updates {
@@ -136,10 +147,6 @@ func TestUploadProfilePhotoEchoesUpdateToCurrentSession(t *testing.T) {
 	if !ok || echoedPhoto.PhotoID != 780 || !echoedPhoto.HasVideo {
 		t.Fatalf("echoed self photo = %+v, want photo 780 has_video=true", echoedUser.Photo)
 	}
-	// 其它设备推送同样发生（同一 updates）。
-	if other, ok := sessions.lastUserPush().(*tg.Updates); !ok || len(other.Users) == 0 {
-		t.Fatalf("other-device push = %T, want *tg.Updates with users", sessions.lastUserPush())
-	}
 }
 
 // TestDeletePhotosPushesSelfUpdate 守护 deletePhotos 推送：删除生效（含撤掉当前头像回落）后
@@ -152,11 +159,11 @@ func TestDeletePhotosPushesSelfUpdate(t *testing.T) {
 	sessions := &captureSessions{}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Files:    files,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Files:          files,
+		Sessions:       sessions,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
-	r.selfPhotoEchoPushDelay = 0
 
 	const currentSessionID = int64(434343)
 	reqCtx := WithSessionID(WithUserID(ctx, owner.ID), currentSessionID)
@@ -177,9 +184,9 @@ func TestDeletePhotosPushesSelfUpdate(t *testing.T) {
 	if _, found, err := files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, owner.ID, domain.ProfilePhotoKindProfile); err != nil || found {
 		t.Fatalf("current profile photo after delete: found=%v err=%v, want removed", found, err)
 	}
-	pushed, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok {
-		t.Fatalf("other-device push after delete = %T, want *tg.Updates", sessions.lastUserPush())
+	item, pushed := lastProfilePhotoDelivery(t, files)
+	if item.TargetUserID != owner.ID || item.ExcludeSessionID != 0 {
+		t.Fatalf("delete delivery target/exclusion = %d/%d, want %d/0", item.TargetUserID, item.ExcludeSessionID, owner.ID)
 	}
 	hasUserUpdate := false
 	for _, u := range pushed.Updates {
@@ -197,14 +204,6 @@ func TestDeletePhotosPushesSelfUpdate(t *testing.T) {
 	if _, stillHasPhoto := pushedUser.Photo.(*tg.UserProfilePhoto); stillHasPhoto {
 		t.Fatalf("pushed self photo after delete = %+v, want cleared", pushedUser.Photo)
 	}
-	// 当前 session 也收到回显（PushToSession 最后调用，覆盖 snapshot().message）。
-	snap := sessions.snapshot()
-	if snap.sessionID != currentSessionID {
-		t.Fatalf("echo session = %d, want %d", snap.sessionID, currentSessionID)
-	}
-	if _, ok := snap.message.(*tg.Updates); !ok {
-		t.Fatalf("echoed message = %T, want *tg.Updates", snap.message)
-	}
 }
 
 func TestUploadProfilePhotoBotTargetUpdatesOwnedBot(t *testing.T) {
@@ -212,21 +211,22 @@ func TestUploadProfilePhotoBotTargetUpdatesOwnedBot(t *testing.T) {
 	userStore := memory.NewUserStore()
 	botStore := memory.NewBotStore(userStore)
 	dialogStore := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogStore, memory.NewDeliveryOutboxStore())
 	bots := botsapp.NewService(userStore, botStore, memory.NewMessageStore(dialogStore))
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550001006", FirstName: "Owner"})
-	bot, _, err := bots.CreateBot(ctx, owner.ID, "Photo Bot", "photo_shape_bot")
+	bot, _, err := bots.CreateBotWithDelivery(ctx, owner.ID, "Photo Bot", "photo_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
 	sessions := &captureSessions{}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Bots:     bots,
-		Files:    files,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Bots:           bots,
+		Files:          files,
+		Sessions:       sessions,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
-	r.selfPhotoEchoPushDelay = 0
 
 	const currentSessionID = int64(454545)
 	reqCtx := WithSessionID(WithUserID(ctx, owner.ID), currentSessionID)
@@ -257,16 +257,9 @@ func TestUploadProfilePhotoBotTargetUpdatesOwnedBot(t *testing.T) {
 		t.Fatalf("returned bot photo = %+v, want photo_id=778 dc_id=2", returnedBot.Photo)
 	}
 
-	if pushed := sessions.pushedUserIDs(); len(pushed) != 1 || pushed[0] != owner.ID {
-		t.Fatalf("pushed user ids = %v, want owner %d", pushed, owner.ID)
-	}
-	snap := sessions.snapshot()
-	if snap.sessionID != currentSessionID {
-		t.Fatalf("echo session = %d, want %d", snap.sessionID, currentSessionID)
-	}
-	echoed, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("echoed message = %T, want *tg.Updates", snap.message)
+	item, echoed := lastProfilePhotoDelivery(t, files)
+	if item.TargetUserID != owner.ID || item.ExcludeSessionID != 0 {
+		t.Fatalf("bot photo delivery target/exclusion = %d/%d, want %d/0", item.TargetUserID, item.ExcludeSessionID, owner.ID)
 	}
 	hasBotUpdate := false
 	for _, u := range echoed.Updates {
@@ -300,9 +293,9 @@ func TestUploadProfilePhotoBotTargetUpdatesOwnedBot(t *testing.T) {
 	if clearedBot.ID != bot.ID || clearedBot.Self || clearedBot.Photo != nil {
 		t.Fatalf("cleared returned bot = id:%d self:%v photo:%+v, want non-self bot without photo", clearedBot.ID, clearedBot.Self, clearedBot.Photo)
 	}
-	echoed, ok = sessions.snapshot().message.(*tg.Updates)
-	if !ok || len(echoed.Users) == 0 {
-		t.Fatalf("clear echoed message = %T %+v, want *tg.Updates with users", sessions.snapshot().message, sessions.snapshot().message)
+	_, echoed = lastProfilePhotoDelivery(t, files)
+	if len(echoed.Users) == 0 {
+		t.Fatalf("clear delivery missing users: %+v", echoed)
 	}
 	echoedBot, ok = echoed.Users[0].(*tg.User)
 	if !ok || echoedBot.ID != bot.ID || echoedBot.Photo != nil {
@@ -315,18 +308,20 @@ func TestUploadProfilePhotoBotTargetRejectsForeignBot(t *testing.T) {
 	userStore := memory.NewUserStore()
 	botStore := memory.NewBotStore(userStore)
 	dialogStore := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogStore, memory.NewDeliveryOutboxStore())
 	bots := botsapp.NewService(userStore, botStore, memory.NewMessageStore(dialogStore))
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550001007", FirstName: "Owner"})
 	stranger, _ := userStore.Create(ctx, domain.User{AccessHash: 12, Phone: "15550001008", FirstName: "Stranger"})
-	foreignBot, _, err := bots.CreateBot(ctx, stranger.ID, "Foreign Bot", "foreign_photo_shape_bot")
+	foreignBot, _, err := bots.CreateBotWithDelivery(ctx, stranger.ID, "Foreign Bot", "foreign_photo_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create foreign bot: %v", err)
 	}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users: appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Bots:  bots,
-		Files: files,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Bots:           bots,
+		Files:          files,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	req := &tg.PhotosUploadProfilePhotoRequest{}
@@ -347,9 +342,10 @@ func TestUploadProfilePhotoSupportsAnimatedVideoAndEmojiMarkup(t *testing.T) {
 	sessions := &captureSessions{}
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Files:    files,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Files:          files,
+		Sessions:       sessions,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	videoReq := &tg.PhotosUploadProfilePhotoRequest{}
@@ -446,8 +442,9 @@ func TestUploadProfilePhotoFallbackEmojiAndInvalidFlags(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550001003", FirstName: "Owner"})
 	files := &fakeFiles{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users: appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
-		Files: files,
+		Users:          appusers.NewService(userStore, appusers.WithPhotoProvider(files)),
+		Files:          files,
+		DeliveryOutbox: files.delivery(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	profileReq := &tg.PhotosUploadProfilePhotoRequest{}

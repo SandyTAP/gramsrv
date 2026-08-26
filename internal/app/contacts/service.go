@@ -3,6 +3,7 @@ package contacts
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -23,7 +24,7 @@ const maxCloseFriendsCount = 5000
 type phonePrivacyService interface {
 	userprojection.PrivacyEvaluator
 	userprojection.BatchPrivacyEvaluator
-	AddAllowUser(ctx context.Context, ownerUserID int64, key domain.PrivacyKey, targetUserID int64) (domain.PrivacyRules, bool, error)
+	GetRules(ctx context.Context, ownerUserID int64, key domain.PrivacyKey) (domain.PrivacyRules, error)
 }
 
 // Service 提供通讯录查询。
@@ -122,9 +123,12 @@ func (s *Service) GetContacts(ctx context.Context, userID int64, hash int64) (do
 	return list, false, nil
 }
 
-func (s *Service) AddContact(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error) {
-	if s == nil || s.contacts == nil || userID == 0 || input.ContactUserID == 0 || input.ContactUserID == userID {
+func (s *Service) AddContactWithDelivery(ctx context.Context, userID int64, input domain.ContactInput, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || input.ContactUserID == 0 || input.ContactUserID == userID || date <= 0 {
 		return domain.Contact{}, ErrContactIDInvalid
+	}
+	if effects == nil {
+		return domain.Contact{}, store.ErrContactMutationRequired
 	}
 	if input.FirstName == "" && input.LastName == "" {
 		return domain.Contact{}, ErrContactNameEmpty
@@ -140,34 +144,44 @@ func (s *Service) AddContact(ctx context.Context, userID int64, input domain.Con
 			input.Phone = digitsOnly(input.Phone)
 		}
 	}
-	if s.users != nil {
-		_, found, err := s.users.ByID(ctx, input.ContactUserID)
-		if err != nil {
-			return domain.Contact{}, err
-		}
-		if !found {
-			return domain.Contact{}, ErrContactIDInvalid
-		}
-	}
-	contact, err := s.contacts.Upsert(ctx, userID, input)
+	_, found, err := s.users.ByID(ctx, input.ContactUserID)
 	if err != nil {
 		return domain.Contact{}, err
 	}
-	s.InvalidateViewers(userID, input.ContactUserID)
-	if input.AddPhonePrivacyException && s.privacy != nil {
-		if _, _, err := s.privacy.AddAllowUser(ctx, userID, domain.PrivacyKeyPhoneNumber, input.ContactUserID); err != nil {
-			return domain.Contact{}, err
-		}
+	if !found {
+		return domain.Contact{}, ErrContactIDInvalid
 	}
-	return s.projectContact(ctx, userID, contact)
+	settings, err := s.contactMutationSettings(ctx, userID, []int64{input.ContactUserID}, store.ContactMutationAdd, map[int64]bool{input.ContactUserID: input.AddPhonePrivacyException})
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	privacyRules, err := s.preparePhonePrivacyExceptions(ctx, userID, []domain.ContactInput{input})
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	snapshot, err := s.contacts.MutateContacts(ctx, store.ContactMutation{
+		Kind: store.ContactMutationAdd, OwnerUserID: userID, Inputs: []domain.ContactInput{input},
+		Date: date, PeerSettings: settings, PhonePrivacyRules: privacyRules,
+	}, effects)
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	if len(snapshot.Contacts) != 1 {
+		return domain.Contact{}, ErrContactIDInvalid
+	}
+	s.InvalidateViewers(userID, input.ContactUserID)
+	return s.projectContact(ctx, userID, snapshot.Contacts[0])
 }
 
 // AcceptContact creates the reciprocal contact for an existing one-way contact.
 // Phone visibility remains governed exclusively by account privacy rules; this
 // RPC has no protocol flag authorizing a hidden phone-number exception.
-func (s *Service) AcceptContact(ctx context.Context, userID, contactUserID int64) (domain.Contact, error) {
-	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || contactUserID == 0 || contactUserID == userID {
+func (s *Service) AcceptContactWithDelivery(ctx context.Context, userID, contactUserID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || contactUserID == 0 || contactUserID == userID || date <= 0 {
 		return domain.Contact{}, ErrContactIDInvalid
+	}
+	if effects == nil {
+		return domain.Contact{}, store.ErrContactMutationRequired
 	}
 	ownerContact, found, err := s.contacts.Get(ctx, userID, contactUserID)
 	if err != nil {
@@ -183,7 +197,7 @@ func (s *Service) AcceptContact(ctx context.Context, userID, contactUserID int64
 	if !found {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
-	target, found, err := s.users.ByID(ctx, contactUserID)
+	_, found, err = s.users.ByID(ctx, contactUserID)
 	if err != nil {
 		return domain.Contact{}, err
 	}
@@ -193,28 +207,41 @@ func (s *Service) AcceptContact(ctx context.Context, userID, contactUserID int64
 	if ownerContact.Mutual {
 		return ownerContact, nil
 	}
-	_, err = s.contacts.Upsert(ctx, contactUserID, domain.ContactInput{
+	reciprocal := domain.ContactInput{
 		ContactUserID: userID,
 		Phone:         self.Phone,
 		FirstName:     self.FirstName,
 		LastName:      self.LastName,
-	})
+	}
+	settings, err := s.contactMutationSettings(ctx, userID, []int64{contactUserID}, store.ContactMutationAccept, nil)
 	if err != nil {
 		return domain.Contact{}, err
 	}
-	s.InvalidateViewers(userID, contactUserID)
-	contact, found, err := s.contacts.Get(ctx, userID, target.ID)
+	snapshot, err := s.contacts.MutateContacts(ctx, store.ContactMutation{
+		Kind: store.ContactMutationAccept, OwnerUserID: userID, ContactUserIDs: []int64{contactUserID},
+		Reciprocal: reciprocal, Date: date, PeerSettings: settings,
+	}, effects)
 	if err != nil {
 		return domain.Contact{}, err
 	}
-	if !found {
+	if !snapshot.Found {
 		return domain.Contact{}, ErrContactReqMissing
 	}
-	return s.projectContact(ctx, userID, contact)
+	if len(snapshot.Contacts) != 1 {
+		return domain.Contact{}, ErrContactReqMissing
+	}
+	s.InvalidateViewers(userID, contactUserID)
+	return s.projectContact(ctx, userID, snapshot.Contacts[0])
 }
 
-func (s *Service) ImportContacts(ctx context.Context, userID int64, inputs []domain.ContactInput) (domain.ImportContactsResult, error) {
-	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || len(inputs) == 0 {
+func (s *Service) ImportContactsWithDelivery(ctx context.Context, userID int64, inputs []domain.ContactInput, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.ImportContactsResult, error) {
+	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || date <= 0 || len(inputs) > store.MaxContactMutationBatch {
+		return domain.ImportContactsResult{}, ErrContactIDInvalid
+	}
+	if effects == nil {
+		return domain.ImportContactsResult{}, store.ErrContactMutationRequired
+	}
+	if len(inputs) == 0 {
 		return domain.ImportContactsResult{}, nil
 	}
 	out := domain.ImportContactsResult{
@@ -301,7 +328,22 @@ func (s *Service) ImportContacts(ctx context.Context, userID int64, inputs []dom
 	for _, targetID := range order {
 		upserts = append(upserts, upsertsByTarget[targetID])
 	}
-	contacts, err := s.contacts.UpsertMany(ctx, userID, upserts)
+	privacyRules, err := s.preparePhonePrivacyExceptions(ctx, userID, upserts)
+	if err != nil {
+		return domain.ImportContactsResult{}, err
+	}
+	forced := make(map[int64]bool)
+	for _, input := range upserts {
+		forced[input.ContactUserID] = input.AddPhonePrivacyException
+	}
+	settings, err := s.contactMutationSettings(ctx, userID, order, store.ContactMutationImport, forced)
+	if err != nil {
+		return domain.ImportContactsResult{}, err
+	}
+	snapshot, err := s.contacts.MutateContacts(ctx, store.ContactMutation{
+		Kind: store.ContactMutationImport, OwnerUserID: userID, Inputs: upserts,
+		Date: date, PeerSettings: settings, PhonePrivacyRules: privacyRules,
+	}, effects)
 	if err != nil {
 		return domain.ImportContactsResult{}, err
 	}
@@ -311,23 +353,154 @@ func (s *Service) ImportContacts(ctx context.Context, userID int64, inputs []dom
 		changedIDs = append(changedIDs, input.ContactUserID)
 	}
 	s.InvalidateViewers(changedIDs...)
-	if s.privacy != nil {
-		for _, input := range upserts {
-			if !input.AddPhonePrivacyException || input.ContactUserID == 0 {
-				continue
-			}
-			if _, _, err := s.privacy.AddAllowUser(ctx, userID, domain.PrivacyKeyPhoneNumber, input.ContactUserID); err != nil {
-				return domain.ImportContactsResult{}, err
-			}
-		}
-	}
-	out.Contacts = append(out.Contacts, contacts...)
+	out.Contacts = append(out.Contacts, snapshot.Contacts...)
 	projected := domain.ContactList{Contacts: out.Contacts}
 	if err := s.projectContactUsers(ctx, userID, &projected); err != nil {
 		return domain.ImportContactsResult{}, err
 	}
 	out.Contacts = projected.Contacts
 	return out, nil
+}
+
+func (s *Service) contactMutationSettings(ctx context.Context, ownerUserID int64, peerUserIDs []int64, kind store.ContactMutationKind, forcePhoneVisible map[int64]bool) ([]store.ContactMutationPeerSettings, error) {
+	ids := normalizeContactMutationIDs(ownerUserID, peerUserIDs)
+	reverse, err := s.contacts.GetReverseContacts(ctx, ownerUserID, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.ContactMutationPeerSettings, 0, len(ids)*2)
+	appendSettings := func(targetUserID, peerUserID int64, found, mutual, forcedVisible bool) error {
+		settings, err := s.projectedContactPeerSettings(ctx, targetUserID, peerUserID, found, mutual, forcedVisible)
+		if err != nil {
+			return err
+		}
+		out = append(out, store.ContactMutationPeerSettings{TargetUserID: targetUserID, PeerUserID: peerUserID, Settings: settings})
+		return nil
+	}
+	for _, peerID := range ids {
+		reverseContact, reverseFound := reverse[peerID]
+		switch kind {
+		case store.ContactMutationAdd, store.ContactMutationImport:
+			if err := appendSettings(ownerUserID, peerID, true, reverseFound, forcePhoneVisible[peerID]); err != nil {
+				return nil, err
+			}
+			if reverseFound {
+				if err := appendSettings(peerID, ownerUserID, true, true, false); err != nil {
+					return nil, err
+				}
+			}
+		case store.ContactMutationAccept:
+			if err := appendSettings(ownerUserID, peerID, true, true, false); err != nil {
+				return nil, err
+			}
+			if err := appendSettings(peerID, ownerUserID, true, true, false); err != nil {
+				return nil, err
+			}
+		case store.ContactMutationDelete:
+			if err := appendSettings(ownerUserID, peerID, false, false, false); err != nil {
+				return nil, err
+			}
+			if reverseFound && (reverseContact.Mutual || reverseContact.User.Mutual) {
+				if err := appendSettings(peerID, ownerUserID, true, false, false); err != nil {
+					return nil, err
+				}
+			}
+		default:
+			return nil, store.ErrContactMutationInvalid
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TargetUserID != out[j].TargetUserID {
+			return out[i].TargetUserID < out[j].TargetUserID
+		}
+		return out[i].PeerUserID < out[j].PeerUserID
+	})
+	return out, nil
+}
+
+func (s *Service) projectedContactPeerSettings(ctx context.Context, ownerUserID, peerUserID int64, found, mutual, forcePhoneVisible bool) (domain.PeerSettings, error) {
+	blocked, err := s.contacts.IsBlocked(ctx, ownerUserID, peerUserID)
+	if err != nil {
+		return domain.PeerSettings{}, err
+	}
+	shareContact := found && !mutual
+	needContactsException := false
+	if s.privacy != nil {
+		visible := forcePhoneVisible
+		if !visible {
+			visible, err = s.peerCanSeeCurrentUserPhone(ctx, ownerUserID, peerUserID)
+			if err != nil {
+				return domain.PeerSettings{}, err
+			}
+		}
+		needContactsException = !visible
+		shareContact = found && !visible
+	}
+	return domain.PeerSettings{
+		AddContact: !found, BlockContact: !blocked, ShareContact: shareContact,
+		NeedContactsException: needContactsException,
+	}, nil
+}
+
+func (s *Service) preparePhonePrivacyExceptions(ctx context.Context, ownerUserID int64, inputs []domain.ContactInput) (*domain.PrivacyRules, error) {
+	want := make(map[int64]struct{})
+	for _, input := range inputs {
+		if input.AddPhonePrivacyException && input.ContactUserID > 0 {
+			want[input.ContactUserID] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+	if s.privacy == nil {
+		return nil, store.ErrPrivacyDeliveryStoreMissing
+	}
+	rules, err := s.privacy.GetRules(ctx, ownerUserID, domain.PrivacyKeyPhoneNumber)
+	if err != nil {
+		return nil, err
+	}
+	rules = store.ClonePrivacyRules(rules)
+	rules.OwnerUserID = ownerUserID
+	rules.Key = domain.PrivacyKeyPhoneNumber
+	allowIndex := -1
+	for i := range rules.Rules {
+		if rules.Rules[i].Kind == domain.PrivacyRuleAllowUsers {
+			allowIndex = i
+			for _, id := range rules.Rules[i].UserIDs {
+				delete(want, id)
+			}
+			break
+		}
+	}
+	missing := make([]int64, 0, len(want))
+	for id := range want {
+		missing = append(missing, id)
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+	if allowIndex < 0 {
+		rules.Rules = append([]domain.PrivacyRule{{Kind: domain.PrivacyRuleAllowUsers, UserIDs: missing}}, rules.Rules...)
+	} else {
+		rules.Rules[allowIndex].UserIDs = append(rules.Rules[allowIndex].UserIDs, missing...)
+		sort.Slice(rules.Rules[allowIndex].UserIDs, func(i, j int) bool { return rules.Rules[allowIndex].UserIDs[i] < rules.Rules[allowIndex].UserIDs[j] })
+	}
+	return &rules, nil
+}
+
+func normalizeContactMutationIDs(ownerUserID int64, ids []int64) []int64 {
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 || id == ownerUserID {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (s *Service) Search(ctx context.Context, userID int64, query string, limit int) (domain.UserSearchResult, error) {
@@ -392,18 +565,29 @@ func (s *Service) Search(ctx context.Context, userID int64, query string, limit 
 	return s.projectSearchResult(ctx, userID, res)
 }
 
-func (s *Service) DeleteContacts(ctx context.Context, userID int64, contactUserIDs []int64) (int, error) {
-	if s == nil || s.contacts == nil || userID == 0 {
+func (s *Service) DeleteContactsWithDelivery(ctx context.Context, userID int64, contactUserIDs []int64, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (int, error) {
+	if s == nil || s.contacts == nil || userID == 0 || date <= 0 || len(contactUserIDs) > store.MaxContactMutationBatch {
+		return 0, ErrContactIDInvalid
+	}
+	if effects == nil {
+		return 0, store.ErrContactMutationRequired
+	}
+	ids := normalizeContactMutationIDs(userID, contactUserIDs)
+	if len(ids) == 0 {
 		return 0, nil
 	}
-	count, err := s.contacts.Delete(ctx, userID, contactUserIDs)
-	if err == nil {
-		ids := make([]int64, 0, len(contactUserIDs)+1)
-		ids = append(ids, userID)
-		ids = append(ids, contactUserIDs...)
-		s.InvalidateViewers(ids...)
+	settings, err := s.contactMutationSettings(ctx, userID, ids, store.ContactMutationDelete, nil)
+	if err != nil {
+		return 0, err
 	}
-	return count, err
+	snapshot, err := s.contacts.MutateContacts(ctx, store.ContactMutation{
+		Kind: store.ContactMutationDelete, OwnerUserID: userID, ContactUserIDs: ids,
+		Date: date, PeerSettings: settings,
+	}, effects)
+	if err == nil {
+		s.InvalidateViewers(append([]int64{userID}, ids...)...)
+	}
+	return snapshot.Deleted, err
 }
 
 func (s *Service) EditCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error) {
@@ -437,26 +621,32 @@ func (s *Service) EditCloseFriends(ctx context.Context, userID int64, contactUse
 	return result, err
 }
 
-func (s *Service) UpdateContactNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, error) {
-	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID {
+func (s *Service) UpdateContactNoteWithDelivery(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity, date int, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID || date <= 0 {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
-	contact, found, err := s.contacts.UpdateNote(ctx, userID, contactUserID, note, entities)
+	if effects == nil {
+		return domain.Contact{}, store.ErrContactMutationRequired
+	}
+	snapshot, err := s.contacts.MutateContacts(ctx, store.ContactMutation{
+		Kind: store.ContactMutationNote, OwnerUserID: userID, ContactUserIDs: []int64{contactUserID},
+		Note: note, NoteEntities: append([]domain.MessageEntity(nil), entities...), Date: date,
+	}, effects)
 	if err != nil {
 		return domain.Contact{}, err
 	}
-	if !found {
+	if !snapshot.Found || len(snapshot.Contacts) != 1 {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
 	s.InvalidateViewers(userID)
-	return contact, nil
+	return snapshot.Contacts[0], nil
 }
 
-func (s *Service) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photo domain.Photo, date int) (domain.Contact, error) {
-	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID || photo.ID == 0 {
+func (s *Service) SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, photo domain.Photo, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID || photo.ID == 0 || effects == nil {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
-	contact, found, err := s.contacts.SetPersonalPhoto(ctx, userID, contactUserID, photo.ID, date)
+	contact, found, err := s.contacts.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, photo.ID, date, effects)
 	if err != nil {
 		return domain.Contact{}, err
 	}
@@ -467,11 +657,11 @@ func (s *Service) SetPersonalPhoto(ctx context.Context, userID, contactUserID in
 	return s.projectContact(ctx, userID, contact)
 }
 
-func (s *Service) ClearPersonalPhoto(ctx context.Context, userID, contactUserID int64, date int) (domain.Contact, error) {
-	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID {
+func (s *Service) ClearPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || userID == 0 || contactUserID == 0 || contactUserID == userID || effects == nil {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
-	contact, found, err := s.contacts.SetPersonalPhoto(ctx, userID, contactUserID, 0, date)
+	contact, found, err := s.contacts.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, 0, date, effects)
 	if err != nil {
 		return domain.Contact{}, err
 	}

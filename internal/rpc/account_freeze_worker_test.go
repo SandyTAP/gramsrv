@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestAccountFreezeNotificationPushesCurrentViewerProjection(t *testing.T) {
@@ -18,7 +19,6 @@ func TestAccountFreezeNotificationPushesCurrentViewerProjection(t *testing.T) {
 		viewerID = int64(1001)
 		frozenID = int64(1002)
 	)
-	sessions := &captureSessions{}
 	freezeSvc := &freezeWorkerService{}
 	users := &freezeWorkerUsers{user: domain.User{
 		ID:                 frozenID,
@@ -28,22 +28,22 @@ func TestAccountFreezeNotificationPushesCurrentViewerProjection(t *testing.T) {
 	r := New(Config{}, Deps{
 		AccountFreeze: freezeSvc,
 		Users:         users,
-		Sessions:      sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	r.dispatchAccountFreezeNotification(context.Background(), freezeSvc, domain.AccountFreezeNotification{
 		ID: 7, TargetUserID: viewerID, FrozenUserID: frozenID, Version: 4, Frozen: true,
 	})
 
-	if len(freezeSvc.completed) != 1 || freezeSvc.completed[0] != [2]int64{7, 4} {
-		t.Fatalf("completed = %v, want [[7 4]]", freezeSvc.completed)
+	if len(freezeSvc.committed) != 1 || freezeSvc.committed[0].id != 7 || freezeSvc.committed[0].version != 4 {
+		t.Fatalf("committed = %+v, want id=7 version=4", freezeSvc.committed)
 	}
-	if got := sessions.pushedUserIDs(); len(got) != 1 || got[0] != viewerID {
-		t.Fatalf("pushed user IDs = %v, want [%d]", got, viewerID)
+	decoded, err := decodeDeliveryUpdate(freezeSvc.committed[0].payload)
+	if err != nil {
+		t.Fatal(err)
 	}
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
+	updates, ok := decoded.(*tg.Updates)
 	if !ok || len(updates.Updates) != 1 || len(updates.Users) != 1 {
-		t.Fatalf("push = %#v, want updateUser plus projected user", sessions.lastUserPush())
+		t.Fatalf("payload = %#v, want updateUser plus projected user", decoded)
 	}
 	if update, ok := updates.Updates[0].(*tg.UpdateUser); !ok || update.UserID != frozenID {
 		t.Fatalf("update = %#v, want updateUser(%d)", updates.Updates[0], frozenID)
@@ -63,21 +63,19 @@ func TestAccountFreezeNotificationLoadsCurrentStateAndRetriesLoadFailure(t *test
 		viewerID = int64(2001)
 		frozenID = int64(2002)
 	)
-	sessions := &captureSessions{}
 	freezeSvc := &freezeWorkerService{}
 	users := &freezeWorkerUsers{err: errors.New("projection unavailable")}
 	r := New(Config{}, Deps{
 		AccountFreeze: freezeSvc,
 		Users:         users,
-		Sessions:      sessions,
 	}, zaptest.NewLogger(t), clock.System)
 	notification := domain.AccountFreezeNotification{
 		ID: 8, TargetUserID: viewerID, FrozenUserID: frozenID, Version: 5, Frozen: true,
 	}
 
 	r.dispatchAccountFreezeNotification(context.Background(), freezeSvc, notification)
-	if len(freezeSvc.completed) != 0 || len(sessions.pushedUserIDs()) != 0 {
-		t.Fatalf("failed load completed=%v pushes=%v, want retry without push", freezeSvc.completed, sessions.pushedUserIDs())
+	if len(freezeSvc.committed) != 0 {
+		t.Fatalf("failed load committed=%v, want retry without commit", freezeSvc.committed)
 	}
 
 	// The queued payload may say frozen, but delivery must hydrate the latest
@@ -85,21 +83,30 @@ func TestAccountFreezeNotificationLoadsCurrentStateAndRetriesLoadFailure(t *test
 	users.err = nil
 	users.user = domain.User{ID: frozenID, FirstName: "Active"}
 	r.dispatchAccountFreezeNotification(context.Background(), freezeSvc, notification)
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
+	decoded, err := decodeDeliveryUpdate(freezeSvc.committed[0].payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, ok := decoded.(*tg.Updates)
 	if !ok || len(updates.Users) != 1 {
-		t.Fatalf("push = %#v", sessions.lastUserPush())
+		t.Fatalf("payload = %#v", decoded)
 	}
 	projected, ok := updates.Users[0].(*tg.User)
 	if !ok || projected.Restricted {
 		t.Fatalf("latest projected user = %#v, want unrestricted", updates.Users[0])
 	}
-	if len(freezeSvc.completed) != 1 || freezeSvc.completed[0] != [2]int64{8, 5} {
-		t.Fatalf("completed = %v, want [[8 5]]", freezeSvc.completed)
+	if len(freezeSvc.committed) != 1 || freezeSvc.committed[0].id != 8 || freezeSvc.committed[0].version != 5 {
+		t.Fatalf("committed = %+v, want id=8 version=5", freezeSvc.committed)
 	}
 }
 
 type freezeWorkerService struct {
-	completed [][2]int64
+	committed []freezeWorkerCommit
+}
+
+type freezeWorkerCommit struct {
+	id, version int64
+	payload     []byte
 }
 
 func (*freezeWorkerService) AccountFreeze(context.Context, int64) (domain.AccountFreeze, bool, error) {
@@ -110,8 +117,8 @@ func (*freezeWorkerService) ClaimAccountFreezeNotifications(context.Context, tim
 	return nil, nil
 }
 
-func (s *freezeWorkerService) CompleteAccountFreezeNotification(_ context.Context, id, version int64, _ time.Time) error {
-	s.completed = append(s.completed, [2]int64{id, version})
+func (s *freezeWorkerService) CommitAccountFreezeNotificationDelivery(_ context.Context, id, version int64, payload []byte, _ time.Time) error {
+	s.committed = append(s.committed, freezeWorkerCommit{id: id, version: version, payload: append([]byte(nil), payload...)})
 	return nil
 }
 
@@ -133,4 +140,30 @@ func (s *freezeWorkerUsers) ByIDs(context.Context, int64, []int64) ([]domain.Use
 		return nil, s.err
 	}
 	return []domain.User{s.user}, nil
+}
+
+func (s *freezeWorkerUsers) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	if s.err != nil {
+		return domain.User{}, domain.UpdateEvent{}, s.err
+	}
+	if userID != s.user.ID {
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrUserNotFound
+	}
+	s.user = testUserWithEmojiStatus(s.user, status)
+	return s.user, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s *freezeWorkerUsers) UpdatePersonalChannelWithDelivery(_ context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	if s.err != nil {
+		return domain.User{}, s.err
+	}
+	if userID != s.user.ID {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	u, err := testUserPersonalChannelMutation(s.user, channelID, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.user = u
+	return u, nil
 }

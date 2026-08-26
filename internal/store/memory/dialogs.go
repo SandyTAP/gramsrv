@@ -20,6 +20,13 @@ type DialogStore struct {
 	// archivePinned 记录 archive folder 行置顶状态；无记录时官方默认 true。
 	archivePinned map[int64]bool
 	translations  map[translationPreferenceKey]bool
+	// account dialog mutations append their allocated PTS event and dispatch
+	// while the dialog state lock is still held. The default is production-
+	// shaped for isolated memory tests; AttachUpdateEventStore binds difference
+	// reads to the same durable fact stream.
+	updateEvents *UpdateEventStore
+	channels     *ChannelStore
+	communities  *CommunityStore
 }
 
 type translationPreferenceKey struct {
@@ -43,6 +50,34 @@ func NewDialogStore() *DialogStore {
 		folderTags:    make(map[int64]bool),
 		archivePinned: make(map[int64]bool),
 		translations:  make(map[translationPreferenceKey]bool),
+		updateEvents:  NewUpdateEventStore(),
+	}
+}
+
+// AttachUpdateEventStore binds dialog aggregates to the event store consumed
+// by updates.getDifference. A nil dependency is rejected by mutation methods.
+func (s *DialogStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.updateEvents = events
+	s.mu.Unlock()
+}
+
+// BindDialogAggregateStores wires the channel/community participants whose
+// account-local dialog rows share the dialog aggregate transaction in memory.
+func (s *DialogStore) BindDialogAggregateStores(channels *ChannelStore, communities *CommunityStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.channels = channels
+	s.communities = communities
+	events := s.updateEvents
+	s.mu.Unlock()
+	if channels != nil {
+		channels.AttachDialogAccountAggregate(s, events)
 	}
 }
 

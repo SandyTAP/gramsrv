@@ -56,7 +56,7 @@ WHERE user_id = ANY($1::bigint[])`, ids).Scan(&initialWatermarks); err != nil {
 		t.Fatalf("initial watermarks = %d, want 0 so concurrency covers first upsert", initialWatermarks)
 	}
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 
 	const n = 200
 	base := time.Now().UnixNano()

@@ -42,10 +42,13 @@ func TestMessagesGetFutureChatCreatorAfterLeaveAndCreatorLeaveTransfers(t *testi
 		t.Fatalf("create member: %v", err)
 	}
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	channelService := appchannels.NewService(channelStore)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: channelService,
+		Users:          appusers.NewService(userStore),
+		Channels:       channelService,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700009100, 0)})
 	created, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,

@@ -103,7 +103,8 @@ func TestChatlistsJoinInviteReturnsDialogFilterUpdate(t *testing.T) {
 			Date: 100,
 		},
 	}
-	r := New(Config{}, Deps{Chatlists: fake}, zap.NewNop(), clock.System)
+	sessions := &captureSessions{}
+	r := New(Config{}, Deps{Chatlists: fake, Sessions: sessions}, zap.NewNop(), clock.System)
 	got, err := r.onChatlistsJoinChatlistInvite(WithUserID(context.Background(), 2002), &tg.ChatlistsJoinChatlistInviteRequest{
 		Slug:  "slug-rpc",
 		Peers: []tg.InputPeerClass{&tg.InputPeerChannel{ChannelID: 42, AccessHash: 4200}},
@@ -143,38 +144,6 @@ func TestChatlistsJoinInviteReturnsDialogFilterUpdate(t *testing.T) {
 	}
 }
 
-func TestChatlistsJoinedChannelNudgesCarryPts(t *testing.T) {
-	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Sessions: sessions}, zap.NewNop(), clock.System)
-	r.pushChatlistJoinedChannelNudges(context.Background(), 2002, []domain.Channel{
-		{ID: 42, Pts: 9},
-		{ID: 43},
-	})
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(updates.Updates) != 1 {
-		t.Fatalf("pushed updates = %#v, want one UpdateChannelTooLong", sessions.lastUserPush())
-	}
-	nudge, ok := updates.Updates[0].(*tg.UpdateChannelTooLong)
-	if !ok || nudge.ChannelID != 42 {
-		t.Fatalf("pushed update = %#v, want channel 42 nudge", updates.Updates[0])
-	}
-	pts, ok := nudge.GetPts()
-	if !ok || pts != 9 {
-		t.Fatalf("pushed nudge pts = %d ok %v, want 9 true", pts, ok)
-	}
-
-	sessions.clearMessages()
-	r.pushChatlistJoinedChannelNudges(WithSessionID(context.Background(), 77), 2002, []domain.Channel{{ID: 44, Pts: 11}})
-	snap := sessions.snapshot()
-	currentUpdates, ok := snap.message.(*tg.Updates)
-	if !ok || len(currentUpdates.Updates) != 1 {
-		t.Fatalf("current session push = %#v, want one UpdateChannelTooLong", snap.message)
-	}
-	if ids := sessions.pushedUserIDs(); len(ids) != 0 {
-		t.Fatalf("current session nudge pushed to user ids = %v, want none", ids)
-	}
-}
-
 func TestChatlistsCheckInviteRPCAlreadyAndFreshShapes(t *testing.T) {
 	peer := domain.DialogFolderPeer{Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 42}, AccessHash: 4200}
 	fake := &fakeChatlistsService{
@@ -190,7 +159,8 @@ func TestChatlistsCheckInviteRPCAlreadyAndFreshShapes(t *testing.T) {
 			Missing: []domain.DialogFolderPeer{peer},
 		},
 	}
-	r := New(Config{}, Deps{Chatlists: fake}, zap.NewNop(), clock.System)
+	sessions := &captureSessions{}
+	r := New(Config{}, Deps{Chatlists: fake, Sessions: sessions}, zap.NewNop(), clock.System)
 	fresh, err := r.onChatlistsCheckChatlistInvite(WithUserID(context.Background(), 2002), "slug-rpc")
 	if err != nil {
 		t.Fatalf("check fresh rpc: %v", err)
@@ -215,6 +185,9 @@ func TestChatlistsCheckInviteRPCAlreadyAndFreshShapes(t *testing.T) {
 	gotAlready, ok := already.(*tg.ChatlistsChatlistInviteAlready)
 	if !ok || gotAlready.FilterID != 5 || len(gotAlready.AlreadyPeers) != 1 {
 		t.Fatalf("already = %#v, want already filter id and peer", already)
+	}
+	if snap := sessions.snapshot(); snap.message != nil || len(sessions.pushedUserIDs()) != 0 {
+		t.Fatalf("read-only checkChatlistInvite emitted a session push: %+v", snap)
 	}
 }
 

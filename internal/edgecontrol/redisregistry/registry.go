@@ -24,13 +24,30 @@ var (
 )
 
 const (
-	locationRecordBatch             = 1024
-	leaseField                      = "__lease"
-	recordFieldPrefix               = "record:"
-	indexesFieldPrefix              = "indexes:"
-	membershipRecordFieldPrefix     = "membership:"
-	membershipChannelIDsFieldPrefix = "membership-channel-ids:"
+	locationRecordBatch                  = 1024
+	leaseField                           = "__lease"
+	recordFieldPrefix                    = "record:"
+	indexesFieldPrefix                   = "indexes:"
+	membershipRecordFieldPrefix          = "membership:"
+	membershipChannelIDsFieldPrefix      = "membership-channel-ids:"
+	channelPresenceFieldPrefix           = "channel-presence:"
+	memberPresenceCountFieldPrefix       = "channel-member-count:"
+	interestPresenceCountFieldPrefix     = "channel-interest-count:"
+	subscriptionPresenceCountFieldPrefix = "channel-subscription-count:"
+	maxLocationLeaseIDBytes              = 255
 )
+
+func validInstanceID(value string) bool {
+	return value != "" && len(value) <= edgecontrol.MaxDeliveryInstanceIDBytes && strings.TrimSpace(value) == value
+}
+
+func validLeaseID(value string) bool {
+	return value != "" && len(value) <= maxLocationLeaseIDBytes && strings.TrimSpace(value) == value
+}
+
+func validLocationRecord(record edgecontrol.LocationRecord) bool {
+	return validInstanceID(record.InstanceID) && record.RawAuthKeyID != ([8]byte{}) && record.SessionID != 0 && record.LocationRevision > 0
+}
 
 const acquireLeaseScript = `
 local current = redis.call('HGET', KEYS[1], ARGV[1])
@@ -71,35 +88,93 @@ if redis.call('HGET', KEYS[1], '` + leaseField + `') ~= ARGV[1] then
   return 0
 end
 
-local oldChannelIDsRaw = redis.call('HGET', KEYS[1], ARGV[3])
-if oldChannelIDsRaw then
-  local ok, oldChannelIDs = pcall(cjson.decode, oldChannelIDsRaw)
+local oldIndexesRaw = redis.call('HGET', KEYS[1], ARGV[3])
+if oldIndexesRaw then
+  local ok, oldIndexes = pcall(cjson.decode, oldIndexesRaw)
   if ok then
-    for _, channelID in ipairs(oldChannelIDs) do
-      redis.call('SREM', ARGV[8] .. tostring(channelID), ARGV[4])
+    for _, indexKey in ipairs(oldIndexes) do
+      redis.call('SREM', indexKey, ARGV[4])
     end
   end
 end
 
+local indexCount = tonumber(ARGV[8])
+local pos = 9 + indexCount
+local subscribedChannelsKey = ARGV[pos]
+pos = pos + 1
+local subscribedCount = tonumber(ARGV[pos])
+pos = pos + 1
+local subscriptionStart = pos
+pos = pos + subscribedCount
+local presenceField = ARGV[pos]
+local presenceRaw = ARGV[pos + 1]
+local instanceID = ARGV[pos + 2]
+local edgeInterestPrefix = ARGV[pos + 3]
+local edgeSubscriptionPrefix = ARGV[pos + 4]
+local interestCountPrefix = ARGV[pos + 5]
+local subscriptionCountPrefix = ARGV[pos + 6]
+
+local oldPresence = {interest = {}, subscription = {}}
+local oldPresenceRaw = redis.call('HGET', KEYS[1], presenceField)
+if oldPresenceRaw then
+  local ok, decoded = pcall(cjson.decode, oldPresenceRaw)
+  if ok then oldPresence = decoded end
+end
+local newPresence = {interest = {}, subscription = {}}
+if ARGV[5] ~= '1' then
+  local ok, decoded = pcall(cjson.decode, presenceRaw)
+  if not ok then return -2 end
+  newPresence = decoded
+end
+
+local function idSet(values)
+  local out = {}
+  if values then
+    for _, value in ipairs(values) do out[tostring(value)] = true end
+  end
+  return out
+end
+local function updatePresence(oldValues, newValues, edgePrefix, countPrefix)
+  local oldSet = idSet(oldValues)
+  local newSet = idSet(newValues)
+  for id, _ in pairs(oldSet) do
+    if not newSet[id] then
+      local count = redis.call('HINCRBY', KEYS[1], countPrefix .. id, -1)
+      if count <= 0 then
+        redis.call('HDEL', KEYS[1], countPrefix .. id)
+        redis.call('SREM', edgePrefix .. id, instanceID)
+      end
+    end
+  end
+  for id, _ in pairs(newSet) do
+    if not oldSet[id] then
+      local count = redis.call('HINCRBY', KEYS[1], countPrefix .. id, 1)
+      if count == 1 then redis.call('SADD', edgePrefix .. id, instanceID) end
+    end
+  end
+end
+
+updatePresence(oldPresence.interest, newPresence.interest, edgeInterestPrefix, interestCountPrefix)
+updatePresence(oldPresence.subscription, newPresence.subscription, edgeSubscriptionPrefix, subscriptionCountPrefix)
+
 if ARGV[5] == '1' then
-  redis.call('HDEL', KEYS[1], ARGV[2], ARGV[3])
+  redis.call('HDEL', KEYS[1], ARGV[2], ARGV[3], presenceField)
 else
   local revision = redis.call('INCR', KEYS[2])
   local recordRaw, replacements = string.gsub(ARGV[6], '"LocationRevision":0', '"LocationRevision":' .. tostring(revision), 1)
   if replacements ~= 1 then
     return -1
   end
-  redis.call('HSET', KEYS[1], ARGV[2], recordRaw, ARGV[3], ARGV[7])
+  redis.call('HSET', KEYS[1], ARGV[2], recordRaw, ARGV[3], ARGV[7], presenceField, presenceRaw)
 end
 
-local indexCount = tonumber(ARGV[8])
-local pos = 9
+pos = 9
 for i = 1, indexCount do
   redis.call('SADD', ARGV[pos], ARGV[4])
   pos = pos + 1
 end
 
-local subscribedChannelsKey = ARGV[pos]
+subscribedChannelsKey = ARGV[pos]
 pos = pos + 1
 local subscribedCount = tonumber(ARGV[pos])
 pos = pos + 1
@@ -118,12 +193,15 @@ if redis.call('HGET', KEYS[1], '` + leaseField + `') ~= ARGV[1] then
   return 0
 end
 
-local oldIndexesRaw = redis.call('HGET', KEYS[1], ARGV[3])
-if oldIndexesRaw then
-  local ok, oldIndexes = pcall(cjson.decode, oldIndexesRaw)
+local oldIDs = {}
+local oldIDsRaw = redis.call('HGET', KEYS[1], ARGV[3])
+if oldIDsRaw then
+  local ok, decoded = pcall(cjson.decode, oldIDsRaw)
   if ok then
-    for _, indexKey in ipairs(oldIndexes) do
-      redis.call('SREM', indexKey, ARGV[4])
+    for _, channelID in ipairs(decoded) do
+      local id = tostring(channelID)
+      oldIDs[id] = true
+      redis.call('SREM', ARGV[8] .. id, ARGV[4])
     end
   end
 end
@@ -136,11 +214,35 @@ end
 
 local memberChannelsKey = ARGV[9]
 local memberCount = tonumber(ARGV[10])
-local pos = 11
+local instanceID = ARGV[11]
+local edgeMemberPrefix = ARGV[12]
+local countFieldPrefix = ARGV[13]
+local pos = 14
+local newIDs = {}
 for i = 1, memberCount do
-  redis.call('SADD', ARGV[8] .. ARGV[pos], ARGV[4])
-  redis.call('SADD', memberChannelsKey, ARGV[pos])
+  local id = ARGV[pos]
+  newIDs[id] = true
+  redis.call('SADD', ARGV[8] .. id, ARGV[4])
+  redis.call('SADD', memberChannelsKey, id)
   pos = pos + 1
+end
+
+for id, _ in pairs(oldIDs) do
+  if not newIDs[id] then
+    local count = redis.call('HINCRBY', KEYS[1], countFieldPrefix .. id, -1)
+    if count <= 0 then
+      redis.call('HDEL', KEYS[1], countFieldPrefix .. id)
+      redis.call('SREM', edgeMemberPrefix .. id, instanceID)
+    end
+  end
+end
+for id, _ in pairs(newIDs) do
+  if not oldIDs[id] then
+    local count = redis.call('HINCRBY', KEYS[1], countFieldPrefix .. id, 1)
+    if count == 1 then
+      redis.call('SADD', edgeMemberPrefix .. id, instanceID)
+    end
+  end
 end
 return 1
 `
@@ -184,7 +286,7 @@ func (r *Registry) AcquireInstanceLease(ctx context.Context, instanceID, leaseID
 	if r == nil || r.c == nil {
 		return ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(leaseID) == "" || ttl <= 0 {
+	if !validInstanceID(instanceID) || !validLeaseID(leaseID) || ttl <= 0 {
 		return ErrInvalidRegistry
 	}
 	result, err := r.c.Eval(ctx, acquireLeaseScript, []string{r.instanceKey(instanceID)}, leaseField, leaseID, ttlMillis(ttl)).Int()
@@ -201,7 +303,7 @@ func (r *Registry) RenewInstanceLease(ctx context.Context, instanceID, leaseID s
 	if r == nil || r.c == nil {
 		return ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(leaseID) == "" || ttl <= 0 {
+	if !validInstanceID(instanceID) || !validLeaseID(leaseID) || ttl <= 0 {
 		return ErrInvalidRegistry
 	}
 	result, err := r.c.Eval(ctx, renewLeaseScript, []string{r.instanceKey(instanceID)}, leaseField, leaseID, ttlMillis(ttl)).Int()
@@ -218,7 +320,7 @@ func (r *Registry) ApplyLocationMutations(ctx context.Context, instanceID, lease
 	if r == nil || r.c == nil {
 		return ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(leaseID) == "" {
+	if !validInstanceID(instanceID) || !validLeaseID(leaseID) {
 		return ErrInvalidRegistry
 	}
 	if len(mutations) == 0 {
@@ -229,7 +331,7 @@ func (r *Registry) ApplyLocationMutations(ctx context.Context, instanceID, lease
 	cmds := make([]*redis.Cmd, 0, len(mutations))
 	for _, mutation := range mutations {
 		record := mutation.Record
-		if record.InstanceID != instanceID || record.RawAuthKeyID == ([8]byte{}) || record.SessionID == 0 {
+		if record.InstanceID != instanceID || !validInstanceID(record.InstanceID) || record.RawAuthKeyID == ([8]byte{}) || record.SessionID == 0 || record.LocationRevision != 0 {
 			return ErrInvalidRecord
 		}
 		record.UpdatedAtUnix = now.Unix()
@@ -252,7 +354,22 @@ func (r *Registry) ApplyLocationMutations(ctx context.Context, instanceID, lease
 			return fmt.Errorf("marshal edge location indexes: %w", err)
 		}
 		activeSubscriptions := activeChannelSubscriptionIDs(record.ChannelSubscriptions, now.UnixNano())
-		args := make([]any, 0, 12+len(indexes)+len(activeSubscriptions))
+		presence := struct {
+			Interest     []int64 `json:"interest"`
+			Subscription []int64 `json:"subscription"`
+		}{
+			Interest:     uniquePositiveInt64sSorted(record.ActiveChannelIDs),
+			Subscription: uniquePositiveInt64sSorted(activeSubscriptions),
+		}
+		if mutation.Deleted {
+			presence.Interest = nil
+			presence.Subscription = nil
+		}
+		presenceRaw, err := json.Marshal(presence)
+		if err != nil {
+			return fmt.Errorf("marshal edge channel presence: %w", err)
+		}
+		args := make([]any, 0, 19+len(indexes)+len(activeSubscriptions))
 		args = append(args, leaseID, recordField, indexesField, ref, boolFlag(mutation.Deleted), string(recordRaw), string(indexesRaw), len(indexes))
 		for _, indexKey := range indexes {
 			args = append(args, indexKey)
@@ -261,6 +378,11 @@ func (r *Registry) ApplyLocationMutations(ctx context.Context, instanceID, lease
 		for _, channelID := range activeSubscriptions {
 			args = append(args, strconv.FormatInt(channelID, 10))
 		}
+		args = append(args,
+			r.channelPresenceField(record.RawAuthKeyID, record.SessionID), string(presenceRaw), instanceID,
+			r.channelEdgeInterestKeyPrefix(), r.channelEdgeSubscriptionKeyPrefix(),
+			interestPresenceCountFieldPrefix, subscriptionPresenceCountFieldPrefix,
+		)
 		cmds = append(cmds, pipe.Eval(ctx, applyLocationMutationScript, []string{r.instanceKey(instanceID), r.locationRevisionKey()}, args...))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -274,6 +396,9 @@ func (r *Registry) ApplyLocationMutations(ctx context.Context, instanceID, lease
 		if result == -1 {
 			return fmt.Errorf("redis apply edge location mutation: revision placeholder missing")
 		}
+		if result == -2 {
+			return fmt.Errorf("redis apply edge location mutation: invalid channel presence payload")
+		}
 		if result != 1 {
 			return edgecontrol.ErrLocationLeaseLost
 		}
@@ -285,7 +410,7 @@ func (r *Registry) ApplyChannelMembershipMutations(ctx context.Context, instance
 	if r == nil || r.c == nil {
 		return ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(leaseID) == "" {
+	if !validInstanceID(instanceID) || !validLeaseID(leaseID) {
 		return ErrInvalidRegistry
 	}
 	if len(mutations) == 0 {
@@ -296,7 +421,7 @@ func (r *Registry) ApplyChannelMembershipMutations(ctx context.Context, instance
 	cmds := make([]*redis.Cmd, 0, len(mutations))
 	for _, mutation := range mutations {
 		record := mutation.Record
-		if record.InstanceID != instanceID || record.UserID <= 0 {
+		if record.InstanceID != instanceID || !validInstanceID(record.InstanceID) || record.UserID <= 0 {
 			return ErrInvalidRecord
 		}
 		record.UpdatedAtUnix = now.Unix()
@@ -318,8 +443,8 @@ func (r *Registry) ApplyChannelMembershipMutations(ctx context.Context, instance
 		if err != nil {
 			return fmt.Errorf("marshal edge channel membership ids: %w", err)
 		}
-		args := make([]any, 0, 10+len(channelIDs))
-		args = append(args, leaseID, recordField, channelIDsField, ref, boolFlag(mutation.Deleted), string(recordRaw), string(channelIDsRaw), r.channelMemberKeyPrefix(), r.memberChannelsKey(), len(channelIDs))
+		args := make([]any, 0, 13+len(channelIDs))
+		args = append(args, leaseID, recordField, channelIDsField, ref, boolFlag(mutation.Deleted), string(recordRaw), string(channelIDsRaw), r.channelMemberKeyPrefix(), r.memberChannelsKey(), len(channelIDs), instanceID, r.channelEdgeMemberKeyPrefix(), memberPresenceCountFieldPrefix)
 		for _, channelID := range channelIDs {
 			args = append(args, strconv.FormatInt(channelID, 10))
 		}
@@ -344,7 +469,7 @@ func (r *Registry) ReleaseInstanceLease(ctx context.Context, instanceID, leaseID
 	if r == nil || r.c == nil {
 		return ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(leaseID) == "" {
+	if !validInstanceID(instanceID) || !validLeaseID(leaseID) {
 		return ErrInvalidRegistry
 	}
 	result, err := r.c.Eval(ctx, releaseLeaseScript, []string{r.instanceKey(instanceID)}, leaseField, leaseID).Int()
@@ -430,7 +555,7 @@ func (r *Registry) ListInstance(ctx context.Context, instanceID string) ([]edgec
 	if r == nil || r.c == nil {
 		return nil, ErrNilClient
 	}
-	if strings.TrimSpace(instanceID) == "" {
+	if !validInstanceID(instanceID) {
 		return nil, ErrInvalidRegistry
 	}
 	values, err := r.c.HGetAll(ctx, r.instanceKey(instanceID)).Result()
@@ -449,7 +574,7 @@ func (r *Registry) ListInstance(ctx context.Context, instanceID string) ([]edgec
 		if err := json.Unmarshal([]byte(raw), &record); err != nil {
 			return nil, fmt.Errorf("unmarshal edge instance location %q: %w", field, err)
 		}
-		if record.InstanceID == instanceID {
+		if record.InstanceID == instanceID && validLocationRecord(record) {
 			records = append(records, record)
 		}
 	}
@@ -484,6 +609,102 @@ func (r *Registry) ListActiveRawAuthKeyIDs(ctx context.Context) ([][8]byte, erro
 		seen[record.RawAuthKeyID] = struct{}{}
 		out = append(out, record.RawAuthKeyID)
 	}
+	return out, nil
+}
+
+func (r *Registry) ListChannelDeliveryTargets(ctx context.Context, routes []edgecontrol.ChannelDeliveryRoute) ([]string, error) {
+	if r == nil || r.c == nil {
+		return nil, ErrNilClient
+	}
+	if len(routes) == 0 || len(routes) > edgecontrol.MaxDeliveryBatchItems {
+		return nil, ErrInvalidRegistry
+	}
+	indexKeys := make(map[string]struct{})
+	explicitUsers := make([]int64, 0)
+	for _, route := range routes {
+		if !route.ValidFor(edgecontrol.OrderingDomain{Kind: edgecontrol.QueueChannelPTS, StreamID: route.ChannelID}) {
+			return nil, ErrInvalidRegistry
+		}
+		switch route.Audience {
+		case edgecontrol.ChannelAudienceMembers:
+			indexKeys[r.channelEdgeMemberKey(route.ChannelID)] = struct{}{}
+			indexKeys[r.channelEdgeInterestKey(route.ChannelID)] = struct{}{}
+			indexKeys[r.channelEdgeSubscriptionKey(route.ChannelID)] = struct{}{}
+		case edgecontrol.ChannelAudienceMessageBox:
+			indexKeys[r.channelEdgeInterestKey(route.ChannelID)] = struct{}{}
+			indexKeys[r.channelEdgeSubscriptionKey(route.ChannelID)] = struct{}{}
+		}
+		explicitUsers = append(explicitUsers, route.AudienceUsers...)
+		explicitUsers = append(explicitUsers, route.AffectedUsers...)
+	}
+
+	pipe := r.c.Pipeline()
+	commands := make(map[string]*redis.StringSliceCmd, len(indexKeys))
+	for key := range indexKeys {
+		commands[key] = pipe.SMembers(ctx, key)
+	}
+	if len(commands) > 0 {
+		if _, err := pipe.Exec(ctx); err != nil {
+			return nil, fmt.Errorf("redis list channel Edge presence: %w", err)
+		}
+	}
+	instances := make(map[string]struct{})
+	instanceIndexes := make(map[string][]string)
+	staleByIndex := make(map[string][]any)
+	for key, command := range commands {
+		values, err := command.Result()
+		if err != nil {
+			return nil, fmt.Errorf("redis read channel Edge presence: %w", err)
+		}
+		for _, instanceID := range values {
+			if !validInstanceID(instanceID) {
+				staleByIndex[key] = append(staleByIndex[key], instanceID)
+				continue
+			}
+			instances[instanceID] = struct{}{}
+			instanceIndexes[instanceID] = append(instanceIndexes[instanceID], key)
+		}
+	}
+	if len(instances) > 0 {
+		livePipe := r.c.Pipeline()
+		live := make(map[string]*redis.BoolCmd, len(instances))
+		for instanceID := range instances {
+			live[instanceID] = livePipe.HExists(ctx, r.instanceKey(instanceID), leaseField)
+		}
+		if _, err := livePipe.Exec(ctx); err != nil {
+			return nil, fmt.Errorf("redis validate channel Edge leases: %w", err)
+		}
+		for instanceID, command := range live {
+			ok, err := command.Result()
+			if err != nil {
+				return nil, fmt.Errorf("redis read channel Edge lease: %w", err)
+			}
+			if ok {
+				continue
+			}
+			delete(instances, instanceID)
+			for _, key := range instanceIndexes[instanceID] {
+				staleByIndex[key] = append(staleByIndex[key], instanceID)
+			}
+		}
+	}
+	r.removeStaleIndexMembers(ctx, staleByIndex)
+	users, err := r.ListUsers(ctx, explicitUsers)
+	if err != nil {
+		return nil, err
+	}
+	for _, records := range users {
+		for _, record := range records {
+			if validLocationRecord(record) && record.ReceivesUpdates {
+				instances[record.InstanceID] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(instances))
+	for instanceID := range instances {
+		out = append(out, instanceID)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -718,7 +939,7 @@ func (r *Registry) channelMembershipRecordsByRefs(ctx context.Context, refs []st
 				stale = append(stale, ref.ref)
 				return records, stale, fmt.Errorf("unmarshal edge channel membership %q: %w", ref.ref, err)
 			}
-			if record.InstanceID != lookup.instanceID || record.UserID != ref.userID {
+			if record.InstanceID != lookup.instanceID || !validInstanceID(record.InstanceID) || record.UserID != ref.userID {
 				stale = append(stale, ref.ref)
 				continue
 			}
@@ -791,7 +1012,7 @@ func (r *Registry) locationRecordsByRefs(ctx context.Context, refs []string) (ma
 				stale = append(stale, ref.ref)
 				return records, stale, fmt.Errorf("unmarshal edge location %q: %w", ref.ref, err)
 			}
-			if record.InstanceID != lookup.instanceID {
+			if record.InstanceID != lookup.instanceID || !validLocationRecord(record) {
 				stale = append(stale, ref.ref)
 				continue
 			}
@@ -844,7 +1065,7 @@ func (r *Registry) parseLocationRef(ref string) (locationReference, error) {
 		return locationReference{}, fmt.Errorf("invalid edge location reference")
 	}
 	instanceRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil || len(instanceRaw) == 0 {
+	if err != nil || !validInstanceID(string(instanceRaw)) {
 		return locationReference{}, fmt.Errorf("invalid edge location instance")
 	}
 	rawAuthKeyID, err := parseKeyIDHex(parts[1])
@@ -866,6 +1087,10 @@ func (r *Registry) indexesField(rawAuthKeyID [8]byte, sessionID int64) string {
 	return fmt.Sprintf("%s%s:%d", indexesFieldPrefix, keyIDHex(rawAuthKeyID), sessionID)
 }
 
+func (r *Registry) channelPresenceField(rawAuthKeyID [8]byte, sessionID int64) string {
+	return fmt.Sprintf("%s%s:%d", channelPresenceFieldPrefix, keyIDHex(rawAuthKeyID), sessionID)
+}
+
 func (r *Registry) channelMembershipRef(instanceID string, userID int64) string {
 	encodedInstance := base64.RawURLEncoding.EncodeToString([]byte(instanceID))
 	return fmt.Sprintf("member:%s:%d", encodedInstance, userID)
@@ -877,7 +1102,7 @@ func (r *Registry) parseChannelMembershipRef(ref string) (channelMembershipRefer
 		return channelMembershipReference{}, fmt.Errorf("invalid edge channel membership reference")
 	}
 	instanceRaw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil || len(instanceRaw) == 0 {
+	if err != nil || !validInstanceID(string(instanceRaw)) {
 		return channelMembershipReference{}, fmt.Errorf("invalid edge channel membership instance")
 	}
 	userID, err := strconv.ParseInt(parts[2], 10, 64)
@@ -914,6 +1139,24 @@ func (r *Registry) channelMemberKey(channelID int64) string {
 }
 func (r *Registry) channelMemberKeyPrefix() string {
 	return fmt.Sprintf("%s:channel:member:", r.prefix)
+}
+func (r *Registry) channelEdgeMemberKey(channelID int64) string {
+	return fmt.Sprintf("%s:channel-edge:member:%d", r.prefix, channelID)
+}
+func (r *Registry) channelEdgeMemberKeyPrefix() string {
+	return fmt.Sprintf("%s:channel-edge:member:", r.prefix)
+}
+func (r *Registry) channelEdgeInterestKey(channelID int64) string {
+	return fmt.Sprintf("%s:channel-edge:interest:%d", r.prefix, channelID)
+}
+func (r *Registry) channelEdgeInterestKeyPrefix() string {
+	return fmt.Sprintf("%s:channel-edge:interest:", r.prefix)
+}
+func (r *Registry) channelEdgeSubscriptionKey(channelID int64) string {
+	return fmt.Sprintf("%s:channel-edge:subscription:%d", r.prefix, channelID)
+}
+func (r *Registry) channelEdgeSubscriptionKeyPrefix() string {
+	return fmt.Sprintf("%s:channel-edge:subscription:", r.prefix)
 }
 func (r *Registry) channelSubscriptionKey(channelID int64) string {
 	return fmt.Sprintf("%s:channel:subscription:%d", r.prefix, channelID)

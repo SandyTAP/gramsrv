@@ -39,7 +39,7 @@ func TestSendMonoforumMessageAndHistoryPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, sub.ID, other.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	broadcast, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner.ID, Title: "Mono Msg " + suffix, Broadcast: true, Date: 1700001000})
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
@@ -59,7 +59,7 @@ func TestSendMonoforumMessageAndHistoryPostgres(t *testing.T) {
 	if _, err := channels.GetChannel(ctx, sub.ID, monoID); err != nil {
 		t.Fatalf("subscriber get enabled monoforum without membership: %v", err)
 	}
-	if _, err := channels.JoinChannel(ctx, monoID, sub.ID, 1700001001); !errors.Is(err, domain.ErrChannelMonoforumUnsupported) {
+	if _, err := channels.JoinChannel(ctx, monoID, sub.ID, 1700001001, testPendingJoinEffects); !errors.Is(err, domain.ErrChannelMonoforumUnsupported) {
 		t.Fatalf("subscriber join monoforum err = %v, want ErrChannelMonoforumUnsupported", err)
 	}
 	suggestedDraft := domain.DialogDraft{
@@ -450,7 +450,7 @@ func TestSendPaidMonoforumMessageLedgerPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create other: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	broadcast, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner.ID, Title: "Paid Mono " + suffix, Broadcast: true, Date: 1700002000})
 	if err != nil {
 		t.Fatalf("create channel: %v", err)

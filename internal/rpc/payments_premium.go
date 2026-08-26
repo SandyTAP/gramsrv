@@ -174,14 +174,15 @@ func (r *Router) sendPremiumStarsForm(
 			return nil, internalErr()
 		}
 	}
-	result, err := r.deps.Premium.Purchase(ctx, domain.PremiumPurchaseRequest{
+	originAuthKeyID, originSessionID := deliveryExclusionFromContext(ctx)
+	result, err := r.deps.Premium.PurchaseWithDelivery(ctx, domain.PremiumPurchaseRequest{
 		BuyerUserID: userID, FormID: formID, Kind: invoice.Kind,
 		RecipientUserID: recipientID, Months: invoice.Months,
 		PlanVersion: invoice.PlanVersion, Message: invoice.Message,
 		Date: int(r.clock.Now().Unix()), CommandKey: fmt.Sprintf("premium:%d", formID),
-		OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx), OriginSessionID: sessionIDOrZero(ctx),
+		OriginAuthKeyID: originAuthKeyID, OriginSessionID: originSessionID,
 		RecipientBlocked: recipientBlocked,
-	})
+	}, r.premiumPurchaseDeliveryEffects(originAuthKeyID, originSessionID))
 	if err != nil {
 		return nil, premiumPaymentErr(err)
 	}
@@ -190,7 +191,6 @@ func (r *Router) sendPremiumStarsForm(
 	}
 	r.invalidatePremiumUserCaches(ctx, result.User.ID)
 	r.invalidateRPCProjectionForUser(result.User.ID)
-	r.pushPremiumStatusUpdate(ctx, result.User)
 	updates := r.starGiftSendUpdates(ctx, userID, result.Send)
 	if result.Form.EffectiveDebitStars() {
 		appendStarGiftBalanceUpdate(updates, domain.StarGiftCurrencyStars, result.Balance.Balance)

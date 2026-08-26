@@ -103,7 +103,7 @@ func TestChannelRevenueWithdrawalAggregatePostgres(t *testing.T) {
 	users := NewUserStore(pool)
 	creator := createTestUser(t, ctx, users, "+1887"+suffix+"01", "RevenueCreator", "")
 	other := createTestUser(t, ctx, users, "+1887"+suffix+"02", "RevenueOther", "")
-	created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: creator.ID, Title: "Revenue " + suffix, Broadcast: true, Date: now,
 	})
 	if err != nil {
@@ -395,7 +395,7 @@ WHERE channel_id=$1 AND currency='stars' AND status='pending'`, channelID).Scan(
 	}); err != nil {
 		t.Fatalf("issue pre-deletion claim: %v", err)
 	}
-	deletion, err := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, creator.ID, domain.AccountDeletionManual,
+	deletion, err := NewAccountLifecycleStore(pool, testAllocatorsFor(pool).boxIDs).ExecuteAccountDeletion(ctx, creator.ID, domain.AccountDeletionManual,
 		"revenue withdrawal test", time.Unix(int64(now+7), 0).UTC())
 	if err != nil || !deletion.Changed {
 		t.Fatalf("delete creator = %+v err=%v", deletion, err)
@@ -431,7 +431,7 @@ func TestChannelRevenueWithdrawalSerializesWithAccountDeletionPostgres(t *testin
 	now := int(time.Now().Unix())
 	users := NewUserStore(pool)
 	creator := createTestUser(t, ctx, users, "+1888"+suffix+"01", "RevenueRace", "")
-	created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: creator.ID, Title: "Revenue race " + suffix, Broadcast: true, Date: now,
 	})
 	if err != nil {
@@ -491,7 +491,7 @@ func TestChannelRevenueWithdrawalSerializesWithAccountDeletionPostgres(t *testin
 	}()
 	go func() {
 		<-start
-		value, deleteErr := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, creator.ID,
+		value, deleteErr := NewAccountLifecycleStore(pool, testAllocatorsFor(pool).boxIDs).ExecuteAccountDeletion(ctx, creator.ID,
 			domain.AccountDeletionManual, "concurrent revenue claim", time.Unix(int64(now+1), 0).UTC())
 		deleted <- deletionResult{value: value, err: deleteErr}
 	}()
@@ -544,7 +544,7 @@ func TestChannelRevenueWithdrawalSerializesWithPasswordChangePostgres(t *testing
 	suffix := randomSuffix(t)
 	now := int(time.Now().Unix())
 	creator := createTestUser(t, ctx, NewUserStore(pool), "+1889"+suffix+"01", "RevenuePasswordRace", "")
-	created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: creator.ID, Title: "Revenue password race " + suffix, Broadcast: true, Date: now,
 	})
 	if err != nil {
@@ -633,7 +633,7 @@ func TestChannelRevenueWithdrawalBindsFullyAuthorizedSessionPostgres(t *testing.
 	users := NewUserStore(pool)
 	creator := createTestUser(t, ctx, users, "+1890"+suffix+"01", "RevenueSession", "")
 	other := createTestUser(t, ctx, users, "+1890"+suffix+"02", "RevenueSessionOther", "")
-	created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: creator.ID, Title: "Revenue session " + suffix, Broadcast: true, Date: now,
 	})
 	if err != nil {

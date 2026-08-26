@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -138,9 +139,12 @@ LIMIT 500`, userID)
 	return out, nil
 }
 
-func (s *ChannelStore) ReadChannelMessageContents(ctx context.Context, req domain.ReadChannelMessageContentsRequest) (domain.ReadChannelMessageContentsResult, error) {
+func (s *ChannelStore) ReadChannelMessageContents(ctx context.Context, req domain.ReadChannelMessageContentsRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelMessageContentsResult]) (domain.ReadChannelMessageContentsResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.ReadChannelMessageContentsResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.ReadChannelMessageContentsResult{}, store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -161,11 +165,19 @@ func (s *ChannelStore) ReadChannelMessageContents(ctx context.Context, req domai
 		return domain.ReadChannelMessageContentsResult{}, err
 	}
 	if len(req.IDs) == 0 {
+		result := domain.ReadChannelMessageContentsResult{Channel: channel}
+		intents, err := effects(result)
+		if err != nil {
+			return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("build channel message contents delivery effects: %w", err)
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("apply channel message contents delivery effects: %w", err)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("commit read channel message contents: %w", err)
 		}
 		committed = true
-		return domain.ReadChannelMessageContentsResult{Channel: channel}, nil
+		return result, nil
 	}
 	if len(req.IDs) > domain.MaxGetMessageIDs {
 		return domain.ReadChannelMessageContentsResult{}, domain.ErrChannelInvalid
@@ -220,16 +232,24 @@ ORDER BY id DESC`, args...)
 	if err := s.populateChannelMessagesReactions(ctx, tx, req.UserID, []domain.Channel{channel}, messages); err != nil {
 		return domain.ReadChannelMessageContentsResult{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("commit read channel message contents: %w", err)
-	}
-	committed = true
-	return domain.ReadChannelMessageContentsResult{
+	result := domain.ReadChannelMessageContentsResult{
 		Channel:                         channel,
 		Messages:                        messages,
 		ClearedUnreadReactionMessageIDs: cleared,
 		ClearedUnreadMentionMessageIDs:  clearedMentions,
-	}, nil
+	}
+	intents, err := effects(result)
+	if err != nil {
+		return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("build channel message contents delivery effects: %w", err)
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("apply channel message contents delivery effects: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ReadChannelMessageContentsResult{}, fmt.Errorf("commit read channel message contents: %w", err)
+	}
+	committed = true
+	return result, nil
 }
 
 // readChannelMentionsForMessageIDsTx 把指定可见消息上的未读 mention 翻转为
@@ -347,10 +367,13 @@ func (s *ChannelStore) ReadChannelMentions(ctx context.Context, req domain.ReadC
 	}, nil
 }
 
-func (s *ChannelStore) ReadChannelHistory(ctx context.Context, req domain.ReadChannelHistoryRequest) (domain.ReadChannelHistoryResult, error) {
+func (s *ChannelStore) ReadChannelHistory(ctx context.Context, req domain.ReadChannelHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelHistoryResult]) (domain.ReadChannelHistoryResult, error) {
+	if effects == nil {
+		return domain.ReadChannelHistoryResult{}, store.ErrDeliveryOutboxRequired
+	}
 	var lastErr error
 	for attempt := 0; attempt < retryableChannelTxAttempts; attempt++ {
-		res, err := s.readChannelHistoryOnce(ctx, req)
+		res, err := s.readChannelHistoryOnce(ctx, req, effects)
 		if err == nil || !isRetryablePostgresTxError(err) || ctx.Err() != nil {
 			return res, err
 		}

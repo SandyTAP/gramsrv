@@ -70,21 +70,20 @@ func TestDispatchPromotesNegativeSessionCacheFromPositiveAuthCache(t *testing.T)
 	auth := &captureAuthService{}
 	r := New(Config{}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 	r.setAuthUserCache(authKeyID, userID, true)
 
 	var in bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 10, FilePart: 0, Bytes: []byte{1}}).Encode(&in); err != nil {
-		t.Fatalf("encode upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&in); err != nil {
+		t.Fatalf("encode authenticated probe: %v", err)
 	}
 	enc, err := r.Dispatch(context.Background(), authKeyID, sessionID, &in)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	if value, ok := dispatchCanonicalValue(enc).(bool); !ok || !value {
-		t.Fatalf("dispatch result = %#v (%T), want true", dispatchCanonicalValue(enc), enc)
+	if _, ok := dispatchCanonicalValue(enc).(*tg.AccountAuthorizations); !ok {
+		t.Fatalf("dispatch result = %#v (%T), want *tg.AccountAuthorizations", dispatchCanonicalValue(enc), enc)
 	}
 	gotSession := sessions.snapshot()
 	if gotSession.userID != userID || !gotSession.userResolved {
@@ -178,14 +177,13 @@ func TestDispatchRevalidatesExpiredSessionAuthUserCache(t *testing.T) {
 	auth := &captureAuthService{userID: userID}
 	r := New(Config{AuthUserCacheTTL: time.Minute}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), fixedClock{now: now})
 	r.setAuthUserCache(authKeyID, userID, true)
 
 	var first bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 44, FilePart: 0, Bytes: []byte{1}}).Encode(&first); err != nil {
-		t.Fatalf("encode first upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&first); err != nil {
+		t.Fatalf("encode first authenticated probe: %v", err)
 	}
 	auth.userID = 0
 	if _, err := r.Dispatch(context.Background(), authKeyID, sessionID, &first); err != nil {
@@ -197,8 +195,8 @@ func TestDispatchRevalidatesExpiredSessionAuthUserCache(t *testing.T) {
 
 	r.clock = fixedClock{now: now.Add(time.Minute)}
 	var second bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 44, FilePart: 1, Bytes: []byte{2}}).Encode(&second); err != nil {
-		t.Fatalf("encode second upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&second); err != nil {
+		t.Fatalf("encode second authenticated probe: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), authKeyID, sessionID, &second); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
 		t.Fatalf("expired session auth dispatch err = %v, want AUTH_KEY_UNREGISTERED", err)
@@ -257,18 +255,17 @@ func TestDispatchRevalidatesCachedTempAuthKeyBinding(t *testing.T) {
 	}
 	r := New(Config{}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	var first bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 10, FilePart: 0, Bytes: []byte{1}}).Encode(&first); err != nil {
-		t.Fatalf("encode first upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&first); err != nil {
+		t.Fatalf("encode first authenticated probe: %v", err)
 	}
 	if enc, err := r.Dispatch(context.Background(), tempAuthKeyID, 123, &first); err != nil {
 		t.Fatalf("first dispatch: %v", err)
-	} else if value, ok := dispatchCanonicalValue(enc).(bool); !ok || !value {
-		t.Fatalf("first dispatch result = %#v (%T), want true", dispatchCanonicalValue(enc), enc)
+	} else if _, ok := dispatchCanonicalValue(enc).(*tg.AccountAuthorizations); !ok {
+		t.Fatalf("first dispatch result = %#v (%T), want *tg.AccountAuthorizations", dispatchCanonicalValue(enc), enc)
 	}
 	gotSession := sessions.snapshot()
 	if gotSession.authKeyID != permAuthKeyID || gotSession.userID != 1000000001 {
@@ -279,8 +276,8 @@ func TestDispatchRevalidatesCachedTempAuthKeyBinding(t *testing.T) {
 	auth.resolvedAuthKeyID = [8]byte{}
 	auth.userID = 0
 	var second bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 10, FilePart: 1, Bytes: []byte{2}}).Encode(&second); err != nil {
-		t.Fatalf("encode second upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&second); err != nil {
+		t.Fatalf("encode second authenticated probe: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 123, &second); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
 		t.Fatalf("second dispatch err = %v, want AUTH_KEY_UNREGISTERED after temp binding no longer resolves", err)
@@ -308,13 +305,12 @@ func TestDispatchUsesCachedTempAuthKeyUserUntilWriteSideInvalidation(t *testing.
 	}
 	r := New(Config{}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	var first bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 11, FilePart: 0, Bytes: []byte{1}}).Encode(&first); err != nil {
-		t.Fatalf("encode first upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&first); err != nil {
+		t.Fatalf("encode first authenticated probe: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 124, &first); err != nil {
 		t.Fatalf("first dispatch: %v", err)
@@ -322,8 +318,8 @@ func TestDispatchUsesCachedTempAuthKeyUserUntilWriteSideInvalidation(t *testing.
 
 	auth.userID = 0
 	var second bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 11, FilePart: 1, Bytes: []byte{2}}).Encode(&second); err != nil {
-		t.Fatalf("encode second upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&second); err != nil {
+		t.Fatalf("encode second authenticated probe: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 124, &second); err != nil {
 		t.Fatalf("second dispatch should use cached user until write-side invalidation: %v", err)
@@ -341,8 +337,8 @@ func TestDispatchUsesCachedTempAuthKeyUserUntilWriteSideInvalidation(t *testing.
 
 	r.revokeAuthKeySessions(permAuthKeyID)
 	var third bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 11, FilePart: 2, Bytes: []byte{3}}).Encode(&third); err != nil {
-		t.Fatalf("encode third upload part: %v", err)
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&third); err != nil {
+		t.Fatalf("encode third authenticated probe: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 124, &third); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
 		t.Fatalf("third dispatch err = %v, want AUTH_KEY_UNREGISTERED after write-side invalidation", err)

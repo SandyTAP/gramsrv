@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,14 +34,66 @@ func NewCollectibleUsernameStore(db sqlcgen.DBTX) *CollectibleUsernameStore {
 }
 
 var (
-	_ store.UsernameRegistryStore    = (*CollectibleUsernameStore)(nil)
-	_ store.CollectibleUsernameStore = (*CollectibleUsernameStore)(nil)
+	_ store.UsernameRegistryStore            = (*CollectibleUsernameStore)(nil)
+	_ store.CollectibleUsernameStore         = (*CollectibleUsernameStore)(nil)
+	_ store.UsernameRegistryDeliveryStore    = (*CollectibleUsernameStore)(nil)
+	_ store.CollectibleUsernameDeliveryStore = (*CollectibleUsernameStore)(nil)
 )
 
 const (
 	defaultCollectibleUsernameListLimit = 50
 	maxCollectibleUsernameListLimit     = 200
 )
+
+func applyUsernameAudienceDeliveryTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	peers []domain.Peer,
+	build store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot],
+) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	userIDs := make([]int64, 0, len(peers))
+	seen := make(map[int64]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[peer.ID]; duplicate {
+			continue
+		}
+		seen[peer.ID] = struct{}{}
+		userIDs = append(userIDs, peer.ID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	snapshot := store.UsernameAudienceDeliverySnapshot{Users: make([]store.UserAudienceDeliverySnapshot, 0, len(userIDs))}
+	qtx := sqlcgen.New(tx)
+	for _, userID := range userIDs {
+		row, err := qtx.GetUserByID(ctx, userID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUserNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("load username delivery user %d: %w", userID, err)
+		}
+		audience, err := moderationFlagAudience(ctx, tx, userID, maxModerationFlagAudience)
+		if err != nil {
+			return err
+		}
+		snapshot.Users = append(snapshot.Users, store.UserAudienceDeliverySnapshot{
+			User: userFromModel(row), Audience: audience,
+		})
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return fmt.Errorf("build username audience delivery: %w", err)
+	}
+	if err := store.ValidateUsernameAudienceDeliveryEffects(snapshot, effects); err != nil {
+		return err
+	}
+	return applyAbsoluteDeliveryEffectsTx(ctx, tx, effects)
+}
 
 // collectibleUsernameColumns is the asset projection shared by every reader.
 const collectibleUsernameColumns = `id, username, status, owner_peer_type, owner_peer_id,
@@ -67,6 +120,17 @@ func (s *CollectibleUsernameStore) PeerUsernamesBatch(ctx context.Context, peers
 // SetUsernameActive toggles one collectible row. The editable slot is rejected:
 // the client owns it through account.updateUsername, not through this path.
 func (s *CollectibleUsernameStore) SetUsernameActive(ctx context.Context, peer domain.Peer, username string, active bool) (bool, error) {
+	return s.setUsernameActive(ctx, peer, username, active, nil)
+}
+
+func (s *CollectibleUsernameStore) SetUsernameActiveWithDelivery(ctx context.Context, peer domain.Peer, username string, active bool, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	return s.setUsernameActive(ctx, peer, username, active, effects)
+}
+
+func (s *CollectibleUsernameStore) setUsernameActive(ctx context.Context, peer domain.Peer, username string, active bool, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -93,6 +157,9 @@ WHERE username_lower = $1 AND peer_type = $2 AND peer_id = $3
 			return fmt.Errorf("update collectible username active: %w", err)
 		}
 		changed = tag.RowsAffected() > 0
+		if changed && effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{peer}, effects)
+		}
 		return nil
 	})
 	if err != nil {
@@ -106,6 +173,17 @@ WHERE username_lower = $1 AND peer_type = $2 AND peer_id = $3
 // domain.ValidateUsernameReorder -- so the editable row is repositioned like any
 // other and a collectible may end up first.
 func (s *CollectibleUsernameStore) ReorderUsernames(ctx context.Context, peer domain.Peer, order []string) (bool, error) {
+	return s.reorderUsernames(ctx, peer, order, nil)
+}
+
+func (s *CollectibleUsernameStore) ReorderUsernamesWithDelivery(ctx context.Context, peer domain.Peer, order []string, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	return s.reorderUsernames(ctx, peer, order, effects)
+}
+
+func (s *CollectibleUsernameStore) reorderUsernames(ctx context.Context, peer domain.Peer, order []string, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -140,6 +218,9 @@ WHERE username_lower = $1 AND peer_type = $2 AND peer_id = $3`,
 				return fmt.Errorf("update username sort order: %w", err)
 			}
 		}
+		if changed && effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{peer}, effects)
+		}
 		return nil
 	})
 	if err != nil {
@@ -152,26 +233,56 @@ WHERE username_lower = $1 AND peer_type = $2 AND peer_id = $3`,
 // is what losing a public surface does to the peer's collectible names. The
 // editable slot keeps its own flag.
 func (s *CollectibleUsernameStore) DeactivateAllUsernames(ctx context.Context, peer domain.Peer) (bool, error) {
+	return s.deactivateAllUsernames(ctx, peer, nil)
+}
+
+func (s *CollectibleUsernameStore) DeactivateAllUsernamesWithDelivery(ctx context.Context, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	return s.deactivateAllUsernames(ctx, peer, effects)
+}
+
+func (s *CollectibleUsernameStore) deactivateAllUsernames(ctx context.Context, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("collectible username store is not configured")
 	}
 	if peer.Type == "" || peer.ID <= 0 {
 		return false, domain.ErrUsernameInvalid
 	}
-	tag, err := s.db.Exec(ctx, `
+	changed := false
+	err := withTx(ctx, s.db, "deactivate collectible usernames", func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 UPDATE peer_usernames SET active = false, updated_at = now()
 WHERE peer_type = $1 AND peer_id = $2 AND collectible_id IS NOT NULL AND active`,
-		string(peer.Type), peer.ID)
-	if err != nil {
-		return false, fmt.Errorf("deactivate collectible usernames: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
+			string(peer.Type), peer.ID)
+		if err != nil {
+			return fmt.Errorf("deactivate collectible usernames: %w", err)
+		}
+		changed = tag.RowsAffected() > 0
+		if changed && effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{peer}, effects)
+		}
+		return nil
+	})
+	return changed, err
 }
 
 // MintCollectibleUsername creates the asset, optionally assigning it in the same
 // transaction. A non-empty CommandKey makes the mint replay-safe: the recorded
 // provenance row carries the key, so a retry returns the original asset.
 func (s *CollectibleUsernameStore) MintCollectibleUsername(ctx context.Context, req domain.MintCollectibleUsernameRequest) (domain.CollectibleUsername, bool, error) {
+	return s.mintCollectibleUsername(ctx, req, nil)
+}
+
+func (s *CollectibleUsernameStore) MintCollectibleUsernameWithDelivery(ctx context.Context, req domain.MintCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if effects == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	return s.mintCollectibleUsername(ctx, req, effects)
+}
+
+func (s *CollectibleUsernameStore) mintCollectibleUsername(ctx context.Context, req domain.MintCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CollectibleUsername{}, false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -272,6 +383,9 @@ RETURNING id`,
 		}
 		asset = loaded
 		created = true
+		if effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{asset.Owner}, effects)
+		}
 		return nil
 	})
 	if err != nil {
@@ -284,6 +398,17 @@ RETURNING id`,
 // the current holder. The old registry row is removed and the new one inserted in
 // the same transaction, so the name never resolves to the wrong peer.
 func (s *CollectibleUsernameStore) TransferCollectibleUsername(ctx context.Context, req domain.TransferCollectibleUsernameRequest) (domain.CollectibleUsername, bool, error) {
+	return s.transferCollectibleUsername(ctx, req, nil)
+}
+
+func (s *CollectibleUsernameStore) TransferCollectibleUsernameWithDelivery(ctx context.Context, req domain.TransferCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if effects == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	return s.transferCollectibleUsername(ctx, req, effects)
+}
+
+func (s *CollectibleUsernameStore) transferCollectibleUsername(ctx context.Context, req domain.TransferCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CollectibleUsername{}, false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -363,6 +488,9 @@ WHERE id = $1`, current.ID, string(req.To.Type), req.To.ID, now); err != nil {
 		}
 		asset = loaded
 		changed = true
+		if effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{current.Owner, asset.Owner}, effects)
+		}
 		return nil
 	})
 	if err != nil {
@@ -375,6 +503,17 @@ WHERE id = $1`, current.ID, string(req.To.Type), req.To.ID, now); err != nil {
 // req.Burn is set. Either way the registry row goes away, so the name stops
 // resolving to the former holder; a burn additionally retires the asset.
 func (s *CollectibleUsernameStore) RevokeCollectibleUsername(ctx context.Context, req domain.RevokeCollectibleUsernameRequest) (domain.CollectibleUsername, bool, error) {
+	return s.revokeCollectibleUsername(ctx, req, nil)
+}
+
+func (s *CollectibleUsernameStore) RevokeCollectibleUsernameWithDelivery(ctx context.Context, req domain.RevokeCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if effects == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	return s.revokeCollectibleUsername(ctx, req, effects)
+}
+
+func (s *CollectibleUsernameStore) revokeCollectibleUsername(ctx context.Context, req domain.RevokeCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CollectibleUsername{}, false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -444,6 +583,9 @@ WHERE id = $1`, current.ID, string(status), now); err != nil {
 		}
 		asset = loaded
 		changed = true
+		if effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{current.Owner}, effects)
+		}
 		return nil
 	})
 	if err != nil {
@@ -461,6 +603,17 @@ WHERE id = $1`, current.ID, string(status), now); err != nil {
 // return -- so a second call simply reports deleted=false once no live asset
 // remains.
 func (s *CollectibleUsernameStore) DeleteCollectibleUsername(ctx context.Context, req domain.DeleteCollectibleUsernameRequest) (bool, error) {
+	return s.deleteCollectibleUsername(ctx, req, nil)
+}
+
+func (s *CollectibleUsernameStore) DeleteCollectibleUsernameWithDelivery(ctx context.Context, req domain.DeleteCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	return s.deleteCollectibleUsername(ctx, req, effects)
+}
+
+func (s *CollectibleUsernameStore) deleteCollectibleUsername(ctx context.Context, req domain.DeleteCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("collectible username store is not configured")
 	}
@@ -475,12 +628,14 @@ func (s *CollectibleUsernameStore) DeleteCollectibleUsername(ctx context.Context
 	deleted := false
 	err := withTx(ctx, s.db, "delete collectible username", func(tx pgx.Tx) error {
 		var id int64
+		var ownerType string
+		var ownerID int64
 		switch err := tx.QueryRow(ctx, `
-SELECT id FROM collectible_usernames
+SELECT id,owner_peer_type,owner_peer_id FROM collectible_usernames
 WHERE username_lower = $1 AND status <> 'burned'
 ORDER BY id DESC
 LIMIT 1
-FOR UPDATE`, usernameLower).Scan(&id); {
+FOR UPDATE`, usernameLower).Scan(&id, &ownerType, &ownerID); {
 		case err == nil:
 		case errors.Is(err, pgx.ErrNoRows):
 			// Either the name was never issued, or only burned history remains.
@@ -499,6 +654,9 @@ FOR UPDATE`, usernameLower).Scan(&id); {
 			return fmt.Errorf("delete collectible username: %w", err)
 		}
 		deleted = true
+		if effects != nil {
+			return applyUsernameAudienceDeliveryTx(ctx, tx, []domain.Peer{{Type: domain.PeerType(ownerType), ID: ownerID}}, effects)
+		}
 		return nil
 	})
 	if err != nil {

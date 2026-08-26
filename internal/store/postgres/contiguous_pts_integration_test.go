@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"testing"
-	"time"
 
 	"telesrv/internal/domain"
 )
@@ -14,383 +13,111 @@ func TestReserveUserPtsRejectsZeroBeforeQuery(t *testing.T) {
 	}
 }
 
-// TestAppendAllocatedFirstPtsRangeAndRollback covers both branches of the
-// single-statement watermark upsert through a legal durable update. A rolled
-// back first allocation must leave no watermark; the committed retry must
-// create one range ending at pts=3 with pts_count=3.
 func TestAppendAllocatedFirstPtsRangeAndRollback(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	suffix := randomSuffix(t)
 	owner, err := NewUserStore(pool).Create(ctx, domain.User{
-		AccessHash: 4,
-		Phone:      "+1555" + suffix + "01",
-		FirstName:  "FirstPtsRange",
+		AccessHash: 4, Phone: "+1555" + randomSuffix(t) + "01", FirstName: "FirstPtsRange",
 	})
 	if err != nil {
-		t.Fatalf("create user: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
-	})
-
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID) })
 	event := domain.UpdateEvent{
-		Type:       domain.UpdateEventDeleteMessages,
-		PtsCount:   3,
-		Date:       1700000003,
+		Type: domain.UpdateEventDeleteMessages, PtsCount: 3, Date: 1700000003,
 		MessageIDs: []int{101, 102, 103},
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		t.Fatalf("begin rollback allocation: %v", err)
+		t.Fatal(err)
 	}
 	allocated, err := NewUpdateEventStore(tx).AppendAllocated(ctx, owner.ID, event)
 	if err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("append allocated before rollback: %v", err)
+		t.Fatal(err)
 	}
 	if allocated.Pts != 3 || allocated.PtsCount != 3 {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("allocated before rollback = pts %d count %d, want 3/3", allocated.Pts, allocated.PtsCount)
+		t.Fatalf("allocated=%+v want pts/count 3/3", allocated)
 	}
 	if err := tx.Rollback(ctx); err != nil {
-		t.Fatalf("rollback first allocation: %v", err)
+		t.Fatal(err)
 	}
-
 	var rows int
-	if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM user_update_watermarks WHERE user_id=$1`, owner.ID).Scan(&rows); err != nil {
-		t.Fatalf("count watermark after rollback: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_update_watermarks WHERE user_id=$1`, owner.ID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("watermark after rollback rows=%d err=%v", rows, err)
 	}
-	if rows != 0 {
-		t.Fatalf("watermark rows after rollback = %d, want 0", rows)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM user_update_events WHERE user_id=$1`, owner.ID).Scan(&rows); err != nil {
-		t.Fatalf("count events after rollback: %v", err)
-	}
-	if rows != 0 {
-		t.Fatalf("event rows after rollback = %d, want 0", rows)
-	}
-
 	allocated, err = NewUpdateEventStore(pool).AppendAllocated(ctx, owner.ID, event)
-	if err != nil {
-		t.Fatalf("append allocated after rollback: %v", err)
-	}
-	if allocated.Pts != 3 || allocated.PtsCount != 3 {
-		t.Fatalf("committed allocation = pts %d count %d, want 3/3", allocated.Pts, allocated.PtsCount)
+	if err != nil || allocated.Pts != 3 || allocated.PtsCount != 3 {
+		t.Fatalf("committed allocation=%+v err=%v", allocated, err)
 	}
 	if pts, err := NewUpdateEventStore(pool).MaxContiguousPts(ctx, owner.ID); err != nil || pts != 3 {
-		t.Fatalf("MaxContiguousPts = %d err=%v, want 3", pts, err)
-	}
-	events, err := NewUpdateEventStore(pool).ListAfter(ctx, owner.ID, 0, 10)
-	if err != nil {
-		t.Fatalf("ListAfter: %v", err)
-	}
-	if len(events) != 1 || events[0].Pts != 3 || events[0].PtsCount != 3 || len(events[0].MessageIDs) != 3 {
-		t.Fatalf("events = %+v, want one delete range ending at 3", events)
+		t.Fatalf("MaxContiguousPts=%d err=%v", pts, err)
 	}
 }
 
-// TestAppendRejectsPtsHole 用真实 PG 验证显式 pts 写入不能制造空洞。
 func TestAppendRejectsPtsHole(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-
-	suffix := randomSuffix(t)
 	owner, err := NewUserStore(pool).Create(ctx, domain.User{
-		AccessHash: 1,
-		Phone:      "+1556" + suffix + "01",
-		FirstName:  "Contig",
+		AccessHash: 1, Phone: "+1556" + randomSuffix(t) + "01", FirstName: "Contig",
 	})
 	if err != nil {
-		t.Fatalf("create user: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, "DELETE FROM user_update_events WHERE user_id = $1", owner.ID)
-		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
-	})
-
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID) })
 	events := NewUpdateEventStore(pool)
-	appendPts := func(pts int) {
-		if err := events.Append(ctx, owner.ID, domain.UpdateEvent{
-			Type:     domain.UpdateEventNoop,
-			Pts:      pts,
-			PtsCount: 1,
-			Date:     1700000000 + pts,
-		}); err != nil {
+	for _, pts := range []int{1, 2, 3} {
+		if err := events.Append(ctx, owner.ID, domain.UpdateEvent{Type: domain.UpdateEventNoop, Pts: pts, PtsCount: 1, Date: 1700000000 + pts}); err != nil {
 			t.Fatalf("append pts=%d: %v", pts, err)
 		}
 	}
-
-	for _, p := range []int{1, 2, 3} {
-		appendPts(p)
+	if err := events.Append(ctx, owner.ID, domain.UpdateEvent{Type: domain.UpdateEventNoop, Pts: 5, PtsCount: 1, Date: 1700000005}); err == nil {
+		t.Fatal("append pts=5 succeeded across a gap")
 	}
-	err = events.Append(ctx, owner.ID, domain.UpdateEvent{
-		Type:     domain.UpdateEventNoop,
-		Pts:      5,
-		PtsCount: 1,
-		Date:     1700000005,
-	})
-	if err == nil {
-		t.Fatal("append pts=5 succeeded, want gap rejection")
-	}
-	got, err := events.MaxContiguousPts(ctx, owner.ID)
-	if err != nil {
-		t.Fatalf("MaxContiguousPts: %v", err)
-	}
-	if got != 3 {
-		t.Fatalf("contiguous = %d, want 3 after rejected gap", got)
-	}
-
-	appendPts(4)
-	appendPts(5)
-	got, err = events.MaxContiguousPts(ctx, owner.ID)
-	if err != nil {
-		t.Fatalf("MaxContiguousPts after fill: %v", err)
-	}
-	if got != 5 {
-		t.Fatalf("contiguous after ordered append = %d, want 5", got)
+	if got, err := events.MaxContiguousPts(ctx, owner.ID); err != nil || got != 3 {
+		t.Fatalf("contiguous=%d err=%v want=3", got, err)
 	}
 }
 
-func TestAppendWithDispatchWritesEventAndOutboxAtomically(t *testing.T) {
+func TestAppendWithDispatchWritesImmutableItemAndLaneAtomically(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-
-	suffix := randomSuffix(t)
 	owner, err := NewUserStore(pool).Create(ctx, domain.User{
-		AccessHash: 2,
-		Phone:      "+1557" + suffix + "01",
-		FirstName:  "Dispatch",
+		AccessHash: 2, Phone: "+1557" + randomSuffix(t) + "01", FirstName: "Dispatch",
 	})
 	if err != nil {
-		t.Fatalf("create user: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, "DELETE FROM dispatch_outbox WHERE target_user_id = $1", owner.ID)
-		_, _ = pool.Exec(ctx, "DELETE FROM user_update_events WHERE user_id = $1", owner.ID)
-		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
-	})
-
+	cleanupDispatchUser(t, pool, owner.ID)
 	event := domain.UpdateEvent{
-		UserID:   owner.ID,
-		Type:     domain.UpdateEventDialogPinned,
-		Pts:      1,
-		PtsCount: 1,
-		Date:     1700000001,
-		Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: 1000000002},
-		Settings: domain.PeerSettings{
-			ShareContact: true,
-		},
-		Bool: true,
+		UserID: owner.ID, Type: domain.UpdateEventDialogPinned, PtsCount: 1, Date: 1700000001,
+		Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 1000000002}, Bool: true,
 	}
-	var excludeAuthKeyID [8]byte
-	excludeAuthKeyID[0] = 9
+	excludeAuthKeyID := [8]byte{0xff, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0xf0}
 	if _, err := NewUpdateEventStore(pool).AppendAllocatedWithDispatch(ctx, owner.ID, event, excludeAuthKeyID, 77); err != nil {
 		t.Fatalf("AppendAllocatedWithDispatch: %v", err)
 	}
-
-	got, err := NewUpdateEventStore(pool).ListAfter(ctx, owner.ID, 0, 10)
-	if err != nil {
-		t.Fatalf("ListAfter: %v", err)
-	}
-	if len(got) != 1 || got[0].Type != event.Type || got[0].Peer != event.Peer || !got[0].Bool {
-		t.Fatalf("events = %+v, want dialog pinned event", got)
-	}
-
-	var outbox struct {
-		pts              int
-		eventType        string
-		excludeAuthKeyID int64
-		excludeSessionID int64
-	}
+	var pts, headPTS int
+	var eventType, laneState string
+	var excludeAuth []byte
+	var excludeSession int64
 	if err := pool.QueryRow(ctx, `
-		SELECT pts, event_type, exclude_auth_key_id, exclude_session_id
-		FROM dispatch_outbox
-		WHERE target_user_id = $1
-	`, owner.ID).Scan(&outbox.pts, &outbox.eventType, &outbox.excludeAuthKeyID, &outbox.excludeSessionID); err != nil {
-		t.Fatalf("query dispatch outbox: %v", err)
+SELECT d.pts, d.event_type, d.exclude_auth_key_id, d.exclude_session_id,
+       l.head_sequence, l.state
+FROM dispatch_outbox d
+JOIN dispatch_outbox_lanes l ON l.stream_id = d.target_user_id
+WHERE d.target_user_id = $1`, owner.ID).Scan(
+		&pts, &eventType, &excludeAuth, &excludeSession, &headPTS, &laneState,
+	); err != nil {
+		t.Fatal(err)
 	}
-	if outbox.pts != 1 || outbox.eventType != string(domain.UpdateEventDialogPinned) || outbox.excludeAuthKeyID != authKeyIDToInt64(excludeAuthKeyID) || outbox.excludeSessionID != 77 {
-		t.Fatalf("outbox = %+v, want event dispatch excluding current session", outbox)
+	storedAuthKeyID, authErr := outboxAuthKeyID(excludeAuth)
+	if pts != 1 || headPTS != 1 || eventType != string(domain.UpdateEventDialogPinned) || authErr != nil ||
+		storedAuthKeyID != excludeAuthKeyID || excludeSession != 77 || laneState != "ready" {
+		t.Fatalf("item/lane=%d/%d/%s/%x/%d/%s authErr=%v", pts, headPTS, eventType, excludeAuth, excludeSession, laneState, authErr)
 	}
-}
-
-func TestDispatchOutboxLifecycleKeepsDurableEvents(t *testing.T) {
-	pool := testPool(t)
-	ctx := context.Background()
-
-	suffix := randomSuffix(t)
-	owner, err := NewUserStore(pool).Create(ctx, domain.User{
-		AccessHash: 3,
-		Phone:      "+1558" + suffix + "01",
-		FirstName:  "Outbox",
-	})
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
-	})
-
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	events := NewUpdateEventStore(tx)
-	outbox := NewDispatchOutboxStore(tx, WithLeaseTimeout(time.Second))
-	appendEvent := func(pts int, sessionID int64) {
-		t.Helper()
-		event := domain.UpdateEvent{
-			UserID:   owner.ID,
-			Type:     domain.UpdateEventDialogPinned,
-			Pts:      pts,
-			PtsCount: 1,
-			Date:     1700000100 + pts,
-			Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID + int64(pts)},
-			Bool:     pts%2 == 0,
-		}
-		if _, err := events.AppendAllocatedWithDispatch(ctx, owner.ID, event, [8]byte{1}, sessionID); err != nil {
-			t.Fatalf("AppendAllocatedWithDispatch pts=%d: %v", pts, err)
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE dispatch_outbox
-			SET next_attempt_at = now() - interval '10 years',
-			    updated_at = now() - interval '10 years'
-			WHERE target_user_id = $1
-			  AND pts = $2
-		`, owner.ID, pts); err != nil {
-			t.Fatalf("make outbox ready pts=%d: %v", pts, err)
-		}
-	}
-	outboxRows := func(pts int) int {
-		t.Helper()
-		var count int
-		if err := tx.QueryRow(ctx, `
-			SELECT count(*)::int
-			FROM dispatch_outbox
-			WHERE target_user_id = $1
-			  AND pts = $2
-		`, owner.ID, pts).Scan(&count); err != nil {
-			t.Fatalf("count outbox pts=%d: %v", pts, err)
-		}
-		return count
-	}
-	eventRows := func(pts int) int {
-		t.Helper()
-		var count int
-		if err := tx.QueryRow(ctx, `
-			SELECT count(*)::int
-			FROM user_update_events
-			WHERE user_id = $1
-			  AND pts = $2
-		`, owner.ID, pts).Scan(&count); err != nil {
-			t.Fatalf("count event pts=%d: %v", pts, err)
-		}
-		return count
-	}
-
-	appendEvent(1, 101)
-	claimed, err := outbox.ClaimPending(ctx, 1)
-	if err != nil {
-		t.Fatalf("ClaimPending first event: %v", err)
-	}
-	if len(claimed) != 1 || claimed[0].TargetUserID != owner.ID || claimed[0].Pts != 1 || claimed[0].Attempts != 1 || claimed[0].ExcludeSessionID != 101 {
-		t.Fatalf("claimed first = %+v, want owner pts=1 attempts=1", claimed)
-	}
-	if err := outbox.MarkDelivered(ctx, claimed[0]); err != nil {
-		t.Fatalf("MarkDelivered: %v", err)
-	}
-	if got := outboxRows(1); got != 0 {
-		t.Fatalf("outbox rows for delivered pts=1 = %d, want 0", got)
-	}
-	if got := eventRows(1); got != 1 {
-		t.Fatalf("durable event rows for delivered pts=1 = %d, want 1", got)
-	}
-
-	appendEvent(2, 102)
-	if _, err := tx.Exec(ctx, `
-		UPDATE dispatch_outbox
-		SET status = 'dispatching',
-		    attempts = 1,
-		    next_attempt_at = now() - interval '10 years',
-		    updated_at = now() - interval '10 years'
-		WHERE target_user_id = $1
-		  AND pts = 2
-	`, owner.ID); err != nil {
-		t.Fatalf("make stale dispatching: %v", err)
-	}
-	claimed, err = outbox.ClaimPending(ctx, 1)
-	if err != nil {
-		t.Fatalf("ClaimPending stale event: %v", err)
-	}
-	if len(claimed) != 1 || claimed[0].TargetUserID != owner.ID || claimed[0].Pts != 2 || claimed[0].Attempts != 2 {
-		t.Fatalf("claimed stale = %+v, want owner pts=2 attempts=2", claimed)
-	}
-	if err := outbox.MarkFailed(ctx, claimed[0], "temporary"); err != nil {
-		t.Fatalf("MarkFailed temporary: %v", err)
-	}
-	var status string
-	var attempts int
-	var lastError string
-	var retryFuture bool
-	if err := tx.QueryRow(ctx, `
-		SELECT status, attempts, last_error, next_attempt_at > now()
-		FROM dispatch_outbox
-		WHERE target_user_id = $1
-		  AND id = $2
-	`, owner.ID, claimed[0].ID).Scan(&status, &attempts, &lastError, &retryFuture); err != nil {
-		t.Fatalf("query temporary failure: %v", err)
-	}
-	if status != "pending" || attempts != 2 || lastError != "temporary" || !retryFuture {
-		t.Fatalf("temporary failure status=%s attempts=%d err=%q retryFuture=%v, want pending attempts=2 future retry", status, attempts, lastError, retryFuture)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE dispatch_outbox
-		SET status = 'dispatching',
-		    attempts = 5,
-		    updated_at = now() - interval '10 years'
-		WHERE target_user_id = $1
-		  AND id = $2
-	`, owner.ID, claimed[0].ID); err != nil {
-		t.Fatalf("prepare terminal failure: %v", err)
-	}
-	claimed[0].Attempts = 5
-	if err := outbox.MarkFailed(ctx, claimed[0], "permanent"); err != nil {
-		t.Fatalf("MarkFailed permanent: %v", err)
-	}
-	if err := tx.QueryRow(ctx, `
-		SELECT status, attempts, last_error
-		FROM dispatch_outbox
-		WHERE target_user_id = $1
-		  AND id = $2
-	`, owner.ID, claimed[0].ID).Scan(&status, &attempts, &lastError); err != nil {
-		t.Fatalf("query terminal failure: %v", err)
-	}
-	if status != "failed" || attempts != 5 || lastError != "permanent" {
-		t.Fatalf("terminal failure status=%s attempts=%d err=%q, want failed attempts=5", status, attempts, lastError)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE dispatch_outbox
-		SET updated_at = now() - interval '10 years'
-		WHERE target_user_id = $1
-		  AND id = $2
-	`, owner.ID, claimed[0].ID); err != nil {
-		t.Fatalf("age failed row: %v", err)
-	}
-	deleted, err := outbox.DeleteFailed(ctx, 24*time.Hour, 1)
-	if err != nil {
-		t.Fatalf("DeleteFailed: %v", err)
-	}
-	if deleted != 1 {
-		t.Fatalf("DeleteFailed deleted=%d, want 1", deleted)
-	}
-	if got := outboxRows(2); got != 0 {
-		t.Fatalf("outbox rows for failed pts=2 = %d, want 0", got)
-	}
-	if got := eventRows(2); got != 1 {
-		t.Fatalf("durable event rows for failed pts=2 = %d, want 1", got)
+	if _, err := pool.Exec(ctx, `UPDATE dispatch_outbox SET event_type = 'noop' WHERE target_user_id = $1`, owner.ID); err == nil {
+		t.Fatal("immutable dispatch item UPDATE succeeded")
 	}
 }

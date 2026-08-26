@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"sort"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
@@ -154,20 +152,38 @@ type privateSendMediaProjection struct {
 	Recipient *domain.MessageMedia
 }
 
-func (s *MessageStore) sendPrivateTextWithHooks(ctx context.Context, req domain.SendPrivateTextRequest, hooks privateSendTxHooks) (res domain.SendPrivateTextResult, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		res, err = s.sendPrivateTextOnce(ctx, req, hooks)
-		if err == nil {
-			return res, nil
-		}
-		if !isMessageBoxDuplicateKey(err) || attempt > 0 {
-			return domain.SendPrivateTextResult{}, err
-		}
-		if recoverErr := s.bumpBoxIDCountersAfterDuplicate(ctx, req); recoverErr != nil {
-			return domain.SendPrivateTextResult{}, fmt.Errorf("%w; recover box id counters: %v", err, recoverErr)
+// encodePrivateSendMediaProjection preserves the three logical projections
+// while avoiding duplicate JSON serialization for the overwhelmingly common
+// case where all three fields reference the same immutable media snapshot.
+// The returned byte slices are read-only for the remainder of the transaction.
+func encodePrivateSendMediaProjection(media privateSendMediaProjection) (shared, sender, recipient []byte, err error) {
+	shared, err = encodeMessageMedia(media.Shared)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if media.Sender == media.Shared {
+		sender = shared
+	} else {
+		sender, err = encodeMessageMedia(media.Sender)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 	}
-	return domain.SendPrivateTextResult{}, err
+	if media.Recipient == media.Shared {
+		recipient = shared
+	} else if media.Recipient == media.Sender {
+		recipient = sender
+	} else {
+		recipient, err = encodeMessageMedia(media.Recipient)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return shared, sender, recipient, nil
+}
+
+func (s *MessageStore) sendPrivateTextWithHooks(ctx context.Context, req domain.SendPrivateTextRequest, hooks privateSendTxHooks) (res domain.SendPrivateTextResult, err error) {
+	return s.sendPrivateTextOnce(ctx, req, hooks)
 }
 
 func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendPrivateTextRequest, hooks privateSendTxHooks) (res domain.SendPrivateTextResult, err error) {
@@ -183,19 +199,23 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
-	entities, err := encodeMessageEntities(req.Entities)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	// reply_markup（bot reply/inline keyboard）随消息一并入双盒；普通用户发送恒 nil → "{}"。
-	replyMarkupJSON, err := encodeReplyMarkup(req.ReplyMarkup)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	// rich_message（Layer 227 富文本）随消息一并入双盒；普通消息恒 nil → "{}"。
-	richMessageJSON, err := encodeRichMessage(req.RichMessage)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
+	plainHotPath := plainPrivateSendHotPath(req, hooks)
+	var entities, replyMarkupJSON, richMessageJSON []byte
+	if !plainHotPath {
+		entities, err = encodeMessageEntities(req.Entities)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, err
+		}
+		// reply_markup（bot reply/inline keyboard）随消息一并入双盒；普通用户发送恒 nil → "{}"。
+		replyMarkupJSON, err = encodeReplyMarkup(req.ReplyMarkup)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, err
+		}
+		// rich_message（Layer 227 富文本）随消息一并入双盒；普通消息恒 nil → "{}"。
+		richMessageJSON, err = encodeRichMessage(req.RichMessage)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, err
+		}
 	}
 	requestFingerprint, err := store.PrivateSendFingerprint(req)
 	if err != nil {
@@ -250,9 +270,11 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 		}
 		_ = tx.Rollback(ctx)
 	}()
-
 	// 事务级 advisory lock 串行化涉及收发双方的并发写，在任何行锁之前获取，消除 watermark/dialog
 	// 行锁的 AB-BA 死锁（A↔B 反向并发 send/read/edit）。
+	// Lock acquisition is a separate statement from all state reads. Under
+	// READ COMMITTED this guarantees TTL and message state use a snapshot taken
+	// after any conflicting writer releases the same ordered advisory locks.
 	lockUserIDs := make([]int64, 0, len(hooks.lockUserIDs)+2)
 	lockUserIDs = append(lockUserIDs, req.SenderUserID, req.RecipientUserID)
 	lockUserIDs = append(lockUserIDs, hooks.lockUserIDs...)
@@ -276,56 +298,58 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 		}
 	}
 	media := privateSendMediaProjection{Shared: req.Media, Sender: req.Media, Recipient: req.Media}
-	if hooks.projectMedia != nil {
-		media, err = hooks.projectMedia(ctx, tx, &req)
+	var sharedMediaJSON, senderMediaJSON, recipientMediaJSON []byte
+	if !plainHotPath {
+		if hooks.projectMedia != nil {
+			media, err = hooks.projectMedia(ctx, tx, &req)
+			if err != nil {
+				return domain.SendPrivateTextResult{}, err
+			}
+		}
+		sharedMediaJSON, senderMediaJSON, recipientMediaJSON, err = encodePrivateSendMediaProjection(media)
 		if err != nil {
 			return domain.SendPrivateTextResult{}, err
 		}
 	}
-	sharedMediaJSON, err := encodeMessageMedia(media.Shared)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	senderMediaJSON, err := encodeMessageMedia(media.Sender)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	recipientMediaJSON, err := encodeMessageMedia(media.Recipient)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	ttlPeriod := req.TTLPeriod
-	if ttlPeriod == 0 {
-		ttlPeriod, err = privateHistoryTTLPeriod(ctx, tx, req.SenderUserID, req.RecipientUserID)
-		if err != nil {
-			return domain.SendPrivateTextResult{}, fmt.Errorf("load private ttl: %w", err)
+	ttlPeriod, expiresAt := req.TTLPeriod, 0
+	var pm sqlcgen.CreatePrivateMessageRow
+	if plainHotPath {
+		pm, err = createPlainPrivateMessage(ctx, tx, req, requestFingerprint, deliverRecipient)
+		if err == nil {
+			ttlPeriod = int(pm.TtlPeriod)
+			expiresAt = int(pm.ExpiresAt)
 		}
+	} else {
+		if ttlPeriod == 0 {
+			ttlPeriod, err = privateHistoryTTLPeriod(ctx, tx, req.SenderUserID, req.RecipientUserID)
+			if err != nil {
+				return domain.SendPrivateTextResult{}, fmt.Errorf("load private ttl: %w", err)
+			}
+		}
+		if ttlPeriod > 0 {
+			expiresAt = req.Date + ttlPeriod
+		}
+		privateArg := sqlcgen.CreatePrivateMessageParams{
+			SenderUserID:       req.SenderUserID,
+			RecipientUserID:    req.RecipientUserID,
+			RandomID:           req.RandomID,
+			RequestFingerprint: requestFingerprint,
+			RecipientDelivered: deliverRecipient,
+			MessageDate:        int32(req.Date),
+			Body:               req.Message,
+			TtlPeriod:          int32(ttlPeriod),
+			ExpiresAt:          int32(expiresAt),
+			EntitiesJson:       entities,
+			MediaJson:          sharedMediaJSON,
+			ReplyMarkupJson:    replyMarkupJSON,
+			RichMessageJson:    richMessageJSON,
+			ViaBotID:           req.ViaBotID,
+			GroupedID:          req.GroupedID,
+			Effect:             req.Effect,
+		}
+		applyCreatePrivateMessageMetadata(&privateArg, senderMeta)
+		pm, err = qtx.CreatePrivateMessage(ctx, privateArg)
 	}
-	expiresAt := 0
-	if ttlPeriod > 0 {
-		expiresAt = req.Date + ttlPeriod
-	}
-
-	privateArg := sqlcgen.CreatePrivateMessageParams{
-		SenderUserID:       req.SenderUserID,
-		RecipientUserID:    req.RecipientUserID,
-		RandomID:           req.RandomID,
-		RequestFingerprint: requestFingerprint,
-		RecipientDelivered: deliverRecipient,
-		MessageDate:        int32(req.Date),
-		Body:               req.Message,
-		TtlPeriod:          int32(ttlPeriod),
-		ExpiresAt:          int32(expiresAt),
-		EntitiesJson:       entities,
-		MediaJson:          sharedMediaJSON,
-		ReplyMarkupJson:    replyMarkupJSON,
-		RichMessageJson:    richMessageJSON,
-		ViaBotID:           req.ViaBotID,
-		GroupedID:          req.GroupedID,
-		Effect:             req.Effect,
-	}
-	applyCreatePrivateMessageMetadata(&privateArg, senderMeta)
-	pm, err := qtx.CreatePrivateMessage(ctx, privateArg)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// 预查与 INSERT 之间另一请求可能已提交。必须在当前 qtx 读取，
@@ -343,22 +367,62 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 		return domain.SendPrivateTextResult{}, fmt.Errorf("create private message: %w", err)
 	}
 
-	senderBoxID, err := s.boxIDs.NextBoxID(ctx, req.SenderUserID)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate sender box id: %w", err)
+	allocationUsers := []int64{req.SenderUserID}
+	if deliverRecipient {
+		allocationUsers = append(allocationUsers, req.RecipientUserID)
 	}
-	senderPts, err := s.reservePts(ctx, tx, req.SenderUserID)
+	boxIDs, err := s.boxIDs.NextBoxIDs(ctx, allocationUsers)
 	if err != nil {
-		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate sender pts: %w", err)
+		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: %w", err)
+	}
+	senderBoxID := boxIDs[req.SenderUserID]
+	if senderBoxID <= 0 {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing sender result")
 	}
 	if deliverRecipient {
-		recipientBoxID, err = s.boxIDs.NextBoxID(ctx, req.RecipientUserID)
-		if err != nil {
-			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate recipient box id: %w", err)
+		recipientBoxID = boxIDs[req.RecipientUserID]
+		if recipientBoxID <= 0 {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send box ids: missing recipient result")
 		}
-		recipientPts, err = s.reservePts(ctx, tx, req.RecipientUserID)
+	}
+	if plainHotPath {
+		projection, err := persistPlainPrivateSendProjection(
+			ctx,
+			tx,
+			req,
+			pm.ID,
+			senderBoxID,
+			recipientBoxID,
+			ttlPeriod,
+			expiresAt,
+		)
 		if err != nil {
-			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate recipient pts: %w", err)
+			return domain.SendPrivateTextResult{}, err
+		}
+		result := domain.SendPrivateTextResult{
+			SenderMessage:    projection.Sender,
+			RecipientMessage: projection.Recipient,
+			SenderEvent:      eventFromMessage(projection.Sender),
+			RecipientEvent:   eventFromMessage(projection.Recipient),
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("commit send message tx: %w", err)
+		}
+		committed = true
+		return result, nil
+	}
+	allocatedPts, err := s.reservePrivateSendPts(ctx, tx, allocationUsers)
+	if err != nil {
+		return domain.SendPrivateTextResult{}, err
+	}
+	senderPts := allocatedPts[req.SenderUserID]
+	if senderPts <= 0 {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send pts: missing sender result")
+	}
+	if deliverRecipient {
+		recipientPts = allocatedPts[req.RecipientUserID]
+		if recipientPts <= 0 {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("allocate private send pts: missing recipient result")
 		}
 	}
 	if hooks.afterAllocate != nil {
@@ -378,15 +442,7 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 				return domain.SendPrivateTextResult{}, err
 			}
 		}
-		sharedMediaJSON, err = encodeMessageMedia(media.Shared)
-		if err != nil {
-			return domain.SendPrivateTextResult{}, err
-		}
-		senderMediaJSON, err = encodeMessageMedia(media.Sender)
-		if err != nil {
-			return domain.SendPrivateTextResult{}, err
-		}
-		recipientMediaJSON, err = encodeMessageMedia(media.Recipient)
+		sharedMediaJSON, senderMediaJSON, recipientMediaJSON, err = encodePrivateSendMediaProjection(media)
 		if err != nil {
 			return domain.SendPrivateTextResult{}, err
 		}
@@ -453,12 +509,12 @@ WHERE sender_user_id=$1 AND id=$2`, req.SenderUserID, pm.ID, sharedMediaJSON)
 	if originUserID == 0 {
 		originUserID = req.SenderUserID
 	}
-	senderExcludeAuthKeyID, senderExcludeSessionID := int64(0), int64(0)
+	senderExcludeAuthKeyID, senderExcludeSessionID := [8]byte{}, int64(0)
 	if originUserID == req.SenderUserID {
-		senderExcludeAuthKeyID = authKeyIDToInt64(req.OriginAuthKeyID)
+		senderExcludeAuthKeyID = req.OriginAuthKeyID
 		senderExcludeSessionID = req.OriginSessionID
 	}
-	if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+	if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 		TargetUserID:     req.SenderUserID,
 		Pts:              int32(senderPts),
 		EventType:        string(domain.UpdateEventNewMessage),
@@ -520,12 +576,12 @@ WHERE sender_user_id=$1 AND id=$2`, req.SenderUserID, pm.ID, sharedMediaJSON)
 		if err := appendNewMessageEvent(ctx, qtx, recipient); err != nil {
 			return domain.SendPrivateTextResult{}, err
 		}
-		recipientExcludeAuthKeyID, recipientExcludeSessionID := int64(0), int64(0)
+		recipientExcludeAuthKeyID, recipientExcludeSessionID := [8]byte{}, int64(0)
 		if originUserID == req.RecipientUserID {
-			recipientExcludeAuthKeyID = authKeyIDToInt64(req.OriginAuthKeyID)
+			recipientExcludeAuthKeyID = req.OriginAuthKeyID
 			recipientExcludeSessionID = req.OriginSessionID
 		}
-		if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 			TargetUserID:     req.RecipientUserID,
 			Pts:              int32(recipientPts),
 			EventType:        string(domain.UpdateEventNewMessage),
@@ -562,11 +618,38 @@ WHERE sender_user_id = $1
 	if tag.RowsAffected() != 1 {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("save private send receipt: private message %d already has or lost its immutable receipt", pm.ID)
 	}
+	var draftEvent domain.UpdateEvent
+	if req.ClearDraft {
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.SenderUserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeUser, ID: req.RecipientUserID},
+		}
+		changed, err := NewDialogStore(tx).DeleteDraft(ctx, mutation.UserID, mutation.Peer, 0)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("clear private draft in send transaction: %w", err)
+		}
+		snapshot := store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		effects, err := sendDraftClearEffects(snapshot)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(snapshot, effects); err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("validate private send draft effects: %w", err)
+		}
+		allocated, err := applyDeliveryEffectsTx(ctx, tx, effects)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("apply private send draft effects: %w", err)
+		}
+		if len(allocated) == 1 {
+			draftEvent = allocated[0].Event
+		}
+	}
 	result := domain.SendPrivateTextResult{
 		SenderMessage:    sender,
 		RecipientMessage: recipient,
 		SenderEvent:      eventFromMessage(sender),
 		RecipientEvent:   eventFromMessage(recipient),
+		DraftEvent:       draftEvent,
 	}
 	if hooks.after != nil {
 		if err := hooks.after(ctx, tx, result); err != nil {
@@ -579,6 +662,24 @@ WHERE sender_user_id = $1
 	}
 	committed = true
 	return result, nil
+}
+
+// sendDraftClearEffects is the mandatory, strongly typed projection
+// used by the message-send aggregate. Keeping it in the store package avoids
+// an RPC callback inside the message transaction while retaining the same
+// exact snapshot/effect proof as standalone dialog mutations.
+func sendDraftClearEffects(snapshot store.DialogAccountMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if snapshot.Mutation.Kind != store.DialogAccountDeleteDraft {
+		return nil, fmt.Errorf("private send draft projection: unexpected mutation %q", snapshot.Mutation.Kind)
+	}
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	event := domain.UpdateEvent{
+		Type: domain.UpdateEventDraftMessage, Date: snapshot.Mutation.Date, PtsCount: 1,
+		Peer: snapshot.Mutation.Peer, MaxID: snapshot.Mutation.TopMessageID,
+	}
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }
 
 // LookupPrivateSendReplay reads an existing receipt without permission checks, source/media
@@ -601,39 +702,6 @@ func (s *MessageStore) LookupPrivateSendReplay(ctx context.Context, lookup domai
 	}
 	res.Duplicate = true
 	return res, true, nil
-}
-
-type boxIDCounterBumper interface {
-	BumpBoxIDAtLeast(ctx context.Context, userID int64, floor int) error
-}
-
-func (s *MessageStore) bumpBoxIDCountersAfterDuplicate(ctx context.Context, req domain.SendPrivateTextRequest) error {
-	bumper, ok := s.boxIDs.(boxIDCounterBumper)
-	if !ok {
-		return nil
-	}
-	userIDs := []int64{req.SenderUserID}
-	if req.RecipientUserID != 0 && req.RecipientUserID != req.SenderUserID {
-		userIDs = append(userIDs, req.RecipientUserID)
-	}
-	for _, userID := range userIDs {
-		maxID, err := s.q.MaxMessageBoxID(ctx, userID)
-		if err != nil {
-			return fmt.Errorf("max message box id for %d: %w", userID, err)
-		}
-		if err := bumper.BumpBoxIDAtLeast(ctx, userID, int(maxID)); err != nil {
-			return fmt.Errorf("bump box id for %d: %w", userID, err)
-		}
-	}
-	return nil
-}
-
-func isMessageBoxDuplicateKey(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	return pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "message_boxes")
 }
 
 func (s *MessageStore) duplicateSendResult(ctx context.Context, q *sqlcgen.Queries, req domain.SendPrivateTextRequest, requestFingerprint []byte) (domain.SendPrivateTextResult, bool, error) {
@@ -854,10 +922,14 @@ func lockUsersForUpdate(ctx context.Context, tx pgx.Tx, userIDs ...int64) error 
 		unique = append(unique, id)
 	}
 	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
-	for _, id := range unique {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", id); err != nil {
-			return fmt.Errorf("advisory lock user %d: %w", id, err)
-		}
+	// PostgreSQL's plan evaluates the volatile lock function in a Result node
+	// above the ORDER BY, so all user locks retain the global ascending order
+	// while crossing the client/server boundary only once.
+	if _, err := tx.Exec(ctx, `
+SELECT pg_advisory_xact_lock(user_id)
+FROM unnest($1::bigint[]) AS requested(user_id)
+ORDER BY user_id`, unique); err != nil {
+		return fmt.Errorf("advisory lock users %v: %w", unique, err)
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -193,9 +194,12 @@ func (s *ChannelStore) cascadeDeleteDiscussionRootsTx(ctx context.Context, tx pg
 	return out, nil
 }
 
-func (s *ChannelStore) DeleteChannelHistory(ctx context.Context, req domain.DeleteChannelHistoryRequest) (domain.DeleteChannelHistoryResult, error) {
+func (s *ChannelStore) DeleteChannelHistory(ctx context.Context, req domain.DeleteChannelHistoryRequest, effects store.DeliveryEffectsBuilder[store.ChannelAvailableMinDeliverySnapshot]) (domain.DeleteChannelHistoryResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.DeleteChannelHistoryResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.DeleteChannelHistoryResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = nowUnix()
@@ -214,6 +218,24 @@ func (s *ChannelStore) DeleteChannelHistory(ctx context.Context, req domain.Dele
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	// The owner-local boundary and its absolute delivery are one idempotent
+	// transition. Serialize concurrent clears before reading available_min_id;
+	// otherwise two READ COMMITTED transactions can both observe the old value
+	// and append duplicate delivery facts for the same boundary.
+	if !req.ForEveryone {
+		var lockedUserID int64
+		err := tx.QueryRow(ctx, `
+SELECT user_id
+FROM channel_members
+WHERE channel_id = $1 AND user_id = $2
+FOR UPDATE`, req.ChannelID, req.UserID).Scan(&lockedUserID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.DeleteChannelHistoryResult{}, domain.ErrChannelPrivate
+		}
+		if err != nil {
+			return domain.DeleteChannelHistoryResult{}, fmt.Errorf("lock channel local clear member: %w", err)
+		}
+	}
 	channel, member, err := s.getChannelForMember(ctx, tx, req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.DeleteChannelHistoryResult{}, err
@@ -305,6 +327,13 @@ ON CONFLICT (user_id, channel_id) DO UPDATE SET
     updated_at = now()`, req.UserID, req.ChannelID, topID, topDate, appliedMinID); err != nil {
 			return domain.DeleteChannelHistoryResult{}, fmt.Errorf("upsert channel local clear dialog: %w", err)
 		}
+		snapshot := store.ChannelAvailableMinDeliverySnapshot{}
+		if changed {
+			snapshot = store.ChannelAvailableMinDeliverySnapshot{TargetUserID: req.UserID, Channel: channel, AvailableMinID: appliedMinID}
+		}
+		if err := applyAvailableMinDeliveryTx(ctx, tx, snapshot, effects); err != nil {
+			return domain.DeleteChannelHistoryResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.DeleteChannelHistoryResult{}, fmt.Errorf("commit local clear channel history: %w", err)
 		}
@@ -323,6 +352,9 @@ ON CONFLICT (user_id, channel_id) DO UPDATE SET
 	}
 	if !canDeleteAnyChannelMessage(member) {
 		return domain.DeleteChannelHistoryResult{}, domain.ErrChannelAdminRequired
+	}
+	if err := applyAvailableMinDeliveryTx(ctx, tx, store.ChannelAvailableMinDeliverySnapshot{}, effects); err != nil {
+		return domain.DeleteChannelHistoryResult{}, err
 	}
 	// id=1 是建群服务消息，全员清空必须保留：它是清空后会话仅剩的
 	// top message，没有它客户端会把 lastMessage 视为空并从聊天列表

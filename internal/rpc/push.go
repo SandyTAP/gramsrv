@@ -8,20 +8,6 @@ import (
 	"go.uber.org/zap"
 )
 
-func (r *Router) pushUserMessage(ctx context.Context, userID int64, logMessage string, msg tg.UpdatesClass) int {
-	if r.deps.Sessions == nil || userID == 0 || msg == nil {
-		return 0
-	}
-	sessionID, _ := SessionIDFrom(ctx)
-	authKeyID := rawAuthKeyIDForOrigin(ctx)
-	if sent, err := r.deps.Sessions.PushToUserExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg); err != nil {
-		r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Error(err))
-		return sent
-	} else {
-		return sent
-	}
-}
-
 // pushUserMessageTransient 推送 transient（typing/presence）update：未就绪的
 // session 直接跳过、不进 pending。生产 Edge control 必须显式实现该能力；缺失时
 // fail closed，避免退回普通 durable/pending push 语义。
@@ -42,7 +28,11 @@ func (r *Router) pushUserMessageTransient(ctx context.Context, userID int64, log
 	return 0
 }
 
-func (r *Router) pushCurrentSessionMessage(ctx context.Context, logMessage string, msg tg.UpdatesClass) {
+// pushCurrentSessionTransient sends an exact-session snapshot outside every
+// durable PTS/recovery domain. Callers are restricted to short-lived presence
+// or handshake state; reliable business updates must use a transactional
+// outbox and must never call this helper.
+func (r *Router) pushCurrentSessionTransient(ctx context.Context, logMessage string, msg tg.UpdatesClass) {
 	if r.deps.Sessions == nil || msg == nil {
 		return
 	}

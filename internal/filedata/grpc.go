@@ -39,10 +39,14 @@ var (
 )
 
 type DataService interface {
+	// SaveFilePart and SaveBigFilePart borrow data as read-only for the duration of the call.
 	SaveFilePart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (bool, error)
 	SaveBigFilePart(ctx context.Context, ownerUserID, fileID int64, part, totalParts int, data []byte) (bool, error)
+	// GetFile transfers ownership of FileChunk.Bytes to the caller.
 	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
+	// GetFileHashes transfers ownership of every FileHash.Hash to the caller.
 	GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error)
+	// AssembleUploadBlob transfers ownership of AssembledUploadBlob.SHA256.
 	AssembleUploadBlob(ctx context.Context, ownerUserID, fileID int64, expectedParts int) (filesapp.AssembledUploadBlob, error)
 	DeleteExpiredUploadParts(ctx context.Context, before time.Time, limit int) (int64, error)
 }

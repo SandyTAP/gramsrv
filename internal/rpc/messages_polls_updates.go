@@ -3,19 +3,18 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
-	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
-// 本文件是 poll 链路的响应/推送/事件辅助，与 reaction（messages_reactions_send.go）同构：
-//   - 私聊：双方各记一条 message_poll durable event（无 pts 的 updateMessagePoll + aux pts 簿记），
-//     离线端经 getDifference 拿到消息快照与最新 poll 状态；
-//   - 频道：实时 fan-out 给在线 viewer（作者进 explicit 收件人），无 durable event——
-//     与 channel reaction 现状一致（离线缺口见 compatibility-matrix.md，客户端靠 getPollResults 刷新）。
+// This file projects poll mutation results for the current RPC. Reliable
+// multi-session delivery belongs to the owning aggregate and delivery lane;
+// Core never runs a post-commit online viewer fan-out.
 
 // pollMutationErr 把 poll/消息域错误映射为 RPC error。
 func pollMutationErr(err error) error {
@@ -70,10 +69,8 @@ func (r *Router) loadMessagePoll(ctx context.Context, userID int64, peer domain.
 	return nil, peer, false
 }
 
-// pollUpdateRefs 收集 updateMessagePoll 响应需要的 users/chats（recent voters 头像 + channel 实体）。
-// channel 由调用方传入（频道 poll 用结果里的 res.Channel；私聊传零值）：与 reaction fan-out 同款用
-// 单个 channel 一次性投影 tgChannels，避免频道 poll fan-out 每 viewer 一次 GetChannel 的 DB N+1
-// （poll 聚合 N+1 已由 ChannelPollFanoutViews 消除，这是 poll fan-out 残留的 per-viewer DB 调用）。
+// pollUpdateRefs 收集当前 viewer 的 updateMessagePoll 响应需要的 users/chats
+// （recent voters 头像 + channel 实体）。频道 mutation 已携带 res.Channel，因此无需再次查询。
 func (r *Router) pollUpdateRefs(ctx context.Context, viewerUserID int64, peer domain.Peer, poll *domain.MessagePoll, channel domain.Channel) ([]tg.UserClass, []tg.ChatClass) {
 	userIDs := make([]int64, 0, domain.MaxPollRecentVoters)
 	if poll != nil && poll.Results != nil {
@@ -83,10 +80,10 @@ func (r *Router) pollUpdateRefs(ctx context.Context, viewerUserID int64, peer do
 	chats := []tg.ChatClass{}
 	if peer.Type == domain.PeerTypeChannel {
 		if channel.ID != 0 {
-			// fan-out 路径：调用方已带 channel，一次性投影（同 reaction），免 per-viewer GetChannel。
+			// Mutation result 已带 channel，直接用于当前调用者投影。
 			chats = tgChannels(viewerUserID, []domain.Channel{channel})
 		} else if r.deps.Channels != nil {
-			// 非 fan-out 单 viewer 路径（getPollResults）：channel 未带，保持原 GetChannel 行为不变。
+			// getPollResults 是只读单-viewer 路径，需要加载 channel 投影。
 			if view, err := r.deps.Channels.GetChannel(ctx, viewerUserID, peer.ID); err == nil && view.Channel.ID != 0 {
 				chats = []tg.ChatClass{tgChannelChatForView(viewerUserID, view)}
 			}
@@ -95,64 +92,95 @@ func (r *Router) pollUpdateRefs(ctx context.Context, viewerUserID int64, peer do
 	return users, chats
 }
 
-// privatePollUpdates 记录双方 durable event、推送双方在线 session，并返回投票者视角响应。
-func (r *Router) privatePollUpdates(ctx context.Context, requestUserID int64, res domain.PrivateMessagePollResult) tg.UpdatesClass {
-	recordedEvents := r.recordPrivateMessagePollEvents(ctx, requestUserID, res)
-	var requesterUpdates *tg.Updates
+// privatePollUpdates 只构造当前 RPC 响应。其它 session 的非 PTS
+// absolute delivery 已由 privatePollDeliveryEffects 在 poll mutation 事务内写入。
+func (r *Router) privatePollUpdates(ctx context.Context, requestUserID int64, res domain.PrivateMessagePollResult) (tg.UpdatesClass, error) {
 	for _, msg := range res.Messages {
-		if msg.ID <= 0 || msg.Media == nil || msg.Media.Poll == nil {
-			continue
-		}
-		update := tgUpdateMessagePoll(msg.Peer, msg.ID, msg.Media.Poll)
-		if update == nil {
-			continue
-		}
-		users, chats := r.pollUpdateRefs(ctx, msg.OwnerUserID, msg.Peer, msg.Media.Poll, domain.Channel{})
-		updates := &tg.Updates{
-			Updates: []tg.UpdateClass{update},
-			Users:   users,
-			Chats:   chats,
-			Date:    int(r.clock.Now().Unix()),
-		}
-		// message_poll 事件占账号 pts 但 updateMessagePoll 无 pts 字段，附 aux 簿记推水位。
-		updates.Updates = appendAuxPtsBookkeeping(updates.Updates, recordedEvents[msg.OwnerUserID])
 		if msg.OwnerUserID == requestUserID {
-			requesterUpdates = updates
+			if updates := r.privatePollUpdateForMessage(ctx, msg); updates != nil {
+				return updates, nil
+			}
 		}
-		r.pushUserUpdates(ctx, msg.OwnerUserID, updates)
 	}
-	if requesterUpdates == nil {
-		return tgEmptyUpdates(int(r.clock.Now().Unix()))
-	}
-	return requesterUpdates
+	return tgEmptyUpdates(int(r.clock.Now().Unix())), nil
 }
 
-func (r *Router) recordPrivateMessagePollEvents(ctx context.Context, requestUserID int64, res domain.PrivateMessagePollResult) map[int64]domain.UpdateEvent {
-	if r.deps.Updates == nil {
+func (r *Router) privatePollUpdateForMessage(ctx context.Context, msg domain.Message) *tg.Updates {
+	if msg.OwnerUserID == 0 || msg.ID <= 0 || msg.Media == nil || msg.Media.Poll == nil {
 		return nil
 	}
-	recorder, ok := r.deps.Updates.(messagePollUpdateRecorder)
-	if !ok {
+	update := tgUpdateMessagePoll(msg.Peer, msg.ID, msg.Media.Poll)
+	if update == nil {
 		return nil
 	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	events := make(map[int64]domain.UpdateEvent, len(res.Messages))
-	for _, msg := range res.Messages {
-		if msg.OwnerUserID == 0 || msg.ID == 0 {
-			continue
-		}
-		eventAuthKeyID := [8]byte{}
-		if msg.OwnerUserID == requestUserID {
-			eventAuthKeyID = authKeyID
-		}
-		event, _, err := recorder.RecordMessagePoll(ctx, eventAuthKeyID, msg.OwnerUserID, msg)
-		if err != nil {
-			r.log.Warn("record message poll event failed")
-			continue
-		}
-		events[msg.OwnerUserID] = event
+	users, chats := r.pollUpdateRefs(ctx, msg.OwnerUserID, msg.Peer, msg.Media.Poll, domain.Channel{})
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{update}, Users: users, Chats: chats,
+		Date: int(r.clock.Now().Unix()), Seq: 0,
 	}
-	return events
+}
+
+func privatePollUpdateForMessageWithUsers(msg domain.Message, users []tg.UserClass, date int) *tg.Updates {
+	if msg.OwnerUserID == 0 || msg.ID <= 0 || msg.Media == nil || msg.Media.Poll == nil {
+		return nil
+	}
+	update := tgUpdateMessagePoll(msg.Peer, msg.ID, msg.Media.Poll)
+	if update == nil {
+		return nil
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{update}, Users: append([]tg.UserClass(nil), users...), Chats: []tg.ChatClass{},
+		Date: date, Seq: 0,
+	}
+}
+
+func (r *Router) privatePollDeliveryUsers(ctx context.Context, requestUserID, peerUserID int64) map[int64][]tg.UserClass {
+	ids := []int64{requestUserID}
+	if peerUserID != 0 && peerUserID != requestUserID {
+		ids = append(ids, peerUserID)
+	}
+	out := map[int64][]tg.UserClass{
+		requestUserID: r.tgUsersForIDs(ctx, requestUserID, ids),
+	}
+	if peerUserID != 0 && peerUserID != requestUserID {
+		out[peerUserID] = r.tgUsersForIDs(ctx, peerUserID, ids)
+	}
+	return out
+}
+
+func (r *Router) privatePollDeliveryEffects(ctx context.Context, requestUserID int64, usersByViewer map[int64][]tg.UserClass, date int) store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(res domain.PrivateMessagePollResult) ([]store.DeliveryEffect, error) {
+		seen := make(map[int64]struct{}, len(res.Messages))
+		effects := make([]store.DeliveryEffect, 0, len(res.Messages))
+		for _, msg := range res.Messages {
+			if _, duplicate := seen[msg.OwnerUserID]; duplicate {
+				continue
+			}
+			users, ok := usersByViewer[msg.OwnerUserID]
+			if !ok {
+				return nil, fmt.Errorf("private poll delivery users missing for user %d", msg.OwnerUserID)
+			}
+			updates := privatePollUpdateForMessageWithUsers(msg, users, date)
+			if updates == nil {
+				return nil, fmt.Errorf("private poll owner projection missing for user %d", msg.OwnerUserID)
+			}
+			payload, err := encodeDeliveryUpdate(updates)
+			if err != nil {
+				return nil, fmt.Errorf("encode private poll delivery for user %d: %w", msg.OwnerUserID, err)
+			}
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if msg.OwnerUserID == requestUserID {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: msg.OwnerUserID, ExcludeAuthKeyID: authKeyID, ExcludeSessionID: sessionID,
+				Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+			seen[msg.OwnerUserID] = struct{}{}
+		}
+		return effects, nil
+	}
 }
 
 // onEditMessageClosePoll 处理 editMessage + InputMediaPoll：当前唯一支持的 poll 编辑是
@@ -183,78 +211,37 @@ func (r *Router) onEditMessageClosePoll(ctx context.Context, req *tg.MessagesEdi
 		if err != nil {
 			return nil, pollMutationErr(err)
 		}
-		return r.channelPollUpdates(ctx, userID, peer, req.ID, res, true), nil
+		return r.channelPollUpdates(ctx, userID, peer, req.ID, res), nil
 	case domain.PeerTypeUser:
 		if r.deps.Messages == nil {
 			return nil, messageIDInvalidErr()
 		}
+		deliveryUsers := r.privatePollDeliveryUsers(ctx, userID, peer.ID)
 		res, err := r.deps.Messages.CloseMessagePoll(ctx, userID, domain.ClosePrivateMessagePollRequest{
-			UserID:    userID,
-			Peer:      peer,
-			MessageID: req.ID,
-			Date:      now,
-		})
+			UserID: userID, Peer: peer, MessageID: req.ID, Date: now,
+		}, r.privatePollDeliveryEffects(ctx, userID, deliveryUsers, now))
 		if err != nil {
 			return nil, pollMutationErr(err)
 		}
-		return r.privatePollUpdates(ctx, userID, res), nil
+		return r.privatePollUpdates(ctx, userID, res)
 	default:
 		return nil, peerIDInvalidErr()
 	}
 }
 
-// channelPollUpdates 组装投票者视角响应；push 为 true 时按 viewer 重建并 fan-out 给在线成员。
-//
-// Phase 4 模板化：fan-out 前一次性批量加载所有收件人的 per-viewer poll 投影（ChannelPollFanoutViews
-// 把 viewer-invariant 聚合只算一次 + 批量 viewerOptions/可见性），消除原先每 viewer 一次 GetMessages
-// 的 N+1。dispatch 仍同步（poll 是 viewer-only 无 durable event，改异步丢队列即永久漏）。
-// 批量视图是在线 fan-out 的唯一数据源；预取失败或未覆盖时跳过该 viewer，不再回到逐 viewer DB reload。
-// actor echo 仍用 res poll。
-func (r *Router) channelPollUpdates(ctx context.Context, userID int64, peer domain.Peer, msgID int, res domain.ChannelMessagePollResult, push bool) tg.UpdatesClass {
-	var batched map[int64]*domain.MessagePoll
-	if push && peer.Type == domain.PeerTypeChannel && r.deps.Channels != nil {
-		recipients := r.channelFanoutRecipients(ctx, channelFanoutViewers, res.Channel.ID, res.Recipients)
-		if len(recipients) > 0 {
-			views, err := r.deps.Channels.ChannelPollFanoutViews(ctx, res.Channel.ID, msgID, recipients, int(r.clock.Now().Unix()))
-			if err != nil {
-				r.log.Warn("channel poll fanout prefetch failed; skipping non-origin online viewers",
-					zap.Int64("channel_id", res.Channel.ID), zap.Int("msg_id", msgID), zap.Error(err))
-			} else {
-				batched = views
-			}
-		}
-	}
-	build := func(viewerUserID int64) *tg.Updates {
-		poll := res.Message.Media.Poll
-		if viewerUserID != userID {
-			// 其它 viewer 的 chosen/correct/solution 门控不同，按其视角取投影。
-			if p, evaluated := batched[viewerUserID]; evaluated {
-				if p == nil {
-					return nil // 预取已判定该 viewer 不可见
-				}
-				poll = p
-			} else {
-				return nil
-			}
-		}
-		update := tgUpdateMessagePoll(peer, msgID, poll)
-		if update == nil {
-			return nil
-		}
-		users, chats := r.pollUpdateRefs(ctx, viewerUserID, peer, poll, res.Channel)
-		return &tg.Updates{
-			Updates: []tg.UpdateClass{update},
-			Users:   users,
-			Chats:   chats,
-			Date:    int(r.clock.Now().Unix()),
-		}
-	}
-	updates := build(userID)
-	if push {
-		r.pushChannelViewerUpdates(ctx, userID, res.Channel.ID, res.Recipients, build)
-	}
-	if updates == nil {
+// channelPollUpdates builds only the caller's post-mutation poll projection.
+func (r *Router) channelPollUpdates(ctx context.Context, userID int64, peer domain.Peer, msgID int, res domain.ChannelMessagePollResult) tg.UpdatesClass {
+	poll := res.Message.Media.Poll
+	update := tgUpdateMessagePoll(peer, msgID, poll)
+	if update == nil {
 		return tgEmptyUpdates(int(r.clock.Now().Unix()))
+	}
+	users, chats := r.pollUpdateRefs(ctx, userID, peer, poll, res.Channel)
+	updates := &tg.Updates{
+		Updates: []tg.UpdateClass{update},
+		Users:   users,
+		Chats:   chats,
+		Date:    int(r.clock.Now().Unix()),
 	}
 	return updates
 }

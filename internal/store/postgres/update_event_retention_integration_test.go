@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -595,16 +594,18 @@ func TestUserUpdateRetentionDeletesDispatchLeaseAndPromotesHeadPostgres(t *testi
 	}
 	first := appendDispatch(1)
 	second := appendDispatch(2)
-	claimed := store.DispatchOutboxItem{TargetUserID: userID, Pts: first.Pts}
-	if err := pool.QueryRow(ctx, `
-UPDATE dispatch_outbox
-SET status = 'dispatching',
-    attempts = attempts + 1,
-    updated_at = now()
-WHERE target_user_id = $1 AND pts = $2
-RETURNING id, attempts`, userID, first.Pts).Scan(&claimed.ID, &claimed.Attempts); err != nil {
-		t.Fatalf("acquire exact retention dispatch lease: %v", err)
+	windows, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueDispatchPTS, Owner: "egress-a/retention-test",
+		LogicalShardCount: store.DispatchOutboxLogicalShards,
+		LogicalShardIDs:   []int{int(userID % store.DispatchOutboxLogicalShards)},
+		LaneLimit:         1, WindowSize: 1, WindowByteLimit: ptsEventByteEstimate, LeaseDuration: time.Hour,
+		PhysicalDuration: 10 * time.Second, ClockSkewAllowance: time.Second,
+	})
+	if err != nil || len(windows) != 1 || len(windows[0].Items) != 1 ||
+		windows[0].StreamID != userID || windows[0].Items[0].Ref.Sequence != int64(first.Pts) {
+		t.Fatalf("acquire exact retention dispatch attempt = %+v err=%v", windows, err)
 	}
+	claimed := windows[0].Items[0].Ref
 	if err := states.ObserveClientState(ctx, authKeyID, userID, domain.UpdateState{Pts: first.Pts, Date: first.Date}); err != nil {
 		t.Fatalf("observe retained dispatch pts: %v", err)
 	}
@@ -613,10 +614,11 @@ RETURNING id, attempts`, userID, first.Pts).Scan(&claimed.ID, &claimed.Attempts)
 		t.Fatalf("delete retained dispatch prefix = %d/%v, want 1/nil", deleted, err)
 	}
 
-	// The in-flight worker owns an attempts token for a row retention just removed. It must be
-	// fenced instead of recreating/marking the deleted head, while the next pts becomes claimable.
-	if err := outbox.MarkDelivered(ctx, claimed); !errors.Is(err, store.ErrDispatchLeaseLost) {
-		t.Fatalf("deliver retained dispatch lease err = %v, want ErrDispatchLeaseLost", err)
+	// Retention leaves an exact abandonment tombstone and promotes the next item
+	// under a new fence; no mutable item status or compatibility token remains.
+	if batch, err := outbox.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: claimed}}); err != nil ||
+		batch.Results[0].Outcome != store.OutboxFinalizeAlreadyFinalized {
+		t.Fatalf("finalize retained dispatch attempt = %+v err=%v", batch, err)
 	}
 	var eventRows, outboxRows, headPts int
 	var headStatus string
@@ -624,12 +626,12 @@ RETURNING id, attempts`, userID, first.Pts).Scan(&claimed.ID, &claimed.Attempts)
 SELECT
   (SELECT count(*) FROM user_update_events WHERE user_id = $1 AND pts = $2)::int,
   (SELECT count(*) FROM dispatch_outbox WHERE target_user_id = $1 AND pts = $2)::int,
-	  (SELECT head_pts FROM dispatch_outbox_user_heads WHERE target_user_id = $1),
-  (SELECT status FROM dispatch_outbox_user_heads WHERE target_user_id = $1)`, userID, first.Pts).Scan(&eventRows, &outboxRows, &headPts, &headStatus); err != nil {
+	  (SELECT head_sequence FROM dispatch_outbox_lanes WHERE stream_id = $1),
+	  (SELECT state FROM dispatch_outbox_lanes WHERE stream_id = $1)`, userID, first.Pts).Scan(&eventRows, &outboxRows, &headPts, &headStatus); err != nil {
 		t.Fatalf("load retained dispatch/head state: %v", err)
 	}
-	if eventRows != 0 || outboxRows != 0 || headPts != second.Pts || headStatus != "pending" {
-		t.Fatalf("retained event/outbox/head = %d/%d/%d/%s, want 0/0/%d/pending", eventRows, outboxRows, headPts, headStatus, second.Pts)
+	if eventRows != 0 || outboxRows != 0 || headPts != second.Pts || headStatus != "ready" {
+		t.Fatalf("retained event/outbox/head = %d/%d/%d/%s, want 0/0/%d/ready", eventRows, outboxRows, headPts, headStatus, second.Pts)
 	}
 }
 

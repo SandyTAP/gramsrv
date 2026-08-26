@@ -12,7 +12,7 @@ import (
 // bot_api_updates 的 INSERT（以及可能打 PG 的 bot 判定）移出发送者 RPC 同步路径，
 // 发送者不再为 Bot API 队列写入多等一次 PG 往返。
 //
-// 与 channel fanout dispatcher 的关键差异：bot_api_updates 行本身就是投递真值
+// bot_api_updates 行本身就是投递真值
 // （getUpdates 只读该表，没有 getDifference 类收敛面），因此队列满时在调用方路径完成
 // durable insert，而不是丢弃——发送者多等一次 INSERT，换 update 不丢。
 //

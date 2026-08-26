@@ -2,11 +2,13 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"sort"
 	"strings"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *PasswordStore) HasBusinessAutomation(_ context.Context, userID int64) (bool, error) {
@@ -136,58 +138,47 @@ func (s *PasswordStore) CheckQuickReplyShortcut(_ context.Context, ownerUserID i
 	return !ok, nil
 }
 
-func (s *PasswordStore) SaveQuickReplyText(_ context.Context, ownerUserID int64, shortcut string, msg domain.QuickReplyMessage) (domain.QuickReplyMutation, error) {
-	shortcut, err := domain.NormalizeQuickReplyShortcut(shortcut)
+func (s *PasswordStore) MutateQuickReplies(_ context.Context, mutation store.QuickReplyAccountMutation, effects store.DeliveryEffectsBuilder[store.QuickReplyAccountMutationSnapshot]) (store.QuickReplyAccountMutationSnapshot, error) {
+	validated, err := mutation.Normalize()
 	if err != nil {
-		return domain.QuickReplyMutation{}, err
+		return store.QuickReplyAccountMutationSnapshot{}, err
 	}
-	if msg.Message == "" || len(msg.Entities) > domain.MaxMessageEntityCount {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+	if effects == nil {
+		return store.QuickReplyAccountMutationSnapshot{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.ensureQuickReplyMapsLocked(ownerUserID)
-	key := quickReplyShortcutKey(shortcut)
-	replyID, found := s.quickReplyByShortcut[ownerUserID][key]
-	created := false
-	if !found {
-		if len(s.quickReplies[ownerUserID]) >= domain.MaxQuickReplies {
-			return domain.QuickReplyMutation{}, domain.ErrQuickRepliesTooMuch
-		}
-		replyID = s.nextQuickReplyID[ownerUserID] + 1
-		s.nextQuickReplyID[ownerUserID] = replyID
-		s.quickReplyByShortcut[ownerUserID][key] = replyID
-		s.quickReplies[ownerUserID][replyID] = domain.QuickReply{
-			OwnerUserID: ownerUserID,
-			ID:          replyID,
-			Shortcut:    shortcut,
-			SortOrder:   len(s.quickReplies[ownerUserID]) + 1,
-		}
-		s.quickReplyMessages[ownerUserID][replyID] = make(map[int]domain.QuickReplyMessage)
-		created = true
+	events := s.updateEvents
+	if events == nil {
+		return store.QuickReplyAccountMutationSnapshot{}, store.ErrDeliveryOutboxRequired
 	}
-	if len(s.quickReplyMessages[ownerUserID][replyID]) >= domain.MaxQuickReplyMessages {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+	state := cloneMemoryQuickReplyState(s, validated.UserID)
+	result, changed, err := state.apply(validated)
+	if err != nil {
+		return store.QuickReplyAccountMutationSnapshot{}, err
 	}
-	msg.OwnerUserID = ownerUserID
-	msg.ShortcutID = replyID
-	msg.ID = s.nextQuickReplyMessageID[ownerUserID] + 1
-	s.nextQuickReplyMessageID[ownerUserID] = msg.ID
-	msg.Entities = append([]domain.MessageEntity(nil), msg.Entities...)
-	s.quickReplyMessages[ownerUserID][replyID][msg.ID] = msg
-	s.refreshQuickReplyLocked(ownerUserID, replyID)
-	reply := cloneQuickReply(s.quickReplies[ownerUserID][replyID])
-	kind := domain.QuickReplyMutationMessage
-	if created {
-		kind = domain.QuickReplyMutationNew
+	snapshot := store.QuickReplyAccountMutationSnapshot{
+		Mutation: validated,
+		Changed:  changed,
+		Result:   result,
 	}
-	return domain.QuickReplyMutation{
-		Kind:       kind,
-		List:       s.quickReplyListLocked(ownerUserID, true),
-		QuickReply: reply,
-		ShortcutID: replyID,
-		Message:    cloneQuickReplyMessage(msg),
-	}, nil
+	intents, err := effects(store.CloneQuickReplyAccountSnapshot(snapshot))
+	if err != nil {
+		return store.QuickReplyAccountMutationSnapshot{}, fmt.Errorf("build memory quick reply effects: %w", err)
+	}
+	if err := store.ValidateQuickReplyAccountEffects(snapshot, intents); err != nil {
+		return store.QuickReplyAccountMutationSnapshot{}, fmt.Errorf("validate memory quick reply effects: %w", err)
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	if len(intents) == 1 {
+		event := events.appendLocked(validated.UserID, intents[0].Event, true)
+		events.dispatches[validated.UserID] = append(events.dispatches[validated.UserID], memoryUpdateDispatch{Pts: event.Pts})
+		intents[0].Event = event
+	}
+	state.install(s, validated.UserID)
+	snapshot.Effects = intents
+	return store.CloneQuickReplyAccountSnapshot(snapshot), nil
 }
 
 func (s *PasswordStore) GetQuickReplyMessages(_ context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMessages, error) {
@@ -221,94 +212,198 @@ func (s *PasswordStore) GetQuickReplyMessages(_ context.Context, ownerUserID int
 	}, nil
 }
 
-func (s *PasswordStore) RenameQuickReplyShortcut(_ context.Context, ownerUserID int64, shortcutID int, shortcut string) (domain.QuickReplyMutation, error) {
-	shortcut, err := domain.NormalizeQuickReplyShortcut(shortcut)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	reply, ok := s.quickReplies[ownerUserID][shortcutID]
-	if !ok {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	key := quickReplyShortcutKey(shortcut)
-	if existingID, exists := s.quickReplyByShortcut[ownerUserID][key]; exists && existingID != shortcutID {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutOccupied
-	}
-	delete(s.quickReplyByShortcut[ownerUserID], quickReplyShortcutKey(reply.Shortcut))
-	reply.Shortcut = shortcut
-	s.quickReplyByShortcut[ownerUserID][key] = shortcutID
-	s.quickReplies[ownerUserID][shortcutID] = reply
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationList, List: s.quickReplyListLocked(ownerUserID, true)}, nil
+type memoryQuickReplyState struct {
+	replies       map[int]domain.QuickReply
+	byShortcut    map[string]int
+	messages      map[int]map[int]domain.QuickReplyMessage
+	nextReplyID   int
+	nextMessageID int
 }
 
-func (s *PasswordStore) ReorderQuickReplies(_ context.Context, ownerUserID int64, order []int) (domain.QuickReplyMutation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	replies := s.quickReplies[ownerUserID]
-	if len(order) != len(replies) {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+func cloneMemoryQuickReplyState(s *PasswordStore, ownerUserID int64) memoryQuickReplyState {
+	state := memoryQuickReplyState{
+		replies:       make(map[int]domain.QuickReply, len(s.quickReplies[ownerUserID])),
+		byShortcut:    make(map[string]int, len(s.quickReplyByShortcut[ownerUserID])),
+		messages:      make(map[int]map[int]domain.QuickReplyMessage, len(s.quickReplyMessages[ownerUserID])),
+		nextReplyID:   s.nextQuickReplyID[ownerUserID],
+		nextMessageID: s.nextQuickReplyMessageID[ownerUserID],
 	}
-	seen := make(map[int]struct{}, len(order))
-	for i, id := range order {
-		reply, ok := replies[id]
+	for id, reply := range s.quickReplies[ownerUserID] {
+		state.replies[id] = cloneQuickReply(reply)
+	}
+	for shortcut, id := range s.quickReplyByShortcut[ownerUserID] {
+		state.byShortcut[shortcut] = id
+	}
+	for shortcutID, messages := range s.quickReplyMessages[ownerUserID] {
+		cloned := make(map[int]domain.QuickReplyMessage, len(messages))
+		for id, message := range messages {
+			cloned[id] = cloneQuickReplyMessage(message)
+		}
+		state.messages[shortcutID] = cloned
+	}
+	return state
+}
+
+func (s *memoryQuickReplyState) apply(mutation store.QuickReplyAccountMutation) (domain.QuickReplyMutation, bool, error) {
+	ownerUserID := mutation.UserID
+	result := domain.QuickReplyMutation{Date: mutation.Date}
+	switch mutation.Kind {
+	case store.QuickReplyAccountSaveText:
+		key := quickReplyShortcutKey(mutation.Shortcut)
+		replyID, found := s.byShortcut[key]
+		created := false
+		if !found {
+			if len(s.replies) >= domain.MaxQuickReplies {
+				return domain.QuickReplyMutation{}, false, domain.ErrQuickRepliesTooMuch
+			}
+			s.nextReplyID++
+			replyID = s.nextReplyID
+			s.byShortcut[key] = replyID
+			s.replies[replyID] = domain.QuickReply{
+				OwnerUserID: ownerUserID, ID: replyID, Shortcut: mutation.Shortcut, SortOrder: len(s.replies) + 1,
+			}
+			s.messages[replyID] = make(map[int]domain.QuickReplyMessage)
+			created = true
+		}
+		if s.messages[replyID] == nil {
+			s.messages[replyID] = make(map[int]domain.QuickReplyMessage)
+		}
+		if len(s.messages[replyID]) >= domain.MaxQuickReplyMessages {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		s.nextMessageID++
+		message := cloneQuickReplyMessage(mutation.Message)
+		message.OwnerUserID, message.ShortcutID, message.ID = ownerUserID, replyID, s.nextMessageID
+		s.messages[replyID][message.ID] = message
+		s.refresh(replyID)
+		result.Kind = domain.QuickReplyMutationMessage
+		if created {
+			result.Kind = domain.QuickReplyMutationNew
+		}
+		result.QuickReply = cloneQuickReply(s.replies[replyID])
+		result.ShortcutID = replyID
+		result.Message = cloneQuickReplyMessage(message)
+	case store.QuickReplyAccountRenameShortcut:
+		reply, ok := s.replies[mutation.ShortcutID]
 		if !ok {
-			return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
 		}
-		if _, dup := seen[id]; dup {
-			return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+		key := quickReplyShortcutKey(mutation.Shortcut)
+		if existingID, exists := s.byShortcut[key]; exists && existingID != mutation.ShortcutID {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutOccupied
 		}
-		seen[id] = struct{}{}
-		reply.SortOrder = i + 1
-		replies[id] = reply
+		result.Kind = domain.QuickReplyMutationList
+		if reply.Shortcut == mutation.Shortcut {
+			result.List = s.list(ownerUserID)
+			return result, false, nil
+		}
+		delete(s.byShortcut, quickReplyShortcutKey(reply.Shortcut))
+		reply.Shortcut = mutation.Shortcut
+		s.byShortcut[key] = mutation.ShortcutID
+		s.replies[mutation.ShortcutID] = reply
+	case store.QuickReplyAccountReorder:
+		current := s.order()
+		if len(mutation.Order) != len(current) {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		for _, id := range mutation.Order {
+			if _, ok := s.replies[id]; !ok {
+				return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+			}
+		}
+		result.Kind = domain.QuickReplyMutationList
+		if sameQuickReplyIDs(current, mutation.Order) {
+			result.List = s.list(ownerUserID)
+			return result, false, nil
+		}
+		for i, id := range mutation.Order {
+			reply := s.replies[id]
+			reply.SortOrder = i + 1
+			s.replies[id] = reply
+		}
+	case store.QuickReplyAccountDeleteShortcut:
+		reply, ok := s.replies[mutation.ShortcutID]
+		if !ok {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		delete(s.byShortcut, quickReplyShortcutKey(reply.Shortcut))
+		delete(s.replies, mutation.ShortcutID)
+		delete(s.messages, mutation.ShortcutID)
+		normalizeQuickReplyOrderLocked(s.replies)
+		result.Kind, result.ShortcutID = domain.QuickReplyMutationDelete, mutation.ShortcutID
+	case store.QuickReplyAccountDeleteMessages:
+		if _, ok := s.replies[mutation.ShortcutID]; !ok {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		messages := s.messages[mutation.ShortcutID]
+		for _, id := range mutation.MessageIDs {
+			if _, ok := messages[id]; !ok {
+				return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+			}
+		}
+		for _, id := range mutation.MessageIDs {
+			delete(messages, id)
+		}
+		s.refresh(mutation.ShortcutID)
+		result.Kind, result.ShortcutID = domain.QuickReplyMutationIDs, mutation.ShortcutID
+		result.MessageIDs = append([]int(nil), mutation.MessageIDs...)
 	}
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationList, List: s.quickReplyListLocked(ownerUserID, true)}, nil
+	result.List = s.list(ownerUserID)
+	return result, true, nil
 }
 
-func (s *PasswordStore) DeleteQuickReplyShortcut(_ context.Context, ownerUserID int64, shortcutID int) (domain.QuickReplyMutation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	reply, ok := s.quickReplies[ownerUserID][shortcutID]
-	if !ok {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+func (s *memoryQuickReplyState) refresh(shortcutID int) {
+	reply := s.replies[shortcutID]
+	reply.Count, reply.TopMessage = len(s.messages[shortcutID]), 0
+	for id := range s.messages[shortcutID] {
+		if id > reply.TopMessage {
+			reply.TopMessage = id
+		}
 	}
-	delete(s.quickReplyByShortcut[ownerUserID], quickReplyShortcutKey(reply.Shortcut))
-	delete(s.quickReplies[ownerUserID], shortcutID)
-	delete(s.quickReplyMessages[ownerUserID], shortcutID)
-	normalizeQuickReplyOrderLocked(s.quickReplies[ownerUserID])
-	return domain.QuickReplyMutation{
-		Kind:       domain.QuickReplyMutationDelete,
-		List:       s.quickReplyListLocked(ownerUserID, true),
-		ShortcutID: shortcutID,
-	}, nil
+	s.replies[shortcutID] = reply
 }
 
-func (s *PasswordStore) DeleteQuickReplyMessages(_ context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMutation, error) {
-	if len(ids) == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+func (s *memoryQuickReplyState) list(ownerUserID int64) domain.QuickReplyList {
+	replies := make([]domain.QuickReply, 0, len(s.replies))
+	for id := range s.replies {
+		s.refresh(id)
+		replies = append(replies, cloneQuickReply(s.replies[id]))
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.quickReplies[ownerUserID][shortcutID]; !ok {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+	sortQuickReplies(replies)
+	return domain.QuickReplyList{OwnerUserID: ownerUserID, QuickReplies: replies, Hash: quickReplyListHash(replies)}
+}
+
+func (s *memoryQuickReplyState) order() []int {
+	replies := make([]domain.QuickReply, 0, len(s.replies))
+	for _, reply := range s.replies {
+		replies = append(replies, reply)
 	}
-	msgs := s.quickReplyMessages[ownerUserID][shortcutID]
-	deleted := make([]int, 0, len(ids))
-	for _, id := range ids {
-		if _, ok := msgs[id]; !ok {
-			return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+	sortQuickReplies(replies)
+	order := make([]int, len(replies))
+	for i := range replies {
+		order[i] = replies[i].ID
+	}
+	return order
+}
+
+func (s *memoryQuickReplyState) install(target *PasswordStore, ownerUserID int64) {
+	target.quickReplies[ownerUserID] = s.replies
+	target.quickReplyByShortcut[ownerUserID] = s.byShortcut
+	target.quickReplyMessages[ownerUserID] = s.messages
+	target.nextQuickReplyID[ownerUserID] = s.nextReplyID
+	target.nextQuickReplyMessageID[ownerUserID] = s.nextMessageID
+}
+
+func sameQuickReplyIDs(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
-		delete(msgs, id)
-		deleted = append(deleted, id)
 	}
-	s.refreshQuickReplyLocked(ownerUserID, shortcutID)
-	return domain.QuickReplyMutation{
-		Kind:       domain.QuickReplyMutationIDs,
-		List:       s.quickReplyListLocked(ownerUserID, true),
-		ShortcutID: shortcutID,
-		MessageIDs: deleted,
-	}, nil
+	return true
 }
 
 func (s *PasswordStore) ReserveBusinessAutomationDelivery(_ context.Context, delivery domain.BusinessAutomationDelivery) (bool, error) {

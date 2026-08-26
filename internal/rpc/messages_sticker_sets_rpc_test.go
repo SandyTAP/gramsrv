@@ -14,7 +14,7 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func userStickerSetRouter(t *testing.T) (*Router, *memory.PasswordStore, *captureSessions) {
+func userStickerSetRouter(t *testing.T) (*Router, *memory.PasswordStore, *memory.DeliveryOutboxStore) {
 	t.Helper()
 	files := &fakeFiles{
 		docs: map[int64]domain.Document{
@@ -32,17 +32,17 @@ func userStickerSetRouter(t *testing.T) (*Router, *memory.PasswordStore, *captur
 		},
 	}
 	passwordStore := memory.NewPasswordStore()
-	sessions := &captureSessions{}
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
 	router := New(Config{}, Deps{
-		Account:  appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore)),
-		Files:    files,
-		Sessions: sessions,
+		Account: appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore)),
+		Files:   files, DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
-	return router, passwordStore, sessions
+	return router, passwordStore, delivery
 }
 
 func TestMessagesInstallStickerSetPersistsAndPushesUpdate(t *testing.T) {
-	r, store, sessions := userStickerSetRouter(t)
+	r, store, delivery := userStickerSetRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	out, err := r.onMessagesInstallStickerSet(ctx, &tg.MessagesInstallStickerSetRequest{
@@ -62,7 +62,7 @@ func TestMessagesInstallStickerSetPersistsAndPushesUpdate(t *testing.T) {
 	if total != 1 || len(items) != 1 || items[0].StickerSetID != 10 || items[0].Archived {
 		t.Fatalf("installed sets = total %d items %+v, want one active set 10", total, items)
 	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindStickers, nil)
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindStickers, nil)
 }
 
 func TestMessagesInstallStickerSetUpdatesAllStickersProjection(t *testing.T) {
@@ -103,6 +103,27 @@ func TestMessagesInstallStickerSetUpdatesAllStickersProjection(t *testing.T) {
 	}
 	if full, ok := afterUninstall.(*tg.MessagesAllStickers); ok && len(full.Sets) != 0 {
 		t.Fatalf("all stickers after uninstall = %+v, want empty", full.Sets)
+	}
+}
+
+func TestMessagesGetArchivedStickersReadsAccountState(t *testing.T) {
+	r, _, _ := userStickerSetRouter(t)
+	ctx := WithUserID(context.Background(), 1000000001)
+	if _, err := r.onMessagesInstallStickerSet(ctx, &tg.MessagesInstallStickerSetRequest{
+		Stickerset: &tg.InputStickerSetID{ID: 10, AccessHash: 100}, Archived: true,
+	}); err != nil {
+		t.Fatalf("install archived sticker set: %v", err)
+	}
+	out, err := r.onMessagesGetArchivedStickers(ctx, &tg.MessagesGetArchivedStickersRequest{Limit: 20})
+	if err != nil {
+		t.Fatalf("get archived sticker sets: %v", err)
+	}
+	if out.Count != 1 || len(out.Sets) != 1 {
+		t.Fatalf("archived sticker sets = count %d sets %d, want 1/1", out.Count, len(out.Sets))
+	}
+	covered, ok := out.Sets[0].(*tg.StickerSetNoCovered)
+	if !ok || covered.Set.ID != 10 || !covered.Set.Archived {
+		t.Fatalf("archived sticker set = %T %+v", out.Sets[0], out.Sets[0])
 	}
 }
 
@@ -174,7 +195,7 @@ func TestMessagesGetStickerSetUsesViewerInstallState(t *testing.T) {
 }
 
 func TestMessagesInstallStickerSetRejectsBadAccessHash(t *testing.T) {
-	r, store, sessions := userStickerSetRouter(t)
+	r, store, delivery := userStickerSetRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	out, err := r.onMessagesInstallStickerSet(ctx, &tg.MessagesInstallStickerSetRequest{
@@ -190,13 +211,13 @@ func TestMessagesInstallStickerSetRejectsBadAccessHash(t *testing.T) {
 	if total != 0 || len(items) != 0 {
 		t.Fatalf("installed after rejected install = total %d items %+v, want empty", total, items)
 	}
-	if push := sessions.lastUserPush(); push != nil {
-		t.Fatalf("push after rejected install = %T, want nil", push)
+	if queued := delivery.Snapshot(); len(queued) != 0 {
+		t.Fatalf("delivery after rejected install = %+v, want empty", queued)
 	}
 }
 
 func TestMessagesReorderAndToggleStickerSets(t *testing.T) {
-	r, store, sessions := userStickerSetRouter(t)
+	r, store, delivery := userStickerSetRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	for _, shortName := range []string{"funny", "work"} {
@@ -204,13 +225,13 @@ func TestMessagesReorderAndToggleStickerSets(t *testing.T) {
 			t.Fatalf("install %s: %v", shortName, err)
 		}
 	}
-	if ok, err := r.onMessagesReorderStickerSets(ctx, &tg.MessagesReorderStickerSetsRequest{Order: []int64{20, 10, 20, 0}}); err != nil || !ok {
+	if ok, err := r.onMessagesReorderStickerSets(ctx, &tg.MessagesReorderStickerSetsRequest{Order: []int64{20, 10}}); err != nil || !ok {
 		t.Fatalf("reorder = %v %v", ok, err)
 	}
 	if got := installedStickerSetIDs(t, store, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 2 || got[0] != 20 || got[1] != 10 {
 		t.Fatalf("installed order = %v, want [20 10]", got)
 	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindStickers, []int64{20, 10})
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindStickers, []int64{20, 10})
 
 	if ok, err := r.onMessagesToggleStickerSets(ctx, &tg.MessagesToggleStickerSetsRequest{
 		Stickersets: []tg.InputStickerSetClass{&tg.InputStickerSetID{ID: 20, AccessHash: 200}},
@@ -221,11 +242,11 @@ func TestMessagesReorderAndToggleStickerSets(t *testing.T) {
 	if got := installedStickerSetIDs(t, store, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 1 || got[0] != 10 {
 		t.Fatalf("installed after toggle uninstall = %v, want [10]", got)
 	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindStickers, nil)
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindStickers, nil)
 }
 
 func TestMessagesToggleEmojiStickerSetsUsesEmojiUpdateFlag(t *testing.T) {
-	r, store, sessions := userStickerSetRouter(t)
+	r, store, delivery := userStickerSetRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	if ok, err := r.onMessagesToggleStickerSets(ctx, &tg.MessagesToggleStickerSetsRequest{
@@ -236,7 +257,85 @@ func TestMessagesToggleEmojiStickerSetsUsesEmojiUpdateFlag(t *testing.T) {
 	if got := installedStickerSetIDs(t, store, ctx, 1000000001, domain.StickerSetKindEmoji, nil); len(got) != 1 || got[0] != 30 {
 		t.Fatalf("emoji installed sets = %v, want [30]", got)
 	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindEmoji, nil)
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindEmoji, nil)
+}
+
+func TestMessagesToggleStickerSetsCommitsMixedKindsAsOneBatch(t *testing.T) {
+	r, passwordStore, delivery := userStickerSetRouter(t)
+	rawAuthKeyID := [8]byte{8, 6, 4, 2}
+	const sessionID = int64(9911)
+	ctx := WithSessionID(WithRawAuthKeyID(WithUserID(context.Background(), 1000000001), rawAuthKeyID), sessionID)
+	ok, err := r.onMessagesToggleStickerSets(ctx, &tg.MessagesToggleStickerSetsRequest{
+		Stickersets: []tg.InputStickerSetClass{
+			&tg.InputStickerSetID{ID: 10, AccessHash: 100},
+			&tg.InputStickerSetID{ID: 30, AccessHash: 300},
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("toggle mixed sticker sets = %v, %v", ok, err)
+	}
+	if got := installedStickerSetIDs(t, passwordStore, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 1 || got[0] != 10 {
+		t.Fatalf("installed stickers = %v, want [10]", got)
+	}
+	if got := installedStickerSetIDs(t, passwordStore, ctx, 1000000001, domain.StickerSetKindEmoji, nil); len(got) != 1 || got[0] != 30 {
+		t.Fatalf("installed emoji = %v, want [30]", got)
+	}
+	items := delivery.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("delivery items = %d, want one vector delivery", len(items))
+	}
+	if items[0].ExcludeAuthKeyID != rawAuthKeyID || items[0].ExcludeSessionID != sessionID {
+		t.Fatalf("delivery exclusion = %x/%d", items[0].ExcludeAuthKeyID, items[0].ExcludeSessionID)
+	}
+	updates := requireDeliveryUpdates(t, items[0])
+	if len(updates.Updates) != 2 {
+		t.Fatalf("mixed delivery updates = %d, want 2", len(updates.Updates))
+	}
+	first, firstOK := updates.Updates[0].(*tg.UpdateStickerSets)
+	second, secondOK := updates.Updates[1].(*tg.UpdateStickerSets)
+	if !firstOK || !secondOK || first.Emojis || !second.Emojis {
+		t.Fatalf("mixed delivery updates = %#v, want sticker then emoji flags", updates.Updates)
+	}
+}
+
+func TestMessagesToggleStickerSetsResolvesWholeVectorBeforeMutation(t *testing.T) {
+	r, passwordStore, delivery := userStickerSetRouter(t)
+	ctx := WithUserID(context.Background(), 1000000001)
+	ok, err := r.onMessagesToggleStickerSets(ctx, &tg.MessagesToggleStickerSetsRequest{
+		Stickersets: []tg.InputStickerSetClass{
+			&tg.InputStickerSetID{ID: 10, AccessHash: 100},
+			&tg.InputStickerSetID{ID: 30, AccessHash: 999},
+		},
+	})
+	if ok || !tgerr.Is(err, "STICKERSET_INVALID") {
+		t.Fatalf("toggle with invalid suffix = %v, %v", ok, err)
+	}
+	if got := installedStickerSetIDs(t, passwordStore, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 0 {
+		t.Fatalf("prefix set survived failed vector = %v", got)
+	}
+	if got := delivery.Snapshot(); len(got) != 0 {
+		t.Fatalf("delivery survived failed vector = %+v", got)
+	}
+}
+
+func TestMessagesStickerSetVectorsRejectAmbiguousOrNormalizedInput(t *testing.T) {
+	r, passwordStore, delivery := userStickerSetRouter(t)
+	ctx := WithUserID(context.Background(), 1000000001)
+	if ok, err := r.onMessagesReorderStickerSets(ctx, &tg.MessagesReorderStickerSetsRequest{Order: []int64{10, 10}}); ok || !tgerr.Is(err, "INPUT_REQUEST_INVALID") {
+		t.Fatalf("duplicate reorder = %v, %v, want INPUT_REQUEST_INVALID", ok, err)
+	}
+	if ok, err := r.onMessagesToggleStickerSets(ctx, &tg.MessagesToggleStickerSetsRequest{
+		Stickersets: []tg.InputStickerSetClass{&tg.InputStickerSetID{ID: 10, AccessHash: 100}},
+		Uninstall:   true, Archive: true,
+	}); ok || !tgerr.Is(err, "INPUT_REQUEST_INVALID") {
+		t.Fatalf("ambiguous toggle = %v, %v, want INPUT_REQUEST_INVALID", ok, err)
+	}
+	if got := installedStickerSetIDs(t, passwordStore, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 0 {
+		t.Fatalf("invalid vector mutated sets = %v", got)
+	}
+	if got := delivery.Snapshot(); len(got) != 0 {
+		t.Fatalf("invalid vector enqueued delivery = %+v", got)
+	}
 }
 
 func TestMessagesGetMyStickersEmptyUntilCreatorStore(t *testing.T) {

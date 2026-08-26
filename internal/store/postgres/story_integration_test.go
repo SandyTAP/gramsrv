@@ -31,14 +31,14 @@ func TestStoryStoreReadMaxHiddenAndPeerMaxIDsPostgres(t *testing.T) {
 		}
 	}
 
-	read, err := store.MarkRead(ctx, viewer.ID, ownerPeer, 2, 1700000200)
+	read, err := store.markRead(ctx, viewer.ID, ownerPeer, 2, 1700000200)
 	if err != nil {
 		t.Fatalf("mark read: %v", err)
 	}
 	if !read.Advanced || read.MaxReadID != 2 {
 		t.Fatalf("read = %+v, want advanced max 2", read)
 	}
-	read, err = store.MarkRead(ctx, viewer.ID, ownerPeer, 1, 1700000201)
+	read, err = store.markRead(ctx, viewer.ID, ownerPeer, 1, 1700000201)
 	if err != nil {
 		t.Fatalf("mark lower read: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestStoryStoreListActiveStoriesPaginatesByPeerPostgres(t *testing.T) {
 	if digest.Count != 3 {
 		t.Fatalf("digest count = %d, want 3", digest.Count)
 	}
-	if _, err := store.MarkRead(ctx, viewer.ID, domain.Peer{Type: domain.PeerTypeUser, ID: owners[0].ID}, 2, 1700000401); err != nil {
+	if _, err := store.markRead(ctx, viewer.ID, domain.Peer{Type: domain.PeerTypeUser, ID: owners[0].ID}, 2, 1700000401); err != nil {
 		t.Fatalf("mark read for digest: %v", err)
 	}
 	changed, err := store.ActiveStoriesDigest(ctx, viewer.ID, false, 1700000400)
@@ -232,7 +232,7 @@ func TestStoryStoreSelfUserViewAndReactionDoNotPolluteOwnerInteractionsPostgres(
 	if created != 0 {
 		t.Fatalf("created self views = %d, want 0", created)
 	}
-	if _, err := store.SetReaction(ctx, owner.ID, ownerPeer, 1, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, owner.ID, ownerPeer, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 1700000201); err != domain.ErrStoryPeerInvalid {
@@ -321,7 +321,7 @@ ON CONFLICT (owner_user_id, blocked_user_id) DO UPDATE SET date = EXCLUDED.date`
 	if created, err := store.IncrementViews(ctx, blockedViewer.ID, ownerPeer, []int{1}, 1700000210); err != nil || created != 0 {
 		t.Fatalf("blocked increment = %d, %v, want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, blockedViewer.ID, ownerPeer, 1, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, blockedViewer.ID, ownerPeer, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 1700000211); err != domain.ErrStoryNotFound {
@@ -387,7 +387,7 @@ func TestStoryStoreChannelStoriesRequireActiveMemberPostgres(t *testing.T) {
 		t.Fatalf("create outsider: %v", err)
 	}
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	createdChannel, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: creator.ID,
 		Title:         "Story Gate " + suffix,
@@ -405,7 +405,7 @@ func TestStoryStoreChannelStoriesRequireActiveMemberPostgres(t *testing.T) {
 	})
 
 	store := NewStoryStore(pool)
-	createdStory, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	createdStory, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    channelPeer,
 		RandomID: 1700000301,
 		Date:     1700000301,
@@ -484,7 +484,7 @@ func TestStoryStoreChannelStoriesRequireActiveMemberPostgres(t *testing.T) {
 	if created, err := store.IncrementViews(ctx, outsider.ID, channelPeer, []int{createdStory.Story.ID}, 1700000311); err != nil || created != 0 {
 		t.Fatalf("outsider increment = %d, %v, want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, outsider.ID, channelPeer, createdStory.Story.ID, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, outsider.ID, channelPeer, createdStory.Story.ID, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "👍",
 	}, 1700000312); !errors.Is(err, domain.ErrStoryNotFound) {
@@ -528,7 +528,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	store := NewStoryStore(pool)
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
 
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:      ownerPeer,
 		RandomID:   1700000251,
 		Date:       1700000250,
@@ -551,7 +551,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryMediaArea(t, list.Stories[0], "🔥", 10)
 
-	edited, err := afterRestart.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := afterRestart.editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -568,7 +568,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryURLMediaArea(t, reloaded.Stories[0], "https://example.com/story/link", 25)
 
-	geoEdited, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	geoEdited, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -585,7 +585,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryGeoPointMediaArea(t, reloaded.Stories[0], 31.2304, 121.4737, 35)
 
-	venueEdited, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	venueEdited, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -602,7 +602,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryVenueMediaArea(t, reloaded.Stories[0], "Inline Cafe", 31.231, 121.474, 40)
 
-	weatherEdited, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	weatherEdited, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -619,7 +619,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryWeatherMediaArea(t, reloaded.Stories[0], "☀️", 22.5, 0x00cc6600, 45)
 
-	channelPostEdited, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	channelPostEdited, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -636,7 +636,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryChannelPostMediaArea(t, reloaded.Stories[0], 777001, 42, 50)
 
-	starGiftEdited, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	starGiftEdited, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -653,7 +653,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearPostgres(t *testing.T) {
 	}
 	assertPGStoryStarGiftMediaArea(t, reloaded.Stories[0], "Gift.Series_01-42", 55)
 
-	cleared, err := NewStoryStore(pool).EditStory(ctx, domain.StoryEditRequest{
+	cleared, err := NewStoryStore(pool).editStory(ctx, domain.StoryEditRequest{
 		Owner:            ownerPeer,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -742,21 +742,21 @@ func TestStoryStoreViewsAndReactionPostgres(t *testing.T) {
 	}
 	like := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}
 	fire := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}
-	res, err := store.SetReaction(ctx, viewer.ID, ownerPeer, 1, like, 1700000303)
+	res, err := store.setReaction(ctx, viewer.ID, ownerPeer, 1, like, 1700000303)
 	if err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ViewsCount != 1 || res.Story.Views.ReactionsCount != 1 {
 		t.Fatalf("reaction result = %+v, want one view and one reaction", res)
 	}
-	res, err = store.SetReaction(ctx, viewer.ID, ownerPeer, 1, fire, 1700000304)
+	res, err = store.setReaction(ctx, viewer.ID, ownerPeer, 1, fire, 1700000304)
 	if err != nil {
 		t.Fatalf("replace reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ReactionsCount != 1 || len(res.Story.Views.Reactions) != 1 || res.Story.Views.Reactions[0].Reaction.Emoticon != "fire" {
 		t.Fatalf("replace result = %+v, want only fire reaction", res)
 	}
-	res, err = store.SetReaction(ctx, viewer.ID, ownerPeer, 1, fire, 1700000305)
+	res, err = store.setReaction(ctx, viewer.ID, ownerPeer, 1, fire, 1700000305)
 	if err != nil {
 		t.Fatalf("retry same reaction: %v", err)
 	}
@@ -792,14 +792,14 @@ func TestStoryStoreViewsAndReactionPostgres(t *testing.T) {
 		t.Fatalf("reaction date after retry = %d, want original date", reactions.Reactions[0].Date)
 	}
 	custom := &domain.MessageReaction{Type: domain.MessageReactionCustomEmoji, DocumentID: 12345}
-	res, err = store.SetReaction(ctx, viewer.ID, ownerPeer, 1, custom, 1700000305)
+	res, err = store.setReaction(ctx, viewer.ID, ownerPeer, 1, custom, 1700000305)
 	if err != nil {
 		t.Fatalf("replace with custom reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ReactionsCount != 1 || len(res.Story.Views.Reactions) != 1 || res.Story.Views.Reactions[0].Reaction.DocumentID != 12345 {
 		t.Fatalf("custom replace result = %+v, want one custom reaction", res)
 	}
-	res, err = store.SetReaction(ctx, viewer.ID, ownerPeer, 1, custom, 1700000306)
+	res, err = store.setReaction(ctx, viewer.ID, ownerPeer, 1, custom, 1700000306)
 	if err != nil {
 		t.Fatalf("retry same custom reaction: %v", err)
 	}
@@ -837,7 +837,7 @@ func TestStoryStoreViewsAndReactionPostgres(t *testing.T) {
 	}); !errors.Is(err, domain.ErrStoryOffsetInvalid) {
 		t.Fatalf("bad story reactions offset err = %v, want ErrStoryOffsetInvalid", err)
 	}
-	res, err = store.SetReaction(ctx, viewer.ID, ownerPeer, 1, nil, 1700000307)
+	res, err = store.setReaction(ctx, viewer.ID, ownerPeer, 1, nil, 1700000307)
 	if err != nil {
 		t.Fatalf("clear reaction: %v", err)
 	}
@@ -874,13 +874,13 @@ func TestStoryStoreExpiredUnpinnedStoriesDoNotAcceptNewInteractionsPostgres(t *t
 	if created, err := store.IncrementViews(ctx, viewer.ID, ownerPeer, []int{1}, 1700000200); err != nil || created != 0 {
 		t.Fatalf("expired unpinned increment = %d, %v; want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, viewer.ID, ownerPeer, 1, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 1700000200); !errors.Is(err, domain.ErrStoryNotFound) {
+	if _, err := store.setReaction(ctx, viewer.ID, ownerPeer, 1, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 1700000200); !errors.Is(err, domain.ErrStoryNotFound) {
 		t.Fatalf("expired unpinned reaction err = %v, want ErrStoryNotFound", err)
 	}
 	if created, err := store.IncrementViews(ctx, viewer.ID, ownerPeer, []int{2}, 1700000200); err != nil || created != 1 {
 		t.Fatalf("expired pinned increment = %d, %v; want 1 nil", created, err)
 	}
-	res, err := store.SetReaction(ctx, otherViewer.ID, ownerPeer, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}, 1700000201)
+	res, err := store.setReaction(ctx, otherViewer.ID, ownerPeer, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}, 1700000201)
 	if err != nil {
 		t.Fatalf("expired pinned reaction: %v", err)
 	}
@@ -896,7 +896,7 @@ func TestStoryStoreForwardRoundTripEditAndClonePostgres(t *testing.T) {
 	store := NewStoryStore(pool)
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
 	source := domain.Peer{Type: domain.PeerTypeUser, ID: sourceUser.ID}
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    ownerPeer,
 		RandomID: 202,
 		Date:     1700000600,
@@ -924,7 +924,7 @@ func TestStoryStoreForwardRoundTripEditAndClonePostgres(t *testing.T) {
 	}
 	assertPGStoryForward(t, list.Stories[0], source, 7, true)
 
-	edited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         ownerPeer,
 		ID:            created.Story.ID,
 		UpdateCaption: true,
@@ -942,7 +942,7 @@ func TestStoryStoreForwardRoundTripEditAndClonePostgres(t *testing.T) {
 	}
 	assertPGStoryForward(t, list.Stories[0], source, 7, true)
 
-	hidden, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	hidden, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    ownerPeer,
 		RandomID: 203,
 		Date:     1700000603,
@@ -970,7 +970,7 @@ func TestStoryStoreForwardRoundTripEditAndClonePostgres(t *testing.T) {
 	}
 	assertPGStoryForwardName(t, list.Stories[0], "Alice Hidden", 8, false)
 
-	editedHidden, err := store.EditStory(ctx, domain.StoryEditRequest{
+	editedHidden, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         ownerPeer,
 		ID:            hidden.Story.ID,
 		UpdateCaption: true,
@@ -989,7 +989,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsListPostgres(t *testing.T) {
 	store := NewStoryStore(pool)
 	sourceOwner := domain.Peer{Type: domain.PeerTypeUser, ID: sourceUser.ID}
 	repostOwner := domain.Peer{Type: domain.PeerTypeUser, ID: repostUser.ID}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 301,
 		Date:     1700000700,
@@ -999,7 +999,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsListPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 302,
 		Date:     1700000701,
@@ -1036,7 +1036,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsListPostgres(t *testing.T) {
 	if views.Views[0].Repost.Owner != repostOwner || views.Views[0].Repost.ID != repost.Story.ID {
 		t.Fatalf("repost interaction = %+v, want owner %+v story %d", views.Views[0].Repost, repostOwner, repost.Story.ID)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000703); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000703); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	sourceList, err = store.GetStoriesByID(ctx, sourceUser.ID, sourceOwner, []int{source.Story.ID}, 1700000703)
@@ -1056,7 +1056,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 	sourceOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: sourceUser.ID}
 	repostOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: repostUser.ID}
 	privateRepostOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: repostUser.ID + 1000}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 311,
 		Date:     1700000710,
@@ -1066,7 +1066,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 312,
 		Date:     1700000711,
@@ -1080,7 +1080,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create public repost: %v", err)
 	}
-	hiddenRepost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	hiddenRepost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 314,
 		Date:     1700000713,
@@ -1095,7 +1095,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hidden-source public repost: %v", err)
 	}
-	if _, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	if _, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    privateRepostOwner,
 		RandomID: 313,
 		Date:     1700000712,
@@ -1130,7 +1130,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 	if list.Forwards[1].Repost.Owner != repostOwner || list.Forwards[1].Repost.ID != repost.Story.ID {
 		t.Fatalf("public forward repost = %+v, want owner %+v story %d", list.Forwards[1].Repost, repostOwner, repost.Story.ID)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000714); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000714); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	afterVisibleDelete, err := store.ListStoryPublicForwards(ctx, domain.StoryPublicForwardListRequest{
@@ -1146,7 +1146,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnlyPostgres(t *testing.T) {
 		afterVisibleDelete.Forwards[0].Repost.ID != hiddenRepost.Story.ID {
 		t.Fatalf("public forwards after visible delete = %+v, want hidden repost only", afterVisibleDelete)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{hiddenRepost.Story.ID}, 1700000715); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{hiddenRepost.Story.ID}, 1700000715); err != nil {
 		t.Fatalf("delete hidden repost: %v", err)
 	}
 	empty, err := store.ListStoryPublicForwards(ctx, domain.StoryPublicForwardListRequest{
@@ -1168,7 +1168,7 @@ func TestStoryStorePublicRepostStoryReactionsListPostgres(t *testing.T) {
 	ctx := context.Background()
 	sourceUser, repostUser := createStoryTestUsers(t, ctx, pool)
 	store := NewStoryStore(pool)
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	createdChannel, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: sourceUser.ID,
 		Title:         "Story Reactions " + randomSuffix(t),
@@ -1184,7 +1184,7 @@ func TestStoryStorePublicRepostStoryReactionsListPostgres(t *testing.T) {
 		cleanupChannelStoryTestRows(t, context.Background(), pool, sourceOwner.ID, []int64{sourceUser.ID, repostUser.ID})
 	})
 	repostOwner := domain.Peer{Type: domain.PeerTypeUser, ID: repostUser.ID}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 401,
 		Date:     1700000800,
@@ -1194,13 +1194,13 @@ func TestStoryStorePublicRepostStoryReactionsListPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	if _, err := store.SetReaction(ctx, repostUser.ID, sourceOwner, source.Story.ID, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, repostUser.ID, sourceOwner, source.Story.ID, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 1700000801); err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 402,
 		Date:     1700000802,
@@ -1246,7 +1246,7 @@ func TestStoryStorePublicRepostStoryReactionsListPostgres(t *testing.T) {
 	if filtered.Count != 1 || len(filtered.Reactions) != 1 || filtered.Reactions[0].Repost != nil || filtered.Reactions[0].ViewerID != repostUser.ID {
 		t.Fatalf("filtered reaction list = %+v, want only emoji reactor", filtered)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000803); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000803); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	list, err = store.ListStoryReactions(ctx, domain.StoryReactionListRequest{
@@ -1640,7 +1640,7 @@ ON CONFLICT (user_id, contact_user_id) DO UPDATE SET
 	if intersection.Count != 0 || len(intersection.Views) != 0 {
 		t.Fatalf("intersection = %+v, want empty contact-filtered bob result", intersection)
 	}
-	if _, err := store.DeleteStories(ctx, ownerPeer, []int{1}, 1700000403); err != nil {
+	if _, err := store.deleteStories(ctx, ownerPeer, []int{1}, 1700000403); err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	deletedViewerIDs, err := store.ListStoryViewerIDs(ctx, ownerPeer, 1, 10)
@@ -1865,7 +1865,7 @@ ON CONFLICT (user_id, contact_user_id) DO UPDATE SET
 	if created, err := afterRestart.IncrementViews(ctx, stranger.ID, ownerPeer, []int{2}, 1700000801); err != nil || created != 0 {
 		t.Fatalf("hidden increment views = %d, %v; want 0 nil", created, err)
 	}
-	if _, err := afterRestart.SetReaction(ctx, stranger.ID, ownerPeer, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 1700000802); err != domain.ErrStoryNotFound {
+	if _, err := afterRestart.setReaction(ctx, stranger.ID, ownerPeer, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 1700000802); err != domain.ErrStoryNotFound {
 		t.Fatalf("hidden set reaction err = %v, want ErrStoryNotFound", err)
 	}
 	recent, err := afterRestart.GetPeerMaxIDs(ctx, contactViewer.ID, []domain.Peer{ownerPeer}, 1700000803)
@@ -1892,7 +1892,7 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
 	media := &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &domain.Photo{ID: 9701, AccessHash: 97, DCID: 2}}
 
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    ownerPeer,
 		RandomID: 99001,
 		Date:     1700000600,
@@ -1908,7 +1908,7 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 	if created.Duplicate || created.Story.ID != 1 || created.Story.ExpireDate != 1700087000 {
 		t.Fatalf("created = %+v, want new story id 1", created)
 	}
-	dup, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	dup, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    ownerPeer,
 		RandomID: 99001,
 		Date:     1700000601,
@@ -1941,7 +1941,7 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 		t.Fatalf("empty get stories by id err = %v, want ErrStoryIDInvalid", err)
 	}
 
-	edited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         ownerPeer,
 		ID:            created.Story.ID,
 		Caption:       "pg edited",
@@ -1963,7 +1963,7 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 	if len(pinned.Stories) != 1 || pinned.Stories[0].ID != created.Story.ID {
 		t.Fatalf("pinned = %+v, want created story", pinned)
 	}
-	toggled, err := store.TogglePinned(ctx, ownerPeer, []int{created.Story.ID, created.Story.ID}, false, 1700000604)
+	toggled, err := store.togglePinned(ctx, ownerPeer, []int{created.Story.ID, created.Story.ID}, false, 1700000604)
 	if err != nil {
 		t.Fatalf("toggle pinned: %v", err)
 	}
@@ -1973,28 +1973,28 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 	if len(toggled.Previous) != 1 || toggled.Previous[0].Deleted || !toggled.Previous[0].Pinned {
 		t.Fatalf("toggled previous = %+v, want pre-toggle pinned snapshot", toggled.Previous)
 	}
-	retryToggled, err := store.TogglePinned(ctx, ownerPeer, []int{created.Story.ID}, false, 1700000605)
+	retryToggled, err := store.togglePinned(ctx, ownerPeer, []int{created.Story.ID}, false, 1700000605)
 	if err != nil {
 		t.Fatalf("retry toggle pinned: %v", err)
 	}
 	if len(retryToggled.IDs) != 1 || retryToggled.IDs[0] != created.Story.ID || len(retryToggled.Stories) != 0 || len(retryToggled.Previous) != 0 {
 		t.Fatalf("retry toggled = %+v, want id echo without mutation snapshot", retryToggled)
 	}
-	emptyToggle, err := store.TogglePinned(ctx, ownerPeer, nil, true, 1700000604)
+	emptyToggle, err := store.togglePinned(ctx, ownerPeer, nil, true, 1700000604)
 	if err != nil {
 		t.Fatalf("empty toggle pinned: %v", err)
 	}
 	if len(emptyToggle.IDs) != 0 || len(emptyToggle.Stories) != 0 {
 		t.Fatalf("empty toggle = %+v, want no-op", emptyToggle)
 	}
-	deleted, err := store.DeleteStories(ctx, ownerPeer, []int{created.Story.ID, created.Story.ID}, 1700000605)
+	deleted, err := store.deleteStories(ctx, ownerPeer, []int{created.Story.ID, created.Story.ID}, 1700000605)
 	if err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	if len(deleted.IDs) != 1 || deleted.IDs[0] != created.Story.ID || len(deleted.Stories) != 1 || !deleted.Stories[0].Deleted {
 		t.Fatalf("deleted = %+v, want deleted story", deleted)
 	}
-	retryDeleted, err := store.DeleteStories(ctx, ownerPeer, []int{created.Story.ID}, 1700000606)
+	retryDeleted, err := store.deleteStories(ctx, ownerPeer, []int{created.Story.ID}, 1700000606)
 	if err != nil {
 		t.Fatalf("retry delete story: %v", err)
 	}
@@ -2012,7 +2012,7 @@ func TestStoryStoreCreateEditDeleteAndPinnedPostgres(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("upsert expired pinned story: %v", err)
 	}
-	expiredPinnedDeleted, err := store.DeleteStories(ctx, ownerPeer, []int{77}, 1700000607)
+	expiredPinnedDeleted, err := store.deleteStories(ctx, ownerPeer, []int{77}, 1700000607)
 	if err != nil {
 		t.Fatalf("delete expired pinned story: %v", err)
 	}
@@ -2090,7 +2090,7 @@ func TestStoryStorePinnedToTopOrderPostgres(t *testing.T) {
 	if pageAfterTail.Count != 4 || len(pageAfterTail.Stories) != 0 || !samePGStoryIDs(pageAfterTail.PinnedToTop, []int{2, 1, 4}) {
 		t.Fatalf("tail page = count %d stories %v top %v, want count 4 empty stories top 2,1,4", pageAfterTail.Count, pgStoryIDs(pageAfterTail.Stories), pageAfterTail.PinnedToTop)
 	}
-	if _, err := store.TogglePinned(ctx, ownerPeer, []int{2}, false, 1700000802); err != nil {
+	if _, err := store.togglePinned(ctx, ownerPeer, []int{2}, false, 1700000802); err != nil {
 		t.Fatalf("unpin story: %v", err)
 	}
 	pinned, err = store.ListPinnedStories(ctx, owner.ID, ownerPeer, 0, 10, 1700000803)
@@ -2103,7 +2103,7 @@ func TestStoryStorePinnedToTopOrderPostgres(t *testing.T) {
 	if err := store.TogglePinnedToTop(ctx, ownerPeer, []int{2}); !errors.Is(err, domain.ErrStoryIDInvalid) {
 		t.Fatalf("unpinned top err = %v, want ErrStoryIDInvalid", err)
 	}
-	if _, err := store.DeleteStories(ctx, ownerPeer, []int{1}, 1700000804); err != nil {
+	if _, err := store.deleteStories(ctx, ownerPeer, []int{1}, 1700000804); err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	pinned, err = store.ListPinnedStories(ctx, owner.ID, ownerPeer, 0, 10, 1700000805)
@@ -2148,7 +2148,7 @@ func samePGStoryIDs(got, want []int) bool {
 func TestStoryUpdateEventPayloadPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	owner, _ := createStoryTestUsers(t, ctx, pool)
+	owner, viewer := createStoryTestUsers(t, ctx, pool)
 	events := NewUpdateEventStore(pool)
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
 	story := domain.Story{
@@ -2183,24 +2183,117 @@ func TestStoryUpdateEventPayloadPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("append reaction event: %v", err)
 	}
+	if err := events.Append(ctx, owner.ID, domain.UpdateEvent{
+		Type:     domain.UpdateEventNewStoryReaction,
+		Pts:      3,
+		PtsCount: 1,
+		Date:     1700000402,
+		Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: viewer.ID},
+		MaxID:    story.ID,
+		Story:    story,
+		Reaction: reaction,
+	}); err != nil {
+		t.Fatalf("append new story reaction event: %v", err)
+	}
 
 	listed, err := events.ListAfter(ctx, owner.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(listed) != 2 || listed[0].Story.ID != story.ID || listed[0].Story.Caption != story.Caption {
+	if len(listed) != 3 || listed[0].Story.ID != story.ID || listed[0].Story.Caption != story.Caption {
 		t.Fatalf("listed story events = %+v, want story payload", listed)
 	}
 	if listed[1].Reaction == nil || *listed[1].Reaction != *reaction || listed[1].Story.ID != story.ID {
 		t.Fatalf("listed reaction event = %+v, want reaction and story payload", listed[1])
 	}
+	if listed[2].Type != domain.UpdateEventNewStoryReaction || listed[2].Peer.ID != viewer.ID ||
+		listed[2].Reaction == nil || *listed[2].Reaction != *reaction || listed[2].Story.ID != story.ID || listed[2].Story.Caption != story.Caption {
+		t.Fatalf("listed new reaction event = %+v, want reactor plus reaction and story payload", listed[2])
+	}
 
-	batched, err := events.BatchByCursor(ctx, []storepkg.EventCursor{{UserID: owner.ID, Pts: 2}})
+	batched, err := events.BatchByCursor(ctx, []storepkg.EventCursor{
+		{UserID: owner.ID, Pts: 2},
+		{UserID: owner.ID, Pts: 3},
+	})
 	if err != nil {
 		t.Fatalf("batch events: %v", err)
 	}
-	if len(batched) != 1 || batched[0].Reaction == nil || *batched[0].Reaction != *reaction || batched[0].Story.ID != story.ID {
+	batchedByPts := make(map[int]domain.UpdateEvent, len(batched))
+	for _, event := range batched {
+		batchedByPts[event.Pts] = event
+	}
+	sent := batchedByPts[2]
+	newReaction := batchedByPts[3]
+	if len(batched) != 2 || sent.Reaction == nil || *sent.Reaction != *reaction || sent.Story.ID != story.ID ||
+		newReaction.Type != domain.UpdateEventNewStoryReaction || newReaction.Reaction == nil || *newReaction.Reaction != *reaction || newReaction.Story.ID != story.ID {
 		t.Fatalf("batched event = %+v, want durable reaction payload", batched)
+	}
+}
+
+func TestStoryCreateWithDeliveryCommitsOrRollsBackAsOneAggregatePostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	owner, _ := createStoryTestUsers(t, ctx, pool)
+	stories := NewStoryStore(pool)
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+	excludeAuthKeyID := [8]byte{1, 7, 3, 9, 2, 4, 6, 8}
+	const excludeSessionID int64 = 7733
+	build := func(snapshot storepkg.StoryMutationSnapshot) ([]storepkg.DeliveryEffect, error) {
+		effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Required))
+		for _, required := range snapshot.Required {
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if required.ExcludeOrigin {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, storepkg.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, authKeyID, sessionID))
+		}
+		return effects, nil
+	}
+	media := &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &domain.Photo{ID: 9791, AccessHash: 97, DCID: 2}}
+	created, err := stories.CreateStoryWithDelivery(ctx, owner.ID, domain.StoryCreateRequest{
+		Owner: ownerPeer, RandomID: 997001, Date: 1700000900, Period: 86400,
+		Public: true, Caption: "atomic story", Media: media,
+	}, build)
+	if err != nil {
+		t.Fatalf("create story aggregate: %v", err)
+	}
+	events, err := NewUpdateEventStore(pool).ListAfter(ctx, owner.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("list story aggregate events: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != domain.UpdateEventStory || events[0].Story.ID != created.Story.ID {
+		t.Fatalf("story aggregate events = %+v, want one created story", events)
+	}
+	var queued int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)::int
+FROM dispatch_outbox
+WHERE target_user_id = $1 AND pts = $2
+  AND exclude_auth_key_id = $3 AND exclude_session_id = $4`,
+		owner.ID, events[0].Pts, excludeAuthKeyID[:], excludeSessionID).Scan(&queued); err != nil {
+		t.Fatalf("count story dispatch: %v", err)
+	}
+	if queued != 1 {
+		t.Fatalf("story dispatch rows = %d, want 1", queued)
+	}
+
+	buildErr := errors.New("reject story delivery")
+	if _, err := stories.CreateStoryWithDelivery(ctx, owner.ID, domain.StoryCreateRequest{
+		Owner: ownerPeer, RandomID: 997002, Date: 1700000901, Period: 86400,
+		Public: true, Caption: "must rollback", Media: media,
+	}, func(storepkg.StoryMutationSnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("rejected story aggregate err = %v, want %v", err, buildErr)
+	}
+	var rolledBack int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)::int FROM stories
+WHERE owner_peer_type = 'user' AND owner_peer_id = $1 AND random_id = $2`, owner.ID, int64(997002)).Scan(&rolledBack); err != nil {
+		t.Fatalf("count rolled back story: %v", err)
+	}
+	if rolledBack != 0 {
+		t.Fatalf("rolled back story rows = %d, want 0", rolledBack)
 	}
 }
 

@@ -31,7 +31,7 @@ func TestSavedMessageTagsPostgresAssignmentCountsSearchAndDelete(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", user.ID)
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	self := domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}
 	peerA := domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}
 	peerB := domain.Peer{Type: domain.PeerTypeChannel, ID: 90001}
@@ -70,7 +70,8 @@ WHERE owner_user_id = $1 AND box_id = $2`,
 			MessageID:           msg.ID,
 			Reactions:           reactions,
 			ReactionsPerUserMax: 3,
-		})
+		}, testPrivateReactionEffects)
+
 		if err != nil {
 			t.Fatalf("set saved tags on %d: %v", msg.ID, err)
 		}
@@ -84,7 +85,7 @@ WHERE owner_user_id = $1 AND box_id = $2`,
 	set(third, custom)
 	if err := messages.UpsertSavedReactionTag(ctx, domain.SavedReactionTag{
 		UserID: user.ID, Reaction: custom, Title: "Custom",
-	}); err != nil {
+	}, testSavedReactionTagEffects); err != nil {
 		t.Fatalf("rename custom saved tag: %v", err)
 	}
 

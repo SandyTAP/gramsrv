@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -432,6 +433,14 @@ func (s *UserStore) SetVerified(ctx context.Context, userID int64, verified bool
 	return userFromModel(row), nil
 }
 
+func (s *UserStore) SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, "set user verified with delivery", effects,
+		func(current domain.User) bool { return current.Verified == verified },
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			return q.SetUserVerified(ctx, sqlcgen.SetUserVerifiedParams{ID: userID, Verified: verified})
+		})
+}
+
 // SetSupport 设置/取消用户的 support 标记（官方客服账号）。
 func (s *UserStore) SetSupport(ctx context.Context, userID int64, support bool) (domain.User, error) {
 	row, err := s.q.SetUserSupport(ctx, sqlcgen.SetUserSupportParams{
@@ -445,6 +454,14 @@ func (s *UserStore) SetSupport(ctx context.Context, userID int64, support bool) 
 		return domain.User{}, fmt.Errorf("set user support: %w", err)
 	}
 	return userFromModel(row), nil
+}
+
+func (s *UserStore) SetSupportWithDelivery(ctx context.Context, userID int64, support bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, "set user support with delivery", effects,
+		func(current domain.User) bool { return current.Support == support },
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			return q.SetUserSupport(ctx, sqlcgen.SetUserSupportParams{ID: userID, Support: support})
+		})
 }
 
 // SetScamFake 设置/取消用户的 scam 与 fake 标记（bot 复用同一路径）。
@@ -509,18 +526,154 @@ FOR UPDATE`, userID).Scan(&currentScam, &currentFake); err != nil {
 	return userFromModel(row), nil
 }
 
-const maxModerationFlagAudience = 4096
-
-// ModerationFlagAudience returns the bounded set of accounts that can already
-// observe the target through a direct contact or private dialog. It is used
-// only for best-effort, non-PTS updateUser fanout after the authoritative flag
-// mutation commits.
-func (s *UserStore) ModerationFlagAudience(ctx context.Context, userID int64, limit int) ([]int64, error) {
-	if limit > maxModerationFlagAudience {
-		limit = maxModerationFlagAudience
+func (s *UserStore) SetScamFakeWithDelivery(ctx context.Context, userID int64, scam, fake bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if scam && fake {
+		return domain.User{}, domain.ErrPeerModerationFlagsInvalid
 	}
-	return moderationFlagAudience(ctx, s.db, userID, limit)
+	return s.setModerationFlagsWithDelivery(ctx, userID, "set user scam/fake with delivery", effects,
+		func(current domain.User) bool { return current.Scam == scam && current.Fake == fake },
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			return q.SetUserScamFake(ctx, sqlcgen.SetUserScamFakeParams{ID: userID, Scam: scam, Fake: fake})
+		})
 }
+
+func (s *UserStore) AdminUpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, "admin update user profile with delivery", effects,
+		func(current domain.User) bool {
+			return current.FirstName == firstName && current.LastName == lastName && current.About == about
+		},
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			return q.UpdateUserProfile(ctx, sqlcgen.UpdateUserProfileParams{
+				ID: userID, FirstName: firstName, LastName: lastName, About: about,
+			})
+		})
+}
+
+func (s *UserStore) AdminUpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
+	usernameLower := strings.ToLower(username)
+	return s.setModerationFlagsWithDelivery(ctx, userID, "admin update user username with delivery", effects,
+		func(current domain.User) bool { return current.Username == username },
+		func(tx pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			if err := replacePeerUsernameTx(ctx, tx, peerUsernameTypeUser, userID, username, usernameLower); err != nil {
+				return sqlcgen.User{}, err
+			}
+			row, err := q.UpdateUserUsername(ctx, sqlcgen.UpdateUserUsernameParams{ID: userID, Username: username})
+			if isUniqueConstraint(err, "users_username_lower_unique_idx") {
+				return sqlcgen.User{}, domain.ErrUsernameOccupied
+			}
+			return row, err
+		})
+}
+
+func (s *UserStore) AdminUpdatePhoneWithDelivery(ctx context.Context, userID int64, phone string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, "admin update user phone with delivery", effects,
+		func(current domain.User) bool { return current.Phone == phone },
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			row, err := q.UpdateUserPhone(ctx, sqlcgen.UpdateUserPhoneParams{ID: userID, Phone: phone})
+			if isUniqueConstraint(err, "users_phone_unique_idx") {
+				return sqlcgen.User{}, domain.ErrPhoneNumberOccupied
+			}
+			return row, err
+		})
+}
+
+func (s *UserStore) AdminUpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, "admin update user color with delivery", effects,
+		func(current domain.User) bool {
+			if forProfile {
+				return current.ProfileColor == color
+			}
+			return current.Color == color
+		},
+		func(_ pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			if forProfile {
+				return q.UpdateUserProfileColor(ctx, sqlcgen.UpdateUserProfileColorParams{
+					ID: userID, ColorSet: color.HasColor, Color: int32(color.Color), BackgroundEmojiID: color.BackgroundEmojiID,
+				})
+			}
+			return q.UpdateUserColor(ctx, sqlcgen.UpdateUserColorParams{
+				ID: userID, ColorSet: color.HasColor, Color: int32(color.Color), BackgroundEmojiID: color.BackgroundEmojiID,
+			})
+		})
+}
+
+func (s *UserStore) AdminUpdateEmojiStatusWithDelivery(ctx context.Context, userID int64, status domain.UserEmojiStatus, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	collectibleJSON, collectibleID, err := encodeEmojiStatusCollectible(status)
+	if err != nil {
+		return domain.User{}, err
+	}
+	params := sqlcgen.UpdateUserEmojiStatusParams{
+		ID: userID, EmojiStatusDocumentID: status.DocumentID, EmojiStatusUntil: int64(status.Until),
+		EmojiStatusCollectibleID: collectibleID, EmojiStatusCollectible: collectibleJSON,
+	}
+	return s.setModerationFlagsWithDelivery(ctx, userID, "admin update user emoji status with delivery", effects,
+		func(current domain.User) bool { return current.EmojiStatus() == status },
+		func(tx pgx.Tx, q *sqlcgen.Queries) (sqlcgen.User, error) {
+			return updateEmojiStatusRow(ctx, tx, q, userID, status, params)
+		})
+}
+
+func (s *UserStore) setModerationFlagsWithDelivery(
+	ctx context.Context,
+	userID int64,
+	operation string,
+	effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot],
+	unchanged func(domain.User) bool,
+	mutate func(pgx.Tx, *sqlcgen.Queries) (sqlcgen.User, error),
+) (domain.User, error) {
+	if userID <= 0 || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	var out domain.User
+	err := withTx(ctx, s.db, operation, func(tx pgx.Tx) error {
+		var lockedUserID int64
+		if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&lockedUserID); errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUserNotFound
+		} else if err != nil {
+			return err
+		}
+		qtx := sqlcgen.New(tx)
+		row, err := qtx.GetUserByID(ctx, userID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUserNotFound
+		}
+		if err != nil {
+			return err
+		}
+		out = userFromModel(row)
+		if unchanged(out) {
+			return nil
+		}
+		row, err = mutate(tx, qtx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUserNotFound
+		}
+		if err != nil {
+			return err
+		}
+		out = userFromModel(row)
+		audience, err := moderationFlagAudience(ctx, tx, userID, maxModerationFlagAudience)
+		if err != nil {
+			return err
+		}
+		snapshot := store.UserAudienceDeliverySnapshot{User: out, Audience: audience}
+		intents, err := effects(snapshot)
+		if err != nil {
+			return fmt.Errorf("build user audience delivery: %w", err)
+		}
+		if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+			return err
+		}
+		return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
+	})
+	if err != nil {
+		return domain.User{}, err
+	}
+	return out, nil
+}
+
+const maxModerationFlagAudience = 4096
 
 func moderationFlagAudience(ctx context.Context, db sqlcgen.DBTX, userID int64, limit int) ([]int64, error) {
 	if userID <= 0 || limit <= 0 {
@@ -567,6 +720,95 @@ ORDER BY picked.user_id`, userID, limit)
 	return out, nil
 }
 
+// userAudienceSnapshots freezes several changed user projections with one
+// set-based user read and one set-based audience query. It is used by aggregate
+// mutations such as collectible-phone ownership transitions where reading each
+// owner after commit would race the mutation and make partial notification
+// possible.
+func userAudienceSnapshots(ctx context.Context, db sqlcgen.DBTX, userIDs []int64, limit int) ([]store.UserAudienceDeliverySnapshot, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("user audience snapshot limit is required")
+	}
+	seen := make(map[int64]struct{}, len(userIDs))
+	ids := make([]int64, 0, len(userIDs))
+	for _, id := range userIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	rows, err := sqlcgen.New(db).GetUsersByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load user audience snapshot users: %w", err)
+	}
+	users := make(map[int64]domain.User, len(rows))
+	for _, row := range rows {
+		user := userFromModel(row)
+		if !user.Deleted {
+			users[user.ID] = user
+		}
+	}
+	if len(users) != len(ids) {
+		return nil, domain.ErrUserNotFound
+	}
+
+	audienceRows, err := db.Query(ctx, `
+WITH owners AS (
+  SELECT unnest($1::bigint[]) AS owner_id
+), candidates AS (
+  SELECT owner_id, owner_id AS user_id, 0 AS priority, 2147483647::bigint AS activity FROM owners
+  UNION ALL
+  SELECT o.owner_id, c.contact_user_id, 1, 0 FROM owners o JOIN contacts c ON c.user_id=o.owner_id
+  UNION ALL
+  SELECT o.owner_id, c.user_id, 1, 0 FROM owners o JOIN contacts c ON c.contact_user_id=o.owner_id
+  UNION ALL
+  SELECT o.owner_id, d.peer_id, 2, d.top_message_date FROM owners o JOIN dialogs d ON d.user_id=o.owner_id AND d.peer_type='user'
+  UNION ALL
+  SELECT o.owner_id, d.user_id, 2, d.top_message_date FROM owners o JOIN dialogs d ON d.peer_type='user' AND d.peer_id=o.owner_id
+), deduplicated AS (
+  SELECT c.owner_id, c.user_id, min(c.priority) AS priority, max(c.activity) AS activity
+  FROM candidates c JOIN users u ON u.id=c.user_id AND u.deleted_at IS NULL
+  GROUP BY c.owner_id, c.user_id
+), ranked AS (
+  SELECT owner_id, user_id,
+         row_number() OVER (PARTITION BY owner_id ORDER BY priority, activity DESC, user_id) AS ordinal
+  FROM deduplicated
+)
+SELECT owner_id, user_id FROM ranked WHERE ordinal <= $2 ORDER BY owner_id, user_id`, ids, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list user audience snapshots: %w", err)
+	}
+	defer audienceRows.Close()
+	audiences := make(map[int64][]int64, len(ids))
+	for audienceRows.Next() {
+		var ownerID, viewerID int64
+		if err := audienceRows.Scan(&ownerID, &viewerID); err != nil {
+			return nil, fmt.Errorf("scan user audience snapshot: %w", err)
+		}
+		audiences[ownerID] = append(audiences[ownerID], viewerID)
+	}
+	if err := audienceRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate user audience snapshots: %w", err)
+	}
+	out := make([]store.UserAudienceDeliverySnapshot, 0, len(ids))
+	for _, id := range ids {
+		audience := audiences[id]
+		if len(audience) == 0 {
+			return nil, fmt.Errorf("user audience snapshot %d is empty", id)
+		}
+		out = append(out, store.UserAudienceDeliverySnapshot{User: users[id], Audience: audience})
+	}
+	return out, nil
+}
+
 // SweepExpiredPremium 清空到期会员行并返回清理后的用户。
 func (s *UserStore) SweepExpiredPremium(ctx context.Context, now int64, limit int) ([]domain.User, error) {
 	if limit <= 0 {
@@ -586,55 +828,55 @@ func (s *UserStore) SweepExpiredPremium(ctx context.Context, now int64, limit in
 	return out, nil
 }
 
-// UpdateEmojiStatus atomically replaces the complete emoji-status snapshot.
-func (s *UserStore) UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error) {
-	collectibleJSON, collectibleID, err := encodeEmojiStatusCollectible(status)
-	if err != nil {
-		return domain.User{}, err
+func (s *UserStore) SweepExpiredPremiumWithDelivery(ctx context.Context, now int64, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	if limit <= 0 {
+		return nil, nil
 	}
-	params := sqlcgen.UpdateUserEmojiStatusParams{
-		ID:                       userID,
-		EmojiStatusDocumentID:    status.DocumentID,
-		EmojiStatusUntil:         int64(status.Until),
-		EmojiStatusCollectibleID: collectibleID,
-		EmojiStatusCollectible:   collectibleJSON,
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
-	var row sqlcgen.User
-	if status.Collectible.Empty() {
-		row, err = updateEmojiStatusRow(ctx, s.db, s.q, userID, status, params)
-	} else {
-		// Serialize selection against transfer/export/burn. RPC-level ownership
-		// checks are advisory; this lock is the write-boundary invariant that
-		// prevents a concurrent lifecycle commit from leaving a non-owned gift
-		// installed after its invalidation trigger already ran.
-		err = withTx(ctx, s.db, "update collectible emoji status", func(tx pgx.Tx) error {
-			row, err = updateEmojiStatusRow(ctx, tx, sqlcgen.New(tx), userID, status, params)
-			return err
+	var out []domain.User
+	err := withTx(ctx, s.db, "sweep expired premium with delivery", func(tx pgx.Tx) error {
+		rows, err := sqlcgen.New(tx).SweepExpiredPremium(ctx, sqlcgen.SweepExpiredPremiumParams{
+			Now:        pgtype.Timestamptz{Time: time.Unix(now, 0).UTC(), Valid: true},
+			LimitCount: int32(limit),
 		})
-	}
+		if err != nil {
+			return fmt.Errorf("sweep expired premium: %w", err)
+		}
+		out = make([]domain.User, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, userFromModel(row))
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		intents, err := effects(out)
+		if err != nil {
+			return fmt.Errorf("build expired premium delivery: %w", err)
+		}
+		if err := store.ValidateUserBatchDeliveryEffects(out, intents); err != nil {
+			return err
+		}
+		return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
+	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.User{}, domain.ErrUserNotFound
-		}
-		if errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
-			return domain.User{}, err
-		}
-		return domain.User{}, fmt.Errorf("update user emoji status: %w", err)
+		return nil, err
 	}
-	return userFromModel(row), nil
+	return out, nil
 }
 
 // UpdateEmojiStatusWithEvent commits the user snapshot, allocated pts event
 // and dispatch outbox row as one aggregate transaction. This is the production
 // boundary used by account.updateEmojiStatus; no success can expose a users
 // row whose change is absent from updates.getDifference.
-func (s *UserStore) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, error) {
+func (s *UserStore) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent) (domain.User, domain.UpdateEvent, error) {
 	collectibleJSON, collectibleID, err := encodeEmojiStatusCollectible(status)
 	if err != nil {
 		return domain.User{}, domain.UpdateEvent{}, err
 	}
 	if event.Type != domain.UpdateEventUserEmojiStatus || event.EmojiStatus != status ||
-		event.Peer != (domain.Peer{Type: domain.PeerTypeUser, ID: userID}) {
+		event.Peer != (domain.Peer{Type: domain.PeerTypeUser, ID: userID}) || event.PtsCount <= 0 || event.Pts != 0 {
 		return domain.User{}, domain.UpdateEvent{}, domain.ErrStarGiftCollectibleInvalid
 	}
 	params := sqlcgen.UpdateUserEmojiStatusParams{
@@ -651,7 +893,7 @@ func (s *UserStore) UpdateEmojiStatusWithEvent(ctx context.Context, userID int64
 			return err
 		}
 		event, err = NewUpdateEventStore(tx).AppendAllocatedWithDispatch(
-			ctx, userID, event, excludeAuthKeyID, excludeSessionID,
+			ctx, userID, event, [8]byte{}, 0,
 		)
 		return err
 	})
@@ -731,17 +973,41 @@ func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64
 	return userFromModel(row), nil
 }
 
-// UpdatePersonalChannel 设置/清除资料页个人频道（channelID=0 表示清除）。
-func (s *UserStore) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
-	row, err := s.q.UpdateUserPersonalChannel(ctx, sqlcgen.UpdateUserPersonalChannelParams{
-		ID:                userID,
-		PersonalChannelID: channelID,
+// UpdatePersonalChannelWithDelivery commits the user row and its owner-only
+// absolute reload as one transaction. There is no mutation-only production
+// path for account.updatePersonalChannel.
+func (s *UserStore) UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	var row sqlcgen.User
+	err := withTx(ctx, s.db, "update user personal channel with delivery", func(tx pgx.Tx) error {
+		var err error
+		row, err = sqlcgen.New(tx).UpdateUserPersonalChannel(ctx, sqlcgen.UpdateUserPersonalChannelParams{
+			ID:                userID,
+			PersonalChannelID: channelID,
+		})
+		if err != nil {
+			return err
+		}
+		snapshot, err := userDeliverySnapshotTx(ctx, tx, userFromModel(row))
+		if err != nil {
+			return err
+		}
+		intents, err := effects(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := store.ValidateUserSelfDeliveryEffects(snapshot, intents); err != nil {
+			return err
+		}
+		return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.User{}, domain.ErrUserNotFound
 		}
-		return domain.User{}, fmt.Errorf("update user personal channel: %w", err)
+		return domain.User{}, fmt.Errorf("update user personal channel with delivery: %w", err)
 	}
 	return userFromModel(row), nil
 }
@@ -828,6 +1094,7 @@ func enqueueUserDeliveryTx(ctx context.Context, tx pgx.Tx, u domain.User, build 
 		ExcludeAuthKeyID: excludeAuthKeyID,
 		ExcludeSessionID: excludeSessionID,
 		Payload:          payload,
+		RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 	}); err != nil {
 		return err
 	}

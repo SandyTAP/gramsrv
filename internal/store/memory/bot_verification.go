@@ -91,6 +91,10 @@ type BotVerificationStore struct {
 	// full scan.
 	markCounts map[int64]int
 	requests   map[int64]domain.CustomVerificationRequest
+	// deliveryOutbox is attached explicitly by production-shaped tests. User
+	// mark mutations fail closed without it; channel marks retain their aggregate
+	// notifier path and never write this queue here.
+	deliveryOutbox *DeliveryOutboxStore
 	// lastNow keeps the store's clock strictly increasing, so orderings that tie
 	// on a timestamp are as deterministic as they are against PostgreSQL.
 	lastNow time.Time
@@ -120,6 +124,17 @@ func NewBotVerificationStore() *BotVerificationStore {
 		markCounts:      make(map[int64]int),
 		requests:        make(map[int64]domain.CustomVerificationRequest),
 	}
+}
+
+// AttachDeliveryOutbox wires the non-PTS absolute delivery queue used by
+// user-target grant/revoke transactions.
+func (s *BotVerificationStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
 }
 
 var _ store.BotVerificationStore = (*BotVerificationStore)(nil)
@@ -233,89 +248,142 @@ func (s *BotVerificationStore) ListVerificationIcons(_ context.Context, activeOn
 
 // ---- verifier status --------------------------------------------------------
 
-// UpsertBotVerifierSettings grants or updates verifier status.
+// UpsertBotVerifierSettingsWithDelivery grants or updates verifier status.
 //
 // settings.Version is the optimistic-locking expectation: 0 means "there is no
 // verifier row yet" and a stored row then reports
 // domain.ErrCustomVerificationVersionConflict, and a non-zero version must match
 // the stored one. CreatedAt is never rewritten, so the grant date survives every
 // later edit.
-func (s *BotVerificationStore) UpsertBotVerifierSettings(_ context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+func (s *BotVerificationStore) UpsertBotVerifierSettingsWithDelivery(ctx context.Context, settings domain.BotVerifierSettings, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
+	if s == nil {
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
+	}
 	settings.CompanyName = strings.TrimSpace(settings.CompanyName)
 	settings.DefaultDescription = strings.TrimSpace(settings.DefaultDescription)
 	settings.GrantedBy = strings.TrimSpace(settings.GrantedBy)
 	settings.GrantReason = strings.TrimSpace(settings.GrantReason)
 	if err := settings.Validate(); err != nil {
-		return domain.BotVerifierSettings{}, err
+		return store.BotVerifierSettingsMutation{}, err
 	}
 	if settings.Version < 0 || !botVerifierSettingsColumnsFit(settings) {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierSettingsInvalid
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierSettingsInvalid
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.nowLocked()
+	if s.deliveryOutbox == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
+	}
 	current, ok := s.verifiers[settings.BotID]
+	if ok && botVerifierSettingsSameState(current, settings) {
+		return store.BotVerifierSettingsMutation{Settings: current}, nil
+	}
 	if !ok {
 		if settings.Version != 0 {
 			// The caller edits a row that is no longer there.
-			return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+			return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 		}
-		stored := settings
+	} else if settings.Version == 0 || settings.Version != current.Version {
+		return store.BotVerifierSettingsMutation{}, domain.ErrCustomVerificationVersionConflict
+	}
+	intents, channels, err := s.botVerifierSettingsDeliveryLocked(settings.BotID, effects)
+	if err != nil {
+		return store.BotVerifierSettingsMutation{}, err
+	}
+	rollback := s.snapshotLocked()
+	now := s.nowLocked()
+	stored := settings
+	if !ok {
 		stored.CreatedAt = now
 		stored.UpdatedAt = now
 		stored.Version = 1
-		s.verifiers[stored.BotID] = stored
-		return stored, nil
+	} else {
+		stored.CreatedAt = current.CreatedAt
+		stored.UpdatedAt = laterVerificationTime(current.UpdatedAt, now)
+		stored.Version = current.Version + 1
 	}
-	if settings.Version == 0 || settings.Version != current.Version {
-		return domain.BotVerifierSettings{}, domain.ErrCustomVerificationVersionConflict
+	s.verifiers[stored.BotID] = stored
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		s.restoreLocked(rollback)
+		return store.BotVerifierSettingsMutation{}, err
 	}
-	updated := settings
-	updated.CreatedAt = current.CreatedAt
-	updated.UpdatedAt = laterVerificationTime(current.UpdatedAt, now)
-	updated.Version = current.Version + 1
-	s.verifiers[updated.BotID] = updated
-	return updated, nil
+	return store.BotVerifierSettingsMutation{Settings: stored, Changed: true, AffectedChannelIDs: channels}, nil
 }
 
-// SetBotVerifierEnabled flips the operator kill switch. Existing marks stay, but
+// SetBotVerifierEnabledWithDelivery flips the operator kill switch. Existing marks stay, but
 // the verifier can grant nothing new and neither its settings nor its marks are
 // projected, so flipping the switch back restores exactly what was there.
 // Setting the flag to the value it already has is a no-op and does not burn a
 // version.
-func (s *BotVerificationStore) SetBotVerifierEnabled(_ context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+func (s *BotVerificationStore) SetBotVerifierEnabledWithDelivery(ctx context.Context, botID int64, enabled bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
+	if s == nil {
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
+	}
 	if botID <= 0 {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deliveryOutbox == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
+	}
 	current, ok := s.verifiers[botID]
 	if !ok {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 	}
 	if current.Enabled == enabled {
-		return current, nil
+		return store.BotVerifierSettingsMutation{Settings: current}, nil
 	}
+	intents, channels, err := s.botVerifierSettingsDeliveryLocked(botID, effects)
+	if err != nil {
+		return store.BotVerifierSettingsMutation{}, err
+	}
+	rollback := s.snapshotLocked()
 	current.Enabled = enabled
 	current.UpdatedAt = laterVerificationTime(current.UpdatedAt, s.nowLocked())
 	current.Version++
 	s.verifiers[botID] = current
-	return current, nil
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		s.restoreLocked(rollback)
+		return store.BotVerifierSettingsMutation{}, err
+	}
+	return store.BotVerifierSettingsMutation{Settings: current, Changed: true, AffectedChannelIDs: channels}, nil
 }
 
-// DeleteBotVerifierSettings removes verifier status. Its marks cascade away with
+// DeleteBotVerifierSettingsWithDelivery removes verifier status. Its marks cascade away with
 // it, because a mark whose verifier no longer exists has nothing to render.
 // Applications survive: they reference users, not the verifier row, and stay as
 // history.
-func (s *BotVerificationStore) DeleteBotVerifierSettings(_ context.Context, botID int64) (bool, error) {
+func (s *BotVerificationStore) DeleteBotVerifierSettingsWithDelivery(ctx context.Context, botID int64, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
+	if s == nil {
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
+	}
 	if botID <= 0 {
-		return false, domain.ErrVerifierNotFound
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.verifiers[botID]; !ok {
-		return false, nil
+	if s.deliveryOutbox == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
 	}
+	current, ok := s.verifiers[botID]
+	if !ok {
+		return store.BotVerifierSettingsMutation{}, nil
+	}
+	intents, channels, err := s.botVerifierSettingsDeliveryLocked(botID, effects)
+	if err != nil {
+		return store.BotVerifierSettingsMutation{}, err
+	}
+	rollback := s.snapshotLocked()
 	delete(s.verifiers, botID)
 	for id, mark := range s.marks {
 		if mark.VerifierBotID != botID {
@@ -325,7 +393,72 @@ func (s *BotVerificationStore) DeleteBotVerifierSettings(_ context.Context, botI
 		delete(s.marksByPeer, customVerificationKeyOf(mark.VerifierBotID, mark.Peer))
 	}
 	delete(s.markCounts, botID)
-	return true, nil
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		s.restoreLocked(rollback)
+		return store.BotVerifierSettingsMutation{}, err
+	}
+	return store.BotVerifierSettingsMutation{Settings: current, Changed: true, AffectedChannelIDs: channels}, nil
+}
+
+func botVerifierSettingsSameState(current, desired domain.BotVerifierSettings) bool {
+	return current.BotID == desired.BotID &&
+		current.IconDocumentID == desired.IconDocumentID &&
+		current.CompanyName == desired.CompanyName &&
+		current.DefaultDescription == desired.DefaultDescription &&
+		current.CanModifyCustomDescription == desired.CanModifyCustomDescription &&
+		current.Enabled == desired.Enabled &&
+		current.GrantedBy == desired.GrantedBy &&
+		current.GrantReason == desired.GrantReason
+}
+
+// botVerifierSettingsDeliveryLocked freezes the in-memory backend's complete
+// known audience. This store has no contacts/dialog projection, so each affected
+// user contributes its own account lane; PostgreSQL expands the same subject set
+// to the bounded known-viewer relation in one set query.
+func (s *BotVerificationStore) botVerifierSettingsDeliveryLocked(botID int64, build store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) ([]store.DeliveryEffect, []int64, error) {
+	users := map[int64]struct{}{botID: {}}
+	channels := make([]int64, 0)
+	for _, mark := range s.marks {
+		if mark.VerifierBotID != botID {
+			continue
+		}
+		switch mark.Peer.Type {
+		case domain.PeerTypeUser:
+			users[mark.Peer.ID] = struct{}{}
+		case domain.PeerTypeChannel:
+			channels = append(channels, mark.Peer.ID)
+		}
+	}
+	if len(users) > store.MaxBotVerifierSettingsDeliveryEffects {
+		return nil, nil, fmt.Errorf("bot verifier settings affects more than %d users", store.MaxBotVerifierSettingsDeliveryEffects)
+	}
+	if len(channels) > store.MaxBotVerifierSettingsChannelInvalidations {
+		return nil, nil, fmt.Errorf("bot verifier settings affects more than %d channels", store.MaxBotVerifierSettingsChannelInvalidations)
+	}
+	userIDs := make([]int64, 0, len(users))
+	for userID := range users {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	sort.Slice(channels, func(i, j int) bool { return channels[i] < channels[j] })
+	intents := make([]store.DeliveryEffect, 0, len(userIDs))
+	for _, userID := range userIDs {
+		snapshot := store.UserAudienceDeliverySnapshot{
+			User: domain.User{ID: userID}, Audience: []int64{userID},
+		}
+		built, err := build(snapshot)
+		if err != nil {
+			return nil, nil, fmt.Errorf("build bot verifier settings user delivery for user %d: %w", userID, err)
+		}
+		if err := store.ValidateUserAudienceDeliveryEffects(snapshot, built); err != nil {
+			return nil, nil, err
+		}
+		if len(intents)+len(built) > store.MaxBotVerifierSettingsDeliveryEffects {
+			return nil, nil, fmt.Errorf("bot verifier settings delivery exceeds %d effects", store.MaxBotVerifierSettingsDeliveryEffects)
+		}
+		intents = append(intents, built...)
+	}
+	return intents, channels, nil
 }
 
 // BotVerifierSettings reads one verifier's status, enabled or not: the caller
@@ -411,6 +544,55 @@ func (s *BotVerificationStore) GrantCustomVerification(_ context.Context, mark d
 	return s.grantLocked(mark)
 }
 
+func (s *BotVerificationStore) GrantCustomVerificationWithDelivery(ctx context.Context, mark domain.CustomVerification, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error) {
+	mark.Description = strings.TrimSpace(mark.Description)
+	if mark.VerifierBotID <= 0 || mark.Peer.Type != domain.PeerTypeUser || mark.Peer.ID <= 0 {
+		return domain.CustomVerification{}, false, domain.ErrCustomVerificationTargetInvalid
+	}
+	if mark.GrantedByUserID < 0 {
+		return domain.CustomVerification{}, false, domain.ErrCustomVerificationTargetInvalid
+	}
+	if len(mark.Description) > maxCustomVerificationDescriptionBytes {
+		return domain.CustomVerification{}, false, domain.ErrCustomVerificationRequestInvalid
+	}
+	if effects == nil {
+		return domain.CustomVerification{}, false, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deliveryOutbox == nil {
+		return domain.CustomVerification{}, false, store.ErrDeliveryOutboxRequired
+	}
+	rollback := s.snapshotLocked()
+	current, found := s.markForPeerLocked(mark.Peer)
+	stored, created, err := s.grantLocked(mark)
+	if err != nil {
+		s.restoreLocked(rollback)
+		return domain.CustomVerification{}, false, err
+	}
+	if found && current.Version == stored.Version {
+		return stored, false, nil
+	}
+	snapshot := store.UserAudienceDeliverySnapshot{
+		User:     domain.User{ID: mark.Peer.ID},
+		Audience: []int64{mark.Peer.ID},
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		s.restoreLocked(rollback)
+		return domain.CustomVerification{}, false, err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		s.restoreLocked(rollback)
+		return domain.CustomVerification{}, false, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		s.restoreLocked(rollback)
+		return domain.CustomVerification{}, false, err
+	}
+	return stored, created, nil
+}
+
 // RevokeCustomVerification removes this verifier's mark from the peer and
 // reports whether anything was removed, so a repeated revoke is a no-op instead
 // of an error. Only this verifier's mark goes: another verifier's mark on the
@@ -422,6 +604,42 @@ func (s *BotVerificationStore) RevokeCustomVerification(_ context.Context, verif
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.revokeLocked(verifierBotID, peer), nil
+}
+
+func (s *BotVerificationStore) RevokeCustomVerificationWithDelivery(ctx context.Context, verifierBotID int64, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (bool, error) {
+	if verifierBotID <= 0 || peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+		return false, domain.ErrCustomVerificationTargetInvalid
+	}
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deliveryOutbox == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	rollback := s.snapshotLocked()
+	if !s.revokeLocked(verifierBotID, peer) {
+		return false, nil
+	}
+	snapshot := store.UserAudienceDeliverySnapshot{
+		User:     domain.User{ID: peer.ID},
+		Audience: []int64{peer.ID},
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		s.restoreLocked(rollback)
+		return false, err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		s.restoreLocked(rollback)
+		return false, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		s.restoreLocked(rollback)
+		return false, err
+	}
+	return true, nil
 }
 
 // CustomVerification reads one verifier's mark on a peer, whether or not that
@@ -794,10 +1012,16 @@ func (s *BotVerificationStore) grantLocked(mark domain.CustomVerification) (doma
 	if err := mark.Validate(); err != nil {
 		return domain.CustomVerification{}, false, err
 	}
-	now := s.nowLocked()
 	key := customVerificationKeyOf(mark.VerifierBotID, mark.Peer)
 	if id, found := s.marksByPeer[key]; found {
 		current := s.marks[id]
+		if current.VerifierBotID == mark.VerifierBotID &&
+			current.IconDocumentID == mark.IconDocumentID &&
+			current.Description == mark.Description &&
+			current.GrantedByUserID == mark.GrantedByUserID {
+			return current, false, nil
+		}
+		now := s.nowLocked()
 		replaced := current.VerifierBotID != mark.VerifierBotID
 		if replaced {
 			if s.markCounts[mark.VerifierBotID] >= domain.MaxCustomVerificationsPerVerifier {
@@ -823,6 +1047,7 @@ func (s *BotVerificationStore) grantLocked(mark domain.CustomVerification) (doma
 	if s.markCounts[mark.VerifierBotID] >= domain.MaxCustomVerificationsPerVerifier {
 		return domain.CustomVerification{}, false, domain.ErrCustomVerificationLimit
 	}
+	now := s.nowLocked()
 	stored := mark
 	stored.ID = s.nextMarkID
 	stored.CreatedAt = now
@@ -833,6 +1058,15 @@ func (s *BotVerificationStore) grantLocked(mark domain.CustomVerification) (doma
 	s.marksByPeer[key] = stored.ID
 	s.markCounts[stored.VerifierBotID]++
 	return stored, true, nil
+}
+
+func (s *BotVerificationStore) markForPeerLocked(peer domain.Peer) (domain.CustomVerification, bool) {
+	id, found := s.marksByPeer[customVerificationKeyOf(0, peer)]
+	if !found {
+		return domain.CustomVerification{}, false
+	}
+	mark, found := s.marks[id]
+	return mark, found
 }
 
 func (s *BotVerificationStore) revokeLocked(verifierBotID int64, peer domain.Peer) bool {
@@ -898,6 +1132,7 @@ type botVerificationSnapshot struct {
 	marksByPeer     map[customVerificationKey]int64
 	markCounts      map[int64]int
 	requests        map[int64]domain.CustomVerificationRequest
+	lastNow         time.Time
 }
 
 func (s *BotVerificationStore) snapshotLocked() botVerificationSnapshot {
@@ -912,6 +1147,7 @@ func (s *BotVerificationStore) snapshotLocked() botVerificationSnapshot {
 		marksByPeer:     copyBotVerificationMap(s.marksByPeer),
 		markCounts:      copyBotVerificationMap(s.markCounts),
 		requests:        copyBotVerificationMap(s.requests),
+		lastNow:         s.lastNow,
 	}
 }
 
@@ -926,6 +1162,7 @@ func (s *BotVerificationStore) restoreLocked(snapshot botVerificationSnapshot) {
 	s.marksByPeer = snapshot.marksByPeer
 	s.markCounts = snapshot.markCounts
 	s.requests = snapshot.requests
+	s.lastNow = snapshot.lastNow
 }
 
 // nowLocked hands out strictly increasing timestamps at timestamptz resolution.

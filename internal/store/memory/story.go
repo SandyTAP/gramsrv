@@ -24,6 +24,7 @@ type StoryStore struct {
 	blocked   map[int64]map[int64]bool
 	channels  *ChannelStore
 	members   map[int64]map[int64]bool
+	updateEvents *UpdateEventStore
 }
 
 type storyKey struct {
@@ -68,7 +69,16 @@ func NewStoryStore(channels ...*ChannelStore) *StoryStore {
 		blocked:   make(map[int64]map[int64]bool),
 		channels:  channelStore,
 		members:   make(map[int64]map[int64]bool),
+		updateEvents: NewUpdateEventStore(),
 	}
+}
+
+// AttachUpdateEventStore makes story mutations and update-difference reads use
+// the same production-shaped account event store in integration tests.
+func (s *StoryStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	s.mu.Lock()
+	s.updateEvents = events
+	s.mu.Unlock()
 }
 
 // SetStoryViewerProfiles seeds owner-visible user metadata used by
@@ -150,7 +160,7 @@ func (s *StoryStore) SetStoryChannelMembers(channelID int64, viewerUserIDs ...in
 	s.members[channelID] = members
 }
 
-func (s *StoryStore) CreateStory(_ context.Context, req domain.StoryCreateRequest) (domain.StoryCreateResult, error) {
+func (s *StoryStore) createStory(_ context.Context, req domain.StoryCreateRequest) (domain.StoryCreateResult, error) {
 	if err := validateStoryPeer(req.Owner); err != nil {
 		return domain.StoryCreateResult{}, err
 	}
@@ -549,7 +559,7 @@ func (s *StoryStore) GetPeerStoryProjections(_ context.Context, viewerUserID int
 	return out, nil
 }
 
-func (s *StoryStore) MarkRead(_ context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error) {
+func (s *StoryStore) markRead(_ context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error) {
 	if viewerUserID == 0 {
 		return domain.StoryReadResult{}, domain.ErrStoryPeerInvalid
 	}
@@ -604,7 +614,7 @@ func (s *StoryStore) IncrementViews(_ context.Context, viewerUserID int64, peer 
 	return created, nil
 }
 
-func (s *StoryStore) SetReaction(_ context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error) {
+func (s *StoryStore) setReaction(_ context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error) {
 	if viewerUserID == 0 {
 		return domain.StoryReactionResult{}, domain.ErrStoryPeerInvalid
 	}
@@ -830,7 +840,7 @@ func (s *StoryStore) ListStoryViewerIDs(_ context.Context, owner domain.Peer, st
 	return ids, nil
 }
 
-func (s *StoryStore) EditStory(_ context.Context, req domain.StoryEditRequest) (domain.StoryEditResult, error) {
+func (s *StoryStore) editStory(_ context.Context, req domain.StoryEditRequest) (domain.StoryEditResult, error) {
 	if err := validateStoryIdentity(req.Owner, req.ID); err != nil {
 		return domain.StoryEditResult{}, err
 	}
@@ -869,7 +879,7 @@ func (s *StoryStore) EditStory(_ context.Context, req domain.StoryEditRequest) (
 	return domain.StoryEditResult{Story: cloneStory(updated), Previous: cloneStory(story)}, nil
 }
 
-func (s *StoryStore) DeleteStories(_ context.Context, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error) {
+func (s *StoryStore) deleteStories(_ context.Context, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error) {
 	_ = date
 	if err := validateStoryPeer(peer); err != nil {
 		return domain.StoryMutationResult{}, err
@@ -900,7 +910,7 @@ func (s *StoryStore) DeleteStories(_ context.Context, peer domain.Peer, ids []in
 	return out, nil
 }
 
-func (s *StoryStore) TogglePinned(_ context.Context, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error) {
+func (s *StoryStore) togglePinned(_ context.Context, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error) {
 	_ = date
 	if err := validateStoryPeer(peer); err != nil {
 		return domain.StoryMutationResult{}, err

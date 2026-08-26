@@ -28,7 +28,7 @@ type Option func(*Service)
 type ChannelService interface {
 	GetChannel(ctx context.Context, userID, channelID int64) (domain.ChannelView, error)
 	InviteToChannel(ctx context.Context, userID, channelID int64, userIDs []int64, date int) (domain.CreateChannelResult, error)
-	JoinChannel(ctx context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error)
+	JoinChannel(ctx context.Context, userID, channelID int64, date int, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	LeaveChannel(ctx context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error)
 }
 
@@ -604,7 +604,12 @@ func (s *Service) joinChannelPeers(ctx context.Context, ownerUserID, userID int6
 		if plan.useInvite {
 			res, err = s.channels.InviteToChannel(ctx, ownerUserID, plan.peer.Peer.ID, []int64{userID}, date)
 		} else {
-			res, err = s.channels.JoinChannel(ctx, userID, plan.peer.Peer.ID, date)
+			res, err = s.channels.JoinChannel(ctx, userID, plan.peer.Peer.ID, date, func(snapshot store.ChannelPendingJoinDeliverySnapshot) ([]store.DeliveryEffect, error) {
+				if len(snapshot.Targets) != 0 {
+					return nil, store.ErrDeliveryOutboxRequired
+				}
+				return nil, nil
+			})
 		}
 		if err != nil {
 			if errors.Is(err, domain.ErrUserAlreadyParticipant) {

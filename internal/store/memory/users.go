@@ -17,6 +17,7 @@ type UserStore struct {
 	nextID           int64
 	usernameRegistry *CollectibleUsernameStore
 	deliveryOutbox   *DeliveryOutboxStore
+	updateEvents     *UpdateEventStore
 }
 
 // NewUserStore 创建内存 UserStore。内置系统账号
@@ -42,6 +43,12 @@ func (s *UserStore) AttachUsernameRegistry(registry *CollectibleUsernameStore) {
 func (s *UserStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
 	s.mu.Lock()
 	s.deliveryOutbox = outbox
+	s.mu.Unlock()
+}
+
+func (s *UserStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	s.mu.Lock()
+	s.updateEvents = events
 	s.mu.Unlock()
 }
 
@@ -231,7 +238,7 @@ func (s *UserStore) UpdateUsernameWithDelivery(ctx context.Context, userID int64
 		return domain.User{}, domain.ErrUsernameNotOccupied
 	}
 	if s.deliveryOutbox == nil || build == nil {
-		return domain.User{}, store.ErrDispatchLeaseLost
+		return domain.User{}, store.ErrDeliveryOutboxRequired
 	}
 	if usernameLower != "" {
 		for id, existing := range s.byID {
@@ -257,6 +264,7 @@ func (s *UserStore) UpdateUsernameWithDelivery(ctx context.Context, userID int64
 		ExcludeAuthKeyID: excludeAuthKeyID,
 		ExcludeSessionID: excludeSessionID,
 		Payload:          payload,
+		RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 	}); err != nil {
 		s.rollbackEditableUsername(ctx, userID, oldUsername)
 		return domain.User{}, err
@@ -304,7 +312,7 @@ func (s *UserStore) UpdateProfileWithDelivery(ctx context.Context, userID int64,
 		return domain.User{}, domain.ErrUsernameNotOccupied
 	}
 	if s.deliveryOutbox == nil || build == nil {
-		return domain.User{}, store.ErrDispatchLeaseLost
+		return domain.User{}, store.ErrDeliveryOutboxRequired
 	}
 	u.FirstName = firstName
 	u.LastName = lastName
@@ -318,6 +326,7 @@ func (s *UserStore) UpdateProfileWithDelivery(ctx context.Context, userID int64,
 		ExcludeAuthKeyID: excludeAuthKeyID,
 		ExcludeSessionID: excludeSessionID,
 		Payload:          payload,
+		RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 	}); err != nil {
 		return domain.User{}, err
 	}
@@ -345,7 +354,7 @@ func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	if s.deliveryOutbox == nil || build == nil {
-		return domain.User{}, store.ErrDispatchLeaseLost
+		return domain.User{}, store.ErrDeliveryOutboxRequired
 	}
 	u.Birthday = birthday
 	payload, err := build(s.deliverySnapshotLocked(ctx, u))
@@ -357,6 +366,7 @@ func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64
 		ExcludeAuthKeyID: excludeAuthKeyID,
 		ExcludeSessionID: excludeSessionID,
 		Payload:          payload,
+		RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 	}); err != nil {
 		return domain.User{}, err
 	}
@@ -364,14 +374,30 @@ func (s *UserStore) UpdateBirthdayWithDelivery(ctx context.Context, userID int64
 	return u, nil
 }
 
-func (s *UserStore) UpdatePersonalChannel(_ context.Context, userID int64, channelID int64) (domain.User, error) {
+func (s *UserStore) UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.byID[userID]
 	if !ok || u.Deleted {
 		return domain.User{}, domain.ErrUserNotFound
 	}
+	if s.deliveryOutbox == nil || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
 	u.PersonalChannelID = channelID
+	snapshot := s.deliverySnapshotLocked(ctx, u)
+	intents, err := effects(snapshot)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if err := store.ValidateUserSelfDeliveryEffects(snapshot, intents); err != nil {
+		return domain.User{}, err
+	}
+	s.deliveryOutbox.mu.Lock()
+	defer s.deliveryOutbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(s.deliveryOutbox, intents, time.Now()); err != nil {
+		return domain.User{}, err
+	}
 	s.byID[userID] = u
 	return u, nil
 }
@@ -437,6 +463,12 @@ func (s *UserStore) SetVerified(_ context.Context, userID int64, verified bool) 
 	return u, nil
 }
 
+func (s *UserStore) SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool { return user.Verified == verified },
+		func(user *domain.User) { user.Verified = verified })
+}
+
 // SetSupport 设置/取消用户的 support 标记（与 postgres 语义一致）。
 func (s *UserStore) SetSupport(_ context.Context, userID int64, support bool) (domain.User, error) {
 	s.mu.Lock()
@@ -448,6 +480,12 @@ func (s *UserStore) SetSupport(_ context.Context, userID int64, support bool) (d
 	u.Support = support
 	s.byID[userID] = u
 	return u, nil
+}
+
+func (s *UserStore) SetSupportWithDelivery(ctx context.Context, userID int64, support bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.setModerationFlagsWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool { return user.Support == support },
+		func(user *domain.User) { user.Support = support })
 }
 
 // SetScamFake 设置/取消用户的 scam 与 fake 标记（与 postgres 语义一致）。
@@ -465,6 +503,203 @@ func (s *UserStore) SetScamFake(_ context.Context, userID int64, scam, fake bool
 	u.Fake = fake
 	s.byID[userID] = u
 	return u, nil
+}
+
+func (s *UserStore) SetScamFakeWithDelivery(ctx context.Context, userID int64, scam, fake bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if scam && fake {
+		return domain.User{}, domain.ErrPeerModerationFlagsInvalid
+	}
+	return s.setModerationFlagsWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool { return user.Scam == scam && user.Fake == fake },
+		func(user *domain.User) { user.Scam, user.Fake = scam, fake })
+}
+
+func (s *UserStore) AdminUpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.adminMutateWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool {
+			return user.FirstName == firstName && user.LastName == lastName && user.About == about
+		},
+		func(user *domain.User) {
+			user.FirstName, user.LastName, user.About = firstName, lastName, about
+		})
+}
+
+func (s *UserStore) AdminUpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
+	usernameLower := strings.ToLower(username)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.byID[userID]
+	if !ok || user.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if user.Username == username {
+		return user, nil
+	}
+	if s.deliveryOutbox == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	for id, existing := range s.byID {
+		if id != userID && !existing.Deleted && strings.ToLower(existing.Username) == usernameLower && usernameLower != "" {
+			return domain.User{}, domain.ErrUsernameOccupied
+		}
+	}
+	oldUsername := user.Username
+	if s.usernameRegistry != nil {
+		if _, err := s.usernameRegistry.SetEditableUsername(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: userID}, username); err != nil {
+			return domain.User{}, err
+		}
+	}
+	user.Username = username
+	if err := s.applyAdminUserDeliveryLocked(ctx, user, effects); err != nil {
+		s.rollbackEditableUsername(ctx, userID, oldUsername)
+		return domain.User{}, err
+	}
+	s.byID[userID] = user
+	return user, nil
+}
+
+func (s *UserStore) AdminUpdatePhoneWithDelivery(ctx context.Context, userID int64, phone string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.byID[userID]
+	if !ok || user.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if user.Phone == phone {
+		return user, nil
+	}
+	if s.deliveryOutbox == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	for id, existing := range s.byID {
+		if id != userID && !existing.Deleted && existing.Phone == phone {
+			return domain.User{}, domain.ErrPhoneNumberOccupied
+		}
+	}
+	user.Phone = phone
+	if err := s.applyAdminUserDeliveryLocked(ctx, user, effects); err != nil {
+		return domain.User{}, err
+	}
+	s.byID[userID] = user
+	return user, nil
+}
+
+func (s *UserStore) AdminUpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	return s.adminMutateWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool {
+			if forProfile {
+				return user.ProfileColor == color
+			}
+			return user.Color == color
+		},
+		func(user *domain.User) {
+			if forProfile {
+				user.ProfileColor = color
+			} else {
+				user.Color = color
+			}
+		})
+}
+
+func (s *UserStore) AdminUpdateEmojiStatusWithDelivery(ctx context.Context, userID int64, status domain.UserEmojiStatus, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error) {
+	if !status.Valid() {
+		return domain.User{}, domain.ErrStarGiftCollectibleInvalid
+	}
+	return s.adminMutateWithDelivery(ctx, userID, effects,
+		func(user domain.User) bool { return user.EmojiStatus() == status },
+		func(user *domain.User) {
+			user.EmojiStatusDocumentID = status.DocumentID
+			user.EmojiStatusUntil = status.Until
+			user.EmojiStatusCollectible = status.Collectible
+		})
+}
+
+func (s *UserStore) adminMutateWithDelivery(
+	ctx context.Context,
+	userID int64,
+	effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot],
+	unchanged func(domain.User) bool,
+	mutate func(*domain.User),
+) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.byID[userID]
+	if !ok || user.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if unchanged(user) {
+		return user, nil
+	}
+	if s.deliveryOutbox == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	mutate(&user)
+	if err := s.applyAdminUserDeliveryLocked(ctx, user, effects); err != nil {
+		return domain.User{}, err
+	}
+	s.byID[userID] = user
+	return user, nil
+}
+
+func (s *UserStore) applyAdminUserDeliveryLocked(ctx context.Context, user domain.User, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) error {
+	snapshot := store.UserAudienceDeliverySnapshot{User: user, Audience: []int64{user.ID}}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		return err
+	}
+	_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	return err
+}
+
+func (s *UserStore) setModerationFlagsWithDelivery(
+	ctx context.Context,
+	userID int64,
+	effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot],
+	unchanged func(domain.User) bool,
+	mutate func(*domain.User),
+) (domain.User, error) {
+	if userID <= 0 || effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.byID[userID]
+	if !ok || user.Deleted {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if unchanged(user) {
+		return user, nil
+	}
+	if s.deliveryOutbox == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	mutate(&user)
+	snapshot := store.UserAudienceDeliverySnapshot{User: user, Audience: []int64{userID}}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		return domain.User{}, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		return domain.User{}, err
+	}
+	s.byID[userID] = user
+	return user, nil
 }
 
 // SweepExpiredPremium 清空到期会员行并返回清理后的用户（与 postgres 语义一致）。
@@ -490,22 +725,74 @@ func (s *UserStore) SweepExpiredPremium(_ context.Context, now int64, limit int)
 	return out, nil
 }
 
-// UpdateEmojiStatus 更新用户自定义 emoji status（零值表示清除）。
-func (s *UserStore) UpdateEmojiStatus(_ context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error) {
+func (s *UserStore) SweepExpiredPremiumWithDelivery(ctx context.Context, now int64, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deliveryOutbox == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	out := make([]domain.User, 0, limit)
+	for _, current := range s.byID {
+		if current.Deleted || current.PremiumUntil <= 0 || int64(current.PremiumUntil) > now {
+			continue
+		}
+		current.PremiumUntil = 0
+		out = append(out, current)
+		if len(out) >= limit {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	intents, err := effects(out)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.ValidateUserBatchDeliveryEffects(out, intents); err != nil {
+		return nil, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		return nil, err
+	}
+	for _, user := range out {
+		s.byID[user.ID] = user
+	}
+	return out, nil
+}
+
+func (s *UserStore) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent) (domain.User, domain.UpdateEvent, error) {
+	if !status.Valid() || event.Type != domain.UpdateEventUserEmojiStatus || event.EmojiStatus != status ||
+		event.Peer != (domain.Peer{Type: domain.PeerTypeUser, ID: userID}) || event.PtsCount <= 0 || event.Pts != 0 {
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrStarGiftCollectibleInvalid
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.byID[userID]
 	if !ok || u.Deleted {
-		return domain.User{}, domain.ErrUserNotFound
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrUserNotFound
 	}
-	if !status.Valid() {
-		return domain.User{}, domain.ErrStarGiftCollectibleInvalid
+	if s.updateEvents == nil {
+		return domain.User{}, domain.UpdateEvent{}, store.ErrDeliveryOutboxRequired
 	}
 	u.EmojiStatusDocumentID = status.DocumentID
 	u.EmojiStatusUntil = status.Until
 	u.EmojiStatusCollectible = status.Collectible
+	s.updateEvents.mu.Lock()
+	defer s.updateEvents.mu.Unlock()
+	event = s.updateEvents.appendLocked(userID, event, true)
+	s.updateEvents.dispatches[userID] = append(s.updateEvents.dispatches[userID], memoryUpdateDispatch{
+		Pts: event.Pts,
+	})
 	s.byID[userID] = u
-	return u, nil
+	return u, event, nil
 }
 
 func (s *UserStore) UpdateColor(_ context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error) {
@@ -532,7 +819,7 @@ func (s *UserStore) UpdateColorWithDelivery(ctx context.Context, userID int64, f
 		return domain.User{}, domain.ErrUserNotFound
 	}
 	if s.deliveryOutbox == nil || build == nil {
-		return domain.User{}, store.ErrDispatchLeaseLost
+		return domain.User{}, store.ErrDeliveryOutboxRequired
 	}
 	if forProfile {
 		u.ProfileColor = color
@@ -548,6 +835,7 @@ func (s *UserStore) UpdateColorWithDelivery(ctx context.Context, userID int64, f
 		ExcludeAuthKeyID: excludeAuthKeyID,
 		ExcludeSessionID: excludeSessionID,
 		Payload:          payload,
+		RecoveryPolicy:   store.OutboxRecoveryAbsoluteReload,
 	}); err != nil {
 		return domain.User{}, err
 	}

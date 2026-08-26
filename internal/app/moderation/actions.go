@@ -27,10 +27,6 @@ type moderationChannelDeleter interface {
 	ModerationDeleteMessages(ctx context.Context, channelID int64, ids []int, date int) (domain.DeleteChannelMessagesResult, error)
 }
 
-type moderationChannelDeleteNotifier interface {
-	NotifyModerationChannelDeletion(ctx context.Context, result domain.DeleteChannelMessagesResult)
-}
-
 type moderationAccountDeleter interface {
 	ExecuteAccountDeletion(ctx context.Context, userID int64, source domain.AccountDeletionSource, reason string, now time.Time) (domain.AccountDeletionResult, error)
 }
@@ -46,7 +42,6 @@ type moderationAppealLinkIssuer interface {
 type ActionExecutor struct {
 	admin           moderationAdminActions
 	channels        moderationChannelDeleter
-	channelNotifier moderationChannelDeleteNotifier
 	accounts        moderationAccountDeleter
 	accountNotifier moderationAccountDeletionNotifier
 	appealLinks     moderationAppealLinkIssuer
@@ -80,11 +75,11 @@ func WithActionClock(now func() time.Time) ActionExecutorOption {
 	}
 }
 
-func NewActionExecutor(adminActions moderationAdminActions, channels moderationChannelDeleter, channelNotifier moderationChannelDeleteNotifier, accounts moderationAccountDeleter, opts ...ActionExecutorOption) *ActionExecutor {
+func NewActionExecutor(adminActions moderationAdminActions, channels moderationChannelDeleter, accounts moderationAccountDeleter, opts ...ActionExecutorOption) *ActionExecutor {
 	executor := &ActionExecutor{
 		admin: adminActions, channels: channels,
-		channelNotifier: channelNotifier, accounts: accounts,
-		now: func() time.Time { return time.Now().UTC() },
+		accounts: accounts,
+		now:      func() time.Time { return time.Now().UTC() },
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -209,16 +204,10 @@ func (e *ActionExecutor) Execute(ctx context.Context, detail domain.ModerationCa
 		if len(payload.IDs) == 0 || len(payload.IDs) > domain.MaxDeleteMessageIDs {
 			return domain.ErrModerationActionInvalid
 		}
-		result, err := e.channels.ModerationDeleteMessages(
+		_, err := e.channels.ModerationDeleteMessages(
 			ctx, detail.Case.Target.ID, payload.IDs, int(e.now().Unix()),
 		)
-		if err != nil {
-			return err
-		}
-		if e.channelNotifier != nil {
-			e.channelNotifier.NotifyModerationChannelDeletion(ctx, result)
-		}
-		return nil
+		return err
 	case domain.ModerationActionDeleteAccount:
 		// The tombstone and live-session revocation are one application-level
 		// outcome. Refuse to commit the durable half if this process cannot run the

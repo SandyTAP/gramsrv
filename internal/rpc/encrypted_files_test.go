@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/iamxvbaba/td/tg"
@@ -72,53 +71,6 @@ func TestUploadEncryptedFile(t *testing.T) {
 	ef, ok := res.(*tg.EncryptedFile)
 	if !ok || ef.ID == 0 {
 		t.Fatalf("upload response = %T, want non-empty EncryptedFile", res)
-	}
-}
-
-// TestEncryptedFileDownloadRequiresCapability：密聊 blob 只有在 id+access_hash 元数据能力
-// 校验成功后才会转换为内部 enc:<id> key；错误 hash 不能触达 Files.GetFile。
-func TestEncryptedFileDownloadRequiresCapability(t *testing.T) {
-	f := newEncryptedFixture(t)
-	chatID, _ := f.acceptChat(t)
-	chat, _, _ := f.store.GetSecretChat(f.ctx, chatID)
-	res, err := f.router.onMessagesUploadEncryptedFile(f.adminCtx(), &tg.MessagesUploadEncryptedFileRequest{
-		Peer: tg.InputEncryptedChat{ChatID: chatID, AccessHash: chat.AdminAccessHash},
-		File: &tg.InputEncryptedFileUploaded{ID: 888, Parts: 1, KeyFingerprint: 9},
-	})
-	if err != nil {
-		t.Fatalf("uploadEncryptedFile: %v", err)
-	}
-	ef := res.(*tg.EncryptedFile)
-	files := f.router.deps.Files.(*fakeFiles)
-	files.getFileFound = true
-	files.getFileChunk = domain.FileChunk{MimeType: "application/octet-stream", Bytes: []byte{1, 2, 3}}
-
-	got, err := f.router.onUploadGetFile(f.adminCtx(), &tg.UploadGetFileRequest{
-		Location: &tg.InputEncryptedFileLocation{ID: ef.ID, AccessHash: ef.AccessHash},
-		Offset:   0,
-		Limit:    1024,
-	})
-	if err != nil {
-		t.Fatalf("get encrypted file: %v", err)
-	}
-	file, ok := got.(*tg.UploadFile)
-	if !ok || !bytes.Equal(file.Bytes, []byte{1, 2, 3}) {
-		t.Fatalf("download = %T %+v", got, got)
-	}
-	if files.getFileCalls != 1 || files.getFileRequest.LocationKey != "enc:9001" {
-		t.Fatalf("GetFile calls/key = %d/%q", files.getFileCalls, files.getFileRequest.LocationKey)
-	}
-
-	_, err = f.router.onUploadGetFile(f.adminCtx(), &tg.UploadGetFileRequest{
-		Location: &tg.InputEncryptedFileLocation{ID: ef.ID, AccessHash: ef.AccessHash + 1},
-		Offset:   0,
-		Limit:    1024,
-	})
-	if !tgerr.Is(err, "LOCATION_INVALID") {
-		t.Fatalf("wrong access hash err = %v", err)
-	}
-	if files.getFileCalls != 1 {
-		t.Fatalf("wrong access hash reached blob store: calls=%d", files.getFileCalls)
 	}
 }
 

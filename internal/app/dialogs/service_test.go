@@ -433,6 +433,7 @@ func TestDialogPeerReadModelCacheRejectsStaleFillAfterInvalidation(t *testing.T)
 func TestGetDialogsIncludesChannelReadOutboxAfterOfflineRead(t *testing.T) {
 	ctx := context.Background()
 	channelStore := memory.NewChannelStore()
+	channelStore.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
 	channels := appchannels.NewService(channelStore)
 	dialogs := NewService(nil, channelStore)
 
@@ -457,6 +458,12 @@ func TestGetDialogsIncludesChannelReadOutboxAfterOfflineRead(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
 		Date:      12,
+	}, func(read domain.ReadChannelHistoryResult) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID:   read.Dialog.UserID,
+			Payload:        []byte{1},
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	}); err != nil {
 		t.Fatalf("ReadHistory: %v", err)
 	}

@@ -24,14 +24,14 @@ func TestStoryStoreReadMaxAndPeerMaxIDs(t *testing.T) {
 		}
 	}
 
-	read, err := store.MarkRead(ctx, 2001, owner, 2, 200)
+	read, err := store.markRead(ctx, 2001, owner, 2, 200)
 	if err != nil {
 		t.Fatalf("mark read: %v", err)
 	}
 	if !read.Advanced || read.MaxReadID != 2 {
 		t.Fatalf("read = %+v, want advanced max 2", read)
 	}
-	read, err = store.MarkRead(ctx, 2001, owner, 1, 201)
+	read, err = store.markRead(ctx, 2001, owner, 1, 201)
 	if err != nil {
 		t.Fatalf("mark read lower: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestStoryStoreListActiveStoriesPaginatesByPeer(t *testing.T) {
 	if digest.Count != 3 {
 		t.Fatalf("digest count = %d, want 3", digest.Count)
 	}
-	if _, err := store.MarkRead(ctx, 2001, owners[0], 2, 401); err != nil {
+	if _, err := store.markRead(ctx, 2001, owners[0], 2, 401); err != nil {
 		t.Fatalf("mark read for digest: %v", err)
 	}
 	changed, err := store.ActiveStoriesDigest(ctx, 2001, false, 400)
@@ -196,7 +196,7 @@ func TestStoryStoreSelfUserViewAndReactionDoNotPolluteOwnerInteractions(t *testi
 	if created != 0 {
 		t.Fatalf("created self views = %d, want 0", created)
 	}
-	if _, err := store.SetReaction(ctx, owner.ID, owner, 1, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, owner.ID, owner, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 201); err != domain.ErrStoryPeerInvalid {
@@ -267,7 +267,7 @@ func TestStoryStoreBlocklistHidesOwnerStoriesFromViewer(t *testing.T) {
 	if created, err := store.IncrementViews(ctx, blockedViewerID, owner, []int{1}, 210); err != nil || created != 0 {
 		t.Fatalf("blocked increment = %d, %v, want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, blockedViewerID, owner, 1, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, blockedViewerID, owner, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 211); err != domain.ErrStoryNotFound {
@@ -323,7 +323,7 @@ func TestStoryStoreChannelStoriesRequireActiveMember(t *testing.T) {
 	outsiderID := int64(2002)
 	store.SetStoryChannelMembers(channel.ID, memberID)
 
-	if _, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	if _, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    channel,
 		RandomID: 300101,
 		Date:     100,
@@ -371,7 +371,7 @@ func TestStoryStoreChannelStoriesRequireActiveMember(t *testing.T) {
 	if created, err := store.IncrementViews(ctx, outsiderID, channel, []int{1}, 201); err != nil || created != 0 {
 		t.Fatalf("outsider increment = %d, %v, want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, outsiderID, channel, 1, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, outsiderID, channel, 1, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "like",
 	}, 202); !errors.Is(err, domain.ErrStoryNotFound) {
@@ -383,7 +383,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	ctx := context.Background()
 	store := NewStoryStore()
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:      owner,
 		RandomID:   101,
 		Date:       100,
@@ -409,7 +409,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 		t.Fatalf("empty get stories by id err = %v, want ErrStoryIDInvalid", err)
 	}
 
-	edited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -427,7 +427,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryURLMediaArea(t, list.Stories[0], "https://example.com/story/link", 25)
 
-	geoEdited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	geoEdited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -446,7 +446,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryGeoPointMediaArea(t, list.Stories[0], 31.2304, 121.4737, 35)
 
-	venueEdited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	venueEdited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -464,7 +464,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryVenueMediaArea(t, list.Stories[0], "Inline Cafe", 31.231, 121.474, 40)
 
-	weatherEdited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	weatherEdited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -484,7 +484,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryWeatherMediaArea(t, list.Stories[0], "☀️", 22.5, 0x00cc6600, 45)
 
-	channelPostEdited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	channelPostEdited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -503,7 +503,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryChannelPostMediaArea(t, list.Stories[0], 777001, 42, 50)
 
-	starGiftEdited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	starGiftEdited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -521,7 +521,7 @@ func TestStoryStoreMediaAreasRoundTripEditClearAndClone(t *testing.T) {
 	}
 	assertDomainStoryStarGiftMediaArea(t, list.Stories[0], "Gift.Series_01-42", 55)
 
-	cleared, err := store.EditStory(ctx, domain.StoryEditRequest{
+	cleared, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:            owner,
 		ID:               created.Story.ID,
 		UpdateMediaAreas: true,
@@ -539,7 +539,7 @@ func TestStoryStoreForwardRoundTripEditAndClone(t *testing.T) {
 	store := NewStoryStore()
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
 	source := domain.Peer{Type: domain.PeerTypeUser, ID: 2002}
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    owner,
 		RandomID: 202,
 		Date:     200,
@@ -567,7 +567,7 @@ func TestStoryStoreForwardRoundTripEditAndClone(t *testing.T) {
 	}
 	assertDomainStoryForward(t, list.Stories[0], source, 7, true)
 
-	edited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         owner,
 		ID:            created.Story.ID,
 		UpdateCaption: true,
@@ -585,7 +585,7 @@ func TestStoryStoreForwardRoundTripEditAndClone(t *testing.T) {
 	}
 	assertDomainStoryForward(t, list.Stories[0], source, 7, true)
 
-	hidden, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	hidden, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    owner,
 		RandomID: 203,
 		Date:     203,
@@ -613,7 +613,7 @@ func TestStoryStoreForwardRoundTripEditAndClone(t *testing.T) {
 	}
 	assertDomainStoryForwardName(t, list.Stories[0], "Alice Hidden", 8, false)
 
-	editedHidden, err := store.EditStory(ctx, domain.StoryEditRequest{
+	editedHidden, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         owner,
 		ID:            hidden.Story.ID,
 		UpdateCaption: true,
@@ -630,7 +630,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsList(t *testing.T) {
 	store := NewStoryStore()
 	sourceOwner := domain.Peer{Type: domain.PeerTypeUser, ID: 1101}
 	repostOwner := domain.Peer{Type: domain.PeerTypeUser, ID: 2202}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 1101,
 		Date:     100,
@@ -640,7 +640,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 2202,
 		Date:     200,
@@ -677,7 +677,7 @@ func TestStoryStorePublicRepostForwardCountAndViewsList(t *testing.T) {
 	if views.Views[0].Repost.Owner != repostOwner || views.Views[0].Repost.ID != repost.Story.ID {
 		t.Fatalf("repost interaction = %+v, want owner %+v story %d", views.Views[0].Repost, repostOwner, repost.Story.ID)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	sourceList, err = store.GetStoriesByID(ctx, sourceOwner.ID, sourceOwner, []int{source.Story.ID}, 202)
@@ -695,7 +695,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 	sourceOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: 3311}
 	repostOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: 4412}
 	privateRepostOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: 4413}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 331101,
 		Date:     100,
@@ -705,7 +705,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 441201,
 		Date:     200,
@@ -719,7 +719,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create public repost: %v", err)
 	}
-	hiddenRepost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	hiddenRepost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 441202,
 		Date:     202,
@@ -734,7 +734,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hidden-source public repost: %v", err)
 	}
-	if _, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	if _, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    privateRepostOwner,
 		RandomID: 441301,
 		Date:     201,
@@ -769,7 +769,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 	if list.Forwards[1].Repost.Owner != repostOwner || list.Forwards[1].Repost.ID != repost.Story.ID {
 		t.Fatalf("public forward repost = %+v, want owner %+v story %d", list.Forwards[1].Repost, repostOwner, repost.Story.ID)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	afterVisibleDelete, err := store.ListStoryPublicForwards(ctx, domain.StoryPublicForwardListRequest{
@@ -785,7 +785,7 @@ func TestStoryStorePublicForwardListReturnsRepostsOnly(t *testing.T) {
 		afterVisibleDelete.Forwards[0].Repost.ID != hiddenRepost.Story.ID {
 		t.Fatalf("public forwards after visible delete = %+v, want hidden repost only", afterVisibleDelete)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{hiddenRepost.Story.ID}, 203); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{hiddenRepost.Story.ID}, 203); err != nil {
 		t.Fatalf("delete hidden repost: %v", err)
 	}
 	empty, err := store.ListStoryPublicForwards(ctx, domain.StoryPublicForwardListRequest{
@@ -807,7 +807,7 @@ func TestStoryStorePublicRepostStoryReactionsList(t *testing.T) {
 	store := NewStoryStore()
 	sourceOwner := domain.Peer{Type: domain.PeerTypeChannel, ID: 3301}
 	repostOwner := domain.Peer{Type: domain.PeerTypeUser, ID: 4402}
-	source, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	source, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    sourceOwner,
 		RandomID: 3301,
 		Date:     100,
@@ -817,13 +817,13 @@ func TestStoryStorePublicRepostStoryReactionsList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create source story: %v", err)
 	}
-	if _, err := store.SetReaction(ctx, 5503, sourceOwner, source.Story.ID, &domain.MessageReaction{
+	if _, err := store.setReaction(ctx, 5503, sourceOwner, source.Story.ID, &domain.MessageReaction{
 		Type:     domain.MessageReactionEmoji,
 		Emoticon: "🔥",
 	}, 150); err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
-	repost, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 4402,
 		Date:     200,
@@ -869,7 +869,7 @@ func TestStoryStorePublicRepostStoryReactionsList(t *testing.T) {
 	if filtered.Count != 1 || len(filtered.Reactions) != 1 || filtered.Reactions[0].Repost != nil || filtered.Reactions[0].ViewerID != 5503 {
 		t.Fatalf("filtered reaction list = %+v, want only emoji reactor", filtered)
 	}
-	if _, err := store.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
+	if _, err := store.deleteStories(ctx, repostOwner, []int{repost.Story.ID}, 202); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	list, err = store.ListStoryReactions(ctx, domain.StoryReactionListRequest{
@@ -1267,21 +1267,21 @@ func TestStoryStoreViewsIdempotentAndReactionReplace(t *testing.T) {
 	}
 	like := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "👍"}
 	fire := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "🔥"}
-	res, err := store.SetReaction(ctx, 2001, owner, 1, like, 202)
+	res, err := store.setReaction(ctx, 2001, owner, 1, like, 202)
 	if err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ViewsCount != 1 || res.Story.Views.ReactionsCount != 1 {
 		t.Fatalf("reaction result = %+v, want one view and one reaction", res)
 	}
-	res, err = store.SetReaction(ctx, 2001, owner, 1, fire, 203)
+	res, err = store.setReaction(ctx, 2001, owner, 1, fire, 203)
 	if err != nil {
 		t.Fatalf("replace reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ReactionsCount != 1 || len(res.Story.Views.Reactions) != 1 || res.Story.Views.Reactions[0].Reaction.Emoticon != "🔥" {
 		t.Fatalf("replace result = %+v, want only fire reaction", res)
 	}
-	res, err = store.SetReaction(ctx, 2001, owner, 1, fire, 204)
+	res, err = store.setReaction(ctx, 2001, owner, 1, fire, 204)
 	if err != nil {
 		t.Fatalf("retry same reaction: %v", err)
 	}
@@ -1301,14 +1301,14 @@ func TestStoryStoreViewsIdempotentAndReactionReplace(t *testing.T) {
 		t.Fatalf("reactions after retry = %+v, want original reaction date", reactions)
 	}
 	custom := &domain.MessageReaction{Type: domain.MessageReactionCustomEmoji, DocumentID: 12345}
-	res, err = store.SetReaction(ctx, 2001, owner, 1, custom, 204)
+	res, err = store.setReaction(ctx, 2001, owner, 1, custom, 204)
 	if err != nil {
 		t.Fatalf("replace with custom reaction: %v", err)
 	}
 	if !res.Changed || res.Story.Views.ReactionsCount != 1 || len(res.Story.Views.Reactions) != 1 || res.Story.Views.Reactions[0].Reaction.DocumentID != 12345 {
 		t.Fatalf("custom replace result = %+v, want one custom reaction", res)
 	}
-	res, err = store.SetReaction(ctx, 2001, owner, 1, custom, 205)
+	res, err = store.setReaction(ctx, 2001, owner, 1, custom, 205)
 	if err != nil {
 		t.Fatalf("retry same custom reaction: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestStoryStoreViewsIdempotentAndReactionReplace(t *testing.T) {
 	}); !errors.Is(err, domain.ErrStoryOffsetInvalid) {
 		t.Fatalf("bad story reactions offset err = %v, want ErrStoryOffsetInvalid", err)
 	}
-	res, err = store.SetReaction(ctx, 2001, owner, 1, nil, 206)
+	res, err = store.setReaction(ctx, 2001, owner, 1, nil, 206)
 	if err != nil {
 		t.Fatalf("clear reaction: %v", err)
 	}
@@ -1371,13 +1371,13 @@ func TestStoryStoreExpiredUnpinnedStoriesDoNotAcceptNewInteractions(t *testing.T
 	if created, err := store.IncrementViews(ctx, 2001, owner, []int{1}, 200); err != nil || created != 0 {
 		t.Fatalf("expired unpinned increment = %d, %v; want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, 2001, owner, 1, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 200); !errors.Is(err, domain.ErrStoryNotFound) {
+	if _, err := store.setReaction(ctx, 2001, owner, 1, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 200); !errors.Is(err, domain.ErrStoryNotFound) {
 		t.Fatalf("expired unpinned reaction err = %v, want ErrStoryNotFound", err)
 	}
 	if created, err := store.IncrementViews(ctx, 2001, owner, []int{2}, 200); err != nil || created != 1 {
 		t.Fatalf("expired pinned increment = %d, %v; want 1 nil", created, err)
 	}
-	res, err := store.SetReaction(ctx, 2002, owner, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}, 201)
+	res, err := store.setReaction(ctx, 2002, owner, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}, 201)
 	if err != nil {
 		t.Fatalf("expired pinned reaction: %v", err)
 	}
@@ -1408,10 +1408,10 @@ func TestStoryStoreListsViewsAndReactions(t *testing.T) {
 	}
 	like := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}
 	fire := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "fire"}
-	if _, err := store.SetReaction(ctx, 2002, owner, 1, like, 202); err != nil {
+	if _, err := store.setReaction(ctx, 2002, owner, 1, like, 202); err != nil {
 		t.Fatalf("set like reaction: %v", err)
 	}
-	if _, err := store.SetReaction(ctx, 2003, owner, 1, fire, 203); err != nil {
+	if _, err := store.setReaction(ctx, 2003, owner, 1, fire, 203); err != nil {
 		t.Fatalf("set fire reaction: %v", err)
 	}
 
@@ -1479,7 +1479,7 @@ func TestStoryStoreListsViewsAndReactions(t *testing.T) {
 	if filtered.Count != 1 || len(filtered.Reactions) != 1 || filtered.Reactions[0].ViewerID != 2003 {
 		t.Fatalf("filtered reactions = %+v, want viewer 2003 only", filtered)
 	}
-	if _, err := store.SetReaction(ctx, 2003, owner, 1, nil, 205); err != nil {
+	if _, err := store.setReaction(ctx, 2003, owner, 1, nil, 205); err != nil {
 		t.Fatalf("clear reaction: %v", err)
 	}
 	reactions, err = store.ListStoryReactions(ctx, domain.StoryReactionListRequest{
@@ -1494,7 +1494,7 @@ func TestStoryStoreListsViewsAndReactions(t *testing.T) {
 	if reactions.Count != 1 || len(reactions.Reactions) != 1 || reactions.Reactions[0].ViewerID != 2002 {
 		t.Fatalf("reactions after clear = %+v, want only viewer 2002", reactions)
 	}
-	if _, err := store.DeleteStories(ctx, owner, []int{1}, 206); err != nil {
+	if _, err := store.deleteStories(ctx, owner, []int{1}, 206); err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	deletedViewerIDs, err := store.ListStoryViewerIDs(ctx, owner, 1, 10)
@@ -1775,7 +1775,7 @@ func TestStoryStorePrivacyVisibility(t *testing.T) {
 	if created, err := store.IncrementViews(ctx, stranger, owner, []int{2}, 210); err != nil || created != 0 {
 		t.Fatalf("hidden increment views = %d, %v; want 0 nil", created, err)
 	}
-	if _, err := store.SetReaction(ctx, stranger, owner, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 211); err != domain.ErrStoryNotFound {
+	if _, err := store.setReaction(ctx, stranger, owner, 2, &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "like"}, 211); err != domain.ErrStoryNotFound {
 		t.Fatalf("hidden set reaction err = %v, want ErrStoryNotFound", err)
 	}
 }
@@ -1786,7 +1786,7 @@ func TestStoryStoreCreateEditDeleteAndPinned(t *testing.T) {
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
 	media := &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &domain.Photo{ID: 77, AccessHash: 7, DCID: 2}}
 
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:      owner,
 		RandomID:   9001,
 		Date:       100,
@@ -1803,7 +1803,7 @@ func TestStoryStoreCreateEditDeleteAndPinned(t *testing.T) {
 	if created.Duplicate || created.Story.ID != 1 || created.Story.ExpireDate != 86500 || !created.Story.Pinned {
 		t.Fatalf("created = %+v, want new pinned story id 1", created)
 	}
-	dup, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	dup, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    owner,
 		RandomID: 9001,
 		Date:     101,
@@ -1826,7 +1826,7 @@ func TestStoryStoreCreateEditDeleteAndPinned(t *testing.T) {
 		t.Fatalf("self max read = %d, want created story id", read.MaxReadID)
 	}
 
-	edited, err := store.EditStory(ctx, domain.StoryEditRequest{
+	edited, err := store.editStory(ctx, domain.StoryEditRequest{
 		Owner:         owner,
 		ID:            created.Story.ID,
 		Caption:       "edited",
@@ -1849,7 +1849,7 @@ func TestStoryStoreCreateEditDeleteAndPinned(t *testing.T) {
 		t.Fatalf("pinned = %+v, want created story", pinned)
 	}
 
-	deleted, err := store.DeleteStories(ctx, owner, []int{created.Story.ID}, 104)
+	deleted, err := store.deleteStories(ctx, owner, []int{created.Story.ID}, 104)
 	if err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
@@ -1873,7 +1873,7 @@ func TestStoryMutationIDsAreDeduped(t *testing.T) {
 	store := NewStoryStore()
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}
 	media := &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &domain.Photo{ID: 1}}
-	created, err := store.CreateStory(ctx, domain.StoryCreateRequest{
+	created, err := store.createStory(ctx, domain.StoryCreateRequest{
 		Owner:    owner,
 		RandomID: 9101,
 		Date:     100,
@@ -1885,7 +1885,7 @@ func TestStoryMutationIDsAreDeduped(t *testing.T) {
 		t.Fatalf("create story: %v", err)
 	}
 
-	toggled, err := store.TogglePinned(ctx, owner, []int{created.Story.ID, created.Story.ID}, true, 101)
+	toggled, err := store.togglePinned(ctx, owner, []int{created.Story.ID, created.Story.ID}, true, 101)
 	if err != nil {
 		t.Fatalf("toggle pinned: %v", err)
 	}
@@ -1895,21 +1895,21 @@ func TestStoryMutationIDsAreDeduped(t *testing.T) {
 	if len(toggled.Previous) != 1 || toggled.Previous[0].Pinned {
 		t.Fatalf("toggled previous = %+v, want pre-toggle unpinned snapshot", toggled.Previous)
 	}
-	retryToggled, err := store.TogglePinned(ctx, owner, []int{created.Story.ID}, true, 102)
+	retryToggled, err := store.togglePinned(ctx, owner, []int{created.Story.ID}, true, 102)
 	if err != nil {
 		t.Fatalf("retry toggle pinned: %v", err)
 	}
 	if len(retryToggled.IDs) != 1 || retryToggled.IDs[0] != created.Story.ID || len(retryToggled.Stories) != 0 || len(retryToggled.Previous) != 0 {
 		t.Fatalf("retry toggled = %+v, want id echo without mutation snapshot", retryToggled)
 	}
-	unpinned, err := store.TogglePinned(ctx, owner, []int{created.Story.ID}, false, 103)
+	unpinned, err := store.togglePinned(ctx, owner, []int{created.Story.ID}, false, 103)
 	if err != nil {
 		t.Fatalf("toggle unpinned: %v", err)
 	}
 	if len(unpinned.Stories) != 1 || unpinned.Stories[0].Pinned || len(unpinned.Previous) != 1 || !unpinned.Previous[0].Pinned {
 		t.Fatalf("unpinned = %+v, want unpinned story with pre-toggle pinned snapshot", unpinned)
 	}
-	retryUnpinned, err := store.TogglePinned(ctx, owner, []int{created.Story.ID}, false, 104)
+	retryUnpinned, err := store.togglePinned(ctx, owner, []int{created.Story.ID}, false, 104)
 	if err != nil {
 		t.Fatalf("retry toggle unpinned: %v", err)
 	}
@@ -1917,7 +1917,7 @@ func TestStoryMutationIDsAreDeduped(t *testing.T) {
 		t.Fatalf("retry unpinned = %+v, want no mutation snapshots", retryUnpinned)
 	}
 
-	emptyToggle, err := store.TogglePinned(ctx, owner, nil, false, 101)
+	emptyToggle, err := store.togglePinned(ctx, owner, nil, false, 101)
 	if err != nil {
 		t.Fatalf("empty toggle pinned: %v", err)
 	}
@@ -1925,14 +1925,14 @@ func TestStoryMutationIDsAreDeduped(t *testing.T) {
 		t.Fatalf("empty toggle = %+v, want no-op", emptyToggle)
 	}
 
-	deleted, err := store.DeleteStories(ctx, owner, []int{created.Story.ID, created.Story.ID}, 102)
+	deleted, err := store.deleteStories(ctx, owner, []int{created.Story.ID, created.Story.ID}, 102)
 	if err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	if len(deleted.IDs) != 1 || deleted.IDs[0] != created.Story.ID || len(deleted.Stories) != 1 || !deleted.Stories[0].Deleted {
 		t.Fatalf("deleted = %+v, want one deleted story", deleted)
 	}
-	retryDeleted, err := store.DeleteStories(ctx, owner, []int{created.Story.ID}, 103)
+	retryDeleted, err := store.deleteStories(ctx, owner, []int{created.Story.ID}, 103)
 	if err != nil {
 		t.Fatalf("retry delete story: %v", err)
 	}
@@ -1991,7 +1991,7 @@ func TestStoryStorePinnedToTopOrder(t *testing.T) {
 	if !sameStoryIDs(storyIDs(pageAfterOffset.Stories), []int{2, 1}) || !sameStoryIDs(pageAfterOffset.PinnedToTop, []int{2, 1, 4}) {
 		t.Fatalf("offset page stories %v top %v, want stories 2,1 and full top 2,1,4", storyIDs(pageAfterOffset.Stories), pageAfterOffset.PinnedToTop)
 	}
-	if _, err := store.TogglePinned(ctx, owner, []int{2}, false, 202); err != nil {
+	if _, err := store.togglePinned(ctx, owner, []int{2}, false, 202); err != nil {
 		t.Fatalf("unpin story: %v", err)
 	}
 	pinned, err = store.ListPinnedStories(ctx, owner.ID, owner, 0, 10, 203)
@@ -2004,7 +2004,7 @@ func TestStoryStorePinnedToTopOrder(t *testing.T) {
 	if err := store.TogglePinnedToTop(ctx, owner, []int{2}); !errors.Is(err, domain.ErrStoryIDInvalid) {
 		t.Fatalf("unpinned top err = %v, want ErrStoryIDInvalid", err)
 	}
-	if _, err := store.DeleteStories(ctx, owner, []int{1}, 204); err != nil {
+	if _, err := store.deleteStories(ctx, owner, []int{1}, 204); err != nil {
 		t.Fatalf("delete story: %v", err)
 	}
 	pinned, err = store.ListPinnedStories(ctx, owner.ID, owner, 0, 10, 205)

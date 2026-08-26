@@ -61,29 +61,33 @@ func TestBotManagementRPCFlow(t *testing.T) {
 
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
 	langPackStore := memory.NewLangPackStore()
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	botStore := memory.NewBotStore(userStore)
+	botStore.AttachDeliveryDependencies(dialogStore, deliveryOutbox)
 	botsService := botsapp.NewService(userStore, botStore, messageStore,
 		botsapp.WithLogger(zaptest.NewLogger(t).Named("bots")))
 	activeSessions := NewSessionManager(zaptest.NewLogger(t).Named("sessions"))
 	deps := rpc.Deps{
 		Auth: auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore,
 			memory.NewTempAuthKeyBindingStore(authKeyStore), code, auth.WithBotLogin(botStore)),
-		Account:       account.NewService(memory.NewPasswordStore()),
-		Help:          help.NewService(helpStore, helpStore),
-		Users:         users.NewService(userStore),
-		Updates:       updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts:      contacts.NewService(memory.NewContactStore()),
-		Dialogs:       dialogs.NewService(dialogStore),
-		Messages:      messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
-		Bots:          botsService,
-		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
-		LangPack:      langpack.NewService(langPackStore),
-		Sessions:      activeSessions,
+		Account:        account.NewService(memory.NewPasswordStore()),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:       contacts.NewService(memory.NewContactStore()),
+		Dialogs:        dialogs.NewService(dialogStore),
+		Messages:       messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
+		Bots:           botsService,
+		BotAPIUpdates:  memory.NewBotAPIUpdateStore(),
+		LangPack:       langpack.NewService(langPackStore),
+		Sessions:       activeSessions,
+		DeliveryOutbox: deliveryOutbox,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(router)
@@ -134,7 +138,7 @@ func TestBotManagementRPCFlow(t *testing.T) {
 	}
 
 	// 直接经 service 建 bot（绕过 BotFather 对话，聚焦管理 RPC）。
-	botUser, botToken, err := botsService.CreateBot(context.Background(), owner.ID, "Mgmt Bot", "mgmt_test_bot")
+	botUser, botToken, err := botsService.CreateBotWithDelivery(context.Background(), owner.ID, "Mgmt Bot", "mgmt_test_bot", edgeTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -298,29 +302,33 @@ func TestBotFatherCreateAndBotLoginFlow(t *testing.T) {
 
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
 	langPackStore := memory.NewLangPackStore()
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	botStore := memory.NewBotStore(userStore)
+	botStore.AttachDeliveryDependencies(dialogStore, deliveryOutbox)
 	botsService := botsapp.NewService(userStore, botStore, messageStore,
 		botsapp.WithLogger(zaptest.NewLogger(t).Named("bots")))
 	activeSessions := NewSessionManager(zaptest.NewLogger(t).Named("sessions"))
 	deps := rpc.Deps{
 		Auth: auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore,
 			memory.NewTempAuthKeyBindingStore(authKeyStore), code, auth.WithBotLogin(botStore)),
-		Account:       account.NewService(memory.NewPasswordStore()),
-		Help:          help.NewService(helpStore, helpStore),
-		Users:         users.NewService(userStore),
-		Updates:       updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts:      contacts.NewService(memory.NewContactStore()),
-		Dialogs:       dialogs.NewService(dialogStore),
-		Messages:      messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
-		Bots:          botsService,
-		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
-		LangPack:      langpack.NewService(langPackStore),
-		Sessions:      activeSessions,
+		Account:        account.NewService(memory.NewPasswordStore()),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:       contacts.NewService(memory.NewContactStore()),
+		Dialogs:        dialogs.NewService(dialogStore),
+		Messages:       messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
+		Bots:           botsService,
+		BotAPIUpdates:  memory.NewBotAPIUpdateStore(),
+		LangPack:       langpack.NewService(langPackStore),
+		Sessions:       activeSessions,
+		DeliveryOutbox: deliveryOutbox,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(router)

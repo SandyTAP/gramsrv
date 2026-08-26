@@ -2,12 +2,15 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // BotStore 是 store.BotStore 的内存实现。bot 的 users 行经注入的 UserStore 创建，
@@ -17,6 +20,7 @@ type BotStore struct {
 	mu             sync.RWMutex
 	users          *UserStore
 	byID           map[int64]domain.BotProfile
+	localizations  map[botInfoLocalizationKey]botInfoLocalization
 	states         map[[2]int64]domain.BotChatState
 	permissions    map[[2]int64]bool
 	appsByID       map[int64]domain.BotApp
@@ -29,11 +33,26 @@ type BotStore struct {
 	requestButtons map[requestedButtonKey]domain.BotRequestedWebViewButton
 	emojiPerms     map[[2]int64]bool
 	customMethod   map[string]domain.BotWebViewCustomMethodQuery
+	dialogs        *DialogStore
+	outbox         *DeliveryOutboxStore
 }
+
+var _ store.BotStore = (*BotStore)(nil)
 
 type botAppShortKey struct {
 	botUserID int64
 	shortName string
+}
+
+type botInfoLocalizationKey struct {
+	botUserID int64
+	langCode  string
+}
+
+type botInfoLocalization struct {
+	name        *string
+	about       *string
+	description *string
 }
 
 type requestedButtonKey struct {
@@ -47,6 +66,7 @@ func NewBotStore(users *UserStore) *BotStore {
 	s := &BotStore{
 		users:          users,
 		byID:           make(map[int64]domain.BotProfile),
+		localizations:  make(map[botInfoLocalizationKey]botInfoLocalization),
 		states:         make(map[[2]int64]domain.BotChatState),
 		permissions:    make(map[[2]int64]bool),
 		appsByID:       make(map[int64]domain.BotApp),
@@ -67,6 +87,29 @@ func NewBotStore(users *UserStore) *BotStore {
 		Description: "Search the server-curated GIF catalog.", InlinePlaceholder: "Search GIFs",
 	}
 	return s
+}
+
+// AttachDeliveryDependencies wires the same authoritative private-dialog read
+// model and absolute outbox used by the memory message/egress path. Bot-info
+// and command mutations require both; lifecycle mutations require the outbox.
+func (s *BotStore) AttachDeliveryDependencies(dialogs *DialogStore, outbox *DeliveryOutboxStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.dialogs = dialogs
+	s.outbox = outbox
+	s.mu.Unlock()
+}
+
+func (s *BotStore) DeliveryOutbox() *DeliveryOutboxStore {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	outbox := s.outbox
+	s.mu.RUnlock()
+	return outbox
 }
 
 func botFatherSeedProfile() domain.BotProfile {
@@ -121,34 +164,110 @@ func chatBotSeedProfile() domain.BotProfile {
 	}
 }
 
-func (s *BotStore) CreateBotAccount(ctx context.Context, user domain.User, profile domain.BotProfile) (domain.User, domain.BotProfile, error) {
+func (s *BotStore) CreateBotAccountWithDelivery(_ context.Context, user domain.User, profile domain.BotProfile, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, domain.BotProfile, error) {
+	if effects == nil {
+		return domain.User{}, domain.BotProfile{}, store.ErrDeliveryOutboxRequired
+	}
 	user.Phone = ""
 	user.Username = strings.TrimSpace(strings.TrimPrefix(user.Username, "@"))
 	user.Bot = true
 	if user.BotInfoVersion < 1 {
 		user.BotInfoVersion = 1
 	}
-	// 持 BotStore.mu 跨「复核计数 → 建 users 行 → 写 profile」，与 postgres 的
-	// advisory lock + 事务内复核对齐，封死 count-then-insert TOCTOU。锁顺序
-	// BotStore.mu → UserStore.mu（UserStore 不反向引用 BotStore，无死锁）。
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.users == nil || s.outbox == nil {
+		return domain.User{}, domain.BotProfile{}, store.ErrDeliveryOutboxRequired
+	}
+	s.users.mu.Lock()
+	defer s.users.mu.Unlock()
 	owned := 0
-	for _, p := range s.byID {
-		if p.OwnerUserID == profile.OwnerUserID && p.BotUserID != p.OwnerUserID {
+	for _, existing := range s.byID {
+		if existing.OwnerUserID == profile.OwnerUserID && existing.BotUserID != existing.OwnerUserID {
 			owned++
 		}
 	}
 	if owned >= domain.MaxBotsPerOwner {
 		return domain.User{}, domain.BotProfile{}, domain.ErrBotsTooMany
 	}
-	created, err := s.users.Create(ctx, user)
+	usernameLower := strings.ToLower(user.Username)
+	for _, existing := range s.users.byID {
+		if !existing.Deleted && usernameLower != "" && strings.ToLower(existing.Username) == usernameLower {
+			return domain.User{}, domain.BotProfile{}, domain.ErrUsernameOccupied
+		}
+	}
+	user.ID = s.users.nextID
+	if user.CreatedAt.IsZero() {
+		user.CreatedAt = time.Now().UTC()
+	}
+	profile.BotUserID = user.ID
+	snapshot := store.BotLifecycleDeliverySnapshot{Bot: user, OwnerUserID: profile.OwnerUserID}
+	intents, err := effects(snapshot)
 	if err != nil {
 		return domain.User{}, domain.BotProfile{}, err
 	}
-	profile.BotUserID = created.ID
-	s.byID[created.ID] = cloneBotProfile(profile)
-	return created, profile, nil
+	if err := store.ValidateBotLifecycleDeliveryEffects(snapshot, intents); err != nil {
+		return domain.User{}, domain.BotProfile{}, err
+	}
+	s.outbox.mu.Lock()
+	defer s.outbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(s.outbox, intents, time.Now().UTC()); err != nil {
+		return domain.User{}, domain.BotProfile{}, err
+	}
+	s.users.nextID++
+	s.users.byID[user.ID] = user
+	s.byID[user.ID] = cloneBotProfile(profile)
+	return user, profile, nil
+}
+
+func (s *BotStore) DeleteBotAccountWithDelivery(_ context.Context, botUserID int64, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, error) {
+	if effects == nil || botUserID <= 0 || domain.IsSystemUserID(botUserID) {
+		if effects == nil {
+			return domain.User{}, store.ErrDeliveryOutboxRequired
+		}
+		return domain.User{}, domain.ErrBotNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil || s.outbox == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	profile, ok := s.byID[botUserID]
+	if !ok {
+		return domain.User{}, domain.ErrBotNotFound
+	}
+	s.users.mu.Lock()
+	defer s.users.mu.Unlock()
+	user, ok := s.users.byID[botUserID]
+	if !ok || !user.Bot || user.Deleted {
+		return domain.User{}, domain.ErrBotNotFound
+	}
+	user.Deleted = true
+	user.DeletedAt = time.Now().Unix()
+	user.DeletionSource = domain.AccountDeletionManual
+	user.DeletionReason = "admin bot deletion"
+	user = user.DeletedTombstone()
+	snapshot := store.BotLifecycleDeliverySnapshot{Bot: user, OwnerUserID: profile.OwnerUserID, Deleted: true}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if err := store.ValidateBotLifecycleDeliveryEffects(snapshot, intents); err != nil {
+		return domain.User{}, err
+	}
+	s.outbox.mu.Lock()
+	defer s.outbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(s.outbox, intents, time.Now().UTC()); err != nil {
+		return domain.User{}, err
+	}
+	s.users.byID[botUserID] = user
+	delete(s.byID, botUserID)
+	for key := range s.localizations {
+		if key.botUserID == botUserID {
+			delete(s.localizations, key)
+		}
+	}
+	return user, nil
 }
 
 func (s *BotStore) GetBot(_ context.Context, botUserID int64) (domain.BotProfile, bool, error) {
@@ -162,6 +281,42 @@ func (s *BotStore) GetBot(_ context.Context, botUserID int64) (domain.BotProfile
 		return domain.BotProfile{}, false, nil
 	}
 	return cloneBotProfile(p), true, nil
+}
+
+func (s *BotStore) GetBotInfo(_ context.Context, botUserID int64, langCode string) (domain.BotInfoValues, bool, error) {
+	if botUserID <= 0 || s.users == nil {
+		return domain.BotInfoValues{}, false, nil
+	}
+	langCode = strings.TrimSpace(langCode)
+	s.mu.RLock()
+	profile, ok := s.byID[botUserID]
+	if !ok {
+		s.mu.RUnlock()
+		return domain.BotInfoValues{}, false, nil
+	}
+	localized, localizedOK := s.localizations[botInfoLocalizationKey{botUserID: botUserID, langCode: langCode}]
+	s.users.mu.RLock()
+	user, userOK := s.users.byID[botUserID]
+	if !userOK || user.Deleted || !user.Bot {
+		s.users.mu.RUnlock()
+		s.mu.RUnlock()
+		return domain.BotInfoValues{}, false, nil
+	}
+	values := domain.BotInfoValues{LangCode: langCode, Name: user.FirstName, About: user.About, Description: profile.Description}
+	if langCode != "" && localizedOK {
+		if localized.name != nil {
+			values.Name = *localized.name
+		}
+		if localized.about != nil {
+			values.About = *localized.about
+		}
+		if localized.description != nil {
+			values.Description = *localized.description
+		}
+	}
+	s.users.mu.RUnlock()
+	s.mu.RUnlock()
+	return values, true, nil
 }
 
 func (s *BotStore) GetBots(_ context.Context, botUserIDs []int64) (map[int64]domain.BotProfile, error) {
@@ -247,26 +402,233 @@ func (s *BotStore) editProfile(botUserID int64, fn func(p *domain.BotProfile)) (
 	return ver, nil
 }
 
-func (s *BotStore) UpdateBotCommands(_ context.Context, botUserID int64, commands []domain.BotCommand) (int, error) {
-	return s.editProfile(botUserID, func(p *domain.BotProfile) {
-		p.Commands = append([]domain.BotCommand(nil), commands...)
-	})
+func (s *BotStore) UpdateBotCommandsWithDelivery(ctx context.Context, botUserID int64, commands []domain.BotCommand, effects store.DeliveryEffectsBuilder[store.BotCommandsDeliverySnapshot]) (int, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profile, ok := s.byID[botUserID]
+	if !ok {
+		return 0, false, domain.ErrBotNotFound
+	}
+	s.users.mu.Lock()
+	defer s.users.mu.Unlock()
+	user, ok := s.users.byID[botUserID]
+	if !ok || user.Deleted || !user.Bot {
+		return 0, false, domain.ErrBotNotFound
+	}
+	if botCommandSlicesEqual(profile.Commands, commands) {
+		return user.BotInfoVersion, false, nil
+	}
+	if effects == nil || s.dialogs == nil || s.outbox == nil {
+		return 0, false, store.ErrDeliveryOutboxRequired
+	}
+	// Retain the dialog read lock through effect persistence and aggregate
+	// publication. Memory private sends take the write side of this lock while
+	// installing both dialog projections, giving the same linearization point
+	// as PostgreSQL's bot advisory lock.
+	s.dialogs.mu.RLock()
+	defer s.dialogs.mu.RUnlock()
+	audience, err := s.botCommandsAudienceLocked(botUserID)
+	if err != nil {
+		return 0, false, err
+	}
+	nextVersion := user.BotInfoVersion + 1
+	snapshot := store.BotCommandsDeliverySnapshot{
+		BotUserID: botUserID,
+		Commands:  append([]domain.BotCommand(nil), commands...),
+		Audience:  audience,
+		Version:   nextVersion,
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := store.ValidateBotCommandsDeliveryEffects(snapshot, intents); err != nil {
+		return 0, false, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.outbox, nil); err != nil {
+		return 0, false, err
+	}
+	profile.Commands = append([]domain.BotCommand(nil), commands...)
+	s.byID[botUserID] = profile
+	user.BotInfoVersion = nextVersion
+	s.users.byID[botUserID] = user
+	return nextVersion, true, nil
 }
 
-func (s *BotStore) UpdateBotInfo(_ context.Context, botUserID int64, upd domain.BotInfoUpdate) (int, error) {
-	if _, ok := s.GetBotProfile(botUserID); !ok {
-		return 0, domain.ErrBotNotFound
-	}
-	if upd.SetName || upd.SetAbout {
-		if !s.users.updateBotProfile(botUserID, upd.SetName, upd.Name, upd.SetAbout, upd.About) {
-			return 0, domain.ErrBotNotFound
+// botCommandsAudienceLocked requires BotStore.mu, UserStore.mu and
+// DialogStore.mu.RLock. It unions both projections of the private-dialog read
+// model and fails instead of truncating when the transaction bound is crossed.
+func (s *BotStore) botCommandsAudienceLocked(botUserID int64) ([]int64, error) {
+	seen := make(map[int64]struct{})
+	for ownerUserID, list := range s.dialogs.m {
+		for _, dialog := range list.Dialogs {
+			viewerID := int64(0)
+			switch {
+			case ownerUserID != botUserID && dialog.Peer.Type == domain.PeerTypeUser && dialog.Peer.ID == botUserID:
+				viewerID = ownerUserID
+			case ownerUserID == botUserID && dialog.Peer.Type == domain.PeerTypeUser && dialog.Peer.ID != botUserID:
+				viewerID = dialog.Peer.ID
+			}
+			if viewerID <= 0 {
+				continue
+			}
+			viewer, ok := s.users.byID[viewerID]
+			if !ok || viewer.Deleted {
+				continue
+			}
+			seen[viewerID] = struct{}{}
+			if len(seen) > store.MaxBotCommandsDeliveryAudience {
+				return nil, fmt.Errorf("update bot commands: audience exceeds %d", store.MaxBotCommandsDeliveryAudience)
+			}
 		}
 	}
-	return s.editProfile(botUserID, func(p *domain.BotProfile) {
+	audience := make([]int64, 0, len(seen))
+	for viewerID := range seen {
+		audience = append(audience, viewerID)
+	}
+	sort.Slice(audience, func(i, j int) bool { return audience[i] < audience[j] })
+	return audience, nil
+}
+
+func botCommandSlicesEqual(a, b []domain.BotCommand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *BotStore) UpdateBotInfoWithDelivery(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (int, bool, error) {
+	if botUserID <= 0 {
+		return 0, false, domain.ErrBotNotFound
+	}
+	if effects == nil {
+		return 0, false, store.ErrDeliveryOutboxRequired
+	}
+	langCode := strings.TrimSpace(upd.LangCode)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil || s.dialogs == nil || s.outbox == nil {
+		return 0, false, store.ErrDeliveryOutboxRequired
+	}
+	profile, ok := s.byID[botUserID]
+	if !ok {
+		return 0, false, domain.ErrBotNotFound
+	}
+	s.users.mu.Lock()
+	defer s.users.mu.Unlock()
+	user, ok := s.users.byID[botUserID]
+	if !ok || user.Deleted || !user.Bot {
+		return 0, false, domain.ErrBotNotFound
+	}
+
+	key := botInfoLocalizationKey{botUserID: botUserID, langCode: langCode}
+	localized, localizedExists := s.localizations[key]
+	changed := false
+	if langCode == "" {
+		changed = (upd.SetName && upd.Name != user.FirstName) ||
+			(upd.SetAbout && upd.About != user.About) ||
+			(upd.SetDescription && upd.Description != profile.Description)
+	} else {
+		changed = !localizedExists ||
+			(upd.SetName && (localized.name == nil || *localized.name != upd.Name)) ||
+			(upd.SetAbout && (localized.about == nil || *localized.about != upd.About)) ||
+			(upd.SetDescription && (localized.description == nil || *localized.description != upd.Description))
+	}
+	if !changed {
+		return user.BotInfoVersion, false, nil
+	}
+
+	s.dialogs.mu.RLock()
+	defer s.dialogs.mu.RUnlock()
+	audience, err := s.botInfoAudienceLocked(botUserID, profile.OwnerUserID)
+	if err != nil {
+		return 0, false, err
+	}
+	nextUser := user
+	nextProfile := profile
+	nextLocalized := localized
+	if langCode == "" {
+		if upd.SetName {
+			nextUser.FirstName = upd.Name
+		}
+		if upd.SetAbout {
+			nextUser.About = upd.About
+		}
 		if upd.SetDescription {
-			p.Description = upd.Description
+			nextProfile.Description = upd.Description
 		}
-	})
+	} else {
+		if upd.SetName {
+			name := upd.Name
+			nextLocalized.name = &name
+		}
+		if upd.SetAbout {
+			about := upd.About
+			nextLocalized.about = &about
+		}
+		if upd.SetDescription {
+			description := upd.Description
+			nextLocalized.description = &description
+		}
+	}
+	nextUser.BotInfoVersion++
+	snapshot := store.UserAudienceDeliverySnapshot{User: nextUser, Audience: audience}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		return 0, false, err
+	}
+	s.outbox.mu.Lock()
+	defer s.outbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(s.outbox, intents, time.Now().UTC()); err != nil {
+		return 0, false, err
+	}
+	s.users.byID[botUserID] = nextUser
+	s.byID[botUserID] = nextProfile
+	if langCode != "" {
+		s.localizations[key] = nextLocalized
+	}
+	return nextUser.BotInfoVersion, true, nil
+}
+
+// botInfoAudienceLocked requires BotStore.mu, UserStore.mu and DialogStore.mu.RLock.
+func (s *BotStore) botInfoAudienceLocked(botUserID, ownerUserID int64) ([]int64, error) {
+	seen := make(map[int64]struct{})
+	if owner, ok := s.users.byID[ownerUserID]; ownerUserID > 0 && ok && !owner.Deleted {
+		seen[ownerUserID] = struct{}{}
+	}
+	for dialogOwnerID, list := range s.dialogs.m {
+		for _, dialog := range list.Dialogs {
+			viewerID := int64(0)
+			switch {
+			case dialogOwnerID != botUserID && dialog.Peer.Type == domain.PeerTypeUser && dialog.Peer.ID == botUserID:
+				viewerID = dialogOwnerID
+			case dialogOwnerID == botUserID && dialog.Peer.Type == domain.PeerTypeUser && dialog.Peer.ID != botUserID:
+				viewerID = dialog.Peer.ID
+			}
+			viewer, ok := s.users.byID[viewerID]
+			if viewerID <= 0 || !ok || viewer.Deleted {
+				continue
+			}
+			seen[viewerID] = struct{}{}
+			if len(seen) > store.MaxBotInfoDeliveryAudience {
+				return nil, fmt.Errorf("update bot info: audience exceeds %d", store.MaxBotInfoDeliveryAudience)
+			}
+		}
+	}
+	audience := make([]int64, 0, len(seen))
+	for viewerID := range seen {
+		audience = append(audience, viewerID)
+	}
+	sort.Slice(audience, func(i, j int) bool { return audience[i] < audience[j] })
+	return audience, nil
 }
 
 func (s *BotStore) UpdateBotMenuButton(_ context.Context, botUserID int64, button domain.BotMenuButton) (int, error) {
@@ -598,17 +960,45 @@ func (s *BotStore) GetAttachMenuState(_ context.Context, userID, botUserID int64
 	return state, true, nil
 }
 
-func (s *BotStore) SetAttachMenuState(_ context.Context, state domain.BotAttachMenuState) (domain.BotAttachMenuState, error) {
+func (s *BotStore) SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState, effects store.DeliveryEffectsBuilder[domain.BotAttachMenuState]) (domain.BotAttachMenuState, error) {
 	if state.UserID == 0 || state.BotUserID == 0 || state.UserID == state.BotUserID {
 		return domain.BotAttachMenuState{}, domain.ErrBotAttachMenuInvalid
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.attachMenu[state.BotUserID]; !ok {
-		s.mu.Unlock()
 		return domain.BotAttachMenuState{}, domain.ErrBotAttachMenuInvalid
 	}
-	s.attachStates[[2]int64{state.UserID, state.BotUserID}] = state
-	s.mu.Unlock()
+	key := [2]int64{state.UserID, state.BotUserID}
+	previous, found := s.attachStates[key]
+	state.WriteAllowed = state.WriteAllowed || previous.WriteAllowed
+	if found && previous.Enabled == state.Enabled && previous.WriteAllowed == state.WriteAllowed {
+		return previous, nil
+	}
+	s.attachStates[key] = state
+	if effects == nil {
+		if found {
+			s.attachStates[key] = previous
+		} else {
+			delete(s.attachStates, key)
+		}
+		return domain.BotAttachMenuState{}, store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(state)
+	if err == nil && len(intents) == 0 {
+		err = store.ErrDeliveryOutboxRequired
+	}
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.outbox, nil)
+	}
+	if err != nil {
+		if found {
+			s.attachStates[key] = previous
+		} else {
+			delete(s.attachStates, key)
+		}
+		return domain.BotAttachMenuState{}, err
+	}
 	return state, nil
 }
 

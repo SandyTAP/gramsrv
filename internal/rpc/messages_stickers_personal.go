@@ -6,25 +6,14 @@ import (
 	"fmt"
 
 	"github.com/iamxvbaba/td/tg"
-	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
-// 个人贴纸集合：收藏贴纸 / 最近贴纸 / 保存的 GIF。读写都经 stickerCollectionService
-// （由 *app/account.Service 实现，类型断言自 r.deps.Account）。文档经 Files 解析为完整
-// 文档对象，未接通服务时回落历史空 stub 行为。
-
-type stickerCollectionService interface {
-	SaveStickerCollectionItem(ctx context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now int) error
-	ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error)
-	ClearStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind) error
-}
-
-func (r *Router) stickerCollectionSvc() (stickerCollectionService, bool) {
-	svc, ok := r.deps.Account.(stickerCollectionService)
-	return svc, ok
-}
+// Personal sticker/GIF collection reads and writes use the mandatory Account
+// boundary. Every write commits its encoded absolute delivery fact in the same
+// transaction; there is no empty-stub or post-commit push path.
 
 // stickerDocumentFromInput 校验输入文档存在且为贴纸（faveSticker/saveRecentSticker）。
 func (r *Router) stickerDocumentFromInput(ctx context.Context, input tg.InputDocumentClass, requireGif bool) (domain.Document, error) {
@@ -71,12 +60,16 @@ func (r *Router) onMessagesFaveSticker(ctx context.Context, req *tg.MessagesFave
 	if err != nil {
 		return false, err
 	}
-	if svc, ok := r.stickerCollectionSvc(); ok {
-		if err := svc.SaveStickerCollectionItem(ctx, userID, domain.StickerCollectionFaved, doc.ID, req.Unfave, int(r.clock.Now().Unix())); err != nil {
-			return false, internalErr()
-		}
+	mutationKind := domain.StickerCollectionMutationSave
+	if req.Unfave {
+		mutationKind = domain.StickerCollectionMutationUnsave
 	}
-	r.pushStickerCollectionUpdate(ctx, userID, &tg.UpdateFavedStickers{})
+	if err := r.mutateStickerCollection(ctx, domain.StickerCollectionMutation{
+		OwnerUserID: userID, Kind: domain.StickerCollectionFaved, Mutation: mutationKind,
+		DocumentID: doc.ID, Date: int(r.clock.Now().Unix()),
+	}, &tg.UpdateFavedStickers{}); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -96,12 +89,16 @@ func (r *Router) onMessagesSaveRecentSticker(ctx context.Context, req *tg.Messag
 	if req.Attached {
 		kind = domain.StickerCollectionRecentAttached
 	}
-	if svc, ok := r.stickerCollectionSvc(); ok {
-		if err := svc.SaveStickerCollectionItem(ctx, userID, kind, doc.ID, req.Unsave, int(r.clock.Now().Unix())); err != nil {
-			return false, internalErr()
-		}
+	mutationKind := domain.StickerCollectionMutationSave
+	if req.Unsave {
+		mutationKind = domain.StickerCollectionMutationUnsave
 	}
-	r.pushStickerCollectionUpdate(ctx, userID, &tg.UpdateRecentStickers{})
+	if err := r.mutateStickerCollection(ctx, domain.StickerCollectionMutation{
+		OwnerUserID: userID, Kind: kind, Mutation: mutationKind,
+		DocumentID: doc.ID, Date: int(r.clock.Now().Unix()),
+	}, &tg.UpdateRecentStickers{}); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -117,31 +114,30 @@ func (r *Router) onMessagesSaveGif(ctx context.Context, req *tg.MessagesSaveGifR
 	if err != nil {
 		return false, err
 	}
-	if svc, ok := r.stickerCollectionSvc(); ok {
-		if err := svc.SaveStickerCollectionItem(ctx, userID, domain.StickerCollectionGif, doc.ID, req.Unsave, int(r.clock.Now().Unix())); err != nil {
-			return false, internalErr()
-		}
+	mutationKind := domain.StickerCollectionMutationSave
+	if req.Unsave {
+		mutationKind = domain.StickerCollectionMutationUnsave
 	}
-	r.pushStickerCollectionUpdate(ctx, userID, &tg.UpdateSavedGifs{})
+	if err := r.mutateStickerCollection(ctx, domain.StickerCollectionMutation{
+		OwnerUserID: userID, Kind: domain.StickerCollectionGif, Mutation: mutationKind,
+		DocumentID: doc.ID, Date: int(r.clock.Now().Unix()),
+	}, &tg.UpdateSavedGifs{}); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
-// autoSaveSentGif mirrors the server-side recent/saved-GIF behaviour clients
-// rely on after sending an inline GIF. It is non-PTS and best-effort because
-// the ordinary message transaction has already committed.
-func (r *Router) autoSaveSentGif(ctx context.Context, userID int64, media *domain.MessageMedia) {
+// autoSaveSentGif commits the collection mutation and its delivery fact as one
+// account transaction. Callers receive failure instead of silently losing the
+// durable saved-GIF transition.
+func (r *Router) autoSaveSentGif(ctx context.Context, userID int64, media *domain.MessageMedia) error {
 	if media == nil || media.Kind != domain.MessageMediaKindDocument || media.Document == nil || !media.Document.IsGif() {
-		return
+		return nil
 	}
-	svc, ok := r.stickerCollectionSvc()
-	if !ok {
-		return
-	}
-	if err := svc.SaveStickerCollectionItem(ctx, userID, domain.StickerCollectionGif, media.Document.ID, false, int(r.clock.Now().Unix())); err != nil {
-		r.log.Warn("auto-save sent gif", zap.Int64("user_id", userID), zap.Int64("document_id", media.Document.ID), zap.Error(err))
-		return
-	}
-	r.pushStickerCollectionUpdate(ctx, userID, &tg.UpdateSavedGifs{})
+	return r.mutateStickerCollection(ctx, domain.StickerCollectionMutation{
+		OwnerUserID: userID, Kind: domain.StickerCollectionGif, Mutation: domain.StickerCollectionMutationSave,
+		DocumentID: media.Document.ID, Date: int(r.clock.Now().Unix()),
+	}, &tg.UpdateSavedGifs{})
 }
 
 func (r *Router) onMessagesClearRecentStickers(ctx context.Context, req *tg.MessagesClearRecentStickersRequest) (bool, error) {
@@ -153,12 +149,11 @@ func (r *Router) onMessagesClearRecentStickers(ctx context.Context, req *tg.Mess
 	if req != nil && req.Attached {
 		kind = domain.StickerCollectionRecentAttached
 	}
-	if svc, ok := r.stickerCollectionSvc(); ok {
-		if err := svc.ClearStickerCollection(ctx, userID, kind); err != nil {
-			return false, internalErr()
-		}
+	if err := r.mutateStickerCollection(ctx, domain.StickerCollectionMutation{
+		OwnerUserID: userID, Kind: kind, Mutation: domain.StickerCollectionMutationClear,
+	}, &tg.UpdateRecentStickers{}); err != nil {
+		return false, err
 	}
-	r.pushStickerCollectionUpdate(ctx, userID, &tg.UpdateRecentStickers{})
 	return true, nil
 }
 
@@ -227,14 +222,10 @@ func (r *Router) onMessagesGetSavedGifs(ctx context.Context, hash int64) (tg.Mes
 // stickerCollectionDocuments 取某集合并解析为完整文档（最新在前，顺序与集合一致）。
 // 集合引用缺失或类型错误属于坏数据并 fail-fast；若 datesOut 非 nil，按相同顺序填充 used_at。
 func (r *Router) stickerCollectionDocuments(ctx context.Context, userID int64, kind domain.StickerCollectionKind, datesOut *[]int) ([]domain.Document, error) {
-	svc, ok := r.stickerCollectionSvc()
-	if !ok || r.deps.Files == nil {
-		if datesOut != nil {
-			*datesOut = []int{}
-		}
-		return nil, nil
+	if r.deps.Account == nil || r.deps.Files == nil {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
-	items, err := svc.ListStickerCollection(ctx, userID, kind, domain.MaxStickerCollectionItems(kind))
+	items, err := r.deps.Account.ListStickerCollection(ctx, userID, kind, domain.MaxStickerCollectionItems(kind))
 	if err != nil {
 		return nil, err
 	}
@@ -285,12 +276,30 @@ func stickerDocumentsHash(docs []domain.Document) int64 {
 	return int64(tdesktopCountHash(values))
 }
 
-// pushStickerCollectionUpdate 把 updateFaved/Recent/SavedGifs nudge 推给本人其它在线设备。
-func (r *Router) pushStickerCollectionUpdate(ctx context.Context, userID int64, update tg.UpdateClass) {
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{update},
-		Users:   []tg.UserClass{},
-		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
+func (r *Router) mutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, update tg.UpdateClass) error {
+	if r.deps.Account == nil || update == nil {
+		return internalErr()
+	}
+	if err := r.requireAccountDelivery(mutation.OwnerUserID, "messages.stickerCollectionMutation"); err != nil {
+		return err
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	err := r.deps.Account.MutateStickerCollection(ctx, mutation, func(snapshot domain.StickerCollectionMutation) ([]store.DeliveryEffect, error) {
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{}, Chats: []tg.ChatClass{},
+			Date: int(r.clock.Now().Unix()),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.OwnerUserID, ExcludeAuthKeyID: excludeAuthKeyID,
+			ExcludeSessionID: excludeSessionID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	})
+	if err != nil {
+		return internalErr()
+	}
+	return nil
 }

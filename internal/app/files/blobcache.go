@@ -169,13 +169,15 @@ func newBlobBytesCache(maxBytes int) *blobBytesCache {
 	}
 }
 
-func (c *blobBytesCache) get(key string) ([]byte, bool) {
+// getShared returns an immutable cache-owned slice. Callers must copy only the
+// range they hand to a mutable owner; entries are replaced, never modified.
+func (c *blobBytesCache) getShared(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.m[key]; ok {
 		c.ll.MoveToFront(el)
 		entry := el.Value.(*blobBytesEntry)
-		return append([]byte(nil), entry.bytes...), true
+		return entry.bytes, true
 	}
 	return nil, false
 }
@@ -190,21 +192,29 @@ func (c *blobBytesCache) has(key string) bool {
 	return false
 }
 
-func (c *blobBytesCache) put(key string, bytes []byte) {
-	if len(bytes) > c.maxBytes {
+func (c *blobBytesCache) put(key string, data []byte) {
+	c.putEntry(key, append([]byte(nil), data...))
+}
+
+// putOwned transfers data into the immutable cache without cloning it.
+func (c *blobBytesCache) putOwned(key string, data []byte) {
+	c.putEntry(key, data)
+}
+
+func (c *blobBytesCache) putEntry(key string, data []byte) {
+	if len(data) > c.maxBytes {
 		return
 	}
-	copied := append([]byte(nil), bytes...)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.m[key]; ok {
 		entry := el.Value.(*blobBytesEntry)
-		c.used += len(copied) - entry.size
-		entry.bytes = copied
-		entry.size = len(copied)
+		c.used += len(data) - entry.size
+		entry.bytes = data
+		entry.size = len(data)
 		c.ll.MoveToFront(el)
 	} else {
-		entry := &blobBytesEntry{key: key, bytes: copied, size: len(copied)}
+		entry := &blobBytesEntry{key: key, bytes: data, size: len(data)}
 		c.m[key] = c.ll.PushFront(entry)
 		c.used += entry.size
 	}

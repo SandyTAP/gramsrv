@@ -152,9 +152,9 @@ type Conn struct {
 	// rpcResultAcked is invoked by the sole outbound actor after it resolves an
 	// acknowledged server frame back to the rpc_result request msg_id.
 	rpcResultAcked func(*Conn, int64)
-	// outboxClientAcked is invoked by the sole outbound actor after a client
-	// msgs_ack resolves to a server-originated durable outbox frame.
-	outboxClientAcked func(*Conn, edgecontrol.OutboxDeliveryRef, int64)
+	// deliveryClientAcked is invoked by the sole outbound actor after a client
+	// msgs_ack resolves to a v3 durable delivery frame.
+	deliveryClientAcked func(*Conn, edgecontrol.DeliveryTracking, int64)
 	// inflightRPCBytes 跟踪已预留/入队/执行中 inbound RPC 的 memory charge；legacy
 	// 等于 copied body，exact 是 typed materialization 的保守放大值。它配合
 	// maxInflightRPCBytes 给 RPC 队列设内存预算（不止限条数）。
@@ -176,10 +176,15 @@ type Conn struct {
 	businessAuthKeyResolved bool
 	userID                  atomic.Int64
 	userIDResolved          atomic.Bool
-	receivesUpdates         atomic.Bool
-	channelWatermarkMu      sync.Mutex
-	channelPayloadPts       map[int64]int
-	channelNudgePts         map[int64]int
+	// deliveryIdentityGeneration fences durable snapshots across an in-place
+	// logout/login or business-auth-key rebind. The Conn pointer already names a
+	// physical generation; this counter names the account identity generation
+	// within that physical connection.
+	deliveryIdentityGeneration atomic.Uint64
+	receivesUpdates            atomic.Bool
+	channelWatermarkMu         sync.Mutex
+	channelPayloadPts          map[int64]int
+	channelNudgePts            map[int64]int
 	// membershipsSynced 表示该连接的 channel membership 推送路由（byMemberChannel）
 	// 已成功建立。它与 receivesUpdates 共同构成「session 完全就绪」：membership
 	// 同步失败时保持 false，让置位短路放行、下一条 RPC 重试同步，避免
@@ -388,6 +393,7 @@ func (c *Conn) SetBusinessAuthKeyID(id [8]byte) {
 	c.businessAuthKeyResolved = true
 	c.identityMu.Unlock()
 	if changed {
+		c.deliveryIdentityGeneration.Add(1)
 		c.userID.Store(0)
 		c.userIDResolved.Store(false)
 	}

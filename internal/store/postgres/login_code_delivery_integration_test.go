@@ -30,7 +30,7 @@ func TestLoginCodeDeliveryPostgresAtomicFactsAndReplay(t *testing.T) {
 		ExpiresAt:     1700001300,
 	}
 
-	first, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, req)
+	first, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, req)
 	if err != nil {
 		t.Fatalf("DeliverLoginCodeMessage: %v", err)
 	}
@@ -91,7 +91,7 @@ WHERE user_id = $1 AND message_box_id = $2`, user.ID, first.Message.ID).Scan(&de
 
 	replayReq := req
 	replayReq.Date += 99
-	replay, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, replayReq)
+	replay, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, replayReq)
 	if err != nil {
 		t.Fatalf("replay DeliverLoginCodeMessage: %v", err)
 	}
@@ -102,7 +102,7 @@ WHERE user_id = $1 AND message_box_id = $2`, user.ID, first.Message.ID).Scan(&de
 
 	changedCode := req
 	changedCode.Code = "54321"
-	if _, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, changedCode); !errors.Is(err, domain.ErrLoginCodeDeliveryConflict) {
+	if _, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, changedCode); !errors.Is(err, domain.ErrLoginCodeDeliveryConflict) {
 		t.Fatalf("changed-code replay err = %v, want ErrLoginCodeDeliveryConflict", err)
 	}
 	assertLoginCodeDeliveryFacts(t, ctx, pool, user.ID, first.Message, 1)
@@ -110,7 +110,7 @@ WHERE user_id = $1 AND message_box_id = $2`, user.ID, first.Message.ID).Scan(&de
 	otherUser := createLoginCodeDeliveryTestUser(t, ctx, pool, "conflict")
 	changedUser := req
 	changedUser.UserID = otherUser.ID
-	if _, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, changedUser); !errors.Is(err, domain.ErrLoginCodeDeliveryConflict) {
+	if _, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, changedUser); !errors.Is(err, domain.ErrLoginCodeDeliveryConflict) {
 		t.Fatalf("changed-user replay err = %v, want ErrLoginCodeDeliveryConflict", err)
 	}
 	var otherFacts int
@@ -135,6 +135,11 @@ func TestLoginCodeDeliveryPostgresConcurrentExactlyOnce(t *testing.T) {
 	}
 
 	const workers = 24
+	// The production Redis allocator recovers its durable floor through the
+	// dedicated counter-recovery pool, never through a business transaction
+	// connection. Use one shared atomic fake here so 24 transactions cannot
+	// accidentally turn the test's main pgx pool into a second allocator path.
+	boxIDs := &perUserCounterAllocator{}
 	var created atomic.Int32
 	results := make(chan domain.LoginCodeDeliveryResult, workers)
 	errs := make(chan error, workers)
@@ -143,7 +148,7 @@ func TestLoginCodeDeliveryPostgresConcurrentExactlyOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			got, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, req)
+			got, err := newTestMessageStore(pool, WithMessageAllocators(boxIDs)).DeliverLoginCodeMessage(ctx, req)
 			if err != nil {
 				errs <- err
 				return
@@ -191,7 +196,7 @@ func TestLoginCodeDeliveryPostgresCommitAckLossRecoversFromReceipt(t *testing.T)
 		ExpiresAt:     time.Now().Add(5 * time.Minute).Unix(),
 	}
 
-	got, err := NewMessageStore(&commitAckLossDB{Pool: pool}).DeliverLoginCodeMessage(ctx, req)
+	got, err := newTestMessageStore(&commitAckLossDB{Pool: pool}).DeliverLoginCodeMessage(ctx, req)
 	if err != nil {
 		t.Fatalf("DeliverLoginCodeMessage with lost commit ACK: %v", err)
 	}
@@ -200,7 +205,7 @@ func TestLoginCodeDeliveryPostgresCommitAckLossRecoversFromReceipt(t *testing.T)
 	}
 	assertLoginCodeDeliveryFacts(t, ctx, pool, user.ID, got.Message, 1)
 
-	replay, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, req)
+	replay, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, req)
 	if err != nil {
 		t.Fatalf("replay after lost commit ACK: %v", err)
 	}
@@ -214,7 +219,7 @@ func TestLoginCodeDeliveryPostgresDifferentUsersDoNotRewriteOfficialIdentity(t *
 	ctx := context.Background()
 	firstUser := createLoginCodeDeliveryTestUser(t, ctx, pool, "official-row-first")
 	now := int(time.Now().Unix())
-	if _, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+	if _, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 		UserID: firstUser.ID, PhoneCodeHash: "official-row-first-" + randomSuffix(t), Code: "12345", Date: now, ExpiresAt: int64(now + 300),
 	}); err != nil {
 		t.Fatalf("first delivery: %v", err)
@@ -247,7 +252,7 @@ WHERE peer_type = 'user' AND peer_id = $1`, domain.OfficialSystemUserID).Scan(&u
 		wg.Add(1)
 		go func(i int, user domain.User) {
 			defer wg.Done()
-			_, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+			_, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 				UserID: user.ID, PhoneCodeHash: hashes[i], Code: "12345", Date: now, ExpiresAt: int64(now + 300),
 			})
 			if err != nil {
@@ -320,7 +325,7 @@ WHERE peer_type = 'user' AND peer_id = $1 AND editable`, domain.OfficialSystemUs
 	})
 
 	now := int(time.Now().Unix())
-	if _, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+	if _, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 		UserID: recipient.ID, PhoneCodeHash: "official-source-update-" + randomSuffix(t),
 		Code: "12345", Date: now, ExpiresAt: int64(now + 300),
 	}); err != nil {
@@ -349,13 +354,13 @@ func TestLoginCodeDeliveryPostgresReceiptRetentionIsBoundedAndSeekOrdered(t *tes
 		if i < 2 {
 			expiresAt = now.Add(time.Duration(i-2) * time.Minute).Unix()
 		}
-		if _, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+		if _, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 			UserID: user.ID, PhoneCodeHash: fmt.Sprintf("expiry-%d-%s", i, randomSuffix(t)), Code: "12345", Date: int(now.Add(-time.Hour).Unix()), ExpiresAt: expiresAt,
 		}); err != nil {
 			t.Fatalf("seed expiry receipt %d: %v", i, err)
 		}
 	}
-	store := NewMessageStore(pool)
+	store := newTestMessageStore(pool)
 	deleted, err := store.DeleteExpiredLoginCodeDeliveries(ctx, now, 1)
 	if err != nil || deleted != 1 {
 		t.Fatalf("first bounded retention = %d, %v; want 1", deleted, err)
@@ -383,7 +388,7 @@ func TestLoginCodeDeliveryPostgresRollsBackEveryFact(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	user := createLoginCodeDeliveryTestUser(t, ctx, pool, "rollback")
-	first, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+	first, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 		UserID:        user.ID,
 		PhoneCodeHash: "pg-login-code-rollback-first-" + randomSuffix(t),
 		Code:          "11111",
@@ -404,7 +409,7 @@ func TestLoginCodeDeliveryPostgresRollsBackEveryFact(t *testing.T) {
 		Date:          1700001201,
 		ExpiresAt:     1700001501,
 	}
-	failing := NewMessageStore(pool, WithMessageAllocators(loginCodeFixedBoxAllocator{boxID: first.Message.ID}))
+	failing := newTestMessageStore(pool, WithMessageAllocators(loginCodeFixedBoxAllocator{boxID: first.Message.ID}))
 	if _, err := failing.DeliverLoginCodeMessage(ctx, failedReq); err == nil {
 		t.Fatal("duplicate box allocator delivery succeeded, want rollback")
 	}
@@ -424,7 +429,7 @@ func TestLoginCodeDeliveryPostgresRollsBackEveryFact(t *testing.T) {
 		t.Fatalf("failed transaction leaked receipts=%d private_messages=%d", failedReceipts, failedBodies)
 	}
 
-	third, err := NewMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
+	third, err := newTestMessageStore(pool).DeliverLoginCodeMessage(ctx, domain.LoginCodeDeliveryRequest{
 		UserID:        user.ID,
 		PhoneCodeHash: "pg-login-code-rollback-third-" + randomSuffix(t),
 		Code:          "33333",
@@ -468,6 +473,14 @@ func (t *commitAckLossTx) Commit(ctx context.Context) error {
 
 func (a loginCodeFixedBoxAllocator) NextBoxID(context.Context, int64) (int, error) {
 	return a.boxID, nil
+}
+
+func (a loginCodeFixedBoxAllocator) NextBoxIDs(_ context.Context, userIDs []int64) (map[int64]int, error) {
+	out := make(map[int64]int, len(userIDs))
+	for _, userID := range userIDs {
+		out[userID] = a.boxID
+	}
+	return out, nil
 }
 
 func (a loginCodeFixedBoxAllocator) CurrentBoxID(context.Context, int64) (int, error) {

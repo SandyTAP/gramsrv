@@ -40,7 +40,7 @@ func NewService(stories store.StoryStore, opts ...Option) *Service {
 	return s
 }
 
-func (s *Service) CreateStory(ctx context.Context, userID int64, req domain.StoryCreateRequest) (domain.StoryCreateResult, error) {
+func (s *Service) CreateStory(ctx context.Context, userID int64, req domain.StoryCreateRequest, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryCreateResult, error) {
 	if err := s.authorizeStoryOwner(ctx, userID, req.Owner, storyOwnerPost); err != nil {
 		return domain.StoryCreateResult{}, err
 	}
@@ -57,7 +57,7 @@ func (s *Service) CreateStory(ctx context.Context, userID int64, req domain.Stor
 	if s == nil || s.stories == nil {
 		return domain.StoryCreateResult{}, domain.ErrStoryNotFound
 	}
-	return s.stories.CreateStory(ctx, req)
+	return s.stories.CreateStoryWithDelivery(ctx, userID, req, effects)
 }
 
 // UpsertStory stores a story snapshot. It is used by tests now and by the
@@ -190,7 +190,7 @@ func (s *Service) GetPeerStoryProjections(ctx context.Context, viewerUserID int6
 	return s.stories.GetPeerStoryProjections(ctx, viewerUserID, peers, now)
 }
 
-func (s *Service) ReadStories(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int) (domain.StoryReadResult, error) {
+func (s *Service) ReadStories(ctx context.Context, viewerUserID int64, peer domain.Peer, maxID, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryReadResult, error) {
 	if maxID <= 0 || maxID > domain.MaxStoryID {
 		return domain.StoryReadResult{}, domain.ErrStoryIDInvalid
 	}
@@ -207,7 +207,7 @@ func (s *Service) ReadStories(ctx context.Context, viewerUserID int64, peer doma
 	if maxID > recent[0].MaxID {
 		maxID = recent[0].MaxID
 	}
-	return s.stories.MarkRead(ctx, viewerUserID, peer, maxID, date)
+	return s.stories.MarkReadWithDelivery(ctx, viewerUserID, peer, maxID, date, effects)
 }
 
 func (s *Service) IncrementViews(ctx context.Context, viewerUserID int64, peer domain.Peer, ids []int, date int) (int, error) {
@@ -221,14 +221,14 @@ func (s *Service) IncrementViews(ctx context.Context, viewerUserID int64, peer d
 	return s.stories.IncrementViews(ctx, viewerUserID, peer, ids, date)
 }
 
-func (s *Service) SendReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int) (domain.StoryReactionResult, error) {
+func (s *Service) SendReaction(ctx context.Context, viewerUserID int64, peer domain.Peer, storyID int, reaction *domain.MessageReaction, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryReactionResult, error) {
 	if storyID <= 0 || storyID > domain.MaxStoryID {
 		return domain.StoryReactionResult{}, domain.ErrStoryIDInvalid
 	}
 	if s == nil || s.stories == nil || viewerUserID == 0 {
 		return domain.StoryReactionResult{ViewerID: viewerUserID, Peer: peer, StoryID: storyID, Reaction: reaction, Date: date}, nil
 	}
-	return s.stories.SetReaction(ctx, viewerUserID, peer, storyID, reaction, date)
+	return s.stories.SetReactionWithDelivery(ctx, viewerUserID, peer, storyID, reaction, date, effects)
 }
 
 func (s *Service) GetStoryViewsList(ctx context.Context, viewerUserID int64, req domain.StoryViewListRequest) (domain.StoryViewList, error) {
@@ -307,7 +307,7 @@ func (s *Service) ListStoryViewerIDs(ctx context.Context, userID int64, owner do
 	return s.stories.ListStoryViewerIDs(ctx, owner, storyID, clampStoryPrivacyFanoutLimit(limit))
 }
 
-func (s *Service) EditStory(ctx context.Context, userID int64, req domain.StoryEditRequest) (domain.StoryEditResult, error) {
+func (s *Service) EditStory(ctx context.Context, userID int64, req domain.StoryEditRequest, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryEditResult, error) {
 	if err := s.authorizeStoryOwner(ctx, userID, req.Owner, storyOwnerEdit); err != nil {
 		return domain.StoryEditResult{}, err
 	}
@@ -323,10 +323,10 @@ func (s *Service) EditStory(ctx context.Context, userID int64, req domain.StoryE
 	if s == nil || s.stories == nil {
 		return domain.StoryEditResult{}, domain.ErrStoryNotFound
 	}
-	return s.stories.EditStory(ctx, req)
+	return s.stories.EditStoryWithDelivery(ctx, userID, req, effects)
 }
 
-func (s *Service) DeleteStories(ctx context.Context, userID int64, peer domain.Peer, ids []int, date int) (domain.StoryMutationResult, error) {
+func (s *Service) DeleteStories(ctx context.Context, userID int64, peer domain.Peer, ids []int, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryMutationResult, error) {
 	if err := s.authorizeStoryOwner(ctx, userID, peer, storyOwnerDelete); err != nil {
 		return domain.StoryMutationResult{}, err
 	}
@@ -337,10 +337,10 @@ func (s *Service) DeleteStories(ctx context.Context, userID int64, peer domain.P
 	if s == nil || s.stories == nil {
 		return domain.StoryMutationResult{Peer: peer, IDs: append([]int(nil), ids...)}, nil
 	}
-	return s.stories.DeleteStories(ctx, peer, ids, date)
+	return s.stories.DeleteStoriesWithDelivery(ctx, userID, peer, ids, date, effects)
 }
 
-func (s *Service) TogglePinned(ctx context.Context, userID int64, peer domain.Peer, ids []int, pinned bool, date int) (domain.StoryMutationResult, error) {
+func (s *Service) TogglePinned(ctx context.Context, userID int64, peer domain.Peer, ids []int, pinned bool, date int, effects store.DeliveryEffectsBuilder[store.StoryMutationSnapshot]) (domain.StoryMutationResult, error) {
 	if err := s.authorizeStoryOwner(ctx, userID, peer, storyOwnerPin); err != nil {
 		return domain.StoryMutationResult{}, err
 	}
@@ -351,7 +351,7 @@ func (s *Service) TogglePinned(ctx context.Context, userID int64, peer domain.Pe
 	if s == nil || s.stories == nil {
 		return domain.StoryMutationResult{Peer: peer, IDs: append([]int(nil), ids...)}, nil
 	}
-	return s.stories.TogglePinned(ctx, peer, ids, pinned, date)
+	return s.stories.TogglePinnedWithDelivery(ctx, userID, peer, ids, pinned, date, effects)
 }
 
 func (s *Service) TogglePinnedToTop(ctx context.Context, userID int64, peer domain.Peer, ids []int) error {

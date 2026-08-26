@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"unicode/utf8"
 )
 
@@ -65,13 +66,6 @@ func (r *Router) onChannelsDeleteParticipantHistory(ctx context.Context, req *tg
 	})
 	if err != nil {
 		return nil, channelDeleteErr(err)
-	}
-	if res.Event.Pts != 0 {
-		// deleteParticipantHistory fan-out 异步化（设计 Phase 0），与已异步的 messages.deleteMessages
-		// 频道分支对齐。builder 纯 viewer 无关（仅 delete update + ChatMin，无 Users），无需预热。
-		r.enqueueChannelFanout(ctx, channelFanoutMembers, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-			return r.channelDeleteMessagesUpdates(viewerUserID, res.Channel, res.Event)
-		})
 	}
 	return &tg.MessagesAffectedHistory{Pts: res.Channel.Pts, PtsCount: res.Event.PtsCount, Offset: res.Offset}, nil
 }
@@ -344,9 +338,6 @@ func (r *Router) onChannelsInviteToChannel(ctx context.Context, req *tg.Channels
 	r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
 	cache := newViewerPeerCache(r)
 	updates := r.channelOperationUpdatesWithPeerCache(ctx, userID, res, cache)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdatesWithPeerCache(ctx, viewerUserID, res, cache)
-	})
 	return &tg.MessagesInvitedUsers{Updates: updates, MissingInvitees: missingInvitees}, nil
 }
 
@@ -371,19 +362,14 @@ func (r *Router) onChannelsJoinChannel(ctx context.Context, input tg.InputChanne
 			return nil, channelInvalidErr(domain.ErrChannelPrivate)
 		}
 	}
-	res, err := r.deps.Channels.JoinChannel(ctx, userID, ref.ID, int(r.clock.Now().Unix()))
+	date := int(r.clock.Now().Unix())
+	res, err := r.deps.Channels.JoinChannel(ctx, userID, ref.ID, date, r.pendingJoinDeliveryEffects(ctx, userID, date))
 	if err != nil {
-		if errors.Is(err, domain.ErrInviteRequestSent) && res.Channel.ID != 0 {
-			r.pushPendingJoinRequestsToAdmins(ctx, res.Channel)
-		}
 		return nil, channelInviteErr(err)
 	}
 	r.invalidateChannelFullBotInfoCacheForChannel(res.Channel.ID)
 	r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
 	updates := r.channelOperationUpdates(ctx, userID, res)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, res)
-	})
 	// Layer 227：channels.joinChannel 返回 messages.ChatInviteJoinResult；
 	// 正常加入即 chatInviteJoinResultOk 包裹本次操作的 updates。
 	return &tg.MessagesChatInviteJoinResultOk{Updates: updates}, nil
@@ -407,38 +393,8 @@ func (r *Router) onChannelsLeaveChannel(ctx context.Context, input tg.InputChann
 	}
 	r.invalidateChannelFullBotInfoCacheForChannel(res.Channel.ID)
 	r.removeOnlineChannelMemberships(res.Channel.ID, userID)
-	r.recordChannelStateForUser(ctx, userID, res.Channel.ID, true)
 	updates := r.channelOperationUpdates(ctx, userID, res)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, res)
-	})
 	return updates, nil
-}
-
-// recordChannelStateForUser 给该账号写一条 durable channel 状态事件：
-// 离线设备经 difference 收到 updateChannel 后重拉 channel，发现 left/
-// forbidden 并移除会话；excludeCurrent 时当前 session 由 RPC 响应承担。
-func (r *Router) recordChannelStateForUser(ctx context.Context, userID, channelID int64, excludeCurrent bool) {
-	if r.deps.Updates == nil || userID == 0 || channelID == 0 {
-		return
-	}
-	authKeyID := [8]byte{}
-	excludeSessionID := int64(0)
-	if excludeCurrent {
-		authKeyID, _ = AuthKeyIDFrom(ctx)
-		excludeSessionID, _ = SessionIDFrom(ctx)
-	}
-	excludeAuthKeyID := [8]byte{}
-	if excludeCurrent {
-		excludeAuthKeyID = rawAuthKeyIDForOrigin(ctx)
-	}
-	event, _, err := r.deps.Updates.RecordChannelState(ctx, authKeyID, userID, channelID, excludeAuthKeyID, excludeSessionID)
-	if err != nil {
-		return
-	}
-	if excludeCurrent {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	}
 }
 
 func (r *Router) onChannelsEditAdmin(ctx context.Context, req *tg.ChannelsEditAdminRequest) (tg.UpdatesClass, error) {
@@ -460,21 +416,18 @@ func (r *Router) onChannelsEditAdmin(ctx context.Context, req *tg.ChannelsEditAd
 		if err != nil {
 			return nil, err
 		}
-		view, changed, err := r.deps.Communities.EditAdmin(ctx, userID, domain.CommunityEditAdminRequest{
+		date := int(r.clock.Now().Unix())
+		view, _, err := r.deps.Communities.EditAdmin(ctx, userID, domain.CommunityEditAdminRequest{
 			CommunityID: community.Community.ID,
 			UserID:      target.ID,
 			Rights:      domainChannelAdminRights(req.AdminRights),
 			Rank:        req.Rank,
-			Date:        int(r.clock.Now().Unix()),
-		})
+			Date:        date,
+		}, r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, communityErr(err)
 		}
-		updates := r.communityMutationUpdates(ctx, userID, view, changed)
-		if changed && target.ID != userID {
-			r.refreshAndPushCommunityState(ctx, target.ID, community.Community.ID, community.Community)
-		}
-		return updates, nil
+		return r.communityUpdates(view), nil
 	}
 	if r.deps.Channels == nil {
 		return nil, channelInvalidErr(domain.ErrChannelInvalid)
@@ -503,9 +456,6 @@ func (r *Router) onChannelsEditAdmin(ctx context.Context, req *tg.ChannelsEditAd
 	}
 	cache := newViewerPeerCache(r)
 	updates := r.channelParticipantUpdatesWithPeerCache(ctx, userID, userID, res.Channel, res.Previous, res.Participant, res.Date, cache)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, userID, res.Channel, res.Previous, res.Participant, res.Date, cache)
-	})
 	return updates, nil
 }
 
@@ -544,9 +494,6 @@ func (r *Router) onChannelsEditBanned(ctx context.Context, req *tg.ChannelsEditB
 	} else {
 		r.removeOnlineChannelMemberships(res.Channel.ID, res.Participant.UserID)
 	}
-	if res.Participant.Status == domain.ChannelMemberKicked && res.Previous.Status == domain.ChannelMemberActive {
-		r.recordChannelStateForUser(ctx, res.Participant.UserID, res.Channel.ID, false)
-	}
 	cache := newViewerPeerCache(r)
 	build := func(viewerUserID int64) *tg.Updates {
 		updates := r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, userID, res.Channel, res.Previous, res.Participant, res.Date, cache)
@@ -560,7 +507,6 @@ func (r *Router) onChannelsEditBanned(ctx context.Context, req *tg.ChannelsEditB
 		return updates
 	}
 	updates := build(userID)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, build)
 	return updates, nil
 }
 
@@ -647,13 +593,14 @@ func (r *Router) onMessagesHideChatJoinRequest(ctx context.Context, req *tg.Mess
 	if len(targets) == 0 {
 		return nil, userIDInvalidErr()
 	}
+	date := int(r.clock.Now().Unix())
 	res, err := r.deps.Channels.HideChatJoinRequest(ctx, userID, domain.HideChannelJoinRequestRequest{
 		UserID:       userID,
 		ChannelID:    view.Channel.ID,
 		TargetUserID: targets[0],
 		Approved:     req.Approved,
-		Date:         int(r.clock.Now().Unix()),
-	})
+		Date:         date,
+	}, r.pendingJoinDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return nil, channelInviteErr(err)
 	}
@@ -661,10 +608,6 @@ func (r *Router) onMessagesHideChatJoinRequest(ctx context.Context, req *tg.Mess
 	r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
 	updates := r.channelOperationUpdates(ctx, userID, res)
 	r.appendPendingJoinRequestsUpdate(ctx, userID, updates, res.Channel)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, res)
-	})
-	r.pushPendingJoinRequestsToAdmins(ctx, res.Channel)
 	return updates, nil
 }
 
@@ -684,14 +627,15 @@ func (r *Router) onMessagesHideAllChatJoinRequests(ctx context.Context, req *tg.
 			return nil, err
 		}
 	}
+	date := int(r.clock.Now().Unix())
 	res, err := r.deps.Channels.HideAllChatJoinRequests(ctx, userID, domain.HideChannelJoinRequestsRequest{
 		UserID:    userID,
 		ChannelID: view.Channel.ID,
 		Hash:      hash,
 		Approved:  req.Approved,
 		Limit:     domain.MaxChannelHideJoinRequests,
-		Date:      int(r.clock.Now().Unix()),
-	})
+		Date:      date,
+	}, r.pendingJoinDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return nil, channelInviteErr(err)
 	}
@@ -699,10 +643,6 @@ func (r *Router) onMessagesHideAllChatJoinRequests(ctx context.Context, req *tg.
 	r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
 	updates := r.channelOperationUpdates(ctx, userID, res)
 	r.appendPendingJoinRequestsUpdate(ctx, userID, updates, res.Channel)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, res)
-	})
-	r.pushPendingJoinRequestsToAdmins(ctx, res.Channel)
 	return updates, nil
 }
 
@@ -719,16 +659,51 @@ func (r *Router) pendingJoinRequestsUpdates(ctx context.Context, viewerUserID in
 	if err != nil {
 		return nil
 	}
+	return pendingJoinRequestsUpdatesAt(
+		viewerUserID, channel, pending,
+		r.tgUsersForIDs(ctx, viewerUserID, pending.RecentRequesters),
+		int(r.clock.Now().Unix()),
+	)
+}
+
+func pendingJoinRequestsUpdatesAt(viewerUserID int64, channel domain.Channel, pending domain.ChannelPendingJoinRequests, users []tg.UserClass, date int) *tg.Updates {
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdatePendingJoinRequests{
 			Peer:             &tg.PeerChannel{ChannelID: channel.ID},
 			RequestsPending:  pending.Count,
 			RecentRequesters: pending.RecentRequesters,
 		}},
-		Users: r.tgUsersForIDs(ctx, viewerUserID, pending.RecentRequesters),
+		Users: users,
 		Chats: []tg.ChatClass{tgChannelChatMin(viewerUserID, channel)},
-		Date:  int(r.clock.Now().Unix()),
+		Date:  date,
 		Seq:   0,
+	}
+}
+
+func (r *Router) pendingJoinDeliveryEffects(ctx context.Context, requestUserID int64, date int) store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot store.ChannelPendingJoinDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, 0, len(snapshot.Targets))
+		for _, target := range snapshot.Targets {
+			updates := pendingJoinRequestsUpdatesAt(
+				target.TargetUserID, target.Channel, target.Pending,
+				tgUsersForViewer(target.TargetUserID, target.RecentUsers), date,
+			)
+			payload, err := encodeDeliveryUpdate(updates)
+			if err != nil {
+				return nil, err
+			}
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if target.TargetUserID == requestUserID {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: target.TargetUserID, ExcludeAuthKeyID: authKeyID,
+				ExcludeSessionID: sessionID, Payload: payload,
+				RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
 	}
 }
 
@@ -742,31 +717,6 @@ func (r *Router) appendPendingJoinRequestsUpdate(ctx context.Context, viewerUser
 	}
 	updates.Updates = append(updates.Updates, pending.Updates...)
 	updates.Users = append(updates.Users, pending.Users...)
-}
-
-func (r *Router) pushPendingJoinRequestsToAdmins(ctx context.Context, channel domain.Channel) {
-	if r.deps.Channels == nil || r.deps.Sessions == nil || channel.ID == 0 {
-		return
-	}
-	adminIDs, err := r.deps.Channels.InviteAdminMemberIDs(ctx, channel.ID, domain.MaxChannelRealtimeFanout)
-	if err != nil || len(adminIDs) == 0 {
-		adminIDs = []int64{channel.CreatorUserID}
-	}
-	seen := make(map[int64]struct{}, len(adminIDs))
-	for _, adminID := range adminIDs {
-		if adminID == 0 {
-			continue
-		}
-		if _, ok := seen[adminID]; ok {
-			continue
-		}
-		seen[adminID] = struct{}{}
-		updates := r.pendingJoinRequestsUpdates(ctx, adminID, channel)
-		if updates == nil {
-			continue
-		}
-		r.pushUserUpdates(ctx, adminID, updates)
-	}
 }
 
 func (r *Router) channelParticipantUpdates(ctx context.Context, viewerUserID, actorUserID int64, channel domain.Channel, previous, participant domain.ChannelMember, date int) *tg.Updates {

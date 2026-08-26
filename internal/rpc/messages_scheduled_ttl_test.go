@@ -18,9 +18,11 @@ func TestScheduledMessagesLifecycleUsesScheduledStore(t *testing.T) {
 	alice := domain.User{ID: aliceID, AccessHash: 11, FirstName: "Alice"}
 	bob := domain.User{ID: bobID, AccessHash: 22, FirstName: "Bob"}
 	messages := &scheduledCaptureMessages{captureMessages: &captureMessages{}}
+	outbox := attachCaptureMessagesDeliveryOutbox(messages.captureMessages)
 	r := New(Config{}, Deps{
-		Messages: messages,
-		Users:    mapUsersService{users: map[int64]domain.User{aliceID: alice, bobID: bob}},
+		Messages:       messages,
+		Users:          mapUsersService{users: map[int64]domain.User{aliceID: alice, bobID: bob}},
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
 	ctx := WithUserID(context.Background(), aliceID)
 
@@ -100,6 +102,9 @@ func TestScheduledMessagesLifecycleUsesScheduledStore(t *testing.T) {
 	if sentIDs, ok := deleteUpdate.GetSentMessages(); !ok || len(sentIDs) != 1 || sentIDs[0] != messages.markedSentID {
 		t.Fatalf("delete scheduled sent ids = %+v ok %v, want sent message id %d", sentIDs, ok, messages.markedSentID)
 	}
+	if items := outbox.Snapshot(); len(items) != 3 {
+		t.Fatalf("scheduled lifecycle durable deliveries = %+v, want create/edit/sent", items)
+	}
 }
 
 func TestScheduledMessageEditDateOnlyPreservesContent(t *testing.T) {
@@ -125,7 +130,8 @@ func TestScheduledMessageEditDateOnlyPreservesContent(t *testing.T) {
 			State:        "pending",
 		}},
 	}
-	r := New(Config{}, Deps{Messages: messages}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
+	outbox := attachCaptureMessagesDeliveryOutbox(messages.captureMessages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
 	ctx := WithUserID(context.Background(), aliceID)
 
 	editReq := &tg.MessagesEditMessageRequest{
@@ -146,6 +152,9 @@ func TestScheduledMessageEditDateOnlyPreservesContent(t *testing.T) {
 	editedMessage := updates.(*tg.Updates).Updates[0].(*tg.UpdateNewScheduledMessage).Message.(*tg.Message)
 	if !editedMessage.FromScheduled || editedMessage.Date != int(now+7200) {
 		t.Fatalf("date-only edit update = %#v, want scheduled message at new date", editedMessage)
+	}
+	if items := outbox.Snapshot(); len(items) != 1 || items[0].TargetUserID != aliceID {
+		t.Fatalf("date-only edit durable deliveries = %+v, want one owner delivery", items)
 	}
 }
 
@@ -172,7 +181,8 @@ func TestScheduledMessageEditAllowsEmptyCaptionForMedia(t *testing.T) {
 			State:        "pending",
 		}},
 	}
-	r := New(Config{}, Deps{Messages: messages}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
+	outbox := attachCaptureMessagesDeliveryOutbox(messages.captureMessages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
 	ctx := WithUserID(context.Background(), aliceID)
 
 	editReq := &tg.MessagesEditMessageRequest{
@@ -190,9 +200,12 @@ func TestScheduledMessageEditAllowsEmptyCaptionForMedia(t *testing.T) {
 	if messages.scheduled[0].Message != "" || messages.scheduled[0].Media != media || messages.scheduled[0].ScheduleDate != int(now+7200) {
 		t.Fatalf("scheduled item after empty-caption edit = %+v, want media kept and caption cleared", messages.scheduled[0])
 	}
+	if items := outbox.Snapshot(); len(items) != 1 || items[0].TargetUserID != aliceID {
+		t.Fatalf("empty-caption edit durable deliveries = %+v, want one owner delivery", items)
+	}
 }
 
-func TestMessagesSetHistoryTTLPushesPrivatePeerBothSides(t *testing.T) {
+func TestMessagesSetHistoryTTLDurablyQueuesPrivatePeerBothSides(t *testing.T) {
 	const (
 		aliceID = int64(1000000001)
 		bobID   = int64(1000000002)
@@ -200,9 +213,10 @@ func TestMessagesSetHistoryTTLPushesPrivatePeerBothSides(t *testing.T) {
 		period  = 86400
 	)
 	messages := &ttlCaptureMessages{captureMessages: &captureMessages{}}
-	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Messages: messages, Sessions: sessions}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
-	ctx := WithSessionID(WithUserID(context.Background(), aliceID), 77)
+	outbox := attachCaptureMessagesDeliveryOutbox(messages.captureMessages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
+	authKeyID := [8]byte{7, 7}
+	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), aliceID), authKeyID), 77)
 
 	out, err := r.onMessagesSetHistoryTTL(ctx, &tg.MessagesSetHistoryTTLRequest{
 		Peer:   &tg.InputPeerUser{UserID: bobID, AccessHash: 22},
@@ -221,12 +235,38 @@ func TestMessagesSetHistoryTTLPushesPrivatePeerBothSides(t *testing.T) {
 	if ttl, ok := selfUpdate.GetTTLPeriod(); !ok || ttl != period {
 		t.Fatalf("self ttl period = %d ok %v, want %d", ttl, ok, period)
 	}
-	if got := sessions.pushedUserIDs(); len(got) != 2 || got[0] != aliceID || got[1] != bobID {
-		t.Fatalf("pushed users = %+v, want alice then bob", got)
+	items := outbox.Snapshot()
+	if len(items) != 2 {
+		t.Fatalf("ttl durable deliveries = %+v, want alice and bob", items)
 	}
-	peerUpdates := sessions.snapshot().message.(*tg.Updates)
+	aliceItem := requireDeliveryItemForUser(t, items, aliceID)
+	if aliceItem.ExcludeAuthKeyID != authKeyID || aliceItem.ExcludeSessionID != 77 {
+		t.Fatalf("alice ttl delivery exclusion = %x/%d, want %x/77", aliceItem.ExcludeAuthKeyID, aliceItem.ExcludeSessionID, authKeyID)
+	}
+	bobItem := requireDeliveryItemForUser(t, items, bobID)
+	if bobItem.ExcludeAuthKeyID != ([8]byte{}) || bobItem.ExcludeSessionID != 0 {
+		t.Fatalf("bob ttl delivery exclusion = %x/%d, want none", bobItem.ExcludeAuthKeyID, bobItem.ExcludeSessionID)
+	}
+	peerUpdates := requireDeliveryUpdates(t, bobItem)
 	peerUpdate := peerUpdates.Updates[0].(*tg.UpdatePeerHistoryTTL)
 	if peer, ok := peerUpdate.Peer.(*tg.PeerUser); !ok || peer.UserID != aliceID {
 		t.Fatalf("peer ttl update peer = %#v, want alice", peerUpdate.Peer)
+	}
+}
+
+func TestScheduledAndTTLRPCsFailClosedWithoutMessagesService(t *testing.T) {
+	const userID int64 = 1000000001
+	r := New(Config{}, Deps{}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1_700_005_000, 0)})
+	ctx := WithUserID(context.Background(), userID)
+
+	if ok, err := r.onMessagesSetDefaultHistoryTTL(ctx, 3600); err == nil || ok {
+		t.Fatalf("set default TTL without messages service = ok %v err %v, want fail closed", ok, err)
+	}
+	updates, err := r.onMessagesDeleteScheduledMessages(ctx, &tg.MessagesDeleteScheduledMessagesRequest{
+		Peer: &tg.InputPeerUser{UserID: 1000000002, AccessHash: 22},
+		ID:   []int{41},
+	})
+	if err == nil || updates != nil {
+		t.Fatalf("delete scheduled without messages service = updates %#v err %v, want no fabricated update", updates, err)
 	}
 }

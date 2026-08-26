@@ -434,11 +434,11 @@ func (s *MessageStore) ReadHistory(ctx context.Context, req domain.ReadHistoryRe
 	if err := appendUserUpdateEvent(ctx, tx, qtx, req.OwnerUserID, res.InboxEvent); err != nil {
 		return res, fmt.Errorf("append read inbox event: %w", err)
 	}
-	if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+	if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 		TargetUserID:     req.OwnerUserID,
 		Pts:              int32(readerPts),
 		EventType:        string(domain.UpdateEventReadHistoryInbox),
-		ExcludeAuthKeyID: authKeyIDToInt64(req.OriginAuthKeyID),
+		ExcludeAuthKeyID: req.OriginAuthKeyID,
 		ExcludeSessionID: req.OriginSessionID,
 	}); err != nil {
 		return res, fmt.Errorf("enqueue read inbox dispatch: %w", err)
@@ -469,11 +469,11 @@ func (s *MessageStore) ReadHistory(ctx context.Context, req domain.ReadHistoryRe
 			if err := appendUserUpdateEvent(ctx, tx, qtx, candidate.SenderOwnerUserID, res.OutboxEvent); err != nil {
 				return res, fmt.Errorf("append read outbox event: %w", err)
 			}
-			if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 				TargetUserID:     candidate.SenderOwnerUserID,
 				Pts:              int32(senderPts),
 				EventType:        string(domain.UpdateEventReadHistoryOutbox),
-				ExcludeAuthKeyID: 0,
+				ExcludeAuthKeyID: [8]byte{},
 				ExcludeSessionID: 0,
 			}); err != nil {
 				return res, fmt.Errorf("enqueue read outbox dispatch: %w", err)

@@ -14,7 +14,36 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/observability/dbtrace"
+	storepkg "telesrv/internal/store"
 )
+
+func botVerifierSettingsIntegrationDelivery(snapshot storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+	effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Audience))
+	for _, viewerID := range snapshot.Audience {
+		effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: viewerID, Payload: []byte{0x7f, 0x42},
+			RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return effects, nil
+}
+
+// Test-only adapters retain the existing invariant matrix without compiling a
+// delivery-free verifier mutation into production.
+func (s *BotVerificationStore) UpsertBotVerifierSettings(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+	mutation, err := s.UpsertBotVerifierSettingsWithDelivery(ctx, settings, botVerifierSettingsIntegrationDelivery)
+	return mutation.Settings, err
+}
+
+func (s *BotVerificationStore) SetBotVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+	mutation, err := s.SetBotVerifierEnabledWithDelivery(ctx, botID, enabled, botVerifierSettingsIntegrationDelivery)
+	return mutation.Settings, err
+}
+
+func (s *BotVerificationStore) DeleteBotVerifierSettings(ctx context.Context, botID int64) (bool, error) {
+	mutation, err := s.DeleteBotVerifierSettingsWithDelivery(ctx, botID, botVerifierSettingsIntegrationDelivery)
+	return mutation.Changed, err
+}
 
 // botVerificationTestUser inserts a throwaway user row and registers the cleanup
 // for everything the third-party verification tables may hang off it. Marks
@@ -145,6 +174,270 @@ func botVerificationUserPeer(id int64) domain.Peer {
 
 func botVerificationChannelPeer(id int64) domain.Peer {
 	return domain.Peer{Type: domain.PeerTypeChannel, ID: id}
+}
+
+func TestBotVerificationUserDeliveryAtomicBoundedPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	insertUser := func(phone string) int64 {
+		t.Helper()
+		var id int64
+		if err := tx.QueryRow(ctx, `
+INSERT INTO users (access_hash, phone, first_name)
+VALUES ($1, $2, 'bot verification delivery test')
+RETURNING id`, time.Now().UnixNano()&0x7fffffffffffffff, phone).Scan(&id); err != nil {
+			t.Fatalf("insert user: %v", err)
+		}
+		return id
+	}
+	prefix := "bv" + randomSuffix(t)
+	deliveryPayload := []byte(prefix)
+	verifierID := insertUser(prefix + "v")
+	targetID := insertUser(prefix + "t")
+	st := NewBotVerificationStore(tx)
+	botVerificationTestVerifier(t, st, verifierID, 990001)
+
+	// Self plus 4,100 distinct contacts proves the SQL freezes a deterministic,
+	// deduplicated set capped at 4,096 before invoking the builder.
+	if _, err := tx.Exec(ctx, `
+WITH viewers AS (
+  INSERT INTO users (access_hash, phone, first_name)
+  SELECT $1::bigint + n, $2::text || n::text, 'bot verification viewer'
+  FROM generate_series(1, 4100) AS n
+  RETURNING id
+)
+INSERT INTO contacts (user_id, contact_user_id)
+SELECT id, $3 FROM viewers`, time.Now().UnixNano()&0x3fffffffffffffff, prefix+"x", targetID); err != nil {
+		t.Fatalf("insert bounded audience: %v", err)
+	}
+
+	observedAudience := 0
+	build := func(snapshot storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		observedAudience = len(snapshot.Audience)
+		if snapshot.User.ID != targetID || observedAudience == 0 || observedAudience > storepkg.MaxBotVerificationUserAudience {
+			return nil, fmt.Errorf("invalid frozen audience: user=%d viewers=%d", snapshot.User.ID, observedAudience)
+		}
+		seen := make(map[int64]struct{}, observedAudience)
+		effects := make([]storepkg.DeliveryEffect, 0, observedAudience)
+		for _, viewerID := range snapshot.Audience {
+			if _, duplicate := seen[viewerID]; duplicate {
+				return nil, fmt.Errorf("duplicate viewer %d", viewerID)
+			}
+			seen[viewerID] = struct{}{}
+			effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+				TargetUserID:   viewerID,
+				Payload:        deliveryPayload,
+				RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
+	}
+	mark := domain.CustomVerification{
+		VerifierBotID: verifierID, Peer: botVerificationUserPeer(targetID),
+		IconDocumentID: 990001, Description: "verified", GrantedByUserID: verifierID,
+	}
+	stored, created, err := st.GrantCustomVerificationWithDelivery(ctx, mark, build)
+	if err != nil || !created {
+		t.Fatalf("grant = %+v/%v/%v", stored, created, err)
+	}
+	if observedAudience != storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("frozen audience = %d, want %d", observedAudience, storepkg.MaxBotVerificationUserAudience)
+	}
+	var outboxCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deliveryPayload).Scan(&outboxCount); err != nil {
+		t.Fatalf("count grant outbox: %v", err)
+	}
+	if outboxCount != storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("grant outbox = %d", outboxCount)
+	}
+
+	// Exact grant replay neither bumps the mark version nor duplicates delivery.
+	replayed, created, err := st.GrantCustomVerificationWithDelivery(ctx, mark, build)
+	if err != nil || created || replayed.Version != stored.Version {
+		t.Fatalf("replayed grant = %+v/%v/%v", replayed, created, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deliveryPayload).Scan(&outboxCount); err != nil || outboxCount != storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("outbox after replay = %d/%v", outboxCount, err)
+	}
+
+	fail := func(storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, errors.New("projection failed")
+	}
+	edited := mark
+	edited.Description = "edited"
+	if _, _, err := st.GrantCustomVerificationWithDelivery(ctx, edited, fail); err == nil {
+		t.Fatal("failed edit returned nil")
+	}
+	current, err := st.CustomVerification(ctx, verifierID, mark.Peer)
+	if err != nil || current.Description != mark.Description || current.Version != stored.Version {
+		t.Fatalf("mark after failed edit = %+v/%v", current, err)
+	}
+	if removed, err := st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, fail); err == nil || removed {
+		t.Fatalf("failed revoke = %v/%v", removed, err)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, mark.Peer); err != nil {
+		t.Fatalf("failed revoke removed mark: %v", err)
+	}
+
+	removed, err := st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, build)
+	if err != nil || !removed {
+		t.Fatalf("revoke = %v/%v", removed, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deliveryPayload).Scan(&outboxCount); err != nil || outboxCount != 2*storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("outbox after revoke = %d/%v", outboxCount, err)
+	}
+	removed, err = st.RevokeCustomVerificationWithDelivery(ctx, verifierID, mark.Peer, build)
+	if err != nil || removed {
+		t.Fatalf("replayed revoke = %v/%v", removed, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deliveryPayload).Scan(&outboxCount); err != nil || outboxCount != 2*storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("outbox after revoke replay = %d/%v", outboxCount, err)
+	}
+
+	filed, err := st.CreateCustomVerificationRequest(ctx,
+		botVerificationTestRequest(verifierID, targetID, mark.Peer, "target"))
+	if err != nil {
+		t.Fatalf("create decision request: %v", err)
+	}
+	apply := func(delivery storepkg.DeliveryEffectsBuilder[storepkg.UserAudienceDeliverySnapshot]) func(context.Context, domain.CustomVerificationRequest) error {
+		return func(callbackCtx context.Context, req domain.CustomVerificationRequest) error {
+			decisionTx, ok := VerificationTxFromContext(callbackCtx)
+			if !ok {
+				return errors.New("decision context carries no transaction")
+			}
+			_, _, err := NewBotVerificationStore(decisionTx).GrantCustomVerificationWithDelivery(callbackCtx, domain.CustomVerification{
+				VerifierBotID: req.VerifierBotID, Peer: req.Peer,
+				IconDocumentID: 990001, Description: "verified", GrantedByUserID: verifierID,
+			}, delivery)
+			return err
+		}
+	}
+	if _, _, err := st.DecideCustomVerificationRequest(ctx, filed.ID, filed.Version,
+		domain.CustomVerificationApproved, "operator", "ok", "", apply(fail)); err == nil {
+		t.Fatal("decision builder failure returned nil")
+	}
+	requestAfterFailure, err := st.CustomVerificationRequest(ctx, filed.ID)
+	if err != nil || requestAfterFailure.Status != domain.CustomVerificationPending || requestAfterFailure.Version != filed.Version {
+		t.Fatalf("request after decision rollback = %+v/%v", requestAfterFailure, err)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, mark.Peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("mark after decision rollback = %v", err)
+	}
+	approved, changed, err := st.DecideCustomVerificationRequest(ctx, filed.ID, filed.Version,
+		domain.CustomVerificationApproved, "operator", "ok", "", apply(build))
+	if err != nil || !changed || approved.Status != domain.CustomVerificationApproved {
+		t.Fatalf("approved decision = %+v/%v/%v", approved, changed, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deliveryPayload).Scan(&outboxCount); err != nil || outboxCount != 3*storepkg.MaxBotVerificationUserAudience {
+		t.Fatalf("outbox after approved decision = %d/%v", outboxCount, err)
+	}
+}
+
+func TestBotVerifierSettingsDeliveryAtomicMixedPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	insertUser := func(phone string) int64 {
+		var id int64
+		if err := tx.QueryRow(ctx, `
+INSERT INTO users (access_hash, phone, first_name)
+VALUES ($1, $2, 'bot verifier settings delivery test')
+RETURNING id`, time.Now().UnixNano()&0x7fffffffffffffff, phone).Scan(&id); err != nil {
+			t.Fatalf("insert user: %v", err)
+		}
+		return id
+	}
+	prefix := "bvs" + randomSuffix(t)
+	verifierID := insertUser(prefix + "v")
+	userID := insertUser(prefix + "u")
+	channelID := verifierID + 9_000_000_000
+	st := NewBotVerificationStore(tx)
+	current := botVerificationTestVerifier(t, st, verifierID, 991001)
+	for _, peer := range []domain.Peer{botVerificationUserPeer(userID), botVerificationChannelPeer(channelID)} {
+		if _, _, err := st.GrantCustomVerification(ctx, domain.CustomVerification{
+			VerifierBotID: verifierID, Peer: peer, IconDocumentID: 991001,
+			Description: "verified", GrantedByUserID: verifierID,
+		}); err != nil {
+			t.Fatalf("seed mark %v: %v", peer, err)
+		}
+	}
+
+	payload := []byte(prefix + "-update")
+	build := func(snapshot storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Audience))
+		for _, viewerID := range snapshot.Audience {
+			effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+				TargetUserID: viewerID, Payload: payload,
+				RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
+	}
+	desired := current
+	desired.CompanyName = "renamed verifier"
+	mutation, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, desired, build)
+	if err != nil || !mutation.Changed || len(mutation.AffectedChannelIDs) != 1 || mutation.AffectedChannelIDs[0] != channelID {
+		t.Fatalf("update mutation = %+v/%v", mutation, err)
+	}
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, payload).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("settings update effects = %d/%v, want verifier + marked user", count, err)
+	}
+
+	// Exact desired-state replay is a no-op even with the now-stale version.
+	replayed, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, desired, build)
+	if err != nil || replayed.Changed || len(replayed.AffectedChannelIDs) != 0 {
+		t.Fatalf("settings replay = %+v/%v", replayed, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, payload).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("effects after replay = %d/%v", count, err)
+	}
+
+	failing := mutation.Settings
+	failing.CompanyName = "must roll back"
+	buildErr := errors.New("projection failed")
+	if _, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, failing, func(storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		return nil, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("failing update = %v", err)
+	}
+	stored, err := st.BotVerifierSettings(ctx, verifierID)
+	if err != nil || stored.CompanyName != mutation.Settings.CompanyName || stored.Version != mutation.Settings.Version {
+		t.Fatalf("settings after rollback = %+v/%v", stored, err)
+	}
+
+	deletePayload := []byte(prefix + "-delete")
+	deleteBuild := func(snapshot storepkg.UserAudienceDeliverySnapshot) ([]storepkg.DeliveryEffect, error) {
+		effects := make([]storepkg.DeliveryEffect, 0, len(snapshot.Audience))
+		for _, viewerID := range snapshot.Audience {
+			effects = append(effects, storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+				TargetUserID: viewerID, Payload: deletePayload,
+				RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
+	}
+	removed, err := st.DeleteBotVerifierSettingsWithDelivery(ctx, verifierID, deleteBuild)
+	if err != nil || !removed.Changed || len(removed.AffectedChannelIDs) != 1 || removed.AffectedChannelIDs[0] != channelID {
+		t.Fatalf("delete mutation = %+v/%v", removed, err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE payload=$1`, deletePayload).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("settings delete effects = %d/%v", count, err)
+	}
+	if _, err := st.CustomVerification(ctx, verifierID, botVerificationUserPeer(userID)); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("user mark survived settings delete: %v", err)
+	}
 }
 
 // botVerificationIconIndex locates an entry in a catalogue listing. The

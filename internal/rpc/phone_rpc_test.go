@@ -63,6 +63,10 @@ func (s *phoneCaptureSessions) PushToUserExceptAuthKeySession(_ context.Context,
 	return 1, nil
 }
 
+func (s *phoneCaptureSessions) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, authKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, _ time.Duration) (int, error) {
+	return s.PushToUserExceptAuthKeySession(ctx, userID, authKeyID, excludeSessionID, t, msg)
+}
+
 func (s *phoneCaptureSessions) PushToUserAuthKey(_ context.Context, userID int64, businessAuthKeyID [8]byte, _ proto.MessageType, msg tg.UpdatesClass) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

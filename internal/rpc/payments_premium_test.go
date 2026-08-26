@@ -13,6 +13,7 @@ import (
 	appaccount "telesrv/internal/app/account"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -42,8 +43,18 @@ func (f *fakePremiumRPCService) IssuePaymentForm(_ context.Context, form domain.
 	form.ID = 99112233
 	return form, nil
 }
-func (f *fakePremiumRPCService) Purchase(_ context.Context, req domain.PremiumPurchaseRequest) (domain.PremiumPurchaseResult, error) {
+func (f *fakePremiumRPCService) PurchaseWithDelivery(_ context.Context, req domain.PremiumPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error) {
 	f.purchase = req
+	// A durable idempotency replay returns the committed result without invoking
+	// the builder or appending a second outbox row.
+	if f.purchaseErr == nil && !f.purchaseResult.Duplicate {
+		if effects == nil {
+			return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
+		}
+		if _, err := effects(f.purchaseResult); err != nil {
+			return domain.PremiumPurchaseResult{}, err
+		}
+	}
 	return f.purchaseResult, f.purchaseErr
 }
 func (f *fakePremiumRPCService) ActiveEntitlements(context.Context, int64, int) ([]domain.PremiumEntitlement, error) {
@@ -52,7 +63,10 @@ func (f *fakePremiumRPCService) ActiveEntitlements(context.Context, int64, int) 
 func (f *fakePremiumRPCService) PurchaseHistory(context.Context, int64, int) ([]domain.PremiumEntitlement, error) {
 	return nil, nil
 }
-func (f *fakePremiumRPCService) SweepExpired(context.Context, int, int) ([]domain.User, error) {
+func (f *fakePremiumRPCService) SweepExpiredWithDelivery(_ context.Context, _ int, _ int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
 	return nil, nil
 }
 func (f *fakePremiumRPCService) Grant(context.Context, domain.PremiumAdminGrantRequest) (domain.PremiumEntitlement, domain.User, error) {

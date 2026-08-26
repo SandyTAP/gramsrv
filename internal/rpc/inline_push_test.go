@@ -24,6 +24,7 @@ func TestInlineBotQueryPublishesRemotePush(t *testing.T) {
 	shared := newTestInlinePushBroker()
 	users := memory.NewUserStore()
 	botStore := memory.NewBotStore(users)
+	botStore.AttachDeliveryDependencies(memory.NewDialogStore(), memory.NewDeliveryOutboxStore())
 	bots := botsapp.NewService(users, botStore, nil)
 	owner, err := users.Create(ctx, domain.User{AccessHash: 9101, Phone: "15550009101", FirstName: "Owner"})
 	if err != nil {
@@ -33,7 +34,7 @@ func TestInlineBotQueryPublishesRemotePush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create peer: %v", err)
 	}
-	bot, _, err := bots.CreateBot(ctx, owner.ID, "Inline Push Bot", "inline_push_bot")
+	bot, _, err := bots.CreateBotWithDelivery(ctx, owner.ID, "Inline Push Bot", "inline_push_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}

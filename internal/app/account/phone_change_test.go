@@ -41,11 +41,21 @@ func (s *trackingPhoneCodeStore) Set(ctx context.Context, hash string, code stor
 	return s.CodeStore.Set(ctx, hash, code, ttl)
 }
 
-func (s *recordingPhoneChangeStore) ChangePhone(ctx context.Context, req domain.PhoneChangeRequest) (domain.PhoneChangeResult, error) {
+func (s *recordingPhoneChangeStore) ChangePhoneWithDelivery(ctx context.Context, req domain.PhoneChangeRequest, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.PhoneChangeResult, error) {
 	s.mu.Lock()
 	s.last = req
 	s.mu.Unlock()
-	return s.inner.ChangePhone(ctx, req)
+	return s.inner.ChangePhoneWithDelivery(ctx, req, effects)
+}
+
+func phoneChangeTestEffects(authKeyID [8]byte, sessionID int64) store.DeliveryEffectsBuilder[store.UserDeliverySnapshot] {
+	return func(snapshot store.UserDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.User.ID, ExcludeAuthKeyID: authKeyID,
+			ExcludeSessionID: sessionID, Payload: []byte{1},
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
 }
 
 func (s *recordingPhoneChangeStore) lastRequest() domain.PhoneChangeRequest {
@@ -58,6 +68,7 @@ func newPhoneChangeFixture(t *testing.T) phoneChangeFixture {
 	t.Helper()
 	ctx := context.Background()
 	users := memory.NewUserStore()
+	users.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
 	auths := memory.NewAuthorizationStore()
 	codes := memory.NewCodeStore()
 	events := memory.NewUpdateEventStore()
@@ -69,7 +80,7 @@ func newPhoneChangeFixture(t *testing.T) phoneChangeFixture {
 	if err := auths.Bind(ctx, domain.Authorization{AuthKeyID: authKeyID, UserID: u.ID, CreatedAt: time.Now().Add(-48 * time.Hour)}); err != nil {
 		t.Fatalf("bind auth: %v", err)
 	}
-	changes := &recordingPhoneChangeStore{inner: memory.NewPhoneChangeStore(users, events)}
+	changes := &recordingPhoneChangeStore{inner: memory.NewPhoneChangeStore(users)}
 	service := NewService(
 		memory.NewPasswordStore(),
 		WithUsers(users),
@@ -100,7 +111,7 @@ func TestPhoneChangeWebhookDeliversRandomScopedCode(t *testing.T) {
 	if err != nil || !found || rec.Channel != store.PhoneCodeChannelSMS || rec.DeliveryID != req.DeliveryID || rec.Code != req.Code {
 		t.Fatalf("record=%+v found=%v err=%v", rec, found, err)
 	}
-	if _, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 78, req.Recipient, hash, req.Code, 1700000000); err != nil {
+	if _, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 78, req.Recipient, hash, req.Code, 1700000000, phoneChangeTestEffects(f.authKeyID, 78)); err != nil {
 		t.Fatalf("ChangePhone: %v", err)
 	}
 }
@@ -143,7 +154,7 @@ func TestPhoneChangeScopesCodeAndPersistsDurableEvent(t *testing.T) {
 	}
 
 	rawAuthKeyID := [8]byte{8, 8, 8, 8}
-	result, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, rawAuthKeyID, 88, "+1 555 001 2002", hash, "12345", 1700000000)
+	result, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, rawAuthKeyID, 88, "+1 555 001 2002", hash, "12345", 1700000000, phoneChangeTestEffects(rawAuthKeyID, 88))
 	if err != nil {
 		t.Fatalf("change phone after session reconnect: %v", err)
 	}
@@ -186,7 +197,7 @@ func TestPhoneChangeRejectsOccupiedAndCrossAuthCode(t *testing.T) {
 	if err := f.auths.Bind(f.ctx, domain.Authorization{AuthKeyID: otherKey, UserID: occupied.ID}); err != nil {
 		t.Fatalf("bind other auth: %v", err)
 	}
-	if _, err := f.service.ChangePhone(f.ctx, occupied.ID, otherKey, otherKey, 99, "15550012004", hash, "12345", 0); !errors.Is(err, domain.ErrPhoneCodeExpired) {
+	if _, err := f.service.ChangePhoneWithDelivery(f.ctx, occupied.ID, otherKey, otherKey, 99, "15550012004", hash, "12345", 0, phoneChangeTestEffects(otherKey, 99)); !errors.Is(err, domain.ErrPhoneCodeExpired) {
 		t.Fatalf("cross-auth change err = %v", err)
 	}
 	if got, found, _ := f.users.ByID(f.ctx, occupied.ID); !found || got.Phone != "15550012003" {
@@ -221,11 +232,11 @@ func TestPhoneChangeWrongCodeExhaustsAttempts(t *testing.T) {
 		t.Fatalf("send code: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 77, "15550012005", hash, "00000", 0); !errors.Is(err, domain.ErrPhoneCodeInvalid) {
+		if _, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 77, "15550012005", hash, "00000", 0, phoneChangeTestEffects(f.authKeyID, 77)); !errors.Is(err, domain.ErrPhoneCodeInvalid) {
 			t.Fatalf("wrong attempt %d err = %v", i+1, err)
 		}
 	}
-	if _, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 77, "15550012005", hash, "12345", 0); !errors.Is(err, domain.ErrPhoneCodeExpired) {
+	if _, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 77, "15550012005", hash, "12345", 0, phoneChangeTestEffects(f.authKeyID, 77)); !errors.Is(err, domain.ErrPhoneCodeExpired) {
 		t.Fatalf("exhausted code err = %v", err)
 	}
 	if got, _, _ := f.users.ByID(f.ctx, f.user.ID); got.Phone != "15550012001" {
@@ -246,10 +257,10 @@ func TestPhoneChangeNewSendInvalidatesPreviousHash(t *testing.T) {
 	if oldHash == newHash {
 		t.Fatalf("hash was not rotated: %q", oldHash)
 	}
-	if _, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 99, "15550012006", oldHash, "12345", 1700000001); !errors.Is(err, domain.ErrPhoneCodeExpired) {
+	if _, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 99, "15550012006", oldHash, "12345", 1700000001, phoneChangeTestEffects(f.authKeyID, 99)); !errors.Is(err, domain.ErrPhoneCodeExpired) {
 		t.Fatalf("old hash replay err = %v", err)
 	}
-	if _, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 99, "15550012006", newHash, "12345", 1700000002); err != nil {
+	if _, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 99, "15550012006", newHash, "12345", 1700000002, phoneChangeTestEffects(f.authKeyID, 99)); err != nil {
 		t.Fatalf("new hash change: %v", err)
 	}
 	events, err := f.events.ListAfter(f.ctx, f.user.ID, 0, 10)
@@ -271,7 +282,7 @@ func TestPhoneChangeConcurrentReplayChangesOnceWithoutPTSEvent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := f.service.ChangePhone(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 88, "15550012007", hash, "12345", 1700000003)
+			_, err := f.service.ChangePhoneWithDelivery(f.ctx, f.user.ID, f.authKeyID, f.authKeyID, 88, "15550012007", hash, "12345", 1700000003, phoneChangeTestEffects(f.authKeyID, 88))
 			errs <- err
 		}()
 	}

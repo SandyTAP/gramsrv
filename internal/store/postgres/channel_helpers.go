@@ -1012,17 +1012,3 @@ func adminLogLikePattern(query string) string {
 	query = strings.ReplaceAll(query, `_`, `\_`)
 	return "%" + query + "%"
 }
-
-func (a pgChannelIDAllocator) NextChannelID(ctx context.Context) (int64, error) {
-	current, err := a.CurrentChannelID(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return current + 1, nil
-}
-
-func (a pgChannelIDAllocator) CurrentChannelID(ctx context.Context) (int64, error) {
-	var id int64
-	err := a.db.QueryRow(ctx, `SELECT COALESCE(MAX(id), 0) FROM channels`).Scan(&id)
-	return id, err
-}

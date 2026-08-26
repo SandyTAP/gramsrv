@@ -161,11 +161,11 @@ WHERE owner_user_id = $1 AND box_id = $2`, box.OwnerUserID, box.BoxID, int32(pts
 			if err := appendUserUpdateEvent(ctx, tx, qtx, msg.OwnerUserID, event); err != nil {
 				return res, fmt.Errorf("append web page event: %w", err)
 			}
-			if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 				TargetUserID:     msg.OwnerUserID,
 				Pts:              int32(pts),
 				EventType:        string(domain.UpdateEventWebPage),
-				ExcludeAuthKeyID: authKeyIDToInt64(req.OriginAuthKeyID),
+				ExcludeAuthKeyID: req.OriginAuthKeyID,
 				ExcludeSessionID: req.OriginSessionID,
 			}); err != nil {
 				return res, fmt.Errorf("enqueue web page dispatch: %w", err)
@@ -257,11 +257,11 @@ WHERE message_sender_id = $1 AND private_message_id = $2`, messageSenderID, targ
 			dispatchAuthKeyID = req.OriginAuthKeyID
 			dispatchSessionID = req.OriginSessionID
 		}
-		if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 			TargetUserID:     msg.OwnerUserID,
 			Pts:              int32(pts),
 			EventType:        string(domain.UpdateEventEditMessage),
-			ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+			ExcludeAuthKeyID: dispatchAuthKeyID,
 			ExcludeSessionID: dispatchSessionID,
 		}); err != nil {
 			return res, fmt.Errorf("enqueue edit message dispatch: %w", err)

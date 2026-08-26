@@ -56,6 +56,8 @@ func TestLoginRegisterFlow(t *testing.T) {
 
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
 	// seed hash 必须高于 help service 的代码默认 hash（低于默认值的 store 行会被
@@ -83,14 +85,15 @@ func TestLoginRegisterFlow(t *testing.T) {
 		t.Fatalf("seed langpack: %v", err)
 	}
 	deps := rpc.Deps{
-		Auth:     auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code),
-		Account:  account.NewService(memory.NewPasswordStore()),
-		Help:     help.NewService(helpStore, helpStore),
-		Users:    users.NewService(userStore),
-		Updates:  updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts: contacts.NewService(memory.NewContactStore()),
-		Dialogs:  dialogs.NewService(memory.NewDialogStore()),
-		LangPack: langpack.NewService(langPackStore),
+		Auth:           auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code),
+		Account:        account.NewService(memory.NewPasswordStore()),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:       contacts.NewService(memory.NewContactStore()),
+		Dialogs:        dialogs.NewService(memory.NewDialogStore()),
+		LangPack:       langpack.NewService(langPackStore),
+		DeliveryOutbox: deliveryOutbox,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	srv := New(Options{Logger: zaptest.NewLogger(t), DC: dc, RSAKey: rsaKey, AuthKeys: authKeyStore, LayerRPC: router})
@@ -312,6 +315,8 @@ func TestPrivateMessageRoundTripFlow(t *testing.T) {
 
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
 	langPackStore := memory.NewLangPackStore()
@@ -319,16 +324,17 @@ func TestPrivateMessageRoundTripFlow(t *testing.T) {
 	messageStore := memory.NewMessageStore(dialogStore)
 	activeSessions := NewSessionManager(zaptest.NewLogger(t).Named("sessions"))
 	deps := rpc.Deps{
-		Auth:     auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code),
-		Account:  account.NewService(memory.NewPasswordStore()),
-		Help:     help.NewService(helpStore, helpStore),
-		Users:    users.NewService(userStore),
-		Updates:  updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts: contacts.NewService(memory.NewContactStore()),
-		Dialogs:  dialogs.NewService(dialogStore),
-		Messages: messageapp.NewService(messageStore, dialogStore),
-		LangPack: langpack.NewService(langPackStore),
-		Sessions: activeSessions,
+		Auth:           auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code),
+		Account:        account.NewService(memory.NewPasswordStore()),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:       contacts.NewService(memory.NewContactStore()),
+		Dialogs:        dialogs.NewService(dialogStore),
+		Messages:       messageapp.NewService(messageStore, dialogStore),
+		LangPack:       langpack.NewService(langPackStore),
+		Sessions:       activeSessions,
+		DeliveryOutbox: deliveryOutbox,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	srv := New(Options{Logger: zaptest.NewLogger(t), DC: dc, RSAKey: rsaKey, AuthKeys: authKeyStore, LayerRPC: router, ActiveSessions: activeSessions})

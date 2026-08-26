@@ -850,9 +850,9 @@ WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, box.OwnerUserID, box.BoxI
 				dispatchAuthKeyID = req.OriginAuthKeyID
 				dispatchSessionID = req.OriginSessionID
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID: msg.OwnerUserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
-				ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID), ExcludeSessionID: dispatchSessionID,
+				ExcludeAuthKeyID: dispatchAuthKeyID, ExcludeSessionID: dispatchSessionID,
 			}); err != nil {
 				return nil, fmt.Errorf("enqueue star gift source edit: %w", err)
 			}

@@ -201,29 +201,78 @@ LIMIT $5`, userID, floor, safePts, cutoff, limit)
 	for i, event := range events {
 		pts[i] = int32(event.pts)
 	}
-	// Every outbox mutation follows user_heads→outbox. Retention may remove a pending or leased
-	// task after the client has already confirmed its durable event; lock the lane head first so
-	// it cannot deadlock a lease-expiry claim/completion. No head means these events have no online
-	// task and the durable prefix can still be pruned safely.
-	var lockedDispatchUserID int64
+	// Finalization and retention share the same blocking lane->item lock order.
+	// Producers never update an active lane, so appends remain independent and a
+	// subsequent READ COMMITTED statement below observes any concurrent successor.
+	var laneFence int64
 	err = tx.QueryRow(ctx, `
-SELECT target_user_id
-FROM dispatch_outbox_user_heads
-WHERE target_user_id = $1
-FOR UPDATE`, userID).Scan(&lockedDispatchUserID)
+SELECT lease_fence
+FROM dispatch_outbox_lanes
+WHERE stream_id = $1
+FOR UPDATE`, userID).Scan(&laneFence)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("lock retained user update dispatch head: %w", err)
+		return 0, fmt.Errorf("lock retained user update dispatch lane: %w", err)
 	}
-	// A retained durable event can still have a pending/dispatching outbox row (for example a
-	// client confirmed the pts through difference while an online push lease was in flight).
-	// Remove those leases first, in this same transaction. The outbox head trigger promotes the
-	// next user lane row; any worker holding an old attempts token is fenced by MarkDelivered/
-	// MarkFailed returning ErrDispatchLeaseLost after this commit.
+	laneExists := err == nil
+	if laneExists {
+		if _, err := tx.Exec(ctx, `
+UPDATE dispatch_outbox_attempts
+SET resolution = COALESCE(resolution, 'terminal_resync'),
+    finalized_at = now(),
+    finalization_outcome = 'terminal_resync',
+    last_error = CASE WHEN last_error = '' THEN 'durable event retained after client confirmation' ELSE last_error END
+WHERE stream_id = $1 AND lease_fence = $2
+  AND item_id IN (
+    SELECT id FROM dispatch_outbox
+    WHERE target_user_id = $1 AND pts = ANY($3::int[])
+  )
+  AND finalized_at IS NULL`, userID, laneFence, pts); err != nil {
+			return 0, fmt.Errorf("finalize retained user update attempts: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `
 DELETE FROM dispatch_outbox
 WHERE target_user_id = $1
   AND pts = ANY($2::int[])`, userID, pts); err != nil {
 		return 0, fmt.Errorf("delete retained user update dispatch outbox: %w", err)
+	}
+	if laneExists {
+		var successorID, successorPTS int64
+		err := tx.QueryRow(ctx, `
+SELECT id, pts
+FROM dispatch_outbox
+WHERE target_user_id = $1
+ORDER BY pts, id
+LIMIT 1`, userID).Scan(&successorID, &successorPTS)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			if laneFence < 0 {
+				return 0, fmt.Errorf("retained user update lane has negative fence %d for user %d", laneFence, userID)
+			}
+			state := newDurableOutboxState(tx, dispatchOutboxStateConfig, defaultOutboxLease)
+			if err := state.deleteEmptyLaneAndRestoreAppendRace(ctx, tx, outboxLaneRow{
+				streamID: userID, leaseFence: uint64(laneFence),
+			}); err != nil {
+				return 0, err
+			}
+		case err != nil:
+			return 0, fmt.Errorf("load retained user update successor: %w", err)
+		default:
+			if laneFence == int64(^uint64(0)>>1) {
+				return 0, fmt.Errorf("retained user update lane fence exhausted for user %d", userID)
+			}
+			if _, err := tx.Exec(ctx, `
+UPDATE dispatch_outbox_lanes
+SET head_item_id = $2, head_sequence = $3,
+    state = 'ready', ready_at = now(),
+    lease_fence = nextval('dispatch_outbox_lease_fence_seq'),
+    lease_owner = '', lease_until = NULL,
+    window_end_item_id = NULL, window_end_sequence = NULL,
+    last_error = '', updated_at = now()
+WHERE stream_id = $1`, userID, successorID, successorPTS); err != nil {
+				return 0, fmt.Errorf("promote retained user update successor: %w", err)
+			}
+		}
 	}
 	tag, err := tx.Exec(ctx, `
 DELETE FROM user_update_events

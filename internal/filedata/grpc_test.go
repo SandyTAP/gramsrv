@@ -98,13 +98,13 @@ func TestGRPCRemoteRejectsWrongBearerToken(t *testing.T) {
 	}
 }
 
-func startBufconnFileData(t *testing.T, token string, service DataService, blobs filesapp.BlobBackend, uploadParts filesapp.UploadPartBackend) (*GRPCRemote, func()) {
+func startBufconnFileData(t testing.TB, token string, service DataService, blobs filesapp.BlobBackend, uploadParts filesapp.UploadPartBackend) (*GRPCRemote, func()) {
 	t.Helper()
 	listener, stopServer := startBufconnFileDataServer(t, token, service, blobs, uploadParts)
 	remote, conn, err := DialGRPCRemote(context.Background(), GRPCClientConfig{
 		Resolver:       bufconnResolver{listener: listener},
 		Token:          token,
-		RequestTimeout: time.Second,
+		RequestTimeout: 10 * time.Second,
 	})
 	if err != nil {
 		stopServer()
@@ -116,7 +116,7 @@ func startBufconnFileData(t *testing.T, token string, service DataService, blobs
 	}
 }
 
-func startBufconnFileDataServer(t *testing.T, token string, service DataService, blobs filesapp.BlobBackend, uploadParts filesapp.UploadPartBackend) (*bufconn.Listener, func()) {
+func startBufconnFileDataServer(t testing.TB, token string, service DataService, blobs filesapp.BlobBackend, uploadParts filesapp.UploadPartBackend) (*bufconn.Listener, func()) {
 	t.Helper()
 	listener := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer(

@@ -18,7 +18,7 @@ import (
 func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
 	const userID int64 = domain.UserIDSequenceBase
 	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), userID), [8]byte{1}), 77)
-	r, updates := newChatAutomationTestRouter(t)
+	r, quickReplyEvents := newChatAutomationTestRouter(t)
 	verify := newFakeBotVerifications()
 	r.deps.BotVerifications = verify
 	userStore := memory.NewUserStore()
@@ -76,8 +76,9 @@ func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
 	if !sawMessageID || !sawNew || messageID == 0 || shortcutID == 0 {
 		t.Fatalf("updates = %#v, want updateMessageID and updateNewQuickReply", result.Updates)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventNewQuickReply {
-		t.Fatalf("recorded events = %+v", updates.events)
+	recorded, err := quickReplyEvents.ListAfter(ctx, userID, 0, 10)
+	if err != nil || len(recorded) != 1 || recorded[0].Type != domain.UpdateEventNewQuickReply || recorded[0].Pts != 1 {
+		t.Fatalf("recorded events = %+v err=%v", recorded, err)
 	}
 
 	list, err := r.onMessagesGetQuickReplies(ctx, 0)
@@ -87,6 +88,28 @@ func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
 	replies, ok := list.(*tg.MessagesQuickReplies)
 	if !ok || len(replies.QuickReplies) != 1 || len(replies.Messages) != 1 {
 		t.Fatalf("quick replies = %#v", list)
+	}
+	if ok, err := r.onMessagesEditQuickReplyShortcut(ctx, &tg.MessagesEditQuickReplyShortcutRequest{
+		ShortcutID: shortcutID, Shortcut: "hello",
+	}); err != nil || !ok {
+		t.Fatalf("same-name quick reply rename: ok=%v err=%v", ok, err)
+	}
+	recorded, _ = quickReplyEvents.ListAfter(ctx, userID, 0, 10)
+	if len(recorded) != 1 {
+		t.Fatalf("no-op rename appended events: %+v", recorded)
+	}
+	if ok, err := r.onMessagesEditQuickReplyShortcut(ctx, &tg.MessagesEditQuickReplyShortcutRequest{
+		ShortcutID: shortcutID, Shortcut: "renamed",
+	}); err != nil || !ok {
+		t.Fatalf("rename quick reply: ok=%v err=%v", ok, err)
+	}
+	if ok, err := r.onMessagesReorderQuickReplies(ctx, []int{shortcutID}); err != nil || !ok {
+		t.Fatalf("no-op quick reply reorder: ok=%v err=%v", ok, err)
+	}
+	recorded, _ = quickReplyEvents.ListAfter(ctx, userID, 0, 10)
+	if len(recorded) != 2 || recorded[1].Pts != 2 || recorded[1].Type != domain.UpdateEventQuickReplies ||
+		len(recorded[1].QuickReplies) != 1 || recorded[1].QuickReplies[0].Shortcut != "renamed" {
+		t.Fatalf("rename/reorder durable events = %+v", recorded)
 	}
 
 	quickReplyMessages, err := r.onMessagesGetQuickReplyMessages(ctx, &tg.MessagesGetQuickReplyMessagesRequest{
@@ -122,6 +145,18 @@ func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
 	}
 	if !sawDelete {
 		t.Fatalf("delete updates = %#v, want updateDeleteQuickReplyMessages", deleteUpdates.Updates)
+	}
+	recorded, _ = quickReplyEvents.ListAfter(ctx, userID, 0, 10)
+	if len(recorded) != 3 || recorded[2].Pts != 3 || recorded[2].Type != domain.UpdateEventDeleteQuickReplyMessages ||
+		len(recorded[2].MessageIDs) != 1 || recorded[2].MessageIDs[0] != messageID {
+		t.Fatalf("delete message durable event = %+v", recorded)
+	}
+	if ok, err := r.onMessagesDeleteQuickReplyShortcut(ctx, shortcutID); err != nil || !ok {
+		t.Fatalf("delete quick reply shortcut: ok=%v err=%v", ok, err)
+	}
+	recorded, _ = quickReplyEvents.ListAfter(ctx, userID, 0, 10)
+	if len(recorded) != 4 || recorded[3].Pts != 4 || recorded[3].Type != domain.UpdateEventDeleteQuickReply || recorded[3].MaxID != shortcutID {
+		t.Fatalf("delete shortcut durable event = %+v", recorded)
 	}
 }
 
@@ -300,12 +335,14 @@ func TestConnectedBusinessBotDefaultsMissingRightsToReply(t *testing.T) {
 	}
 }
 
-func newChatAutomationTestRouter(t *testing.T) (*Router, *captureUpdates) {
+func newChatAutomationTestRouter(t *testing.T) (*Router, *memory.UpdateEventStore) {
 	t.Helper()
 	store := memory.NewPasswordStore()
+	events := memory.NewUpdateEventStore()
+	store.AttachUpdateEventStore(events)
 	updates := &captureUpdates{state: domain.UpdateState{Pts: 10, Date: 1700000000}}
 	return New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
 		Account: accountapp.NewService(store, accountapp.WithBusinessAutomation(store)),
 		Updates: updates,
-	}, zaptest.NewLogger(t), clock.System), updates
+	}, zaptest.NewLogger(t), clock.System), events
 }

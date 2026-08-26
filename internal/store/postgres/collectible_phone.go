@@ -92,9 +92,12 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`, id, string(kind), from, to, currency,
 	return nil
 }
 
-func (s *CollectiblePhoneStore) MintCollectiblePhone(ctx context.Context, req domain.MintCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error) {
+func (s *CollectiblePhoneStore) MintCollectiblePhoneWithDelivery(ctx context.Context, req domain.MintCollectiblePhoneRequest, effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CollectiblePhone{}, false, fmt.Errorf("collectible phone store is not configured")
+	}
+	if effects == nil {
+		return domain.CollectiblePhone{}, false, store.ErrDeliveryOutboxRequired
 	}
 	req.Phone, req.Actor, req.Reason, req.CommandKey = normalizePhoneCommand(req.Phone, req.Actor, req.Reason, req.CommandKey)
 	if req.Tier == "" {
@@ -154,15 +157,21 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$4,0,1,now(),now()) RETURNING `+collectibl
 		if err := insertCollectiblePhoneTransfer(ctx, tx, out.ID, domain.CollectibleUsernameKindMint, 0, req.OwnerUserID, req.Currency, req.Amount, req.Actor, req.Reason, req.CommandKey); err != nil {
 			return err
 		}
+		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, out, []int64{out.OwnerUserID}, effects); err != nil {
+			return err
+		}
 		created = true
 		return nil
 	})
 	return out, created, err
 }
 
-func (s *CollectiblePhoneStore) UpdateCollectiblePhonePrice(ctx context.Context, req domain.UpdateCollectiblePhonePriceRequest) (domain.CollectiblePhone, bool, error) {
+func (s *CollectiblePhoneStore) UpdateCollectiblePhonePriceWithDelivery(ctx context.Context, req domain.UpdateCollectiblePhonePriceRequest, effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CollectiblePhone{}, false, fmt.Errorf("collectible phone store is not configured")
+	}
+	if effects == nil {
+		return domain.CollectiblePhone{}, false, store.ErrDeliveryOutboxRequired
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
@@ -192,13 +201,19 @@ WHERE id=$1 RETURNING `+collectiblePhoneColumns, a.ID, req.Currency, req.Amount,
 		if err != nil {
 			return err
 		}
+		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, out, []int64{out.OwnerUserID}, effects); err != nil {
+			return err
+		}
 		changed = true
 		return nil
 	})
 	return out, changed, err
 }
 
-func (s *CollectiblePhoneStore) TransferCollectiblePhone(ctx context.Context, req domain.TransferCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error) {
+func (s *CollectiblePhoneStore) TransferCollectiblePhoneWithDelivery(ctx context.Context, req domain.TransferCollectiblePhoneRequest, effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error) {
+	if effects == nil {
+		return domain.CollectiblePhone{}, false, store.ErrDeliveryOutboxRequired
+	}
 	req.Phone, req.Actor, req.Reason, req.CommandKey = normalizePhoneCommand(req.Phone, req.Actor, req.Reason, req.CommandKey)
 	if err := req.Validate(); err != nil {
 		return domain.CollectiblePhone{}, false, err
@@ -242,13 +257,19 @@ WHERE id=$1 RETURNING `+collectiblePhoneColumns, a.ID, req.ToUserID, original))
 		if err := insertCollectiblePhoneTransfer(ctx, tx, a.ID, domain.CollectibleUsernameKindTransfer, a.OwnerUserID, req.ToUserID, "", 0, req.Actor, req.Reason, req.CommandKey); err != nil {
 			return err
 		}
+		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, out, []int64{a.OwnerUserID, out.OwnerUserID}, effects); err != nil {
+			return err
+		}
 		changed = true
 		return nil
 	})
 	return out, changed, err
 }
 
-func (s *CollectiblePhoneStore) RevokeCollectiblePhone(ctx context.Context, req domain.RevokeCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error) {
+func (s *CollectiblePhoneStore) RevokeCollectiblePhoneWithDelivery(ctx context.Context, req domain.RevokeCollectiblePhoneRequest, effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error) {
+	if effects == nil {
+		return domain.CollectiblePhone{}, false, store.ErrDeliveryOutboxRequired
+	}
 	req.Phone, req.Actor, req.Reason, req.CommandKey = normalizePhoneCommand(req.Phone, req.Actor, req.Reason, req.CommandKey)
 	if err := req.Validate(); err != nil {
 		return domain.CollectiblePhone{}, false, err
@@ -287,22 +308,74 @@ version=version+1, updated_at=now() WHERE id=$1 RETURNING `+collectiblePhoneColu
 		if err := insertCollectiblePhoneTransfer(ctx, tx, a.ID, kind, a.OwnerUserID, 0, "", 0, req.Actor, req.Reason, req.CommandKey); err != nil {
 			return err
 		}
+		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, out, []int64{a.OwnerUserID}, effects); err != nil {
+			return err
+		}
 		changed = true
 		return nil
 	})
 	return out, changed, err
 }
 
-func (s *CollectiblePhoneStore) DeleteCollectiblePhone(ctx context.Context, req domain.DeleteCollectiblePhoneRequest) (bool, error) {
+func (s *CollectiblePhoneStore) DeleteCollectiblePhoneWithDelivery(ctx context.Context, req domain.DeleteCollectiblePhoneRequest, effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (bool, error) {
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
 	req.Phone, req.Actor, req.Reason, req.CommandKey = normalizePhoneCommand(req.Phone, req.Actor, req.Reason, req.CommandKey)
 	if err := req.Validate(); err != nil {
 		return false, err
 	}
-	tag, err := s.db.Exec(ctx, `DELETE FROM collectible_phones WHERE id=(SELECT id FROM collectible_phones WHERE phone=$1 ORDER BY id DESC LIMIT 1)`, req.Phone)
+	deleted := false
+	err := withTx(ctx, s.db, "delete collectible phone with delivery", func(tx pgx.Tx) error {
+		asset, err := scanCollectiblePhone(tx.QueryRow(ctx, `SELECT `+collectiblePhoneColumns+` FROM collectible_phones WHERE phone=$1 ORDER BY id DESC LIMIT 1 FOR UPDATE`, req.Phone))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM collectible_phones WHERE id=$1`, asset.ID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("delete collectible phone lost row lock")
+		}
+		if err := applyCollectiblePhoneDeliveryTx(ctx, tx, asset, []int64{asset.OwnerUserID}, effects); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
 	if err != nil {
 		return false, fmt.Errorf("delete collectible phone: %w", err)
 	}
-	return tag.RowsAffected() > 0, nil
+	return deleted, nil
+}
+
+func applyCollectiblePhoneDeliveryTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	asset domain.CollectiblePhone,
+	userIDs []int64,
+	effects store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot],
+) error {
+	users, err := userAudienceSnapshots(ctx, tx, userIDs, maxModerationFlagAudience)
+	if err != nil {
+		return err
+	}
+	if len(users) == 0 {
+		return nil
+	}
+	snapshot := store.CollectiblePhoneDeliverySnapshot{Asset: asset, Users: users}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return fmt.Errorf("build collectible phone delivery: %w", err)
+	}
+	if err := store.ValidateCollectiblePhoneDeliveryEffects(snapshot, intents); err != nil {
+		return err
+	}
+	return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
 }
 
 func (s *CollectiblePhoneStore) CollectiblePhone(ctx context.Context, phone string) (domain.CollectiblePhone, error) {

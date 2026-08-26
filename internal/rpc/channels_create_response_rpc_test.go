@@ -70,14 +70,8 @@ func TestChannelsCreateChannelResponseCarriesTdlibMessageMappingOnlyForCaller(t 
 				t.Fatalf("refresh = %#v, want updateChannel", updates.Updates[2])
 			}
 
-			pushed, ok := sessions.lastUserPush().(*tg.Updates)
-			if !ok || len(pushed.Updates) != 2 {
-				t.Fatalf("fan-out = %T %+v, want create message and channel refresh only", sessions.lastUserPush(), sessions.lastUserPush())
-			}
-			for _, update := range pushed.Updates {
-				if _, ok := update.(*tg.UpdateMessageID); ok {
-					t.Fatalf("response-only updateMessageID leaked into fan-out: %+v", pushed.Updates)
-				}
+			if pushed := sessions.lastUserPush(); pushed != nil {
+				t.Fatalf("Core directly pushed committed channel_pts mutation: %T %+v", pushed, pushed)
 			}
 		})
 	}

@@ -19,8 +19,10 @@ import (
 func TestGroupBotRPCShape(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
-	botStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	botStore := memory.NewBotStore(users)
+	outbox := memory.NewDeliveryOutboxStore()
+	botStore.AttachDeliveryDependencies(dialogs, outbox)
 	messages := memory.NewMessageStore(dialogs)
 	bots := botsapp.NewService(users, botStore, messages)
 	channelStore := memory.NewChannelStore()
@@ -35,7 +37,7 @@ func TestGroupBotRPCShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create friend: %v", err)
 	}
-	bot, _, err := bots.CreateBot(ctx, owner.ID, "Group Bot", "group_shape_bot")
+	bot, _, err := bots.CreateBotWithDelivery(ctx, owner.ID, "Group Bot", "group_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -44,10 +46,12 @@ func TestGroupBotRPCShape(t *testing.T) {
 	}
 
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    appusers.NewService(users),
-		Channels: channels,
-		Bots:     bots,
+		Users:          appusers.NewService(users),
+		Channels:       channels,
+		Bots:           bots,
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), clock.System)
+	bots.SetRouterHooks(r)
 	ownerCtx := WithUserID(ctx, owner.ID)
 	created, err := r.onMessagesCreateChat(ownerCtx, &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -136,6 +140,7 @@ func TestFullChannelBotInfoCacheCachesEmptyResult(t *testing.T) {
 	users := memory.NewUserStore()
 	botStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messages := memory.NewMessageStore(dialogs)
 	bots := botsapp.NewService(users, botStore, messages)
 	channelStore := memory.NewChannelStore()
@@ -190,6 +195,7 @@ func TestTGUsersForIDsUsesBatchBotProfiles(t *testing.T) {
 	users := memory.NewUserStore()
 	botStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messages := memory.NewMessageStore(dialogs)
 	baseBots := botsapp.NewService(users, botStore, messages)
 	bots := &countingBatchBotsService{Service: baseBots}
@@ -198,11 +204,11 @@ func TestTGUsersForIDsUsesBatchBotProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	botA, _, err := baseBots.CreateBot(ctx, owner.ID, "Batch Bot A", "batcha_bot")
+	botA, _, err := baseBots.CreateBotWithDelivery(ctx, owner.ID, "Batch Bot A", "batcha_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot A: %v", err)
 	}
-	botB, _, err := baseBots.CreateBot(ctx, owner.ID, "Batch Bot B", "batchb_bot")
+	botB, _, err := baseBots.CreateBotWithDelivery(ctx, owner.ID, "Batch Bot B", "batchb_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot B: %v", err)
 	}

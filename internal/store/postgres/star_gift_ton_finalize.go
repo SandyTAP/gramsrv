@@ -95,7 +95,10 @@ func (s *StarGiftTONFinalizerStore) FinalizeTONExport(ctx context.Context, final
 	}
 	var out domain.StarGiftTONFinalizationResult
 	err = withTx(ctx, s.db, "finalize TON star gift export", func(tx pgx.Tx) error {
-		if err := lockUsersForUpdate(ctx, tx, lockScope.UserIDs...); err != nil {
+		if err := lockUserStarGiftProjectionScope(ctx, tx, lockScope.Projection); err != nil {
+			if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+				return domain.ErrStarGiftTONExportStateConflict
+			}
 			return err
 		}
 		if err := lockStarGiftProfiles(ctx, tx, domain.Peer{Type: domain.PeerTypeUser, ID: lockScope.OwnerUserID}); err != nil {
@@ -129,14 +132,7 @@ func (s *StarGiftTONFinalizerStore) FinalizeTONExport(ctx context.Context, final
 		saved, found, err := lockSavedStarGiftByUniqueID(ctx, tx, export.UniqueGiftID)
 		if err != nil || !found || saved.ID != lockScope.SavedGiftID ||
 			saved.Owner != (domain.Peer{Type: domain.PeerTypeUser, ID: export.OwnerUserID}) ||
-			!saved.LifecycleStatus.Live() {
-			return domain.ErrStarGiftTONExportStateConflict
-		}
-		lockedUserIDs, err := tonFinalizationMessageUserIDs(ctx, tx, saved.Owner.ID, saved.ID, saved.MsgID, saved.UpgradeMsgID)
-		if err != nil {
-			return err
-		}
-		if !equalTONUserIDs(lockedUserIDs, lockScope.UserIDs) {
+			!saved.LifecycleStatus.Live() || !lockScope.Projection.matches(saved) {
 			return domain.ErrStarGiftTONExportStateConflict
 		}
 		unique, found, err := NewStarGiftStore(tx).UniqueByID(ctx, export.UniqueGiftID)
@@ -172,7 +168,8 @@ func (s *StarGiftTONFinalizerStore) FinalizeTONExport(ctx context.Context, final
 		unique.ExternalizationPending = false
 		unique.CraftChancePermille = 0
 		unique.ResellAmount = nil
-		if _, err := s.lifecycle.retireUserStarGiftMessagesTx(ctx, tx, saved, unique, finalization.FinalizedAt); err != nil {
+		if _, err := s.lifecycle.retireUserStarGiftMessagesTx(ctx, tx, saved, unique,
+			lockScope.Projection, finalization.FinalizedAt); err != nil {
 			return err
 		}
 		if err := updateStarGiftResaleProjection(ctx, tx, unique.GiftID); err != nil {
@@ -481,7 +478,7 @@ type tonFinalizeLockScope struct {
 	UniqueGiftID int64
 	OwnerUserID  int64
 	SavedGiftID  int64
-	UserIDs      []int64
+	Projection   userStarGiftProjectionLockScope
 }
 
 func loadTONFinalizeLockScope(ctx context.Context, db sqlcgen.DBTX, jobID int64) (tonFinalizeLockScope, error) {
@@ -498,57 +495,11 @@ WHERE j.id=$1`, jobID).Scan(&scope.ExportID, &scope.UniqueGiftID, &scope.OwnerUs
 	if err != nil {
 		return tonFinalizeLockScope{}, err
 	}
-	scope.UserIDs, err = tonFinalizationMessageUserIDs(ctx, db, scope.OwnerUserID, scope.SavedGiftID, msgID, upgradeMsgID)
+	scope.Projection, err = loadUserStarGiftProjectionLockScope(ctx, db, scope.OwnerUserID, scope.SavedGiftID, msgID, upgradeMsgID)
 	if err != nil {
 		return tonFinalizeLockScope{}, err
 	}
 	return scope, nil
-}
-
-func tonFinalizationMessageUserIDs(ctx context.Context, db sqlcgen.DBTX, ownerUserID, savedGiftID int64, msgID, upgradeMsgID int) ([]int64, error) {
-	userIDs := []int64{ownerUserID}
-	rows, err := db.Query(ctx, `SELECT DISTINCT m.peer_id
-FROM message_boxes m
-WHERE m.owner_user_id=$1 AND m.peer_type='user' AND m.peer_id>0 AND NOT m.deleted
-  AND (m.box_id=$3 OR m.box_id=$4 OR EXISTS (
-      SELECT 1 FROM star_gift_user_message_refs r
-      WHERE r.owner_user_id=$1 AND r.saved_gift_id=$2 AND r.msg_id=m.box_id
-  ))
-ORDER BY m.peer_id`, ownerUserID, savedGiftID, msgID, upgradeMsgID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var userID int64
-		if err := rows.Scan(&userID); err != nil {
-			return nil, err
-		}
-		userIDs = append(userIDs, userID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
-	deduped := userIDs[:0]
-	for _, userID := range userIDs {
-		if len(deduped) == 0 || deduped[len(deduped)-1] != userID {
-			deduped = append(deduped, userID)
-		}
-	}
-	return deduped, nil
-}
-
-func equalTONUserIDs(a, b []int64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 type tonProfileLockScope struct {

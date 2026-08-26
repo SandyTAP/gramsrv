@@ -12,7 +12,7 @@ func TestBootstrapUpdateJobPostgresSameAuthKeyReconnectTakesOverPendingSession(t
 	pool := testPool(t)
 	ctx := context.Background()
 	user := createLoginCodeDeliveryTestUser(t, ctx, pool, "bootstrap-reconnect")
-	msg, err := NewMessageStore(pool).Create(ctx, domain.Message{
+	msg, err := newTestMessageStore(pool).Create(ctx, domain.Message{
 		OwnerUserID: user.ID,
 		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},
 		From:        domain.Peer{Type: domain.PeerTypeUser, ID: domain.OfficialSystemUserID},

@@ -2,15 +2,17 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // 私聊消息 poll 投票/关闭：消息可见性在本 store 校验，poll 级校验与状态全部
 // 委托共享 PollStore（与 postgres 实现共用 domain 纯函数语义）。
 
-func (s *MessageStore) VoteMessagePoll(_ context.Context, req domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *MessageStore) VoteMessagePoll(ctx context.Context, req domain.VotePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	target, err := s.pollMessageTarget(req.UserID, req.Peer, req.MessageID)
 	if err != nil {
 		return domain.PrivateMessagePollResult{}, err
@@ -18,13 +20,20 @@ func (s *MessageStore) VoteMessagePoll(_ context.Context, req domain.VotePrivate
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
-	if err := s.polls.Vote(target.Media.Poll.ID, req.UserID, req.Options, req.Date); err != nil {
+	pollID := target.Media.Poll.ID
+	previous, existed := s.snapshotPollVote(pollID, req.UserID)
+	if err := s.polls.Vote(pollID, req.UserID, req.Options, req.Date); err != nil {
 		return domain.PrivateMessagePollResult{}, err
 	}
-	return s.privatePollResult(target.UID, target.Media.Poll.ID, req.Date), nil
+	res, err := s.privatePollResultWithEffects(ctx, target.UID, pollID, req.Date, effects)
+	if err != nil {
+		s.restorePollVote(pollID, req.UserID, previous, existed)
+		return domain.PrivateMessagePollResult{}, err
+	}
+	return res, nil
 }
 
-func (s *MessageStore) CloseMessagePoll(_ context.Context, req domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *MessageStore) CloseMessagePoll(ctx context.Context, req domain.ClosePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	target, err := s.pollMessageTarget(req.UserID, req.Peer, req.MessageID)
 	if err != nil {
 		return domain.PrivateMessagePollResult{}, err
@@ -32,10 +41,76 @@ func (s *MessageStore) CloseMessagePoll(_ context.Context, req domain.ClosePriva
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
-	if err := s.polls.Close(target.Media.Poll.ID, req.UserID); err != nil {
+	pollID := target.Media.Poll.ID
+	previous, existed := s.snapshotPollDefinition(pollID)
+	if err := s.polls.Close(pollID, req.UserID); err != nil {
 		return domain.PrivateMessagePollResult{}, err
 	}
-	return s.privatePollResult(target.UID, target.Media.Poll.ID, req.Date), nil
+	res, err := s.privatePollResultWithEffects(ctx, target.UID, pollID, req.Date, effects)
+	if err != nil {
+		s.restorePollDefinition(pollID, previous, existed)
+		return domain.PrivateMessagePollResult{}, err
+	}
+	return res, nil
+}
+
+func (s *MessageStore) privatePollResultWithEffects(ctx context.Context, uid, pollID int64, now int, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
+	if effects == nil {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
+	}
+	out := s.privatePollResult(uid, pollID, now)
+	sort.Slice(out.Messages, func(i, j int) bool { return out.Messages[i].OwnerUserID < out.Messages[j].OwnerUserID })
+	intents, err := effects(out)
+	if err != nil {
+		return domain.PrivateMessagePollResult{}, err
+	}
+	if len(intents) == 0 && len(out.Messages) > 0 {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.RLock()
+	outbox := s.deliveryOutbox
+	s.mu.RUnlock()
+	if _, err := applyDeliveryEffects(ctx, intents, outbox, nil); err != nil {
+		return domain.PrivateMessagePollResult{}, err
+	}
+	return out, nil
+}
+
+func (s *MessageStore) snapshotPollVote(pollID, userID int64) (domain.PollVote, bool) {
+	s.polls.mu.RLock()
+	defer s.polls.mu.RUnlock()
+	vote, ok := s.polls.votes[pollID][userID]
+	return clonePollVote(vote), ok
+}
+
+func (s *MessageStore) restorePollVote(pollID, userID int64, vote domain.PollVote, existed bool) {
+	s.polls.mu.Lock()
+	defer s.polls.mu.Unlock()
+	if !existed {
+		delete(s.polls.votes[pollID], userID)
+		return
+	}
+	if s.polls.votes[pollID] == nil {
+		s.polls.votes[pollID] = make(map[int64]domain.PollVote)
+	}
+	s.polls.votes[pollID][userID] = clonePollVote(vote)
+}
+
+func (s *MessageStore) snapshotPollDefinition(pollID int64) (domain.PollDefinition, bool) {
+	s.polls.mu.RLock()
+	defer s.polls.mu.RUnlock()
+	def, ok := s.polls.polls[pollID]
+	return clonePollDefinition(def), ok
+}
+
+func (s *MessageStore) restorePollDefinition(pollID int64, def domain.PollDefinition, existed bool) {
+	s.polls.mu.Lock()
+	defer s.polls.mu.Unlock()
+	if !existed {
+		delete(s.polls.polls, pollID)
+		return
+	}
+	s.polls.polls[pollID] = clonePollDefinition(def)
 }
 
 // pollMessageTarget 定位 viewer box 中带 poll 的目标消息。

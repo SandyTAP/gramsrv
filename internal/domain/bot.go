@@ -83,6 +83,8 @@ const (
 	MaxBotAboutLen = 120
 	// MaxBotDescriptionLen 是 bot description（"What can this bot do?"）长度上限。
 	MaxBotDescriptionLen = 512
+	// MaxBotLangCodeLen matches the durable bot-info localization key bound.
+	MaxBotLangCodeLen = 64
 	// MaxBotMenuButtonTextLen / MaxBotMenuButtonURLLen 是菜单按钮文本/URL 上限。
 	MaxBotMenuButtonTextLen = 64
 	MaxBotMenuButtonURLLen  = 512
@@ -117,12 +119,23 @@ type BotMenuButton struct {
 // BotInfoUpdate 是 bots.setBotInfo 的部分更新（name→users.first_name、
 // about→users.about、description→bots.description）。各 SetXxx 为 false 时不动该字段。
 type BotInfoUpdate struct {
+	// LangCode selects the localized bot-info row. Empty updates the default
+	// users/bots projection; non-empty updates the exact localization key.
+	LangCode       string
 	SetName        bool
 	Name           string
 	SetAbout       bool
 	About          string
 	SetDescription bool
 	Description    string
+}
+
+// BotInfoValues is the resolved default-or-localized bot-info projection.
+type BotInfoValues struct {
+	LangCode    string
+	Name        string
+	About       string
+	Description string
 }
 
 // BotApp 是 mini app catalog 的一项。一个 bot 可拥有多个 app，ID/access_hash

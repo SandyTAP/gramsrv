@@ -2,8 +2,10 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"github.com/iamxvbaba/td/tg"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // maxHistoryTTLPeriod 限制自毁倒计时上界（366 天）。无上界时客户端可传接近
@@ -17,12 +19,12 @@ func (r *Router) onMessagesGetDefaultHistoryTTL(ctx context.Context) (*tg.Defaul
 	if err != nil {
 		return nil, internalErr()
 	}
-	period := 0
-	if ttlSvc, ok := r.deps.Messages.(historyTTLMessagesService); r.deps.Messages != nil && ok {
-		period, err = ttlSvc.DefaultHistoryTTL(ctx, userID)
-		if err != nil {
-			return nil, internalErr()
-		}
+	if r.deps.Messages == nil {
+		return nil, internalErr()
+	}
+	period, err := r.deps.Messages.DefaultHistoryTTL(ctx, userID)
+	if err != nil {
+		return nil, internalErr()
 	}
 	return &tg.DefaultHistoryTTL{Period: period}, nil
 }
@@ -35,10 +37,11 @@ func (r *Router) onMessagesSetDefaultHistoryTTL(ctx context.Context, period int)
 	if period < 0 || period > maxHistoryTTLPeriod {
 		return false, ttlPeriodInvalidErr()
 	}
-	if ttlSvc, ok := r.deps.Messages.(historyTTLMessagesService); r.deps.Messages != nil && ok {
-		if err := ttlSvc.SetDefaultHistoryTTL(ctx, userID, period); err != nil {
-			return false, internalErr()
-		}
+	if r.deps.Messages == nil {
+		return false, internalErr()
+	}
+	if err := r.deps.Messages.SetDefaultHistoryTTL(ctx, userID, period); err != nil {
+		return false, internalErr()
 	}
 	return true, nil
 }
@@ -55,39 +58,75 @@ func (r *Router) onMessagesSetHistoryTTL(ctx context.Context, req *tg.MessagesSe
 	if err != nil {
 		return nil, err
 	}
+	if err := r.requireAccountDelivery(userID, "messages.setHistoryTTL"); err != nil {
+		return nil, err
+	}
+	date := int(r.clock.Now().Unix())
 	switch peer.Type {
 	case domain.PeerTypeUser:
-		if ttlSvc, ok := r.deps.Messages.(historyTTLMessagesService); r.deps.Messages != nil && ok {
-			if err := ttlSvc.SetPrivateHistoryTTL(ctx, userID, peer, req.Period); err != nil {
-				return nil, internalErr()
-			}
+		if r.deps.Messages == nil {
+			return nil, internalErr()
+		}
+		if err := r.deps.Messages.SetPrivateHistoryTTL(ctx, userID, peer, req.Period,
+			privateHistoryTTLDeliveryEffects(ctx, userID, date)); err != nil {
+			return nil, internalErr()
 		}
 	case domain.PeerTypeChannel:
 		ttlSvc, ok := r.deps.Channels.(channelHistoryTTLService)
 		if r.deps.Channels == nil || !ok {
 			return nil, channelInvalidErr(domain.ErrChannelInvalid)
 		}
-		channel, recipients, err := ttlSvc.SetHistoryTTL(ctx, userID, peer.ID, req.Period, int(r.clock.Now().Unix()))
+		channel, recipients, err := ttlSvc.SetHistoryTTL(ctx, userID, peer.ID, req.Period, date)
 		if err != nil {
 			return nil, channelInvalidErr(err)
 		}
-		date := int(r.clock.Now().Unix())
 		out := r.peerHistoryTTLUpdates(ctx, userID, peer, req.Peer, req.Period, date)
-		r.pushChannelUpdates(ctx, userID, channel.ID, recipients, func(viewerUserID int64) *tg.Updates {
-			return r.peerHistoryTTLUpdates(ctx, viewerUserID, peer, req.Peer, req.Period, date)
-		})
+		_ = channel
+		_ = recipients // channel_pts event + channel delivery signal own fan-out.
 		return out, nil
 	default:
 		return nil, peerIDInvalidErr()
 	}
-	date := int(r.clock.Now().Unix())
 	out := r.peerHistoryTTLUpdates(ctx, userID, peer, req.Peer, req.Period, date)
-	r.pushUserUpdates(ctx, userID, out)
-	if peer.Type == domain.PeerTypeUser && peer.ID != userID {
-		otherPeer := domain.Peer{Type: domain.PeerTypeUser, ID: userID}
-		r.pushUserUpdates(ctx, peer.ID, r.peerHistoryTTLUpdates(ctx, peer.ID, otherPeer, nil, req.Period, date))
-	}
 	return out, nil
+}
+
+func privateHistoryTTLDeliveryEffects(ctx context.Context, requestUserID int64, date int) store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(res domain.PrivateHistoryTTLResult) ([]store.DeliveryEffect, error) {
+		owners := []struct {
+			userID int64
+			peer   domain.Peer
+		}{{res.OwnerUserID, res.Peer}}
+		if res.Peer.ID != res.OwnerUserID {
+			owners = append(owners, struct {
+				userID int64
+				peer   domain.Peer
+			}{res.Peer.ID, domain.Peer{Type: domain.PeerTypeUser, ID: res.OwnerUserID}})
+		}
+		effects := make([]store.DeliveryEffect, 0, len(owners))
+		for _, owner := range owners {
+			update := &tg.UpdatePeerHistoryTTL{Peer: tgPeer(owner.peer)}
+			if res.Period > 0 {
+				update.SetTTLPeriod(res.Period)
+			}
+			payload, err := encodeDeliveryUpdate(&tg.Updates{
+				Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{}, Chats: []tg.ChatClass{}, Date: date, Seq: 0,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("encode private history ttl delivery for user %d: %w", owner.userID, err)
+			}
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if owner.userID == requestUserID {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: owner.userID, ExcludeAuthKeyID: authKeyID, ExcludeSessionID: sessionID,
+				Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
+	}
 }
 
 func (r *Router) peerHistoryTTLUpdates(ctx context.Context, viewerUserID int64, peer domain.Peer, inputPeer tg.InputPeerClass, period int, date int) *tg.Updates {

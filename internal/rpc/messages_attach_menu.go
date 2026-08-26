@@ -7,6 +7,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesGetAttachMenuBots(ctx context.Context, hash int64) (tg.AttachMenuBotsClass, error) {
@@ -85,7 +86,10 @@ func (r *Router) onMessagesToggleBotInAttachMenu(ctx context.Context, req *tg.Me
 	} else if !found {
 		return false, botInvalidErr()
 	}
-	prev, found, err := r.deps.Bots.GetAttachMenuState(ctx, userID, target.ID)
+	if err := r.requireAccountDelivery(userID, "messages.toggleBotInAttachMenu"); err != nil {
+		return false, err
+	}
+	prev, _, err := r.deps.Bots.GetAttachMenuState(ctx, userID, target.ID)
 	if err != nil {
 		return false, internalErr()
 	}
@@ -95,28 +99,33 @@ func (r *Router) onMessagesToggleBotInAttachMenu(ctx context.Context, req *tg.Me
 		Enabled:      req.Enabled,
 		WriteAllowed: prev.WriteAllowed || req.WriteAllowed,
 	}
-	if _, err := r.deps.Bots.SetAttachMenuState(ctx, next); err != nil {
-		return false, botInvalidErr()
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateAttachMenuBots{}},
+		Date:    int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	effects := func(domain.BotAttachMenuState) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+	if _, err := r.deps.Bots.SetAttachMenuState(ctx, next, effects); err != nil {
+		return false, internalErr()
 	}
 	if req.WriteAllowed && !prev.WriteAllowed {
 		if _, err := r.deps.Bots.AllowSendMessage(ctx, userID, target.ID, true); err != nil {
 			return false, botInvalidErr()
 		}
-		res, err := r.sendBotAllowedServiceMessageWith(ctx, userID, target.ID, domain.MessageBotAllowedAction{AttachMenu: true})
+		_, err := r.sendBotAllowedServiceMessageWith(ctx, userID, target.ID, domain.MessageBotAllowedAction{AttachMenu: true})
 		if err != nil {
 			return false, internalErr()
 		}
-		if !res.Duplicate {
-			senderUsers := r.usersForMessageUpdate(ctx, userID, res.SenderMessage)
-			senderChats := r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
-			r.pushUserMessage(ctx, userID, "push attach menu bot allowed", tgPrivateMessageUpdates(res.SenderEvent, res.SenderMessage, 0, false, senderUsers, senderChats))
-		}
-	}
-	if !found || prev.Enabled != next.Enabled || prev.WriteAllowed != next.WriteAllowed {
-		r.pushUserMessageTransient(ctx, userID, "push attach menu bots changed", &tg.Updates{
-			Updates: []tg.UpdateClass{&tg.UpdateAttachMenuBots{}},
-			Date:    int(r.clock.Now().Unix()),
-		})
+		// SendPrivateText already commits update_event + dispatch_outbox for the
+		// service message. No Core session push is allowed here.
 	}
 	return true, nil
 }

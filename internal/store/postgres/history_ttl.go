@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *MessageStore) GetPrivateHistoryTTL(ctx context.Context, ownerUserID int64, peer domain.Peer) (int, error) {
@@ -18,12 +19,15 @@ func (s *MessageStore) GetPrivateHistoryTTL(ctx context.Context, ownerUserID int
 	return privateHistoryTTLPeriod(ctx, s.db, ownerUserID, peer.ID)
 }
 
-func (s *MessageStore) SetPrivateHistoryTTL(ctx context.Context, ownerUserID int64, peer domain.Peer, period int) error {
+func (s *MessageStore) SetPrivateHistoryTTL(ctx context.Context, ownerUserID int64, peer domain.Peer, period int, effects store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult]) error {
 	if ownerUserID == 0 || peer.Type != domain.PeerTypeUser || peer.ID == 0 {
 		return fmt.Errorf("set private history ttl: invalid peer")
 	}
 	if period < 0 {
 		return fmt.Errorf("set private history ttl: invalid period")
+	}
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
 	return withTx(ctx, s.db, "set private history ttl", func(tx pgx.Tx) error {
 		if err := lockUsersForUpdate(ctx, tx, ownerUserID, peer.ID); err != nil {
@@ -36,6 +40,20 @@ func (s *MessageStore) SetPrivateHistoryTTL(ctx context.Context, ownerUserID int
 			if err := upsertPrivateDialogTTL(ctx, tx, peer.ID, ownerUserID, period); err != nil {
 				return err
 			}
+		}
+		intents, err := effects(domain.PrivateHistoryTTLResult{OwnerUserID: ownerUserID, Peer: peer, Period: period})
+		if err != nil {
+			return fmt.Errorf("build private history ttl delivery effects: %w", err)
+		}
+		want := 1
+		if peer.ID != ownerUserID {
+			want = 2
+		}
+		if len(intents) != want {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply private history ttl delivery effects: %w", err)
 		}
 		return nil
 	})

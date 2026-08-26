@@ -55,6 +55,8 @@ func collectibleEmojiTestGift(ownerID int64) domain.UniqueStarGift {
 func TestAccountCollectibleEmojiStatusListSetAndRejectNonOwner(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
+	eventStore := memory.NewUpdateEventStore()
+	userStore.AttachUpdateEventStore(eventStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 1, Phone: "15550009101", FirstName: "Owner"})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +71,7 @@ func TestAccountCollectibleEmojiStatusListSetAndRejectNonOwner(t *testing.T) {
 	}
 	gift := collectibleEmojiTestGift(owner.ID)
 	gifts := &collectibleEmojiGiftService{gifts: map[int64]domain.UniqueStarGift{gift.ID: gift}}
-	updates := appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore())
+	updates := appupdates.NewService(memory.NewUpdateStateStore(), eventStore)
 	r := New(Config{}, Deps{Users: users, Updates: updates, Gifts: gifts}, zaptest.NewLogger(t), clock.System)
 	ownerCtx := WithUserID(ctx, owner.ID)
 
@@ -141,6 +143,37 @@ func TestAccountUpdateEmojiStatusRequiresDurableEventBoundary(t *testing.T) {
 	}
 	if !self.EmojiStatus().Empty() {
 		t.Fatalf("emoji status mutated despite missing durable event boundary: %+v", self.EmojiStatus())
+	}
+}
+
+func TestAccountUpdateEmojiStatusDurableAudienceIncludesCurrentSession(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	eventStore := memory.NewUpdateEventStore()
+	userStore.AttachUpdateEventStore(eventStore)
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 4, Phone: "15550009104", FirstName: "Owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := appusers.NewService(userStore)
+	if _, err := users.GrantPremium(ctx, owner.ID, 1); err != nil {
+		t.Fatalf("grant premium: %v", err)
+	}
+	sessions := &captureSessions{}
+	r := New(Config{}, Deps{Users: users, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	rawAuthKeyID := [8]byte{0x91, 0x04}
+	rpcCtx := WithRawAuthKeyID(WithSessionID(WithUserID(ctx, owner.ID), 91), rawAuthKeyID)
+
+	ok, err := r.onAccountUpdateEmojiStatus(rpcCtx, &tg.EmojiStatus{DocumentID: 42})
+	if err != nil || !ok {
+		t.Fatalf("update emoji status = %v, %v", ok, err)
+	}
+	events, listErr := eventStore.ListAfter(ctx, owner.ID, 0, 10)
+	if listErr != nil || len(events) != 1 || events[0].Type != domain.UpdateEventUserEmojiStatus {
+		t.Fatalf("events = %+v err=%v, want one durable emoji-status event", events, listErr)
+	}
+	if got := sessions.snapshot(); got.message != nil {
+		t.Fatalf("Core current-session direct push = %T %+v, want none", got.message, got.message)
 	}
 }
 

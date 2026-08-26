@@ -278,25 +278,11 @@ type VoteChannelMessagePollRequest struct {
 	Date      int
 }
 
-// ChannelMessagePollResult 返回投票者视角消息与建议推送收件人。
+// ChannelMessagePollResult 返回当前 RPC 调用者视角的消息投影。
 type ChannelMessagePollResult struct {
-	PollID     int64
-	Channel    Channel
-	Message    ChannelMessage
-	Recipients []int64
-}
-
-// ChannelPollFanoutViews 是频道 poll fan-out 的批量 per-viewer enrich 结果（消除逐 viewer GetMessages
-// 的 N+1）：viewer-invariant 聚合（counts/total/recent）只算一次 + 批量 viewerOptions + 批量成员可见性，
-// 每 viewer 用同一 ResolvePollResults 合成，与逐 viewer 路径字节同源。
-//   - Found：poll 消息存在且确为 poll（否则视为无可投影）。
-//   - Message：基础消息快照（未 per-viewer enrich），供 app 层叠加 bot 历史可见性过滤。
-//   - Polls：key 存在=已评估该 viewer；值为 nil=该 viewer 不可见（非成员/pre-history 隐藏）；
-//     非 nil=该 viewer 视角已 enrich 的 poll。bot 历史过滤由 app 层在此基础上叠加（置 nil）。
-type ChannelPollFanoutViews struct {
-	Found   bool
+	PollID  int64
+	Channel Channel
 	Message ChannelMessage
-	Polls   map[int64]*MessagePoll
 }
 
 // CloseChannelMessagePollRequest 关闭频道消息上的 poll（仅 poll 创建者）。

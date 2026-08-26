@@ -329,14 +329,22 @@ func (s *Service) PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) 
 }
 
 // CompletePasswordSignIn 在两步验证通过后清除 password_pending，使 auth_key 转为完全授权。
-func (s *Service) CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64) error {
-	if s == nil || s.auths == nil {
-		return nil
+func (s *Service) CompletePasswordSignIn(ctx context.Context, authKeyID [8]byte, expectedUserID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if s == nil || s.auths == nil || s.users == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	if expectedUserID == 0 {
+	if expectedUserID == 0 || delivery == nil {
 		return store.ErrAuthorizationStateChanged
 	}
-	if err := s.auths.MarkPasswordPassed(ctx, authKeyID, expectedUserID); err != nil {
+	u, found, err := s.users.ByID(ctx, expectedUserID)
+	if err != nil {
+		return err
+	}
+	if !found || systemUserLoginForbidden(u) {
+		_ = s.auths.Delete(ctx, authKeyID)
+		return ErrSystemUserLoginForbidden
+	}
+	if err := s.auths.MarkPasswordPassedWithDelivery(ctx, authKeyID, u, delivery); err != nil {
 		return err
 	}
 	// Revalidate the active account after the CAS promotion before Router caches
@@ -931,7 +939,10 @@ func (s *Service) cancelCode(ctx context.Context, authKeyID [8]byte, phone, phon
 
 // SignIn 校验验证码并尝试登录。
 // needSignUp=true 表示验证码正确但用户不存在，调用方应引导注册（此时不删验证码，留给 SignUp）。
-func (s *Service) SignIn(ctx context.Context, auth domain.Authorization, phone, phoneCodeHash, code string) (u domain.User, loginMessage domain.Message, needSignUp bool, err error) {
+func (s *Service) SignIn(ctx context.Context, auth domain.Authorization, phone, phoneCodeHash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (u domain.User, loginMessage domain.Message, needSignUp bool, err error) {
+	if delivery == nil {
+		return domain.User{}, domain.Message{}, false, store.ErrDeliveryOutboxRequired
+	}
 	phone = normalizePhone(phone)
 	if systemLoginPhoneForbidden(phone) {
 		return domain.User{}, domain.Message{}, false, ErrSystemUserLoginForbidden
@@ -943,7 +954,7 @@ func (s *Service) SignIn(ctx context.Context, auth domain.Authorization, phone, 
 	if !found {
 		return domain.User{}, domain.Message{}, true, nil
 	}
-	return s.finishSignIn(ctx, auth, existing)
+	return s.finishSignIn(ctx, auth, existing, delivery)
 }
 
 // SignInWithEmail 处理带 email_verification 的 auth.signIn。它与 SignIn
@@ -951,7 +962,10 @@ func (s *Service) SignIn(ctx context.Context, auth domain.Authorization, phone, 
 // email_verification，WebK 把同一邮箱码放在 phone_code；TL 字段只是 proof
 // carrier，服务端签发记录的 channel 才表示实际投递渠道。所有渠道都必须精确
 // 匹配签发码，并共用 owner 绑定、原子尝试计数、一次性消费与 2FA 门控。
-func (s *Service) SignInWithEmail(ctx context.Context, auth domain.Authorization, phone, phoneCodeHash, code string) (domain.User, domain.Message, bool, error) {
+func (s *Service) SignInWithEmail(ctx context.Context, auth domain.Authorization, phone, phoneCodeHash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
+	if delivery == nil {
+		return domain.User{}, domain.Message{}, false, store.ErrDeliveryOutboxRequired
+	}
 	phone = normalizePhone(phone)
 	if systemLoginPhoneForbidden(phone) {
 		return domain.User{}, domain.Message{}, false, ErrSystemUserLoginForbidden
@@ -963,7 +977,7 @@ func (s *Service) SignInWithEmail(ctx context.Context, auth domain.Authorization
 	if !found {
 		return domain.User{}, domain.Message{}, true, nil
 	}
-	return s.finishSignIn(ctx, auth, existing)
+	return s.finishSignIn(ctx, auth, existing, delivery)
 }
 
 // verifyLoginCode closes the login-code state transition around one atomic
@@ -1064,7 +1078,7 @@ func (s *Service) verifyLoginCode(ctx context.Context, phone, phoneCodeHash, cod
 // 验证码已由 VerifyLogin 原子消费；这里只处理 2FA password_pending 绑定。已有账号的 app-code 消息已在
 // SendCode/ResendCode 返回前持久化与入 outbox，这里绝不能再创建或补发；
 // 否则未完成登录/2FA 的真实验证码反而不会及时到达旧设备。
-func (s *Service) finishSignIn(ctx context.Context, auth domain.Authorization, existing domain.User) (domain.User, domain.Message, bool, error) {
+func (s *Service) finishSignIn(ctx context.Context, auth domain.Authorization, existing domain.User, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
 	if systemUserLoginForbidden(existing) {
 		return domain.User{}, domain.Message{}, false, ErrSystemUserLoginForbidden
 	}
@@ -1078,7 +1092,7 @@ func (s *Service) finishSignIn(ctx context.Context, auth domain.Authorization, e
 		return domain.User{}, domain.Message{}, false, err
 	}
 	auth.PasswordPending = passwordNeeded
-	if err := s.bind(ctx, auth, existing.ID); err != nil {
+	if err := s.bindWithDelivery(ctx, auth, existing, delivery); err != nil {
 		return domain.User{}, domain.Message{}, false, err
 	}
 	if passwordNeeded {
@@ -1246,7 +1260,7 @@ func (s *Service) SignInBot(ctx context.Context, auth domain.Authorization, toke
 // BindVerifiedLogin 把当前 auth_key 绑定到一个已由外部强因子(如 passkey)验证过身份的
 // 用户,直接完成授权。passkey 是独立强因子,不再叠加 2FA password(PasswordPending=false),
 // 与官方"passkey 登录跳过密码步骤"一致。校验已发生在调用方(passkey 断言验证),此处只负责绑定。
-func (s *Service) BindVerifiedLogin(ctx context.Context, auth domain.Authorization, userID int64) (domain.User, error) {
+func (s *Service) BindVerifiedLogin(ctx context.Context, auth domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, error) {
 	if s == nil || s.users == nil || userID == 0 {
 		return domain.User{}, domain.ErrPasskeyInvalid
 	}
@@ -1261,22 +1275,29 @@ func (s *Service) BindVerifiedLogin(ctx context.Context, auth domain.Authorizati
 		return domain.User{}, ErrSystemUserLoginForbidden
 	}
 	auth.PasswordPending = false
-	if err := s.bind(ctx, auth, userID); err != nil {
+	if err := s.bindWithDelivery(ctx, auth, u, delivery); err != nil {
 		return domain.User{}, err
 	}
 	return u, nil
 }
 
 // AcceptLoginToken 把 QR 登录请求方的 auth_key 绑定到扫码确认的 user。
-func (s *Service) AcceptLoginToken(ctx context.Context, auth domain.Authorization, userID int64) (domain.Authorization, error) {
+func (s *Service) AcceptLoginToken(ctx context.Context, auth domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.Authorization, error) {
 	if s == nil || s.auths == nil || userID == 0 || auth.AuthKeyID == ([8]byte{}) {
 		return domain.Authorization{}, fmt.Errorf("accept login token: invalid authorization")
 	}
 	if domain.IsSystemUserID(userID) {
 		return domain.Authorization{}, ErrSystemUserLoginForbidden
 	}
+	u, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.Authorization{}, err
+	}
+	if !found || systemUserLoginForbidden(u) {
+		return domain.Authorization{}, ErrSystemUserLoginForbidden
+	}
 	auth.PasswordPending = false
-	if err := s.bind(ctx, auth, userID); err != nil {
+	if err := s.bindWithDelivery(ctx, auth, u, delivery); err != nil {
 		return domain.Authorization{}, err
 	}
 	bound, found, err := s.auths.ByAuthKey(ctx, auth.AuthKeyID)
@@ -1409,6 +1430,35 @@ func (s *Service) bind(ctx context.Context, auth domain.Authorization, userID in
 	// update state，再原子建立新用户 baseline。RPC 层不得在 Bind 成功后清整个 key，
 	// 否则会把刚建立的 retained-floor checkpoint 一并删除。
 	if err := s.auths.Bind(ctx, auth); err != nil {
+		if errors.Is(err, store.ErrAuthKeyNotPermanent) {
+			return ErrAuthKeyPermEmpty
+		}
+		if errors.Is(err, domain.ErrAccountDeleted) || errors.Is(err, domain.ErrUserNotFound) {
+			return ErrSystemUserLoginForbidden
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) bindWithDelivery(ctx context.Context, auth domain.Authorization, user domain.User, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if s == nil || s.users == nil || s.auths == nil || user.ID == 0 || delivery == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if systemUserLoginForbidden(user) {
+		return ErrSystemUserLoginForbidden
+	}
+	if s.authKeys != nil {
+		key, found, err := s.authKeys.Get(ctx, auth.AuthKeyID)
+		if err != nil {
+			return err
+		}
+		if !found || key.ExpiresAt != 0 {
+			return ErrAuthKeyPermEmpty
+		}
+	}
+	auth.UserID = user.ID
+	if err := s.auths.BindWithDelivery(ctx, auth, user, delivery); err != nil {
 		if errors.Is(err, store.ErrAuthKeyNotPermanent) {
 			return ErrAuthKeyPermEmpty
 		}

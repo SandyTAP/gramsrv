@@ -12,6 +12,21 @@ import (
 	"telesrv/internal/store/memory"
 )
 
+const contactMutationTestDate = 1_700_000_000
+
+func contactMutationTestEffects(snapshot store.ContactMutationSnapshot) ([]store.DeliveryEffect, error) {
+	out := make([]store.DeliveryEffect, 0, len(snapshot.RequiredEvents)+1)
+	for _, required := range snapshot.RequiredEvents {
+		out = append(out, store.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, [8]byte{}, 0))
+	}
+	if snapshot.PhonePrivacyChanged {
+		out = append(out, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.OwnerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return out, nil
+}
+
 type serviceCountingContactStore struct {
 	store.ContactStore
 	listCalls int
@@ -144,10 +159,10 @@ func TestImportContactsBatchesPhonesAndDedupesUpserts(t *testing.T) {
 		target.ID: {PhotoID: 9400, DCID: 2},
 	}))
 
-	res, err := svc.ImportContacts(ctx, owner.ID, []domain.ContactInput{
+	res, err := svc.ImportContactsWithDelivery(ctx, owner.ID, []domain.ContactInput{
 		{ClientID: 11, Phone: "+1 (555) 123-4567", FirstName: "A"},
 		{ClientID: 12, Phone: "15551234567", FirstName: "Alice Final"},
-	})
+	}, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("ImportContacts: %v", err)
 	}
@@ -182,11 +197,11 @@ func TestImportContactsResolvesNationalTrunkVariantToCanonicalUser(t *testing.T)
 	}
 	svc := NewService(contactsStore, users)
 
-	res, err := svc.ImportContacts(ctx, owner.ID, []domain.ContactInput{{
+	res, err := svc.ImportContactsWithDelivery(ctx, owner.ID, []domain.ContactInput{{
 		ClientID:  98,
 		Phone:     "+98 0998 167 9461",
 		FirstName: "Saved",
-	}})
+	}}, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("ImportContacts: %v", err)
 	}
@@ -213,11 +228,11 @@ func TestAddContactWithoutPhoneDoesNotBackfillTargetPhone(t *testing.T) {
 	privacySvc := privacyapp.NewService(memory.NewPrivacyStore(), contactsStore)
 	svc := NewService(contactsStore, users).Configure(WithPrivacyEvaluator(privacySvc))
 
-	contact, err := svc.AddContact(ctx, owner.ID, domain.ContactInput{
+	contact, err := svc.AddContactWithDelivery(ctx, owner.ID, domain.ContactInput{
 		ContactUserID: target.ID,
 		FirstName:     "Saved",
 		Phone:         "",
-	})
+	}, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("AddContact: %v", err)
 	}
@@ -252,7 +267,7 @@ func TestImportContactsHonorsAddedByPhoneInOneBatch(t *testing.T) {
 	svc := NewService(contactsStore, users).Configure(WithPrivacyEvaluator(privacySvc))
 	input := []domain.ContactInput{{ClientID: 1, Phone: target.Phone, FirstName: "Saved"}}
 
-	hidden, err := svc.ImportContacts(ctx, owner.ID, input)
+	hidden, err := svc.ImportContactsWithDelivery(ctx, owner.ID, input, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("ImportContacts hidden: %v", err)
 	}
@@ -266,7 +281,7 @@ func TestImportContactsHonorsAddedByPhoneInOneBatch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("target add owner: %v", err)
 	}
-	visible, err := svc.ImportContacts(ctx, owner.ID, input)
+	visible, err := svc.ImportContactsWithDelivery(ctx, owner.ID, input, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("ImportContacts visible: %v", err)
 	}
@@ -464,12 +479,12 @@ func TestAcceptContactSharesPhoneAndClearsShareContact(t *testing.T) {
 	}
 	svc := NewService(contactsStore, users)
 
-	if _, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+	if _, err := svc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID: bob.ID,
 		Phone:         bob.Phone,
 		FirstName:     "Bobby",
 		LastName:      "Remark",
-	}); err != nil {
+	}, contactMutationTestDate, contactMutationTestEffects); err != nil {
 		t.Fatalf("alice add bob: %v", err)
 	}
 	settings, err := svc.GetPeerSettings(ctx, alice.ID, domain.Peer{Type: domain.PeerTypeUser, ID: bob.ID})
@@ -480,7 +495,7 @@ func TestAcceptContactSharesPhoneAndClearsShareContact(t *testing.T) {
 		t.Fatalf("alice settings before accept = %+v, want share contact", settings)
 	}
 
-	contact, err := svc.AcceptContact(ctx, alice.ID, bob.ID)
+	contact, err := svc.AcceptContactWithDelivery(ctx, alice.ID, bob.ID, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("AcceptContact: %v", err)
 	}
@@ -509,7 +524,7 @@ func TestAcceptContactSharesPhoneAndClearsShareContact(t *testing.T) {
 		t.Fatalf("bob contact alice = %+v, want alice phone/name and mutual", reverse)
 	}
 
-	repeated, err := svc.AcceptContact(ctx, alice.ID, bob.ID)
+	repeated, err := svc.AcceptContactWithDelivery(ctx, alice.ID, bob.ID, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("AcceptContact repeat: %v", err)
 	}
@@ -532,11 +547,11 @@ func TestAddContactNormalizesPhoneToDigits(t *testing.T) {
 	}
 	svc := NewService(contactsStore, users)
 
-	contact, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+	contact, err := svc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID: bob.ID,
 		Phone:         "+1 555-006-0302",
 		FirstName:     "Bob B",
-	})
+	}, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("AddContact: %v", err)
 	}
@@ -554,11 +569,11 @@ func TestAddContactNormalizesPhoneToDigits(t *testing.T) {
 		t.Fatalf("stored contact phone = %q, want digits-only 15550060302", stored.Phone)
 	}
 
-	emptied, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+	emptied, err := svc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID: bob.ID,
 		Phone:         "+",
 		FirstName:     "Bob B",
-	})
+	}, contactMutationTestDate, contactMutationTestEffects)
 	if err != nil {
 		t.Fatalf("AddContact digitless phone: %v", err)
 	}
@@ -571,7 +586,10 @@ func TestAddContactPhonePrivacyExceptionPeerSettings(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
 	contactsStore := memory.NewContactStore()
-	privacySvc := privacyapp.NewService(memory.NewPrivacyStore(), contactsStore)
+	privacyStore := memory.NewPrivacyStore()
+	contactsStore.AttachPrivacyStore(privacyStore)
+	contactsStore.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
+	privacySvc := privacyapp.NewService(privacyStore, contactsStore)
 	alice, err := users.Create(ctx, domain.User{Phone: "15550000101", FirstName: "Alice", LastName: "A"})
 	if err != nil {
 		t.Fatalf("create alice: %v", err)
@@ -597,11 +615,11 @@ func TestAddContactPhonePrivacyExceptionPeerSettings(t *testing.T) {
 	if !bobSettings.AddContact || bobSettings.ShareContact || !bobSettings.NeedContactsException {
 		t.Fatalf("bob settings before add = %+v, want add + need exception only", bobSettings)
 	}
-	if _, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+	if _, err := svc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID: bob.ID,
 		Phone:         bob.Phone,
 		FirstName:     "Bobby",
-	}); err != nil {
+	}, contactMutationTestDate, contactMutationTestEffects); err != nil {
 		t.Fatalf("alice add bob: %v", err)
 	}
 	bobSettings, err = svc.GetPeerSettings(ctx, alice.ID, domain.Peer{Type: domain.PeerTypeUser, ID: bob.ID})
@@ -617,12 +635,12 @@ func TestAddContactPhonePrivacyExceptionPeerSettings(t *testing.T) {
 		t.Fatalf("bob can see alice phone = true, want false before exception")
 	}
 
-	if _, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+	if _, err := svc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID:            carol.ID,
 		Phone:                    carol.Phone,
 		FirstName:                "Carol",
 		AddPhonePrivacyException: true,
-	}); err != nil {
+	}, contactMutationTestDate, contactMutationTestEffects); err != nil {
 		t.Fatalf("alice add carol with exception: %v", err)
 	}
 	carolSettings, err := svc.GetPeerSettings(ctx, alice.ID, domain.Peer{Type: domain.PeerTypeUser, ID: carol.ID})
@@ -669,7 +687,7 @@ func TestAcceptContactRequiresExistingContactRequest(t *testing.T) {
 	}
 	svc := NewService(contactsStore, users)
 
-	if _, err := svc.AcceptContact(ctx, alice.ID, bob.ID); !errors.Is(err, ErrContactReqMissing) {
+	if _, err := svc.AcceptContactWithDelivery(ctx, alice.ID, bob.ID, contactMutationTestDate, contactMutationTestEffects); !errors.Is(err, ErrContactReqMissing) {
 		t.Fatalf("AcceptContact without contact err = %v, want ErrContactReqMissing", err)
 	}
 }

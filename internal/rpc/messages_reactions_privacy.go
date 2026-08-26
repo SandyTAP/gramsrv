@@ -8,6 +8,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesSetDefaultReaction(ctx context.Context, reaction tg.ReactionClass) (bool, error) {
@@ -93,6 +94,9 @@ func (r *Router) onMessagesTogglePaidReactionPrivacy(ctx context.Context, req *t
 	if err != nil {
 		return false, internalErr()
 	}
+	if err := r.requireAccountDelivery(userID, "messages.togglePaidReactionPrivacy"); err != nil {
+		return false, err
+	}
 	if _, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer); err != nil {
 		return false, err
 	}
@@ -100,20 +104,30 @@ func (r *Router) onMessagesTogglePaidReactionPrivacy(ctx context.Context, req *t
 	if err != nil {
 		return false, err
 	}
-	if svc, ok := r.deps.Account.(accountPaidReactionPrivacyService); ok {
-		next, err := svc.SetPaidReactionPrivacy(ctx, userID, privacy)
-		if err != nil {
-			return false, internalErr()
-		}
-		privacy = next.PaidPrivacy
+	svc, ok := r.deps.Account.(accountPaidReactionPrivacyService)
+	if !ok {
+		return false, internalErr()
 	}
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
+	date := int(r.clock.Now().Unix())
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdatePaidReactionPrivacy{Private: r.tgPaidReactionPrivacy(ctx, userID, privacy)}},
 		Users:   []tg.UserClass{},
 		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
+		Date:    date,
 		Seq:     0,
 	})
+	if err != nil {
+		return false, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	if _, err := svc.SetPaidReactionPrivacy(ctx, userID, privacy, func(domain.AccountReactionSettings) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}); err != nil {
+		return false, internalErr()
+	}
 	return true, nil
 }
 
@@ -204,20 +218,13 @@ func (r *Router) onMessagesSendPaidReaction(ctx context.Context, req *tg.Message
 }
 
 func (r *Router) paidReactionResponse(ctx context.Context, userID int64, res domain.ChannelMessagePaidReactionResult) tg.UpdatesClass {
-	// 构建并扇出 updateMessageReactions；请求者额外带 updateStarsBalance。
-	ids := []int{res.Message.ID}
-	build := func(viewerUserID int64) *tg.Updates {
-		updates := r.channelPaidReactionUpdates(ctx, userID, viewerUserID, res, ids)
-		if updates != nil && viewerUserID == userID {
-			updates.Updates = append(updates.Updates, &tg.UpdateStarsBalance{Balance: &tg.StarsAmount{Amount: res.PayerBalance.Balance}})
-		}
-		return updates
+	// Core returns only the caller projection and balance; it never performs a
+	// post-commit channel viewer fan-out.
+	updates := r.channelPaidReactionResponseUpdates(ctx, userID, res)
+	if updates != nil {
+		updates.Updates = append(updates.Updates, &tg.UpdateStarsBalance{Balance: &tg.StarsAmount{Amount: res.PayerBalance.Balance}})
 	}
-	if !res.Duplicate {
-		recipients := append([]int64{res.Message.SenderUserID}, res.Recipients...)
-		r.pushChannelViewerUpdates(ctx, userID, res.Channel.ID, recipients, build)
-	}
-	return build(userID)
+	return updates
 }
 
 // paidReactionPrivacyIntent preserves the wire flag distinction: missing

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"time"
 )
 
@@ -29,8 +30,21 @@ func (s *MessageStore) ReadMessageContents(_ context.Context, req domain.ReadMes
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
+	if (req.OriginAuthKeyID == ([8]byte{})) != (req.OriginSessionID == 0) {
+		return res, fmt.Errorf("read message contents: origin exclusion requires both raw auth key and session id")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	events := s.updateEvents
+	if events == nil {
+		return res, store.ErrDeliveryOutboxRequired
+	}
+	if s.dialogs != nil {
+		s.dialogs.mu.Lock()
+		defer s.dialogs.mu.Unlock()
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
 	reactionUIDs := make(map[int64]struct{})
 	senderUIDs := make(map[int64]map[int64]struct{})
 	for i := range s.m[req.OwnerUserID] {
@@ -77,27 +91,27 @@ func (s *MessageStore) ReadMessageContents(_ context.Context, req domain.ReadMes
 			continue
 		}
 		sort.Ints(boxIDs)
-		res.SenderEvents = append(res.SenderEvents, domain.UpdateEvent{
+		event := domain.UpdateEvent{
 			UserID:     senderID,
 			Type:       domain.UpdateEventReadMessageContents,
-			Pts:        s.nextPtsNLocked(senderID, len(boxIDs)),
 			PtsCount:   len(boxIDs),
 			Date:       req.Date,
 			MessageIDs: boxIDs,
-		})
+		}
+		event = appendMemoryAllocatedMessageEventLocked(s, events, senderID, event, [8]byte{}, 0)
+		res.SenderEvents = append(res.SenderEvents, event)
 	}
 	for uid := range reactionUIDs {
-		s.refreshPrivateReactionDialogSnapshotsLocked(uid)
+		s.refreshPrivateReactionDialogSnapshotsWithDialogLocked(uid)
 	}
-	pts := s.nextPtsNLocked(req.OwnerUserID, len(res.MessageIDs))
 	res.Event = domain.UpdateEvent{
 		UserID:     req.OwnerUserID,
 		Type:       domain.UpdateEventReadMessageContents,
-		Pts:        pts,
 		PtsCount:   len(res.MessageIDs),
 		Date:       req.Date,
 		MessageIDs: append([]int(nil), res.MessageIDs...),
 	}
+	res.Event = appendMemoryAllocatedMessageEventLocked(s, events, req.OwnerUserID, res.Event, req.OriginAuthKeyID, req.OriginSessionID)
 	return res, nil
 }
 

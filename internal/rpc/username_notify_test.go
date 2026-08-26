@@ -10,39 +10,67 @@ import (
 
 	usernamesapp "telesrv/internal/app/usernames"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 var _ usernamesapp.PeerUsernameNotifier = (*Router)(nil)
 
-func TestNotifyPeerUsernamesChangedUserPushesPreloadedVector(t *testing.T) {
+func TestUsernameAudienceDeliveryEffectsProjectsFrozenUsers(t *testing.T) {
+	r := New(Config{}, Deps{}, zap.NewNop(), clock.System)
+	effects, err := r.UsernameAudienceDeliveryEffects(store.UsernameAudienceDeliverySnapshot{
+		Users: []store.UserAudienceDeliverySnapshot{
+			{User: domain.User{ID: 10}, Audience: []int64{10, 11}},
+			{User: domain.User{ID: 20}, Audience: []int64{20}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("build username effects: %v", err)
+	}
+	if len(effects) != 3 {
+		t.Fatalf("effects = %d, want 3", len(effects))
+	}
+	wantTargets := []int64{10, 11, 20}
+	wantUsers := []int64{10, 10, 20}
+	for i := range effects {
+		if effects[i].TargetUserID != wantTargets[i] || effects[i].Kind != store.DeliveryEffectAbsolute {
+			t.Fatalf("effect[%d] = %+v", i, effects[i])
+		}
+		decoded, err := decodeDeliveryUpdate(effects[i].Payload)
+		if err != nil {
+			t.Fatalf("decode effect[%d]: %v", i, err)
+		}
+		updates := decoded.(*tg.Updates)
+		refresh := updates.Updates[0].(*tg.UpdateUser)
+		if refresh.UserID != wantUsers[i] {
+			t.Fatalf("effect[%d] refresh user = %d, want %d", i, refresh.UserID, wantUsers[i])
+		}
+	}
+	empty, err := r.UsernameAudienceDeliveryEffects(store.UsernameAudienceDeliverySnapshot{})
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("channel-only snapshot = effects:%v err:%v", empty, err)
+	}
+}
+
+func TestNotifyPeerUsernamesChangedUserIsCacheOnly(t *testing.T) {
 	const (
 		targetID = int64(2002)
 		viewerID = int64(1001)
 	)
-	users := &verifiedNotifyUsers{
-		user:     domain.User{ID: targetID, FirstName: "Owner", Username: "owner_slot"},
-		found:    true,
-		audience: []int64{targetID, viewerID},
-	}
-	registry := newFakeUsernameRegistry()
-	registry.byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: targetID}] = []domain.Username{
-		{Username: "owner_slot", Editable: true, Active: true, SortOrder: 1},
-		{Username: "nft4", Active: true, SortOrder: 0, CollectibleID: 7},
-	}
 	sessions := &captureSessions{onlineUserIDs: []int64{targetID, viewerID}}
-	r := New(Config{}, Deps{Users: users, Usernames: registry, Sessions: sessions}, zap.NewNop(), clock.System)
+	r := New(Config{}, Deps{Sessions: sessions}, zap.NewNop(), clock.System)
+	seedUserFullProjection(t, r, viewerID, targetID)
 
 	if err := r.NotifyPeerUsernamesChanged(context.Background(), domain.Peer{
 		Type: domain.PeerTypeUser, ID: targetID,
 	}); err != nil {
 		t.Fatalf("notify user usernames: %v", err)
 	}
-	if registry.peerCalls != 1 || registry.batchCalls != 0 {
-		t.Fatalf("registry reads = peer %d / batch %d, want one peer-wide read", registry.peerCalls, registry.batchCalls)
+	if _, ok := r.userFullProjectionCache.Lookup(viewerID, targetID); ok {
+		t.Fatal("userFull projection survived username mutation")
 	}
-	updates := sessions.lastUserPush().(*tg.Updates)
-	user := updates.Users[0].(*tg.User)
-	assertVectorOnlyUsernames(t, "pushed user", user, []string{"nft4", "owner_slot"})
+	if pushed := sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("post-commit username hook pushed %v", pushed)
+	}
 }
 
 func TestNotifyPeerUsernamesChangedChannelPushesPreloadedVector(t *testing.T) {

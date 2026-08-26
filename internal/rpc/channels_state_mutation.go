@@ -42,34 +42,54 @@ func (r *Router) applyChannelChangeInfoMutation(ctx context.Context, input tg.In
 }
 
 func (r *Router) channelStateMutationUpdates(ctx context.Context, userID int64, channel domain.Channel) tg.UpdatesClass {
+	projection := r.prepareChannelStateMutationProjection(ctx, userID, channel)
+	r.pushTransientChannelStateInvalidationWithLinkedMonoforum(ctx, userID, projection.channel, projection.monoforum, projection.includeMonoforum, projection.botVerificationIcon, projection.usernames)
+	return r.renderChannelStateMutationProjection(userID, projection)
+}
+
+type channelStateMutationProjection struct {
+	channel             domain.Channel
+	monoforum           domain.Channel
+	includeMonoforum    bool
+	botVerificationIcon int64
+	usernames           map[domain.Peer][]domain.Username
+}
+
+func (r *Router) prepareChannelStateMutationProjection(ctx context.Context, userID int64, channel domain.Channel) channelStateMutationProjection {
 	r.invalidateRPCProjectionForChannel(channel.ID)
 	if channel.LinkedMonoforumID != 0 {
 		r.invalidateRPCProjectionForChannel(channel.LinkedMonoforumID)
 	}
 	mono, includeMono := r.linkedMonoforumForChannelState(ctx, userID, channel)
-	// One read for the whole fan-out plus the returned updates: the third-party
-	// verification mark is a peer-wide fact, and the per-recipient builder must stay
-	// read-free (see channelStateUpdatesWithLinkedMonoforum).
 	icon := r.peerBotVerificationIcon(ctx, domain.Peer{Type: domain.PeerTypeChannel, ID: channel.ID})
 	usernames := r.channelStateUsernameRegistry(ctx, channel, mono, includeMono)
-	r.pushChannelStateToMembersWithLinkedMonoforum(ctx, userID, channel, mono, includeMono, icon, usernames)
-	return r.channelStateUpdatesWithLinkedMonoforum(userID, channel, mono, includeMono, icon, usernames)
+	return channelStateMutationProjection{
+		channel: channel, monoforum: mono, includeMonoforum: includeMono,
+		botVerificationIcon: icon, usernames: usernames,
+	}
+}
+
+func (r *Router) renderChannelStateMutationProjection(userID int64, projection channelStateMutationProjection) *tg.Updates {
+	return r.channelStateUpdatesWithLinkedMonoforum(
+		userID, projection.channel, projection.monoforum, projection.includeMonoforum,
+		projection.botVerificationIcon, projection.usernames,
+	)
 }
 
 func (r *Router) channelPaidMessagesPriceUpdates(ctx context.Context, userID int64, res domain.ChannelPaidMessagesPriceResult) tg.UpdatesClass {
-	state := r.channelStateMutationUpdates(ctx, userID, res.Channel)
 	services := res.ServiceMessages
 	if len(services) == 0 && res.ServiceMessage != nil {
 		services = []domain.SendChannelMessageResult{*res.ServiceMessage}
 	}
 	if len(services) == 0 {
-		return state
+		return r.channelStateMutationUpdates(ctx, userID, res.Channel)
 	}
+	// A service event makes this a channel_pts mutation. Build only the caller
+	// response; Egress consumes the signals committed with the service events.
+	projection := r.prepareChannelStateMutationProjection(ctx, userID, res.Channel)
+	state := r.renderChannelStateMutationProjection(userID, projection)
 	service := r.channelMessagesUpdatesWithPeerCache(ctx, userID, services, nil, false, nil, newViewerPeerCache(r))
-	if updates, ok := state.(*tg.Updates); ok {
-		return mergeUpdates(updates, service)
-	}
-	return state
+	return mergeUpdates(state, service)
 }
 
 func mergeUpdates(a, b *tg.Updates) *tg.Updates {

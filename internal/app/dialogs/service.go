@@ -108,6 +108,46 @@ func (s *Service) rebuildProjector() {
 	)
 }
 
+// MutateAccountDialogs delegates the entire account mutation to the owning
+// store aggregate. Cache invalidation happens only after the transaction has
+// committed with its allocated event and dispatch row.
+func (s *Service) MutateAccountDialogs(ctx context.Context, mutation store.DialogAccountMutation, effects store.DeliveryEffectsBuilder[store.DialogAccountMutationSnapshot]) (store.DialogAccountMutationSnapshot, error) {
+	if s == nil || s.dialogs == nil {
+		return store.DialogAccountMutationSnapshot{}, store.ErrDeliveryOutboxRequired
+	}
+	if mutation.Kind == store.DialogAccountSaveDraft {
+		if err := validateDraft(mutation.Draft); err != nil {
+			return store.DialogAccountMutationSnapshot{}, err
+		}
+	}
+	if mutation.Kind == store.DialogAccountDeleteDraft {
+		if err := validateDraftKey(mutation.Peer, mutation.TopMessageID); err != nil {
+			return store.DialogAccountMutationSnapshot{}, err
+		}
+	}
+	result, err := s.dialogs.MutateAccountDialogs(ctx, mutation, effects)
+	if err != nil || !result.Changed {
+		return result, err
+	}
+	switch mutation.Kind {
+	case store.DialogAccountSaveDraft:
+		s.InvalidateDialog(mutation.UserID, mutation.Draft.Peer)
+	case store.DialogAccountDeleteDraft, store.DialogAccountSetPinned, store.DialogAccountSetUnreadMark, store.DialogAccountHidePeerSettings, store.DialogAccountSetChannelViewForum:
+		s.InvalidateDialog(mutation.UserID, mutation.Peer)
+	case store.DialogAccountClearDrafts:
+		for _, draft := range result.Drafts {
+			s.InvalidateDialog(mutation.UserID, draft.Peer)
+		}
+	case store.DialogAccountReorderPinned, store.DialogAccountUpsertFolder, store.DialogAccountDeleteFolder, store.DialogAccountReorderFolders, store.DialogAccountSetFolderTags:
+		s.FlushReadModelCache()
+	case store.DialogAccountEditPeerFolders:
+		for _, item := range mutation.FolderPeers {
+			s.InvalidateDialog(mutation.UserID, item.Peer)
+		}
+	}
+	return result, nil
+}
+
 // GetDialogs 返回当前登录账号的会话摘要。未登录或无持久化实现时按空账号处理。
 func (s *Service) GetDialogs(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogList, error) {
 	return s.getDialogs(ctx, userID, filter, false)

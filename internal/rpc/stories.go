@@ -1255,19 +1255,11 @@ func (r *Router) onStoriesSendStory(ctx context.Context, req *tg.StoriesSendStor
 		Media:            media,
 		MediaAreas:       mediaAreas,
 		Forward:          forward,
-	})
+	}, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		return nil, storyErr(err)
 	}
 	r.invalidateStoryProjectionCacheForPeer(peer)
-	if !res.Duplicate {
-		if err := r.recordStoryChange(ctx, userID, res.Story); err != nil {
-			return nil, err
-		}
-		if err := r.fanoutChannelStoryChange(ctx, userID, res.Story); err != nil {
-			return nil, err
-		}
-	}
 	return r.tgStoryChangeUpdates(ctx, userID, peer, res.Story, req.RandomID, true, now), nil
 }
 
@@ -1419,7 +1411,7 @@ func (r *Router) onStoriesEditStory(ctx context.Context, req *tg.StoriesEditStor
 		UpdatePrivacy:    updatePrivacy,
 		MediaAreas:       mediaAreas,
 		UpdateMediaAreas: updateMediaAreas,
-	})
+	}, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		if musicOnlyNoop && errors.Is(err, domain.ErrStoryNotModified) {
 			return r.tgUnchangedStoryUpdates(ctx, userID, peer, req.ID, int(r.clock.Now().Unix()))
@@ -1427,17 +1419,6 @@ func (r *Router) onStoriesEditStory(ctx context.Context, req *tg.StoriesEditStor
 		return nil, storyErr(err)
 	}
 	r.invalidateStoryProjectionCacheForPeer(peer)
-	if err := r.recordStoryChange(ctx, userID, res.Story); err != nil {
-		return nil, err
-	}
-	if err := r.fanoutChannelStoryChange(ctx, userID, res.Story); err != nil {
-		return nil, err
-	}
-	if updatePrivacy {
-		if err := r.fanoutStoryPrivacyChange(ctx, userID, res.Previous, res.Story); err != nil {
-			return nil, err
-		}
-	}
 	return r.tgStoryChangeUpdates(ctx, userID, peer, res.Story, 0, false, int(r.clock.Now().Unix())), nil
 }
 
@@ -2316,26 +2297,11 @@ func (r *Router) onStoriesDeleteStories(ctx context.Context, req *tg.StoriesDele
 	if r.deps.Stories == nil || userID == 0 {
 		return append([]int(nil), ids...), nil
 	}
-	res, err := r.deps.Stories.DeleteStories(ctx, userID, peer, ids, now)
+	res, err := r.deps.Stories.DeleteStories(ctx, userID, peer, ids, now, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		return nil, storyErr(err)
 	}
 	r.invalidateStoryProjectionCacheForPeer(peer)
-	previousByID := make(map[int]domain.Story, len(res.Previous))
-	for _, story := range res.Previous {
-		previousByID[story.ID] = story
-	}
-	for _, story := range res.Stories {
-		if err := r.recordStoryChange(ctx, userID, story); err != nil {
-			return nil, err
-		}
-		if err := r.fanoutDeletedUserStory(ctx, userID, previousByID[story.ID], story, now); err != nil {
-			return nil, err
-		}
-		if err := r.fanoutChannelStoryChange(ctx, userID, story); err != nil {
-			return nil, err
-		}
-	}
 	return res.IDs, nil
 }
 
@@ -2372,26 +2338,11 @@ func (r *Router) onStoriesTogglePinned(ctx context.Context, req *tg.StoriesToggl
 	if r.deps.Stories == nil || userID == 0 {
 		return append([]int(nil), ids...), nil
 	}
-	res, err := r.deps.Stories.TogglePinned(ctx, userID, peer, ids, req.Pinned, now)
+	res, err := r.deps.Stories.TogglePinned(ctx, userID, peer, ids, req.Pinned, now, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		return nil, storyErr(err)
 	}
 	r.invalidateStoryProjectionCacheForPeer(peer)
-	previousByID := make(map[int]domain.Story, len(res.Previous))
-	for _, story := range res.Previous {
-		previousByID[story.ID] = story
-	}
-	for _, story := range res.Stories {
-		if err := r.recordStoryChange(ctx, userID, story); err != nil {
-			return nil, err
-		}
-		if err := r.fanoutUnpinnedExpiredUserStory(ctx, userID, previousByID[story.ID], story, now); err != nil {
-			return nil, err
-		}
-		if err := r.fanoutChannelStoryChange(ctx, userID, story); err != nil {
-			return nil, err
-		}
-	}
 	return res.IDs, nil
 }
 
@@ -2471,16 +2422,9 @@ func (r *Router) onStoriesReadStories(ctx context.Context, req *tg.StoriesReadSt
 		return []int{}, nil
 	}
 	now := int(r.clock.Now().Unix())
-	read, err := r.deps.Stories.ReadStories(ctx, userID, peer, req.MaxID, now)
+	read, err := r.deps.Stories.ReadStories(ctx, userID, peer, req.MaxID, now, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		return nil, storyErr(err)
-	}
-	if read.Advanced && r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		if _, _, err := r.deps.Updates.RecordReadStories(ctx, authKeyID, userID, read, rawAuthKeyIDForOrigin(ctx), sessionID); err != nil {
-			return nil, internalErr()
-		}
 	}
 	if read.MaxReadID <= 0 {
 		return []int{}, nil
@@ -2778,7 +2722,7 @@ func (r *Router) onStoriesSendReaction(ctx context.Context, req *tg.StoriesSendR
 	if r.deps.Stories == nil || userID == 0 {
 		return r.tgStoryReactionUpdates(ctx, userID, peer, req.StoryID, req.Reaction, now), nil
 	}
-	res, err := r.deps.Stories.SendReaction(ctx, userID, peer, req.StoryID, reaction, now)
+	res, err := r.deps.Stories.SendReaction(ctx, userID, peer, req.StoryID, reaction, now, storyMutationDeliveryEffects(ctx))
 	if err != nil {
 		return nil, storyErr(err)
 	}
@@ -2790,18 +2734,6 @@ func (r *Router) onStoriesSendReaction(ctx context.Context, req *tg.StoriesSendR
 	if reaction != nil && res.Changed {
 		if err := r.recordMessageReactionUse(ctx, userID, []domain.MessageReaction{*reaction}, req.GetAddToRecent(), now); err != nil {
 			return nil, internalErr()
-		}
-	}
-	if res.Changed && r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		if _, _, err := r.deps.Updates.RecordSentStoryReaction(ctx, authKeyID, userID, res, rawAuthKeyIDForOrigin(ctx), sessionID); err != nil {
-			return nil, internalErr()
-		}
-		if ownerUserID, ok := ownerStoryReactionNotificationUserID(res, userID); ok && res.Reaction != nil {
-			if _, _, err := r.deps.Updates.RecordNewStoryReaction(ctx, [8]byte{}, ownerUserID, res, [8]byte{}, 0); err != nil {
-				return nil, internalErr()
-			}
 		}
 	}
 	return r.tgStoryReactionUpdates(ctx, userID, peer, req.StoryID, req.Reaction, now), nil

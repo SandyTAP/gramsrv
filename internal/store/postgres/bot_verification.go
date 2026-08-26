@@ -273,28 +273,31 @@ LIMIT $2`, activeOnly, limit)
 
 // ---- verifier status --------------------------------------------------------
 
-// UpsertBotVerifierSettings grants or updates verifier status.
+// UpsertBotVerifierSettingsWithDelivery grants or updates verifier status.
 //
 // settings.Version is the optimistic-locking expectation: 0 means "there is no
 // verifier row yet" and a stored row then reports
 // domain.ErrCustomVerificationVersionConflict, and a non-zero version must match
 // the stored one. created_at is never rewritten, so the grant date survives every
 // later edit.
-func (s *BotVerificationStore) UpsertBotVerifierSettings(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+func (s *BotVerificationStore) UpsertBotVerifierSettingsWithDelivery(ctx context.Context, settings domain.BotVerifierSettings, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
 	if s == nil || s.db == nil {
-		return domain.BotVerifierSettings{}, fmt.Errorf("bot verification store is not configured")
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
 	}
 	settings.CompanyName = strings.TrimSpace(settings.CompanyName)
 	settings.DefaultDescription = strings.TrimSpace(settings.DefaultDescription)
 	settings.GrantedBy = strings.TrimSpace(settings.GrantedBy)
 	settings.GrantReason = strings.TrimSpace(settings.GrantReason)
 	if err := settings.Validate(); err != nil {
-		return domain.BotVerifierSettings{}, err
+		return store.BotVerifierSettingsMutation{}, err
 	}
 	if settings.Version < 0 || !botVerifierSettingsColumnsFit(settings) {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierSettingsInvalid
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierSettingsInvalid
 	}
-	var stored domain.BotVerifierSettings
+	var mutation store.BotVerifierSettingsMutation
 	err := withTx(ctx, s.db, "upsert bot verifier settings", func(tx pgx.Tx) error {
 		current, err := lockBotVerifierSettingsTx(ctx, tx, settings.BotID)
 		switch {
@@ -318,10 +321,17 @@ RETURNING `+botVerifierSettingsColumnList,
 			if err != nil {
 				return fmt.Errorf("insert bot verifier settings: %w", err)
 			}
-			stored = inserted
-			return nil
+			mutation.Settings = inserted
+			mutation.Changed = true
+			channels, err := applyBotVerifierSettingsDeliveryTx(ctx, tx, settings.BotID, effects)
+			mutation.AffectedChannelIDs = channels
+			return err
 		case err != nil:
 			return err
+		}
+		if botVerifierSettingsSameState(current, settings) {
+			mutation.Settings = current
+			return nil
 		}
 		if settings.Version == 0 || settings.Version != current.Version {
 			return domain.ErrCustomVerificationVersionConflict
@@ -350,35 +360,41 @@ RETURNING `+botVerifierSettingsColumnList,
 		if err != nil {
 			return fmt.Errorf("update bot verifier settings: %w", err)
 		}
-		stored = updated
-		return nil
+		mutation.Settings = updated
+		mutation.Changed = true
+		channels, err := applyBotVerifierSettingsDeliveryTx(ctx, tx, settings.BotID, effects)
+		mutation.AffectedChannelIDs = channels
+		return err
 	})
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return store.BotVerifierSettingsMutation{}, err
 	}
-	return stored, nil
+	return mutation, nil
 }
 
-// SetBotVerifierEnabled flips the operator kill switch. Existing marks stay on
+// SetBotVerifierEnabledWithDelivery flips the operator kill switch. Existing marks stay on
 // disk, but the verifier can grant nothing new and neither its settings nor its
 // marks are projected, so flipping the switch back restores exactly what was
 // there. Setting the flag to the value it already has is a no-op and does not
 // burn a version.
-func (s *BotVerificationStore) SetBotVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+func (s *BotVerificationStore) SetBotVerifierEnabledWithDelivery(ctx context.Context, botID int64, enabled bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
 	if s == nil || s.db == nil {
-		return domain.BotVerifierSettings{}, fmt.Errorf("bot verification store is not configured")
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
 	}
 	if botID <= 0 {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 	}
-	var stored domain.BotVerifierSettings
+	var mutation store.BotVerifierSettingsMutation
 	err := withTx(ctx, s.db, "set bot verifier enabled", func(tx pgx.Tx) error {
 		current, err := lockBotVerifierSettingsTx(ctx, tx, botID)
 		if err != nil {
 			return err
 		}
 		if current.Enabled == enabled {
-			stored = current
+			mutation.Settings = current
 			return nil
 		}
 		updated, err := scanBotVerifierSettings(tx.QueryRow(ctx, `
@@ -389,31 +405,57 @@ RETURNING `+botVerifierSettingsColumnList, botID, enabled, botVerificationNow())
 		if err != nil {
 			return fmt.Errorf("set bot verifier enabled: %w", err)
 		}
-		stored = updated
-		return nil
+		mutation.Settings = updated
+		mutation.Changed = true
+		channels, err := applyBotVerifierSettingsDeliveryTx(ctx, tx, botID, effects)
+		mutation.AffectedChannelIDs = channels
+		return err
 	})
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return store.BotVerifierSettingsMutation{}, err
 	}
-	return stored, nil
+	return mutation, nil
 }
 
-// DeleteBotVerifierSettings removes verifier status. Its marks cascade away with
+// DeleteBotVerifierSettingsWithDelivery removes verifier status. Its marks cascade away with
 // it (custom_verifications.verifier_bot_id ON DELETE CASCADE), because a mark
 // whose verifier no longer exists has nothing to render. Applications survive:
 // they reference users, not the verifier row, and stay as history.
-func (s *BotVerificationStore) DeleteBotVerifierSettings(ctx context.Context, botID int64) (bool, error) {
+func (s *BotVerificationStore) DeleteBotVerifierSettingsWithDelivery(ctx context.Context, botID int64, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (store.BotVerifierSettingsMutation, error) {
 	if s == nil || s.db == nil {
-		return false, fmt.Errorf("bot verification store is not configured")
+		return store.BotVerifierSettingsMutation{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if effects == nil {
+		return store.BotVerifierSettingsMutation{}, store.ErrDeliveryOutboxRequired
 	}
 	if botID <= 0 {
-		return false, domain.ErrVerifierNotFound
+		return store.BotVerifierSettingsMutation{}, domain.ErrVerifierNotFound
 	}
-	tag, err := s.db.Exec(ctx, `DELETE FROM bot_verifier_settings WHERE bot_id = $1`, botID)
+	var mutation store.BotVerifierSettingsMutation
+	err := withTx(ctx, s.db, "delete bot verifier settings", func(tx pgx.Tx) error {
+		current, err := lockBotVerifierSettingsTx(ctx, tx, botID)
+		if errors.Is(err, domain.ErrVerifierNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		channels, err := applyBotVerifierSettingsDeliveryTx(ctx, tx, botID, effects)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM bot_verifier_settings WHERE bot_id = $1`, botID); err != nil {
+			return fmt.Errorf("delete bot verifier settings: %w", err)
+		}
+		mutation.Settings = current
+		mutation.Changed = true
+		mutation.AffectedChannelIDs = channels
+		return nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("delete bot verifier settings: %w", err)
+		return store.BotVerifierSettingsMutation{}, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return mutation, nil
 }
 
 // BotVerifierSettings reads one verifier's status, enabled or not: the caller
@@ -535,6 +577,24 @@ LIMIT $2`, enabledOnly, limit)
 // grant time" means; an explicit id is honoured, so re-issuing a historical mark
 // keeps its original icon.
 func (s *BotVerificationStore) GrantCustomVerification(ctx context.Context, mark domain.CustomVerification) (domain.CustomVerification, bool, error) {
+	return s.grantCustomVerification(ctx, mark, nil)
+}
+
+// GrantCustomVerificationWithDelivery is the mandatory user-peer write path.
+// The audience is frozen after the mark mutation while the same transaction is
+// still open, and the bounded absolute effects are inserted set-wise before the
+// mark can commit.
+func (s *BotVerificationStore) GrantCustomVerificationWithDelivery(ctx context.Context, mark domain.CustomVerification, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error) {
+	if mark.Peer.Type != domain.PeerTypeUser || mark.Peer.ID <= 0 {
+		return domain.CustomVerification{}, false, domain.ErrCustomVerificationTargetInvalid
+	}
+	if effects == nil {
+		return domain.CustomVerification{}, false, store.ErrDeliveryOutboxRequired
+	}
+	return s.grantCustomVerification(ctx, mark, effects)
+}
+
+func (s *BotVerificationStore) grantCustomVerification(ctx context.Context, mark domain.CustomVerification, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerification{}, false, fmt.Errorf("bot verification store is not configured")
 	}
@@ -561,15 +621,22 @@ func (s *BotVerificationStore) GrantCustomVerification(ctx context.Context, mark
 		if err := mark.Validate(); err != nil {
 			return err
 		}
-		existed := true
-		switch _, err := customVerificationTx(ctx, tx, mark.VerifierBotID, mark.Peer, true); {
-		case err == nil:
-		case errors.Is(err, domain.ErrCustomVerificationNotFound):
-			existed = false
-		default:
+		current, currentFound, err := customVerificationForPeerTx(ctx, tx, mark.Peer, true)
+		if err != nil {
 			return err
 		}
-		if !existed {
+		if currentFound && current.VerifierBotID == mark.VerifierBotID &&
+			current.IconDocumentID == mark.IconDocumentID &&
+			current.Description == mark.Description &&
+			current.GrantedByUserID == mark.GrantedByUserID {
+			// A transport retry is a real no-op: do not burn a mark version and,
+			// critically, do not append a second delivery effect.
+			stored = current
+			created = false
+			return nil
+		}
+		sameVerifier := currentFound && current.VerifierBotID == mark.VerifierBotID
+		if !sameVerifier {
 			count, err := countCustomVerificationsTx(ctx, tx, mark.VerifierBotID)
 			if err != nil {
 				return err
@@ -604,7 +671,12 @@ RETURNING `+customVerificationColumnList,
 			return fmt.Errorf("grant custom verification: %w", err)
 		}
 		stored = upserted
-		created = !existed
+		created = !sameVerifier
+		if effects != nil {
+			if err := applyBotVerificationUserDeliveryTx(ctx, tx, mark.Peer.ID, effects); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -632,6 +704,265 @@ WHERE verifier_bot_id = $1 AND peer_type = $2 AND peer_id = $3`,
 		return false, fmt.Errorf("revoke custom verification: %w", err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// RevokeCustomVerificationWithDelivery removes a user mark and appends the
+// corresponding frozen-audience updateUser effects in the same transaction.
+// Replaying an already-applied revoke neither invokes the builder nor appends
+// another outbox row.
+func (s *BotVerificationStore) RevokeCustomVerificationWithDelivery(ctx context.Context, verifierBotID int64, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("bot verification store is not configured")
+	}
+	if verifierBotID <= 0 || peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+		return false, domain.ErrCustomVerificationTargetInvalid
+	}
+	if effects == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	removed := false
+	err := withTx(ctx, s.db, "revoke custom verification with delivery", func(tx pgx.Tx) error {
+		current, found, err := customVerificationForPeerTx(ctx, tx, peer, true)
+		if err != nil {
+			return err
+		}
+		if !found || current.VerifierBotID != verifierBotID {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+DELETE FROM custom_verifications
+WHERE id = $1`, current.ID); err != nil {
+			return fmt.Errorf("revoke custom verification: %w", err)
+		}
+		if err := applyBotVerificationUserDeliveryTx(ctx, tx, peer.ID, effects); err != nil {
+			return err
+		}
+		removed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return removed, nil
+}
+
+func botVerifierSettingsSameState(current, desired domain.BotVerifierSettings) bool {
+	return current.BotID == desired.BotID &&
+		current.IconDocumentID == desired.IconDocumentID &&
+		current.CompanyName == desired.CompanyName &&
+		current.DefaultDescription == desired.DefaultDescription &&
+		current.CanModifyCustomDescription == desired.CanModifyCustomDescription &&
+		current.Enabled == desired.Enabled &&
+		current.GrantedBy == desired.GrantedBy &&
+		current.GrantReason == desired.GrantReason
+}
+
+// applyBotVerifierSettingsDeliveryTx freezes the complete verifier aggregate
+// audience and writes all reliable user effects with one set-based INSERT. It
+// returns only channel ids; those are an explicitly transient cache-invalidation
+// surface and are never persisted as account delivery rows.
+func applyBotVerifierSettingsDeliveryTx(ctx context.Context, tx pgx.Tx, botID int64, build store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) ([]int64, error) {
+	snapshots, channels, err := botVerifierSettingsDeliveryTargetsTx(ctx, tx, botID)
+	if err != nil {
+		return nil, err
+	}
+	intents := make([]store.DeliveryEffect, 0, store.MaxBotVerifierSettingsDeliveryEffects)
+	for i := range snapshots {
+		snapshot := snapshots[i]
+		built, err := build(snapshot)
+		if err != nil {
+			return nil, fmt.Errorf("build bot verifier settings user delivery for user %d: %w", snapshot.User.ID, err)
+		}
+		if err := store.ValidateUserAudienceDeliveryEffects(snapshot, built); err != nil {
+			return nil, err
+		}
+		if len(intents)+len(built) > store.MaxBotVerifierSettingsDeliveryEffects {
+			return nil, fmt.Errorf("bot verifier settings delivery exceeds %d effects", store.MaxBotVerifierSettingsDeliveryEffects)
+		}
+		intents = append(intents, built...)
+	}
+	if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return nil, err
+	}
+	return channels, nil
+}
+
+// botVerifierSettingsDeliveryTargetsTx resolves every affected user and channel
+// in a bounded number of set queries. The per-user candidate relation mirrors
+// moderationFlagAudience, but all marked users are frozen in one statement
+// rather than issuing one audience query per mark.
+func botVerifierSettingsDeliveryTargetsTx(ctx context.Context, tx pgx.Tx, botID int64) ([]store.UserAudienceDeliverySnapshot, []int64, error) {
+	rows, err := tx.Query(ctx, `
+SELECT affected.user_id
+FROM (
+  SELECT $1::bigint AS user_id
+  UNION
+  SELECT peer_id
+  FROM custom_verifications
+  WHERE verifier_bot_id = $1 AND peer_type = 'user'
+) affected
+ORDER BY affected.user_id
+LIMIT $2`, botID, store.MaxBotVerifierSettingsDeliveryEffects+1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list bot verifier affected users: %w", err)
+	}
+	userIDs := make([]int64, 0)
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			rows.Close()
+			return nil, nil, fmt.Errorf("scan bot verifier affected user: %w", err)
+		}
+		userIDs = append(userIDs, userID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, fmt.Errorf("iterate bot verifier affected users: %w", err)
+	}
+	rows.Close()
+	if len(userIDs) > store.MaxBotVerifierSettingsDeliveryEffects {
+		return nil, nil, fmt.Errorf("bot verifier settings affects more than %d users", store.MaxBotVerifierSettingsDeliveryEffects)
+	}
+
+	channelRows, err := tx.Query(ctx, `
+SELECT peer_id
+FROM custom_verifications
+WHERE verifier_bot_id = $1 AND peer_type = 'channel'
+ORDER BY peer_id
+LIMIT $2`, botID, store.MaxBotVerifierSettingsChannelInvalidations+1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list bot verifier affected channels: %w", err)
+	}
+	channels := make([]int64, 0)
+	for channelRows.Next() {
+		var channelID int64
+		if err := channelRows.Scan(&channelID); err != nil {
+			channelRows.Close()
+			return nil, nil, fmt.Errorf("scan bot verifier affected channel: %w", err)
+		}
+		channels = append(channels, channelID)
+	}
+	if err := channelRows.Err(); err != nil {
+		channelRows.Close()
+		return nil, nil, fmt.Errorf("iterate bot verifier affected channels: %w", err)
+	}
+	channelRows.Close()
+	if len(channels) > store.MaxBotVerifierSettingsChannelInvalidations {
+		return nil, nil, fmt.Errorf("bot verifier settings affects more than %d channels", store.MaxBotVerifierSettingsChannelInvalidations)
+	}
+
+	audiences := make(map[int64][]int64, len(userIDs))
+	audienceRows, err := tx.Query(ctx, `
+WITH subjects(user_id) AS MATERIALIZED (
+  SELECT unnest($1::bigint[])
+), candidates AS (
+  SELECT user_id AS subject_id, user_id AS viewer_id,
+         0 AS priority, 2147483647::bigint AS activity
+  FROM subjects
+  UNION ALL
+  SELECT s.user_id, c.contact_user_id, 1, 0
+  FROM subjects s JOIN contacts c ON c.user_id = s.user_id
+  UNION ALL
+  SELECT s.user_id, c.user_id, 1, 0
+  FROM subjects s JOIN contacts c ON c.contact_user_id = s.user_id
+  UNION ALL
+  SELECT s.user_id, d.peer_id, 2, d.top_message_date
+  FROM subjects s JOIN dialogs d ON d.user_id = s.user_id
+  WHERE d.peer_type = 'user'
+  UNION ALL
+  SELECT s.user_id, d.user_id, 2, d.top_message_date
+  FROM subjects s JOIN dialogs d ON d.peer_type = 'user' AND d.peer_id = s.user_id
+), grouped AS (
+  SELECT c.subject_id, c.viewer_id,
+         min(c.priority) AS priority, max(c.activity) AS activity
+  FROM candidates c
+  JOIN users viewer ON viewer.id = c.viewer_id AND viewer.deleted_at IS NULL
+  GROUP BY c.subject_id, c.viewer_id
+), ranked AS (
+  SELECT g.subject_id, g.viewer_id,
+         row_number() OVER (
+           PARTITION BY g.subject_id
+           ORDER BY g.priority, g.activity DESC, g.viewer_id
+         ) AS ordinal
+  FROM grouped g
+)
+SELECT subject_id, viewer_id
+FROM ranked
+WHERE ordinal <= $2
+ORDER BY subject_id, viewer_id
+LIMIT $3`, userIDs, store.MaxBotVerificationUserAudience, store.MaxBotVerifierSettingsDeliveryEffects+1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list bot verifier settings audiences: %w", err)
+	}
+	total := 0
+	for audienceRows.Next() {
+		var subjectID, viewerID int64
+		if err := audienceRows.Scan(&subjectID, &viewerID); err != nil {
+			audienceRows.Close()
+			return nil, nil, fmt.Errorf("scan bot verifier settings audience: %w", err)
+		}
+		audiences[subjectID] = append(audiences[subjectID], viewerID)
+		total++
+	}
+	if err := audienceRows.Err(); err != nil {
+		audienceRows.Close()
+		return nil, nil, fmt.Errorf("iterate bot verifier settings audiences: %w", err)
+	}
+	audienceRows.Close()
+	if total > store.MaxBotVerifierSettingsDeliveryEffects {
+		return nil, nil, fmt.Errorf("bot verifier settings delivery exceeds %d effects", store.MaxBotVerifierSettingsDeliveryEffects)
+	}
+	snapshots := make([]store.UserAudienceDeliverySnapshot, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if audience := audiences[userID]; len(audience) > 0 {
+			snapshots = append(snapshots, store.UserAudienceDeliverySnapshot{
+				User: domain.User{ID: userID}, Audience: audience,
+			})
+		}
+	}
+	return snapshots, channels, nil
+}
+
+func applyBotVerificationUserDeliveryTx(ctx context.Context, tx pgx.Tx, userID int64, build store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) error {
+	audience, err := moderationFlagAudience(ctx, tx, userID, store.MaxBotVerificationUserAudience)
+	if err != nil {
+		return err
+	}
+	if len(audience) == 0 {
+		// Revocation must remain possible after the account becomes otherwise
+		// unresolvable; retaining self as the recovery lane also matches the old
+		// edge notifier's minimum audience.
+		audience = []int64{userID}
+	}
+	snapshot := store.UserAudienceDeliverySnapshot{
+		User:     domain.User{ID: userID},
+		Audience: audience,
+	}
+	intents, err := build(snapshot)
+	if err != nil {
+		return fmt.Errorf("build bot verification user delivery: %w", err)
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, intents); err != nil {
+		return err
+	}
+	return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
+}
+
+func customVerificationForPeerTx(ctx context.Context, db sqlcgen.DBTX, peer domain.Peer, lock bool) (domain.CustomVerification, bool, error) {
+	query := `SELECT ` + customVerificationColumnList + `
+FROM custom_verifications
+WHERE peer_type = $1 AND peer_id = $2`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	mark, err := scanCustomVerification(db.QueryRow(ctx, query, string(peer.Type), peer.ID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.CustomVerification{}, false, nil
+	}
+	if err != nil {
+		return domain.CustomVerification{}, false, fmt.Errorf("get peer custom verification: %w", err)
+	}
+	return mark, true, nil
 }
 
 // CustomVerification reads one verifier's mark on a peer, whether or not that

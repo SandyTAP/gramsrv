@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
@@ -9,6 +10,22 @@ import (
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
+
+var ErrBoxIDAllocatorMissing = errors.New("postgres message store: Redis box id allocator is required")
+
+type missingBoxIDAllocator struct{}
+
+func (missingBoxIDAllocator) NextBoxID(context.Context, int64) (int, error) {
+	return 0, ErrBoxIDAllocatorMissing
+}
+
+func (missingBoxIDAllocator) NextBoxIDs(context.Context, []int64) (map[int64]int, error) {
+	return nil, ErrBoxIDAllocatorMissing
+}
+
+func (missingBoxIDAllocator) CurrentBoxID(context.Context, int64) (int, error) {
+	return 0, ErrBoxIDAllocatorMissing
+}
 
 // MessageStore 用 PostgreSQL 实现 store.MessageStore。
 type MessageStore struct {
@@ -49,7 +66,7 @@ func NewMessageStore(db sqlcgen.DBTX, opts ...MessageStoreOption) *MessageStore 
 		s.log = zap.NewNop()
 	}
 	if s.boxIDs == nil {
-		s.boxIDs = pgBoxIDAllocator{s: s}
+		s.boxIDs = missingBoxIDAllocator{}
 	}
 	return s
 }

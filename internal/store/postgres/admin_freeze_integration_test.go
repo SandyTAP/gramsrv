@@ -152,8 +152,8 @@ WHERE model = 'user_visibility' AND owner_user_id = 0 AND peer_type = 'user' AND
 	}
 	// A worker that claimed v1 before the unfreeze cannot acknowledge the
 	// coalesced v2 row and suppress its online refresh.
-	if err := store.CompleteAccountFreezeNotification(ctx, oldNotification.ID, oldNotification.Version, claimAt); err != nil {
-		t.Fatalf("complete stale notification: %v", err)
+	if err := store.CommitAccountFreezeNotificationDelivery(ctx, oldNotification.ID, oldNotification.Version, []byte{1}, claimAt); err == nil {
+		t.Fatal("stale notification delivery committed")
 	}
 	claimed, err = store.ClaimAccountFreezeNotifications(ctx, claimAt.Add(time.Minute), 10, time.Minute)
 	if err != nil || len(claimed) != 1 {
@@ -163,12 +163,22 @@ WHERE model = 'user_visibility' AND owner_user_id = 0 AND peer_type = 'user' AND
 	if newNotification.ID != oldNotification.ID || newNotification.Version != 2 || newNotification.Frozen {
 		t.Fatalf("coalesced unfreeze notification = %+v, previous=%+v", newNotification, oldNotification)
 	}
-	if err := store.CompleteAccountFreezeNotification(ctx, newNotification.ID, newNotification.Version, claimAt.Add(2*time.Minute)); err != nil {
-		t.Fatalf("complete unfreeze notification: %v", err)
+	if err := store.CommitAccountFreezeNotificationDelivery(ctx, newNotification.ID, newNotification.Version, []byte{2}, claimAt.Add(2*time.Minute)); err != nil {
+		t.Fatalf("commit unfreeze notification delivery: %v", err)
 	}
 	var notificationStatus string
 	if err := tx.QueryRow(ctx, `SELECT status FROM account_freeze_notifications WHERE id = $1`, newNotification.ID).Scan(&notificationStatus); err != nil || notificationStatus != "delivered" {
 		t.Fatalf("notification status = %q err=%v, want delivered", notificationStatus, err)
+	}
+	var deliveredRows int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1 AND payload=$2`, observerID, []byte{2}).Scan(&deliveredRows); err != nil || deliveredRows != 1 {
+		t.Fatalf("freeze delivery rows = %d err=%v, want 1", deliveredRows, err)
+	}
+	if err := store.CommitAccountFreezeNotificationDelivery(ctx, newNotification.ID, newNotification.Version, []byte{2}, claimAt.Add(3*time.Minute)); err != nil {
+		t.Fatalf("replay committed freeze delivery: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1 AND payload=$2`, observerID, []byte{2}).Scan(&deliveredRows); err != nil || deliveredRows != 1 {
+		t.Fatalf("replayed freeze delivery rows = %d err=%v, want 1", deliveredRows, err)
 	}
 	got, found, err = store.GetAccountFreeze(ctx, activeUserID)
 	if err != nil || !found || got.Frozen || !got.Since.IsZero() || !got.Until.IsZero() || got.AppealURL != "" || got.Version != 2 {

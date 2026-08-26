@@ -126,7 +126,7 @@ func (s *Service) warmBlobBytes(ctx context.Context, blob domain.FileBlob) (bool
 		return false, fmt.Errorf("read blob %q: %w", blob.LocationKey, err)
 	}
 	if total <= blobBytesCacheMaxEntryBytes && int64(len(data)) == total {
-		s.byteCache.put(blob.ObjectKey, data)
+		s.byteCache.putOwned(blob.ObjectKey, data)
 		return true, nil
 	}
 	return false, nil

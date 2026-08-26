@@ -29,7 +29,7 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: peerUser.ID}
 	media := &domain.MessageMedia{
 		Kind: domain.MessageMediaKindDocument,
@@ -49,7 +49,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		Media:        media,
 		ScheduleDate: 1700003600,
 		Date:         1700000000,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("create media scheduled message: %v", err)
 	}
@@ -60,7 +61,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		ID:           scheduled.ID,
 		ScheduleDate: 1700007200,
 		Date:         1700000100,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("date-only edit scheduled message: %v", err)
 	}
@@ -76,7 +78,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		Message:      "",
 		ScheduleDate: 1700010800,
 		Date:         1700000200,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("empty-caption edit scheduled media: %v", err)
 	}
@@ -91,7 +94,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		Message:      "text",
 		ScheduleDate: 1700014400,
 		Date:         1700000300,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("create text scheduled message: %v", err)
 	}
@@ -103,7 +107,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		Message:      "",
 		ScheduleDate: 1700018000,
 		Date:         1700000400,
-	})
+	}, testScheduledMessageEffects)
+
 	if !errors.Is(err, domain.ErrMessageEmpty) {
 		t.Fatalf("empty text scheduled edit err = %v, want ErrMessageEmpty", err)
 	}
@@ -116,7 +121,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		RichMessage:  richInitial,
 		ScheduleDate: 1700021600,
 		Date:         1700000500,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("create rich scheduled message: %v", err)
 	}
@@ -141,7 +147,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		ID:           richOnly.ID,
 		ScheduleDate: 1700025200,
 		Date:         1700000600,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("date-only edit rich scheduled message: %v", err)
 	}
@@ -157,7 +164,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		RichMessage:    richEdited,
 		ScheduleDate:   1700028800,
 		Date:           1700000700,
-	})
+	}, testScheduledMessageEffects)
+
 	if err != nil {
 		t.Fatalf("edit rich scheduled message: %v", err)
 	}
@@ -171,7 +179,8 @@ func TestScheduledMessageEditPreservesContentWhenMessageUnset(t *testing.T) {
 		SetRichMessage: true,
 		ScheduleDate:   1700032400,
 		Date:           1700000800,
-	})
+	}, testScheduledMessageEffects)
+
 	if !errors.Is(err, domain.ErrMessageEmpty) {
 		t.Fatalf("clear only rich scheduled edit err = %v, want ErrMessageEmpty", err)
 	}

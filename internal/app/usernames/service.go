@@ -45,20 +45,31 @@ const (
 // a caller bug rather than a client-visible protocol state.
 var ErrPeerInvalid = errors.New("username peer invalid")
 
-// PeerUsernameNotifier is the domain-only edge hook invoked after a username
-// registry mutation. The RPC router implements it: it invalidates the cached
-// peer projections and pushes the username change to online clients, exactly
-// like the account.updateUsername path does for the editable slot. Keeping it an
-// injected port means this package never depends on the protocol edge.
+// PeerUsernameNotifier remains only for channel targets. User-target delivery is
+// a mandatory transaction effect owned by the username store.
 type PeerUsernameNotifier interface {
 	NotifyPeerUsernamesChanged(ctx context.Context, peer domain.Peer) error
 }
 
+// RegistryStore and CollectibleStore make the delivery-aware mutation boundary
+// a construction-time requirement. A read-only/legacy writer cannot be wired
+// and discovered only after a request has already reached the service.
+type RegistryStore interface {
+	store.UsernameRegistryStore
+	store.UsernameRegistryDeliveryStore
+}
+
+type CollectibleStore interface {
+	store.CollectibleUsernameStore
+	store.CollectibleUsernameDeliveryStore
+}
+
 // Service is the collectible username use-case layer.
 type Service struct {
-	registry     store.UsernameRegistryStore
-	collectibles store.CollectibleUsernameStore
+	registry     RegistryStore
+	collectibles CollectibleStore
 	notifier     PeerUsernameNotifier
+	userDelivery store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]
 
 	// urlTemplate is the operator-provided collectible landing URL template;
 	// publicBaseURL is the fallback root the default route is built from.
@@ -73,12 +84,12 @@ type Service struct {
 type Option func(*Service)
 
 // WithRegistryStore injects the peer username registry reader/writer.
-func WithRegistryStore(registry store.UsernameRegistryStore) Option {
+func WithRegistryStore(registry RegistryStore) Option {
 	return func(s *Service) { s.registry = registry }
 }
 
 // WithCollectibleStore injects the collectible asset lifecycle store.
-func WithCollectibleStore(collectibles store.CollectibleUsernameStore) Option {
+func WithCollectibleStore(collectibles CollectibleStore) Option {
 	return func(s *Service) { s.collectibles = collectibles }
 }
 
@@ -146,19 +157,29 @@ func (s *Service) SetPeerUsernameNotifier(notifier PeerUsernameNotifier) {
 	s.notifier = notifier
 }
 
+// SetUserAudienceDelivery installs the late-bound protocol projector. The
+// service fails closed at every mutation while this mandatory dependency is
+// absent; nil can never clear a production binding.
+func (s *Service) SetUserAudienceDelivery(effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) {
+	if s == nil || effects == nil {
+		return
+	}
+	s.userDelivery = effects
+}
+
 // Configured reports whether both registries are installed.
 func (s *Service) Configured() bool {
 	return s != nil && s.registry != nil && s.collectibles != nil
 }
 
-func (s *Service) registryStore() (store.UsernameRegistryStore, error) {
+func (s *Service) registryStore() (RegistryStore, error) {
 	if s == nil || s.registry == nil {
 		return nil, fmt.Errorf("username registry store is not configured")
 	}
 	return s.registry, nil
 }
 
-func (s *Service) collectibleStore() (store.CollectibleUsernameStore, error) {
+func (s *Service) collectibleStore() (CollectibleStore, error) {
 	if s == nil || s.collectibles == nil {
 		return nil, fmt.Errorf("collectible username store is not configured")
 	}
@@ -238,12 +259,15 @@ func (s *Service) ToggleUsername(ctx context.Context, peer domain.Peer, username
 	if err := domain.ValidateUsernameToggle(current, username, active); err != nil {
 		return false, err
 	}
-	changed, err := registry.SetUsernameActive(ctx, peer, username, active)
+	if s.userDelivery == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	changed, err := registry.SetUsernameActiveWithDelivery(ctx, peer, username, active, s.userDelivery)
 	if err != nil {
 		return false, err
 	}
 	if changed {
-		s.notifyPeers(ctx, peer)
+		s.notifyChannelPeers(ctx, peer)
 	}
 	return changed, nil
 }
@@ -269,12 +293,15 @@ func (s *Service) ReorderUsernames(ctx context.Context, peer domain.Peer, order 
 	if err := domain.ValidateUsernameReorder(current, normalized); err != nil {
 		return false, err
 	}
-	changed, err := registry.ReorderUsernames(ctx, peer, normalized)
+	if s.userDelivery == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	changed, err := registry.ReorderUsernamesWithDelivery(ctx, peer, normalized, s.userDelivery)
 	if err != nil {
 		return false, err
 	}
 	if changed {
-		s.notifyPeers(ctx, peer)
+		s.notifyChannelPeers(ctx, peer)
 	}
 	return changed, nil
 }
@@ -288,12 +315,15 @@ func (s *Service) DeactivateAllUsernames(ctx context.Context, peer domain.Peer) 
 	if !validPeer(peer) {
 		return false, ErrPeerInvalid
 	}
-	changed, err := registry.DeactivateAllUsernames(ctx, peer)
+	if s.userDelivery == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	changed, err := registry.DeactivateAllUsernamesWithDelivery(ctx, peer, s.userDelivery)
 	if err != nil {
 		return false, err
 	}
 	if changed {
-		s.notifyPeers(ctx, peer)
+		s.notifyChannelPeers(ctx, peer)
 	}
 	return changed, nil
 }
@@ -342,12 +372,15 @@ func (s *Service) Mint(ctx context.Context, req domain.MintCollectibleUsernameRe
 	if err := req.Validate(); err != nil {
 		return domain.CollectibleUsername{}, false, err
 	}
-	asset, created, err := collectibles.MintCollectibleUsername(ctx, req)
+	if s.userDelivery == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	asset, created, err := collectibles.MintCollectibleUsernameWithDelivery(ctx, req, s.userDelivery)
 	if err != nil {
 		return domain.CollectibleUsername{}, false, err
 	}
 	if created {
-		s.notifyPeers(ctx, req.Owner, asset.Owner)
+		s.notifyChannelPeers(ctx, req.Owner, asset.Owner)
 	}
 	return asset, created, nil
 }
@@ -367,12 +400,15 @@ func (s *Service) Transfer(ctx context.Context, req domain.TransferCollectibleUs
 		return domain.CollectibleUsername{}, false, err
 	}
 	previousOwner := s.currentOwner(ctx, collectibles, req.Username)
-	asset, changed, err := collectibles.TransferCollectibleUsername(ctx, req)
+	if s.userDelivery == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	asset, changed, err := collectibles.TransferCollectibleUsernameWithDelivery(ctx, req, s.userDelivery)
 	if err != nil {
 		return domain.CollectibleUsername{}, false, err
 	}
 	if changed {
-		s.notifyPeers(ctx, previousOwner, req.To, asset.Owner)
+		s.notifyChannelPeers(ctx, previousOwner, req.To, asset.Owner)
 	}
 	return asset, changed, nil
 }
@@ -391,12 +427,15 @@ func (s *Service) Revoke(ctx context.Context, req domain.RevokeCollectibleUserna
 		return domain.CollectibleUsername{}, false, err
 	}
 	previousOwner := s.currentOwner(ctx, collectibles, req.Username)
-	asset, changed, err := collectibles.RevokeCollectibleUsername(ctx, req)
+	if s.userDelivery == nil {
+		return domain.CollectibleUsername{}, false, store.ErrDeliveryOutboxRequired
+	}
+	asset, changed, err := collectibles.RevokeCollectibleUsernameWithDelivery(ctx, req, s.userDelivery)
 	if err != nil {
 		return domain.CollectibleUsername{}, false, err
 	}
 	if changed {
-		s.notifyPeers(ctx, previousOwner, asset.Owner)
+		s.notifyChannelPeers(ctx, previousOwner, asset.Owner)
 	}
 	return asset, changed, nil
 }
@@ -420,12 +459,15 @@ func (s *Service) Delete(ctx context.Context, req domain.DeleteCollectibleUserna
 		return false, err
 	}
 	previousOwner := s.currentOwner(ctx, collectibles, req.Username)
-	deleted, err := collectibles.DeleteCollectibleUsername(ctx, req)
+	if s.userDelivery == nil {
+		return false, store.ErrDeliveryOutboxRequired
+	}
+	deleted, err := collectibles.DeleteCollectibleUsernameWithDelivery(ctx, req, s.userDelivery)
 	if err != nil {
 		return false, err
 	}
 	if deleted {
-		s.notifyPeers(ctx, previousOwner, domain.Peer{})
+		s.notifyChannelPeers(ctx, previousOwner, domain.Peer{})
 	}
 	return deleted, nil
 }
@@ -490,7 +532,7 @@ func (s *Service) CollectibleURL(username string) string {
 // peer's projection is invalidated too. It is best effort: a missing or
 // unreadable asset only means there is no extra peer to notify, and the
 // mutation itself remains the authority.
-func (s *Service) currentOwner(ctx context.Context, collectibles store.CollectibleUsernameStore, username string) domain.Peer {
+func (s *Service) currentOwner(ctx context.Context, collectibles CollectibleStore, username string) domain.Peer {
 	asset, err := collectibles.CollectibleUsername(ctx, username)
 	if err != nil {
 		if !errors.Is(err, domain.ErrCollectibleUsernameNotFound) {
@@ -506,17 +548,16 @@ func (s *Service) currentOwner(ctx context.Context, collectibles store.Collectib
 	return asset.Owner
 }
 
-// notifyPeers invalidates projections and pushes updates for every distinct
-// affected peer. Notification is best effort: the registry mutation already
-// committed, and a failed push converges through the client's next
-// authoritative peer read.
-func (s *Service) notifyPeers(ctx context.Context, peers ...domain.Peer) {
+// notifyChannelPeers preserves the channel-specific post-commit hook. User
+// peers are deliberately ignored because their durable effects were committed
+// by the store transaction and a second notifier would duplicate delivery.
+func (s *Service) notifyChannelPeers(ctx context.Context, peers ...domain.Peer) {
 	if s == nil || s.notifier == nil {
 		return
 	}
 	seen := make(map[domain.Peer]struct{}, len(peers))
 	for _, peer := range peers {
-		if !validPeer(peer) {
+		if peer.Type != domain.PeerTypeChannel || peer.ID <= 0 {
 			continue
 		}
 		if _, ok := seen[peer]; ok {

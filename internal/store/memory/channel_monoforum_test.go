@@ -12,7 +12,7 @@ import (
 // 与 postgres 实现行为对齐。
 func TestSetPaidMessagesPriceCreatesAndReusesMonoforum(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	broadcast, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1, Title: "DM Broadcast", Broadcast: true, Date: 1_700_000_900,
 	})
@@ -44,7 +44,8 @@ func TestSetPaidMessagesPriceCreatesAndReusesMonoforum(t *testing.T) {
 	for _, userID := range []int64{1, 42} {
 		read, err := store.ReadChannelHistory(ctx, domain.ReadChannelHistoryRequest{
 			UserID: userID, ChannelID: monoID, MaxID: mono.TopMessageID, Date: 1_700_000_901,
-		})
+		}, testChannelReadEffects)
+
 		if err != nil {
 			t.Fatalf("synthetic monoforum read for %d: %v", userID, err)
 		}
@@ -171,7 +172,7 @@ func TestSetPaidMessagesPriceCreatesAndReusesMonoforum(t *testing.T) {
 // 普通 megagroup。非管理员既拿不到 monoforum 也不会被泄漏母频道。
 func TestGetChannelDialogsCoDeliversMonoforumParent(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	broadcast, err := store.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: 1, Title: "DM Broadcast", Broadcast: true, Date: 1_700_000_900})
 	if err != nil {
 		t.Fatalf("create broadcast: %v", err)

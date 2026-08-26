@@ -20,7 +20,7 @@ func TestInjectPaidReactionRequesterView(t *testing.T) {
 		},
 	}
 	mr := &tg.MessageReactions{Results: []tg.ReactionCount{}}
-	injectPaidReaction(mr, clonePaidForViewer(paid, true))
+	injectPaidReaction(mr, paid)
 
 	if len(mr.Results) != 1 {
 		t.Fatalf("results = %d, want 1 paid", len(mr.Results))
@@ -52,30 +52,6 @@ func TestInjectPaidReactionRequesterView(t *testing.T) {
 	}
 }
 
-// 非请求者视角：无 chosen、My 一律抹去（min 语义防串视角）。
-func TestInjectPaidReactionOtherViewerScrubsMy(t *testing.T) {
-	paid := domain.ChannelMessagePaidReactions{
-		TotalStars: 150,
-		MyStars:    50,
-		TopReactors: []domain.PaidReactor{
-			{UserID: 2, Stars: 100, My: false},
-			{UserID: 1, Stars: 50, My: true},
-		},
-	}
-	mr := &tg.MessageReactions{Results: []tg.ReactionCount{}}
-	injectPaidReaction(mr, clonePaidForViewer(paid, false))
-
-	if _, ok := mr.Results[0].GetChosenOrder(); ok {
-		t.Fatalf("non-requester chosen must be unset")
-	}
-	reactors, _ := mr.GetTopReactors()
-	for i, rr := range reactors {
-		if rr.My {
-			t.Fatalf("reactor[%d] My must be scrubbed for non-requester: %+v", i, rr)
-		}
-	}
-}
-
 // 匿名 reactor（非本人）：Anonymous 置位、不暴露 PeerID。
 func TestInjectPaidReactionAnonymousHidesPeer(t *testing.T) {
 	paid := domain.ChannelMessagePaidReactions{
@@ -83,7 +59,7 @@ func TestInjectPaidReactionAnonymousHidesPeer(t *testing.T) {
 		TopReactors: []domain.PaidReactor{{UserID: 9, Stars: 100, Anonymous: true, My: false}},
 	}
 	mr := &tg.MessageReactions{Results: []tg.ReactionCount{}}
-	injectPaidReaction(mr, clonePaidForViewer(paid, true))
+	injectPaidReaction(mr, paid)
 	reactors, ok := mr.GetTopReactors()
 	if !ok || len(reactors) != 1 {
 		t.Fatalf("reactors = %d ok %v, want 1", len(reactors), ok)

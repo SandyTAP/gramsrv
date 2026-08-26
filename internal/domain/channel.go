@@ -1626,6 +1626,9 @@ type SendChannelMessageRequest struct {
 	Action      *ChannelMessageAction
 	Date        int
 	TTLPeriod   int
+	// ClearDraft joins the sender's channel/topic draft deletion and account
+	// PTS delivery fact to the channel-message transaction.
+	ClearDraft bool
 }
 
 // SendMonoforumMessageRequest 向频道私信(monoforum)发送一条消息。MonoforumID 是 monoforum
@@ -1839,6 +1842,9 @@ type SendChannelMessageResult struct {
 	Event      ChannelUpdateEvent
 	Recipients []int64
 	Duplicate  bool
+	// DraftEvent is the account-scoped draft deletion committed by the first
+	// send. The channel message itself remains in the channel PTS domain.
+	DraftEvent UpdateEvent
 	// SenderStarsBalance 仅在实际发生 paid-message 借记时返回；RPC 只向发件人投影余额更新。
 	SenderStarsBalance *StarsBalance
 	// ReplayDeleteEvent is the existing durable channel delete event paired
@@ -2431,6 +2437,10 @@ type ReadChannelHistoryResult struct {
 	Forum         bool
 	Dialog        ChannelDialog
 	OutboxUpdates []ChannelReadOutboxUpdate
+	// GeneralTopic is advanced in the same channel-store transaction for a
+	// forum-wide read. It is nil when the channel is not a forum or General did
+	// not require a watermark change.
+	GeneralTopic *ReadChannelTopicHistoryResult
 }
 
 // ReadChannelTopicHistoryRequest 推进 forum 单个话题的 per-viewer 已读水位（messages.readDiscussion）。

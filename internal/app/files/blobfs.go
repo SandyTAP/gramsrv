@@ -21,18 +21,24 @@ import (
 // 内容寻址：Put 返回的 objectKey 是内容 sha256，相同内容自动去重。
 type BlobBackend interface {
 	Name() string
+	// Put borrows data as read-only until the call returns and must not retain it.
 	Put(ctx context.Context, data []byte) (objectKey string, err error)
+	// PutReader consumes r before returning and transfers ownership of sha256.
 	PutReader(ctx context.Context, r io.Reader) (objectKey string, size int64, sha256 []byte, err error)
+	// Get transfers ownership of the returned bytes to the caller.
 	Get(ctx context.Context, objectKey string) ([]byte, error)
 	// GetRange 只读 [offset, offset+limit) 段并返回该段字节与文件总大小（limit<=0 读到末尾），
 	// 避免大文件每个 chunk 都整文件读入内存（getFile 按 chunk 多次请求 ⇒ 否则 O(N²) 放大）。
+	// 返回的 data 会将所有权移交给调用者，后端不得继续引用或修改。
 	GetRange(ctx context.Context, objectKey string, offset, limit int64) (data []byte, total int64, err error)
 }
 
 // UploadPartBackend 保存 upload.saveFilePart/saveBigFilePart 的临时分片字节。
 // 与正式 blob 不同，上传分片 key 唯一且可删除，成功组装/覆盖重传/GC 后必须清理。
 type UploadPartBackend interface {
+	// PutUploadPart borrows data as read-only until the call returns and must not retain it.
 	PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (UploadPartObject, error)
+	// GetUploadPart transfers ownership of the returned bytes to the caller.
 	GetUploadPart(ctx context.Context, objectKey string) ([]byte, error)
 	OpenUploadPart(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	DeleteUploadPart(ctx context.Context, objectKey string) error
@@ -43,7 +49,8 @@ type UploadPartObject struct {
 	Backend   domain.MediaBackend
 	ObjectKey string
 	Size      int64
-	SHA256    []byte
+	// SHA256 is exclusively owned by this value and may move into a wire response.
+	SHA256 []byte
 }
 
 // LocalFS 把 blob 字节存到本地磁盘根目录下，路径按内容 hash 两级 fanout。
@@ -120,7 +127,7 @@ func (l *LocalFS) PutReader(ctx context.Context, r io.Reader) (string, int64, []
 	if _, err := os.Stat(path); err == nil {
 		committed = true
 		_ = os.Remove(tmpPath)
-		return key, size, append([]byte(nil), sum...), nil
+		return key, size, sum, nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return "", 0, nil, fmt.Errorf("stat blob: %w", err)
 	}
@@ -131,12 +138,12 @@ func (l *LocalFS) PutReader(ctx context.Context, r io.Reader) (string, int64, []
 		if _, statErr := os.Stat(path); statErr == nil {
 			committed = true
 			_ = os.Remove(tmpPath)
-			return key, size, append([]byte(nil), sum...), nil
+			return key, size, sum, nil
 		}
 		return "", 0, nil, fmt.Errorf("commit blob: %w", err)
 	}
 	committed = true
-	return key, size, append([]byte(nil), sum...), nil
+	return key, size, sum, nil
 }
 
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
@@ -274,7 +281,7 @@ func (l *LocalFS) PutUploadPart(_ context.Context, ownerUserID, fileID int64, pa
 		Backend:   domain.MediaBackend(l.Name()),
 		ObjectKey: key,
 		Size:      int64(len(data)),
-		SHA256:    append([]byte(nil), sum[:]...),
+		SHA256:    sum[:],
 	}, nil
 }
 

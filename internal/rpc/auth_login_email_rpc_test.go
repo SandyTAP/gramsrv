@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store/memory"
 )
 
 type loginEmailAccountService struct {
@@ -109,13 +110,16 @@ func TestAuthSignInRoutesOfficialEmailCodeCarriers(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			authSvc := &captureAuthService{signInUser: domain.User{ID: 100200301, Phone: "8618800000021", FirstName: "Alice"}}
-			r := New(Config{}, Deps{Auth: authSvc}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000000, 0)})
+			r := New(Config{}, Deps{Auth: authSvc, DeliveryOutbox: memory.NewDeliveryOutboxStore()}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000000, 0)})
 
-			if _, err := r.onAuthSignIn(context.Background(), tc.request()); err != nil {
+			if _, err := r.onAuthSignIn(authorizationDeliveryTestContext(context.Background()), tc.request()); err != nil {
 				t.Fatalf("onAuthSignIn: %v", err)
 			}
 			if authSvc.signInCount != tc.wantPhoneCodeCalls || authSvc.signInWithEmailCount != tc.wantEmailCodeCalls {
 				t.Fatalf("SignIn/SignInWithEmail calls=%d/%d, want %d/%d", authSvc.signInCount, authSvc.signInWithEmailCount, tc.wantPhoneCodeCalls, tc.wantEmailCodeCalls)
+			}
+			if len(authSvc.authorizationEffects) != 1 || authSvc.authorizationEffects[0].ExcludeSessionID != 909 || authSvc.authorizationEffects[0].ExcludeAuthKeyID != ([8]byte{0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}) {
+				t.Fatalf("authorization delivery effects = %+v, want one effect excluding login session", authSvc.authorizationEffects)
 			}
 			if tc.wantPhoneCodeCalls == 1 && (authSvc.signInPhone != phone || authSvc.signInHash != hash || authSvc.signInCode != code) {
 				t.Fatalf("SignIn proof=%q/%q/%q, want %q/%q/%q", authSvc.signInPhone, authSvc.signInHash, authSvc.signInCode, phone, hash, code)
@@ -136,11 +140,12 @@ func TestAccountVerifyEmailLoginSetupReturnsSentCodeSuccess(t *testing.T) {
 	}
 	authSvc := &captureAuthService{signInUser: user}
 	r := New(Config{}, Deps{
-		Auth:    authSvc,
-		Account: loginEmailAccountService{verifiedEmail: "alice@example.test"},
+		Auth:           authSvc,
+		Account:        loginEmailAccountService{verifiedEmail: "alice@example.test"},
+		DeliveryOutbox: memory.NewDeliveryOutboxStore(),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000000, 0)})
 
-	got, err := r.onAccountVerifyEmail(context.Background(), &tg.AccountVerifyEmailRequest{
+	got, err := r.onAccountVerifyEmail(authorizationDeliveryTestContext(context.Background()), &tg.AccountVerifyEmailRequest{
 		Purpose: &tg.EmailVerifyPurposeLoginSetup{
 			PhoneNumber:   "+86 188 0000 0020",
 			PhoneCodeHash: "hash-email-setup",

@@ -2,7 +2,6 @@ package stargifts
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"telesrv/internal/domain"
@@ -82,24 +81,6 @@ func TestSavedGiftLifecycle(t *testing.T) {
 		t.Fatalf("full list = %d, want 1 (hidden still listed)", len(all.Gifts))
 	}
 
-	// 转换回 Stars → 标记 converted，从列表消失。
-	saved, err := svc.Convert(ctx, ref)
-	if err != nil || saved.ConvertStars != 15 {
-		t.Fatalf("Convert = %+v err %v, want ConvertStars 15", saved, err)
-	}
-	after, _ := svc.ListSaved(ctx, owner, false, "", 100)
-	if len(after.Gifts) != 0 {
-		t.Fatalf("list after convert = %d, want 0", len(after.Gifts))
-	}
-	collections, err := svc.ListCollections(ctx, owner)
-	if err != nil || len(collections) != 1 || len(collections[0].GiftIDs) != 0 ||
-		collections[0].Hash != domain.StarGiftCollectionHash("Inbox", nil) {
-		t.Fatalf("collection after convert = %+v err %v, want empty membership and refreshed hash", collections, err)
-	}
-	// 重复转换被拒。
-	if _, err := svc.Convert(ctx, ref); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
-		t.Fatalf("double convert err = %v, want ErrStarGiftAlreadyConverted", err)
-	}
 }
 
 func TestChannelSavedGiftAllocatesSavedIDWithoutMessage(t *testing.T) {

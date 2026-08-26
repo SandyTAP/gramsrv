@@ -2,11 +2,13 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *MessageStore) GetByIDs(_ context.Context, userID int64, ids []int) (domain.MessageList, error) {
@@ -82,16 +84,25 @@ func (s *MessageStore) ReadHistory(_ context.Context, req domain.ReadHistoryRequ
 	if req.OwnerUserID == 0 || req.Peer.ID == 0 {
 		return res, nil
 	}
+	if (req.OriginAuthKeyID == ([8]byte{})) != (req.OriginSessionID == 0) {
+		return res, fmt.Errorf("read history: origin exclusion requires both raw auth key and session id")
+	}
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.dialogs == nil {
-		return res, nil
+		return res, fmt.Errorf("read history: dialog store is required")
+	}
+	events := s.updateEvents
+	if events == nil {
+		return res, store.ErrDeliveryOutboxRequired
 	}
 	s.dialogs.mu.Lock()
 	defer s.dialogs.mu.Unlock()
+	events.mu.Lock()
+	defer events.mu.Unlock()
 	list := s.dialogs.m[req.OwnerUserID]
 	for i, dialog := range list.Dialogs {
 		if dialog.Peer != req.Peer {
@@ -151,17 +162,16 @@ func (s *MessageStore) ReadHistory(_ context.Context, req domain.ReadHistoryRequ
 		// readHistory 不清 reaction 角标（与 PG 一致，见上）。
 		dialog.UnreadMark = false
 		res.StillUnreadCount = unread
-		pts := s.nextPtsLocked(req.OwnerUserID)
 		res.InboxEvent = domain.UpdateEvent{
 			UserID:           req.OwnerUserID,
 			Type:             domain.UpdateEventReadHistoryInbox,
-			Pts:              pts,
 			PtsCount:         1,
 			Date:             req.Date,
 			Peer:             req.Peer,
 			MaxID:            readMax,
 			StillUnreadCount: unread,
 		}
+		res.InboxEvent = appendMemoryAllocatedMessageEventLocked(s, events, req.OwnerUserID, res.InboxEvent, req.OriginAuthKeyID, req.OriginSessionID)
 		list.Dialogs[i] = dialog
 		s.dialogs.m[req.OwnerUserID] = list
 
@@ -192,18 +202,17 @@ func (s *MessageStore) ReadHistory(_ context.Context, req domain.ReadHistoryRequ
 							s.readOutboxDates[readOutboxDateKey{ownerUserID: senderUserID, peerID: req.OwnerUserID, msgID: msg.ID}] = req.Date
 						}
 					}
-					outPts := s.nextPtsLocked(senderUserID)
 					res.OutboxChanged = true
 					res.OutboxUserID = senderUserID
 					res.OutboxEvent = domain.UpdateEvent{
 						UserID:   senderUserID,
 						Type:     domain.UpdateEventReadHistoryOutbox,
-						Pts:      outPts,
 						PtsCount: 1,
 						Date:     req.Date,
 						Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: req.OwnerUserID},
 						MaxID:    senderBoxID,
 					}
+					res.OutboxEvent = appendMemoryAllocatedMessageEventLocked(s, events, senderUserID, res.OutboxEvent, [8]byte{}, 0)
 					break
 				}
 			}

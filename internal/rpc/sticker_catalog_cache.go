@@ -31,26 +31,23 @@ func newStickerCatalogCache(now func() time.Time) *stickerCatalogCache {
 	}
 }
 
-// stickerCatalogSets 返回某 kind 的（缓存的）贴纸集目录。Files 缺失或出错返回 nil。
+// stickerCatalogSets 返回某 kind 的（缓存的）贴纸集目录。依赖或存储错误原样返回，
+// 调用方不得把失败解释为空目录。
 // 返回的切片只读（调用方不得修改元素），需要派生时各自计算 hash/过滤。
-func (r *Router) stickerCatalogSets(ctx context.Context, kind domain.StickerSetKind) []domain.StickerSet {
+func (r *Router) stickerCatalogSets(ctx context.Context, kind domain.StickerSetKind) ([]domain.StickerSet, error) {
 	if r.deps.Files == nil {
-		return nil
+		return nil, domain.ErrStickerInvalid
 	}
 	if r.stickerCatalog == nil {
-		sets, err := r.deps.Files.ListStickerSets(ctx, kind)
-		if err != nil {
-			return nil
-		}
-		return sets
+		return r.deps.Files.ListStickerSets(ctx, kind)
 	}
 	sets, err := r.stickerCatalog.cache.GetOrLoad(ctx, kind, func() ([]domain.StickerSet, error) {
 		return r.deps.Files.ListStickerSets(ctx, kind)
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return sets
+	return sets, nil
 }
 
 func (r *Router) invalidateStickerCatalog(kind domain.StickerSetKind) {

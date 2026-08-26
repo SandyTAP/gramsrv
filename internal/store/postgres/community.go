@@ -25,10 +25,10 @@ type CommunityStore struct {
 
 func NewCommunityStore(db sqlcgen.DBTX, ids store.ChannelIDAllocator, msgIDs store.ChannelMessageIDAllocator) *CommunityStore {
 	if ids == nil {
-		ids = pgChannelIDAllocator{db: db}
+		ids = missingChannelIDAllocator{}
 	}
 	if msgIDs == nil {
-		msgIDs = pgChannelMessageIDAllocator{db: db}
+		msgIDs = missingChannelMessageIDAllocator{}
 	}
 	return &CommunityStore{db: db, ids: ids, msgIDs: msgIDs}
 }
@@ -292,6 +292,77 @@ FROM community_members WHERE community_id=$1`, c.ID).
 	return view, nil
 }
 
+func communityDeliverySnapshotTx(ctx context.Context, tx pgx.Tx, communityID int64, targetUserIDs ...int64) (store.CommunityDeliverySnapshot, error) {
+	seen := make(map[int64]struct{}, len(targetUserIDs))
+	snapshot := store.CommunityDeliverySnapshot{Targets: make([]store.CommunityDeliveryTarget, 0, len(targetUserIDs))}
+	for _, targetUserID := range targetUserIDs {
+		if targetUserID <= 0 {
+			return store.CommunityDeliverySnapshot{}, fmt.Errorf("community delivery target user id is required")
+		}
+		if _, duplicate := seen[targetUserID]; duplicate {
+			continue
+		}
+		seen[targetUserID] = struct{}{}
+		view, err := communityView(ctx, tx, targetUserID, communityID)
+		if errors.Is(err, domain.ErrCommunityPrivate) {
+			// The forbidden projection returned by communityView is itself the
+			// authoritative post-state for a viewer who just lost access.
+			err = nil
+		}
+		if err != nil {
+			return store.CommunityDeliverySnapshot{}, err
+		}
+		snapshot.Targets = append(snapshot.Targets, store.CommunityDeliveryTarget{TargetUserID: targetUserID, View: view})
+	}
+	return snapshot, nil
+}
+
+func applyCommunityDeliveryEffectsTx(ctx context.Context, tx pgx.Tx, snapshot store.CommunityDeliverySnapshot, build store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return fmt.Errorf("build community delivery effects: %w", err)
+	}
+	if len(effects) != len(snapshot.Targets) {
+		return fmt.Errorf("community delivery effects count %d does not match target count %d", len(effects), len(snapshot.Targets))
+	}
+	expected := make(map[int64]struct{}, len(snapshot.Targets))
+	for _, target := range snapshot.Targets {
+		if target.TargetUserID <= 0 {
+			return fmt.Errorf("community delivery snapshot contains invalid target")
+		}
+		expected[target.TargetUserID] = struct{}{}
+	}
+	for i := range effects {
+		if effects[i].Kind != store.DeliveryEffectAbsolute {
+			return fmt.Errorf("community delivery effect %d must be absolute", i)
+		}
+		if _, ok := expected[effects[i].TargetUserID]; !ok {
+			return fmt.Errorf("community delivery effect %d has unexpected target %d", i, effects[i].TargetUserID)
+		}
+		delete(expected, effects[i].TargetUserID)
+	}
+	if len(expected) != 0 {
+		return fmt.Errorf("community delivery effects omit %d targets", len(expected))
+	}
+	if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, effects); err != nil {
+		return fmt.Errorf("apply community delivery effects: %w", err)
+	}
+	return nil
+}
+
+func actorCommunityDeliverySnapshot(actorUserID int64, view domain.CommunityView, changed bool) store.CommunityDeliverySnapshot {
+	if !changed {
+		return store.CommunityDeliverySnapshot{}
+	}
+	return store.CommunityDeliverySnapshot{Targets: []store.CommunityDeliveryTarget{{
+		TargetUserID: actorUserID,
+		View:         view,
+	}}}
+}
+
 func (s *CommunityStore) GetCommunity(ctx context.Context, viewerUserID, communityID int64) (domain.CommunityView, error) {
 	return communityView(ctx, s.db, viewerUserID, communityID)
 }
@@ -505,8 +576,18 @@ func lockCommunityActor(ctx context.Context, tx pgx.Tx, actorUserID, communityID
 	return c, m, nil
 }
 
-func (s *CommunityStore) ToggleCommunityPeerLink(ctx context.Context, req domain.CommunityTogglePeerLinkRequest) (domain.CommunityTogglePeerLinkResult, error) {
+func (s *CommunityStore) ToggleCommunityPeerLink(ctx context.Context, req domain.CommunityTogglePeerLinkRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error) {
 	return withCommunityTx(ctx, s, func(tx pgx.Tx) (domain.CommunityTogglePeerLinkResult, error) {
+		finish := func(result domain.CommunityTogglePeerLinkResult, targetUserIDs ...int64) (domain.CommunityTogglePeerLinkResult, error) {
+			snapshot, err := communityDeliverySnapshotTx(ctx, tx, req.CommunityID, targetUserIDs...)
+			if err != nil {
+				return domain.CommunityTogglePeerLinkResult{}, err
+			}
+			if err := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); err != nil {
+				return domain.CommunityTogglePeerLinkResult{}, err
+			}
+			return result, nil
+		}
 		c, actor, err := lockCommunityActor(ctx, tx, req.ActorUserID, req.CommunityID)
 		if err != nil {
 			return domain.CommunityTogglePeerLinkResult{}, err
@@ -529,7 +610,7 @@ func (s *CommunityStore) ToggleCommunityPeerLink(ctx context.Context, req domain
 			if err != nil {
 				return domain.CommunityTogglePeerLinkResult{}, err
 			}
-			return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, ServiceMessage: serviceMessage, Removed: true}, nil
+			return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, ServiceMessage: serviceMessage, Removed: true}, req.ActorUserID)
 		}
 		if actor.CanManageLinkedPeers() {
 			link, err := insertCommunityLink(ctx, tx, c.ID, req.ActorUserID, req.Peer, req.Visibility, req.Date)
@@ -540,7 +621,7 @@ func (s *CommunityStore) ToggleCommunityPeerLink(ctx context.Context, req domain
 			if err != nil {
 				return domain.CommunityTogglePeerLinkResult{}, err
 			}
-			return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, Link: &link, ServiceMessage: serviceMessage}, nil
+			return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, Link: &link, ServiceMessage: serviceMessage}, req.ActorUserID)
 		}
 		if c.DefaultBannedRights.ManageLinkedPeers {
 			return domain.CommunityTogglePeerLinkResult{}, domain.ErrCommunityAdminRequired
@@ -555,37 +636,53 @@ ON CONFLICT(community_id,peer_type,peer_id) DO UPDATE SET requested_by=EXCLUDED.
 			c.ID, string(req.Peer.Type), req.Peer.ID, req.ActorUserID, string(req.Visibility), req.Date); err != nil {
 			return domain.CommunityTogglePeerLinkResult{}, fmt.Errorf("save community link request: %w", err)
 		}
-		return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, RequestCreated: true}, nil
+		return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, RequestCreated: true})
 	})
 }
 
-func (s *CommunityStore) SetCommunityCollapsed(ctx context.Context, userID, communityID int64, collapsed bool) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) SetCommunityCollapsed(ctx context.Context, userID, communityID int64, collapsed bool, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		if _, _, err := lockCommunityActor(ctx, tx, userID, communityID); err != nil {
-			return false, err
+			return result{}, err
 		}
 		var old bool
 		err := tx.QueryRow(ctx, `SELECT collapsed FROM community_user_states WHERE community_id=$1 AND user_id=$2 FOR UPDATE`, communityID, userID).Scan(&old)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return false, err
+			return result{}, err
 		}
-		if err == nil && old == collapsed {
-			return false, nil
-		}
-		_, err = tx.Exec(ctx, `
+		changed := err != nil || old != collapsed
+		if changed {
+			if _, err = tx.Exec(ctx, `
 INSERT INTO community_user_states(community_id,user_id,collapsed,pinned,pinned_order)
 VALUES($1,$2,$3,false,0)
 ON CONFLICT(community_id,user_id) DO UPDATE SET collapsed=EXCLUDED.collapsed,
   pinned=CASE WHEN EXCLUDED.collapsed THEN community_user_states.pinned ELSE false END,
   pinned_order=CASE WHEN EXCLUDED.collapsed THEN community_user_states.pinned_order ELSE 0 END,
-  updated_at=now()`, communityID, userID, collapsed)
-		return true, err
+  updated_at=now()`, communityID, userID, collapsed); err != nil {
+				return result{}, err
+			}
+		}
+		view, err := communityView(ctx, tx, userID, communityID)
+		if err != nil {
+			return result{}, err
+		}
+		snapshot := store.CommunityDeliverySnapshot{}
+		if changed {
+			snapshot.Targets = []store.CommunityDeliveryTarget{{TargetUserID: userID, View: view}}
+		}
+		if err := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); err != nil {
+			return result{}, err
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	view, err := s.GetCommunity(ctx, userID, communityID)
-	return view, changed, err
+	return out.view, out.changed, nil
 }
 
 type communityRequestCursor struct {
@@ -691,7 +788,7 @@ WHERE community_id=$1 AND peer_type=$2 AND peer_id=$3 FOR UPDATE`, communityID, 
 	return out, nil
 }
 
-func (s *CommunityStore) DecideCommunityPeerLinkRequest(ctx context.Context, actorUserID, communityID int64, peer domain.Peer, reject bool, date int) (domain.CommunityTogglePeerLinkResult, error) {
+func (s *CommunityStore) DecideCommunityPeerLinkRequest(ctx context.Context, actorUserID, communityID int64, peer domain.Peer, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error) {
 	return withCommunityTx(ctx, s, func(tx pgx.Tx) (domain.CommunityTogglePeerLinkResult, error) {
 		c, actor, err := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if err != nil {
@@ -708,7 +805,11 @@ func (s *CommunityStore) DecideCommunityPeerLinkRequest(ctx context.Context, act
 			return domain.CommunityTogglePeerLinkResult{}, err
 		}
 		if reject {
-			return domain.CommunityTogglePeerLinkResult{Community: c, Peer: peer, RequestedBy: req.RequestedBy}, nil
+			result := domain.CommunityTogglePeerLinkResult{Community: c, Peer: peer, RequestedBy: req.RequestedBy}
+			if err := applyCommunityDeliveryEffectsTx(ctx, tx, store.CommunityDeliverySnapshot{}, effects); err != nil {
+				return domain.CommunityTogglePeerLinkResult{}, err
+			}
+			return result, nil
 		}
 		link, err := insertCommunityLink(ctx, tx, communityID, req.RequestedBy, peer, req.Visibility, date)
 		if err != nil {
@@ -718,11 +819,19 @@ func (s *CommunityStore) DecideCommunityPeerLinkRequest(ctx context.Context, act
 		if err != nil {
 			return domain.CommunityTogglePeerLinkResult{}, err
 		}
-		return domain.CommunityTogglePeerLinkResult{Community: c, Peer: peer, RequestedBy: req.RequestedBy, Link: &link, ServiceMessage: serviceMessage}, nil
+		result := domain.CommunityTogglePeerLinkResult{Community: c, Peer: peer, RequestedBy: req.RequestedBy, Link: &link, ServiceMessage: serviceMessage}
+		snapshot, err := communityDeliverySnapshotTx(ctx, tx, communityID, actorUserID, req.RequestedBy)
+		if err != nil {
+			return domain.CommunityTogglePeerLinkResult{}, err
+		}
+		if err := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); err != nil {
+			return domain.CommunityTogglePeerLinkResult{}, err
+		}
+		return result, nil
 	})
 }
 
-func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(ctx context.Context, actorUserID, communityID int64, reject bool, date int) ([]domain.CommunityTogglePeerLinkResult, error) {
+func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(ctx context.Context, actorUserID, communityID int64, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) ([]domain.CommunityTogglePeerLinkResult, error) {
 	return withCommunityTx(ctx, s, func(tx pgx.Tx) ([]domain.CommunityTogglePeerLinkResult, error) {
 		c, actor, err := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if err != nil {
@@ -748,8 +857,13 @@ func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(ctx context.Context,
 		}
 		rows.Close()
 		if reject {
-			_, err := tx.Exec(ctx, `DELETE FROM community_peer_link_requests WHERE community_id=$1`, communityID)
-			return make([]domain.CommunityTogglePeerLinkResult, len(requests)), err
+			if _, err := tx.Exec(ctx, `DELETE FROM community_peer_link_requests WHERE community_id=$1`, communityID); err != nil {
+				return nil, err
+			}
+			if err := applyCommunityDeliveryEffectsTx(ctx, tx, store.CommunityDeliverySnapshot{}, effects); err != nil {
+				return nil, err
+			}
+			return make([]domain.CommunityTogglePeerLinkResult, len(requests)), nil
 		}
 		var currentChannels, currentBots int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FILTER(WHERE peer_type='channel')::int, COUNT(*) FILTER(WHERE peer_type='user')::int FROM community_peer_links WHERE community_id=$1`, communityID).Scan(&currentChannels, &currentBots); err != nil {
@@ -780,8 +894,24 @@ func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(ctx context.Context,
 			}
 			out = append(out, domain.CommunityTogglePeerLinkResult{Community: c, Peer: r.Peer, RequestedBy: r.RequestedBy, Link: &link, ServiceMessage: serviceMessage})
 		}
-		_, err = tx.Exec(ctx, `DELETE FROM community_peer_link_requests WHERE community_id=$1`, communityID)
-		return out, err
+		if _, err = tx.Exec(ctx, `DELETE FROM community_peer_link_requests WHERE community_id=$1`, communityID); err != nil {
+			return nil, err
+		}
+		targetUserIDs := make([]int64, 0, len(out)+1)
+		if len(out) > 0 {
+			targetUserIDs = append(targetUserIDs, actorUserID)
+		}
+		for _, result := range out {
+			targetUserIDs = append(targetUserIDs, result.RequestedBy)
+		}
+		snapshot, err := communityDeliverySnapshotTx(ctx, tx, communityID, targetUserIDs...)
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); err != nil {
+			return nil, err
+		}
+		return out, nil
 	})
 }
 
@@ -892,7 +1022,7 @@ func (s *CommunityStore) banCommunityParticipantFromChannelTx(ctx context.Contex
 	}, true, nil
 }
 
-func (s *CommunityStore) ToggleCommunityParticipantBanned(ctx context.Context, actorUserID, communityID, participantUserID int64, unban bool, date int) (domain.CommunityParticipantBanResult, error) {
+func (s *CommunityStore) ToggleCommunityParticipantBanned(ctx context.Context, actorUserID, communityID, participantUserID int64, unban bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityParticipantBanResult, error) {
 	return withCommunityTx(ctx, s, func(tx pgx.Tx) (domain.CommunityParticipantBanResult, error) {
 		c, actor, err := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if err != nil {
@@ -903,7 +1033,14 @@ func (s *CommunityStore) ToggleCommunityParticipantBanned(ctx context.Context, a
 		}
 		if unban {
 			cmd, err := tx.Exec(ctx, `DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 AND role='member' AND status='kicked'`, communityID, participantUserID)
-			return domain.CommunityParticipantBanResult{Changed: cmd.RowsAffected() > 0}, err
+			if err != nil {
+				return domain.CommunityParticipantBanResult{}, err
+			}
+			result := domain.CommunityParticipantBanResult{Changed: cmd.RowsAffected() > 0}
+			if err := applyCommunityDeliveryEffectsTx(ctx, tx, store.CommunityDeliverySnapshot{}, effects); err != nil {
+				return domain.CommunityParticipantBanResult{}, err
+			}
+			return result, nil
 		}
 		participant, found, err := derivedCommunityMember(ctx, tx, c, participantUserID)
 		if err != nil {
@@ -986,6 +1123,18 @@ ON CONFLICT(community_id,user_id) DO UPDATE SET role='member',status='kicked',ad
 			}
 		}
 		result.Changed = !alreadyKicked || len(result.ChannelBans) > 0 || len(result.RemovedLinks) > 0
+		snapshot := store.CommunityDeliverySnapshot{}
+		if result.Changed {
+			forbidden := domain.CommunityView{
+				Community: c,
+				Self:      domain.CommunityMember{CommunityID: communityID, UserID: participantUserID},
+				Forbidden: true,
+			}
+			snapshot.Targets = []store.CommunityDeliveryTarget{{TargetUserID: participantUserID, View: forbidden}}
+		}
+		if err := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); err != nil {
+			return domain.CommunityParticipantBanResult{}, err
+		}
 		return result, nil
 	})
 }
@@ -1058,130 +1207,197 @@ ORDER BY CASE am.role WHEN 'creator' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,am.us
 	return out, err
 }
 
-func (s *CommunityStore) EditCommunityTitle(ctx context.Context, actorUserID, communityID int64, title string) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) EditCommunityTitle(ctx context.Context, actorUserID, communityID int64, title string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		c, m, e := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if e != nil {
-			return false, e
+			return result{}, e
 		}
 		if !m.CanChangeInfo() {
-			return false, domain.ErrCommunityAdminRequired
+			return result{}, domain.ErrCommunityAdminRequired
 		}
-		if c.Title == title {
-			return false, nil
+		changed := c.Title != title
+		if changed {
+			if _, e = tx.Exec(ctx, `UPDATE communities SET title=$2,updated_at=now() WHERE id=$1`, communityID, title); e != nil {
+				return result{}, e
+			}
 		}
-		_, e = tx.Exec(ctx, `UPDATE communities SET title=$2,updated_at=now() WHERE id=$1`, communityID, title)
-		return true, e
+		view, e := communityView(ctx, tx, actorUserID, communityID)
+		if e != nil {
+			return result{}, e
+		}
+		snapshot := actorCommunityDeliverySnapshot(actorUserID, view, changed)
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	v, err := s.GetCommunity(ctx, actorUserID, communityID)
-	return v, changed, err
+	return out.view, out.changed, nil
 }
 
-func (s *CommunityStore) EditCommunityAbout(ctx context.Context, actorUserID, communityID int64, about string) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) EditCommunityAbout(ctx context.Context, actorUserID, communityID int64, about string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		c, m, e := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if e != nil {
-			return false, e
+			return result{}, e
 		}
 		if !m.CanChangeInfo() {
-			return false, domain.ErrCommunityAdminRequired
+			return result{}, domain.ErrCommunityAdminRequired
 		}
-		if c.About == about {
-			return false, nil
+		changed := c.About != about
+		if changed {
+			if _, e = tx.Exec(ctx, `UPDATE communities SET about=$2,updated_at=now() WHERE id=$1`, communityID, about); e != nil {
+				return result{}, e
+			}
 		}
-		_, e = tx.Exec(ctx, `UPDATE communities SET about=$2,updated_at=now() WHERE id=$1`, communityID, about)
-		return true, e
+		view, e := communityView(ctx, tx, actorUserID, communityID)
+		if e != nil {
+			return result{}, e
+		}
+		snapshot := actorCommunityDeliverySnapshot(actorUserID, view, changed)
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	v, err := s.GetCommunity(ctx, actorUserID, communityID)
-	return v, changed, err
+	return out.view, out.changed, nil
 }
 
 func zeroCommunityAdminRights(r domain.ChannelAdminRights) bool {
 	return r == (domain.ChannelAdminRights{})
 }
 
-func (s *CommunityStore) EditCommunityAdmin(ctx context.Context, req domain.CommunityEditAdminRequest) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) EditCommunityAdmin(ctx context.Context, req domain.CommunityEditAdminRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		c, actor, e := lockCommunityActor(ctx, tx, req.ActorUserID, req.CommunityID)
 		if e != nil {
-			return false, e
+			return result{}, e
 		}
+		changed := false
 		if req.UserID == req.ActorUserID && actor.Role == domain.CommunityRoleAdmin && zeroCommunityAdminRights(req.Rights) {
 			cmd, e := tx.Exec(ctx, `DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 AND role='admin'`, req.CommunityID, req.UserID)
-			return cmd.RowsAffected() > 0, e
-		}
-		if !actor.CanAddAdmins() {
-			return false, domain.ErrCommunityAdminRequired
-		}
-		if req.UserID == c.CreatorUserID {
-			return false, domain.ErrCommunityCreatorRequired
-		}
-		if zeroCommunityAdminRights(req.Rights) {
-			cmd, e := tx.Exec(ctx, `DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 AND role='admin'`, req.CommunityID, req.UserID)
-			return cmd.RowsAffected() > 0, e
-		}
-		var exists bool
-		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND deleted_at IS NULL)`, req.UserID).Scan(&exists); e != nil || !exists {
-			return false, domain.ErrCommunityParticipantInvalid
-		}
-		rights, _ := json.Marshal(req.Rights)
-		_, e = tx.Exec(ctx, `
+			if e != nil {
+				return result{}, e
+			}
+			changed = cmd.RowsAffected() > 0
+		} else {
+			if !actor.CanAddAdmins() {
+				return result{}, domain.ErrCommunityAdminRequired
+			}
+			if req.UserID == c.CreatorUserID {
+				return result{}, domain.ErrCommunityCreatorRequired
+			}
+			if zeroCommunityAdminRights(req.Rights) {
+				cmd, e := tx.Exec(ctx, `DELETE FROM community_members WHERE community_id=$1 AND user_id=$2 AND role='admin'`, req.CommunityID, req.UserID)
+				if e != nil {
+					return result{}, e
+				}
+				changed = cmd.RowsAffected() > 0
+			} else {
+				var exists bool
+				if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND deleted_at IS NULL)`, req.UserID).Scan(&exists); e != nil || !exists {
+					return result{}, domain.ErrCommunityParticipantInvalid
+				}
+				rights, _ := json.Marshal(req.Rights)
+				if _, e = tx.Exec(ctx, `
 INSERT INTO community_members(community_id,user_id,role,status,admin_rights,rank,date)
 VALUES($1,$2,'admin','active',$3,$4,$5)
-ON CONFLICT(community_id,user_id) DO UPDATE SET role='admin',status='active',admin_rights=EXCLUDED.admin_rights,rank=EXCLUDED.rank,date=EXCLUDED.date,updated_at=now()`, req.CommunityID, req.UserID, rights, req.Rank, req.Date)
-		return true, e
+ON CONFLICT(community_id,user_id) DO UPDATE SET role='admin',status='active',admin_rights=EXCLUDED.admin_rights,rank=EXCLUDED.rank,date=EXCLUDED.date,updated_at=now()`, req.CommunityID, req.UserID, rights, req.Rank, req.Date); e != nil {
+					return result{}, e
+				}
+				changed = true
+			}
+		}
+		view, e := communityView(ctx, tx, req.ActorUserID, req.CommunityID)
+		if errors.Is(e, domain.ErrCommunityPrivate) {
+			e = nil
+		}
+		if e != nil {
+			return result{}, e
+		}
+		snapshot := store.CommunityDeliverySnapshot{}
+		if changed {
+			snapshot, e = communityDeliverySnapshotTx(ctx, tx, req.CommunityID, req.ActorUserID, req.UserID)
+			if e != nil {
+				return result{}, e
+			}
+		}
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	v, err := s.GetCommunity(ctx, req.ActorUserID, req.CommunityID)
-	if changed && req.UserID == req.ActorUserID && errors.Is(err, domain.ErrCommunityPrivate) {
-		c, loadErr := communityByID(ctx, s.db, req.CommunityID, false)
-		if loadErr != nil {
-			return domain.CommunityView{}, false, loadErr
-		}
-		return domain.CommunityView{Community: c, Forbidden: true}, true, nil
-	}
-	return v, changed, err
+	return out.view, out.changed, nil
 }
 
-func (s *CommunityStore) EditCommunityDefaultBannedRights(ctx context.Context, actorUserID, communityID int64, rights domain.ChannelBannedRights) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) EditCommunityDefaultBannedRights(ctx context.Context, actorUserID, communityID int64, rights domain.ChannelBannedRights, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		c, m, e := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if e != nil {
-			return false, e
+			return result{}, e
 		}
 		if !m.CanChangeInfo() {
-			return false, domain.ErrCommunityAdminRequired
+			return result{}, domain.ErrCommunityAdminRequired
 		}
-		if c.DefaultBannedRights == rights {
-			return false, nil
+		changed := c.DefaultBannedRights != rights
+		if changed {
+			raw, _ := json.Marshal(rights)
+			if _, e = tx.Exec(ctx, `UPDATE communities SET default_banned_rights=$2,updated_at=now() WHERE id=$1`, communityID, raw); e != nil {
+				return result{}, e
+			}
 		}
-		raw, _ := json.Marshal(rights)
-		_, e = tx.Exec(ctx, `UPDATE communities SET default_banned_rights=$2,updated_at=now() WHERE id=$1`, communityID, raw)
-		return true, e
+		view, e := communityView(ctx, tx, actorUserID, communityID)
+		if e != nil {
+			return result{}, e
+		}
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, actorCommunityDeliverySnapshot(actorUserID, view, changed), effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	v, err := s.GetCommunity(ctx, actorUserID, communityID)
-	return v, changed, err
+	return out.view, out.changed, nil
 }
 
-func (s *CommunityStore) SetCommunityPhoto(ctx context.Context, actorUserID, communityID int64, photo *domain.Photo, date int) (domain.CommunityView, bool, error) {
-	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+func (s *CommunityStore) SetCommunityPhoto(ctx context.Context, actorUserID, communityID int64, photo *domain.Photo, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (result, error) {
 		c, m, e := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if e != nil {
-			return false, e
+			return result{}, e
 		}
 		if !m.CanChangeInfo() {
-			return false, domain.ErrCommunityAdminRequired
+			return result{}, domain.ErrCommunityAdminRequired
 		}
 		id, dc := int64(0), 0
 		var stripped []byte
@@ -1189,20 +1405,28 @@ func (s *CommunityStore) SetCommunityPhoto(ctx context.Context, actorUserID, com
 			id, dc = photo.ID, photo.DCID
 			stripped = domain.StrippedFromSizes(photo.Sizes)
 		}
-		if c.PhotoID == id && c.PhotoDCID == dc && string(c.PhotoStripped) == string(stripped) {
-			return false, nil
+		changed := c.PhotoID != id || c.PhotoDCID != dc || string(c.PhotoStripped) != string(stripped)
+		if changed {
+			if _, e = tx.Exec(ctx, `UPDATE communities SET photo_id=$2,photo_dc_id=$3,photo_stripped=$4,updated_at=now() WHERE id=$1`, communityID, id, dc, stripped); e != nil {
+				return result{}, e
+			}
 		}
-		_, e = tx.Exec(ctx, `UPDATE communities SET photo_id=$2,photo_dc_id=$3,photo_stripped=$4,updated_at=now() WHERE id=$1`, communityID, id, dc, stripped)
-		return true, e
+		view, e := communityView(ctx, tx, actorUserID, communityID)
+		if e != nil {
+			return result{}, e
+		}
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, actorCommunityDeliverySnapshot(actorUserID, view, changed), effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, changed: changed}, nil
 	})
 	if err != nil {
 		return domain.CommunityView{}, false, err
 	}
-	v, err := s.GetCommunity(ctx, actorUserID, communityID)
-	return v, changed, err
+	return out.view, out.changed, nil
 }
 
-func (s *CommunityStore) DeleteCommunity(ctx context.Context, actorUserID, communityID int64, date int) (domain.CommunityView, []domain.Peer, error) {
+func (s *CommunityStore) DeleteCommunity(ctx context.Context, actorUserID, communityID int64, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, []domain.Peer, error) {
 	type result struct {
 		view  domain.CommunityView
 		peers []domain.Peer
@@ -1249,7 +1473,12 @@ func (s *CommunityStore) DeleteCommunity(ctx context.Context, actorUserID, commu
 		c.Deleted = true
 		c.Title = ""
 		c.About = ""
-		return result{view: domain.CommunityView{Community: c, Self: m, Forbidden: true, ServiceMessages: serviceMessages}, peers: peers}, nil
+		view := domain.CommunityView{Community: c, Self: m, Forbidden: true, ServiceMessages: serviceMessages}
+		snapshot := store.CommunityDeliverySnapshot{Targets: []store.CommunityDeliveryTarget{{TargetUserID: actorUserID, View: view}}}
+		if e := applyCommunityDeliveryEffectsTx(ctx, tx, snapshot, effects); e != nil {
+			return result{}, e
+		}
+		return result{view: view, peers: peers}, nil
 	})
 	return r.view, r.peers, err
 }

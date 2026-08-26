@@ -200,11 +200,9 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 		if r.deps.Channels == nil {
 			return nil, peerIDInvalidErr()
 		}
-		recipients := make([]int64, 0)
 		results := make([]domain.SendChannelMessageResult, 0, len(sources))
 		extraUserIDs := make([]int64, 0, len(sources))
-		fanoutResults := make([]domain.SendChannelMessageResult, 0, len(sources))
-		fanoutExtraUserIDs := make([]int64, 0, len(sources))
+		committedResults := make([]domain.SendChannelMessageResult, 0, len(sources))
 		for i, source := range sources {
 			if replays[i].found {
 				results = append(results, replays[i].channel)
@@ -247,30 +245,17 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 			if res.Duplicate {
 				continue
 			}
-			fanoutResults = append(fanoutResults, res)
-			if sourceUserID != 0 {
-				fanoutExtraUserIDs = append(fanoutExtraUserIDs, sourceUserID)
-			}
-			// 收件人是该频道的活跃成员集，对本次转发的每条源都相同；只取一次，
-			// 避免一次转发 ≤100 条到 N 成员大群时把 recipients 累积成 ~100×N 条目
-			// 的巨大临时切片（N=10^5 时约千万级）。
-			if len(recipients) == 0 {
-				recipients = res.Recipients
-			}
+			committedResults = append(committedResults, res)
 		}
-		// echo 与 fan-out 用各自独立 cache（RPC vs worker goroutine 防竞态）。多条转发汇成
-		// 一个 fan-out job（channelMessagesUpdatesWithPeerCache 内含多条 UpdateNewChannelMessage），
-		// 由同 channel 分片 FIFO 原子投递。
 		echoCache := newViewerPeerCache(r)
 		updates := r.channelMessagesUpdatesWithPeerCache(ctx, userID, results, req.RandomID, true, extraUserIDs, echoCache)
-		if n := len(fanoutResults); n > 0 {
-			fanoutPts := fanoutResults[n-1].Event.Pts
-			if err := r.enqueueChannelMessagesFanout(ctx, userID, toPeer.ID, fanoutPts, recipients, fanoutResults, fanoutExtraUserIDs); err != nil {
+		if len(committedResults) > 0 {
+			if err := r.enqueueBotAPIChannelMessagesUpdate(ctx, userID, committedResults); err != nil {
 				return nil, internalErr()
 			}
 		}
-		for _, res := range fanoutResults {
-			if err := r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
+		for _, res := range committedResults {
+			if err := r.enqueueBotAPIChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
 				return nil, internalErr()
 			}
 		}

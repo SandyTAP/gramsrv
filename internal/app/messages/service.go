@@ -2,12 +2,15 @@ package messages
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+var errMessageStoreRequired = errors.New("messages store is required")
 
 // Service 提供消息历史、搜索与已读业务。
 type Service struct {
@@ -386,26 +389,29 @@ func (s *Service) CountPrivateMediaCategories(ctx context.Context, userID, peerI
 
 // ReadHistory 将当前账号某个 peer 的 inbox 标记为已读，并为发送方生成 outbox 已读回执。
 func (s *Service) ReadHistory(ctx context.Context, userID int64, req domain.ReadHistoryRequest) (domain.ReadHistoryResult, error) {
-	if s == nil || userID == 0 {
-		return domain.ReadHistoryResult{Peer: req.Peer, MaxID: req.MaxID}, nil
+	if s == nil || s.messages == nil {
+		return domain.ReadHistoryResult{Peer: req.Peer, MaxID: req.MaxID}, errMessageStoreRequired
+	}
+	if userID == 0 {
+		return domain.ReadHistoryResult{Peer: req.Peer, MaxID: req.MaxID}, domain.ErrAuthenticatedScopeInvalid
 	}
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
 	}
-	if s.messages != nil {
-		return s.messages.ReadHistory(ctx, req)
+	if req.OwnerUserID != userID {
+		return domain.ReadHistoryResult{OwnerUserID: userID, Peer: req.Peer, MaxID: req.MaxID}, domain.ErrAuthenticatedScopeInvalid
 	}
-	if s.dialogs != nil {
-		return s.dialogs.MarkRead(ctx, userID, req.Peer, req.MaxID)
-	}
-	return domain.ReadHistoryResult{OwnerUserID: userID, Peer: req.Peer, MaxID: req.MaxID}, nil
+	return s.messages.ReadHistory(ctx, req)
 }
 
 // ReadMessageContents checks exact owner-visible private message IDs for content-read sync.
 func (s *Service) ReadMessageContents(ctx context.Context, userID int64, req domain.ReadMessageContentsRequest) (domain.ReadMessageContentsResult, error) {
 	res := domain.ReadMessageContentsResult{OwnerUserID: userID}
-	if s == nil || s.messages == nil || userID == 0 {
-		return res, nil
+	if s == nil || s.messages == nil {
+		return res, errMessageStoreRequired
+	}
+	if userID == 0 {
+		return res, domain.ErrAuthenticatedScopeInvalid
 	}
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
@@ -433,7 +439,7 @@ func (s *Service) GetOutboxReadDate(ctx context.Context, userID int64, req domai
 }
 
 // SetMessageReactions replaces the current user's reactions on a visible private message.
-func (s *Service) SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s *Service) SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	if s == nil || s.messages == nil || userID == 0 {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
 	}
@@ -443,11 +449,14 @@ func (s *Service) SetMessageReactions(ctx context.Context, userID int64, req dom
 	if req.UserID != userID || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
 	}
-	return s.messages.SetMessageReactions(ctx, req)
+	if effects == nil {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.messages.SetMessageReactions(ctx, req, effects)
 }
 
 // VoteMessagePoll 给私聊消息上的 poll 投票（options 为空 = 撤票）。
-func (s *Service) VoteMessagePoll(ctx context.Context, userID int64, req domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *Service) VoteMessagePoll(ctx context.Context, userID int64, req domain.VotePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	if s == nil || s.messages == nil || userID == 0 {
 		return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 	}
@@ -457,11 +466,14 @@ func (s *Service) VoteMessagePoll(ctx context.Context, userID int64, req domain.
 	if req.UserID != userID || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 	}
-	return s.messages.VoteMessagePoll(ctx, req)
+	if effects == nil {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.messages.VoteMessagePoll(ctx, req, effects)
 }
 
 // CloseMessagePoll 关闭私聊消息上的 poll（仅 poll 创建者）。
-func (s *Service) CloseMessagePoll(ctx context.Context, userID int64, req domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *Service) CloseMessagePoll(ctx context.Context, userID int64, req domain.ClosePrivateMessagePollRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	if s == nil || s.messages == nil || userID == 0 {
 		return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 	}
@@ -471,7 +483,10 @@ func (s *Service) CloseMessagePoll(ctx context.Context, userID int64, req domain
 	if req.UserID != userID || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 	}
-	return s.messages.CloseMessagePoll(ctx, req)
+	if effects == nil {
+		return domain.PrivateMessagePollResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.messages.CloseMessagePoll(ctx, req, effects)
 }
 
 // GetMessageReactions returns reaction summaries for visible private messages.
@@ -510,12 +525,15 @@ func (s *Service) SavedReactionTags(ctx context.Context, userID int64, savedPeer
 
 // UpdateSavedReactionTag stores or removes the optional global title for one
 // tag that is currently assigned to at least one visible Saved Message.
-func (s *Service) UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag) error {
+func (s *Service) UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag, effects store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error {
 	if s == nil || s.messages == nil || userID == 0 || !tag.Reaction.Valid() {
 		return domain.ErrReactionInvalid
 	}
 	tag.UserID = userID
-	return s.messages.UpsertSavedReactionTag(ctx, tag)
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	return s.messages.UpsertSavedReactionTag(ctx, tag, effects)
 }
 
 // EditMessage 编辑当前账号发出的私聊文本消息。
@@ -609,20 +627,16 @@ func (s *Service) GetSavedDialogsByPeers(ctx context.Context, userID int64, peer
 	return s.messages.ListSavedDialogsByPeers(ctx, userID, peers)
 }
 
-// ToggleSavedDialogPin 翻转收藏夹子会话置顶状态，返回是否实际变化。
-func (s *Service) ToggleSavedDialogPin(ctx context.Context, userID int64, peer domain.Peer, pinned bool) (bool, error) {
-	if s == nil || s.messages == nil || userID == 0 {
-		return false, nil
+// MutateSavedDialogs owns saved-dialog rows and their Account PTS delivery
+// effects in one store transaction.
+func (s *Service) MutateSavedDialogs(ctx context.Context, userID int64, mutation store.SavedDialogMutation, effects store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error) {
+	if s == nil || s.messages == nil || userID == 0 || mutation.UserID != userID {
+		return store.SavedDialogMutationSnapshot{}, errMessageStoreRequired
 	}
-	return s.messages.ToggleSavedDialogPin(ctx, userID, peer, pinned)
-}
-
-// ReorderPinnedSavedDialogs 全量重排收藏夹置顶顺序。
-func (s *Service) ReorderPinnedSavedDialogs(ctx context.Context, userID int64, order []domain.Peer, force bool) error {
-	if s == nil || s.messages == nil || userID == 0 {
-		return nil
+	if effects == nil {
+		return store.SavedDialogMutationSnapshot{}, store.ErrDeliveryOutboxRequired
 	}
-	return s.messages.ReorderPinnedSavedDialogs(ctx, userID, order, force)
+	return s.messages.MutateSavedDialogs(ctx, mutation, effects)
 }
 
 // DeleteSavedHistory 删除收藏夹一个子会话的消息（单批）。
@@ -636,187 +650,175 @@ func (s *Service) DeleteSavedHistory(ctx context.Context, userID int64, req doma
 	return s.messages.DeleteSavedHistory(ctx, req)
 }
 
-func (s *Service) ScheduleMessage(ctx context.Context, userID int64, req domain.ScheduleMessageRequest) (domain.ScheduledMessage, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+func (s *Service) ScheduleMessage(ctx context.Context, userID int64, req domain.ScheduleMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
+	if s == nil || s.messages == nil {
+		return domain.ScheduledMessage{}, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return domain.ScheduledMessage{}, nil
 	}
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return domain.ScheduledMessage{}, nil
+	if effects == nil {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
 	}
-	return scheduled.CreateScheduledMessage(ctx, req)
+	return s.messages.CreateScheduledMessage(ctx, req, effects)
 }
 
 func (s *Service) ListScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return domain.ScheduledMessageList{}, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return domain.ScheduledMessageList{}, nil
 	}
 	if filter.OwnerUserID == 0 {
 		filter.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return domain.ScheduledMessageList{}, nil
-	}
-	return scheduled.ListScheduledMessages(ctx, filter)
+	return s.messages.ListScheduledMessages(ctx, filter)
 }
 
-func (s *Service) EditScheduledMessage(ctx context.Context, userID int64, req domain.EditScheduledMessageRequest) (domain.ScheduledMessage, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+func (s *Service) EditScheduledMessage(ctx context.Context, userID int64, req domain.EditScheduledMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
+	if s == nil || s.messages == nil {
+		return domain.ScheduledMessage{}, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return domain.ScheduledMessage{}, nil
 	}
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return domain.ScheduledMessage{}, nil
+	if effects == nil {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
 	}
-	return scheduled.EditScheduledMessage(ctx, req)
+	return s.messages.EditScheduledMessage(ctx, req, effects)
 }
 
 func (s *Service) GetScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return domain.ScheduledMessageList{}, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return domain.ScheduledMessageList{}, nil
 	}
 	if filter.OwnerUserID == 0 {
 		filter.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return domain.ScheduledMessageList{}, nil
-	}
-	return scheduled.GetScheduledMessages(ctx, filter)
+	return s.messages.GetScheduledMessages(ctx, filter)
 }
 
-func (s *Service) DeleteScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter, date int) ([]domain.ScheduledMessage, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+func (s *Service) DeleteScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter, date int, effects store.DeliveryEffectsBuilder[[]domain.ScheduledMessage]) ([]domain.ScheduledMessage, error) {
+	if s == nil || s.messages == nil {
+		return nil, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return nil, nil
 	}
 	if filter.OwnerUserID == 0 {
 		filter.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return nil, nil
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
-	return scheduled.DeleteScheduledMessages(ctx, filter, date)
+	return s.messages.DeleteScheduledMessages(ctx, filter, date, effects)
 }
 
 func (s *Service) ClaimScheduledMessages(ctx context.Context, userID int64, claim domain.ScheduledMessageClaim) ([]domain.ScheduledMessage, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return nil, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return nil, nil
 	}
 	if claim.OwnerUserID == 0 {
 		claim.OwnerUserID = userID
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return nil, nil
-	}
-	return scheduled.ClaimScheduledMessages(ctx, claim)
+	return s.messages.ClaimScheduledMessages(ctx, claim)
 }
 
 func (s *Service) ClaimDueScheduledMessages(ctx context.Context, now, limit, leaseSeconds int) ([]domain.ScheduledMessage, error) {
 	if s == nil || s.messages == nil {
-		return nil, nil
+		return nil, errMessageStoreRequired
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return nil, nil
-	}
-	return scheduled.ClaimDueScheduledMessages(ctx, now, limit, leaseSeconds)
+	return s.messages.ClaimDueScheduledMessages(ctx, now, limit, leaseSeconds)
 }
 
-func (s *Service) MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int) error {
+func (s *Service) MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) error {
 	if s == nil || s.messages == nil {
-		return nil
+		return errMessageStoreRequired
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return nil
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	return scheduled.MarkScheduledMessageSent(ctx, ownerUserID, id, sentMessageID, date)
+	return s.messages.MarkScheduledMessageSent(ctx, ownerUserID, id, sentMessageID, date, effects)
 }
 
 func (s *Service) ReleaseScheduledMessage(ctx context.Context, ownerUserID int64, id int, errText string) error {
 	if s == nil || s.messages == nil {
-		return nil
+		return errMessageStoreRequired
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return nil
-	}
-	return scheduled.ReleaseScheduledMessage(ctx, ownerUserID, id, errText)
+	return s.messages.ReleaseScheduledMessage(ctx, ownerUserID, id, errText)
 }
 
 func (s *Service) HasScheduledMessages(ctx context.Context, userID int64, peer domain.Peer) (bool, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return false, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return false, nil
 	}
-	scheduled, ok := s.messages.(store.ScheduledMessageStore)
-	if !ok {
-		return false, nil
-	}
-	return scheduled.HasScheduledMessages(ctx, userID, peer)
+	return s.messages.HasScheduledMessages(ctx, userID, peer)
 }
 
 func (s *Service) GetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer) (int, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return 0, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return 0, nil
 	}
-	ttl, ok := s.messages.(store.HistoryTTLStore)
-	if !ok {
-		return 0, nil
-	}
-	return ttl.GetPrivateHistoryTTL(ctx, userID, peer)
+	return s.messages.GetPrivateHistoryTTL(ctx, userID, peer)
 }
 
-func (s *Service) SetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer, period int) error {
-	if s == nil || s.messages == nil || userID == 0 {
+func (s *Service) SetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer, period int, effects store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult]) error {
+	if s == nil || s.messages == nil {
+		return errMessageStoreRequired
+	}
+	if userID == 0 {
 		return nil
 	}
-	ttl, ok := s.messages.(store.HistoryTTLStore)
-	if !ok {
-		return nil
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	return ttl.SetPrivateHistoryTTL(ctx, userID, peer, period)
+	return s.messages.SetPrivateHistoryTTL(ctx, userID, peer, period, effects)
 }
 
 func (s *Service) DefaultHistoryTTL(ctx context.Context, userID int64) (int, error) {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return 0, errMessageStoreRequired
+	}
+	if userID == 0 {
 		return 0, nil
 	}
-	ttl, ok := s.messages.(store.HistoryTTLStore)
-	if !ok {
-		return 0, nil
-	}
-	return ttl.DefaultHistoryTTL(ctx, userID)
+	return s.messages.DefaultHistoryTTL(ctx, userID)
 }
 
 func (s *Service) SetDefaultHistoryTTL(ctx context.Context, userID int64, period int) error {
-	if s == nil || s.messages == nil || userID == 0 {
+	if s == nil || s.messages == nil {
+		return errMessageStoreRequired
+	}
+	if userID == 0 {
 		return nil
 	}
-	ttl, ok := s.messages.(store.HistoryTTLStore)
-	if !ok {
-		return nil
-	}
-	return ttl.SetDefaultHistoryTTL(ctx, userID, period)
+	return s.messages.SetDefaultHistoryTTL(ctx, userID, period)
 }
 
 func (s *Service) ClaimExpiredPrivateMessages(ctx context.Context, now, limit int) ([]domain.DeleteMessagesRequest, error) {
 	if s == nil || s.messages == nil {
-		return nil, nil
+		return nil, errMessageStoreRequired
 	}
-	ttl, ok := s.messages.(store.HistoryTTLStore)
-	if !ok {
-		return nil, nil
-	}
-	return ttl.ClaimExpiredPrivateMessages(ctx, now, limit)
+	return s.messages.ClaimExpiredPrivateMessages(ctx, now, limit)
 }
 
 func (s *Service) list(ctx context.Context, userID int64, filter domain.MessageFilter) (domain.MessageList, error) {

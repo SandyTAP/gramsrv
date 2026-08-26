@@ -6,11 +6,13 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestContactProjectionForViewerUserIDsDoesNotCrossPairs(t *testing.T) {
 	ctx := context.Background()
 	contacts := NewContactStore()
+	contacts.AttachDeliveryOutbox(NewDeliveryOutboxStore())
 	const (
 		viewerA = int64(11)
 		viewerB = int64(12)
@@ -39,7 +41,11 @@ func TestContactProjectionForViewerUserIDsDoesNotCrossPairs(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, found, err := contacts.SetPersonalPhoto(ctx, row.viewer, row.owner, row.photo, 1); err != nil || !found {
+		if _, found, err := contacts.SetPersonalPhotoWithDelivery(ctx, row.viewer, row.owner, row.photo, 1, func(snapshot store.ContactPersonalPhotoDeliverySnapshot) ([]store.DeliveryEffect, error) {
+			return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: snapshot.ViewerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})}, nil
+		}); err != nil || !found {
 			t.Fatalf("SetPersonalPhoto %d->%d: found=%v err=%v", row.viewer, row.owner, found, err)
 		}
 	}

@@ -52,7 +52,7 @@ func (s *trackingCodeStore) Del(ctx context.Context, hash string) error {
 func TestExistingAccountSendCodeDeliversBeforeSignInAndDoesNotRedeliver(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
-	authz := memory.NewAuthorizationStore()
+	authz := newAuthorizationStoreWithDelivery()
 	codes := memory.NewCodeStore()
 	u, err := users.Create(ctx, domain.User{Phone: "15550009201", FirstName: "Existing"})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestExistingAccountSendCodeDeliversBeforeSignInAndDoesNotRedeliver(t *testi
 
 	var key [8]byte
 	key[0] = 0x92
-	got, lateMessage, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, "+15550009201", hash, "12345")
+	got, lateMessage, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, "+15550009201", hash, "12345", testAuthorizationDelivery)
 	if err != nil || needSignUp || got.ID != u.ID {
 		t.Fatalf("SignIn user=%d needSignUp=%v err=%v, want %d/false", got.ID, needSignUp, err, u.ID)
 	}
@@ -120,7 +120,7 @@ func TestDeliveredLoginCodeSurvivesWrongSignInAndCancelWithoutDuplicate(t *testi
 	}
 	assertFacts("after SendCode")
 
-	if _, late, _, err := svc.SignIn(ctx, domain.Authorization{}, "15550009208", hash, "00000"); !errors.Is(err, ErrCodeInvalid) || late.ID != 0 {
+	if _, late, _, err := svc.SignIn(ctx, domain.Authorization{}, "15550009208", hash, "00000", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) || late.ID != 0 {
 		t.Fatalf("wrong SignIn late=%+v err=%v, want ErrCodeInvalid/no message", late, err)
 	}
 	assertFacts("after wrong SignIn")
@@ -129,7 +129,7 @@ func TestDeliveredLoginCodeSurvivesWrongSignInAndCancelWithoutDuplicate(t *testi
 		t.Fatalf("CancelCode: %v", err)
 	}
 	assertFacts("after CancelCode")
-	if _, late, _, err := svc.SignIn(ctx, domain.Authorization{}, "15550009208", hash, "12345"); !errors.Is(err, ErrCodeExpired) || late.ID != 0 {
+	if _, late, _, err := svc.SignIn(ctx, domain.Authorization{}, "15550009208", hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeExpired) || late.ID != 0 {
 		t.Fatalf("SignIn after cancel late=%+v err=%v, want ErrCodeExpired/no message", late, err)
 	}
 	assertFacts("after canceled SignIn")
@@ -157,7 +157,7 @@ func TestCodeIssuedBeforeConcurrentOwnerCreationIsRejected(t *testing.T) {
 	}
 	var key [8]byte
 	key[0] = 0x93
-	got, lateMessage, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, "15550009209", hash, "12345")
+	got, lateMessage, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, "15550009209", hash, "12345", testAuthorizationDelivery)
 	if !errors.Is(err, ErrCodeInvalid) || needSignUp || got.ID != 0 || lateMessage.ID != 0 {
 		t.Fatalf("SignIn after owner creation got=%+v late=%+v needSignUp=%v err=%v, want invalid", got, lateMessage, needSignUp, err)
 	}

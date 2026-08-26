@@ -69,6 +69,35 @@ func (s *MessageStore) SendPrivateText(_ context.Context, req domain.SendPrivate
 	if err != nil {
 		return domain.SendPrivateTextResult{}, err
 	}
+	dialogs := s.dialogs
+	events := s.updateEvents
+	if events == nil || (req.ClearDraft && dialogs == nil) {
+		return domain.SendPrivateTextResult{}, store.ErrDeliveryOutboxRequired
+	}
+	if dialogs != nil {
+		dialogs.mu.Lock()
+		defer dialogs.mu.Unlock()
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+
+	var draftSnapshot store.DialogAccountMutationSnapshot
+	var draftEffects []store.DeliveryEffect
+	if req.ClearDraft {
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.SenderUserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeUser, ID: req.RecipientUserID},
+		}
+		_, changed := dialogs.drafts[mutation.UserID][draftKey(mutation.Peer, 0)]
+		draftSnapshot = store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		draftEffects, err = sendDraftClearEffects(draftSnapshot)
+		if err != nil {
+			return domain.SendPrivateTextResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(draftSnapshot, draftEffects); err != nil {
+			return domain.SendPrivateTextResult{}, fmt.Errorf("validate memory private send draft effects: %w", err)
+		}
+	}
 	uid := s.nextUID
 	s.nextUID++
 	sender := domain.Message{
@@ -92,7 +121,7 @@ func (s *MessageStore) SendPrivateText(_ context.Context, req domain.SendPrivate
 		RichMessage: cloneRichMessage(req.RichMessage),
 		ReplyTo:     cloneMessageReply(senderReply),
 		Forward:     cloneMessageForward(req.Forward),
-		Pts:         s.nextPtsLocked(req.SenderUserID),
+		Pts:         s.nextPtsWithEventsLocked(events, req.SenderUserID),
 		// voice/round 在发送者副本上同样保持"未听"，由对端内容已读清除。
 		MediaUnread: req.Media.HasUnreadPayload() && req.SenderUserID != req.RecipientUserID,
 	}
@@ -115,7 +144,7 @@ func (s *MessageStore) SendPrivateText(_ context.Context, req domain.SendPrivate
 		// 让双盒各持独立快照（与 postgres 每盒独立 decode 对齐，I3/I2）。
 		recipient.ReplyMarkup = cloneReplyMarkup(sender.ReplyMarkup)
 		recipient.RichMessage = cloneRichMessage(sender.RichMessage)
-		recipient.Pts = s.nextPtsLocked(req.RecipientUserID)
+		recipient.Pts = s.nextPtsWithEventsLocked(events, req.RecipientUserID)
 		recipient.MediaUnread = req.Media.HasUnreadPayload()
 	}
 	var senderSnapshot []byte
@@ -139,9 +168,34 @@ func (s *MessageStore) SendPrivateText(_ context.Context, req domain.SendPrivate
 	}
 	if s.dialogs != nil {
 		if recipient.ID != 0 {
-			s.upsertMemoryDialogsLocked(sender, recipient)
+			s.upsertMemoryDialogsStateLocked(sender, recipient)
 		} else {
-			s.upsertMemoryDialogsLocked(sender, sender)
+			s.upsertMemoryDialogsStateLocked(sender, sender)
+		}
+	}
+	originUserID := req.OriginUserID
+	if originUserID == 0 {
+		originUserID = req.SenderUserID
+	}
+	senderExcludeAuthKeyID, senderExcludeSessionID := [8]byte{}, int64(0)
+	if originUserID == req.SenderUserID {
+		senderExcludeAuthKeyID, senderExcludeSessionID = req.OriginAuthKeyID, req.OriginSessionID
+	}
+	appendMemorySendEventLocked(events, req.SenderUserID, newMessageEvent(sender), senderExcludeAuthKeyID, senderExcludeSessionID)
+	if recipient.ID != 0 && recipient.OwnerUserID != sender.OwnerUserID {
+		recipientExcludeAuthKeyID, recipientExcludeSessionID := [8]byte{}, int64(0)
+		if originUserID == req.RecipientUserID {
+			recipientExcludeAuthKeyID, recipientExcludeSessionID = req.OriginAuthKeyID, req.OriginSessionID
+		}
+		appendMemorySendEventLocked(events, req.RecipientUserID, newMessageEvent(recipient), recipientExcludeAuthKeyID, recipientExcludeSessionID)
+	}
+	var draftEvent domain.UpdateEvent
+	if len(draftEffects) == 1 {
+		delete(dialogs.drafts[req.SenderUserID], draftKey(draftSnapshot.Mutation.Peer, 0))
+		draftEvent = events.appendLocked(req.SenderUserID, draftEffects[0].Event, true)
+		events.dispatches[req.SenderUserID] = append(events.dispatches[req.SenderUserID], memoryUpdateDispatch{Pts: draftEvent.Pts})
+		if draftEvent.Pts > s.nextPts[req.SenderUserID] {
+			s.nextPts[req.SenderUserID] = draftEvent.Pts
 		}
 	}
 	return domain.SendPrivateTextResult{
@@ -149,7 +203,57 @@ func (s *MessageStore) SendPrivateText(_ context.Context, req domain.SendPrivate
 		RecipientMessage: cloneMessage(recipient),
 		SenderEvent:      newMessageEvent(sender),
 		RecipientEvent:   newMessageEvent(recipient),
+		DraftEvent:       cloneUpdateEvent(draftEvent),
 	}, nil
+}
+
+func (s *MessageStore) nextPtsWithEventsLocked(events *UpdateEventStore, userID int64) int {
+	return s.nextPtsNWithEventsLocked(events, userID, 1)
+}
+
+func (s *MessageStore) nextPtsNWithEventsLocked(events *UpdateEventStore, userID int64, count int) int {
+	if count <= 0 {
+		count = 1
+	}
+	current := s.nextPts[userID]
+	for _, event := range events.events[userID] {
+		if event.Pts > current {
+			current = event.Pts
+		}
+	}
+	current += count
+	s.nextPts[userID] = current
+	return current
+}
+
+func appendMemorySendEventLocked(events *UpdateEventStore, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) {
+	event = events.appendLocked(userID, event, false)
+	events.dispatches[userID] = append(events.dispatches[userID], memoryUpdateDispatch{
+		Pts: event.Pts, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+	})
+}
+
+func appendMemoryAllocatedMessageEventLocked(s *MessageStore, events *UpdateEventStore, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) domain.UpdateEvent {
+	event.Pts = s.nextPtsNWithEventsLocked(events, userID, event.PtsCount)
+	event = events.appendLocked(userID, event, false)
+	events.dispatches[userID] = append(events.dispatches[userID], memoryUpdateDispatch{
+		Pts: event.Pts, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+	})
+	return event
+}
+
+func sendDraftClearEffects(snapshot store.DialogAccountMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if snapshot.Mutation.Kind != store.DialogAccountDeleteDraft {
+		return nil, fmt.Errorf("memory private send draft projection: unexpected mutation %q", snapshot.Mutation.Kind)
+	}
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	event := domain.UpdateEvent{
+		Type: domain.UpdateEventDraftMessage, Date: snapshot.Mutation.Date, PtsCount: 1,
+		Peer: snapshot.Mutation.Peer, MaxID: snapshot.Mutation.TopMessageID,
+	}
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }
 
 // LookupPrivateSendReplay returns an existing immutable/current replay receipt without running
@@ -276,9 +380,7 @@ func (s *MessageStore) resolveMemoryReplyLocked(req domain.SendPrivateTextReques
 	return senderReply, nil, nil
 }
 
-func (s *MessageStore) upsertMemoryDialogsLocked(sender, recipient domain.Message) {
-	s.dialogs.mu.Lock()
-	defer s.dialogs.mu.Unlock()
+func (s *MessageStore) upsertMemoryDialogsStateLocked(sender, recipient domain.Message) {
 	list := s.dialogs.m[sender.OwnerUserID]
 	list = upsertMemoryDialog(list, domain.Dialog{Peer: sender.Peer, TopMessage: sender.ID, TopMessageDate: sender.Date})
 	// 发送方向清手动未读标记（对齐 postgres UpsertOutboxDialog 与

@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
@@ -14,24 +13,26 @@ import (
 	"time"
 )
 
-func TestMessagesUpdateSavedReactionTagPersistsAndPushesRefresh(t *testing.T) {
+func TestMessagesUpdateSavedReactionTagPersistsAndDurablyQueuesRefresh(t *testing.T) {
 	userID, users := newReactionTestUsers(t, true)
-	sessions := &captureSessions{}
 	reaction := domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "\U0001f44d"}
 	messages := &captureMessages{savedTags: []domain.SavedReactionTag{{
 		UserID: userID, Reaction: reaction, Count: 1,
 	}}}
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
 	r := New(Config{}, Deps{
-		Messages: messages,
-		Users:    users,
-		Sessions: sessions,
+		Messages:       messages,
+		Users:          users,
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), clock.System)
 
 	req := &tg.MessagesUpdateSavedReactionTagRequest{
 		Reaction: &tg.ReactionEmoji{Emoticon: "\U0001f44d"},
 	}
 	req.SetTitle("Fav")
-	ok, err := r.onMessagesUpdateSavedReactionTag(WithSessionID(WithUserID(context.Background(), userID), 55), req)
+	authKeyID := [8]byte{5, 5}
+	callCtx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), userID), authKeyID), 55)
+	ok, err := r.onMessagesUpdateSavedReactionTag(callCtx, req)
 	if err != nil || !ok {
 		t.Fatalf("update saved reaction tag = %v, %v, want true nil", ok, err)
 	}
@@ -48,14 +49,15 @@ func TestMessagesUpdateSavedReactionTagPersistsAndPushesRefresh(t *testing.T) {
 		t.Fatalf("saved reaction tag = %+v, want persisted thumb/Fav", page.Tags[0])
 	}
 
-	push := sessions.snapshot()
-	if push.userID != userID || push.sessionID != 55 || push.messageType != proto.MessageFromServer {
-		t.Fatalf("push = user %d exclude session %d type %v, want self/exclude/from_server", push.userID, push.sessionID, push.messageType)
+	items := outbox.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("durable deliveries = %+v, want one", items)
 	}
-	updates, ok := push.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("pushed message = %T, want *tg.Updates", push.message)
+	item := items[0]
+	if item.TargetUserID != userID || item.ExcludeAuthKeyID != authKeyID || item.ExcludeSessionID != 55 {
+		t.Fatalf("durable delivery = target %d exclude %x/%d, want self/%x/55", item.TargetUserID, item.ExcludeAuthKeyID, item.ExcludeSessionID, authKeyID)
 	}
+	updates := requireDeliveryUpdates(t, item)
 	if len(updates.Updates) != 1 {
 		t.Fatalf("updates = %+v, want one update", updates.Updates)
 	}
@@ -70,7 +72,8 @@ func TestMessagesUpdateSavedReactionTagAcceptsCustomEmoji(t *testing.T) {
 	messages := &captureMessages{savedTags: []domain.SavedReactionTag{{
 		UserID: userID, Reaction: custom, Count: 1,
 	}}}
-	r := New(Config{}, Deps{Messages: messages, Users: users}, zaptest.NewLogger(t), clock.System)
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
+	r := New(Config{}, Deps{Messages: messages, Users: users, DeliveryOutbox: outbox}, zaptest.NewLogger(t), clock.System)
 	req := &tg.MessagesUpdateSavedReactionTagRequest{
 		Reaction: &tg.ReactionCustomEmoji{DocumentID: custom.DocumentID},
 	}
@@ -105,11 +108,11 @@ func newReactionTestUsers(t *testing.T, premium bool) (int64, UsersService) {
 func TestMessagesSendReactionSavedMessageUsesTagsWithoutPTSBookkeeping(t *testing.T) {
 	userID, users := newReactionTestUsers(t, true)
 	messages := &captureMessages{}
-	sessions := &captureSessions{}
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
 	r := New(Config{}, Deps{
-		Messages: messages,
-		Users:    users,
-		Sessions: sessions,
+		Messages:       messages,
+		Users:          users,
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1_700_000_200, 0)})
 	req := &tg.MessagesSendReactionRequest{
 		Peer:     &tg.InputPeerSelf{},
@@ -140,10 +143,13 @@ func TestMessagesSendReactionSavedMessageUsesTagsWithoutPTSBookkeeping(t *testin
 	if messages.setReactionReq.Peer != (domain.Peer{Type: domain.PeerTypeUser, ID: userID}) {
 		t.Fatalf("saved tag peer = %+v, want self", messages.setReactionReq.Peer)
 	}
-	push := sessions.snapshot()
-	pushed, ok := push.message.(*tg.Updates)
-	if push.userID != userID || push.sessionID != 72 || !ok || len(pushed.Updates) != 1 {
-		t.Fatalf("saved tag push = user %d exclude %d %T %+v", push.userID, push.sessionID, push.message, push.message)
+	items := outbox.Snapshot()
+	if len(items) != 1 || items[0].TargetUserID != userID {
+		t.Fatalf("saved tag durable deliveries = %+v, want one self delivery", items)
+	}
+	pushed := requireDeliveryUpdates(t, items[0])
+	if len(pushed.Updates) != 1 {
+		t.Fatalf("saved tag durable updates = %+v, want one", pushed.Updates)
 	}
 	pushedReaction, ok := pushed.Updates[0].(*tg.UpdateMessageReactions)
 	if !ok || !pushedReaction.Reactions.ReactionsAsTags {
@@ -154,9 +160,11 @@ func TestMessagesSendReactionSavedMessageUsesTagsWithoutPTSBookkeeping(t *testin
 func TestMessagesSendReactionSavedMessageRequiresPremiumButAllowsClear(t *testing.T) {
 	userID, users := newReactionTestUsers(t, false)
 	messages := &captureMessages{}
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
 	r := New(Config{}, Deps{
-		Messages: messages,
-		Users:    users,
+		Messages:       messages,
+		Users:          users,
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), clock.System)
 	add := &tg.MessagesSendReactionRequest{
 		Peer:     &tg.InputPeerSelf{},
@@ -167,9 +175,15 @@ func TestMessagesSendReactionSavedMessageRequiresPremiumButAllowsClear(t *testin
 	if _, err := r.onMessagesSendReaction(WithUserID(context.Background(), userID), add); !tgerr.Is(err, "PREMIUM_ACCOUNT_REQUIRED") {
 		t.Fatalf("non-premium add err = %v, want PREMIUM_ACCOUNT_REQUIRED", err)
 	}
+	if items := outbox.Snapshot(); len(items) != 0 {
+		t.Fatalf("rejected non-premium reaction queued deliveries = %+v, want none", items)
+	}
 	clear := &tg.MessagesSendReactionRequest{Peer: &tg.InputPeerSelf{}, MsgID: 8}
 	if _, err := r.onMessagesSendReaction(WithUserID(context.Background(), userID), clear); err != nil {
 		t.Fatalf("non-premium clear: %v", err)
+	}
+	if items := outbox.Snapshot(); len(items) != 1 || items[0].TargetUserID != userID {
+		t.Fatalf("non-premium clear durable deliveries = %+v, want one self delivery", items)
 	}
 }
 
@@ -280,7 +294,8 @@ func TestMessagesSendReactionPrivatePeerReturnsReactionUpdate(t *testing.T) {
 		now    = int64(1700000200)
 	)
 	messages := &captureMessages{}
-	r := New(Config{}, Deps{Messages: messages}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
 	req := &tg.MessagesSendReactionRequest{
 		Peer:     &tg.InputPeerUser{UserID: peerID, AccessHash: 22},
 		MsgID:    7,
@@ -321,7 +336,8 @@ func TestMessagesSendReactionPrivatePeerAllowsCustomEmoji(t *testing.T) {
 		customDocumentID = int64(990001)
 	)
 	messages := &captureMessages{}
-	r := New(Config{}, Deps{Messages: messages}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000200, 0)})
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000200, 0)})
 	req := &tg.MessagesSendReactionRequest{
 		Peer:  &tg.InputPeerUser{UserID: peerID, AccessHash: 22},
 		MsgID: 7,
@@ -342,7 +358,7 @@ func TestMessagesSendReactionPrivatePeerAllowsCustomEmoji(t *testing.T) {
 	}
 }
 
-func TestMessagesSendReactionPrivatePushesViewerLocalMessageID(t *testing.T) {
+func TestMessagesSendReactionPrivateDurablyQueuesViewerLocalMessageID(t *testing.T) {
 	const (
 		aliceID = int64(1000000001)
 		bobID   = int64(1000000002)
@@ -403,8 +419,8 @@ func TestMessagesSendReactionPrivatePushesViewerLocalMessageID(t *testing.T) {
 			Reactions: bobReactions,
 		},
 	}
-	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Messages: messages, Sessions: sessions}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
+	outbox := attachCaptureMessagesDeliveryOutbox(messages)
+	r := New(Config{}, Deps{Messages: messages, DeliveryOutbox: outbox}, zaptest.NewLogger(t), fixedClock{now: time.Unix(now, 0)})
 	req := &tg.MessagesSendReactionRequest{
 		Peer:     &tg.InputPeerUser{UserID: aliceID, AccessHash: 11},
 		MsgID:    64,
@@ -412,7 +428,9 @@ func TestMessagesSendReactionPrivatePushesViewerLocalMessageID(t *testing.T) {
 	}
 	req.SetReaction(req.Reaction)
 
-	updates, err := r.onMessagesSendReaction(WithSessionID(WithUserID(context.Background(), bobID), 77), req)
+	authKeyID := [8]byte{7, 7}
+	callCtx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), bobID), authKeyID), 77)
+	updates, err := r.onMessagesSendReaction(callCtx, req)
 	if err != nil {
 		t.Fatalf("messages.sendReaction private: %v", err)
 	}
@@ -420,16 +438,21 @@ func TestMessagesSendReactionPrivatePushesViewerLocalMessageID(t *testing.T) {
 	if peer, ok := self.Peer.(*tg.PeerUser); !ok || peer.UserID != aliceID || self.MsgID != 64 {
 		t.Fatalf("self update peer/msg = %#v/%d, want alice/msg64", self.Peer, self.MsgID)
 	}
-	if got := sessions.pushedUserIDs(); len(got) != 2 || got[0] != bobID || got[1] != aliceID {
-		t.Fatalf("pushed users = %+v, want bob then alice", got)
+	items := outbox.Snapshot()
+	if len(items) != 2 {
+		t.Fatalf("durable deliveries = %+v, want alice and bob", items)
 	}
-	pushed := sessions.snapshot()
-	if pushed.userID != aliceID || pushed.sessionID != 77 || pushed.messageType != proto.MessageFromServer {
-		t.Fatalf("last push = user %d session %d type %v, want alice/exclude bob/from_server", pushed.userID, pushed.sessionID, pushed.messageType)
+	bobItem := requireDeliveryItemForUser(t, items, bobID)
+	if bobItem.ExcludeAuthKeyID != authKeyID || bobItem.ExcludeSessionID != 77 {
+		t.Fatalf("bob durable exclusion = %x/%d, want %x/77", bobItem.ExcludeAuthKeyID, bobItem.ExcludeSessionID, authKeyID)
 	}
-	pushedUpdates, ok := pushed.message.(*tg.Updates)
-	if !ok || len(pushedUpdates.Updates) != 1 {
-		t.Fatalf("pushed message = %T %+v, want one updates container", pushed.message, pushed.message)
+	aliceItem := requireDeliveryItemForUser(t, items, aliceID)
+	if aliceItem.ExcludeAuthKeyID != ([8]byte{}) || aliceItem.ExcludeSessionID != 0 {
+		t.Fatalf("alice durable exclusion = %x/%d, want none", aliceItem.ExcludeAuthKeyID, aliceItem.ExcludeSessionID)
+	}
+	pushedUpdates := requireDeliveryUpdates(t, aliceItem)
+	if len(pushedUpdates.Updates) != 1 {
+		t.Fatalf("alice durable updates = %+v, want one", pushedUpdates.Updates)
 	}
 	other, ok := pushedUpdates.Updates[0].(*tg.UpdateMessageReactions)
 	if !ok {

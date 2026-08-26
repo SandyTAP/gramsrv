@@ -7,6 +7,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 const communitiesLayer = 228
@@ -128,37 +129,34 @@ func (r *Router) communityPeerFromInput(ctx context.Context, userID int64, input
 }
 
 func (r *Router) communityUpdates(view domain.CommunityView) *tg.Updates {
-	return &tg.Updates{Updates: []tg.UpdateClass{}, Users: tgUsers(view.Users), Chats: tgCommunityHydratedChats(view.Self.UserID, view), Date: int(r.clock.Now().Unix())}
+	return r.communityUpdatesAt(view, int(r.clock.Now().Unix()))
 }
 
-func (r *Router) pushCommunityState(ctx context.Context, userID int64, view domain.CommunityView) {
-	r.pushUserUpdates(ctx, userID, r.communityUpdates(view))
+func (r *Router) communityUpdatesAt(view domain.CommunityView, date int) *tg.Updates {
+	return &tg.Updates{Updates: []tg.UpdateClass{}, Users: tgUsers(view.Users), Chats: tgCommunityHydratedChats(view.Self.UserID, view), Date: date}
 }
 
-func (r *Router) refreshAndPushCommunityState(ctx context.Context, viewerUserID, communityID int64, fallback domain.Community) {
-	if viewerUserID == 0 || r.deps.Communities == nil {
-		return
+func (r *Router) communityDeliveryEffects(ctx context.Context, requestUserID int64, date int) store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot store.CommunityDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, 0, len(snapshot.Targets))
+		for _, target := range snapshot.Targets {
+			payload, err := encodeDeliveryUpdate(r.communityUpdatesAt(target.View, date))
+			if err != nil {
+				return nil, err
+			}
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if target.TargetUserID == requestUserID {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: target.TargetUserID, ExcludeAuthKeyID: authKeyID,
+				ExcludeSessionID: sessionID, Payload: payload,
+				RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return effects, nil
 	}
-	view, err := r.deps.Communities.Get(ctx, viewerUserID, communityID)
-	if err == nil {
-		r.pushCommunityState(ctx, viewerUserID, view)
-		return
-	}
-	if errors.Is(err, domain.ErrCommunityPrivate) {
-		r.pushCommunityState(ctx, viewerUserID, domain.CommunityView{
-			Community: fallback,
-			Self:      domain.CommunityMember{CommunityID: communityID, UserID: viewerUserID},
-			Forbidden: true,
-		})
-	}
-}
-
-func (r *Router) communityMutationUpdates(ctx context.Context, userID int64, view domain.CommunityView, changed bool) *tg.Updates {
-	out := r.communityUpdates(view)
-	if changed {
-		r.pushCommunityState(ctx, userID, view)
-	}
-	return out
 }
 
 func (r *Router) withCommunityDialogList(ctx context.Context, userID int64, filter domain.DialogFilter, list domain.DialogList) (domain.DialogList, error) {
@@ -220,18 +218,18 @@ func (r *Router) onCommunitiesCreate(ctx context.Context, req *tg.CommunitiesCre
 		return nil, communityErr(err)
 	}
 	for _, serviceMessage := range view.ServiceMessages {
-		if err := r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil); err != nil {
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, serviceMessage); err != nil {
 			return nil, internalErr()
 		}
 	}
 	return r.communityUpdates(view), nil
 }
 
-func (r *Router) emitCommunityLinkService(ctx context.Context, actorUserID int64, result domain.CommunityTogglePeerLinkResult) error {
+func (r *Router) enqueueBotAPICommunityLinkService(ctx context.Context, actorUserID int64, result domain.CommunityTogglePeerLinkResult) error {
 	if result.ServiceMessage == nil {
 		return nil
 	}
-	return r.enqueueChannelMessageFanout(ctx, actorUserID, *result.ServiceMessage, nil)
+	return r.enqueueBotAPIChannelMessageUpdate(ctx, actorUserID, *result.ServiceMessage)
 }
 
 func (r *Router) onCommunitiesTogglePeerLink(ctx context.Context, req *tg.CommunitiesTogglePeerLinkRequest) (bool, error) {
@@ -267,17 +265,17 @@ func (r *Router) onCommunitiesTogglePeerLink(ctx context.Context, req *tg.Commun
 	if req.Hidden {
 		visibility = domain.CommunityPeerHidden
 	}
-	result, err := r.deps.Communities.TogglePeerLink(ctx, userID, domain.CommunityTogglePeerLinkRequest{CommunityID: view.Community.ID, Peer: peer, Visibility: visibility, Deleted: req.Deleted, Date: int(r.clock.Now().Unix())})
+	date := int(r.clock.Now().Unix())
+	result, err := r.deps.Communities.TogglePeerLink(ctx, userID, domain.CommunityTogglePeerLinkRequest{CommunityID: view.Community.ID, Peer: peer, Visibility: visibility, Deleted: req.Deleted, Date: date}, r.communityDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return false, communityErr(err)
 	}
 	if result.RequestCreated {
 		return false, tgerr400("COMMUNITY_REQUEST_CREATED")
 	}
-	if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+	if err := r.enqueueBotAPICommunityLinkService(ctx, userID, result); err != nil {
 		return false, internalErr()
 	}
-	r.refreshAndPushCommunityState(ctx, userID, view.Community.ID, result.Community)
 	return true, nil
 }
 
@@ -309,16 +307,14 @@ func (r *Router) onCommunitiesToggleCollapsed(ctx context.Context, req *tg.Commu
 		return nil, err
 	}
 	wasPinned := view.State.Pinned
-	view, changed, err := r.deps.Communities.SetCollapsed(ctx, userID, view.Community.ID, req.Collapsed)
+	date := int(r.clock.Now().Unix())
+	view, changed, err := r.deps.Communities.SetCollapsed(ctx, userID, view.Community.ID, req.Collapsed, r.communityDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return nil, communityErr(err)
 	}
 	out := r.communityUpdates(view)
 	if changed && !req.Collapsed && wasPinned {
 		out.Updates = append(out.Updates, &tg.UpdateDialogPinned{Peer: &tg.DialogPeerCommunity{CommunityID: view.Community.ID}})
-	}
-	if changed {
-		r.pushCommunityState(ctx, userID, view)
 	}
 	return out, nil
 }
@@ -366,17 +362,14 @@ func (r *Router) onCommunitiesTogglePeerLinkRequestApproval(ctx context.Context,
 	if err != nil {
 		return false, err
 	}
-	result, err := r.deps.Communities.DecidePeerLinkRequest(ctx, userID, view.Community.ID, peer, req.Reject, int(r.clock.Now().Unix()))
+	date := int(r.clock.Now().Unix())
+	result, err := r.deps.Communities.DecidePeerLinkRequest(ctx, userID, view.Community.ID, peer, req.Reject, date, r.communityDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return false, communityErr(err)
 	}
 	if !req.Reject {
-		if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+		if err := r.enqueueBotAPICommunityLinkService(ctx, userID, result); err != nil {
 			return false, internalErr()
-		}
-		r.refreshAndPushCommunityState(ctx, userID, view.Community.ID, result.Community)
-		if result.RequestedBy != userID {
-			r.refreshAndPushCommunityState(ctx, result.RequestedBy, view.Community.ID, result.Community)
 		}
 	}
 	return true, nil
@@ -394,24 +387,15 @@ func (r *Router) onCommunitiesToggleAllPeerLinkRequestApproval(ctx context.Conte
 	if err != nil {
 		return false, err
 	}
-	results, err := r.deps.Communities.DecideAllPeerLinkRequests(ctx, userID, view.Community.ID, req.Reject, int(r.clock.Now().Unix()))
+	date := int(r.clock.Now().Unix())
+	results, err := r.deps.Communities.DecideAllPeerLinkRequests(ctx, userID, view.Community.ID, req.Reject, date, r.communityDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return false, communityErr(err)
 	}
 	if !req.Reject {
-		requesters := map[int64]struct{}{}
 		for _, result := range results {
-			if err := r.emitCommunityLinkService(ctx, userID, result); err != nil {
+			if err := r.enqueueBotAPICommunityLinkService(ctx, userID, result); err != nil {
 				return false, internalErr()
-			}
-			if result.RequestedBy != 0 && result.RequestedBy != userID {
-				requesters[result.RequestedBy] = struct{}{}
-			}
-		}
-		if len(results) > 0 {
-			r.refreshAndPushCommunityState(ctx, userID, view.Community.ID, results[0].Community)
-			for requester := range requesters {
-				r.refreshAndPushCommunityState(ctx, requester, view.Community.ID, results[0].Community)
 			}
 		}
 	}
@@ -434,34 +418,19 @@ func (r *Router) onCommunitiesToggleParticipantBanned(ctx context.Context, req *
 	if err != nil || peer.Type != domain.PeerTypeUser {
 		return false, peerIDInvalidErr()
 	}
-	result, err := r.deps.Communities.ToggleParticipantBanned(ctx, userID, view.Community.ID, peer.ID, req.Unban, int(r.clock.Now().Unix()))
+	date := int(r.clock.Now().Unix())
+	result, err := r.deps.Communities.ToggleParticipantBanned(ctx, userID, view.Community.ID, peer.ID, req.Unban, date, r.communityDeliveryEffects(ctx, userID, date))
 	if err != nil {
 		return false, communityErr(err)
 	}
 	for _, removed := range result.RemovedLinks {
-		if err := r.emitCommunityLinkService(ctx, userID, removed); err != nil {
+		if err := r.enqueueBotAPICommunityLinkService(ctx, userID, removed); err != nil {
 			return false, internalErr()
 		}
 	}
 	for _, ban := range result.ChannelBans {
 		r.invalidateChannelFullBotInfoCacheForChannel(ban.Channel.ID)
 		r.removeOnlineChannelMemberships(ban.Channel.ID, peer.ID)
-		r.recordChannelStateForUser(ctx, peer.ID, ban.Channel.ID, false)
-		cache := newViewerPeerCache(r)
-		build := func(viewerUserID int64) *tg.Updates {
-			updates := r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, userID, ban.Channel, ban.Previous, ban.Participant, ban.Date, cache)
-			if updates != nil && ban.ServiceEvent.Pts != 0 {
-				if update := tgChannelUpdate(viewerUserID, ban.ServiceEvent); update != nil {
-					updates.Updates = append([]tg.UpdateClass{update}, updates.Updates...)
-				}
-			}
-			return updates
-		}
-		r.pushChannelUpdates(ctx, userID, ban.Channel.ID, ban.Recipients, build)
-	}
-	if result.Changed && !req.Unban {
-		forbidden := domain.CommunityView{Community: view.Community, Forbidden: true, Self: domain.CommunityMember{UserID: peer.ID}}
-		r.pushUserUpdates(ctx, peer.ID, r.communityUpdates(forbidden))
 	}
 	return true, nil
 }

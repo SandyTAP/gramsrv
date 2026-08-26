@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,16 @@ func TestRegistryValidatesInputs(t *testing.T) {
 	defer c.Close()
 	if err := reg.AcquireInstanceLease(context.Background(), "", "", 0); err != ErrInvalidRegistry {
 		t.Fatalf("AcquireInstanceLease invalid err = %v, want ErrInvalidRegistry", err)
+	}
+	for _, invalid := range []string{" edge-a", "edge-a ", strings.Repeat("e", edgecontrol.MaxDeliveryInstanceIDBytes+1)} {
+		if err := reg.AcquireInstanceLease(context.Background(), invalid, "lease-a", time.Minute); err != ErrInvalidRegistry {
+			t.Fatalf("AcquireInstanceLease instance %q err = %v, want ErrInvalidRegistry", invalid, err)
+		}
+	}
+	for _, invalid := range []string{" lease-a", "lease-a ", strings.Repeat("l", maxLocationLeaseIDBytes+1)} {
+		if err := reg.AcquireInstanceLease(context.Background(), "edge-a", invalid, time.Minute); err != ErrInvalidRegistry {
+			t.Fatalf("AcquireInstanceLease lease %q err = %v, want ErrInvalidRegistry", invalid, err)
+		}
 	}
 	if err := reg.ApplyLocationMutations(context.Background(), "edge-a", "lease-a", []edgecontrol.LocationMutation{{}}); err != ErrInvalidRecord {
 		t.Fatalf("ApplyLocationMutations invalid err = %v, want ErrInvalidRecord", err)
@@ -219,6 +230,18 @@ func assertLocationIndexes(t *testing.T, ctx context.Context, reg *Registry, rec
 	bySubscription, err := reg.ListChannelSubscription(ctx, 88)
 	if err != nil || len(bySubscription) != 1 {
 		t.Fatalf("ListChannelSubscription = %+v err=%v", bySubscription, err)
+	}
+	targets, err := reg.ListChannelDeliveryTargets(ctx, []edgecontrol.ChannelDeliveryRoute{{
+		ChannelID: 77, Audience: edgecontrol.ChannelAudienceMembers,
+	}})
+	if err != nil || len(targets) != 1 || targets[0] != record.InstanceID {
+		t.Fatalf("ListChannelDeliveryTargets members = %v err=%v, want [%s]", targets, err, record.InstanceID)
+	}
+	targets, err = reg.ListChannelDeliveryTargets(ctx, []edgecontrol.ChannelDeliveryRoute{{
+		ChannelID: 88, Audience: edgecontrol.ChannelAudienceMessageBox, AudienceUsers: []int64{record.UserID},
+	}})
+	if err != nil || len(targets) != 1 || targets[0] != record.InstanceID {
+		t.Fatalf("ListChannelDeliveryTargets message-box = %v err=%v, want [%s]", targets, err, record.InstanceID)
 	}
 	channelIDs, err := reg.ListOnlineChannelIDsSnapshot(ctx)
 	if err != nil || len(channelIDs) != 2 || channelIDs[0] != 77 || channelIDs[1] != 88 {

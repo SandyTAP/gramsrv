@@ -2,8 +2,10 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"github.com/iamxvbaba/td/tg"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesGetScheduledMessages(ctx context.Context, req *tg.MessagesGetScheduledMessagesRequest) (tg.MessagesMessagesClass, error) {
@@ -18,13 +20,10 @@ func (r *Router) onMessagesGetScheduledMessages(ctx context.Context, req *tg.Mes
 	if err != nil {
 		return nil, err
 	}
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if r.deps.Messages == nil || !ok {
-		result := &tg.MessagesMessages{Chats: r.chatsForMessageUpdate(ctx, userID, domain.Message{Peer: peer})}
-		r.applyPeerReadModelsToMessages(ctx, userID, result)
-		return result, nil
+	if r.deps.Messages == nil {
+		return nil, internalErr()
 	}
-	list, err := scheduledSvc.GetScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
+	list, err := r.deps.Messages.GetScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
 		OwnerUserID: userID,
 		Peer:        peer,
 		IDs:         append([]int(nil), req.ID...),
@@ -45,16 +44,10 @@ func (r *Router) onMessagesGetScheduledHistory(ctx context.Context, req *tg.Mess
 	if err != nil {
 		return nil, err
 	}
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if r.deps.Messages == nil || !ok {
-		if req.Hash != 0 {
-			return &tg.MessagesMessagesNotModified{Count: 0}, nil
-		}
-		result := &tg.MessagesMessages{Chats: r.chatsForMessageUpdate(ctx, userID, domain.Message{Peer: peer})}
-		r.applyPeerReadModelsToMessages(ctx, userID, result)
-		return result, nil
+	if r.deps.Messages == nil {
+		return nil, internalErr()
 	}
-	list, err := scheduledSvc.ListScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
+	list, err := r.deps.Messages.ListScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
 		OwnerUserID: userID,
 		Peer:        peer,
 		Limit:       maxScheduledMessagePage,
@@ -81,15 +74,17 @@ func (r *Router) onMessagesSendScheduledMessages(ctx context.Context, req *tg.Me
 	if err != nil {
 		return nil, err
 	}
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
 	if len(req.ID) == 0 {
 		return tgEmptyUpdates(int(r.clock.Now().Unix())), nil
 	}
-	if r.deps.Messages == nil || !ok {
+	if r.deps.Messages == nil {
 		return nil, messageIDInvalidErr()
 	}
+	if err := r.requireAccountDelivery(userID, "messages.sendScheduledMessages"); err != nil {
+		return nil, err
+	}
 	now := int(r.clock.Now().Unix())
-	claimed, err := scheduledSvc.ClaimScheduledMessages(ctx, userID, domain.ScheduledMessageClaim{
+	claimed, err := r.deps.Messages.ClaimScheduledMessages(ctx, userID, domain.ScheduledMessageClaim{
 		OwnerUserID: userID,
 		Peer:        peer,
 		IDs:         append([]int(nil), req.ID...),
@@ -114,17 +109,19 @@ func (r *Router) onMessagesDeleteScheduledMessages(ctx context.Context, req *tg.
 	if err != nil {
 		return nil, err
 	}
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if r.deps.Messages == nil || !ok {
-		date := int(r.clock.Now().Unix())
-		return tgDeleteScheduledUpdates(peer, append([]int(nil), req.ID...), nil, r.chatsForMessageUpdate(ctx, userID, domain.Message{Peer: peer}), date), nil
+	if r.deps.Messages == nil {
+		return nil, internalErr()
+	}
+	if err := r.requireAccountDelivery(userID, "messages.deleteScheduledMessages"); err != nil {
+		return nil, err
 	}
 	date := int(r.clock.Now().Unix())
-	deleted, err := scheduledSvc.DeleteScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
+	deleteChats := r.chatsForMessageUpdate(ctx, userID, domain.Message{Peer: peer})
+	deleted, err := r.deps.Messages.DeleteScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
 		OwnerUserID: userID,
 		Peer:        peer,
 		IDs:         append([]int(nil), req.ID...),
-	}, date)
+	}, date, scheduledDeleteDeliveryEffectsForMessages(ctx, userID, date, deleteChats))
 	if err != nil {
 		return nil, messageIDInvalidErr()
 	}
@@ -136,7 +133,6 @@ func (r *Router) onMessagesDeleteScheduledMessages(ctx context.Context, req *tg.
 		return tgEmptyUpdates(date), nil
 	}
 	updates := tgDeleteScheduledUpdates(peer, ids, nil, r.chatsForMessageUpdates(ctx, userID, scheduledMessagesAsDomainMessages(deleted, userID)), date)
-	r.pushUserUpdates(ctx, userID, updates)
 	return updates, nil
 }
 
@@ -162,12 +158,14 @@ func scheduleDateIsImmediate(scheduleDate, now int) bool {
 }
 
 func (r *Router) scheduleOutgoing(ctx context.Context, userID int64, peer domain.Peer, p outgoingSend, scheduleDate, repeatPeriod int) (tg.UpdatesClass, error) {
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if r.deps.Messages == nil || !ok {
+	if r.deps.Messages == nil {
 		return nil, peerIDInvalidErr()
 	}
 	if repeatPeriod != 0 {
 		return nil, scheduleDateInvalidErr()
+	}
+	if err := r.requireAccountDelivery(userID, "messages.scheduleMessage"); err != nil {
+		return nil, err
 	}
 	if peer.Type == domain.PeerTypeUser && p.randomID == 0 {
 		// 私聊发送要求非零 random_id（幂等键）。random_id==0 的定时私聊消息到点
@@ -190,7 +188,7 @@ func (r *Router) scheduleOutgoing(ctx context.Context, userID int64, peer domain
 		return nil, err
 	}
 	date := int(r.clock.Now().Unix())
-	msg, err := scheduledSvc.ScheduleMessage(ctx, userID, domain.ScheduleMessageRequest{
+	scheduleReq := domain.ScheduleMessageRequest{
 		OwnerUserID:          userID,
 		Peer:                 peer,
 		RandomID:             p.randomID,
@@ -205,15 +203,14 @@ func (r *Router) scheduleOutgoing(ctx context.Context, userID int64, peer domain
 		ScheduleDate:         scheduleDate,
 		ScheduleRepeatPeriod: repeatPeriod,
 		Date:                 date,
-	})
+		ClearDraft:           p.clearDraft,
+	}
+	deliveryRefs := r.preloadScheduledDeliveryRefs(ctx, userID, scheduledFromRequest(scheduleReq))
+	msg, err := r.deps.Messages.ScheduleMessage(ctx, userID, scheduleReq, scheduledNewDeliveryEffects(ctx, userID, p.randomID, date, deliveryRefs))
 	if err != nil {
 		return nil, messageSendErr(err)
 	}
-	if p.clearDraft {
-		r.clearDraftAfterSend(ctx, userID, peer, replyTo)
-	}
 	updates := r.tgNewScheduledMessageUpdates(ctx, userID, msg, p.randomID, date)
-	r.pushUserUpdates(ctx, userID, updates)
 	return updates, nil
 }
 
@@ -241,17 +238,18 @@ func (r *Router) sendClaimedScheduledMessages(ctx context.Context, userID int64,
 			noforwards:  scheduled.NoForwards,
 		})
 		if err != nil {
-			if scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService); ok {
-				_ = scheduledSvc.ReleaseScheduledMessage(ctx, scheduled.OwnerUserID, scheduled.ID, err.Error())
+			if r.deps.Messages != nil {
+				_ = r.deps.Messages.ReleaseScheduledMessage(ctx, scheduled.OwnerUserID, scheduled.ID, err.Error())
 			}
 			return nil, err
 		}
 		sentID := sentMessageIDFromUpdates(updates)
-		scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-		if !ok {
+		if r.deps.Messages == nil {
 			return nil, internalErr()
 		}
-		if err := scheduledSvc.MarkScheduledMessageSent(ctx, scheduled.OwnerUserID, scheduled.ID, sentID, date); err != nil {
+		deleteChats := r.chatsForMessageUpdate(ctx, scheduled.OwnerUserID, domain.Message{Peer: scheduled.Peer})
+		if err := r.deps.Messages.MarkScheduledMessageSent(ctx, scheduled.OwnerUserID, scheduled.ID, sentID, date,
+			scheduledDeleteDeliveryEffects(ctx, scheduled.OwnerUserID, date, deleteChats)); err != nil {
 			return nil, internalErr()
 		}
 		deletedIDs = append(deletedIDs, scheduled.ID)
@@ -268,7 +266,6 @@ func (r *Router) sendClaimedScheduledMessages(ctx context.Context, userID int64,
 	deleteUpdate := tgDeleteScheduledUpdates(peer, deletedIDs, sentIDs, r.chatsForMessageUpdates(ctx, userID, scheduledMessagesAsDomainMessages(claimed, userID)), date)
 	combined.Updates = append(combined.Updates, deleteUpdate.Updates...)
 	combined.Chats = mergeTGChats(combined.Chats, deleteUpdate.Chats)
-	r.pushUserUpdates(ctx, userID, deleteUpdate)
 	return combined, nil
 }
 
@@ -298,6 +295,24 @@ func (r *Router) tgScheduledMessages(ctx context.Context, userID int64, peer dom
 }
 
 func (r *Router) tgNewScheduledMessageUpdates(ctx context.Context, userID int64, msg domain.ScheduledMessage, randomID int64, date int) *tg.Updates {
+	refs := r.preloadScheduledDeliveryRefs(ctx, userID, msg)
+	return tgNewScheduledMessageUpdatesWithRefs(userID, msg, randomID, date, refs)
+}
+
+type scheduledDeliveryRefs struct {
+	users []tg.UserClass
+	chats []tg.ChatClass
+}
+
+func (r *Router) preloadScheduledDeliveryRefs(ctx context.Context, userID int64, msg domain.ScheduledMessage) scheduledDeliveryRefs {
+	domainMsg := scheduledMessageAsDomainMessage(msg, userID)
+	return scheduledDeliveryRefs{
+		users: r.usersForMessageUpdate(ctx, userID, domainMsg),
+		chats: r.chatsForMessageUpdate(ctx, userID, domainMsg),
+	}
+}
+
+func tgNewScheduledMessageUpdatesWithRefs(userID int64, msg domain.ScheduledMessage, randomID int64, date int, refs scheduledDeliveryRefs) *tg.Updates {
 	domainMsg := scheduledMessageAsDomainMessage(msg, userID)
 	item := tgMessage(domainMsg)
 	if scheduled, ok := item.(*tg.Message); ok {
@@ -313,11 +328,80 @@ func (r *Router) tgNewScheduledMessageUpdates(ctx context.Context, userID int64,
 	updates = append(updates, &tg.UpdateNewScheduledMessage{Message: item})
 	return &tg.Updates{
 		Updates: updates,
-		Users:   r.usersForMessageUpdate(ctx, userID, domainMsg),
-		Chats:   r.chatsForMessageUpdate(ctx, userID, domainMsg),
+		Users:   append([]tg.UserClass(nil), refs.users...),
+		Chats:   append([]tg.ChatClass(nil), refs.chats...),
 		Date:    date,
 		Seq:     0,
 	}
+}
+
+func scheduledFromRequest(req domain.ScheduleMessageRequest) domain.ScheduledMessage {
+	return domain.ScheduledMessage{
+		OwnerUserID: req.OwnerUserID, Peer: req.Peer, RandomID: req.RandomID,
+		Message: req.Message, Entities: append([]domain.MessageEntity(nil), req.Entities...),
+		Media: req.Media, RichMessage: req.RichMessage, Silent: req.Silent, NoForwards: req.NoForwards,
+		ReplyTo: req.ReplyTo, Forward: req.Forward, SendAs: req.SendAs,
+		ScheduleDate: req.ScheduleDate, ScheduleRepeatPeriod: req.ScheduleRepeatPeriod,
+	}
+}
+
+func scheduledNewDeliveryEffects(ctx context.Context, userID int64, randomID int64, date int, refs scheduledDeliveryRefs) store.DeliveryEffectsBuilder[domain.ScheduledMessage] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(msg domain.ScheduledMessage) ([]store.DeliveryEffect, error) {
+		updates := tgNewScheduledMessageUpdatesWithRefs(userID, msg, randomID, date, refs)
+		payload, err := encodeDeliveryUpdate(updates)
+		if err != nil {
+			return nil, fmt.Errorf("encode scheduled message delivery: %w", err)
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func scheduledDeleteDeliveryEffects(ctx context.Context, userID int64, date int, chats []tg.ChatClass) store.DeliveryEffectsBuilder[domain.ScheduledMessage] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(msg domain.ScheduledMessage) ([]store.DeliveryEffect, error) {
+		updates := tgDeleteScheduledUpdates(msg.Peer, []int{msg.ID}, nonZeroScheduledSentIDs(msg.SentMessageID), chats, date)
+		payload, err := encodeDeliveryUpdate(updates)
+		if err != nil {
+			return nil, fmt.Errorf("encode scheduled delete delivery: %w", err)
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func scheduledDeleteDeliveryEffectsForMessages(ctx context.Context, userID int64, date int, chats []tg.ChatClass) store.DeliveryEffectsBuilder[[]domain.ScheduledMessage] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(messages []domain.ScheduledMessage) ([]store.DeliveryEffect, error) {
+		if len(messages) == 0 {
+			return nil, nil
+		}
+		ids := make([]int, 0, len(messages))
+		for _, msg := range messages {
+			ids = append(ids, msg.ID)
+		}
+		updates := tgDeleteScheduledUpdates(messages[0].Peer, ids, nil, chats, date)
+		payload, err := encodeDeliveryUpdate(updates)
+		if err != nil {
+			return nil, fmt.Errorf("encode scheduled delete delivery: %w", err)
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func nonZeroScheduledSentIDs(id int) []int {
+	if id <= 0 {
+		return nil
+	}
+	return []int{id}
 }
 
 func scheduledMessagesAsDomainMessages(messages []domain.ScheduledMessage, viewerUserID int64) []domain.Message {
@@ -375,9 +459,11 @@ func sentMessageIDFromUpdates(updates tg.UpdatesClass) int {
 }
 
 func (r *Router) scheduleForwardMessages(ctx context.Context, userID int64, fromPeer, toPeer domain.Peer, req *tg.MessagesForwardMessagesRequest, replyTo *domain.MessageReply, sendAs *domain.Peer, preloadedSources []forwardSource) (tg.UpdatesClass, error) {
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if r.deps.Messages == nil || !ok {
+	if r.deps.Messages == nil {
 		return nil, peerIDInvalidErr()
+	}
+	if err := r.requireAccountDelivery(userID, "messages.scheduleForwardMessages"); err != nil {
+		return nil, err
 	}
 	sources, err := r.forwardSourcesForRequest(ctx, userID, fromPeer, req.ID, preloadedSources)
 	if err != nil {
@@ -397,7 +483,7 @@ func (r *Router) scheduleForwardMessages(ctx context.Context, userID int64, from
 		if req.DropAuthor {
 			forward = nil
 		}
-		msg, err := scheduledSvc.ScheduleMessage(ctx, userID, domain.ScheduleMessageRequest{
+		scheduleReq := domain.ScheduleMessageRequest{
 			OwnerUserID:          userID,
 			Peer:                 toPeer,
 			RandomID:             req.RandomID[i],
@@ -412,7 +498,10 @@ func (r *Router) scheduleForwardMessages(ctx context.Context, userID int64, from
 			ScheduleDate:         req.ScheduleDate,
 			ScheduleRepeatPeriod: req.ScheduleRepeatPeriod,
 			Date:                 date,
-		})
+		}
+		deliveryRefs := r.preloadScheduledDeliveryRefs(ctx, userID, scheduledFromRequest(scheduleReq))
+		msg, err := r.deps.Messages.ScheduleMessage(ctx, userID, scheduleReq,
+			scheduledNewDeliveryEffects(ctx, userID, req.RandomID[i], date, deliveryRefs))
 		if err != nil {
 			return nil, messageForwardErr(err)
 		}
@@ -432,7 +521,6 @@ func (r *Router) scheduleForwardMessages(ctx context.Context, userID int64, from
 	}
 	updates.Users = r.usersForMessageUpdates(ctx, userID, domainMessages)
 	updates.Chats = r.chatsForMessageUpdates(ctx, userID, domainMessages)
-	r.pushUserUpdates(ctx, userID, updates)
 	return updates, nil
 }
 
@@ -440,15 +528,21 @@ func (r *Router) editScheduledMessage(ctx context.Context, userID int64, peer do
 	if r.deps.Messages == nil {
 		return nil, messageIDInvalidErr()
 	}
-	scheduledSvc, ok := r.deps.Messages.(scheduledMessagesService)
-	if !ok {
-		return nil, messageIDInvalidErr()
+	if err := r.requireAccountDelivery(userID, "messages.editScheduledMessage"); err != nil {
+		return nil, err
 	}
 	now := int(r.clock.Now().Unix())
 	if scheduleDateIsImmediate(scheduleDate, now) {
 		return nil, scheduleDateInvalidErr()
 	}
-	msg, err := scheduledSvc.EditScheduledMessage(ctx, userID, domain.EditScheduledMessageRequest{
+	current, err := r.deps.Messages.GetScheduledMessages(ctx, userID, domain.ScheduledMessageFilter{
+		OwnerUserID: userID, Peer: peer, IDs: []int{id}, Limit: 1,
+	})
+	if err != nil || len(current.Messages) != 1 {
+		return nil, messageIDInvalidErr()
+	}
+	deliveryRefs := r.preloadScheduledDeliveryRefs(ctx, userID, current.Messages[0])
+	msg, err := r.deps.Messages.EditScheduledMessage(ctx, userID, domain.EditScheduledMessageRequest{
 		OwnerUserID:    userID,
 		Peer:           peer,
 		ID:             id,
@@ -459,11 +553,10 @@ func (r *Router) editScheduledMessage(ctx context.Context, userID int64, peer do
 		RichMessage:    richMessage,
 		ScheduleDate:   scheduleDate,
 		Date:           now,
-	})
+	}, scheduledNewDeliveryEffects(ctx, userID, 0, now, deliveryRefs))
 	if err != nil {
 		return nil, messageEditErr(err)
 	}
 	updates := r.tgNewScheduledMessageUpdates(ctx, userID, msg, 0, now)
-	r.pushUserUpdates(ctx, userID, updates)
 	return updates, nil
 }

@@ -556,6 +556,10 @@ func TestCountPrivateMediaCategoriesCachesByReadModelHash(t *testing.T) {
 }
 
 type projectionMessageStore struct {
+	// Unused reliable mutation methods intentionally remain unavailable in this
+	// read-projection test double. Tests exercising them use the production-shaped
+	// memory MessageStore instead.
+	store.MessageStore
 	list domain.MessageList
 }
 
@@ -682,15 +686,33 @@ func businessAutomationAllRecipients() domain.BusinessRecipients {
 
 func saveBusinessQuickReply(t *testing.T, ctx context.Context, svc *account.Service, ownerID int64, shortcut, message string, randomID int64) int {
 	t.Helper()
-	mutation, err := svc.SaveQuickReplyText(ctx, ownerID, shortcut, domain.QuickReplyMessage{
-		RandomID: randomID,
-		Date:     1_700_000_000,
-		Message:  message,
-	})
+	snapshot, err := svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountSaveText, UserID: ownerID, Date: 1_700_000_000, Shortcut: shortcut,
+		Message: domain.QuickReplyMessage{RandomID: randomID, Date: 1_700_000_000, Message: message},
+	}, businessQuickReplyTestEffects)
 	if err != nil {
 		t.Fatalf("save quick reply %s: %v", shortcut, err)
 	}
-	return mutation.ShortcutID
+	return snapshot.Result.ShortcutID
+}
+
+func businessQuickReplyTestEffects(snapshot store.QuickReplyAccountMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	result := snapshot.Result
+	event := domain.UpdateEvent{
+		Date: snapshot.Mutation.Date, PtsCount: 1, MaxID: result.ShortcutID,
+		QuickReplies: append([]domain.QuickReply(nil), result.List.QuickReplies...),
+		QuickReply:   result.QuickReply, QuickReplyMessage: result.Message,
+		MessageIDs: append([]int(nil), result.MessageIDs...),
+	}
+	if result.Kind == domain.QuickReplyMutationNew {
+		event.Type = domain.UpdateEventNewQuickReply
+	} else {
+		event.Type = domain.UpdateEventQuickReplyMessage
+	}
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }
 
 func countBusinessMessagesByBody(t *testing.T, ctx context.Context, messages *memory.MessageStore, ownerID, peerID int64, body string) int {
@@ -764,7 +786,7 @@ func (s projectionMessageStore) GetOutboxReadDate(context.Context, domain.Outbox
 	return 0, nil
 }
 
-func (s projectionMessageStore) SetMessageReactions(context.Context, domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s projectionMessageStore) SetMessageReactions(context.Context, domain.SetPrivateMessageReactionsRequest, store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	return domain.PrivateMessageReactionsResult{}, nil
 }
 
@@ -776,15 +798,15 @@ func (s projectionMessageStore) ListSavedReactionTags(context.Context, domain.Sa
 	return nil, nil
 }
 
-func (s projectionMessageStore) UpsertSavedReactionTag(context.Context, domain.SavedReactionTag) error {
+func (s projectionMessageStore) UpsertSavedReactionTag(context.Context, domain.SavedReactionTag, store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error {
 	return nil
 }
 
-func (s projectionMessageStore) VoteMessagePoll(context.Context, domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s projectionMessageStore) VoteMessagePoll(context.Context, domain.VotePrivateMessagePollRequest, store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	return domain.PrivateMessagePollResult{}, nil
 }
 
-func (s projectionMessageStore) CloseMessagePoll(context.Context, domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s projectionMessageStore) CloseMessagePoll(context.Context, domain.ClosePrivateMessagePollRequest, store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	return domain.PrivateMessagePollResult{}, nil
 }
 
@@ -816,12 +838,8 @@ func (s projectionMessageStore) ListSavedDialogsByPeers(context.Context, int64, 
 	return domain.SavedDialogList{}, nil
 }
 
-func (s projectionMessageStore) ToggleSavedDialogPin(context.Context, int64, domain.Peer, bool) (bool, error) {
-	return false, nil
-}
-
-func (s projectionMessageStore) ReorderPinnedSavedDialogs(context.Context, int64, []domain.Peer, bool) error {
-	return nil
+func (s projectionMessageStore) MutateSavedDialogs(context.Context, store.SavedDialogMutation, store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error) {
+	return store.SavedDialogMutationSnapshot{}, nil
 }
 
 func (s projectionMessageStore) DeleteSavedHistory(context.Context, domain.DeleteSavedHistoryRequest) (domain.DeleteSavedHistoryResult, error) {

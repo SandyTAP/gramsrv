@@ -41,7 +41,7 @@ func TestChannelStoreSendMessageFansOutDialogRows(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Dialog Top " + suffix,
@@ -118,7 +118,8 @@ WHERE channel_id = $1 AND user_id = $2`, channelID, owner.ID).Scan(&ownerMemberR
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000302,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("read history: %v", err)
 	}
@@ -205,7 +206,7 @@ WHERE c.id = $1`, channelID).Scan(&channelPtsBeforeClear, &channelEventsBeforeCl
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000302,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("local clear history: %v", err)
 	}
@@ -281,7 +282,7 @@ LIMIT $4`, friend.ID, 1700000302, int64(0), 10)
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000303,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("stale local clear history: %v", err)
 	}
@@ -430,7 +431,7 @@ func TestChannelStoreStoryMessageForwardsPublicOnlyAndDeleteRollbackPostgres(t *
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	var channelIDs []int64
 	t.Cleanup(func() {
 		if len(channelIDs) > 0 {
@@ -560,7 +561,7 @@ func TestChannelStoreSendMessageViaBotIDSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID, bot.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Inline Via Channel " + suffix,
@@ -728,7 +729,7 @@ func TestChannelStoreSendMessageSkipDeliveryAdvancesReadBoundary(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID, bot.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Skip Delivery " + suffix,
@@ -841,7 +842,7 @@ func TestChannelStoreConcurrentSendAndReadHistoryDoNotSurfaceDeadlock(t *testing
 		_, _ = pool.Exec(context.Background(), "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Send Read Race " + suffix,
@@ -889,7 +890,8 @@ func TestChannelStoreConcurrentSendAndReadHistoryDoNotSurfaceDeadlock(t *testing
 				ChannelID: channelID,
 				MaxID:     first.Message.ID,
 				Date:      1700000600,
-			})
+			}, testChannelReadEffects)
+
 			errs <- err
 		}()
 		close(start)
@@ -933,7 +935,7 @@ func TestChannelStoreJoinInitialReadWatermarkSkipsExistingHistory(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Join Watermark " + suffix,
@@ -954,11 +956,11 @@ func TestChannelStoreJoinInitialReadWatermarkSkipsExistingHistory(t *testing.T) 
 	if err != nil {
 		t.Fatalf("send existing message: %v", err)
 	}
-	joined, err := channels.JoinChannel(ctx, channelID, friend.ID, 1700000322)
+	joined, err := channels.JoinChannel(ctx, channelID, friend.ID, 1700000322, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("join channel: %v", err)
 	}
-	if _, err := channels.JoinChannel(ctx, channelID, friend.ID, 1700000323); !errors.Is(err, domain.ErrUserAlreadyParticipant) {
+	if _, err := channels.JoinChannel(ctx, channelID, friend.ID, 1700000323, testPendingJoinEffects); !errors.Is(err, domain.ErrUserAlreadyParticipant) {
 		t.Fatalf("duplicate join err = %v, want ErrUserAlreadyParticipant", err)
 	}
 	if len(joined.Members) != 1 || joined.Members[0].ReadInboxMaxID != joined.Message.ID {
@@ -1033,7 +1035,7 @@ func TestChannelStoreInviteInitialReadWatermarkSkipsExistingHistory(t *testing.T
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, invited.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Invite Watermark " + suffix,
@@ -1101,7 +1103,7 @@ func TestChannelStoreImportInviteInitialReadWatermarkSkipsExistingHistory(t *tes
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, joiner.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Import Watermark " + suffix,
@@ -1135,7 +1137,7 @@ func TestChannelStoreImportInviteInitialReadWatermarkSkipsExistingHistory(t *tes
 		UserID: joiner.ID,
 		Hash:   invite.Invite.Hash,
 		Date:   1700000333,
-	})
+	}, testPendingJoinEffects)
 	if err != nil {
 		t.Fatalf("import invite: %v", err)
 	}
@@ -1194,7 +1196,7 @@ func TestChannelStoreSendMessageResolvesReplyTopID(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Reply Top " + suffix,
@@ -1284,7 +1286,7 @@ func TestChannelStoreHistorySupportsOffsetDateOnly(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "History Date " + suffix,
@@ -1357,7 +1359,7 @@ func TestChannelStoreDeleteHistoryForEveryoneBatchesHugeMaxID(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Bulk Delete " + suffix,
@@ -1440,7 +1442,7 @@ WHERE id = $1`, channelID, total+1); err != nil {
 		MaxID:       int(^uint(0) >> 1),
 		ForEveryone: true,
 		Date:        1700000700,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("DeleteChannelHistory first batch: %v", err)
 	}
@@ -1462,7 +1464,7 @@ WHERE id = $1`, channelID, total+1); err != nil {
 		MaxID:       int(^uint(0) >> 1),
 		ForEveryone: true,
 		Date:        1700000701,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("DeleteChannelHistory second batch: %v", err)
 	}

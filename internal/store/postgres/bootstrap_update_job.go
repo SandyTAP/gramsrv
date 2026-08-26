@@ -82,7 +82,7 @@ func (s *BootstrapUpdateJobStore) ClaimReady(ctx context.Context, limit int, lea
 	}
 	leaseSeconds := int(leaseTimeout / time.Second)
 	if leaseSeconds <= 0 {
-		leaseSeconds = int(defaultDispatchLease / time.Second)
+		leaseSeconds = int(defaultOutboxLease / time.Second)
 	}
 	rows, err := s.db.Query(ctx, `
 WITH picked AS (

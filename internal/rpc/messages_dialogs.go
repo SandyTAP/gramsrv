@@ -6,9 +6,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/iamxvbaba/td/tg"
-	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesSaveDraft(ctx context.Context, req *tg.MessagesSaveDraftRequest) (bool, error) {
@@ -20,67 +20,24 @@ func (r *Router) onMessagesSaveDraft(ctx context.Context, req *tg.MessagesSaveDr
 	if err != nil {
 		return false, err
 	}
-	peerTL := tgPeer(peer)
-	if peerTL == nil {
-		return true, nil
-	}
 	date := int(r.clock.Now().Unix())
 	draft, err := r.dialogDraftFromSaveDraft(ctx, userID, peer, req, date)
 	if err != nil {
 		return false, err
 	}
-	var recorded domain.UpdateEvent
-	changed := true
-	if r.deps.Dialogs != nil {
-		changed, err = r.deps.Dialogs.SaveDraft(ctx, userID, draft)
-		if err != nil {
-			return false, dialogDraftErr(err)
-		}
-		if !changed {
-			return true, nil
-		}
-		// durable 事件：草稿是绝对状态，事件只记 peer(+top_msg_id) 标记，
-		// difference/outbox 重放时按 peer 重载当前值（见 enrichDraftMessageEvent）。
-		recorded = r.recordDraftMessageEvent(ctx, userID, peer, draft.TopMessageID, &date)
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
 	}
-	update := &tg.UpdateDraftMessage{
-		Peer:  peerTL,
-		Draft: tgDialogDraft(draft),
+	mutation := store.DialogAccountMutation{
+		Kind: store.DialogAccountSaveDraft, UserID: userID, Date: date, Draft: draft,
 	}
-	if draft.TopMessageID > 0 {
-		update.SetTopMsgID(draft.TopMessageID)
+	if draft.Empty() {
+		mutation.Kind, mutation.Peer, mutation.TopMessageID = store.DialogAccountDeleteDraft, peer, draft.TopMessageID
 	}
-	users, chats := r.peerObjectsForDraftUpdate(ctx, userID, peer)
-	updates := &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
-		Users:   users,
-		Chats:   chats,
-		Date:    date,
-		Seq:     0,
+	if _, err := r.deps.Dialogs.MutateAccountDialogs(ctx, mutation, dialogAccountDeliveryEffects); err != nil {
+		return false, dialogDraftErr(err)
 	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	return true, nil
-}
-
-// recordDraftMessageEvent 记录 draft_message durable 事件（占账号 pts，无 wire pts），
-// 经 transactional outbox + 独立 Egress 推给其它在线 session；Updates 服务缺席时
-// fail-closed，不再从 Core/RPC 直推 session。
-func (r *Router) recordDraftMessageEvent(ctx context.Context, userID int64, peer domain.Peer, topMsgID int, date *int) domain.UpdateEvent {
-	if r.deps.Updates == nil {
-		return domain.UpdateEvent{}
-	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	event, state, err := r.deps.Updates.RecordDraftMessage(ctx, authKeyID, userID, peer, topMsgID, rawAuthKeyIDForOrigin(ctx), sessionID)
-	if err != nil {
-		r.log.Warn("record draft message event", zap.Int64("user_id", userID), zap.Error(err))
-		return domain.UpdateEvent{}
-	}
-	if date != nil && state.Date != 0 {
-		*date = state.Date
-	}
-	return event
 }
 
 func (r *Router) onMessagesGetAllDrafts(ctx context.Context) (tg.UpdatesClass, error) {
@@ -120,36 +77,14 @@ func (r *Router) onMessagesClearAllDrafts(ctx context.Context) (bool, error) {
 	if r.deps.Dialogs == nil {
 		return true, nil
 	}
-	drafts, err := r.deps.Dialogs.ClearDrafts(ctx, userID, domain.MaxDialogDraftsPerUser)
+	result, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountClearDrafts, UserID: userID,
+		Date: int(r.clock.Now().Unix()), Limit: domain.MaxDialogDraftsPerUser,
+	}, dialogAccountDeliveryEffects)
 	if err != nil {
 		return false, dialogDraftErr(err)
 	}
-	if len(drafts) == 0 {
-		return true, nil
-	}
-	date := int(r.clock.Now().Unix())
-	updates := make([]tg.UpdateClass, 0, len(drafts))
-	events := make([]domain.UpdateEvent, 0, len(drafts))
-	for _, draft := range drafts {
-		update := draftClearUpdate(draft.Peer, draft.TopMessageID, date)
-		if update == nil {
-			continue
-		}
-		updates = append(updates, update)
-		if event := r.recordDraftMessageEvent(ctx, userID, draft.Peer, draft.TopMessageID, nil); event.Pts > 0 {
-			events = append(events, event)
-			updates = appendAuxPtsBookkeeping(updates, event)
-		}
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, events...)
-	users, chats := r.peerObjectsForDrafts(ctx, userID, drafts)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: updates,
-		Users:   users,
-		Chats:   chats,
-		Date:    date,
-		Seq:     0,
-	})
+	_ = result
 	return true, nil
 }
 
@@ -375,49 +310,6 @@ func dialogDraftErr(err error) error {
 	}
 }
 
-func (r *Router) clearDraftAfterSend(ctx context.Context, userID int64, peer domain.Peer, replyTo *domain.MessageReply) {
-	r.clearDraftAfterSendWithOptionalPeerObjects(ctx, userID, peer, replyTo, nil, nil, false)
-}
-
-func (r *Router) clearDraftAfterSendWithPeerObjects(ctx context.Context, userID int64, peer domain.Peer, replyTo *domain.MessageReply, users []tg.UserClass, chats []tg.ChatClass) {
-	r.clearDraftAfterSendWithOptionalPeerObjects(ctx, userID, peer, replyTo, users, chats, true)
-}
-
-func (r *Router) clearDraftAfterSendWithOptionalPeerObjects(ctx context.Context, userID int64, peer domain.Peer, replyTo *domain.MessageReply, users []tg.UserClass, chats []tg.ChatClass, peerObjectsReady bool) {
-	if r.deps.Dialogs == nil || userID == 0 || peer.ID == 0 {
-		return
-	}
-	topMessageID := 0
-	if peer.Type == domain.PeerTypeChannel && replyTo != nil && replyTo.TopMessageID > 0 {
-		topMessageID = replyTo.TopMessageID
-	}
-	changed, err := r.deps.Dialogs.DeleteDraft(ctx, userID, peer, topMessageID)
-	if err != nil {
-		r.log.Debug("clear draft after send", zap.Int64("user_id", userID), zap.Error(err))
-		return
-	}
-	if !changed {
-		return
-	}
-	date := int(r.clock.Now().Unix())
-	update := draftClearUpdate(peer, topMessageID, date)
-	if update == nil {
-		return
-	}
-	recorded := r.recordDraftMessageEvent(ctx, userID, peer, topMessageID, &date)
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	if !peerObjectsReady {
-		users, chats = r.peerObjectsForDraftUpdate(ctx, userID, peer)
-	}
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
-		Users:   users,
-		Chats:   chats,
-		Date:    date,
-		Seq:     0,
-	})
-}
-
 func (r *Router) onMessagesGetDialogFilters(ctx context.Context) (*tg.MessagesDialogFilters, error) {
 	if r.deps.Dialogs == nil {
 		return tgDialogFilters(domain.DialogFolderList{}), nil
@@ -442,44 +334,22 @@ func (r *Router) onMessagesUpdateDialogFilter(ctx context.Context, req *tg.Messa
 		return false, internalErr()
 	}
 	filter, ok := req.GetFilter()
-	var folder *domain.DialogFolder
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
+	}
+	mutation := store.DialogAccountMutation{UserID: userID, Date: int(r.clock.Now().Unix())}
 	if ok {
 		parsed, err := r.dialogFolderFromTG(ctx, userID, req.ID, filter)
 		if err != nil {
 			return false, err
 		}
-		folder = &parsed
-		if r.deps.Dialogs != nil {
-			if err := r.deps.Dialogs.SaveDialogFolder(ctx, userID, parsed); err != nil {
-				return false, internalErr()
-			}
-		}
-	} else if r.deps.Dialogs != nil {
-		if err := r.deps.Dialogs.DeleteDialogFolder(ctx, userID, req.ID); err != nil {
-			return false, internalErr()
-		}
+		mutation.Kind, mutation.Folder = store.DialogAccountUpsertFolder, parsed
+	} else {
+		mutation.Kind, mutation.FolderID = store.DialogAccountDeleteFolder, req.ID
 	}
-	// 顺序约定：先 Save（durable 真值）后 Record（增量通知）。Record 失败时
-	// RPC 返回错误，但真值已落库——其它设备丢的只是即时 update，重启/重拉
-	// getDialogFilters 即收敛，不会产生持久漂移；反向顺序（先 Record）失败
-	// 会让其它设备应用 update 内嵌的新 filter 而 store 仍是旧值，重拉后回退
-	// 抖动，故不可取。
-	event := domain.UpdateEvent{
-		Type:         domain.UpdateEventDialogFilter,
-		FilterID:     req.ID,
-		DialogFilter: folder,
-		Date:         int(r.clock.Now().Unix()),
+	if _, err := r.deps.Dialogs.MutateAccountDialogs(ctx, mutation, dialogAccountDeliveryEffects); err != nil {
+		return false, internalErr()
 	}
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordDialogFilter(ctx, authKeyID, userID, req.ID, folder, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -492,26 +362,15 @@ func (r *Router) onMessagesUpdateDialogFiltersOrder(ctx context.Context, order [
 		return false, internalErr()
 	}
 	clean := cleanDialogFilterOrder(order)
-	if r.deps.Dialogs != nil {
-		if err := r.deps.Dialogs.ReorderDialogFolders(ctx, userID, clean); err != nil {
-			return false, internalErr()
-		}
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
 	}
-	event := domain.UpdateEvent{
-		Type:        domain.UpdateEventDialogFilterOrder,
-		FilterOrder: clean,
-		Date:        int(r.clock.Now().Unix()),
+	if _, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountReorderFolders, UserID: userID,
+		Date: int(r.clock.Now().Unix()), FolderOrder: clean,
+	}, dialogAccountDeliveryEffects); err != nil {
+		return false, internalErr()
 	}
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordDialogFilterOrder(ctx, authKeyID, userID, clean, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -520,26 +379,15 @@ func (r *Router) onMessagesToggleDialogFilterTags(ctx context.Context, enabled b
 	if err != nil {
 		return false, internalErr()
 	}
-	if r.deps.Dialogs != nil {
-		if err := r.deps.Dialogs.ToggleDialogFolderTags(ctx, userID, enabled); err != nil {
-			return false, internalErr()
-		}
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
 	}
-	event := domain.UpdateEvent{
-		Type:        domain.UpdateEventDialogFilters,
-		TagsEnabled: enabled,
-		Date:        int(r.clock.Now().Unix()),
+	if _, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountSetFolderTags, UserID: userID,
+		Date: int(r.clock.Now().Unix()), Value: enabled,
+	}, dialogAccountDeliveryEffects); err != nil {
+		return false, internalErr()
 	}
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordDialogFiltersReload(ctx, authKeyID, userID, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return true, nil
 }
 
@@ -613,42 +461,20 @@ func (r *Router) onMessagesToggleDialogPin(ctx context.Context, req *tg.Messages
 		}
 		pinned := req.GetPinned()
 		peer := domain.Peer{Type: domain.PeerTypeCommunity, ID: community.Community.ID}
-		if pinned && !community.State.Pinned {
-			if err := r.ensureCombinedPinCapacity(ctx, userID, domain.DialogMainFolderID, peer); err != nil {
-				if errors.Is(err, domain.ErrPinnedDialogsTooMuch) {
-					return false, pinnedTooMuchErr()
-				}
-				return false, internalErr()
-			}
+		if r.deps.Dialogs == nil {
+			return false, internalErr()
 		}
-		changed, err := r.deps.Communities.SetPinned(ctx, userID, community.Community.ID, pinned)
+		_, err = r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+			Kind: store.DialogAccountSetPinned, UserID: userID, Date: int(r.clock.Now().Unix()),
+			Peer: peer, Value: pinned,
+			PinnedLimit: domain.PinnedDialogsLimit(domain.DialogMainFolderID, r.userIsPremium(ctx, userID)),
+		}, dialogAccountDeliveryEffects)
 		if err != nil {
+			if errors.Is(err, domain.ErrPinnedDialogsTooMuch) {
+				return false, pinnedTooMuchErr()
+			}
 			return false, communityErr(err)
 		}
-		if !changed {
-			return true, nil
-		}
-		if pinned {
-			if err := r.promoteCombinedPinnedDialog(ctx, userID, domain.DialogMainFolderID, peer); err != nil {
-				return false, internalErr()
-			}
-		}
-		date := int(r.clock.Now().Unix())
-		var recorded domain.UpdateEvent
-		if r.deps.Updates != nil {
-			authKeyID, _ := AuthKeyIDFrom(ctx)
-			sessionID, _ := SessionIDFrom(ctx)
-			event, state, err := r.deps.Updates.RecordDialogPinned(ctx, authKeyID, userID, peer, pinned, domain.DialogMainFolderID, rawAuthKeyIDForOrigin(ctx), sessionID)
-			if err != nil {
-				return false, internalErr()
-			}
-			date, recorded = state.Date, event
-		}
-		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogPinned{Pinned: pinned, Peer: tgDialogPeer(peer)}}, recorded),
-			Chats:   []tg.ChatClass{tgCommunityChat(community)}, Date: date,
-		})
 		return true, nil
 	}
 	peers, err := r.dialogPeersFromInput(ctx, userID, []tg.InputDialogPeerClass{req.Peer})
@@ -660,10 +486,10 @@ func (r *Router) onMessagesToggleDialogPin(ctx context.Context, req *tg.Messages
 	}
 	pinned := req.GetPinned()
 	if r.deps.Dialogs == nil {
-		return true, nil
+		return false, internalErr()
 	}
+	folderID := domain.DialogMainFolderID
 	if pinned {
-		folderID := domain.DialogMainFolderID
 		current, err := r.deps.Dialogs.GetPeerDialogs(ctx, userID, peers)
 		if err != nil {
 			return false, internalErr()
@@ -674,51 +500,17 @@ func (r *Router) onMessagesToggleDialogPin(ctx context.Context, req *tg.Messages
 				break
 			}
 		}
-		if err := r.ensureCombinedPinCapacity(ctx, userID, folderID, peers[0]); err != nil {
-			if errors.Is(err, domain.ErrPinnedDialogsTooMuch) {
-				return false, pinnedTooMuchErr()
-			}
-			return false, internalErr()
-		}
 	}
-	changed, folderID, err := r.deps.Dialogs.TogglePinned(ctx, userID, peers[0], pinned)
+	_, err = r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountSetPinned, UserID: userID, Date: int(r.clock.Now().Unix()),
+		Peer: peers[0], Value: pinned,
+		PinnedLimit: domain.PinnedDialogsLimit(folderID, r.userIsPremium(ctx, userID)),
+	}, dialogAccountDeliveryEffects)
 	if err != nil {
 		if errors.Is(err, domain.ErrPinnedDialogsTooMuch) {
 			return false, pinnedTooMuchErr()
 		}
 		return false, internalErr()
-	}
-	if changed {
-		if pinned {
-			if err := r.promoteCombinedPinnedDialog(ctx, userID, folderID, peers[0]); err != nil {
-				return false, internalErr()
-			}
-		}
-		date := int(r.clock.Now().Unix())
-		var recorded domain.UpdateEvent
-		if r.deps.Updates != nil {
-			authKeyID, _ := AuthKeyIDFrom(ctx)
-			sessionID, _ := SessionIDFrom(ctx)
-			event, state, err := r.deps.Updates.RecordDialogPinned(ctx, authKeyID, userID, peers[0], pinned, folderID, rawAuthKeyIDForOrigin(ctx), sessionID)
-			if err != nil {
-				return false, internalErr()
-			}
-			date = state.Date
-			recorded = event
-		}
-		update := &tg.UpdateDialogPinned{
-			Pinned: pinned,
-			Peer:   tgDialogPeer(peers[0]),
-		}
-		if folderID != domain.DialogMainFolderID {
-			update.SetFolderID(folderID)
-		}
-		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
-			Date:    date,
-			Seq:     0,
-		})
 	}
 	return true, nil
 }
@@ -733,35 +525,13 @@ func (r *Router) toggleArchiveFolderPin(ctx context.Context, userID int64, folde
 	if r.deps.Dialogs == nil {
 		return true, nil
 	}
-	changed, err := r.deps.Dialogs.ToggleArchivePinned(ctx, userID, pinned)
+	_, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountSetPinned, UserID: userID, Date: int(r.clock.Now().Unix()),
+		Peer: domain.Peer{Type: domain.PeerTypeFolder, ID: int64(folderID)}, Value: pinned,
+	}, dialogAccountDeliveryEffects)
 	if err != nil {
 		return false, internalErr()
 	}
-	if !changed {
-		return true, nil
-	}
-	folderPeer := domain.Peer{Type: domain.PeerTypeFolder, ID: int64(folderID)}
-	date := int(r.clock.Now().Unix())
-	var recorded domain.UpdateEvent
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, state, err := r.deps.Updates.RecordDialogPinned(ctx, authKeyID, userID, folderPeer, pinned, 0, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-		date = state.Date
-		recorded = event
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogPinned{
-			Pinned: pinned,
-			Peer:   &tg.DialogPeerFolder{FolderID: folderID},
-		}}, recorded),
-		Date: date,
-		Seq:  0,
-	})
 	return true, nil
 }
 
@@ -795,49 +565,16 @@ func (r *Router) onMessagesReorderPinnedDialogs(ctx context.Context, req *tg.Mes
 	if len(peers) > domain.PinnedDialogsLimit(req.FolderID, r.userIsPremium(ctx, userID)) {
 		return false, pinnedTooMuchErr()
 	}
-	if r.deps.Dialogs == nil && r.deps.Communities == nil {
-		return true, nil
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
 	}
-	changed := false
-	if r.deps.Dialogs != nil {
-		dialogsChanged, err := r.deps.Dialogs.ReorderPinned(ctx, userID, req.FolderID, peers, req.GetForce())
-		if err != nil {
-			return false, internalErr()
-		}
-		changed = dialogsChanged
+	if _, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountReorderPinned, UserID: userID, Date: int(r.clock.Now().Unix()),
+		FolderID: req.FolderID, Peers: peers, Force: req.GetForce(),
+		PinnedLimit: domain.PinnedDialogsLimit(req.FolderID, r.userIsPremium(ctx, userID)),
+	}, dialogAccountDeliveryEffects); err != nil {
+		return false, internalErr()
 	}
-	if r.deps.Communities != nil && req.FolderID == domain.DialogMainFolderID {
-		communitiesChanged, err := r.deps.Communities.ReorderPinned(ctx, userID, peers, req.GetForce())
-		if err != nil {
-			return false, communityErr(err)
-		}
-		changed = changed || communitiesChanged
-	}
-	if !changed {
-		return true, nil
-	}
-	date := int(r.clock.Now().Unix())
-	var recorded domain.UpdateEvent
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, state, err := r.deps.Updates.RecordPinnedDialogs(ctx, authKeyID, userID, req.FolderID, peers, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-		date = state.Date
-		recorded = event
-	}
-	update := &tg.UpdatePinnedDialogs{Order: tgDialogPeers(peers)}
-	if req.FolderID != domain.DialogMainFolderID {
-		update.SetFolderID(req.FolderID)
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
-		Date:    date,
-		Seq:     0,
-	})
 	return true, nil
 }
 
@@ -870,33 +607,14 @@ func (r *Router) onMessagesMarkDialogUnread(ctx context.Context, req *tg.Message
 	if r.deps.Dialogs == nil {
 		return true, nil
 	}
-	changed, err := r.deps.Dialogs.MarkUnread(ctx, userID, peers[0], unread)
+	result, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountSetUnreadMark, UserID: userID, Date: int(r.clock.Now().Unix()),
+		Peer: peers[0], Value: unread,
+	}, dialogAccountDeliveryEffects)
 	if err != nil {
 		return false, internalErr()
 	}
-	if changed {
-		date := int(r.clock.Now().Unix())
-		var recorded domain.UpdateEvent
-		if r.deps.Updates != nil {
-			authKeyID, _ := AuthKeyIDFrom(ctx)
-			sessionID, _ := SessionIDFrom(ctx)
-			event, state, err := r.deps.Updates.RecordDialogUnreadMark(ctx, authKeyID, userID, peers[0], unread, rawAuthKeyIDForOrigin(ctx), sessionID)
-			if err != nil {
-				return false, internalErr()
-			}
-			date = state.Date
-			recorded = event
-		}
-		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateDialogUnreadMark{
-				Unread: unread,
-				Peer:   tgDialogPeer(peers[0]),
-			}}, recorded),
-			Date: date,
-			Seq:  0,
-		})
-	}
+	_ = result
 	return true, nil
 }
 
@@ -941,39 +659,20 @@ func (r *Router) onMessagesHidePeerSettingsBar(ctx context.Context, input tg.Inp
 	if err != nil {
 		return false, err
 	}
-	changed := true
-	if r.deps.Dialogs != nil {
-		var err error
-		changed, err = r.deps.Dialogs.HidePeerSettingsBar(ctx, userID, peer)
-		if err != nil {
-			return false, internalErr()
-		}
+	if r.deps.Dialogs == nil {
+		return false, internalErr()
 	}
-	if !changed {
+	result, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountHidePeerSettings, UserID: userID,
+		Date: int(r.clock.Now().Unix()), Peer: peer, Value: true,
+	}, dialogAccountDeliveryEffects)
+	if err != nil {
+		return false, internalErr()
+	}
+	if !result.Changed {
 		return true, nil
 	}
 	r.invalidateRPCProjectionForPeer(userID, peer)
-	date := int(r.clock.Now().Unix())
-	var recorded domain.UpdateEvent
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, state, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, domain.PeerSettings{HiddenPeerSettingsBar: true}, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-		date = state.Date
-		recorded = event
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdatePeerSettings{
-			Peer:     tgPeer(peer),
-			Settings: tg.PeerSettings{},
-		}}, recorded),
-		Date: date,
-		Seq:  0,
-	})
 	return true, nil
 }
 

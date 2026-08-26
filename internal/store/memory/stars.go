@@ -2,9 +2,11 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // StarsStore 是 store.StarsStore 的内存实现，复刻 postgres 版的原子语义
@@ -13,6 +15,7 @@ type StarsStore struct {
 	mu     sync.Mutex
 	states map[int64]*starsState
 	nextID int64
+	outbox *DeliveryOutboxStore
 }
 
 type starsState struct {
@@ -24,6 +27,12 @@ type starsState struct {
 // NewStarsStore 创建内存 StarsStore。
 func NewStarsStore() *StarsStore {
 	return &StarsStore{states: make(map[int64]*starsState)}
+}
+
+func (s *StarsStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	s.mu.Lock()
+	s.outbox = outbox
+	s.mu.Unlock()
 }
 
 func (s *StarsStore) GetBalance(_ context.Context, userID int64) (domain.StarsBalance, error) {
@@ -78,6 +87,40 @@ func (s *StarsStore) Credit(_ context.Context, userID, amount int64, reason doma
 	return domain.StarsBalance{UserID: userID, Balance: st.balance, Granted: st.granted}, nil
 }
 
+func (s *StarsStore) CreditWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if userID == 0 || amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outbox == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	next := cloneStarsState(s.states[userID])
+	next.balance += amount
+	balance := domain.StarsBalance{UserID: userID, Balance: next.balance, Granted: next.granted}
+	intents, err := effects(balance)
+	if err != nil {
+		return domain.StarsBalance{}, fmt.Errorf("build stars credit delivery: %w", err)
+	}
+	if err := store.ValidateStarsBalanceDeliveryEffects(userID, intents); err != nil {
+		return domain.StarsBalance{}, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.outbox, nil); err != nil {
+		return domain.StarsBalance{}, err
+	}
+	s.nextID++
+	next.txns = append(next.txns, domain.StarsTransaction{
+		ID: s.nextID, UserID: userID, Peer: peer, Amount: amount, Date: date,
+		Reason: reason, Title: title, Description: desc,
+	})
+	s.states[userID] = next
+	return balance, nil
+}
+
 func (s *StarsStore) Debit(_ context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string) (domain.StarsBalance, error) {
 	if userID == 0 || amount <= 0 {
 		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
@@ -91,6 +134,56 @@ func (s *StarsStore) Debit(_ context.Context, userID, amount int64, reason domai
 	st.balance -= amount
 	s.appendTxn(st, userID, -amount, reason, peer, date, title, desc)
 	return domain.StarsBalance{UserID: userID, Balance: st.balance, Granted: st.granted}, nil
+}
+
+func (s *StarsStore) DebitWithDelivery(ctx context.Context, userID, amount, startingGrant int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if userID == 0 || amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outbox == nil {
+		return domain.StarsBalance{}, store.ErrDeliveryOutboxRequired
+	}
+	next := cloneStarsState(s.states[userID])
+	grantApplied := false
+	if !next.granted && startingGrant > 0 {
+		next.balance += startingGrant
+		next.granted = true
+		grantApplied = true
+	}
+	if next.balance < amount {
+		return domain.StarsBalance{}, domain.ErrStarsInsufficient
+	}
+	next.balance -= amount
+	balance := domain.StarsBalance{UserID: userID, Balance: next.balance, Granted: next.granted}
+	intents, err := effects(balance)
+	if err != nil {
+		return domain.StarsBalance{}, fmt.Errorf("build stars debit delivery: %w", err)
+	}
+	if err := store.ValidateStarsBalanceDeliveryEffects(userID, intents); err != nil {
+		return domain.StarsBalance{}, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.outbox, nil); err != nil {
+		return domain.StarsBalance{}, err
+	}
+	if grantApplied {
+		s.nextID++
+		next.txns = append(next.txns, domain.StarsTransaction{
+			ID: s.nextID, UserID: userID, Amount: startingGrant, Date: date,
+			Reason: domain.StarsReasonGrant,
+		})
+	}
+	s.nextID++
+	next.txns = append(next.txns, domain.StarsTransaction{
+		ID: s.nextID, UserID: userID, Peer: peer, Amount: -amount, Date: date,
+		Reason: reason, Title: title, Description: desc,
+	})
+	s.states[userID] = next
+	return balance, nil
 }
 
 func (s *StarsStore) ListTransactions(_ context.Context, userID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
@@ -154,4 +247,11 @@ func (s *StarsStore) appendTxn(st *starsState, userID, amount int64, reason doma
 		Title:       title,
 		Description: desc,
 	})
+}
+
+func cloneStarsState(in *starsState) *starsState {
+	if in == nil {
+		return &starsState{}
+	}
+	return &starsState{balance: in.balance, granted: in.granted, txns: append([]domain.StarsTransaction(nil), in.txns...)}
 }

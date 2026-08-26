@@ -61,56 +61,12 @@ func (s *ChannelStore) pollChannelMessageTarget(userID, channelID int64, message
 	return cloneChannel(channel), cloneChannelMessage(msg), nil
 }
 
-// ChannelPollFanoutViews 批量加载一条 poll 消息对一组 viewer 的 per-viewer enrich（与 postgres 同口径，
-// 是在线 poll fan-out 的唯一批量投影入口）：成员/AvailableMinID 可见性复刻 channelAndMemberLocked +
-// pollChannelMessageTarget；poll enrich 委托 PollStore.EnrichPollForViewers（模板一次）。bot 历史过滤
-// 在 app 层叠加。Polls：key 存在=已评估；nil=不可见；非 nil=可见 enrich poll。
-func (s *ChannelStore) ChannelPollFanoutViews(_ context.Context, channelID int64, msgID int, viewers []int64, now int) (domain.ChannelPollFanoutViews, error) {
-	out := domain.ChannelPollFanoutViews{Polls: map[int64]*domain.MessagePoll{}}
-	if s == nil || s.polls == nil || channelID == 0 || msgID <= 0 || len(viewers) == 0 {
-		return out, nil
-	}
-	if now == 0 {
-		now = int(time.Now().Unix())
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	channel, ok := s.channels[channelID]
-	if !ok || channel.Deleted {
-		return out, nil
-	}
-	msg, ok := s.findMessageLocked(channelID, msgID)
-	if !ok || msg.Deleted || msg.Action != nil || msg.Media == nil || msg.Media.Kind != domain.MessageMediaKindPoll || msg.Media.Poll == nil || msg.Media.Poll.ID == 0 {
-		return out, nil
-	}
-	out.Found = true
-	out.Message = cloneChannelMessage(msg)
-	visible := make([]int64, 0, len(viewers))
-	for _, viewer := range viewers {
-		if viewer == 0 {
-			continue
-		}
-		member, ok := s.members[channelID][viewer]
-		if !ok || member.Status != domain.ChannelMemberActive || member.BannedRights.ViewMessages || (member.AvailableMinID > 0 && msgID <= member.AvailableMinID) {
-			out.Polls[viewer] = nil // 已评估但不可见
-			continue
-		}
-		visible = append(visible, viewer)
-	}
-	enriched := s.polls.EnrichPollForViewers(msg.Media.Poll, visible, now)
-	for viewer, poll := range enriched {
-		out.Polls[viewer] = poll
-	}
-	return out, nil
-}
-
-// channelPollResult 为投票者视角组装结果；实时 fan-out 与 reaction 同款由 rpc 层按 viewer 重建。
+// channelPollResult 只组装当前 RPC 调用者视角；可靠投递由频道 delivery lane 完成。
 func (s *ChannelStore) channelPollResult(channel domain.Channel, msg domain.ChannelMessage, viewerUserID int64, now int) domain.ChannelMessagePollResult {
 	msg.Media = enrichPollMediaForViewer(s.polls, msg.Media, viewerUserID, now)
 	return domain.ChannelMessagePollResult{
-		PollID:     msg.Media.Poll.ID,
-		Channel:    channel,
-		Message:    msg,
-		Recipients: []int64{viewerUserID, msg.SenderUserID},
+		PollID:  msg.Media.Poll.ID,
+		Channel: channel,
+		Message: msg,
 	}
 }

@@ -13,6 +13,7 @@ import (
 	appchannels "telesrv/internal/app/channels"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -34,12 +35,8 @@ type fakeBotVerifications struct {
 	settingsCalls      int
 	settingsBatchCalls int
 	setCalls           int
-	// notifier mirrors production wiring: the application service owns the badge
-	// push for all three drivers (this RPC, the bot dialog, the admin panel), so the
-	// fake pushes here exactly where the real service does.
-	notifier interface {
-		NotifyPeerBotVerification(ctx context.Context, peer domain.Peer) error
-	}
+	userDelivery       store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	deliveryEffects    []store.DeliveryEffect
 }
 
 func newFakeBotVerifications() *fakeBotVerifications {
@@ -123,8 +120,10 @@ func (f *fakeBotVerifications) SetCustomVerification(_ context.Context, req doma
 		if !marked || existing.VerifierBotID != req.VerifierBotID {
 			return false, nil
 		}
+		if err := f.buildUserDelivery(req.Peer); err != nil {
+			return false, err
+		}
 		delete(f.marks, req.Peer)
-		f.notify(req.Peer)
 		return true, nil
 	}
 	description, err := settings.DescriptionFor(req.CustomDescription)
@@ -138,6 +137,9 @@ func (f *fakeBotVerifications) SetCustomVerification(_ context.Context, req doma
 	if f.limit > 0 && !marked && f.countFor(req.VerifierBotID) >= f.limit {
 		return false, domain.ErrCustomVerificationLimit
 	}
+	if err := f.buildUserDelivery(req.Peer); err != nil {
+		return false, err
+	}
 	f.marks[req.Peer] = domain.CustomVerification{
 		VerifierBotID:   req.VerifierBotID,
 		Peer:            req.Peer,
@@ -145,16 +147,28 @@ func (f *fakeBotVerifications) SetCustomVerification(_ context.Context, req doma
 		Description:     description,
 		GrantedByUserID: req.CallerUserID,
 	}
-	f.notify(req.Peer)
 	return true, nil
 }
 
-// notify reproduces the service's post-commit push.
-func (f *fakeBotVerifications) notify(peer domain.Peer) {
-	if f.notifier == nil {
-		return
+func (f *fakeBotVerifications) buildUserDelivery(peer domain.Peer) error {
+	if peer.Type != domain.PeerTypeUser {
+		return nil
 	}
-	_ = f.notifier.NotifyPeerBotVerification(context.Background(), peer)
+	if f.userDelivery == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	snapshot := store.UserAudienceDeliverySnapshot{
+		User: domain.User{ID: peer.ID}, Audience: []int64{peer.ID},
+	}
+	effects, err := f.userDelivery(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := store.ValidateUserAudienceDeliveryEffects(snapshot, effects); err != nil {
+		return err
+	}
+	f.deliveryEffects = append(f.deliveryEffects, effects...)
+	return nil
 }
 
 func (f *fakeBotVerifications) countFor(verifierBotID int64) int {
@@ -189,6 +203,7 @@ func newBotVerificationFixture(t *testing.T, verify BotVerificationService) botV
 	userStore := memory.NewUserStore()
 	botStore := memory.NewBotStore(userStore)
 	dialogs := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messageStore := memory.NewMessageStore(dialogs)
 	bots := botsapp.NewService(userStore, botStore, messageStore)
 	channelStore := memory.NewChannelStore()
@@ -206,11 +221,11 @@ func newBotVerificationFixture(t *testing.T, verify BotVerificationService) botV
 	if err != nil {
 		t.Fatalf("create target: %v", err)
 	}
-	bot, _, err := bots.CreateBot(ctx, owner.ID, "Verifier Bot", "verifier_shape_bot")
+	bot, _, err := bots.CreateBotWithDelivery(ctx, owner.ID, "Verifier Bot", "verifier_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create verifier bot: %v", err)
 	}
-	foreign, _, err := bots.CreateBot(ctx, stranger.ID, "Foreign Bot", "foreign_shape_bot")
+	foreign, _, err := bots.CreateBotWithDelivery(ctx, stranger.ID, "Foreign Bot", "foreign_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create foreign bot: %v", err)
 	}
@@ -223,8 +238,12 @@ func newBotVerificationFixture(t *testing.T, verify BotVerificationService) botV
 	if verify != nil {
 		deps.BotVerifications = verify
 	}
+	router := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, deps, zaptest.NewLogger(t), clock.System)
+	if fake != nil {
+		fake.userDelivery = router.UserAudienceDeliveryEffects
+	}
 	return botVerificationFixture{
-		router:   New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, deps, zaptest.NewLogger(t), clock.System),
+		router:   router,
 		verify:   fake,
 		bots:     bots,
 		owner:    owner,

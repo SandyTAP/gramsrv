@@ -11,81 +11,6 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-type fakeOutboxRetention struct {
-	calls     int
-	olderThan time.Duration
-	limit     int
-	deleted   int
-}
-
-func (f *fakeOutboxRetention) DeleteFailed(_ context.Context, olderThan time.Duration, limit int) (int, error) {
-	f.calls++
-	f.olderThan = olderThan
-	f.limit = limit
-	return f.deleted, nil
-}
-
-func TestRetentionWorkerUsesIndependentOutboxPoisonPolicyAndSignalsRelease(t *testing.T) {
-	core, logs := observer.New(zapcore.ErrorLevel)
-	outbox := &fakeOutboxRetention{deleted: 2}
-	w := NewRetentionWorker(outbox, nil, zap.New(core), 7*24*time.Hour, time.Hour, 73).
-		WithDispatchOutboxPoisonPolicy(2*time.Minute, 7*time.Second)
-
-	w.runOnce(context.Background())
-
-	if outbox.calls != 1 || outbox.olderThan != 2*time.Minute || outbox.limit != 73 {
-		t.Fatalf("outbox poison calls/args = %d/%v/%d, want 1/2m/73", outbox.calls, outbox.olderThan, outbox.limit)
-	}
-	entries := logs.FilterMessage("terminal failed outbox 已结束隔离并释放用户 lane").All()
-	if len(entries) != 1 {
-		t.Fatalf("poison release error signals = %d, want 1", len(entries))
-	}
-	if got := entries[0].ContextMap()["signal"]; got != "dispatch_outbox_poison_released" {
-		t.Fatalf("poison signal = %v", got)
-	}
-	if got := entries[0].ContextMap()["outbox"]; got != "dispatch_outbox" {
-		t.Fatalf("poison outbox = %v", got)
-	}
-}
-
-func TestRetentionWorkerReclaimsEdgeDeliveryOutboxPoison(t *testing.T) {
-	core, logs := observer.New(zapcore.ErrorLevel)
-	dispatch := &fakeOutboxRetention{}
-	delivery := &fakeOutboxRetention{deleted: 3}
-	w := NewRetentionWorker(dispatch, nil, zap.New(core), time.Hour, time.Hour, 91).
-		WithDispatchOutboxPoisonPolicy(3*time.Minute, time.Second).
-		WithEdgeDeliveryOutboxPoisonStore(delivery)
-
-	w.runOutboxPoisonOnce(context.Background())
-
-	if dispatch.calls != 1 {
-		t.Fatalf("dispatch outbox poison calls = %d, want 1", dispatch.calls)
-	}
-	if delivery.calls != 1 || delivery.olderThan != 3*time.Minute || delivery.limit != 91 {
-		t.Fatalf("edge delivery poison calls/args = %d/%v/%d, want 1/3m/91", delivery.calls, delivery.olderThan, delivery.limit)
-	}
-	entries := logs.FilterMessage("terminal failed outbox 已结束隔离并释放用户 lane").All()
-	if len(entries) != 1 {
-		t.Fatalf("edge delivery poison release signals = %d, want 1", len(entries))
-	}
-	if got := entries[0].ContextMap()["signal"]; got != "edge_delivery_outbox_poison_released" {
-		t.Fatalf("edge delivery poison signal = %v", got)
-	}
-	if got := entries[0].ContextMap()["outbox"]; got != "edge_delivery_outbox" {
-		t.Fatalf("edge delivery poison outbox = %v", got)
-	}
-}
-
-func TestRetentionWorkerOutboxPoisonPolicyDefaultsAreShort(t *testing.T) {
-	outbox := &fakeOutboxRetention{}
-	w := NewRetentionWorker(outbox, nil, zap.NewNop(), 168*time.Hour, time.Hour, 100).
-		WithDispatchOutboxPoisonPolicy(0, 0)
-	w.runOutboxPoisonOnce(context.Background())
-	if outbox.olderThan != defaultOutboxPoisonRetention || w.outboxPoisonInterval != defaultOutboxPoisonInterval {
-		t.Fatalf("default poison policy = %v/%v, want %v/%v", outbox.olderThan, w.outboxPoisonInterval, defaultOutboxPoisonRetention, defaultOutboxPoisonInterval)
-	}
-}
-
 type fakeTempKeyRetention struct {
 	calls         int
 	expiredBefore int64
@@ -100,14 +25,13 @@ func (f *fakeTempKeyRetention) DeleteExpired(_ context.Context, expiredBefore in
 }
 
 func TestRetentionWorkerReclaimsExpiredTempKeys(t *testing.T) {
-	outbox := &fakeOutboxRetention{}
 	temp := &fakeTempKeyRetention{}
-	w := NewRetentionWorker(outbox, temp, zap.NewNop(), time.Hour, time.Hour, 100)
+	w := NewRetentionWorker(temp, zap.NewNop(), time.Hour, time.Hour, 100)
 
 	w.runOnce(context.Background())
 
-	if outbox.calls != 1 || temp.calls != 1 {
-		t.Fatalf("calls outbox=%d temp=%d, want 1/1", outbox.calls, temp.calls)
+	if temp.calls != 1 {
+		t.Fatalf("temp calls=%d, want 1", temp.calls)
 	}
 	if temp.limit != 100 {
 		t.Fatalf("limit = %d, want batch 100", temp.limit)
@@ -119,12 +43,8 @@ func TestRetentionWorkerReclaimsExpiredTempKeys(t *testing.T) {
 }
 
 func TestRetentionWorkerSkipsNilTempKeyStore(t *testing.T) {
-	outbox := &fakeOutboxRetention{}
-	w := NewRetentionWorker(outbox, nil, zap.NewNop(), time.Hour, time.Hour, 100)
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, time.Hour, 100)
 	w.runOnce(context.Background()) // 不应 panic
-	if outbox.calls != 1 {
-		t.Fatalf("outbox calls = %d, want 1", outbox.calls)
-	}
 }
 
 type fakeBotAPIRetention struct {
@@ -149,7 +69,7 @@ func (f *fakeLoginCodeDeliveryRetention) DeleteExpiredLoginCodeDeliveries(_ cont
 
 func TestRetentionWorkerReclaimsExpiredLoginCodeDeliveryReceipts(t *testing.T) {
 	loginCodes := &fakeLoginCodeDeliveryRetention{}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), 168*time.Hour, time.Hour, 83).
+	w := NewRetentionWorker(nil, zap.NewNop(), 168*time.Hour, time.Hour, 83).
 		WithLoginCodeDeliveryRetention(loginCodes)
 	before := time.Now()
 	w.runRetentionOnce(context.Background())
@@ -210,7 +130,7 @@ func TestRetentionWorkerSeparatesTelemetryDiagnosticsAndModerationCapabilities(t
 	)
 	store := &fakeReportRetention{}
 	w := NewRetentionWorker(
-		&fakeOutboxRetention{}, nil, zap.NewNop(),
+		nil, zap.NewNop(),
 		168*time.Hour, time.Hour, batch,
 	).WithClientTelemetryRetention(store, telemetryTTL).
 		WithAuthDeliveryReportRetention(store, authTTL).
@@ -251,9 +171,8 @@ func (f *fakeBotAPIRetention) DeleteDeliveredOrExpired(_ context.Context, confir
 }
 
 func TestRetentionWorkerReclaimsBotAPIUpdates(t *testing.T) {
-	outbox := &fakeOutboxRetention{}
 	botAPI := &fakeBotAPIRetention{}
-	w := NewRetentionWorker(outbox, nil, zap.NewNop(), time.Hour, time.Hour, 100).
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, time.Hour, 100).
 		WithBotAPIUpdateRetention(botAPI, 24*time.Hour)
 
 	w.runOnce(context.Background())
@@ -269,7 +188,7 @@ func TestRetentionWorkerReclaimsBotAPIUpdates(t *testing.T) {
 
 func TestRetentionWorkerBotAPIRetentionDefaultsTo24h(t *testing.T) {
 	botAPI := &fakeBotAPIRetention{}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), time.Hour, time.Hour, 100).
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, time.Hour, 100).
 		WithBotAPIUpdateRetention(botAPI, 0)
 	w.runOnce(context.Background())
 	if botAPI.maxAge != 24*time.Hour {
@@ -293,7 +212,7 @@ func (f *fakeUserUpdateRetention) DeleteConfirmedPrefix(_ context.Context, older
 func TestRetentionWorkerReclaimsOnlyConfirmedUserUpdatePrefix(t *testing.T) {
 	const retention = 7 * 24 * time.Hour
 	store := &fakeUserUpdateRetention{}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), retention, time.Hour, 91).
+	w := NewRetentionWorker(nil, zap.NewNop(), retention, time.Hour, 91).
 		WithUserUpdateRetention(store)
 	w.runOnce(context.Background())
 	if store.calls != 1 || store.olderThan != retention || store.limit != 91 {
@@ -320,7 +239,7 @@ func TestRetentionWorkerReclaimsChannelUpdates(t *testing.T) {
 		batch     = 321
 	)
 	channelUpdates := &fakeChannelUpdateRetention{}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), retention, time.Hour, batch).
+	w := NewRetentionWorker(nil, zap.NewNop(), retention, time.Hour, batch).
 		WithChannelUpdateRetention(channelUpdates)
 
 	w.runOnce(context.Background())
@@ -351,8 +270,8 @@ func (f *fakeOrphanAuthKeyRetention) DeleteOrphaned(_ context.Context, olderThan
 
 type fakeActiveRawAuthKeys struct{ ids [][8]byte }
 
-func (f fakeActiveRawAuthKeys) ActiveRawAuthKeyIDs() [][8]byte {
-	return append([][8]byte(nil), f.ids...)
+func (f fakeActiveRawAuthKeys) ActiveRawAuthKeySnapshot(context.Context) ([][8]byte, error) {
+	return append([][8]byte(nil), f.ids...), nil
 }
 
 type fakeSnapshotActiveRawAuthKeys struct {
@@ -366,14 +285,10 @@ func (f *fakeSnapshotActiveRawAuthKeys) ActiveRawAuthKeySnapshot(context.Context
 	return append([][8]byte(nil), f.ids...), f.err
 }
 
-func (f *fakeSnapshotActiveRawAuthKeys) ActiveRawAuthKeyIDs() [][8]byte {
-	panic("legacy active raw-key provider must not be used when snapshot provider is available")
-}
-
 func TestRetentionWorkerProtectsActiveRawAuthKeysFromOrphanGC(t *testing.T) {
-	store := &fakeOrphanAuthKeyRetention{}
+	store := &fakeHeartbeatOrphanRetention{}
 	active := fakeActiveRawAuthKeys{ids: [][8]byte{{1}, {2}}}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), time.Hour, time.Hour, 73).
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, time.Hour, 73).
 		WithOrphanAuthKeyRetention(store, active, 24*time.Hour)
 
 	w.runOnce(context.Background())
@@ -386,10 +301,28 @@ func TestRetentionWorkerProtectsActiveRawAuthKeysFromOrphanGC(t *testing.T) {
 	}
 }
 
+func TestRetentionWorkerSkipsOrphanDeleteWithoutDurableHeartbeat(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	store := &fakeOrphanAuthKeyRetention{}
+	active := fakeActiveRawAuthKeys{ids: [][8]byte{{1}}}
+	w := NewRetentionWorker(nil, zap.New(core), time.Hour, time.Hour, 73).
+		WithOrphanAuthKeyRetention(store, active, 24*time.Hour)
+
+	w.runOnce(context.Background())
+
+	if store.calls != 0 {
+		t.Fatalf("orphan delete calls = %d, want 0 without durable heartbeat", store.calls)
+	}
+	entries := logs.FilterMessage("缺少 active raw auth key heartbeat，本轮跳过 orphan GC").All()
+	if len(entries) != 1 || entries[0].ContextMap()["signal"] != "active_raw_auth_key_heartbeat_missing" {
+		t.Fatalf("missing heartbeat signals = %+v", entries)
+	}
+}
+
 func TestRetentionWorkerUsesDistributedActiveRawKeySnapshot(t *testing.T) {
 	store := &fakeHeartbeatOrphanRetention{}
 	active := &fakeSnapshotActiveRawAuthKeys{ids: [][8]byte{{9}, {}, {9}, {8}}}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), time.Hour, 2*time.Hour, 19).
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, 2*time.Hour, 19).
 		WithOrphanAuthKeyRetention(store, active, 3*time.Hour)
 
 	w.runRetentionOnce(context.Background())
@@ -410,7 +343,7 @@ func TestRetentionWorkerSkipsOrphanDeleteWhenActiveSnapshotFails(t *testing.T) {
 	core, logs := observer.New(zapcore.ErrorLevel)
 	store := &fakeHeartbeatOrphanRetention{}
 	active := &fakeSnapshotActiveRawAuthKeys{err: errors.New("redis unavailable")}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.New(core), time.Hour, 30*time.Minute, 11).
+	w := NewRetentionWorker(nil, zap.New(core), time.Hour, 30*time.Minute, 11).
 		WithOrphanAuthKeyRetention(store, active, 24*time.Hour)
 
 	w.runRetentionOnce(context.Background())
@@ -440,7 +373,7 @@ func (f *fakeHeartbeatOrphanRetention) TouchActiveRawAuthKeys(_ context.Context,
 func TestRetentionWorkerHeartbeatsActiveKeysBeforeOrphanDelete(t *testing.T) {
 	store := &fakeHeartbeatOrphanRetention{}
 	active := fakeActiveRawAuthKeys{ids: [][8]byte{{3}, {4}}}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.NewNop(), time.Hour, 2*time.Hour, 19).
+	w := NewRetentionWorker(nil, zap.NewNop(), time.Hour, 2*time.Hour, 19).
 		WithOrphanAuthKeyRetention(store, active, 3*time.Hour)
 
 	w.runRetentionOnce(context.Background())
@@ -461,7 +394,7 @@ func TestRetentionWorkerSkipsOrphanDeleteWhenHeartbeatFails(t *testing.T) {
 	core, logs := observer.New(zapcore.ErrorLevel)
 	store := &fakeHeartbeatOrphanRetention{heartbeatErr: errors.New("db unavailable")}
 	active := fakeActiveRawAuthKeys{ids: [][8]byte{{5}}}
-	w := NewRetentionWorker(&fakeOutboxRetention{}, nil, zap.New(core), time.Hour, 30*time.Minute, 11).
+	w := NewRetentionWorker(nil, zap.New(core), time.Hour, 30*time.Minute, 11).
 		WithOrphanAuthKeyRetention(store, active, 24*time.Hour)
 	if got := w.orphanHeartbeatInterval(); got != 30*time.Minute {
 		t.Fatalf("heartbeat interval = %v, want worker interval 30m", got)

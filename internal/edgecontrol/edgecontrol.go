@@ -2,80 +2,488 @@ package edgecontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
+
+	"telesrv/internal/deliverycontract"
 )
 
-var ErrOutboxDeliveryIndeterminate = errors.New("edgecontrol: outbox delivery indeterminate")
+var ErrDeliveryIndeterminate = errors.New("edgecontrol: delivery indeterminate")
 
-var ErrOutboxTargetUnavailable = errors.New("edgecontrol: outbox target instance unavailable")
+var ErrDeliveryTargetUnavailable = errors.New("edgecontrol: delivery target instance unavailable")
+
+var ErrDeliveryOverloaded = errors.New("edgecontrol: delivery executor overloaded")
 
 var ErrLocationLeaseHeld = errors.New("edgecontrol: location lease held by another process")
 
 var ErrLocationLeaseLost = errors.New("edgecontrol: location lease lost")
 
-type OutboxDeliveryStatus uint8
+// BatchID identifies one frozen multi-Edge delivery fan-out. CommandID identifies
+// one target Edge within that fan-out. Both are fixed-width protocol identities;
+// neither is a human-readable or compatibility string.
+type BatchID [16]byte
+type CommandID [16]byte
+
+func (id BatchID) Empty() bool   { return id == BatchID{} }
+func (id CommandID) Empty() bool { return id == CommandID{} }
+
+type QueueKind uint8
 
 const (
-	OutboxDeliveryUnknown OutboxDeliveryStatus = iota
-	OutboxDeliveryDelivered
-	OutboxDeliveryNoKnownOnlineTargets
-	OutboxDeliveryIndeterminate
+	QueueAccountPTS QueueKind = iota + 1
+	QueueAccountNonPTS
+	QueueChannelPTS
 )
 
-// OutboxDeliveryRef is the durable queue identity attached to an online push so
-// service-level Edge confirmation and optional late client ACKs can be fenced.
-type OutboxDeliveryRef struct {
+func (d DetailCode) Valid() bool { return d <= DetailAttemptConflict }
+
+type OrderingDomain struct {
+	Kind     QueueKind
+	StreamID int64
+}
+
+func OrderingDomainHash(domain OrderingDomain) uint64 {
+	x := uint64(domain.StreamID) ^ (uint64(domain.Kind) * 0x9e3779b97f4a7c15)
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	return x ^ (x >> 31)
+}
+
+// DeliveryRef is the complete durable identity carried through command
+// admission, physical write and late client ACK. LeaseFence is independent from
+// the human-readable attempt counter and prevents a reclaimed lane from being
+// completed by an older process.
+type DeliveryRef struct {
+	Domain       OrderingDomain
 	OutboxID     int64
 	TargetUserID int64
-	Pts          int
-	Attempt      int
+	PTS          int
+	LeaseFence   uint64
+	Attempt      uint32
 }
 
-func (r OutboxDeliveryRef) Empty() bool {
-	return r.OutboxID == 0 && r.TargetUserID == 0 && r.Pts == 0 && r.Attempt == 0
+// DeliveryTracking is the immutable ledger identity attached to an outbound
+// frame. BatchID and CommandID are intentionally retained through late client
+// ACK observation; DeliveryRef alone is not an exact target-ledger key.
+type DeliveryTracking struct {
+	BatchID          BatchID
+	CommandID        CommandID
+	SourceInstanceID string
+	Ref              DeliveryRef
 }
 
-type OutboxPushRequest struct {
-	TargetUserID     int64
-	DeliveryRef      OutboxDeliveryRef
-	ExcludeAuthKeyID [8]byte
-	ExcludeSessionID int64
-	MessageType      proto.MessageType
-	UpdateBytes      []byte
-	DeliveryTimeout  time.Duration
+func (t DeliveryTracking) Empty() bool {
+	return t.BatchID.Empty() && t.CommandID.Empty() && t.Ref.Empty()
 }
 
-type OutboxPushResult struct {
-	Sent   int
-	Status OutboxDeliveryStatus
+func (t DeliveryTracking) Valid() bool {
+	return !t.BatchID.Empty() && !t.CommandID.Empty() && ValidDeliveryInstanceID(t.SourceInstanceID) && t.Ref.Valid()
 }
 
-type OutboxPushCommand struct {
-	CommandID        string
+func (r DeliveryRef) Empty() bool { return r == DeliveryRef{} }
+
+func (r DeliveryRef) Valid() bool {
+	if r.OutboxID <= 0 || r.TargetUserID < 0 || r.Domain.StreamID <= 0 || r.LeaseFence == 0 || r.Attempt == 0 {
+		return false
+	}
+	switch r.Domain.Kind {
+	case QueueAccountPTS:
+		return r.TargetUserID > 0 && r.Domain.StreamID == r.TargetUserID && r.PTS > 0 && int64(r.PTS) <= int64(^uint32(0)>>1)
+	case QueueAccountNonPTS:
+		return r.TargetUserID > 0 && r.Domain.StreamID == r.TargetUserID && r.PTS == 0
+	case QueueChannelPTS:
+		return r.TargetUserID == 0 && r.PTS > 0 && int64(r.PTS) <= int64(^uint32(0)>>1)
+	default:
+		return false
+	}
+}
+
+type ChannelDeliveryAudience uint8
+
+const (
+	ChannelAudienceMembers ChannelDeliveryAudience = iota + 1
+	ChannelAudienceMessageBox
+	ChannelAudienceMonoforumAdmins
+)
+
+const MaxChannelDeliveryExplicitUsers = 1000
+
+// ChannelDeliveryRoute is frozen with the durable channel event. Membership
+// is expanded from Edge-local indexes; explicit audience and affected users
+// are bounded identities needed for message-box/admin ACLs and leave/kick
+// events whose target is no longer present in the membership index.
+type ChannelDeliveryRoute struct {
+	ChannelID     int64
+	Audience      ChannelDeliveryAudience
+	AudienceUsers []int64
+	AffectedUsers []int64
+}
+
+func (r ChannelDeliveryRoute) Empty() bool {
+	return r.ChannelID == 0 && r.Audience == 0 && len(r.AudienceUsers) == 0 && len(r.AffectedUsers) == 0
+}
+
+func (r ChannelDeliveryRoute) ValidFor(domain OrderingDomain) bool {
+	if domain.Kind != QueueChannelPTS || r.ChannelID <= 0 || r.ChannelID != domain.StreamID {
+		return false
+	}
+	switch r.Audience {
+	case ChannelAudienceMembers:
+	case ChannelAudienceMessageBox, ChannelAudienceMonoforumAdmins:
+		if len(r.AudienceUsers) == 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	return canonicalPositiveIDs(r.AudienceUsers, MaxChannelDeliveryExplicitUsers) &&
+		canonicalPositiveIDs(r.AffectedUsers, MaxChannelDeliveryExplicitUsers)
+}
+
+func canonicalPositiveIDs(ids []int64, limit int) bool {
+	if len(ids) > limit {
+		return false
+	}
+	for i, id := range ids {
+		if id <= 0 || (i > 0 && ids[i-1] >= id) {
+			return false
+		}
+	}
+	return true
+}
+
+type DeliveryItem struct {
+	Ref         DeliveryRef
+	MessageType proto.MessageType
+	PayloadHash [16]byte
+	UpdateBytes []byte
+	Channel     ChannelDeliveryRoute
+}
+
+func DeliveryPayloadHash(payload []byte) [16]byte {
+	full := sha256.Sum256(payload)
+	var out [16]byte
+	copy(out[:], full[:len(out)])
+	return out
+}
+
+type DeliveryBatch struct {
+	BatchID          BatchID
+	CommandID        CommandID
 	SourceInstanceID string
 	TargetInstanceID string
 	TargetUserID     int64
-	DeliveryRef      OutboxDeliveryRef
 	ExcludeAuthKeyID [8]byte
 	ExcludeSessionID int64
-	MessageType      proto.MessageType
-	UpdateBytes      []byte
-	DeliveryTimeout  time.Duration
+	NotAfter         time.Time
+	Items            []DeliveryItem
 }
 
-type OutboxPushAck struct {
-	CommandID        string
+const (
+	MaxDeliveryBatchItems = deliverycontract.MaxBatchItems
+	// Target count and identity length are protocol limits, not deployment
+	// suggestions. They keep registry corruption from turning one durable lane
+	// into an unbounded target ledger and ensure every plan accepted before bind
+	// is encodable by the Redis v3 transport.
+	MaxDeliveryTargets         = deliverycontract.MaxTargets
+	MaxDeliveryInstanceIDBytes = deliverycontract.MaxInstanceIDBytes
+	// MaxDeliveryBatchBytes bounds the immutable TL payload plus explicit
+	// channel route identities carried on the Redis wire. Treating route IDs as
+	// free would let Egress bind an attempt that Redis must deterministically
+	// reject after the durable target set has already been frozen.
+	MaxDeliveryBatchBytes = deliverycontract.MaxBatchBytes
+	// Includes the configured one-minute physical bound plus at most ten
+	// seconds of DB/Edge clock skew. Longer identities are rejected before they
+	// can occupy Edge fence/terminal retention budgets.
+	MaxDeliveryNotAfterHorizon = deliverycontract.MaxNotAfterHorizon
+)
+
+// DeliveryRequest is the Egress-facing, not-yet-routed batch. DeliveryFabric
+// freezes registry targets and assigns one fixed-width CommandID per target.
+type DeliveryRequest struct {
+	TargetUserID     int64
+	ExcludeAuthKeyID [8]byte
+	ExcludeSessionID int64
+	NotAfter         time.Time
+	Items            []DeliveryItem
+}
+
+// ValidateDeliveryBatchEnvelope validates bounded v3 identities and ownership
+// without re-hashing payload bytes. Redis send/parse use it to avoid hashing
+// the same immutable batch once per target Edge; the accepting Edge calls the
+// full ValidateDeliveryBatch exactly once before admission.
+func ValidateDeliveryBatchEnvelope(batch DeliveryBatch) error {
+	if batch.BatchID.Empty() || batch.CommandID.Empty() || !ValidDeliveryInstanceID(batch.SourceInstanceID) || !ValidDeliveryInstanceID(batch.TargetInstanceID) {
+		return fmt.Errorf("edgecontrol: delivery batch identity is required")
+	}
+	if batch.TargetUserID < 0 || len(batch.Items) == 0 || len(batch.Items) > MaxDeliveryBatchItems {
+		return fmt.Errorf("edgecontrol: delivery batch target and items are required")
+	}
+	if (batch.ExcludeAuthKeyID != ([8]byte{})) != (batch.ExcludeSessionID != 0) {
+		return fmt.Errorf("edgecontrol: invalid delivery exclusion pair")
+	}
+	if batch.NotAfter.IsZero() || batch.NotAfter.UnixNano() <= 0 {
+		return fmt.Errorf("edgecontrol: absolute delivery deadline is required")
+	}
+	if batch.NotAfter.After(time.Now().Add(MaxDeliveryNotAfterHorizon)) {
+		return fmt.Errorf("edgecontrol: delivery deadline exceeds maximum horizon")
+	}
+	domain := batch.Items[0].Ref.Domain
+	channel := domain.Kind == QueueChannelPTS
+	if channel != (batch.TargetUserID == 0) || (channel && (batch.ExcludeAuthKeyID != ([8]byte{}) || batch.ExcludeSessionID != 0)) {
+		return fmt.Errorf("edgecontrol: invalid delivery target for ordering domain")
+	}
+	seenRefs := make(map[DeliveryRef]struct{}, len(batch.Items))
+	seenItems := make(map[int64]struct{}, len(batch.Items))
+	totalBytes := 0
+	for i, item := range batch.Items {
+		if !item.Ref.Valid() || item.Ref.TargetUserID != batch.TargetUserID || item.Ref.Domain != domain ||
+			(channel && !item.Channel.ValidFor(domain)) || (!channel && !item.Channel.Empty()) {
+			return fmt.Errorf("edgecontrol: invalid delivery ref at index %d", i)
+		}
+		if item.MessageType != proto.MessageFromServer || len(item.UpdateBytes) == 0 {
+			return fmt.Errorf("edgecontrol: invalid delivery payload at index %d", i)
+		}
+		if _, exists := seenRefs[item.Ref]; exists {
+			return fmt.Errorf("edgecontrol: duplicate delivery ref at index %d", i)
+		}
+		if _, exists := seenItems[item.Ref.OutboxID]; exists {
+			return fmt.Errorf("edgecontrol: duplicate delivery item at index %d", i)
+		}
+		seenRefs[item.Ref] = struct{}{}
+		seenItems[item.Ref.OutboxID] = struct{}{}
+		totalBytes += deliveryItemEnvelopeBytes(item)
+		if totalBytes > MaxDeliveryBatchBytes {
+			return fmt.Errorf("edgecontrol: delivery payload and route metadata exceed batch byte limit")
+		}
+	}
+	return nil
+}
+
+func deliveryItemEnvelopeBytes(item DeliveryItem) int {
+	return len(item.UpdateBytes) + 8*(len(item.Channel.AudienceUsers)+len(item.Channel.AffectedUsers))
+}
+
+// ValidateDeliveryBatch performs the receiver-side payload integrity check in
+// addition to the bounded envelope validation.
+func ValidateDeliveryBatch(batch DeliveryBatch) error {
+	if err := ValidateDeliveryBatchEnvelope(batch); err != nil {
+		return err
+	}
+	for i, item := range batch.Items {
+		if item.PayloadHash != DeliveryPayloadHash(item.UpdateBytes) {
+			return fmt.Errorf("edgecontrol: invalid delivery payload hash at index %d", i)
+		}
+	}
+	return nil
+}
+
+type DetailCode uint16
+
+const (
+	DetailNone DetailCode = iota
+	DetailInvalidIdentity
+	DetailInvalidPayload
+	DetailCapacity
+	DetailTargetUnavailable
+	DetailWriteFailed
+	DetailDeadline
+	DetailAttemptConflict
+)
+
+type AdmissionOutcome uint8
+
+const (
+	AdmissionAccepted AdmissionOutcome = iota + 1
+	AdmissionDuplicateInFlight
+	AdmissionDuplicateTerminal
+	AdmissionOverloaded
+	AdmissionRejected
+)
+
+type DeliveryAdmission struct {
+	BatchID          BatchID
+	CommandID        CommandID
 	SourceInstanceID string
 	TargetInstanceID string
-	DeliveryRef      OutboxDeliveryRef
-	Sent             int
-	Status           OutboxDeliveryStatus
-	Error            string
+	Outcome          AdmissionOutcome
+	Detail           DetailCode
+}
+
+func (a DeliveryAdmission) Valid() bool {
+	if a.BatchID.Empty() || a.CommandID.Empty() || !ValidDeliveryInstanceID(a.SourceInstanceID) || !ValidDeliveryInstanceID(a.TargetInstanceID) || !a.Detail.Valid() {
+		return false
+	}
+	switch a.Outcome {
+	case AdmissionAccepted, AdmissionDuplicateInFlight, AdmissionDuplicateTerminal:
+		return a.Detail == DetailNone
+	case AdmissionOverloaded:
+		return a.Detail == DetailCapacity || a.Detail == DetailDeadline
+	case AdmissionRejected:
+		return a.Detail != DetailNone
+	default:
+		return false
+	}
+}
+
+type PhysicalOutcome uint8
+
+const (
+	PhysicalWritten PhysicalOutcome = iota + 1
+	PhysicalNoEligibleSessions
+	PhysicalIndeterminate
+	PhysicalRejected
+)
+
+type PhysicalReceipt struct {
+	BatchID          BatchID
+	CommandID        CommandID
+	SourceInstanceID string
+	TargetInstanceID string
+	Ref              DeliveryRef
+	Outcome          PhysicalOutcome
+	Detail           DetailCode
+	EligibleSessions int
+	WrittenSessions  int
+	FirstServerMsgID int64
+	// ObservedAt is captured by the Conn outbound actor immediately after the
+	// underlying writer returns nil. Reporter receive time is not equivalent.
+	ObservedAt time.Time
+}
+
+type PhysicalReceiptResultOutcome uint8
+
+const (
+	PhysicalReceiptApplied PhysicalReceiptResultOutcome = iota + 1
+	PhysicalReceiptStale
+	PhysicalReceiptRejected
+	PhysicalReceiptRetryable
+)
+
+type PhysicalReceiptResult struct {
+	Outcome PhysicalReceiptResultOutcome
+	Detail  DetailCode
+}
+
+type PhysicalReceiptReporter interface {
+	ReportPhysicalReceipts(context.Context, []PhysicalReceipt) ([]PhysicalReceiptResult, error)
+}
+
+// ClientAckObservation is late, non-authoritative evidence. It preserves the
+// exact batch/command target-ledger identity and never infers queue kind from a
+// zero sequence.
+type ClientAckObservation struct {
+	Tracking         DeliveryTracking
+	TargetInstanceID string
+	AuthKeyID        [8]byte
+	SessionID        int64
+	ServerMsgID      int64
+	ObservedAt       time.Time
+}
+
+func (o ClientAckObservation) Valid() bool {
+	return o.Tracking.Valid() && ValidDeliveryInstanceID(o.TargetInstanceID) &&
+		o.AuthKeyID != ([8]byte{}) && o.SessionID != 0 &&
+		o.ServerMsgID > 0 && !o.ObservedAt.IsZero()
+}
+
+type ClientAckObservationOutcome uint8
+
+const (
+	ClientAckObservationApplied ClientAckObservationOutcome = iota + 1
+	ClientAckObservationStale
+	ClientAckObservationRejected
+	ClientAckObservationRetryable
+)
+
+type ClientAckObservationResult struct {
+	Outcome ClientAckObservationOutcome
+	Detail  DetailCode
+}
+
+type ClientAckObservationReporter interface {
+	ReportClientAcks(context.Context, []ClientAckObservation) ([]ClientAckObservationResult, error)
+}
+
+type TargetAdmission struct {
+	TargetInstanceID string
+	CommandID        CommandID
+	Admission        DeliveryAdmission
+	Err              error
+}
+
+// FrozenDelivery always retains every registry-selected target, including
+// targets whose Redis command admission was indeterminate.
+type FrozenDelivery struct {
+	BatchID BatchID
+	Targets []TargetAdmission
+}
+
+type PreparedDeliveryTarget struct {
+	TargetInstanceID string
+	CommandID        CommandID
+}
+
+// FrozenDeliveryPlan is deliberately opaque. PrepareDelivery freezes the
+// registry snapshot and allocates every wire identity without publishing.
+// Callers bind a copy of Targets() in their durable ledger, then pass this same
+// value to AdmitPreparedDelivery.
+type FrozenDeliveryPlan struct {
+	batchID          BatchID
+	sourceInstanceID string
+	targetUserID     int64
+	excludeAuthKeyID [8]byte
+	excludeSessionID int64
+	notAfter         time.Time
+	items            []DeliveryItem
+	targets          []PreparedDeliveryTarget
+}
+
+func (p FrozenDeliveryPlan) BatchID() BatchID { return p.batchID }
+
+func (p FrozenDeliveryPlan) SourceInstanceID() string { return p.sourceInstanceID }
+
+func (p FrozenDeliveryPlan) Targets() []PreparedDeliveryTarget {
+	return append([]PreparedDeliveryTarget(nil), p.targets...)
+}
+
+func (p FrozenDeliveryPlan) Validate() error { return validateFrozenDeliveryPlan(p) }
+
+// RehydrateDeliveryPlan reconstructs the immutable plan after an Egress crash
+// from the request and exact target ledger already committed before admission.
+// It performs no registry lookup and no publish.
+func RehydrateDeliveryPlan(sourceInstanceID string, batchID BatchID, request DeliveryRequest, targets []PreparedDeliveryTarget) (FrozenDeliveryPlan, error) {
+	plan := buildFrozenDeliveryPlan(sourceInstanceID, batchID, request, targets)
+	return plan, plan.Validate()
+}
+
+func buildFrozenDeliveryPlan(sourceInstanceID string, batchID BatchID, request DeliveryRequest, targets []PreparedDeliveryTarget) FrozenDeliveryPlan {
+	items := make([]DeliveryItem, len(request.Items))
+	for i := range request.Items {
+		items[i] = request.Items[i]
+		items[i].UpdateBytes = append([]byte(nil), request.Items[i].UpdateBytes...)
+		items[i].Channel.AudienceUsers = append([]int64(nil), request.Items[i].Channel.AudienceUsers...)
+		items[i].Channel.AffectedUsers = append([]int64(nil), request.Items[i].Channel.AffectedUsers...)
+	}
+	return FrozenDeliveryPlan{
+		batchID: batchID, sourceInstanceID: sourceInstanceID,
+		targetUserID: request.TargetUserID, excludeAuthKeyID: request.ExcludeAuthKeyID,
+		excludeSessionID: request.ExcludeSessionID, notAfter: request.NotAfter.UTC(),
+		items: items, targets: append([]PreparedDeliveryTarget(nil), targets...),
+	}
+}
+
+type DeliveryPlanner interface {
+	PrepareDelivery(context.Context, DeliveryRequest) (FrozenDeliveryPlan, error)
+	AdmitPreparedDelivery(context.Context, FrozenDeliveryPlan) (FrozenDelivery, error)
 }
 
 type SessionControlKind string
@@ -199,18 +607,40 @@ type SessionControlAck struct {
 	Error                     string
 }
 
-// OutboxDeliverer gives Core a delivery confirmation boundary for durable
-// outbox rows. Implementations must return Indeterminate rather than pretending
-// success when a target may be online on another Edge but no ACK was observed.
-type OutboxDeliverer interface {
-	PushOutboxUpdate(ctx context.Context, req OutboxPushRequest) (OutboxPushResult, error)
+// DeliveryBatchAcceptor is the Edge-local command-admission boundary. A returned
+// Accepted result means the fixed user executor and every future physical
+// receipt slot are reserved. It never means that a socket write completed.
+type DeliveryBatchAcceptor interface {
+	AdmitDeliveryBatch(context.Context, DeliveryBatch) DeliveryAdmission
 }
 
-type OutboxPushCommandHandler func(context.Context, OutboxPushCommand) OutboxPushAck
+type DeliveryBatchHandler func(context.Context, DeliveryBatch) DeliveryAdmission
 
-type OutboxPushCommandBus interface {
-	SendOutboxPush(ctx context.Context, targetInstanceID string, cmd OutboxPushCommand) (OutboxPushAck, error)
-	SubscribeOutboxPushes(ctx context.Context, instanceID string, handle OutboxPushCommandHandler) error
+// DeliveryCommandBus carries only command admission through Redis. Physical
+// receipts have a separate Edge -> Egress reporter boundary and must never be
+// published through Redis as a fallback.
+type DeliveryCommandBus interface {
+	SendDeliveryBatch(context.Context, string, DeliveryBatch) (DeliveryAdmission, error)
+	SubscribeDeliveryBatches(context.Context, string, DeliveryBatchHandler) error
+}
+
+// PhysicalReceiptReservation is obtained before Edge acknowledges command
+// admission. Each index is resolved exactly once by Commit or Release. Commit
+// must be O(1), non-blocking and safe from a Conn outbound actor.
+type PhysicalReceiptReservation interface {
+	Commit(index int, receipt PhysicalReceipt)
+	Release(index int)
+}
+
+type PhysicalReceiptSink interface {
+	ReservePhysicalReceipts(
+		batchID BatchID,
+		sourceInstanceID string,
+		targetInstanceID string,
+		commandID CommandID,
+		notAfter time.Time,
+		refs []DeliveryRef,
+	) (PhysicalReceiptReservation, error)
 }
 
 type SessionControlCommandHandler func(context.Context, SessionControlCommand) SessionControlAck
@@ -234,8 +664,8 @@ type LocationRecord struct {
 	// LocationRevision is allocated atomically by the shared registry and is
 	// the authoritative reconnect ownership order across Edge instances.
 	LocationRevision int64
-	// UpdatedAtUnixNano is diagnostic time and a fallback for records written
-	// before LocationRevision existed; it is not the cross-host clock authority.
+	// UpdatedAtUnixNano is diagnostic time only. A record without a positive
+	// LocationRevision is invalid and is never eligible for routing.
 	UpdatedAtUnixNano int64
 }
 
@@ -303,6 +733,14 @@ type ChannelLocationRegistry interface {
 	ListOnlineChannelIDsSnapshot(ctx context.Context) ([]int64, error)
 }
 
+// ChannelDeliveryTargetRegistry returns owning Edge instances, never users.
+// Implementations must use per-instance presence indexes and may return a
+// bounded superset; the accepting Edge performs the frozen local-session
+// expansion and reports NoEligibleSessions for a target without a match.
+type ChannelDeliveryTargetRegistry interface {
+	ListChannelDeliveryTargets(context.Context, []ChannelDeliveryRoute) ([]string, error)
+}
+
 // Controller is the Core-facing control-plane boundary for active MTProto
 // sessions owned by Edge.
 //
@@ -354,22 +792,6 @@ type FullController interface {
 // capabilities remain visible through type assertions at the edge boundary.
 func NewLocal(controller Controller) Controller {
 	return controller
-}
-
-type outboxController struct {
-	Controller
-	deliverer OutboxDeliverer
-}
-
-func NewOutboxController(controller Controller, deliverer OutboxDeliverer) Controller {
-	if deliverer == nil {
-		return controller
-	}
-	return &outboxController{Controller: controller, deliverer: deliverer}
-}
-
-func (c *outboxController) PushOutboxUpdate(ctx context.Context, req OutboxPushRequest) (OutboxPushResult, error) {
-	return c.deliverer.PushOutboxUpdate(ctx, req)
 }
 
 // RawAuthKeyIdentityBinder switches all live sessions for a raw temporary key to

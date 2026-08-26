@@ -99,6 +99,7 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 			RichMessage:            p.richMessage,
 			SendAs:                 sendAs,
 			Date:                   int(r.clock.Now().Unix()),
+			ClearDraft:             p.clearDraft,
 		})
 		if err != nil {
 			return nil, false, channelInvalidErr(err)
@@ -112,17 +113,14 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 		echoCache := newViewerPeerCache(r)
 		updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, res, p.randomID, echoCache)
 		if !res.Duplicate {
-			if err := r.enqueueChannelMessageFanout(ctx, userID, res, nil); err != nil {
+			if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, res); err != nil {
 				return nil, false, internalErr()
 			}
-			if err := r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
+			if err := r.enqueueBotAPIChannelDiscussionUpdate(ctx, userID, res.Discussion); err != nil {
 				return nil, false, internalErr()
 			}
 			// 频道链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
 			r.maybeEnqueueWebPageResolve(userID, peer, res.Message.ID, res.Message.Media)
-		}
-		if p.clearDraft && !res.Duplicate {
-			r.clearDraftAfterSend(ctx, userID, peer, replyTo)
 		}
 		return updates, res.Duplicate, nil
 	}
@@ -194,6 +192,7 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 		ViaBotID:               p.viaBotID,
 		GroupedID:              p.groupedID,
 		Effect:                 p.effect,
+		ClearDraft:             p.clearDraft,
 	})
 	if err != nil {
 		fields := append(r.contextLogFields(ctx),
@@ -216,9 +215,6 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	if !res.Duplicate {
 		users = r.usersForMessageUpdateWithPreloaded(ctx, userID, res.SenderMessage, projectedUsers)
 		chats = r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
-	}
-	if p.clearDraft && !res.Duplicate {
-		r.clearDraftAfterSendWithPeerObjects(ctx, userID, peer, replyTo, users, chats)
 	}
 	if !res.Duplicate {
 		// 链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
@@ -343,9 +339,6 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 			return nil, err
 		}
 		if replay.found {
-			if req.ClearDraft {
-				r.clearDraftAfterSend(ctx, userID, peer, replyTo)
-			}
 			return r.monoforumSendUpdatesStrict(ctx, userID, replay.channel.Channel, savedPeer, replay.channel)
 		}
 		if r.messageEffectInvalid(ctx, req.Effect) {

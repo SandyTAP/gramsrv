@@ -21,13 +21,16 @@ func TestPublicChannelPreviewRPCsAllowNonMember(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 92001, Phone: "15550092001", FirstName: "Owner"})
 	viewer, _ := userStore.Create(ctx, domain.User{AccessHash: 92002, Phone: "15550092002", FirstName: "Viewer"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	channelService := appchannels.NewService(channelStore)
 	dialogService := appdialogs.NewService(memory.NewDialogStore(), channelStore)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: channelService,
-		Dialogs:  dialogService,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       channelService,
+		Dialogs:        dialogService,
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	public, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		Title:     "Public Preview RPC",
@@ -163,48 +166,8 @@ func TestPublicChannelPreviewRPCsAllowNonMember(t *testing.T) {
 		t.Fatalf("send live public post: %v", err)
 	}
 	sessions.clearMessages()
-	cancelFanout := startChannelFanoutForTest(t, r)
-	defer cancelFanout()
-	if err := r.enqueueChannelMessageFanout(WithUserID(ctx, owner.ID), owner.ID, live, nil); err != nil {
-		t.Fatalf("enqueueChannelMessageFanout: %v", err)
-	}
-	if !fanoutHasID(waitForPushedUserIDs(t, sessions, 1), viewer.ID) {
-		t.Fatalf("live public preview fanout users = %v, want viewer %d", sessions.pushedUserIDs(), viewer.ID)
-	}
-	liveUpdates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(liveUpdates.Updates) == 0 {
-		t.Fatalf("live public preview update = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
-	}
-	foundLive := false
-	for _, update := range liveUpdates.Updates {
-		newMessage, ok := update.(*tg.UpdateNewChannelMessage)
-		if !ok {
-			continue
-		}
-		if item, ok := newMessage.Message.(*tg.Message); ok && item.ID == live.Message.ID && item.Message == live.Message.Body {
-			foundLive = true
-		}
-	}
-	if !foundLive {
-		t.Fatalf("live public preview updates = %+v, want new message %d", liveUpdates.Updates, live.Message.ID)
-	}
-	sessions.clearMessages()
-	if ok := r.runChannelFanoutOverflowNudge(ctx, public.Channel.ID, live.Event.Pts); !ok {
-		t.Fatal("public preview overflow nudge did not complete")
-	}
-	if !fanoutHasID(sessions.pushedUserIDs(), viewer.ID) {
-		t.Fatalf("public preview overflow nudge users = %v, want viewer %d", sessions.pushedUserIDs(), viewer.ID)
-	}
-	nudgeUpdates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(nudgeUpdates.Updates) != 1 {
-		t.Fatalf("public preview overflow nudge = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
-	}
-	tooLong, ok := nudgeUpdates.Updates[0].(*tg.UpdateChannelTooLong)
-	if !ok || tooLong.ChannelID != public.Channel.ID {
-		t.Fatalf("public preview overflow update = %T %+v, want channel %d tooLong", nudgeUpdates.Updates[0], nudgeUpdates.Updates[0], public.Channel.ID)
-	}
-	if pts, ok := tooLong.GetPts(); !ok || pts != live.Event.Pts {
-		t.Fatalf("public preview overflow pts = %d/%v, want %d", pts, ok, live.Event.Pts)
+	if pushed := sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("Core pushed durable public-channel update directly: %v", pushed)
 	}
 
 	domainPeers, err := r.dialogPeersFromInput(WithUserID(ctx, viewer.ID), viewer.ID, []tg.InputDialogPeerClass{&tg.InputDialogPeer{Peer: peer}})
@@ -254,7 +217,7 @@ func TestPublicChannelPreviewRPCsAllowNonMember(t *testing.T) {
 		t.Fatalf("peer dialog chat = %T %+v, want left public channel", peerDialogs.Chats[0], peerDialogs.Chats[0])
 	}
 
-	if _, err := channelService.JoinChannel(ctx, viewer.ID, public.Channel.ID, 1700010120); err != nil {
+	if _, err := channelService.JoinChannel(ctx, viewer.ID, public.Channel.ID, 1700010120, testPendingJoinEffects); err != nil {
 		t.Fatalf("join public channel after preview: %v", err)
 	}
 	var joinedPeerDialogsIn bin.Buffer
@@ -290,6 +253,8 @@ func TestChannelsReadHistoryAllowsSyntheticMonoforumViewers(t *testing.T) {
 		t.Fatal(err)
 	}
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	channels := appchannels.NewService(channelStore)
 	parent, err := channels.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		Title: "Monoforum Read RPC", Broadcast: true, Date: 1_700_011_000,
@@ -306,7 +271,7 @@ func TestChannelsReadHistoryAllowsSyntheticMonoforumViewers(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := New(Config{}, Deps{
-		Users: appusers.NewService(userStore), Channels: channels,
+		Users: appusers.NewService(userStore), Channels: channels, DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	for _, userID := range []int64{owner.ID, subscriber.ID} {
 		ok, err := r.onChannelsReadHistory(WithUserID(ctx, userID), &tg.ChannelsReadHistoryRequest{

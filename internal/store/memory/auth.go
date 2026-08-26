@@ -267,15 +267,32 @@ func (s *TempAuthKeyBindingStore) DeleteExpired(_ context.Context, expiredBefore
 
 // AuthorizationStore 是 store.AuthorizationStore 的内存实现。
 type AuthorizationStore struct {
-	linkMu   sync.RWMutex
-	authKeys *authKeyState
-	mu       sync.RWMutex
-	m        map[[8]byte]domain.Authorization
+	linkMu         sync.RWMutex
+	authKeys       *authKeyState
+	mu             sync.RWMutex
+	m              map[[8]byte]domain.Authorization
+	deliveryOutbox *DeliveryOutboxStore
 }
 
 // NewAuthorizationStore 创建内存 AuthorizationStore。
 func NewAuthorizationStore() *AuthorizationStore {
 	return &AuthorizationStore{m: make(map[[8]byte]domain.Authorization)}
+}
+
+// AttachDeliveryOutbox makes the in-memory authorization boundary share the
+// same queue observed by an in-memory Egress fixture. Passing nil is rejected
+// by the subsequent login write; there is no direct-delivery fallback.
+func (s *AuthorizationStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
+}
+
+// DeliveryOutbox exposes the store-owned queue to production-isomorphic tests.
+func (s *AuthorizationStore) DeliveryOutbox() *DeliveryOutboxStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.deliveryOutbox
 }
 
 // LinkAuthKeyAuthority connects the test/dev in-memory projection to the same
@@ -350,6 +367,85 @@ func (s *AuthorizationStore) Bind(_ context.Context, a domain.Authorization) err
 	s.bindLocked(a)
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *AuthorizationStore) BindWithDelivery(ctx context.Context, a domain.Authorization, user domain.User, build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if user.ID <= 0 || (a.UserID != 0 && user.ID != a.UserID) {
+		return store.ErrAuthorizationStateChanged
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	if a.Hash == 0 {
+		a.Hash = int64(binary.LittleEndian.Uint64(a.AuthKeyID[:]))
+	}
+	a.UserID = user.ID
+	a.CreatedAt = now
+	a.ActiveAt = now
+
+	s.linkMu.RLock()
+	defer s.linkMu.RUnlock()
+	if s.authKeys != nil {
+		s.authKeys.mu.RLock()
+		defer s.authKeys.mu.RUnlock()
+		key, found := s.authKeys.keys[a.AuthKeyID]
+		if !found {
+			return store.ErrAuthKeyNotFound
+		}
+		if key.ExpiresAt != 0 {
+			return store.ErrAuthKeyNotPermanent
+		}
+		a.Layer = key.Layer
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.m[a.AuthKeyID]
+	notify := !a.PasswordPending && (!exists || current.UserID != user.ID || current.PasswordPending)
+	if exists && current.UserID == user.ID && current.PasswordPending == a.PasswordPending {
+		// Exact bind replay preserves the original authorization age and never
+		// creates a second notification.
+		return nil
+	}
+	if !notify {
+		s.bindLocked(a)
+		return nil
+	}
+	outbox := s.deliveryOutbox
+	if outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(store.AuthorizationDeliverySnapshot{Authorization: a, User: user})
+	if err != nil {
+		return err
+	}
+	if err := store.ValidateAuthorizationDeliveryEffects(user.ID, effects); err != nil {
+		return err
+	}
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	appendAuthorizationDeliveryEffectLocked(outbox, effects[0], now)
+	s.bindLocked(a)
+	return nil
+}
+
+func appendAuthorizationDeliveryEffectLocked(outbox *DeliveryOutboxStore, effect store.DeliveryEffect, now time.Time) {
+	item := store.DeliveryOutboxItem{
+		ID: outbox.nextID, TargetUserID: effect.TargetUserID,
+		ExcludeAuthKeyID: effect.ExcludeAuthKeyID, ExcludeSessionID: effect.ExcludeSessionID,
+		Payload: append([]byte(nil), effect.Payload...), RecoveryPolicy: effect.RecoveryPolicy,
+	}
+	outbox.nextID++
+	outbox.items[item.ID] = cloneDeliveryOutboxItem(item)
+	if _, exists := outbox.lanes[item.TargetUserID]; !exists {
+		outbox.lanes[item.TargetUserID] = &memoryOutboxLane{
+			streamID: item.TargetUserID, headItemID: item.ID, state: "ready", readyAt: now,
+		}
+	}
 }
 
 func (s *AuthorizationStore) bindLocked(a domain.Authorization) {
@@ -427,6 +523,46 @@ func (s *AuthorizationStore) MarkPasswordPassed(_ context.Context, id [8]byte, e
 	a.PasswordPending = false
 	a.CreatedAt = now
 	a.ActiveAt = now
+	s.m[id] = a
+	return nil
+}
+
+func (s *AuthorizationStore) MarkPasswordPassedWithDelivery(ctx context.Context, id [8]byte, expectedUser domain.User, build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if build == nil || expectedUser.ID <= 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.m[id]
+	if !ok || a.UserID != expectedUser.ID {
+		return store.ErrAuthorizationStateChanged
+	}
+	if !a.PasswordPending {
+		// Same-user proof replay is already fully authorized and must not emit a
+		// second new-login notification.
+		return nil
+	}
+	now := time.Now()
+	a.PasswordPending = false
+	a.CreatedAt = now
+	a.ActiveAt = now
+	outbox := s.deliveryOutbox
+	if outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(store.AuthorizationDeliverySnapshot{Authorization: a, User: expectedUser})
+	if err != nil {
+		return err
+	}
+	if err := store.ValidateAuthorizationDeliveryEffects(expectedUser.ID, effects); err != nil {
+		return err
+	}
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	appendAuthorizationDeliveryEffectLocked(outbox, effects[0], now)
 	s.m[id] = a
 	return nil
 }

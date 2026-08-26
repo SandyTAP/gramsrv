@@ -2,7 +2,7 @@ param(
     [string]$AdvertiseIP = $env:TELESRV_ADVERTISE_IP,
     [string]$EdgeListen = '0.0.0.0:2398',
     [string]$CoreExecGRPCAddr = '127.0.0.1:2440',
-    [string]$EgressAckGRPCAddr = '127.0.0.1:2510',
+    [string]$EgressDeliveryGRPCAddr = '127.0.0.1:2510',
     [string]$FileGRPCAddr = '127.0.0.1:2520',
     [string]$GroupCallControlAddr = '127.0.0.1:2420',
     [string]$GroupCallControlURL = 'http://127.0.0.1:2420',
@@ -10,7 +10,7 @@ param(
     [string]$SFUControlGRPCURL = 'grpc://127.0.0.1:2450',
     [int]$SFUUDPPort = 12399,
     [string]$CoreExecToken = $(if ($env:TELESRV_CORE_EXEC_TOKEN) { $env:TELESRV_CORE_EXEC_TOKEN } else { 'edge-core-smoke' }),
-    [string]$EgressAckToken = $(if ($env:TELESRV_EGRESS_ACK_TOKEN) { $env:TELESRV_EGRESS_ACK_TOKEN } else { 'edge-core-smoke-egress' }),
+    [string]$EgressDeliveryToken = $(if ($env:TELESRV_EGRESS_DELIVERY_TOKEN) { $env:TELESRV_EGRESS_DELIVERY_TOKEN } else { 'edge-core-smoke-egress' }),
     [string]$FileToken = $(if ($env:TELESRV_FILE_TOKEN) { $env:TELESRV_FILE_TOKEN } else { 'edge-core-smoke-file' }),
     [string]$PostgresDSN = $env:TELESRV_POSTGRES_DSN,
     [string]$PostgresContainer = 'telesrv-postgres',
@@ -92,14 +92,24 @@ function Start-Role([string]$name, [string]$exe, [hashtable]$env, [string]$suffi
     $stderr = Join-Path $logDir "$name-$suffix.err.log"
     if (Test-Path $stdout) { Remove-Item -Force $stdout }
     if (Test-Path $stderr) { Remove-Item -Force $stderr }
-    $proc = Start-Process `
-        -FilePath $exe `
-        -WorkingDirectory $repo `
-        -Environment $env `
-        -RedirectStandardOutput $stdout `
-        -RedirectStandardError $stderr `
-        -WindowStyle Hidden `
-        -PassThru
+    $savedEnv = @{}
+    try {
+        foreach ($key in $env.Keys) {
+            $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+            [Environment]::SetEnvironmentVariable($key, [string]$env[$key], 'Process')
+        }
+        $proc = Start-Process `
+            -FilePath $exe `
+            -WorkingDirectory $repo `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -WindowStyle Hidden `
+            -PassThru
+    } finally {
+        foreach ($key in $env.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process')
+        }
+    }
     Write-Host ("Started {0} pid={1} stdout={2} stderr={3}" -f $name, $proc.Id, $stdout, $stderr)
     return $proc
 }
@@ -158,7 +168,7 @@ function Resolve-AdvertiseIP([string]$requested, [object[]]$oldProcesses) {
 
 Assert-SingleAddress 'Edge listen' $EdgeListen
 Assert-SingleAddress 'CoreExec gRPC' $CoreExecGRPCAddr
-Assert-SingleAddress 'Egress ACK gRPC' $EgressAckGRPCAddr
+Assert-SingleAddress 'Egress Delivery gRPC' $EgressDeliveryGRPCAddr
 Assert-SingleAddress 'FileData gRPC' $FileGRPCAddr
 Assert-SingleAddress 'GroupCall control' $GroupCallControlAddr
 Assert-SingleAddress 'SFU control gRPC' $SFUControlGRPCAddr
@@ -218,7 +228,7 @@ if (-not $SkipBuild) {
 }
 
 $coreTargets = Join-Targets @($CoreExecGRPCAddr)
-$egressTargets = Join-Targets @($EgressAckGRPCAddr)
+$egressTargets = Join-Targets @($EgressDeliveryGRPCAddr)
 $fileTargets = $FileGRPCAddr
 $advertisePort = Get-ListenPort $EdgeListen
 
@@ -231,12 +241,12 @@ $redisPasswordValue = $(if ($null -eq $RedisPassword) { '' } else { $RedisPasswo
 $redisDBValue = $(if ([string]::IsNullOrWhiteSpace($RedisDB)) { '0' } else { $RedisDB })
 $rsaKeyValue = $(if ([string]::IsNullOrWhiteSpace($RSAKeyPath)) { 'data/server_rsa.pem' } else { $RSAKeyPath })
 $coreTargetYaml = Format-YamlList @($CoreExecGRPCAddr) 4
-$egressTargetYaml = Format-YamlList @($EgressAckGRPCAddr) 6
+$egressTargetYaml = Format-YamlList @($EgressDeliveryGRPCAddr) 6
 $fileTargetYaml = Format-YamlList @($FileGRPCAddr) 4
 
 $commonEnv = @{
     TELESRV_CORE_EXEC_TOKEN = $CoreExecToken
-    TELESRV_EGRESS_ACK_TOKEN = $EgressAckToken
+    TELESRV_EGRESS_DELIVERY_TOKEN = $EgressDeliveryToken
     TELESRV_FILE_TOKEN = $FileToken
     TELESRV_GROUPCALL_CONTROL_TOKEN = 'edge-core-smoke-groupcall'
     TELESRV_SFU_CONTROL_TOKEN = 'edge-core-smoke-sfu'
@@ -365,25 +375,27 @@ public:
     port: $advertisePort
 postgres:
   dsn: '`$`{TELESRV_POSTGRES_DSN`}'
-  max_conns: 8
-  min_conns: 1
+  max_conns: 32
+  min_conns: 4
 redis:
   addr: $(Quote-YamlScalar $redisAddrValue)
   password: $(Quote-YamlScalar $redisPasswordValue)
   db: $redisDBValue
 egress:
-  ack_server:
-    addr: $(Quote-YamlScalar $EgressAckGRPCAddr)
-    token: '`$`{TELESRV_EGRESS_ACK_TOKEN`}'
-  workers: 1
-  batch: 8
+  delivery_server:
+    addr: $(Quote-YamlScalar $EgressDeliveryGRPCAddr)
+    token: '`$`{TELESRV_EGRESS_DELIVERY_TOKEN`}'
+  workers: 4
+  batch: 128
   lease_timeout: 30s
   outbound_push_timeout: 2s
+  delivery_attempt_timeout: 2s
+  delivery_clock_skew_allowance: 1s
 "@
 $egressEnv['TELESRV_CONFIG'] = $egressConfig
 $egressProc = Start-Role 'egress' (Join-Path $runDir 'telesrv-egress.exe') $egressEnv $stamp
 Assert-Alive $egressProc 'egress'
-Wait-Port '127.0.0.1' (Get-ListenPort $EgressAckGRPCAddr) 30
+Wait-Port '127.0.0.1' (Get-ListenPort $EgressDeliveryGRPCAddr) 30
 
 $sfuEnv = Copy-Env $commonEnv
 $sfuConfig = Write-RoleConfig (Join-Path $configDir "sfu-$stamp.yaml") @"
@@ -469,11 +481,11 @@ $fileTargetYaml
   token: '`$`{TELESRV_FILE_TOKEN`}'
   timeout: 10s
 egress:
-  ack:
+  delivery:
     resolver: static
     targets:
 $egressTargetYaml
-    token: '`$`{TELESRV_EGRESS_ACK_TOKEN`}'
+    token: '`$`{TELESRV_EGRESS_DELIVERY_TOKEN`}'
     timeout: 5s
 "@
 $edgeEnv['TELESRV_CONFIG'] = $edgeConfig
@@ -487,7 +499,7 @@ Start-Sleep -Seconds 2
 $ports = @()
 $ports += Get-ListenPort $EdgeListen
 $ports += Get-ListenPort $CoreExecGRPCAddr
-$ports += Get-ListenPort $EgressAckGRPCAddr
+$ports += Get-ListenPort $EgressDeliveryGRPCAddr
 $ports += Get-ListenPort $FileGRPCAddr
 $ports += Get-ListenPort $GroupCallControlAddr
 $ports += Get-ListenPort $SFUControlGRPCAddr
@@ -499,7 +511,7 @@ $listeners = Get-NetTCPConnection -State Listen -LocalPort $ports -ErrorAction S
 
 Write-Host ''
 Write-Host "AdvertiseIP=$AdvertiseIP"
-Write-Host "CoreExec=$coreTargets EgressAck=$egressTargets FileData=$fileTargets GroupCallControl=$GroupCallControlURL SFUControl=$SFUControlGRPCURL SFUUDP=$SFUUDPPort"
+Write-Host "CoreExec=$coreTargets EgressDelivery=$egressTargets FileData=$fileTargets GroupCallControl=$GroupCallControlURL SFUControl=$SFUControlGRPCURL SFUUDP=$SFUUDPPort"
 $listeners | Format-Table -AutoSize
 
 $udp = Get-NetUDPEndpoint -LocalPort $SFUUDPPort -ErrorAction SilentlyContinue |

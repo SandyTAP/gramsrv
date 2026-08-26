@@ -36,7 +36,7 @@ func TestDialogTopMessageCarriesFullMetadata(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	const groupedID = int64(990000000777)
 	const effect = int64(5104841169784993603)
 	markup := &domain.MessageReplyMarkup{Inline: [][]domain.MarkupButton{{
@@ -115,7 +115,7 @@ func TestSavedDialogTopMessageCarriesFullMetadata(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", alice.ID)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	const groupedID = int64(990000000888)
 	const effect = int64(5104841169784993603)
 	markup := &domain.MessageReplyMarkup{Inline: [][]domain.MarkupButton{{

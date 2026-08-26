@@ -311,7 +311,7 @@ func TestSessionControlFabricRoutesTransientPushToOwningRemoteEdge(t *testing.T)
 		got.cmd.DeliveryTimeout != 50*time.Millisecond {
 		t.Fatalf("command = %+v", got.cmd)
 	}
-	if decoded, err := DecodeOutboxUpdate(got.cmd.UpdateBytes); err != nil {
+	if decoded, err := DecodeDeliveryUpdate(got.cmd.UpdateBytes); err != nil {
 		t.Fatalf("decode live push update: %v", err)
 	} else if _, ok := decoded.(*tg.UpdateShort); !ok {
 		t.Fatalf("decoded update = %T, want *tg.UpdateShort", decoded)
@@ -320,7 +320,7 @@ func TestSessionControlFabricRoutesTransientPushToOwningRemoteEdge(t *testing.T)
 
 func TestHandleSessionControlCommandAppliesTransientPush(t *testing.T) {
 	local := &captureFullController{}
-	updateBytes, err := EncodeOutboxUpdate(&tg.UpdateShort{
+	updateBytes, err := EncodeDeliveryUpdate(&tg.UpdateShort{
 		Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}},
 		Date:   1,
 	})
@@ -441,7 +441,7 @@ func TestSessionControlFabricRoutesSemanticTransientOnlyToCompatibleProfiles(t *
 
 func TestHandleSessionControlCommandAppliesSemanticTransientPush(t *testing.T) {
 	local := &captureFullController{}
-	updateBytes, err := EncodeOutboxUpdate(&tg.UpdateShort{Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}}, Date: 1})
+	updateBytes, err := EncodeDeliveryUpdate(&tg.UpdateShort{Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}}, Date: 1})
 	if err != nil {
 		t.Fatalf("encode update: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestHandleSessionControlCommandAppliesSemanticTransientPush(t *testing.T) {
 func TestHandleSessionControlCommandAppliesBusinessAuthKeyPush(t *testing.T) {
 	local := &captureFullController{}
 	business := [8]byte{6}
-	updateBytes, err := EncodeOutboxUpdate(&tg.UpdateShort{
+	updateBytes, err := EncodeDeliveryUpdate(&tg.UpdateShort{
 		Update: &tg.UpdateUserTyping{UserID: 1001, Action: &tg.SendMessageTypingAction{}},
 		Date:   1,
 	})
@@ -526,7 +526,7 @@ func TestSessionControlFabricRoutesChannelStateAndReadsRegistryIndexes(t *testin
 	raw := [8]byte{1}
 	registry := &captureLocationRegistry{
 		raw: map[[8]byte][]LocationRecord{
-			raw: {{InstanceID: "edge-b", RawAuthKeyID: raw, SessionID: 10, UserID: 42}},
+			raw: {{InstanceID: "edge-b", RawAuthKeyID: raw, SessionID: 10, UserID: 42, LocationRevision: 1}},
 		},
 		channelMembers: map[int64][]LocationRecord{
 			77: {
@@ -596,6 +596,24 @@ func TestSessionControlFabricMembershipSyncPrefersNewestReconnectLocation(t *tes
 	}
 	if len(bus.sent) != 1 || bus.sent[0].target != "edge-current" {
 		t.Fatalf("membership sync targets = %+v, want only newest reconnect location", bus.sent)
+	}
+}
+
+func TestSessionControlFabricMembershipSyncRejectsLocationWithoutRevision(t *testing.T) {
+	raw := [8]byte{1}
+	registry := &captureLocationRegistry{raw: map[[8]byte][]LocationRecord{
+		raw: {
+			{InstanceID: "edge-unversioned", RawAuthKeyID: raw, SessionID: 10, UserID: 42, UpdatedAtUnixNano: time.Now().UnixNano()},
+		},
+	}}
+	bus := &captureSessionBus{membershipSyncID: 19, membershipSyncDisposition: ChannelMembershipSyncAcquired}
+	fabric := NewSessionControlFabric(SessionControlFabricConfig{InstanceID: "core", Registry: registry, Bus: bus})
+
+	if _, _, err := fabric.BeginSessionChannelMembershipSync(context.Background(), raw, 10, 42); err == nil || !strings.Contains(err.Error(), "target count 0") {
+		t.Fatalf("begin membership sync err = %v, want missing authoritative location", err)
+	}
+	if len(bus.sent) != 0 {
+		t.Fatalf("unversioned location must not receive session control: %+v", bus.sent)
 	}
 }
 
@@ -677,11 +695,11 @@ func TestSessionControlFabricPushesUsingSuppliedLocations(t *testing.T) {
 func TestHandleSessionControlCommandAppliesUserPushBatch(t *testing.T) {
 	local := &captureFullController{}
 	raw := [8]byte{7}
-	first, err := EncodeOutboxUpdate(&tg.Updates{Date: 1})
+	first, err := EncodeDeliveryUpdate(&tg.Updates{Date: 1})
 	if err != nil {
 		t.Fatalf("encode first update: %v", err)
 	}
-	second, err := EncodeOutboxUpdate(&tg.Updates{Date: 2})
+	second, err := EncodeDeliveryUpdate(&tg.Updates{Date: 2})
 	if err != nil {
 		t.Fatalf("encode second update: %v", err)
 	}
@@ -708,7 +726,7 @@ func TestHandleSessionControlCommandAppliesUserPushBatch(t *testing.T) {
 func TestHandleSessionControlCommandAppliesChannelDeliveryBatch(t *testing.T) {
 	local := &captureFullController{}
 	raw := [8]byte{7}
-	updateBytes, err := EncodeOutboxUpdate(&tg.Updates{Date: 1})
+	updateBytes, err := EncodeDeliveryUpdate(&tg.Updates{Date: 1})
 	if err != nil {
 		t.Fatalf("encode update: %v", err)
 	}

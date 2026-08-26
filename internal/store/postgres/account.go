@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -195,14 +196,56 @@ WHERE user_id = $1`, userID)
 	return settings, true, nil
 }
 
-func (s *PasswordStore) SaveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings) error {
+func (s *PasswordStore) SaveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings, effects store.DeliveryEffectsBuilder[domain.AccountReactionSettings]) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return fmt.Errorf("save account reaction settings: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin account reaction settings tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := saveReactionSettingsRow(ctx, tx, userID, settings); err != nil {
+		return err
+	}
+	intents, err := effects(settings)
+	if err != nil {
+		return fmt.Errorf("build account reaction settings delivery effects: %w", err)
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply account reaction settings delivery effects: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit account reaction settings tx: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *PasswordStore) SaveReactionsNotifySettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings) error {
+	if userID <= 0 {
+		return fmt.Errorf("save reactions notify settings: invalid user")
+	}
+	return saveReactionSettingsRow(ctx, s.db, userID, settings)
+}
+
+func saveReactionSettingsRow(ctx context.Context, db sqlcgen.DBTX, userID int64, settings domain.AccountReactionSettings) error {
 	var paidPeerType any
 	var paidPeerID any
 	if settings.PaidPrivacy.Kind == domain.PaidReactionPrivacyPeer && settings.PaidPrivacy.Peer != nil {
 		paidPeerType = string(settings.PaidPrivacy.Peer.Type)
 		paidPeerID = settings.PaidPrivacy.Peer.ID
 	}
-	if _, err := s.db.Exec(ctx, `
+	if _, err := db.Exec(ctx, `
 INSERT INTO account_reaction_settings (
     user_id, messages_notify_from, stories_notify_from, poll_votes_notify_from, show_previews,
     default_reaction_type, default_reaction_value, paid_privacy_kind, paid_privacy_peer_type, paid_privacy_peer_id
@@ -412,11 +455,104 @@ ON CONFLICT (owner_user_id, scope_kind, peer_type, peer_id, topic_id) DO UPDATE 
 	return nil
 }
 
-func (s *PasswordStore) ResetNotifySettings(ctx context.Context, ownerUserID int64) error {
-	if _, err := s.db.Exec(ctx, `DELETE FROM notify_settings WHERE owner_user_id = $1`, ownerUserID); err != nil {
+func (s *PasswordStore) SaveNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings, delivery store.DeliveryOutboxEnqueue) error {
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return fmt.Errorf("save notify settings with delivery: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin notify settings delivery tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := NewPasswordStore(tx).SaveNotifySettings(ctx, ownerUserID, scope, settings); err != nil {
+		return err
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, []store.DeliveryEffect{store.AbsoluteDeliveryEffect(delivery)}); err != nil {
+		return fmt.Errorf("apply notify settings delivery: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit notify settings delivery tx: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *PasswordStore) ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot]) error {
+	if ownerUserID <= 0 || effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return fmt.Errorf("reset notify settings with delivery: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin reset notify settings delivery tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	snapshot, err := notifySettingsResetSnapshot(ctx, tx, ownerUserID)
+	if err != nil {
+		return err
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return fmt.Errorf("build reset notify settings delivery effects: %w", err)
+	}
+	if err := store.ValidateNotifySettingsResetDeliveryEffects(snapshot, intents); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM notify_settings WHERE owner_user_id = $1`, ownerUserID); err != nil {
 		return fmt.Errorf("reset notify settings: %w", err)
 	}
+	if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply reset notify settings delivery: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit reset notify settings delivery tx: %w", err)
+	}
+	committed = true
 	return nil
+}
+
+func notifySettingsResetSnapshot(ctx context.Context, db sqlcgen.DBTX, ownerUserID int64) (store.NotifySettingsResetSnapshot, error) {
+	rows, err := db.Query(ctx, `
+SELECT scope_kind, peer_type, peer_id, topic_id
+FROM notify_settings
+WHERE owner_user_id = $1
+ORDER BY scope_kind, peer_type, peer_id, topic_id`, ownerUserID)
+	if err != nil {
+		return store.NotifySettingsResetSnapshot{}, fmt.Errorf("list notify scopes for reset: %w", err)
+	}
+	defer rows.Close()
+	snapshot := store.NotifySettingsResetSnapshot{OwnerUserID: ownerUserID}
+	for rows.Next() {
+		var kind, peerType string
+		var peerID int64
+		var topicID int
+		if err := rows.Scan(&kind, &peerType, &peerID, &topicID); err != nil {
+			return store.NotifySettingsResetSnapshot{}, fmt.Errorf("scan notify scope for reset: %w", err)
+		}
+		scope := domain.NotifyScope{Kind: domain.NotifyScopeKind(kind), TopicID: topicID}
+		if scope.Kind == domain.NotifyScopePeer {
+			scope.Peer = domain.Peer{Type: domain.PeerType(peerType), ID: peerID}
+		}
+		snapshot.Scopes = append(snapshot.Scopes, scope)
+	}
+	if err := rows.Err(); err != nil {
+		return store.NotifySettingsResetSnapshot{}, fmt.Errorf("iterate notify scopes for reset: %w", err)
+	}
+	return snapshot, nil
 }
 
 func (s *PasswordStore) GetPeerNotifySettings(ctx context.Context, ownerUserID int64, peers []domain.Peer) (map[domain.Peer]domain.PeerNotifySettings, error) {
@@ -569,33 +705,28 @@ ORDER BY peer_type, peer_id, topic_id`, ownerUserID)
 	return out, nil
 }
 
-func (s *PasswordStore) SaveStickerCollectionItem(ctx context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now, max int) error {
-	if userID == 0 || documentID == 0 {
-		return domain.ErrStickerInvalid
+func (s *PasswordStore) MutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, effects store.DeliveryEffectsBuilder[domain.StickerCollectionMutation]) error {
+	if err := validateStickerCollectionMutation(mutation); err != nil {
+		return err
 	}
-	if unsave {
-		if _, err := s.db.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2 AND document_id = $3`,
-			userID, string(kind), documentID); err != nil {
-			return fmt.Errorf("unsave sticker collection item: %w", err)
-		}
-		return nil
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	if max <= 0 {
-		max = domain.MaxStickerCollectionItems(kind)
-	}
-	return withTx(ctx, s.db, "save sticker collection item", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
+	return withTx(ctx, s.db, "mutate sticker collection with delivery", func(tx pgx.Tx) error {
+		switch mutation.Mutation {
+		case domain.StickerCollectionMutationSave:
+			if _, err := tx.Exec(ctx, `
 INSERT INTO user_sticker_collections (owner_user_id, kind, document_id, used_at)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (owner_user_id, kind, document_id) DO UPDATE
 SET used_at = EXCLUDED.used_at,
     order_key = nextval('user_sticker_collections_order_key_seq')`,
-			userID, string(kind), documentID, now); err != nil {
-			return fmt.Errorf("upsert sticker collection item: %w", err)
-		}
-		// 截断超上界：单次有序窗口扫描（索引 user_sticker_collections_order_idx 服务
-		// order_key DESC 排序），按 ctid 删除排名 > max 的旧项，避免 NOT IN 双扫全集。
-		if _, err := tx.Exec(ctx, `
+				mutation.OwnerUserID, string(mutation.Kind), mutation.DocumentID, mutation.Date); err != nil {
+				return fmt.Errorf("upsert sticker collection item: %w", err)
+			}
+			// Truncate with one indexed ordered scan; the collection cap is a
+			// domain invariant and is not supplied by callers.
+			if _, err := tx.Exec(ctx, `
 DELETE FROM user_sticker_collections
 WHERE ctid IN (
   SELECT ctid FROM (
@@ -603,16 +734,37 @@ WHERE ctid IN (
     FROM user_sticker_collections
     WHERE owner_user_id = $1 AND kind = $2
   ) t WHERE rn > $3
-)`, userID, string(kind), max); err != nil {
-			return fmt.Errorf("trim sticker collection: %w", err)
+)`, mutation.OwnerUserID, string(mutation.Kind), domain.MaxStickerCollectionItems(mutation.Kind)); err != nil {
+				return fmt.Errorf("trim sticker collection: %w", err)
+			}
+		case domain.StickerCollectionMutationUnsave:
+			if _, err := tx.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2 AND document_id = $3`,
+				mutation.OwnerUserID, string(mutation.Kind), mutation.DocumentID); err != nil {
+				return fmt.Errorf("unsave sticker collection item: %w", err)
+			}
+		case domain.StickerCollectionMutationClear:
+			if _, err := tx.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2`,
+				mutation.OwnerUserID, string(mutation.Kind)); err != nil {
+				return fmt.Errorf("clear sticker collection: %w", err)
+			}
+		}
+		intents, err := effects(mutation)
+		if err != nil {
+			return fmt.Errorf("build sticker collection delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply sticker collection delivery effects: %w", err)
 		}
 		return nil
 	})
 }
 
 func (s *PasswordStore) ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error) {
-	if userID == 0 {
-		return nil, nil
+	if userID <= 0 || !validStickerCollectionKind(kind) {
+		return nil, domain.ErrStickerInvalid
 	}
 	if limit <= 0 || limit > domain.MaxStickerCollectionItems(kind) {
 		limit = domain.MaxStickerCollectionItems(kind)
@@ -641,22 +793,29 @@ LIMIT $3`, userID, string(kind), limit)
 	return out, nil
 }
 
-func (s *PasswordStore) ClearStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind) error {
-	if _, err := s.db.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2`,
-		userID, string(kind)); err != nil {
-		return fmt.Errorf("clear sticker collection: %w", err)
+func (s *PasswordStore) MutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation, effects store.DeliveryEffectsBuilder[domain.UserStickerSetMutation]) error {
+	if err := validateUserStickerSetMutation(mutation); err != nil {
+		return err
 	}
-	return nil
-}
-
-func (s *PasswordStore) InstallUserStickerSet(ctx context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error {
-	if userID == 0 || setID == 0 {
-		return domain.ErrStickerInvalid
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	orderValue := int64(installedDate) << 32
-	_, err := s.db.Exec(ctx, `
+	mutation.Items = append([]domain.UserStickerSetMutationItem(nil), mutation.Items...)
+	mutation.Order = append([]int64(nil), mutation.Order...)
+	return withTx(ctx, s.db, "mutate user sticker sets with delivery", func(tx pgx.Tx) error {
+		ids := make([]int64, 0, len(mutation.Items))
+		kinds := make([]string, 0, len(mutation.Items))
+		for _, item := range mutation.Items {
+			ids = append(ids, item.StickerSetID)
+			kinds = append(kinds, string(item.Kind))
+		}
+		switch mutation.Mutation {
+		case domain.UserStickerSetMutationInstall:
+			if _, err := tx.Exec(ctx, `
 INSERT INTO user_sticker_sets (owner_user_id, sticker_set_id, set_kind, archived, installed_date, order_value, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, now())
+SELECT $1, input.sticker_set_id, input.set_kind, $4, $5::integer,
+       ((($5::integer)::bigint << 32) - (input.ordinality - 1)), now()
+FROM unnest($2::bigint[], $3::text[]) WITH ORDINALITY AS input(sticker_set_id, set_kind, ordinality)
 ON CONFLICT (owner_user_id, sticker_set_id) DO UPDATE SET
   set_kind = EXCLUDED.set_kind,
   archived = EXCLUDED.archived,
@@ -666,59 +825,53 @@ ON CONFLICT (owner_user_id, sticker_set_id) DO UPDATE SET
   END,
   order_value = EXCLUDED.order_value,
   updated_at = now()`,
-		userID, setID, string(kind), archived, installedDate, orderValue)
-	if err != nil {
-		return fmt.Errorf("install user sticker set: %w", err)
-	}
-	return nil
-}
-
-func (s *PasswordStore) UninstallUserStickerSet(ctx context.Context, userID int64, setID int64) error {
-	if _, err := s.db.Exec(ctx, `
+				mutation.OwnerUserID, ids, kinds, mutation.Archived, mutation.Date); err != nil {
+				return fmt.Errorf("install user sticker sets: %w", err)
+			}
+		case domain.UserStickerSetMutationUninstall:
+			if _, err := tx.Exec(ctx, `
 DELETE FROM user_sticker_sets
-WHERE owner_user_id = $1 AND sticker_set_id = $2`, userID, setID); err != nil {
-		return fmt.Errorf("uninstall user sticker set: %w", err)
-	}
-	return nil
-}
-
-func (s *PasswordStore) SetUserStickerSetArchived(ctx context.Context, userID int64, setID int64, archived bool, now int) error {
-	orderValue := int64(now) << 32
-	_, err := s.db.Exec(ctx, `
+WHERE owner_user_id = $1 AND sticker_set_id = ANY($2::bigint[])`, mutation.OwnerUserID, ids); err != nil {
+				return fmt.Errorf("uninstall user sticker sets: %w", err)
+			}
+		case domain.UserStickerSetMutationArchive, domain.UserStickerSetMutationUnarchive:
+			archived := mutation.Mutation == domain.UserStickerSetMutationArchive
+			if _, err := tx.Exec(ctx, `
 UPDATE user_sticker_sets
 SET archived = $3,
     order_value = CASE WHEN $3::boolean = false AND $4::bigint > 0 THEN $4::bigint ELSE order_value END,
     updated_at = now()
-WHERE owner_user_id = $1 AND sticker_set_id = $2`, userID, setID, archived, orderValue)
-	if err != nil {
-		return fmt.Errorf("set user sticker set archived: %w", err)
-	}
-	return nil
-}
-
-func (s *PasswordStore) ReorderUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, order []int64, now int) error {
-	if len(order) == 0 {
-		return nil
-	}
-	return withTx(ctx, s.db, "reorder user sticker sets", func(tx pgx.Tx) error {
-		orderValue := int64(now) << 32
-		for _, id := range order {
+WHERE owner_user_id = $1 AND sticker_set_id = ANY($2::bigint[])`,
+				mutation.OwnerUserID, ids, archived, int64(mutation.Date)<<32); err != nil {
+				return fmt.Errorf("set user sticker sets archived: %w", err)
+			}
+		case domain.UserStickerSetMutationReorder:
 			if _, err := tx.Exec(ctx, `
 UPDATE user_sticker_sets
-SET order_value = $4, updated_at = now()
-WHERE owner_user_id = $1 AND set_kind = $2 AND sticker_set_id = $3`,
-				userID, string(kind), id, orderValue); err != nil {
-				return fmt.Errorf("update user sticker set order: %w", err)
+SET order_value = (($4::bigint << 32) - (input.ordinality - 1)), updated_at = now()
+FROM unnest($3::bigint[]) WITH ORDINALITY AS input(sticker_set_id, ordinality)
+WHERE owner_user_id = $1 AND set_kind = $2 AND user_sticker_sets.sticker_set_id = input.sticker_set_id`,
+				mutation.OwnerUserID, string(mutation.Kind), mutation.Order, mutation.Date); err != nil {
+				return fmt.Errorf("reorder user sticker sets: %w", err)
 			}
-			orderValue--
+		}
+		intents, err := effects(mutation)
+		if err != nil {
+			return fmt.Errorf("build user sticker set delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply user sticker set delivery effects: %w", err)
 		}
 		return nil
 	})
 }
 
 func (s *PasswordStore) ListUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error) {
-	if userID == 0 {
-		return nil, 0, nil
+	if userID <= 0 || !validInstalledStickerSetKind(kind) {
+		return nil, 0, domain.ErrStickerInvalid
 	}
 	if limit <= 0 || limit > domain.MaxInstalledStickerSets {
 		limit = domain.MaxInstalledStickerSets
@@ -766,6 +919,87 @@ LIMIT $5`, userID, string(kind), archivedFilter, offsetID, limit)
 		return nil, 0, fmt.Errorf("iterate user sticker sets: %w", err)
 	}
 	return out, total, nil
+}
+
+func validateStickerCollectionMutation(mutation domain.StickerCollectionMutation) error {
+	if mutation.OwnerUserID <= 0 || !validStickerCollectionKind(mutation.Kind) {
+		return domain.ErrStickerInvalid
+	}
+	switch mutation.Mutation {
+	case domain.StickerCollectionMutationSave, domain.StickerCollectionMutationUnsave:
+		if mutation.DocumentID <= 0 {
+			return domain.ErrStickerInvalid
+		}
+	case domain.StickerCollectionMutationClear:
+		if mutation.DocumentID != 0 {
+			return domain.ErrStickerInvalid
+		}
+	default:
+		return domain.ErrStickerInvalid
+	}
+	return nil
+}
+
+func validateUserStickerSetMutation(mutation domain.UserStickerSetMutation) error {
+	if mutation.OwnerUserID <= 0 {
+		return domain.ErrStickerInvalid
+	}
+	if mutation.Mutation == domain.UserStickerSetMutationReorder {
+		if !validInstalledStickerSetKind(mutation.Kind) || len(mutation.Order) == 0 || len(mutation.Order) > domain.MaxInstalledStickerSets {
+			return domain.ErrStickerInvalid
+		}
+		return validateUniqueStickerSetIDs(mutation.Order)
+	}
+	switch mutation.Mutation {
+	case domain.UserStickerSetMutationInstall, domain.UserStickerSetMutationUninstall,
+		domain.UserStickerSetMutationArchive, domain.UserStickerSetMutationUnarchive:
+	default:
+		return domain.ErrStickerInvalid
+	}
+	if len(mutation.Items) == 0 || len(mutation.Items) > domain.MaxInstalledStickerSets {
+		return domain.ErrStickerInvalid
+	}
+	ids := make([]int64, 0, len(mutation.Items))
+	for _, item := range mutation.Items {
+		if !validInstalledStickerSetKind(item.Kind) {
+			return domain.ErrStickerInvalid
+		}
+		ids = append(ids, item.StickerSetID)
+	}
+	return validateUniqueStickerSetIDs(ids)
+}
+
+func validStickerCollectionKind(kind domain.StickerCollectionKind) bool {
+	switch kind {
+	case domain.StickerCollectionFaved, domain.StickerCollectionRecent,
+		domain.StickerCollectionRecentAttached, domain.StickerCollectionGif:
+		return true
+	default:
+		return false
+	}
+}
+
+func validInstalledStickerSetKind(kind domain.StickerSetKind) bool {
+	switch kind {
+	case domain.StickerSetKindStickers, domain.StickerSetKindMasks, domain.StickerSetKindEmoji:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateUniqueStickerSetIDs(ids []int64) error {
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return domain.ErrStickerInvalid
+		}
+		if _, exists := seen[id]; exists {
+			return domain.ErrStickerInvalid
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
 }
 
 func nullableBool(v *bool) any {

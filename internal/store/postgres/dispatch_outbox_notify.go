@@ -2,15 +2,18 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
 // DispatchOutboxReadyNotifyChannel is emitted transactionally by dispatch_outbox
-// triggers when at least one user head is ready to claim.
+// lane triggers when at least one account ordering domain is ready to claim.
 const DispatchOutboxReadyNotifyChannel = "telesrv_dispatch_outbox_ready"
+const DispatchOutboxFinalizeNotifyChannel = "telesrv_dispatch_outbox_finalize"
 const EdgeDeliveryOutboxReadyNotifyChannel = "telesrv_edge_delivery_outbox_ready"
+const EdgeDeliveryOutboxFinalizeNotifyChannel = "telesrv_edge_delivery_outbox_finalize"
 const BootstrapUpdateReadyNotifyChannel = "telesrv_bootstrap_update_ready"
 
 // DispatchOutboxReadyListener consumes ready notifications for the durable
@@ -88,7 +91,10 @@ func (l *EdgeDeliveryOutboxReadyListener) Run(ctx context.Context, wake func()) 
 		if ctx.Err() != nil {
 			return
 		}
-		err := listenAndConsumeOutboxReady(ctx, l.dsn, EdgeDeliveryOutboxReadyNotifyChannel, l.log, wake)
+		err := listenAndConsumeOutboxSignals(ctx, l.dsn, []string{
+			EdgeDeliveryOutboxReadyNotifyChannel,
+			EdgeDeliveryOutboxFinalizeNotifyChannel,
+		}, l.log, wake)
 		if ctx.Err() != nil {
 			return
 		}
@@ -130,12 +136,22 @@ func (l *BootstrapUpdateReadyListener) Run(ctx context.Context, wake func()) {
 }
 
 func (l *DispatchOutboxReadyListener) listenAndConsume(ctx context.Context, wake func()) error {
-	return listenAndConsumeOutboxReady(ctx, l.dsn, DispatchOutboxReadyNotifyChannel, l.log, wake)
+	return listenAndConsumeOutboxSignals(ctx, l.dsn, []string{
+		DispatchOutboxReadyNotifyChannel,
+		DispatchOutboxFinalizeNotifyChannel,
+	}, l.log, wake)
 }
 
 func listenAndConsumeOutboxReady(ctx context.Context, dsn, channel string, log *zap.Logger, wake func()) error {
+	return listenAndConsumeOutboxSignals(ctx, dsn, []string{channel}, log, wake)
+}
+
+func listenAndConsumeOutboxSignals(ctx context.Context, dsn string, channels []string, log *zap.Logger, wake func()) error {
 	if log == nil {
 		log = zap.NewNop()
+	}
+	if len(channels) == 0 {
+		return fmt.Errorf("outbox listener requires at least one channel")
 	}
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -143,11 +159,13 @@ func listenAndConsumeOutboxReady(ctx context.Context, dsn, channel string, log *
 	}
 	defer conn.Close(context.Background())
 
-	if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
-		return err
+	for _, channel := range channels {
+		if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
+			return err
+		}
 	}
 	wake()
-	log.Info("ready listener active", zap.String("notify_channel", channel))
+	log.Info("outbox signal listener active", zap.Strings("notify_channels", channels))
 
 	for {
 		notification, err := conn.WaitForNotification(ctx)
@@ -157,6 +175,11 @@ func listenAndConsumeOutboxReady(ctx context.Context, dsn, channel string, log *
 		if notification == nil {
 			continue
 		}
-		wake()
+		for _, channel := range channels {
+			if notification.Channel == channel {
+				wake()
+				break
+			}
+		}
 	}
 }

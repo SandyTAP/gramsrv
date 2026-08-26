@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 
 	"telesrv/internal/domain"
 )
@@ -32,21 +33,11 @@ type UserStore interface {
 	// SweepExpiredPremium 把到期（premium_expires_at <= now）的会员行清空并
 	// 返回清理后的用户（供推送 updateUser）；单次最多处理 limit 行。
 	SweepExpiredPremium(ctx context.Context, now int64, limit int) ([]domain.User, error)
-	// UpdateEmojiStatus 更新用户自定义 emoji status。零值清除；collectible
-	// 必须是完整且与 DocumentID 一致的不可变快照。
-	UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error)
 	UpdateColor(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error)
 	// UpdateBirthday 更新用户生日（零值 Birthday 表示清除）。
 	UpdateBirthday(ctx context.Context, userID int64, birthday domain.Birthday) (domain.User, error)
-	// UpdatePersonalChannel 设置/清除资料页个人频道（channelID=0 表示清除）。
-	UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error)
-}
-
-// UserEmojiStatusEventStore is the aggregate write boundary used by the
-// account RPC in durable deployments. The user snapshot, pts event and online
-// dispatch row must commit or roll back together.
-type UserEmojiStatusEventStore interface {
-	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, domain.UpdateEvent, error)
+	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, event domain.UpdateEvent) (domain.User, domain.UpdateEvent, error)
+	UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects DeliveryEffectsBuilder[UserDeliverySnapshot]) (domain.User, error)
 }
 
 type UserDeliverySnapshot struct {
@@ -66,6 +57,124 @@ type UserDeliveryStore interface {
 	UpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
 	UpdateBirthdayWithDelivery(ctx context.Context, userID int64, birthday domain.Birthday, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
 	UpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, build UserDeliveryPayloadBuilder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.User, error)
+}
+
+func ValidateUserSelfDeliveryEffects(snapshot UserDeliverySnapshot, effects []DeliveryEffect) error {
+	if snapshot.User.ID <= 0 || len(effects) != 1 {
+		return fmt.Errorf("self user delivery requires exactly one effect")
+	}
+	effect := effects[0]
+	if err := effect.Validate(); err != nil {
+		return fmt.Errorf("self user delivery effect: %w", err)
+	}
+	if effect.Kind != DeliveryEffectAbsolute || effect.TargetUserID != snapshot.User.ID {
+		return fmt.Errorf("self user delivery requires an absolute owner-targeted effect")
+	}
+	if effect.ExcludeAuthKeyID != ([8]byte{}) || effect.ExcludeSessionID != 0 {
+		return fmt.Errorf("self user delivery must not exclude a session")
+	}
+	if effect.RecoveryPolicy != OutboxRecoveryAbsoluteReload {
+		return fmt.Errorf("self user delivery requires absolute reload recovery")
+	}
+	return nil
+}
+
+// UserPremiumDeliveryStore clears an expiry batch and commits one absolute
+// updateUser effect per changed account in the same aggregate transaction.
+type UserPremiumDeliveryStore interface {
+	SweepExpiredPremiumWithDelivery(ctx context.Context, now int64, limit int, effects DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error)
+}
+
+type UserAudienceDeliverySnapshot struct {
+	User     domain.User
+	Audience []int64
+}
+
+type UserModerationDeliveryStore interface {
+	SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	SetScamFakeWithDelivery(ctx context.Context, userID int64, scam, fake bool, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	SetSupportWithDelivery(ctx context.Context, userID int64, support bool, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+}
+
+// UserAdminDeliveryStore is the trusted-operator aggregate boundary for
+// externally visible user facts. Unlike the account self-session boundary,
+// these methods freeze the bounded known-viewer audience while the users row is
+// locked and commit one absolute updateUser effect per viewer in the same
+// transaction. A no-op must return without producing an effect.
+type UserAdminDeliveryStore interface {
+	AdminUpdateProfileWithDelivery(ctx context.Context, userID int64, firstName, lastName, about string, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdatePhoneWithDelivery(ctx context.Context, userID int64, phone string, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateEmojiStatusWithDelivery(ctx context.Context, userID int64, status domain.UserEmojiStatus, effects DeliveryEffectsBuilder[UserAudienceDeliverySnapshot]) (domain.User, error)
+}
+
+func ValidateUserAudienceDeliveryEffects(snapshot UserAudienceDeliverySnapshot, effects []DeliveryEffect) error {
+	if snapshot.User.ID <= 0 || len(snapshot.Audience) == 0 || len(effects) != len(snapshot.Audience) {
+		return fmt.Errorf("user audience delivery requires one effect per frozen viewer")
+	}
+	want := make(map[int64]struct{}, len(snapshot.Audience))
+	for _, viewerID := range snapshot.Audience {
+		if viewerID <= 0 {
+			return fmt.Errorf("user audience delivery contains invalid viewer")
+		}
+		want[viewerID] = struct{}{}
+	}
+	if len(want) != len(snapshot.Audience) {
+		return fmt.Errorf("user audience delivery contains duplicate viewers")
+	}
+	seen := make(map[int64]struct{}, len(effects))
+	for i := range effects {
+		effect := effects[i]
+		if err := effect.Validate(); err != nil {
+			return fmt.Errorf("user audience delivery effect %d: %w", i, err)
+		}
+		if effect.Kind != DeliveryEffectAbsolute {
+			return fmt.Errorf("user audience delivery effect %d is not absolute", i)
+		}
+		if effect.ExcludeAuthKeyID != ([8]byte{}) || effect.ExcludeSessionID != 0 {
+			return fmt.Errorf("user audience delivery effect %d must not exclude a session", i)
+		}
+		if _, ok := want[effect.TargetUserID]; !ok {
+			return fmt.Errorf("user audience delivery effect %d has unexpected target", i)
+		}
+		if _, duplicate := seen[effect.TargetUserID]; duplicate {
+			return fmt.Errorf("user audience delivery target %d is duplicated", effect.TargetUserID)
+		}
+		seen[effect.TargetUserID] = struct{}{}
+	}
+	return nil
+}
+
+func ValidateUserBatchDeliveryEffects(users []domain.User, effects []DeliveryEffect) error {
+	if len(users) == 0 || len(effects) != len(users) {
+		return fmt.Errorf("user batch delivery requires one effect per changed user")
+	}
+	want := make(map[int64]struct{}, len(users))
+	for _, user := range users {
+		if user.ID <= 0 {
+			return fmt.Errorf("user batch delivery contains invalid user")
+		}
+		want[user.ID] = struct{}{}
+	}
+	seen := make(map[int64]struct{}, len(effects))
+	for i := range effects {
+		effect := effects[i]
+		if err := effect.Validate(); err != nil {
+			return fmt.Errorf("user batch delivery effect %d: %w", i, err)
+		}
+		if effect.Kind != DeliveryEffectAbsolute {
+			return fmt.Errorf("user batch delivery effect %d is not absolute", i)
+		}
+		if _, ok := want[effect.TargetUserID]; !ok {
+			return fmt.Errorf("user batch delivery effect %d has unexpected target", i)
+		}
+		if _, duplicate := seen[effect.TargetUserID]; duplicate {
+			return fmt.Errorf("user batch delivery target %d is duplicated", effect.TargetUserID)
+		}
+		seen[effect.TargetUserID] = struct{}{}
+	}
+	return nil
 }
 
 // UserCache 缓存 viewer 无关的 users 表基础资料。

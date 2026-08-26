@@ -317,19 +317,8 @@ func TestMessagesCreateChatCreatesOwnerOnlyMegagroupRPC(t *testing.T) {
 			}
 
 			pushedUserIDs := sessions.pushedUserIDs()
-			if len(pushedUserIDs) != 1 || pushedUserIDs[0] != owner.ID {
-				t.Fatalf("push user ids = %v, want creator's other sessions", pushedUserIDs)
-			}
-			push := sessions.snapshot()
-			if push.sessionID != sessionID || sessions.scopedAuthKey() != authKeyID {
-				t.Fatalf("push exclusion = auth_key %x session %d, want %x/%d", sessions.scopedAuthKey(), push.sessionID, authKeyID, sessionID)
-			}
-			canonicalPush, ok := sessions.userMessage.(*tg.Updates)
-			if !ok || len(canonicalPush.Chats) != 1 {
-				t.Fatalf("creator push = %T %+v, want canonical channel updates", sessions.userMessage, sessions.userMessage)
-			}
-			if pushedChannel, ok := canonicalPush.Chats[0].(*tg.Channel); !ok || pushedChannel.ID != channel.ID {
-				t.Fatalf("creator pushed chat = %#v, want channel %d", canonicalPush.Chats[0], channel.ID)
+			if len(pushedUserIDs) != 0 {
+				t.Fatalf("Core directly pushed committed create event to users %v", pushedUserIDs)
 			}
 
 			participants, err := r.onChannelsGetParticipants(requestCtx, &tg.ChannelsGetParticipantsRequest{
@@ -619,8 +608,8 @@ func TestMessagesCreateChatDispatchRemembersTDesktopClientInfo(t *testing.T) {
 	sessions.mu.Lock()
 	pushUserIDs := append([]int64(nil), sessions.pushUserIDs...)
 	sessions.mu.Unlock()
-	if len(pushUserIDs) != 2 || pushUserIDs[0] != owner.ID || pushUserIDs[1] != friend.ID {
-		t.Fatalf("push user ids = %v, want creator then invited friend %d/%d", pushUserIDs, owner.ID, friend.ID)
+	if len(pushUserIDs) != 0 {
+		t.Fatalf("Core directly pushed committed create/invite events to users %v", pushUserIDs)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"telesrv/internal/app/auth"
 	"telesrv/internal/branding"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // devCodeLength 是开发固定验证码长度，写入 auth.sentCode 的 type.length。
@@ -283,7 +284,12 @@ func (r *Router) onAuthAcceptLoginToken(ctx context.Context, token []byte) (*tg.
 		r.loginTokens.failAcceptContext(ctx, token)
 		return nil, internalErr()
 	}
-	bound, err := r.deps.Auth.AcceptLoginToken(ctx, authz, userID)
+	delivery, deliveryErr := r.signInDeliveryEffectsFor(accept.target.rawAuthKeyID, accept.target.sessionID)
+	if deliveryErr != nil {
+		r.loginTokens.failAcceptContext(ctx, token)
+		return nil, internalErr()
+	}
+	bound, err := r.deps.Auth.AcceptLoginToken(ctx, authz, userID, delivery)
 	if err != nil {
 		r.loginTokens.failAcceptContext(ctx, token)
 		if errors.Is(err, auth.ErrSystemUserLoginForbidden) {
@@ -349,18 +355,23 @@ func (r *Router) pushLoginTokenAccepted(ctx context.Context, target loginTokenTa
 	if r.deps.Sessions == nil || target.sessionID == 0 {
 		return
 	}
+	immediate, ok := r.deps.Sessions.(ImmediateSessionPusher)
+	if !ok {
+		if r.log != nil {
+			r.log.Error("push login token accepted requires immediate session pusher",
+				zap.Int64("session_id", target.sessionID),
+			)
+		}
+		return
+	}
 	updates := &tg.UpdateShort{
 		Update: &tg.UpdateLoginToken{},
 		Date:   int(r.clock.Now().Unix()),
 	}
-	if immediate, ok := r.deps.Sessions.(ImmediateSessionPusher); ok {
-		if err := immediate.PushToSessionForAuthKeyImmediate(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
+	if err := immediate.PushToSessionForAuthKeyImmediate(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
+		if r.log != nil {
 			r.log.Debug("push login token accepted immediate", zap.Int64("session_id", target.sessionID), zap.Error(err))
 		}
-		return
-	}
-	if err := r.deps.Sessions.PushToSessionForAuthKey(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
-		r.log.Debug("push login token accepted", zap.Int64("session_id", target.sessionID), zap.Error(err))
 	}
 }
 
@@ -514,17 +525,21 @@ func (r *Router) tgSentCodeForHash(ctx context.Context, hash string) (tg.AuthSen
 // onAuthSignIn 处理 auth.signIn：校验验证码；用户不存在时返回 SignUpRequired。
 // 带 email_verification 时走登录邮箱路径（验证码来自邮箱而非短信）。
 func (r *Router) onAuthSignIn(ctx context.Context, req *tg.AuthSignInRequest) (tg.AuthAuthorizationClass, error) {
+	delivery, err := r.signInDeliveryEffects(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
 	var (
 		u          domain.User
 		needSignUp bool
-		err        error
+		signInErr  error
 	)
 	if verification, ok := req.GetEmailVerification(); ok {
-		u, _, needSignUp, err = r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, emailVerificationCode(verification))
+		u, _, needSignUp, signInErr = r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, emailVerificationCode(verification), delivery)
 	} else {
-		u, _, needSignUp, err = r.deps.Auth.SignIn(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, req.PhoneCode)
+		u, _, needSignUp, signInErr = r.deps.Auth.SignIn(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, req.PhoneCode, delivery)
 	}
-	return r.finishAuthSignIn(ctx, u, needSignUp, err)
+	return r.finishAuthSignIn(ctx, u, needSignUp, signInErr)
 }
 
 func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, needSignUp bool, err error) (tg.AuthAuthorizationClass, error) {
@@ -549,7 +564,6 @@ func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, needSignUp
 		r.setAuthUserCache(id, u.ID, true)
 	}
 	r.bindSessionUser(ctx, u.ID)
-	r.pushSignInServiceNotificationToOthers(ctx, u)
 	return &tg.AuthAuthorization{User: r.tgSelfUserWithUsernames(ctx, u)}, nil
 }
 
@@ -742,9 +756,13 @@ func (r *Router) currentOrPendingPasswordUserID(ctx context.Context) (userID int
 
 func (r *Router) completePendingPasswordSignIn(ctx context.Context, authKeyID [8]byte, userID int64) error {
 	if r.deps.Auth == nil {
-		return nil
+		return store.ErrDeliveryOutboxRequired
 	}
-	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID, userID); err != nil {
+	delivery, err := r.signInDeliveryEffects(ctx)
+	if err != nil {
+		return err
+	}
+	if err := r.deps.Auth.CompletePasswordSignIn(ctx, authKeyID, userID, delivery); err != nil {
 		return err
 	}
 	r.invalidateAuthUserCache(authKeyID)
@@ -824,7 +842,11 @@ func (r *Router) onAuthFinishPasskeyLogin(ctx context.Context, req *tg.AuthFinis
 	if err != nil {
 		return nil, passkeyErr(err)
 	}
-	u, err := r.deps.Auth.BindVerifiedLogin(ctx, r.authzFromCtx(ctx), userID)
+	delivery, err := r.signInDeliveryEffects(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	u, err := r.deps.Auth.BindVerifiedLogin(ctx, r.authzFromCtx(ctx), userID, delivery)
 	if err != nil {
 		return nil, passkeyErr(err)
 	}
@@ -990,43 +1012,53 @@ func (r *Router) invalidateTempAuthKeyCacheForPerm(authKeyID [8]byte) [][8]byte 
 	return r.tempKeyResolveCache.DeleteByPerm(authKeyID)
 }
 
-func (r *Router) pushSignInServiceNotificationToOthers(ctx context.Context, u domain.User) {
-	if r.deps.Sessions == nil || u.ID == 0 {
-		return
+func (r *Router) signInDeliveryEffects(ctx context.Context) (store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot], error) {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return r.signInDeliveryEffectsFor(excludeAuthKeyID, excludeSessionID)
+}
+
+func (r *Router) signInDeliveryEffectsFor(excludeAuthKeyID [8]byte, excludeSessionID int64) (store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot], error) {
+	if r.deps.DeliveryOutbox == nil || excludeAuthKeyID == ([8]byte{}) || excludeSessionID == 0 {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
-	authKeyID, hasAuthKeyID := AuthKeyIDFrom(ctx)
-	rawAuthKeyID, hasRawAuthKeyID := RawAuthKeyIDFrom(ctx)
-	sessionID, hasSessionID := SessionIDFrom(ctx)
-	if !hasAuthKeyID || !hasRawAuthKeyID || !hasSessionID {
-		return
-	}
-	notification := r.tgSignInServiceNotification(ctx, u, authKeyID)
-	go func() {
-		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if sent, err := r.deps.Sessions.PushToUserExceptAuthKeySession(pushCtx, u.ID, rawAuthKeyID, sessionID, proto.MessageFromServer, notification); err != nil {
-			r.log.Debug("push sign-in service notification", zap.Int64("user_id", u.ID), zap.Int("sent", sent), zap.Error(err))
+	return func(snapshot store.AuthorizationDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		if snapshot.User.ID <= 0 || snapshot.Authorization.UserID != snapshot.User.ID {
+			return nil, fmt.Errorf("sign-in delivery snapshot mismatch")
 		}
-	}()
+		payload, err := encodeDeliveryUpdate(r.tgSignInServiceNotificationForAuthorization(snapshot.User, snapshot.Authorization))
+		if err != nil {
+			return nil, fmt.Errorf("encode sign-in service notification: %w", err)
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.User.ID, ExcludeAuthKeyID: excludeAuthKeyID,
+			ExcludeSessionID: excludeSessionID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}, nil
 }
 
 func (r *Router) tgSignInServiceNotification(ctx context.Context, u domain.User, authKeyID [8]byte) *tg.Updates {
+	a := r.authzFromCtx(ctx)
+	a.AuthKeyID = authKeyID
+	a.UserID = u.ID
+	return r.tgSignInServiceNotificationForAuthorization(u, a)
+}
+
+func (r *Router) tgSignInServiceNotificationForAuthorization(u domain.User, authorization domain.Authorization) *tg.Updates {
 	now := r.clock.Now()
 	client := "Unknown device"
-	if ci, ok := ClientInfoFrom(ctx); ok {
-		parts := []string{}
-		if ci.DeviceModel != "" {
-			parts = append(parts, branding.UserVisibleText(ci.DeviceModel, ""))
-		}
-		if ci.SystemVersion != "" {
-			parts = append(parts, branding.UserVisibleText(ci.SystemVersion, ""))
-		}
-		if ci.AppVersion != "" {
-			parts = append(parts, branding.UserVisibleText(ci.AppVersion, ""))
-		}
-		if len(parts) > 0 {
-			client = strings.Join(parts, " / ")
-		}
+	parts := []string{}
+	if authorization.DeviceModel != "" {
+		parts = append(parts, branding.UserVisibleText(authorization.DeviceModel, ""))
+	}
+	if authorization.SystemVersion != "" {
+		parts = append(parts, branding.UserVisibleText(authorization.SystemVersion, ""))
+	}
+	if authorization.AppVersion != "" {
+		parts = append(parts, branding.UserVisibleText(authorization.AppVersion, ""))
+	}
+	if len(parts) > 0 {
+		client = strings.Join(parts, " / ")
 	}
 	name := strings.TrimSpace(strings.TrimSpace(u.FirstName + " " + u.LastName))
 	if name == "" {
@@ -1040,7 +1072,7 @@ func (r *Router) tgSignInServiceNotification(ctx context.Context, u domain.User,
 		now.UTC().Format(time.RFC1123),
 		client,
 	)
-	authID := int64(binary.LittleEndian.Uint64(authKeyID[:]))
+	authID := int64(binary.LittleEndian.Uint64(authorization.AuthKeyID[:]))
 	update := &tg.UpdateServiceNotification{
 		InboxDate: int(now.Unix()),
 		Type:      fmt.Sprintf("auth%d_%d", authID, now.Unix()),

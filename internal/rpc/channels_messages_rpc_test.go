@@ -169,14 +169,17 @@ func TestChannelsDeleteHistoryLocalClearEmitsAvailableMessagesUpdate(t *testing.
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 41, Phone: "15550002141", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 42, Phone: "15550002142", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	updateSvc := appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore())
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Dialogs:  appdialogs.NewService(memory.NewDialogStore(), channelStore),
-		Updates:  updateSvc,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		Dialogs:        appdialogs.NewService(memory.NewDialogStore(), channelStore),
+		Updates:        updateSvc,
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -202,7 +205,10 @@ func TestChannelsDeleteHistoryLocalClearEmitsAvailableMessagesUpdate(t *testing.
 		t.Fatalf("account state before clear: %v", err)
 	}
 	pushesBefore := len(sessions.pushedUserIDs())
-	cleared, err := r.onChannelsDeleteHistory(WithUserID(ctx, owner.ID), &tg.ChannelsDeleteHistoryRequest{
+	outboxBefore := len(deliveryOutbox.Snapshot())
+	authKeyID := [8]byte{4, 1}
+	requestCtx := WithSessionID(WithRawAuthKeyID(WithUserID(ctx, owner.ID), authKeyID), 411)
+	cleared, err := r.onChannelsDeleteHistory(requestCtx, &tg.ChannelsDeleteHistoryRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash},
 		MaxID:   msg.ID,
 	})
@@ -224,19 +230,27 @@ func TestChannelsDeleteHistoryLocalClearEmitsAvailableMessagesUpdate(t *testing.
 	if stateAfter.Pts != stateBefore.Pts {
 		t.Fatalf("account pts advanced on local channel clear: before=%d after=%d", stateBefore.Pts, stateAfter.Pts)
 	}
-	pushed := sessions.snapshot()
-	if pushed.userID != owner.ID {
-		t.Fatalf("pushed user = %d, want owner %d", pushed.userID, owner.ID)
+	if got := len(sessions.pushedUserIDs()) - pushesBefore; got != 0 {
+		t.Fatalf("Core direct clear pushes = %d, want durable Egress only", got)
 	}
-	pushedUpdates, ok := pushed.message.(*tg.Updates)
-	if !ok || len(pushedUpdates.Updates) != 1 {
-		t.Fatalf("pushed clear update = %T %+v, want one no-pts available update", pushed.message, pushed.message)
+	outbox := deliveryOutbox.Snapshot()
+	if len(outbox) != outboxBefore+1 {
+		t.Fatalf("delivery outbox rows = %d, want %d", len(outbox), outboxBefore+1)
 	}
-	if _, ok := pushedUpdates.Updates[0].(*tg.UpdateChannelAvailableMessages); !ok {
-		t.Fatalf("pushed update[0] = %T, want updateChannelAvailableMessages", pushedUpdates.Updates[0])
+	item := outbox[len(outbox)-1]
+	if item.TargetUserID != owner.ID || item.ExcludeAuthKeyID != authKeyID || item.ExcludeSessionID != 411 {
+		t.Fatalf("delivery identity/exclusion = %+v", item)
 	}
-	if got := len(sessions.pushedUserIDs()) - pushesBefore; got != 1 {
-		t.Fatalf("clear online pushes = %d, want exactly one owner-session fanout", got)
+	durableUpdate, err := decodeDeliveryUpdate(item.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableUpdates, ok := durableUpdate.(*tg.Updates)
+	if !ok || len(durableUpdates.Updates) != 1 {
+		t.Fatalf("durable clear payload = %T %+v", durableUpdate, durableUpdate)
+	}
+	if got, ok := durableUpdates.Updates[0].(*tg.UpdateChannelAvailableMessages); !ok || got.ChannelID != channel.ID || got.AvailableMinID != msg.ID {
+		t.Fatalf("durable clear update = %#v", durableUpdates.Updates[0])
 	}
 	diff, err := updateSvc.GetDifference(ctx, [8]byte{}, owner.ID, stateBefore)
 	if err != nil {
@@ -404,12 +418,15 @@ func TestChannelsDeleteHistoryForEveryoneDrainsBatchesAndKeepsDialogVisible(t *t
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 45, Phone: "15550002145", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 46, Phone: "15550002146", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Dialogs:  appdialogs.NewService(memory.NewDialogStore(), channelStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		Dialogs:        appdialogs.NewService(memory.NewDialogStore(), channelStore),
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -432,8 +449,7 @@ func TestChannelsDeleteHistoryForEveryoneDrainsBatchesAndKeepsDialogVisible(t *t
 		}
 	}
 	pushedBefore := len(sessions.pushedUserIDs())
-	cancelFanout := startChannelFanoutForTest(t, r)
-	defer cancelFanout()
+	outboxBefore := len(deliveryOutbox.Snapshot())
 
 	clearReq := &tg.ChannelsDeleteHistoryRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash},
@@ -458,9 +474,11 @@ func TestChannelsDeleteHistoryForEveryoneDrainsBatchesAndKeepsDialogVisible(t *t
 			t.Fatalf("final batch deleted id %d, creation service message must be spared", id)
 		}
 	}
-	// 两批（1000+1）删除，每批向 owner 和 friend 各推送一次。
-	if pushedAfter := len(waitForPushedUserIDs(t, sessions, pushedBefore+4)); pushedAfter-pushedBefore != 4 {
-		t.Fatalf("pushed fanout count = %d, want 4 (two batches to both members)", pushedAfter-pushedBefore)
+	if pushedAfter := len(sessions.pushedUserIDs()); pushedAfter != pushedBefore {
+		t.Fatalf("Core pushed durable delete updates directly: before=%d after=%d", pushedBefore, pushedAfter)
+	}
+	if got := len(deliveryOutbox.Snapshot()); got != outboxBefore {
+		t.Fatalf("for-everyone delete wrote absolute outbox rows: before=%d after=%d", outboxBefore, got)
 	}
 	history, err := channelStore.ListChannelHistory(ctx, owner.ID, domain.ChannelHistoryFilter{ChannelID: channel.ID, Limit: 10})
 	if err != nil {

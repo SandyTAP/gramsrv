@@ -2,10 +2,12 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/iamxvbaba/td/tg"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesSendReaction(ctx context.Context, req *tg.MessagesSendReactionRequest) (tg.UpdatesClass, error) {
@@ -49,15 +51,14 @@ func (r *Router) onMessagesSendReaction(ctx context.Context, req *tg.MessagesSen
 			return nil, channelReactionErr(err)
 		}
 		updates := r.channelMessageReactionsUpdates(ctx, userID, res)
-		// 官方保证消息作者收到 updateMessageReactions：作者进 explicit 收件人，
-		// 不依赖在线 viewer 采样（fan-out 封顶后作者可能被挤出采样集）。
-		ids := []int{res.Message.ID}
-		r.pushChannelViewerUpdates(ctx, userID, res.Channel.ID, []int64{userID, res.Message.SenderUserID}, func(viewerUserID int64) *tg.Updates {
-			return r.channelReactionsViewerUpdates(ctx, userID, viewerUserID, res, ids)
-		})
+		// Core returns only the caller projection. Reliable multi-session
+		// delivery is owned by the channel aggregate and Egress lane.
 		return updates, nil
 	}
 	if peer.Type == domain.PeerTypeUser && r.deps.Messages != nil {
+		if err := r.requireAccountDelivery(userID, "messages.sendReaction"); err != nil {
+			return nil, err
+		}
 		if peer.ID != userID && len(reactions) == 0 && r.shouldSuppressTransientPrivateReactionClear(userID, peer, req.MsgID, date) {
 			res, err := r.deps.Messages.GetMessageReactions(ctx, userID, domain.PrivateMessageReactionsRequest{
 				OwnerUserID: userID,
@@ -72,6 +73,16 @@ func (r *Router) onMessagesSendReaction(ctx context.Context, req *tg.MessagesSen
 		if peer.ID != userID && req.Big && len(reactions) > 0 {
 			r.rememberTransientPrivateBigReaction(userID, peer, req.MsgID, date)
 		}
+		// Delivery payloads are projected before the store transaction starts.
+		// The builder passed into the aggregate is therefore a pure snapshot ->
+		// opaque-bytes function and cannot deadlock on a second DB connection
+		// while the reaction transaction holds both user rows.
+		deliveryUsers := map[int64][]tg.UserClass{
+			userID: r.tgUsersForIDs(ctx, userID, []int64{userID, peer.ID}),
+		}
+		if peer.ID != userID {
+			deliveryUsers[peer.ID] = r.tgUsersForIDs(ctx, peer.ID, []int64{userID, peer.ID})
+		}
 		res, err := r.deps.Messages.SetMessageReactions(ctx, userID, domain.SetPrivateMessageReactionsRequest{
 			UserID:              userID,
 			Peer:                peer,
@@ -81,7 +92,7 @@ func (r *Router) onMessagesSendReaction(ctx context.Context, req *tg.MessagesSen
 			AddToRecent:         req.GetAddToRecent(),
 			Date:                date,
 			ReactionsPerUserMax: perUserMax,
-		})
+		}, r.privateReactionDeliveryEffects(ctx, userID, deliveryUsers, date))
 		if err != nil {
 			return nil, messageReactionErr(err)
 		}
@@ -95,15 +106,6 @@ func (r *Router) onMessagesSendReaction(ctx context.Context, req *tg.MessagesSen
 			}
 		}
 		updates := r.privateMessageReactionsUpdates(ctx, userID, peer, res)
-		r.pushUserUpdates(ctx, userID, updates)
-		for _, msg := range res.Messages {
-			if msg.OwnerUserID == 0 || msg.OwnerUserID == userID {
-				continue
-			}
-			viewerPeer := msg.Peer
-			viewerUpdates := r.privateMessageReactionsUpdates(ctx, msg.OwnerUserID, viewerPeer, res)
-			r.pushUserUpdates(ctx, msg.OwnerUserID, viewerUpdates)
-		}
 		return updates, nil
 	}
 	return tgEmptyUpdates(int(r.clock.Now().Unix())), nil
@@ -226,94 +228,6 @@ func (r *Router) channelMessageReactionsUpdates(ctx context.Context, viewerUserI
 	return r.channelMessagesReactionsUpdates(ctx, viewerUserID, res, ids)
 }
 
-// channelReactionsViewerUpdates 为 fan-out 构造某 viewer 的 updateMessageReactions。
-// res 内的聚合是请求者视角（chosen/My/unread 都是 per-viewer 字段）：
-//   - 请求者本人：直接用；
-//   - 消息作者：按作者视角重载（unread 角标与作者自己的 chosen 必须正确）；
-//   - 其他 viewer：官方 min 语义——只下发计数与 recent 列表，客户端保留本地 chosen
-//     （TDesktop 非 min 更新会用 chosen_order 直接覆盖本地 my 状态，串视角即"别人的
-//     reaction 显示成我选的"）。
-func (r *Router) channelReactionsViewerUpdates(ctx context.Context, requestUserID, viewerUserID int64, res domain.ChannelMessageReactionsResult, ids []int) *tg.Updates {
-	if viewerUserID == requestUserID {
-		return r.channelMessagesReactionsUpdates(ctx, viewerUserID, res, ids)
-	}
-	if viewerUserID != 0 && viewerUserID == reactionsResultSenderID(res) && r.deps.Channels != nil {
-		reloaded, err := r.deps.Channels.GetMessageReactions(ctx, viewerUserID, domain.ChannelMessageReactionsRequest{
-			UserID:    viewerUserID,
-			ChannelID: res.Channel.ID,
-			IDs:       append([]int(nil), ids...),
-		})
-		if err == nil && len(reloaded.Messages) > 0 {
-			reloaded.Channel = res.Channel
-			return r.channelMessagesReactionsUpdates(ctx, viewerUserID, reloaded, ids)
-		}
-	}
-	updates := r.channelMessagesReactionsUpdates(ctx, viewerUserID, minifyChannelReactionsResult(res), ids)
-	if updates != nil {
-		for _, update := range updates.Updates {
-			if reactions, ok := update.(*tg.UpdateMessageReactions); ok {
-				reactions.Reactions.Min = true
-			}
-		}
-	}
-	return updates
-}
-
-// reactionsResultSenderID 取结果中消息作者（单消息场景；多消息 moderation 不做作者特判）。
-func reactionsResultSenderID(res domain.ChannelMessageReactionsResult) int64 {
-	if res.Message.ID != 0 {
-		return res.Message.SenderUserID
-	}
-	if len(res.Messages) == 1 {
-		return res.Messages[0].SenderUserID
-	}
-	return 0
-}
-
-// minifyChannelReactionsResult 深拷并清掉所有 per-viewer 字段（chosen/My/unread），
-// 供 min 推送使用；不改原 res（请求者响应仍用全量视角）。
-func minifyChannelReactionsResult(res domain.ChannelMessageReactionsResult) domain.ChannelMessageReactionsResult {
-	scrub := func(in *domain.ChannelMessageReactions) *domain.ChannelMessageReactions {
-		if in == nil {
-			return nil
-		}
-		out := domain.ChannelMessageReactions{
-			CanSeeList: in.CanSeeList,
-			AsTags:     in.AsTags,
-			Results:    make([]domain.ChannelMessageReactionCount, 0, len(in.Results)),
-			Recent:     make([]domain.ChannelMessagePeerReaction, 0, len(in.Recent)),
-		}
-		for _, item := range in.Results {
-			item.ChosenOrder = 0
-			out.Results = append(out.Results, item)
-		}
-		for _, item := range in.Recent {
-			item.My = false
-			item.Unread = false
-			item.ChosenOrder = 0
-			out.Recent = append(out.Recent, item)
-		}
-		return &out
-	}
-	out := res
-	if scrubbed := scrub(res.Message.Reactions); scrubbed != nil {
-		msg := res.Message
-		msg.Reactions = scrubbed
-		out.Message = msg
-	}
-	if len(res.Messages) > 0 {
-		out.Messages = make([]domain.ChannelMessage, 0, len(res.Messages))
-		for _, msg := range res.Messages {
-			msg.Reactions = scrub(msg.Reactions)
-			out.Messages = append(out.Messages, msg)
-		}
-	}
-	if scrubbed := scrub(&res.Reactions); scrubbed != nil {
-		out.Reactions = *scrubbed
-	}
-	return out
-}
-
 func (r *Router) privateMessageReactionsUpdates(ctx context.Context, viewerUserID int64, peer domain.Peer, res domain.PrivateMessageReactionsResult) *tg.Updates {
 	ids := make([]int, 0, 1)
 	for _, msg := range res.Messages {
@@ -326,8 +240,6 @@ func (r *Router) privateMessageReactionsUpdates(ctx context.Context, viewerUserI
 }
 
 func (r *Router) privateMessagesReactionsUpdates(ctx context.Context, viewerUserID int64, peer domain.Peer, res domain.PrivateMessageReactionsResult, ids []int) *tg.Updates {
-	updates := make([]tg.UpdateClass, 0, len(ids))
-	messagesByID := make(map[int]domain.Message, len(res.Messages))
 	userIDs := []int64{viewerUserID}
 	if peer.Type == domain.PeerTypeUser && peer.ID != 0 {
 		userIDs = append(userIDs, peer.ID)
@@ -336,7 +248,6 @@ func (r *Router) privateMessagesReactionsUpdates(ctx context.Context, viewerUser
 		if msg.OwnerUserID != viewerUserID || msg.ID == 0 {
 			continue
 		}
-		messagesByID[msg.ID] = msg
 		if msg.Peer.Type == domain.PeerTypeUser && msg.Peer.ID != 0 {
 			userIDs = append(userIDs, msg.Peer.ID)
 		}
@@ -348,6 +259,20 @@ func (r *Router) privateMessagesReactionsUpdates(ctx context.Context, viewerUser
 		}
 	}
 	userIDs = append(userIDs, channelMessageReactionUserIDs(res.Reactions)...)
+	return privateMessagesReactionsUpdatesWithUsers(viewerUserID, peer, res, ids, r.tgUsersForIDs(ctx, viewerUserID, userIDs), int(r.clock.Now().Unix()))
+}
+
+// privateMessagesReactionsUpdatesWithUsers is the transaction-safe projection
+// used by DeliveryEffectsBuilder. All mutable entity lookups happen before the
+// aggregate transaction; this function only consumes its snapshot arguments.
+func privateMessagesReactionsUpdatesWithUsers(viewerUserID int64, peer domain.Peer, res domain.PrivateMessageReactionsResult, ids []int, users []tg.UserClass, date int) *tg.Updates {
+	updates := make([]tg.UpdateClass, 0, len(ids))
+	messagesByID := make(map[int]domain.Message, len(res.Messages))
+	for _, msg := range res.Messages {
+		if msg.OwnerUserID == viewerUserID && msg.ID != 0 {
+			messagesByID[msg.ID] = msg
+		}
+	}
 	fallbackPeer := tgPeer(peer)
 	for _, id := range ids {
 		if id <= 0 || id > domain.MaxMessageBoxID {
@@ -374,17 +299,50 @@ func (r *Router) privateMessagesReactionsUpdates(ctx context.Context, viewerUser
 			converted = &tg.MessageReactions{Results: []tg.ReactionCount{}}
 		}
 		updates = append(updates, &tg.UpdateMessageReactions{
-			Peer:      outPeer,
-			MsgID:     id,
-			Reactions: *converted,
+			Peer: outPeer, MsgID: id, Reactions: *converted,
 		})
 	}
 	return &tg.Updates{
 		Updates: updates,
-		Users:   r.tgUsersForIDs(ctx, viewerUserID, userIDs),
+		Users:   append([]tg.UserClass(nil), users...),
 		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
+		Date:    date,
 		Seq:     0,
+	}
+}
+
+func (r *Router) privateReactionDeliveryEffects(ctx context.Context, requestUserID int64, usersByViewer map[int64][]tg.UserClass, date int) store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(res domain.PrivateMessageReactionsResult) ([]store.DeliveryEffect, error) {
+		seen := make(map[int64]struct{}, len(res.Messages))
+		effects := make([]store.DeliveryEffect, 0, len(res.Messages))
+		for _, msg := range res.Messages {
+			if msg.OwnerUserID <= 0 || msg.ID <= 0 {
+				continue
+			}
+			if _, ok := seen[msg.OwnerUserID]; ok {
+				continue
+			}
+			users, ok := usersByViewer[msg.OwnerUserID]
+			if !ok {
+				return nil, fmt.Errorf("private reaction delivery users missing for owner %d", msg.OwnerUserID)
+			}
+			updates := privateMessagesReactionsUpdatesWithUsers(msg.OwnerUserID, msg.Peer, res, []int{msg.ID}, users, date)
+			payload, err := encodeDeliveryUpdate(updates)
+			if err != nil {
+				return nil, fmt.Errorf("encode private reaction delivery for owner %d: %w", msg.OwnerUserID, err)
+			}
+			authKeyID, sessionID := [8]byte{}, int64(0)
+			if msg.OwnerUserID == requestUserID {
+				authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+			}
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: msg.OwnerUserID, ExcludeAuthKeyID: authKeyID, ExcludeSessionID: sessionID,
+				Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+			seen[msg.OwnerUserID] = struct{}{}
+		}
+		return effects, nil
 	}
 }
 

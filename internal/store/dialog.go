@@ -8,6 +8,7 @@ import (
 
 // DialogStore 持久化用户会话摘要。
 type DialogStore interface {
+	MutateAccountDialogs(ctx context.Context, mutation DialogAccountMutation, effects DeliveryEffectsBuilder[DialogAccountMutationSnapshot]) (DialogAccountMutationSnapshot, error)
 	ListByUser(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogList, error)
 	ListByPeers(ctx context.Context, userID int64, peers []domain.Peer) (domain.DialogList, error)
 	Upsert(ctx context.Context, userID int64, dialog domain.Dialog) error

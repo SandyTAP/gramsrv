@@ -43,7 +43,7 @@ func newReactionPolicyTestEnv(t *testing.T, broadcast bool) reactionPolicyTestEn
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID, member2.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Reaction Policy " + suffix,
@@ -193,7 +193,7 @@ func TestChannelStoreSetAvailableReactionsRefreshesRowCache(t *testing.T) {
 	})
 
 	rowCache := NewChannelRowCache(100)
-	channels := NewChannelStore(pool, WithChannelRowCache(rowCache))
+	channels := newTestChannelStore(pool, WithChannelRowCache(rowCache))
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Reaction Policy Cache " + suffix,

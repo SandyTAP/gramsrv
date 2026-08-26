@@ -10,7 +10,6 @@ import (
 
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
-	"telesrv/internal/edgecontrol"
 	"telesrv/internal/egress"
 	"telesrv/internal/store"
 )
@@ -230,9 +229,35 @@ func (r *Router) BuildOutboxUpdateBytes(ctx context.Context, requests []egress.O
 		if update == nil {
 			continue
 		}
-		raw, err := edgecontrol.EncodeOutboxUpdate(update)
+		raw, err := encodeDeliveryUpdate(update)
 		if err != nil {
 			return nil, fmt.Errorf("encode outbox update %d: %w", i, err)
+		}
+		out[i] = raw
+	}
+	return out, nil
+}
+
+// BuildChannelUpdateBytes constructs the deterministic channel-PTS nudge at
+// the only allowed typed TL projection boundary. Date is deliberately zero:
+// exact-owner replay must reproduce byte-identical payloads from immutable
+// channel_id/PTS identity instead of sampling a new wall clock.
+func (r *Router) BuildChannelUpdateBytes(ctx context.Context, requests []egress.ChannelUpdateRequest) ([][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make([][]byte, len(requests))
+	for i, request := range requests {
+		if request.ChannelID <= 0 || request.PTS <= 0 {
+			return nil, fmt.Errorf("invalid channel delivery projection at index %d", i)
+		}
+		update := &tg.UpdateChannelTooLong{ChannelID: request.ChannelID}
+		update.SetPts(request.PTS)
+		raw, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{}, Chats: []tg.ChatClass{}, Date: 0, Seq: 0,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode channel delivery projection %d: %w", i, err)
 		}
 		out[i] = raw
 	}

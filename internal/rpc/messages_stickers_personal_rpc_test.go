@@ -14,7 +14,7 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func stickerCollectionRouter(t *testing.T) (*Router, *captureSessions) {
+func stickerCollectionRouter(t *testing.T) (*Router, *memory.DeliveryOutboxStore) {
 	t.Helper()
 	files := &fakeFiles{docs: map[int64]domain.Document{
 		101: {ID: 101, AccessHash: 11, Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrSticker}}},
@@ -30,12 +30,12 @@ func stickerCollectionRouter(t *testing.T) (*Router, *captureSessions) {
 		301: {ID: 301, AccessHash: 31, Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrAudio}}},
 	}}
 	passwordStore := memory.NewPasswordStore()
-	sessions := &captureSessions{}
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
 	return New(Config{}, Deps{
-		Account:  appaccount.NewService(passwordStore, appaccount.WithStickerCollections(passwordStore)),
-		Files:    files,
-		Sessions: sessions,
-	}, zaptest.NewLogger(t), clock.System), sessions
+		Account: appaccount.NewService(passwordStore, appaccount.WithStickerCollections(passwordStore)),
+		Files:   files, DeliveryOutbox: delivery,
+	}, zaptest.NewLogger(t), clock.System), delivery
 }
 
 func inputDoc(id, accessHash int64) *tg.InputDocument {
@@ -118,7 +118,7 @@ func TestRecentStickersRoundTrip(t *testing.T) {
 
 // TestSavedGifsRoundTrip 验证 saveGif/getSavedGifs + 非 GIF 拒绝。
 func TestSavedGifsRoundTrip(t *testing.T) {
-	r, sessions := stickerCollectionRouter(t)
+	r, delivery := stickerCollectionRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	// 非 GIF（贴纸）拒绝。
@@ -128,8 +128,9 @@ func TestSavedGifsRoundTrip(t *testing.T) {
 	if ok, err := r.onMessagesSaveGif(ctx, &tg.MessagesSaveGifRequest{ID: inputDoc(201, 21)}); err != nil || !ok {
 		t.Fatalf("save gif = ok %v err %v", ok, err)
 	}
-	if pushed, ok := sessions.lastUserPush().(*tg.Updates); !ok || len(pushed.Updates) != 1 {
-		t.Fatalf("save gif push = %T %+v, want updateSavedGifs", sessions.lastUserPush(), pushed)
+	pushed := lastQueuedDeliveryUpdates(t, delivery)
+	if len(pushed.Updates) != 1 {
+		t.Fatalf("save gif delivery = %+v, want updateSavedGifs", pushed)
 	} else if _, ok := pushed.Updates[0].(*tg.UpdateSavedGifs); !ok {
 		t.Fatalf("save gif update = %T, want *tg.UpdateSavedGifs", pushed.Updates[0])
 	}
@@ -160,6 +161,48 @@ func TestSavedGifsRoundTrip(t *testing.T) {
 	}
 	if got := out.(*tg.MessagesSavedGifs); len(got.Gifs) != 1 || got.Gifs[0].(*tg.Document).ID != 202 {
 		t.Fatalf("saved gifs after unsave = %+v, want [202]", got.Gifs)
+	}
+}
+
+func TestStickerCollectionDeliveryCarriesPayloadAndOriginExclusion(t *testing.T) {
+	r, delivery := stickerCollectionRouter(t)
+	rawAuthKeyID := [8]byte{9, 7, 5, 3, 1}
+	const sessionID = int64(7788)
+	ctx := WithSessionID(WithRawAuthKeyID(WithUserID(context.Background(), 1000000001), rawAuthKeyID), sessionID)
+	if ok, err := r.onMessagesFaveSticker(ctx, &tg.MessagesFaveStickerRequest{ID: inputDoc(101, 11)}); err != nil || !ok {
+		t.Fatalf("fave sticker = %v, %v", ok, err)
+	}
+	items := delivery.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("delivery items = %d, want 1", len(items))
+	}
+	item := items[0]
+	if item.ExcludeAuthKeyID != rawAuthKeyID || item.ExcludeSessionID != sessionID {
+		t.Fatalf("delivery exclusion = %x/%d, want %x/%d", item.ExcludeAuthKeyID, item.ExcludeSessionID, rawAuthKeyID, sessionID)
+	}
+	updates := requireDeliveryUpdates(t, item)
+	if len(updates.Updates) != 1 {
+		t.Fatalf("delivery updates = %d, want 1", len(updates.Updates))
+	}
+	if _, ok := updates.Updates[0].(*tg.UpdateFavedStickers); !ok {
+		t.Fatalf("delivery update = %T, want *tg.UpdateFavedStickers", updates.Updates[0])
+	}
+}
+
+func TestStickerCollectionRPCMissingDeliveryDependencyDoesNotMutate(t *testing.T) {
+	r, delivery := stickerCollectionRouter(t)
+	r.deps.DeliveryOutbox = nil
+	ctx := WithUserID(context.Background(), 1000000001)
+	ok, err := r.onMessagesFaveSticker(ctx, &tg.MessagesFaveStickerRequest{ID: inputDoc(101, 11)})
+	if ok || !tgerr.Is(err, "INTERNAL_SERVER_ERROR") {
+		t.Fatalf("fave without delivery dependency = %v, %v, want INTERNAL_SERVER_ERROR", ok, err)
+	}
+	items, listErr := r.deps.Account.ListStickerCollection(ctx, 1000000001, domain.StickerCollectionFaved, 10)
+	if listErr != nil || len(items) != 0 {
+		t.Fatalf("collection mutated without dependency = %+v, err %v", items, listErr)
+	}
+	if got := delivery.Snapshot(); len(got) != 0 {
+		t.Fatalf("delivery enqueued without dependency = %+v", got)
 	}
 }
 

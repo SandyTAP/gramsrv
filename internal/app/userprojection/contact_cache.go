@@ -489,37 +489,22 @@ func (c *CachedContactStore) loadReverseContacts(ctx context.Context, userID int
 	}
 }
 
-func (c *CachedContactStore) Upsert(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error) {
-	contact, err := c.inner.Upsert(ctx, userID, input)
-	if err == nil {
-		// Published account snapshots are immutable. Invalidate instead of
-		// modifying their inner maps/slices in place or publishing a mutation
-		// payload whose cache-write order may differ from its DB commit order.
-		c.InvalidateViewers(userID, input.ContactUserID)
+func (c *CachedContactStore) MutateContacts(ctx context.Context, mutation store.ContactMutation, effects store.DeliveryEffectsBuilder[store.ContactMutationSnapshot]) (store.ContactMutationSnapshot, error) {
+	snapshot, err := c.inner.MutateContacts(ctx, mutation, effects)
+	if err != nil {
+		return store.ContactMutationSnapshot{}, err
 	}
-	return contact, err
-}
-
-func (c *CachedContactStore) UpsertMany(ctx context.Context, userID int64, inputs []domain.ContactInput) ([]domain.Contact, error) {
-	contacts, err := c.inner.UpsertMany(ctx, userID, inputs)
-	if err == nil {
-		ids := make([]int64, 0, len(inputs))
-		for _, input := range inputs {
-			ids = append(ids, input.ContactUserID)
-		}
-		c.InvalidateViewers(append([]int64{userID}, ids...)...)
+	ids := make([]int64, 0, len(mutation.Inputs)+len(mutation.ContactUserIDs)+len(snapshot.RequiredEvents)+1)
+	ids = append(ids, mutation.OwnerUserID)
+	for _, input := range mutation.Inputs {
+		ids = append(ids, input.ContactUserID)
 	}
-	return contacts, err
-}
-
-func (c *CachedContactStore) UpdateNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, bool, error) {
-	contact, found, err := c.inner.UpdateNote(ctx, userID, contactUserID, note, entities)
-	if err == nil {
-		if found {
-			c.InvalidateViewers(userID)
-		}
+	ids = append(ids, mutation.ContactUserIDs...)
+	for _, event := range snapshot.RequiredEvents {
+		ids = append(ids, event.TargetUserID)
 	}
-	return contact, found, err
+	c.InvalidateViewers(ids...)
+	return snapshot, nil
 }
 
 func (c *CachedContactStore) SetCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error) {
@@ -530,12 +515,9 @@ func (c *CachedContactStore) SetCloseFriends(ctx context.Context, userID int64, 
 	return res, err
 }
 
-func (c *CachedContactStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
-	contact, found, err := c.inner.SetPersonalPhoto(ctx, userID, contactUserID, photoID, date)
+func (c *CachedContactStore) SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
+	contact, found, err := c.inner.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, photoID, date, effects)
 	if err == nil && found {
-		// Do not perform a post-commit read followed by write-through: two
-		// concurrent mutations can complete their cache writes in the opposite
-		// order and reinsert a stale pair after a newer NOTIFY invalidation.
 		c.InvalidateViewers(userID)
 	}
 	return contact, found, err
@@ -559,14 +541,6 @@ func (c *CachedContactStore) PersonalPhotos(ctx context.Context, userID int64, c
 		}
 	}
 	return out, nil
-}
-
-func (c *CachedContactStore) Delete(ctx context.Context, userID int64, contactUserIDs []int64) (int, error) {
-	count, err := c.inner.Delete(ctx, userID, contactUserIDs)
-	if err == nil {
-		c.InvalidateViewers(append([]int64{userID}, contactUserIDs...)...)
-	}
-	return count, err
 }
 
 func (c *CachedContactStore) Block(ctx context.Context, userID, blockedUserID int64, date int) (bool, error) {

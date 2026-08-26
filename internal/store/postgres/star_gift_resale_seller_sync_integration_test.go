@@ -70,7 +70,7 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 		t.Fatalf("pool: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
 		StarsProceedsPermille: 900, TONProceedsPermille: 900,
 	}))
@@ -82,7 +82,7 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 		BuyerUserID: seller.ID, To: sellerPeer, GiftID: entry.Gift.ID, IncludeUpgrade: true,
 		CommandKey: "resale-sync-purchase-" + suffix, Date: now,
 	})
-	bought, err := lifecycle.PurchaseStarGift(ctx, purchase)
+	bought, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, purchase, starGiftPurchaseTestEffects)
 	if err != nil {
 		t.Fatalf("purchase: %v", err)
 	}
@@ -99,8 +99,10 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 	if !valid {
 		t.Fatalf("cannot wear: %+v", upgraded.Unique)
 	}
-	if _, err := users.UpdateEmojiStatus(ctx, seller.ID, domain.UserEmojiStatus{
-		DocumentID: selected.DocumentID, Collectible: selected,
+	wornStatus := domain.UserEmojiStatus{DocumentID: selected.DocumentID, Collectible: selected}
+	if _, _, err := users.UpdateEmojiStatusWithEvent(ctx, seller.ID, wornStatus, domain.UpdateEvent{
+		Type: domain.UpdateEventUserEmojiStatus, Peer: sellerPeer,
+		EmojiStatus: wornStatus, Date: now + 1, PtsCount: 1,
 	}); err != nil {
 		t.Fatalf("wear: %v", err)
 	}
@@ -237,7 +239,8 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 	// suppressed by the buyer's origin session.
 	var dispatched int
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox
-	 WHERE target_user_id=$1 AND pts>$2 AND exclude_auth_key_id=0 AND exclude_session_id=0`,
+	 WHERE target_user_id=$1 AND pts>$2
+	   AND exclude_auth_key_id=decode('0000000000000000', 'hex') AND exclude_session_id=0`,
 		seller.ID, sellerPtsBefore).Scan(&dispatched); err != nil {
 		t.Fatalf("dispatch rows: %v", err)
 	}

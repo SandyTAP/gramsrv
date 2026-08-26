@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *PasswordStore) HasBusinessAutomation(ctx context.Context, userID int64) (bool, error) {
@@ -265,69 +266,42 @@ func (s *PasswordStore) CheckQuickReplyShortcut(ctx context.Context, ownerUserID
 	return false, nil
 }
 
-func (s *PasswordStore) SaveQuickReplyText(ctx context.Context, ownerUserID int64, shortcut string, msg domain.QuickReplyMessage) (domain.QuickReplyMutation, error) {
-	shortcut, err := domain.NormalizeQuickReplyShortcut(shortcut)
+func (s *PasswordStore) MutateQuickReplies(ctx context.Context, mutation store.QuickReplyAccountMutation, effects store.DeliveryEffectsBuilder[store.QuickReplyAccountMutationSnapshot]) (store.QuickReplyAccountMutationSnapshot, error) {
+	validated, err := mutation.Normalize()
 	if err != nil {
-		return domain.QuickReplyMutation{}, err
+		return store.QuickReplyAccountMutationSnapshot{}, err
 	}
-	var mutation domain.QuickReplyMutation
-	err = withTx(ctx, s.db, "save quick reply text", func(tx pgx.Tx) error {
-		shortcutID, created, err := ensureQuickReplyShortcut(ctx, tx, ownerUserID, shortcut)
+	if effects == nil {
+		return store.QuickReplyAccountMutationSnapshot{}, store.ErrDeliveryOutboxRequired
+	}
+	var snapshot store.QuickReplyAccountMutationSnapshot
+	err = withTx(ctx, s.db, "mutate quick replies", func(tx pgx.Tx) error {
+		if err := lockUsersForUpdate(ctx, tx, validated.UserID); err != nil {
+			return fmt.Errorf("lock quick reply owner: %w", err)
+		}
+		result, changed, err := applyQuickReplyAccountMutationTx(ctx, tx, validated)
 		if err != nil {
 			return err
 		}
-		var count int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*)::int FROM quick_reply_messages WHERE owner_user_id = $1 AND shortcut_id = $2`, ownerUserID, shortcutID).Scan(&count); err != nil {
-			return fmt.Errorf("count quick reply messages: %w", err)
-		}
-		if count >= domain.MaxQuickReplyMessages {
-			return domain.ErrShortcutInvalid
-		}
-		var messageID int
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(message_id), 0)::int + 1 FROM quick_reply_messages WHERE owner_user_id = $1`, ownerUserID).Scan(&messageID); err != nil {
-			return fmt.Errorf("allocate quick reply message id: %w", err)
-		}
-		entities, err := encodeMessageEntities(msg.Entities)
+		snapshot = store.QuickReplyAccountMutationSnapshot{Mutation: validated, Changed: changed, Result: result}
+		intents, err := effects(store.CloneQuickReplyAccountSnapshot(snapshot))
 		if err != nil {
-			return err
+			return fmt.Errorf("build quick reply delivery effects: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-INSERT INTO quick_reply_messages (owner_user_id, shortcut_id, message_id, random_id, message_date, body, entities, created_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,now(),now())`,
-			ownerUserID, shortcutID, messageID, msg.RandomID, msg.Date, msg.Message, string(entities)); err != nil {
-			return fmt.Errorf("insert quick reply message: %w", err)
+		if err := store.ValidateQuickReplyAccountEffects(snapshot, intents); err != nil {
+			return fmt.Errorf("validate quick reply delivery effects: %w", err)
 		}
-		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
+		allocated, err := applyDeliveryEffectsTx(ctx, tx, intents)
 		if err != nil {
-			return err
+			return fmt.Errorf("apply quick reply delivery effects: %w", err)
 		}
-		message := domain.QuickReplyMessage{
-			OwnerUserID: ownerUserID,
-			ShortcutID:  shortcutID,
-			ID:          messageID,
-			RandomID:    msg.RandomID,
-			Date:        msg.Date,
-			Message:     msg.Message,
-			Entities:    append([]domain.MessageEntity(nil), msg.Entities...),
-		}
-		reply := quickReplyByID(replies, shortcutID)
-		kind := domain.QuickReplyMutationMessage
-		if created {
-			kind = domain.QuickReplyMutationNew
-		}
-		mutation = domain.QuickReplyMutation{
-			Kind:       kind,
-			List:       domain.QuickReplyList{OwnerUserID: ownerUserID, QuickReplies: replies, Messages: []domain.QuickReplyMessage{message}, Hash: postgresQuickReplyListHash(replies)},
-			QuickReply: reply,
-			ShortcutID: shortcutID,
-			Message:    message,
-		}
+		snapshot.Effects = allocated
 		return nil
 	})
 	if err != nil {
-		return domain.QuickReplyMutation{}, err
+		return store.QuickReplyAccountMutationSnapshot{}, err
 	}
-	return mutation, nil
+	return store.CloneQuickReplyAccountSnapshot(snapshot), nil
 }
 
 func (s *PasswordStore) GetQuickReplyMessages(ctx context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMessages, error) {
@@ -377,107 +351,183 @@ ORDER BY message_id ASC`, args...)
 	return out, nil
 }
 
-func (s *PasswordStore) RenameQuickReplyShortcut(ctx context.Context, ownerUserID int64, shortcutID int, shortcut string) (domain.QuickReplyMutation, error) {
-	shortcut, err := domain.NormalizeQuickReplyShortcut(shortcut)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	tag, err := s.db.Exec(ctx, `
-UPDATE quick_replies
-SET shortcut = $3,
-    updated_at = now()
-WHERE owner_user_id = $1
-  AND shortcut_id = $2`, ownerUserID, shortcutID, shortcut)
-	if err != nil {
-		return domain.QuickReplyMutation{}, quickReplyPGErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	list, err := s.ListQuickReplies(ctx, ownerUserID, true)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationList, List: list}, nil
-}
-
-func (s *PasswordStore) ReorderQuickReplies(ctx context.Context, ownerUserID int64, order []int) (domain.QuickReplyMutation, error) {
-	err := withTx(ctx, s.db, "reorder quick replies", func(tx pgx.Tx) error {
+func applyQuickReplyAccountMutationTx(ctx context.Context, tx pgx.Tx, mutation store.QuickReplyAccountMutation) (domain.QuickReplyMutation, bool, error) {
+	result := domain.QuickReplyMutation{Date: mutation.Date}
+	ownerUserID := mutation.UserID
+	switch mutation.Kind {
+	case store.QuickReplyAccountSaveText:
+		shortcutID, created, err := ensureQuickReplyShortcut(ctx, tx, ownerUserID, mutation.Shortcut)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*)::int FROM quick_reply_messages WHERE owner_user_id=$1 AND shortcut_id=$2`, ownerUserID, shortcutID).Scan(&count); err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("count quick reply messages: %w", err)
+		}
+		if count >= domain.MaxQuickReplyMessages {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		var messageID int
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(message_id),0)::int+1 FROM quick_reply_messages WHERE owner_user_id=$1`, ownerUserID).Scan(&messageID); err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("allocate quick reply message id: %w", err)
+		}
+		entities, err := encodeMessageEntities(mutation.Message.Entities)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO quick_reply_messages(owner_user_id,shortcut_id,message_id,random_id,message_date,body,entities,created_at,updated_at)
+VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,now(),now())`, ownerUserID, shortcutID, messageID,
+			mutation.Message.RandomID, mutation.Message.Date, mutation.Message.Message, string(entities)); err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("insert quick reply message: %w", err)
+		}
 		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
 		if err != nil {
-			return err
+			return domain.QuickReplyMutation{}, false, err
 		}
-		if len(order) != len(replies) {
-			return domain.ErrShortcutInvalid
+		message := domain.QuickReplyMessage{
+			OwnerUserID: ownerUserID, ShortcutID: shortcutID, ID: messageID,
+			RandomID: mutation.Message.RandomID, Date: mutation.Message.Date, Message: mutation.Message.Message,
+			Entities: append([]domain.MessageEntity(nil), mutation.Message.Entities...),
 		}
-		seen := make(map[int]struct{}, len(order))
+		result.Kind = domain.QuickReplyMutationMessage
+		if created {
+			result.Kind = domain.QuickReplyMutationNew
+		}
+		result.List = quickReplyMutationList(ownerUserID, replies)
+		result.QuickReply = quickReplyByID(replies, shortcutID)
+		result.ShortcutID, result.Message = shortcutID, message
+		return result, true, nil
+
+	case store.QuickReplyAccountRenameShortcut:
+		var current string
+		if err := tx.QueryRow(ctx, `SELECT shortcut FROM quick_replies WHERE owner_user_id=$1 AND shortcut_id=$2 FOR UPDATE`, ownerUserID, mutation.ShortcutID).Scan(&current); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+			}
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("lock quick reply shortcut: %w", err)
+		}
+		changed := current != mutation.Shortcut
+		if changed {
+			if _, err := tx.Exec(ctx, `UPDATE quick_replies SET shortcut=$3,updated_at=now() WHERE owner_user_id=$1 AND shortcut_id=$2`, ownerUserID, mutation.ShortcutID, mutation.Shortcut); err != nil {
+				return domain.QuickReplyMutation{}, false, quickReplyPGErr(err)
+			}
+		}
+		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		result.Kind, result.List = domain.QuickReplyMutationList, quickReplyMutationList(ownerUserID, replies)
+		return result, changed, nil
+
+	case store.QuickReplyAccountReorder:
+		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		if len(mutation.Order) != len(replies) {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		current := make([]int, len(replies))
 		byID := make(map[int]struct{}, len(replies))
-		for _, reply := range replies {
-			byID[reply.ID] = struct{}{}
+		for i, reply := range replies {
+			current[i], byID[reply.ID] = reply.ID, struct{}{}
 		}
-		for i, id := range order {
-			if _, ok := byID[id]; !ok {
-				return domain.ErrShortcutInvalid
-			}
-			if _, ok := seen[id]; ok {
-				return domain.ErrShortcutInvalid
-			}
-			seen[id] = struct{}{}
-			if _, err := tx.Exec(ctx, `UPDATE quick_replies SET sort_order = $3, updated_at = now() WHERE owner_user_id = $1 AND shortcut_id = $2`, ownerUserID, id, i+1); err != nil {
-				return fmt.Errorf("update quick reply order: %w", err)
+		for _, id := range mutation.Order {
+			if _, exists := byID[id]; !exists {
+				return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
+		changed := !sameQuickReplyOrder(current, mutation.Order)
+		if changed {
+			for i, id := range mutation.Order {
+				if _, err := tx.Exec(ctx, `UPDATE quick_replies SET sort_order=$3,updated_at=now() WHERE owner_user_id=$1 AND shortcut_id=$2`, ownerUserID, id, i+1); err != nil {
+					return domain.QuickReplyMutation{}, false, fmt.Errorf("update quick reply order: %w", err)
+				}
+			}
+			replies, err = listQuickRepliesTx(ctx, tx, ownerUserID)
+			if err != nil {
+				return domain.QuickReplyMutation{}, false, err
+			}
+		}
+		result.Kind, result.List = domain.QuickReplyMutationList, quickReplyMutationList(ownerUserID, replies)
+		return result, changed, nil
+
+	case store.QuickReplyAccountDeleteShortcut:
+		tag, err := tx.Exec(ctx, `DELETE FROM quick_replies WHERE owner_user_id=$1 AND shortcut_id=$2`, ownerUserID, mutation.ShortcutID)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("delete quick reply shortcut: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		for i, reply := range replies {
+			if reply.SortOrder == i+1 {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `UPDATE quick_replies SET sort_order=$3 WHERE owner_user_id=$1 AND shortcut_id=$2`, ownerUserID, reply.ID, i+1); err != nil {
+				return domain.QuickReplyMutation{}, false, fmt.Errorf("normalize quick reply order: %w", err)
+			}
+			replies[i].SortOrder = i + 1
+		}
+		result.Kind, result.ShortcutID = domain.QuickReplyMutationDelete, mutation.ShortcutID
+		result.List = quickReplyMutationList(ownerUserID, replies)
+		return result, true, nil
+
+	case store.QuickReplyAccountDeleteMessages:
+		var shortcutID int
+		if err := tx.QueryRow(ctx, `SELECT shortcut_id FROM quick_replies WHERE owner_user_id=$1 AND shortcut_id=$2 FOR UPDATE`, ownerUserID, mutation.ShortcutID).Scan(&shortcutID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+			}
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("lock quick reply shortcut: %w", err)
+		}
+		ids := make([]int32, len(mutation.MessageIDs))
+		for i, id := range mutation.MessageIDs {
+			ids[i] = int32(id)
+		}
+		var found int
+		if err := tx.QueryRow(ctx, `SELECT count(*)::int FROM quick_reply_messages WHERE owner_user_id=$1 AND shortcut_id=$2 AND message_id=ANY($3::int[])`, ownerUserID, mutation.ShortcutID, ids).Scan(&found); err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("check quick reply messages: %w", err)
+		}
+		if found != len(ids) {
+			return domain.QuickReplyMutation{}, false, domain.ErrShortcutInvalid
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM quick_reply_messages WHERE owner_user_id=$1 AND shortcut_id=$2 AND message_id=ANY($3::int[])`, ownerUserID, mutation.ShortcutID, ids); err != nil {
+			return domain.QuickReplyMutation{}, false, fmt.Errorf("delete quick reply messages: %w", err)
+		}
+		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
+		if err != nil {
+			return domain.QuickReplyMutation{}, false, err
+		}
+		result.Kind, result.ShortcutID = domain.QuickReplyMutationIDs, mutation.ShortcutID
+		result.MessageIDs = append([]int(nil), mutation.MessageIDs...)
+		result.List = quickReplyMutationList(ownerUserID, replies)
+		return result, true, nil
 	}
-	list, err := s.ListQuickReplies(ctx, ownerUserID, true)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationList, List: list}, nil
+	return domain.QuickReplyMutation{}, false, fmt.Errorf("unsupported quick reply mutation %q", mutation.Kind)
 }
 
-func (s *PasswordStore) DeleteQuickReplyShortcut(ctx context.Context, ownerUserID int64, shortcutID int) (domain.QuickReplyMutation, error) {
-	tag, err := s.db.Exec(ctx, `DELETE FROM quick_replies WHERE owner_user_id = $1 AND shortcut_id = $2`, ownerUserID, shortcutID)
-	if err != nil {
-		return domain.QuickReplyMutation{}, fmt.Errorf("delete quick reply shortcut: %w", err)
+func quickReplyMutationList(ownerUserID int64, replies []domain.QuickReply) domain.QuickReplyList {
+	return domain.QuickReplyList{
+		OwnerUserID: ownerUserID, QuickReplies: append([]domain.QuickReply(nil), replies...), Hash: postgresQuickReplyListHash(replies),
 	}
-	if tag.RowsAffected() == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	_ = s.normalizeQuickReplyOrder(ctx, ownerUserID)
-	list, err := s.ListQuickReplies(ctx, ownerUserID, true)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationDelete, List: list, ShortcutID: shortcutID}, nil
 }
 
-func (s *PasswordStore) DeleteQuickReplyMessages(ctx context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMutation, error) {
-	if len(ids) == 0 {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
+func sameQuickReplyOrder(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	if err := s.ensureQuickReplyExists(ctx, ownerUserID, shortcutID); err != nil {
-		return domain.QuickReplyMutation{}, err
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
-	ids32 := make([]int32, len(ids))
-	for i, id := range ids {
-		ids32[i] = int32(id)
-	}
-	tag, err := s.db.Exec(ctx, `DELETE FROM quick_reply_messages WHERE owner_user_id = $1 AND shortcut_id = $2 AND message_id = ANY($3::int[])`, ownerUserID, shortcutID, ids32)
-	if err != nil {
-		return domain.QuickReplyMutation{}, fmt.Errorf("delete quick reply messages: %w", err)
-	}
-	if int(tag.RowsAffected()) != len(ids) {
-		return domain.QuickReplyMutation{}, domain.ErrShortcutInvalid
-	}
-	list, err := s.ListQuickReplies(ctx, ownerUserID, true)
-	if err != nil {
-		return domain.QuickReplyMutation{}, err
-	}
-	return domain.QuickReplyMutation{Kind: domain.QuickReplyMutationIDs, List: list, ShortcutID: shortcutID, MessageIDs: append([]int(nil), ids...)}, nil
+	return true
 }
 
 func (s *PasswordStore) ReserveBusinessAutomationDelivery(ctx context.Context, delivery domain.BusinessAutomationDelivery) (bool, error) {
@@ -714,21 +764,6 @@ func (s *PasswordStore) ensureQuickReplyExists(ctx context.Context, ownerUserID 
 		return fmt.Errorf("get quick reply shortcut: %w", err)
 	}
 	return nil
-}
-
-func (s *PasswordStore) normalizeQuickReplyOrder(ctx context.Context, ownerUserID int64) error {
-	return withTx(ctx, s.db, "normalize quick reply order", func(tx pgx.Tx) error {
-		replies, err := listQuickRepliesTx(ctx, tx, ownerUserID)
-		if err != nil {
-			return err
-		}
-		for i, reply := range replies {
-			if _, err := tx.Exec(ctx, `UPDATE quick_replies SET sort_order = $3 WHERE owner_user_id = $1 AND shortcut_id = $2`, ownerUserID, reply.ID, i+1); err != nil {
-				return fmt.Errorf("normalize quick reply order: %w", err)
-			}
-		}
-		return nil
-	})
 }
 
 func scanBusinessChatLink(row interface {

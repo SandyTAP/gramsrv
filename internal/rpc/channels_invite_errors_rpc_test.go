@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
 	"strings"
@@ -21,11 +20,14 @@ func TestImportChatInviteErrorsRPC(t *testing.T) {
 	first, _ := userStore.Create(ctx, domain.User{AccessHash: 59, Phone: "15550002259", FirstName: "First"})
 	second, _ := userStore.Create(ctx, domain.User{AccessHash: 60, Phone: "15550002260", FirstName: "Second"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onChannelsCreateChannel(WithUserID(ctx, owner.ID), &tg.ChannelsCreateChannelRequest{
 		Title:     "RPC Import Errors",
@@ -46,16 +48,25 @@ func TestImportChatInviteErrorsRPC(t *testing.T) {
 		t.Fatalf("export request-needed invite: %v", err)
 	}
 	requestHash := strings.TrimPrefix(requestInvite.(*tg.ChatInviteExported).Link, "https://telesrv.net/+")
+	outboxBefore := len(deliveryOutbox.Snapshot())
 	if _, err := r.onMessagesImportChatInvite(WithUserID(ctx, first.ID), requestHash); err == nil || !strings.Contains(err.Error(), "INVITE_REQUEST_SENT") {
 		t.Fatalf("import request-needed err = %v, want INVITE_REQUEST_SENT", err)
 	}
-	pushedPending := sessions.snapshot()
-	if pushedPending.userID != owner.ID || pushedPending.messageType != proto.MessageFromServer {
-		t.Fatalf("pending request push = %+v, want owner server update", pushedPending)
+	outbox := deliveryOutbox.Snapshot()
+	if len(outbox) != outboxBefore+1 {
+		t.Fatalf("pending request durable rows = %d, want %d", len(outbox), outboxBefore+1)
 	}
-	pushedPendingUpdates, ok := pushedPending.message.(*tg.Updates)
+	item := outbox[len(outbox)-1]
+	if item.TargetUserID != owner.ID || item.ExcludeAuthKeyID != ([8]byte{}) || item.ExcludeSessionID != 0 {
+		t.Fatalf("cross-user pending delivery identity = %+v", item)
+	}
+	pushedPending, err := decodeDeliveryUpdate(item.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushedPendingUpdates, ok := pushedPending.(*tg.Updates)
 	if !ok || len(pushedPendingUpdates.Updates) != 1 {
-		t.Fatalf("pending request push message = %T %+v, want one update", pushedPending.message, pushedPending.message)
+		t.Fatalf("pending request durable payload = %T %+v, want one update", pushedPending, pushedPending)
 	}
 	pushedPendingUpdate, ok := pushedPendingUpdates.Updates[0].(*tg.UpdatePendingJoinRequests)
 	if !ok || pushedPendingUpdate.RequestsPending != 1 || len(pushedPendingUpdate.RecentRequesters) != 1 || pushedPendingUpdate.RecentRequesters[0] != first.ID {

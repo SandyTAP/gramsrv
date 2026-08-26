@@ -4,7 +4,6 @@ import (
 	"context"
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
 	"reflect"
@@ -182,7 +181,7 @@ func TestMessagesReadHistoryMarksDialogReadWithoutCoreSessionFallback(t *testing
 	}
 }
 
-func TestMessagesReadHistoryWithReliableDispatchPushesCurrentSessionReadUpdate(t *testing.T) {
+func TestMessagesReadHistoryResponseCarriesPtsWithoutCurrentSessionPush(t *testing.T) {
 	var authKeyID [8]byte
 	authKeyID[0] = 8
 	messages := &captureMessages{readResult: domain.ReadHistoryResult{
@@ -229,20 +228,8 @@ func TestMessagesReadHistoryWithReliableDispatchPushesCurrentSessionReadUpdate(t
 	if messages.readReq.OriginSessionID != 77 || messages.readReq.OriginAuthKeyID != authKeyID {
 		t.Fatalf("read origin = auth %v session %d, want request auth/session", messages.readReq.OriginAuthKeyID, messages.readReq.OriginSessionID)
 	}
-	snap := sessions.snapshot()
-	if snap.sessionID != 77 || snap.messageType != proto.MessageFromServer {
-		t.Fatalf("current-session push target = session %d type %v, want session 77 server message", snap.sessionID, snap.messageType)
-	}
-	updatesMsg, ok := snap.message.(*tg.Updates)
-	if !ok || len(updatesMsg.Updates) != 1 {
-		t.Fatalf("current-session push = %T %+v, want one updates container", snap.message, snap.message)
-	}
-	update, ok := updatesMsg.Updates[0].(*tg.UpdateReadHistoryInbox)
-	if !ok {
-		t.Fatalf("current-session update = %T, want *tg.UpdateReadHistoryInbox", updatesMsg.Updates[0])
-	}
-	if update.Pts != 5 || update.PtsCount != 1 || update.MaxID != 12 || update.StillUnreadCount != 2 {
-		t.Fatalf("current-session update = %+v, want pts=5 count=1 max=12 still=2", update)
+	if snap := sessions.snapshot(); snap.message != nil {
+		t.Fatalf("current-session direct push = %T %+v, want only affectedMessages response", snap.message, snap.message)
 	}
 }
 

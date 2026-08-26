@@ -32,7 +32,7 @@ func TestChannelTopicReadIsolation(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "TopicRead " + suffix,
@@ -71,10 +71,10 @@ func TestChannelTopicReadIsolation(t *testing.T) {
 		return res.Message
 	}
 	// 交错发送：topicB 两条都在 topicA 最新一条之前，id 更小。
-	_ = send(222003, topicA.Topic.TopicID, 1700002103)        // A1
-	_ = send(222004, topicB.Topic.TopicID, 1700002104)        // B1
-	_ = send(222005, topicB.Topic.TopicID, 1700002105)        // B2
-	a2 := send(222006, topicA.Topic.TopicID, 1700002106)      // A2（全局最大 id）
+	_ = send(222003, topicA.Topic.TopicID, 1700002103)   // A1
+	_ = send(222004, topicB.Topic.TopicID, 1700002104)   // B1
+	_ = send(222005, topicB.Topic.TopicID, 1700002105)   // B2
+	a2 := send(222006, topicA.Topic.TopicID, 1700002106) // A2（全局最大 id）
 
 	if u := topicUnread(t, channels, ctx, member.ID, channelID, topicA.Topic.TopicID); u != 2 {
 		t.Fatalf("before read: topicA unread = %d, want 2", u)
@@ -89,7 +89,8 @@ func TestChannelTopicReadIsolation(t *testing.T) {
 		TopicID:   topicA.Topic.TopicID,
 		MaxID:     a2.ID,
 		Date:      1700002110,
-	})
+	}, testChannelTopicReadEffects)
+
 	if err != nil {
 		t.Fatalf("read topic A: %v", err)
 	}
@@ -108,7 +109,8 @@ func TestChannelTopicReadIsolation(t *testing.T) {
 	// 幂等：再读一次同水位 → Changed=false。
 	again, err := channels.ReadChannelTopicHistory(ctx, domain.ReadChannelTopicHistoryRequest{
 		UserID: member.ID, ChannelID: channelID, TopicID: topicA.Topic.TopicID, MaxID: a2.ID, Date: 1700002111,
-	})
+	}, testChannelTopicReadEffects)
+
 	if err != nil || again.Changed {
 		t.Fatalf("re-read topic A = %+v err %v, want not changed", again, err)
 	}
@@ -164,7 +166,7 @@ func TestChannelGeneralTopicRead(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "General " + suffix, Megagroup: true, Forum: true,
 		MemberUserIDs: []int64{member.ID}, Date: 1700003100,
@@ -235,7 +237,7 @@ func TestChannelGeneralTopicRead(t *testing.T) {
 	// 读话题 A2 不污染 General。
 	if _, err := channels.ReadChannelTopicHistory(ctx, domain.ReadChannelTopicHistoryRequest{
 		UserID: member.ID, ChannelID: channelID, TopicID: topicA2.Topic.TopicID, MaxID: a1.Message.ID, Date: 1700003120,
-	}); err != nil {
+	}, testChannelTopicReadEffects); err != nil {
 		t.Fatalf("read topic A2: %v", err)
 	}
 	genAfterTopic, err := channels.GeneralForumTopic(ctx, member.ID, channelID)
@@ -249,7 +251,8 @@ func TestChannelGeneralTopicRead(t *testing.T) {
 	// 读 General 清零并推进 General 自己的水位。
 	res, err := channels.ReadChannelTopicHistory(ctx, domain.ReadChannelTopicHistoryRequest{
 		UserID: member.ID, ChannelID: channelID, TopicID: domain.ForumGeneralTopicID, MaxID: g2.ID, Date: 1700003121,
-	})
+	}, testChannelTopicReadEffects)
+
 	if err != nil || !res.Changed {
 		t.Fatalf("read general = %+v err %v, want changed", res, err)
 	}

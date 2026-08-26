@@ -29,8 +29,10 @@ func newContactProfilePhotoTestRouter(t *testing.T) (*Router, *memory.ContactSto
 		t.Fatalf("create friend: %v", err)
 	}
 	contactStore := memory.NewContactStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	contactStore.AttachDeliveryOutbox(delivery)
 	contacts := appcontacts.NewService(contactStore, userStore)
-	if _, err := contacts.AddContact(ctx, owner.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "Friend"}); err != nil {
+	if _, err := contacts.AddContactWithDelivery(ctx, owner.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "Friend"}, 1700000400, rpcTestContactMutationEffects); err != nil {
 		t.Fatalf("add contact: %v", err)
 	}
 	dialogStore := memory.NewDialogStore()
@@ -39,11 +41,12 @@ func newContactProfilePhotoTestRouter(t *testing.T) (*Router, *memory.ContactSto
 	files := &fakeFiles{photos: map[int64]domain.Photo{}}
 	sessions := &captureSessions{}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Users:    users,
-		Contacts: contacts,
-		Files:    files,
-		Messages: appmessages.NewService(messageStore, dialogStore, appmessages.WithContactStore(contactStore)),
-		Sessions: sessions,
+		Users:          users,
+		Contacts:       contacts,
+		Files:          files,
+		Messages:       appmessages.NewService(messageStore, dialogStore, appmessages.WithContactStore(contactStore)),
+		Sessions:       sessions,
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 	return r, contactStore, sessions, owner, friend
 }
@@ -138,20 +141,25 @@ func TestUploadContactProfilePhotoSuggestCreatesServiceMessage(t *testing.T) {
 
 	assertSuggestProfilePhotoHistory(t, r, owner.ID, friend.ID, true)
 	assertSuggestProfilePhotoHistory(t, r, friend.ID, owner.ID, false)
-	snap := sessions.snapshot()
-	pushed, ok := snap.message.(*tg.Updates)
-	if !ok {
-		t.Fatalf("current-session push = %T, want *tg.Updates", snap.message)
+	if snap := sessions.snapshot(); snap.message != nil {
+		t.Fatalf("current-session direct push = %T %+v, want durable sender event only", snap.message, snap.message)
 	}
-	if len(pushed.Updates) != 1 {
-		t.Fatalf("current-session updates = %+v, want UpdateNewMessage only", pushed.Updates)
+}
+
+func TestSuggestedProfilePhotoSenderDurableAudienceIncludesOrigin(t *testing.T) {
+	messages := &captureMessages{}
+	r := New(Config{}, Deps{Messages: messages}, zaptest.NewLogger(t), clock.System)
+	rawAuthKeyID := [8]byte{0x71, 0x72}
+	ctx := WithRawAuthKeyID(WithSessionID(WithUserID(context.Background(), 1001), 91), rawAuthKeyID)
+
+	if _, err := r.sendSuggestedProfilePhotoMessage(ctx, 1001, 1002, domain.Photo{ID: 77}); err != nil {
+		t.Fatalf("send suggested profile photo message: %v", err)
 	}
-	update, ok := pushed.Updates[0].(*tg.UpdateNewMessage)
-	if !ok {
-		t.Fatalf("current-session update = %T, want *tg.UpdateNewMessage", pushed.Updates[0])
+	if messages.sendReq.OriginAuthKeyID != ([8]byte{}) || messages.sendReq.OriginSessionID != 0 {
+		t.Fatalf("sender durable exclusion = %x/%d, want none", messages.sendReq.OriginAuthKeyID, messages.sendReq.OriginSessionID)
 	}
-	if service, ok := update.Message.(*tg.MessageService); !ok || !service.Out {
-		t.Fatalf("current-session message = %T %+v, want outgoing MessageService", update.Message, update.Message)
+	if messages.sendReq.Media == nil || messages.sendReq.Media.ServiceAction == nil || messages.sendReq.Media.ServiceAction.Kind != domain.MessageServiceActionSuggestProfilePhoto {
+		t.Fatalf("send request media = %+v, want suggest-profile-photo service action", messages.sendReq.Media)
 	}
 }
 

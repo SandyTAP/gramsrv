@@ -28,7 +28,7 @@ func TestUpdateEventListAfterCarriesPinServiceReply(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID: alice.ID, RecipientUserID: bob.ID, RandomID: 841001,
 		Message: "OfflinePinTarget", Date: 1700000800,

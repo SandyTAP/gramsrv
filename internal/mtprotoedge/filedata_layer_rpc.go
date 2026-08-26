@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/iamxvbaba/td/bin"
+	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
 	"github.com/iamxvbaba/td/tlprofile"
@@ -20,7 +19,8 @@ import (
 )
 
 const fileDataMaxUploadGetFileChunkLimit = 1 << 20
-const fileDataLocalAdmissionTTL = 6 * time.Minute
+
+var errNotFileDataTerminal = errors.New("mtprotoedge: terminal RPC is not FileData")
 
 // FileDataDataPlane is the Edge-visible File service contract. It deliberately
 // carries only upload/download data-plane calls; message ownership, permissions
@@ -32,32 +32,42 @@ type FileDataDataPlane interface {
 	GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error)
 }
 
+// FileDataLayerRPCBase owns only non-FileData RPCs and shared session/profile
+// state. Every FileData terminal, including invoke/gzip wrapping, is admitted
+// by the Edge-local generated dispatcher and can never be sent to CoreExec.
+type FileDataLayerRPCBase interface {
+	LayerRPCHandler
+	LayerRPCOptionsAdmitter
+	LayerRPCDefaultProfileOptionsAdmitter
+	LayerRPCFlatBytesPayloadSizer
+	LayerRPCSessionProfileRegistry
+	LayerRPCOrderedSessionProfileRegistry
+	LayerRPCDurableSessionProfileResolver
+	LayerRPCInheritedAuthKeyProfileResolver
+	LayerRPCDurableSessionProfileAdvancer
+	LayerRPCDurableSessionProfileDeleter
+	LayerRPCReplayPreparer
+	LayerRPCProfileEvidenceContext
+	LayerRPCIdentityHintContext
+	LayerRPCAdmissionProfilePublisher
+	RPCInitConnectionObserver
+	postresponse.ActionExecutor
+	DiscardAdmitted(tlprofile.PreparedIdentity) bool
+}
+
 type fileDataIdentityHintKey struct{}
 
 // FileDataLayerRPC intercepts the high-volume upload/download data plane and
 // delegates every business/control capability to the wrapped CoreExec handler.
 type FileDataLayerRPC struct {
-	base       LayerRPCHandler
-	files      FileDataDataPlane
+	base       FileDataLayerRPCBase
 	dispatcher *tlprofile.Dispatcher
-	classifier *tlprofile.Dispatcher
-	log        *zap.Logger
-
-	localMu         sync.Mutex
-	localAdmissions map[tlprofile.PreparedIdentity]time.Time
 }
 
-func NewFileDataLayerRPC(base LayerRPCHandler, files FileDataDataPlane, log *zap.Logger) *FileDataLayerRPC {
-	if log == nil {
-		log = zap.NewNop()
-	}
+func NewFileDataLayerRPC(base FileDataLayerRPCBase, files FileDataDataPlane, _ *zap.Logger) *FileDataLayerRPC {
 	return &FileDataLayerRPC{
-		base:            base,
-		files:           files,
-		dispatcher:      newFileDataDispatcher(files),
-		classifier:      newFileDataClassifierDispatcher(),
-		log:             log,
-		localAdmissions: make(map[tlprofile.PreparedIdentity]time.Time),
+		base:       base,
+		dispatcher: newFileDataDispatcher(files),
 	}
 }
 
@@ -155,23 +165,16 @@ func newFileDataDispatcher(files FileDataDataPlane) *tlprofile.Dispatcher {
 	return d
 }
 
-func newFileDataClassifierDispatcher() *tlprofile.Dispatcher {
-	d := tlprofile.NewDispatcher()
-	registerFileDataAdmissionPreflight(d)
-	d.OnWrappers(func(ctx context.Context, _ tlprofile.Admission, next tlprofile.Next) error {
-		return next(ctx)
-	})
-	mustRegisterFileDataRPC[*tg.UploadGetFileRequest](d, tlprofile.SemanticMethodUploadGetFile, func(_ context.Context, req *tg.UploadGetFileRequest) (any, error) {
-		_, ok := fileDataLocationKey(req.Location)
-		return ok, nil
-	})
-	return d
-}
-
 func registerFileDataAdmissionPreflight(d *tlprofile.Dispatcher) {
 	if d == nil {
 		panic("mtprotoedge filedata: nil dispatcher")
 	}
+	d.OnAdmissionPreflight(func(view tlprofile.AdmissionView) error {
+		if !fileDataFastPathMethod(view.Semantic()) {
+			return errNotFileDataTerminal
+		}
+		return nil
+	})
 	for _, fieldID := range []tlprofile.FieldID{
 		tlprofile.FieldUploadSaveFilePartBytes,
 		tlprofile.FieldUploadSaveBigFilePartBytes,
@@ -221,14 +224,18 @@ func (r *FileDataLayerRPC) AdmitLayer(profile tlprofile.Profile, b *bin.Buffer, 
 }
 
 func (r *FileDataLayerRPC) AdmitLayerWithOptions(profile tlprofile.Profile, b *bin.Buffer, options tlprofile.AdmissionOptions) (tlprofile.Admission, error) {
-	if admitted, ok := r.admitFileData(admitFileDataLayer, profile, b, options); ok {
-		return admitted, nil
+	if r.directFileDataMethod(profile, b) {
+		return r.dispatcher.AdmitWithOptions(profile, b, options)
 	}
-	admitter, ok := r.base.(LayerRPCOptionsAdmitter)
-	if ok {
-		return admitter.AdmitLayerWithOptions(profile, b, options)
+	if fileDataEnvelopeMayWrap(profile, b) {
+		if admitted, handled, err := r.tryLocalFileDataAdmission(b, func(probe *bin.Buffer) (tlprofile.Admission, error) {
+			return r.dispatcher.AdmitWithOptions(profile, probe, options)
+		}); handled {
+			return admitted, err
+		}
 	}
-	return r.base.AdmitLayer(profile, b, options.Limits)
+	admitted, err := r.base.AdmitLayerWithOptions(profile, b, options)
+	return r.rejectCoreFileDataAdmission(admitted, err)
 }
 
 func (r *FileDataLayerRPC) AdmitDefaultLayer(profile tlprofile.Profile, b *bin.Buffer, limits tlprofile.Limits) (tlprofile.Admission, error) {
@@ -236,19 +243,18 @@ func (r *FileDataLayerRPC) AdmitDefaultLayer(profile tlprofile.Profile, b *bin.B
 }
 
 func (r *FileDataLayerRPC) AdmitDefaultLayerWithOptions(profile tlprofile.Profile, b *bin.Buffer, options tlprofile.AdmissionOptions) (tlprofile.Admission, error) {
-	if admitted, ok := r.admitFileData(admitFileDataDefault, profile, b, options); ok {
-		return admitted, nil
+	if r.directFileDataMethod(profile, b) {
+		return r.dispatcher.AdmitDefaultWithOptions(profile, b, options)
 	}
-	if admitter, ok := r.base.(LayerRPCDefaultProfileOptionsAdmitter); ok {
-		return admitter.AdmitDefaultLayerWithOptions(profile, b, options)
+	if fileDataEnvelopeMayWrap(profile, b) {
+		if admitted, handled, err := r.tryLocalFileDataAdmission(b, func(probe *bin.Buffer) (tlprofile.Admission, error) {
+			return r.dispatcher.AdmitDefaultWithOptions(profile, probe, options)
+		}); handled {
+			return admitted, err
+		}
 	}
-	if admitter, ok := r.base.(LayerRPCDefaultProfileAdmitter); ok {
-		return admitter.AdmitDefaultLayer(profile, b, options.Limits)
-	}
-	if admitter, ok := r.base.(LayerRPCOptionsAdmitter); ok {
-		return admitter.AdmitLayerWithOptions(profile, b, options)
-	}
-	return r.base.AdmitLayer(profile, b, options.Limits)
+	admitted, err := r.base.AdmitDefaultLayerWithOptions(profile, b, options)
+	return r.rejectCoreFileDataAdmission(admitted, err)
 }
 
 func (r *FileDataLayerRPC) AdmitUnprofiled(b *bin.Buffer, limits tlprofile.Limits) (tlprofile.Admission, error) {
@@ -256,121 +262,104 @@ func (r *FileDataLayerRPC) AdmitUnprofiled(b *bin.Buffer, limits tlprofile.Limit
 }
 
 func (r *FileDataLayerRPC) AdmitUnprofiledWithOptions(b *bin.Buffer, options tlprofile.AdmissionOptions) (tlprofile.Admission, error) {
-	if admitted, ok := r.admitFileData(admitFileDataUnprofiled, 0, b, options); ok {
-		return admitted, nil
+	if admitted, handled, err := r.tryLocalFileDataAdmission(b, func(probe *bin.Buffer) (tlprofile.Admission, error) {
+		return r.dispatcher.AdmitUnprofiledWithOptions(probe, options)
+	}); handled {
+		return admitted, err
 	}
-	admitter, ok := r.base.(LayerRPCOptionsAdmitter)
-	if ok {
-		return admitter.AdmitUnprofiledWithOptions(b, options)
-	}
-	return r.base.AdmitUnprofiled(b, options.Limits)
+	admitted, err := r.base.AdmitUnprofiledWithOptions(b, options)
+	return r.rejectCoreFileDataAdmission(admitted, err)
 }
 
-type admitFileDataMode uint8
-
-const (
-	admitFileDataLayer admitFileDataMode = iota
-	admitFileDataDefault
-	admitFileDataUnprofiled
-)
-
-func (r *FileDataLayerRPC) admitFileData(mode admitFileDataMode, profile tlprofile.Profile, b *bin.Buffer, options tlprofile.AdmissionOptions) (tlprofile.Admission, bool) {
+// directFileDataMethod performs only a generated constructor-to-semantic lookup.
+// It never scans or materializes the terminal request. Wrapped and gzip-packed
+// requests are admitted once by the base codec shell; finishBaseAdmission then
+// discards the captured wire and diverts the admission before any CoreExec call.
+func (r *FileDataLayerRPC) directFileDataMethod(profile tlprofile.Profile, b *bin.Buffer) bool {
 	if r == nil || r.dispatcher == nil || b == nil || len(b.Raw()) < bin.Word {
-		return tlprofile.Admission{}, false
-	}
-	probe := &bin.Buffer{Buf: b.Raw()}
-	admitted, err := r.admitWith(r.dispatcher, mode, profile, probe, options)
-	if err != nil || probe.Len() != 0 {
-		return tlprofile.Admission{}, false
-	}
-	method := admitted.Call().Method()
-	if !fileDataFastPathMethod(method) {
-		return tlprofile.Admission{}, false
-	}
-	if method == tlprofile.SemanticMethodUploadGetFile && !r.fileDataGetFileAllowed(mode, profile, b.Raw(), options) {
-		return tlprofile.Admission{}, false
-	}
-	b.ResetTo(probe.Raw())
-	if method == tlprofile.SemanticMethodUploadGetFile {
-		r.rememberLocalAdmission(admitted)
-	}
-	return admitted, true
-}
-
-func (r *FileDataLayerRPC) admitWith(d *tlprofile.Dispatcher, mode admitFileDataMode, profile tlprofile.Profile, b *bin.Buffer, options tlprofile.AdmissionOptions) (tlprofile.Admission, error) {
-	switch mode {
-	case admitFileDataLayer:
-		return d.AdmitWithOptions(profile, b, options)
-	case admitFileDataDefault:
-		return d.AdmitDefaultWithOptions(profile, b, options)
-	case admitFileDataUnprofiled:
-		return d.AdmitUnprofiledWithOptions(b, options)
-	default:
-		return tlprofile.Admission{}, fmt.Errorf("mtprotoedge filedata: invalid admission mode %d", mode)
-	}
-}
-
-func (r *FileDataLayerRPC) fileDataGetFileAllowed(mode admitFileDataMode, profile tlprofile.Profile, raw []byte, options tlprofile.AdmissionOptions) bool {
-	if r == nil || r.classifier == nil {
 		return false
 	}
-	probe := &bin.Buffer{Buf: raw}
-	admitted, err := r.admitWith(r.classifier, mode, profile, probe, options)
-	if err != nil || probe.Len() != 0 {
-		return false
-	}
-	result, err := r.classifier.Dispatch(context.Background(), admitted)
+	wireID, err := b.PeekID()
 	if err != nil {
 		return false
 	}
-	allowed, _ := result.CanonicalValue().(bool)
-	return allowed
+	method, ok := tlprofile.SemanticForWireID(profile, wireID)
+	return ok && fileDataFastPathMethod(method)
 }
 
-func (r *FileDataLayerRPC) rememberLocalAdmission(admitted tlprofile.Admission) {
-	if r == nil {
-		return
-	}
-	now := time.Now()
-	cutoff := now.Add(-fileDataLocalAdmissionTTL)
-	identity := admitted.Prepared().Identity()
-	r.localMu.Lock()
-	for key, createdAt := range r.localAdmissions {
-		if createdAt.Before(cutoff) {
-			delete(r.localAdmissions, key)
-		}
-	}
-	r.localAdmissions[identity] = now
-	r.localMu.Unlock()
-}
-
-func (r *FileDataLayerRPC) isLocalAdmission(request tlprofile.Admission) bool {
-	if r == nil {
+func fileDataEnvelopeMayWrap(profile tlprofile.Profile, b *bin.Buffer) bool {
+	if b == nil || len(b.Raw()) < bin.Word {
 		return false
 	}
-	identity := request.Prepared().Identity()
-	cutoff := time.Now().Add(-fileDataLocalAdmissionTTL)
-	r.localMu.Lock()
-	createdAt, ok := r.localAdmissions[identity]
-	if ok && createdAt.Before(cutoff) {
-		delete(r.localAdmissions, identity)
-		ok = false
+	wireID, err := b.PeekID()
+	if err != nil {
+		return false
 	}
-	r.localMu.Unlock()
-	return ok
+	if wireID == proto.GZIPTypeID {
+		return true
+	}
+	method, ok := tlprofile.SemanticForWireID(profile, wireID)
+	return ok && fileDataWrapperMethod(method)
+}
+
+func fileDataWrapperMethod(method tlprofile.SemanticID) bool {
+	switch method {
+	case tlprofile.SemanticMethodInitConnection,
+		tlprofile.SemanticMethodInvokeAfterMsg,
+		tlprofile.SemanticMethodInvokeAfterMsgs,
+		tlprofile.SemanticMethodInvokeWithApnsSecret,
+		tlprofile.SemanticMethodInvokeWithBusinessConnection,
+		tlprofile.SemanticMethodInvokeWithGooglePlayIntegrity,
+		tlprofile.SemanticMethodInvokeWithLayer,
+		tlprofile.SemanticMethodInvokeWithMessagesRange,
+		tlprofile.SemanticMethodInvokeWithReCaptcha,
+		tlprofile.SemanticMethodInvokeWithTakeout,
+		tlprofile.SemanticMethodInvokeWithoutUpdates:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *FileDataLayerRPC) tryLocalFileDataAdmission(
+	body *bin.Buffer,
+	admit func(*bin.Buffer) (tlprofile.Admission, error),
+) (tlprofile.Admission, bool, error) {
+	if r == nil || r.dispatcher == nil || body == nil || admit == nil {
+		return tlprofile.Admission{}, true, fmt.Errorf("mtprotoedge filedata: local admission dependency missing")
+	}
+	probe := &bin.Buffer{Buf: body.Raw()}
+	admitted, err := admit(probe)
+	if errors.Is(err, errNotFileDataTerminal) || errors.Is(err, tlprofile.ErrUnknownRPCMethod) {
+		return tlprofile.Admission{}, false, nil
+	}
+	if err != nil {
+		return tlprofile.Admission{}, true, err
+	}
+	if !fileDataFastPathMethod(admitted.Call().Method()) {
+		return tlprofile.Admission{}, true, fmt.Errorf("mtprotoedge filedata: local dispatcher admitted non-FileData terminal")
+	}
+	body.Skip(body.Len())
+	return admitted, true, nil
+}
+
+// rejectCoreFileDataAdmission is a hard-cut invariant guard. A CoreExec codec
+// must never produce a FileData admission; if it does, release the capture and
+// fail the request instead of treating it as a compatibility route.
+func (r *FileDataLayerRPC) rejectCoreFileDataAdmission(admitted tlprofile.Admission, err error) (tlprofile.Admission, error) {
+	if err != nil || !fileDataFastPathMethod(admitted.Call().Method()) {
+		return admitted, err
+	}
+	_ = r.base.DiscardAdmitted(admitted.Prepared().Identity())
+	return tlprofile.Admission{}, fmt.Errorf("mtprotoedge filedata: CoreExec returned forbidden FileData admission")
 }
 
 func (r *FileDataLayerRPC) DispatchAdmitted(ctx context.Context, authKeyID [8]byte, sessionID int64, msgID int64, admissionSeq uint64, request tlprofile.Admission) (tlprofile.Result, string, error) {
 	switch request.Call().Method() {
 	case tlprofile.SemanticMethodUploadSaveFilePart,
 		tlprofile.SemanticMethodUploadSaveBigFilePart,
+		tlprofile.SemanticMethodUploadGetFile,
 		tlprofile.SemanticMethodUploadGetFileHashes:
-		result, err := r.dispatcher.Dispatch(ctx, request)
-		return result, fileDataMethodName(request.Call().Method()), err
-	case tlprofile.SemanticMethodUploadGetFile:
-		if !r.isLocalAdmission(request) {
-			break
-		}
 		result, err := r.dispatcher.Dispatch(ctx, request)
 		return result, fileDataMethodName(request.Call().Method()), err
 	}
@@ -412,135 +401,82 @@ func (r *FileDataLayerRPC) WithLayerRPCIdentityHint(ctx context.Context, hint La
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if decorator, ok := r.base.(LayerRPCIdentityHintContext); ok {
-		if decorated := decorator.WithLayerRPCIdentityHint(ctx, hint); decorated != nil {
-			ctx = decorated
-		}
-	}
+	ctx = r.base.WithLayerRPCIdentityHint(ctx, hint)
 	return context.WithValue(ctx, fileDataIdentityHintKey{}, hint)
 }
 
 func (r *FileDataLayerRPC) WithLayerRPCProfileEvidenceFresh(ctx context.Context, fresh bool) context.Context {
-	if decorator, ok := r.base.(LayerRPCProfileEvidenceContext); ok {
-		return decorator.WithLayerRPCProfileEvidenceFresh(ctx, fresh)
-	}
-	return ctx
+	return r.base.WithLayerRPCProfileEvidenceFresh(ctx, fresh)
 }
 
 func (r *FileDataLayerRPC) LayerRPCFlatBytesPayloadSize(wire []byte) (int, bool) {
-	if sizer, ok := r.base.(LayerRPCFlatBytesPayloadSizer); ok {
-		return sizer.LayerRPCFlatBytesPayloadSize(wire)
-	}
-	return 0, false
+	return r.base.LayerRPCFlatBytesPayloadSize(wire)
 }
 
 func (r *FileDataLayerRPC) NegotiatedSessionLayer(authKeyID [8]byte, sessionID int64) (int, bool) {
-	if resolver, ok := r.base.(LayerRPCSessionProfileResolver); ok {
-		return resolver.NegotiatedSessionLayer(authKeyID, sessionID)
-	}
-	return 0, false
+	return r.base.NegotiatedSessionLayer(authKeyID, sessionID)
 }
 
 func (r *FileDataLayerRPC) NegotiatedSessionLayerEvidence(authKeyID [8]byte, sessionID int64) (int, int64, bool) {
-	if resolver, ok := r.base.(LayerRPCOrderedSessionProfileResolver); ok {
-		return resolver.NegotiatedSessionLayerEvidence(authKeyID, sessionID)
-	}
-	return 0, 0, false
+	return r.base.NegotiatedSessionLayerEvidence(authKeyID, sessionID)
 }
 
 func (r *FileDataLayerRPC) FreezeNegotiatedSessionLayer(authKeyID [8]byte, sessionID int64, layer int) error {
-	if registry, ok := r.base.(LayerRPCSessionProfileRegistry); ok {
-		return registry.FreezeNegotiatedSessionLayer(authKeyID, sessionID, layer)
-	}
-	return fmt.Errorf("mtprotoedge filedata: base does not implement session profile registry")
+	return r.base.FreezeNegotiatedSessionLayer(authKeyID, sessionID, layer)
 }
 
 func (r *FileDataLayerRPC) FreezeNegotiatedSessionLayerAt(authKeyID [8]byte, sessionID int64, layer int, msgID int64) (bool, error) {
-	if registry, ok := r.base.(LayerRPCOrderedSessionProfileRegistry); ok {
-		return registry.FreezeNegotiatedSessionLayerAt(authKeyID, sessionID, layer, msgID)
-	}
-	return false, fmt.Errorf("mtprotoedge filedata: base does not implement ordered session profile registry")
+	return r.base.FreezeNegotiatedSessionLayerAt(authKeyID, sessionID, layer, msgID)
 }
 
 func (r *FileDataLayerRPC) ForgetNegotiatedSessionLayer(authKeyID [8]byte, sessionID int64) {
-	if registry, ok := r.base.(LayerRPCSessionProfileRegistry); ok {
-		registry.ForgetNegotiatedSessionLayer(authKeyID, sessionID)
-	}
+	r.base.ForgetNegotiatedSessionLayer(authKeyID, sessionID)
 }
 
 func (r *FileDataLayerRPC) ForgetNegotiatedAuthKey(authKeyID [8]byte) {
-	if registry, ok := r.base.(LayerRPCSessionProfileRegistry); ok {
-		registry.ForgetNegotiatedAuthKey(authKeyID)
-	}
+	r.base.ForgetNegotiatedAuthKey(authKeyID)
 }
 
 func (r *FileDataLayerRPC) ResolveNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (int, int64, bool, error) {
-	if resolver, ok := r.base.(LayerRPCDurableSessionProfileResolver); ok {
-		return resolver.ResolveNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
-	}
-	return 0, 0, false, fmt.Errorf("mtprotoedge filedata: base does not implement durable session profile resolver")
+	return r.base.ResolveNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
 }
 
 func (r *FileDataLayerRPC) ResolveInheritedAuthKeyLayer(ctx context.Context, rawAuthKeyID [8]byte) (int, bool, error) {
-	if resolver, ok := r.base.(LayerRPCInheritedAuthKeyProfileResolver); ok {
-		return resolver.ResolveInheritedAuthKeyLayer(ctx, rawAuthKeyID)
-	}
-	return 0, false, fmt.Errorf("mtprotoedge filedata: base does not implement inherited auth-key profile resolver")
+	return r.base.ResolveInheritedAuthKeyLayer(ctx, rawAuthKeyID)
 }
 
 func (r *FileDataLayerRPC) AdvanceNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, layer int, msgID int64) (int, int64, bool, error) {
-	if advancer, ok := r.base.(LayerRPCDurableSessionProfileAdvancer); ok {
-		return advancer.AdvanceNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID, layer, msgID)
-	}
-	return 0, 0, false, fmt.Errorf("mtprotoedge filedata: base does not implement durable session profile advancer")
+	return r.base.AdvanceNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID, layer, msgID)
 }
 
 func (r *FileDataLayerRPC) DeleteNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (bool, error) {
-	if deleter, ok := r.base.(LayerRPCDurableSessionProfileDeleter); ok {
-		return deleter.DeleteNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
-	}
-	return false, fmt.Errorf("mtprotoedge filedata: base does not implement durable session profile deleter")
+	return r.base.DeleteNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
 }
 
 func (r *FileDataLayerRPC) PublishAdmittedLayerProfileEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, msgID int64, admissionSeq uint64, safeFloor uint64, layer int) error {
-	if publisher, ok := r.base.(LayerRPCAdmissionProfilePublisher); ok {
-		return publisher.PublishAdmittedLayerProfileEvidence(ctx, rawAuthKeyID, sessionID, msgID, admissionSeq, safeFloor, layer)
-	}
-	return fmt.Errorf("mtprotoedge filedata: base does not implement layer profile publisher")
+	return r.base.PublishAdmittedLayerProfileEvidence(ctx, rawAuthKeyID, sessionID, msgID, admissionSeq, safeFloor, layer)
 }
 
 func (r *FileDataLayerRPC) PrepareAdmittedReplay(ctx context.Context, authKeyID [8]byte, sessionID int64, msgID int64, admissionSeq uint64, request tlprofile.Admission) (func() error, error) {
 	switch request.Call().Method() {
 	case tlprofile.SemanticMethodUploadSaveFilePart,
 		tlprofile.SemanticMethodUploadSaveBigFilePart,
+		tlprofile.SemanticMethodUploadGetFile,
 		tlprofile.SemanticMethodUploadGetFileHashes:
 		return nil, nil
-	case tlprofile.SemanticMethodUploadGetFile:
-		if r.isLocalAdmission(request) {
-			return nil, nil
-		}
 	}
-	if preparer, ok := r.base.(LayerRPCReplayPreparer); ok {
-		return preparer.PrepareAdmittedReplay(ctx, authKeyID, sessionID, msgID, admissionSeq, request)
-	}
-	return nil, nil
+	return r.base.PrepareAdmittedReplay(ctx, authKeyID, sessionID, msgID, admissionSeq, request)
 }
 
 func (r *FileDataLayerRPC) ObserveInitConnection(ctx context.Context, authKeyID [8]byte, sessionID int64, layer, apiID int, deviceModel, systemVersion, appVersion, systemLangCode, langPack, langCode string) error {
-	if observer, ok := r.base.(RPCInitConnectionObserver); ok {
-		return observer.ObserveInitConnection(ctx, authKeyID, sessionID, layer, apiID, deviceModel, systemVersion, appVersion, systemLangCode, langPack, langCode)
-	}
-	return fmt.Errorf("mtprotoedge filedata: base does not implement initConnection observer")
+	return r.base.ObserveInitConnection(ctx, authKeyID, sessionID, layer, apiID, deviceModel, systemVersion, appVersion, systemLangCode, langPack, langCode)
 }
 
 func (r *FileDataLayerRPC) RunPostResponseActions(ctx context.Context, actions []postresponse.Action) error {
 	if len(actions) == 0 {
 		return nil
 	}
-	if executor, ok := r.base.(postresponse.ActionExecutor); ok {
-		return executor.RunPostResponseActions(ctx, actions)
-	}
-	return nil
+	return r.base.RunPostResponseActions(ctx, actions)
 }
 
 func fileDataSaveErr(err error) error {
@@ -703,7 +639,7 @@ func fileDataTGFileHashes(hashes []domain.FileHash) []tg.FileHash {
 		out = append(out, tg.FileHash{
 			Offset: hash.Offset,
 			Limit:  hash.Limit,
-			Hash:   append([]byte(nil), hash.Hash...),
+			Hash:   hash.Hash,
 		})
 	}
 	return out

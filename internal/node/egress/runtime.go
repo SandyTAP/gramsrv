@@ -34,7 +34,10 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	if err := validateEgressConfig(cfg); err != nil {
 		return err
 	}
-	instanceID := config.ResolveInstanceID(cfg.InstanceID)
+	instanceID, err := config.RequireInstanceID(cfg.InstanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance id: %w", err)
+	}
 	if err := common.ConfigureProcessGlobals(cfg); err != nil {
 		return err
 	}
@@ -51,7 +54,9 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 		zap.Int("outbox_batch", cfg.OutboxBatch),
 		zap.Duration("outbox_lease_timeout", cfg.OutboxLeaseTimeout),
 		zap.Duration("outbound_push_timeout", cfg.OutboundPushTimeout),
-		zap.String("egress_ack_grpc_addr", cfg.EgressAckGRPCAddr),
+		zap.Duration("delivery_attempt_timeout", cfg.DeliveryAttemptTimeout),
+		zap.Duration("delivery_clock_skew_allowance", cfg.DeliveryClockSkewAllowance),
+		zap.String("egress_delivery_grpc_addr", cfg.EgressDeliveryGRPCAddr),
 	)
 
 	ctx, stop, metricRegistry := common.StartRuntimeSupport(cfg, logger)
@@ -104,30 +109,35 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	updateEventStore := postgres.NewUpdateEventStore(pool, postgres.WithUpdateEventLogger(logger.Named("store").Named("updates")))
 	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(cfg.OutboxLeaseTimeout))
 	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool, postgres.WithDeliveryLeaseTimeout(cfg.OutboxLeaseTimeout))
+	channelDeliveryStore := postgres.NewChannelDeliveryStore(pool)
 	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
-	if _, err := egresssvc.StartGRPCAck(ctx, egresssvc.GRPCAckServerConfig{
-		Addr:            cfg.EgressAckGRPCAddr,
+	if _, err := egresssvc.StartGRPCDelivery(ctx, egresssvc.GRPCDeliveryServerConfig{
+		Addr:            cfg.EgressDeliveryGRPCAddr,
 		InstanceID:      instanceID,
-		Token:           cfg.EgressAckToken,
-		TLSCertFile:     cfg.EgressAckGRPCTLSCertFile,
-		TLSKeyFile:      cfg.EgressAckGRPCTLSKeyFile,
-		TLSClientCAFile: cfg.EgressAckGRPCTLSClientCAFile,
+		Token:           cfg.EgressDeliveryToken,
+		TLSCertFile:     cfg.EgressDeliveryGRPCTLSCertFile,
+		TLSKeyFile:      cfg.EgressDeliveryGRPCTLSKeyFile,
+		TLSClientCAFile: cfg.EgressDeliveryGRPCTLSClientCAFile,
 		Store:           dispatchOutboxStore,
 		DeliveryStore:   deliveryOutboxStore,
-		Logger:          logger.Named("egress").Named("ack").Named("grpc"),
+		ChannelStore:    channelDeliveryStore,
+		Logger:          logger.Named("egress").Named("delivery").Named("grpc"),
 	}); err != nil {
-		return fmt.Errorf("start egress ack grpc: %w", err)
+		return fmt.Errorf("start egress delivery grpc: %w", err)
 	}
-	deliverer := edgecontrol.NewOutboxFabric(edgecontrol.OutboxFabricConfig{
+	registry := redisregistry.New(rdb)
+	bus := redisbus.New(rdb)
+	deliverer := edgecontrol.NewDeliveryFabric(edgecontrol.DeliveryFabricConfig{
 		InstanceID:     instanceID,
-		Registry:       redisregistry.New(rdb),
-		Bus:            redisbus.New(rdb),
+		Registry:       registry,
+		Bus:            bus,
 		CommandTimeout: cfg.OutboundPushTimeout,
 	})
+	defer deliverer.Close()
 	welcomeEdgeControl, err := edgecontrol.NewControlFabricController(
 		edgecontrol.NewNoLocalController(),
 		edgecontrol.NewSessionControlFabric(edgecontrol.SessionControlFabricConfig{
-			InstanceID: instanceID, Registry: redisregistry.New(rdb), Bus: redisbus.New(rdb),
+			InstanceID: instanceID, Registry: registry, Bus: bus,
 			CommandTimeout: cfg.OutboundPushTimeout,
 		}),
 	)
@@ -145,41 +155,48 @@ func runWithConfig(logger *zap.Logger, cfg config.EgressConfig, buildMeta common
 	go outboxReadyListener.Run(ctx, wakes.wakeDispatchOutbox)
 	deliveryReadyListener := postgres.NewEdgeDeliveryOutboxReadyListener(cfg.PostgresDSN, logger.Named("egress").Named("delivery-ready-listener"))
 	go deliveryReadyListener.Run(ctx, wakes.wakeEdgeDeliveryOutbox)
-	service, err := egresssvc.NewService(updateEventStore, dispatchOutboxStore, deliverer, projection.projector.BuildOutboxUpdateBytes, metricRegistry, logger.Named("egress"), egresssvc.Config{
-		Workers:     cfg.OutboxWorkers,
-		Batch:       cfg.OutboxBatch,
-		PushTimeout: cfg.OutboundPushTimeout,
-	})
+	channelReadyListener := postgres.NewChannelDeliveryReadyListener(cfg.PostgresDSN, logger.Named("egress").Named("channel-ready-listener"))
+	go channelReadyListener.Run(ctx, wakes.wakeChannelDelivery)
+	service, err := egresssvc.NewService(
+		updateEventStore,
+		dispatchOutboxStore,
+		deliveryOutboxStore,
+		channelDeliveryStore,
+		deliverer,
+		projection.projector.BuildOutboxUpdateBytes,
+		projection.projector.BuildChannelUpdateBytes,
+		metricRegistry,
+		logger.Named("egress"),
+		egresssvc.Config{
+			InstanceID: instanceID, Workers: cfg.OutboxWorkers, Batch: cfg.OutboxBatch,
+			LeaseDuration:              cfg.OutboxLeaseTimeout,
+			DeliveryAttemptTimeout:     cfg.DeliveryAttemptTimeout,
+			DeliveryClockSkewAllowance: cfg.DeliveryClockSkewAllowance,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("init egress service: %w", err)
-	}
-	deliveryService, err := egresssvc.NewDeliveryService(deliveryOutboxStore, deliverer, metricRegistry, logger.Named("egress").Named("delivery"), egresssvc.Config{
-		Workers:     cfg.OutboxWorkers,
-		Batch:       cfg.OutboxBatch,
-		PushTimeout: cfg.OutboundPushTimeout,
-	})
-	if err != nil {
-		return fmt.Errorf("init edge delivery service: %w", err)
 	}
 	logger.Info("telesrv egress ready",
 		zap.String("instance_id", instanceID),
 		zap.Int("pid", os.Getpid()),
 		zap.String("git_commit", buildMeta.Commit),
 		zap.Uint("schema_version", migrationStatus.Version),
-		zap.String("egress_ack_grpc_addr", cfg.EgressAckGRPCAddr),
+		zap.String("egress_delivery_grpc_addr", cfg.EgressDeliveryGRPCAddr),
 	)
-	go deliveryService.RunWithWake(ctx, wakes.edgeDeliveryOutbox)
 	go welcomeDispatcher.Run(ctx)
-	service.RunWithWake(ctx, wakes.dispatchOutbox)
+	service.RunWithWake(ctx, egresssvc.WakeSources{
+		AccountPTS: wakes.dispatchOutbox, AccountNonPTS: wakes.edgeDeliveryOutbox, ChannelPTS: wakes.channelDelivery,
+	})
 	return nil
 }
 
 func validateEgressConfig(cfg config.EgressConfig) error {
-	if strings.TrimSpace(cfg.EgressAckGRPCAddr) == "" {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_ADDR is required by cmd/telesrv-egress")
+	if strings.TrimSpace(cfg.EgressDeliveryGRPCAddr) == "" {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_ADDR is required by cmd/telesrv-egress")
 	}
-	if strings.TrimSpace(cfg.EgressAckToken) == "" {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_TOKEN is required by cmd/telesrv-edge and cmd/telesrv-egress")
+	if strings.TrimSpace(cfg.EgressDeliveryToken) == "" {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_TOKEN is required by cmd/telesrv-edge and cmd/telesrv-egress")
 	}
 	return nil
 }
@@ -187,18 +204,23 @@ func validateEgressConfig(cfg config.EgressConfig) error {
 type egressWakeLanes struct {
 	dispatchOutbox         <-chan struct{}
 	edgeDeliveryOutbox     <-chan struct{}
+	channelDelivery        <-chan struct{}
 	wakeDispatchOutbox     func()
 	wakeEdgeDeliveryOutbox func()
+	wakeChannelDelivery    func()
 }
 
 func newEgressWakeLanes() egressWakeLanes {
 	dispatchOutbox, wakeDispatchOutbox := newWakeLane()
 	edgeDeliveryOutbox, wakeEdgeDeliveryOutbox := newWakeLane()
+	channelDelivery, wakeChannelDelivery := newWakeLane()
 	return egressWakeLanes{
 		dispatchOutbox:         dispatchOutbox,
 		edgeDeliveryOutbox:     edgeDeliveryOutbox,
+		channelDelivery:        channelDelivery,
 		wakeDispatchOutbox:     wakeDispatchOutbox,
 		wakeEdgeDeliveryOutbox: wakeEdgeDeliveryOutbox,
+		wakeChannelDelivery:    wakeChannelDelivery,
 	}
 }
 

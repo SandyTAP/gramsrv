@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -60,9 +61,10 @@ func newStickersBotTestService(t *testing.T) (*Service, *memory.UserStore, *memo
 	bots := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
 	messages := memory.NewMessageStore(dialogs)
-	creator := &stickersBotFakeCreator{}
 	installer := &stickersBotFakeInstaller{}
-	svc := NewService(users, bots, messages, WithStickerSetCreator(creator), WithUserStickerSets(installer))
+	creator := &stickersBotFakeCreator{installer: installer}
+	svc := NewService(users, bots, messages, WithStickerSetCreator(creator))
+	svc.SetRouterHooks(&stickersBotHookRecorder{})
 	return svc, users, bots, messages, creator, installer
 }
 
@@ -482,11 +484,12 @@ func assertReplyEntityText(t *testing.T, msg domain.Message, typ domain.MessageE
 }
 
 type stickersBotFakeCreator struct {
-	created []domain.CreateStickerSetRequest
-	sets    []domain.StickerSet
-	docs    map[int64]domain.Document
-	adds    []stickersBotAdd
-	removes []stickersBotRemove
+	created   []domain.CreateStickerSetRequest
+	sets      []domain.StickerSet
+	docs      map[int64]domain.Document
+	adds      []stickersBotAdd
+	removes   []stickersBotRemove
+	installer *stickersBotFakeInstaller
 }
 
 type stickersBotAdd struct {
@@ -501,7 +504,7 @@ type stickersBotRemove struct {
 	accessHash int64
 }
 
-func (f *stickersBotFakeCreator) CreateStickerSet(_ context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+func (f *stickersBotFakeCreator) CreateInstalledStickerSet(_ context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	f.created = append(f.created, req)
 	docIDs := make([]int64, 0, len(req.Items))
 	for _, item := range req.Items {
@@ -522,6 +525,15 @@ func (f *stickersBotFakeCreator) CreateStickerSet(_ context.Context, req domain.
 		CreatorUserID: req.CreatorUserID,
 		Count:         len(docIDs),
 		DocumentIDs:   docIDs,
+		Installed:     true,
+		InstalledDate: req.Date,
+	}
+	installation := domain.UserStickerSet{OwnerUserID: req.CreatorUserID, StickerSetID: set.ID, Kind: kind, InstalledDate: req.Date}
+	if _, err := effects(store.StickerSetMutation{Set: set, Installation: &installation}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
+	if f.installer != nil {
+		f.installer.installs = append(f.installer.installs, stickersBotInstall{userID: req.CreatorUserID, setID: set.ID, kind: kind})
 	}
 	f.sets = append(f.sets, set)
 	return set, nil, nil
@@ -559,7 +571,7 @@ func (f *stickersBotFakeCreator) GetDocuments(_ context.Context, ids []int64) ([
 	return out, nil
 }
 
-func (f *stickersBotFakeCreator) AddStickerToSet(_ context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error) {
+func (f *stickersBotFakeCreator) AddStickerToSet(_ context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	f.adds = append(f.adds, stickersBotAdd{userID: actorUserID, ref: ref, item: item})
 	idx := f.indexSet(ref)
 	if idx < 0 || f.sets[idx].CreatorUserID != actorUserID {
@@ -570,11 +582,14 @@ func (f *stickersBotFakeCreator) AddStickerToSet(_ context.Context, actorUserID 
 		set.DocumentIDs = append(set.DocumentIDs, item.DocumentID)
 		set.Count = len(set.DocumentIDs)
 	}
+	if _, err := effects(store.StickerSetMutation{Set: set}); err != nil {
+		return domain.StickerSet{}, nil, err
+	}
 	f.sets[idx] = set
 	return set, nil, nil
 }
 
-func (f *stickersBotFakeCreator) RemoveStickerFromSet(_ context.Context, actorUserID int64, documentID int64, accessHash int64) (domain.StickerSet, []domain.Document, error) {
+func (f *stickersBotFakeCreator) RemoveStickerFromSet(_ context.Context, actorUserID int64, documentID int64, accessHash int64, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	f.removes = append(f.removes, stickersBotRemove{userID: actorUserID, documentID: documentID, accessHash: accessHash})
 	for i, set := range f.sets {
 		if set.CreatorUserID != actorUserID {
@@ -586,6 +601,9 @@ func (f *stickersBotFakeCreator) RemoveStickerFromSet(_ context.Context, actorUs
 			}
 			set.DocumentIDs = append(append([]int64(nil), set.DocumentIDs[:idx]...), set.DocumentIDs[idx+1:]...)
 			set.Count = len(set.DocumentIDs)
+			if _, err := effects(store.StickerSetMutation{Set: set}); err != nil {
+				return domain.StickerSet{}, nil, err
+			}
 			f.sets[i] = set
 			return set, nil, nil
 		}
@@ -628,26 +646,45 @@ type stickersBotInstall struct {
 	kind   domain.StickerSetKind
 }
 
-func (f *stickersBotFakeInstaller) InstallUserStickerSet(_ context.Context, userID int64, setID int64, kind domain.StickerSetKind, _ bool, _ int) error {
-	f.installs = append(f.installs, stickersBotInstall{userID: userID, setID: setID, kind: kind})
-	return nil
-}
-
 type stickersBotHookRecorder struct {
 	userID int64
 	kind   domain.StickerSetKind
 }
 
+func (h *stickersBotHookRecorder) InvalidateStickerSetCatalog(domain.StickerSetKind) {}
+
 func (h *stickersBotHookRecorder) RevokeBotSessions(context.Context, int64) error {
 	return nil
 }
 
-func (h *stickersBotHookRecorder) PushBotCommandsChanged(context.Context, int64, []domain.BotCommand) {
+func (h *stickersBotHookRecorder) BotLifecycleDeliveryEffects(context.Context) store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot] {
+	return appBotLifecycleEffects
 }
 
-func (h *stickersBotHookRecorder) PushStickerSetsChanged(_ context.Context, userID int64, kind domain.StickerSetKind) {
-	h.userID = userID
-	h.kind = kind
+func (h *stickersBotHookRecorder) BotInfoDeliveryEffects(context.Context) store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot] {
+	return appBotInfoEffects
+}
+
+func (h *stickersBotHookRecorder) BotCommandsDeliveryEffects(context.Context) store.DeliveryEffectsBuilder[store.BotCommandsDeliverySnapshot] {
+	return func(snapshot store.BotCommandsDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, len(snapshot.Audience))
+		for i, viewerID := range snapshot.Audience {
+			effects[i] = store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: viewerID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})
+		}
+		return effects, nil
+	}
+}
+
+func (h *stickersBotHookRecorder) StickerSetDeliveryEffects(_ context.Context, userID int64) store.DeliveryEffectsBuilder[store.StickerSetMutation] {
+	return func(snapshot store.StickerSetMutation) ([]store.DeliveryEffect, error) {
+		h.userID = userID
+		h.kind = snapshot.Set.Kind
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
 }
 
 func TestNormalizeStickersBotShortNameAcceptsHostBasedAppLinks(t *testing.T) {

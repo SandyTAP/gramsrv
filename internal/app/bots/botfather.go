@@ -15,6 +15,7 @@ import (
 	telegramloginapp "telesrv/internal/app/telegramlogin"
 	"telesrv/internal/branding"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // BotFather 对话状态机：用户发给 BotFather 的每条私聊消息经 app/messages 的
@@ -434,7 +435,11 @@ func (s *Service) handleNewBotName(ctx context.Context, state domain.BotChatStat
 }
 
 func (s *Service) handleNewBotUsername(ctx context.Context, state domain.BotChatState, username string) botReply {
-	u, token, err := s.CreateBot(ctx, state.UserID, state.Draft["name"], username)
+	var effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]
+	if s.hooks != nil {
+		effects = s.hooks.BotLifecycleDeliveryEffects(ctx)
+	}
+	u, token, err := s.CreateBotWithDelivery(ctx, state.UserID, state.Draft["name"], username, effects)
 	switch {
 	case errors.Is(err, domain.ErrBotUsernameInvalid):
 		return botReply{Text: "Sorry, this username is invalid. A bot username must be 5-32 characters long, start with a letter, contain only Latin letters, digits and underscores, and end in 'bot' (e.g. tetris_bot)."}
@@ -603,15 +608,19 @@ func (s *Service) handleSetValue(ctx context.Context, state domain.BotChatState,
 		reply botReply
 		err   error
 	)
+	var infoEffects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	if s.hooks != nil && (state.Command == botFatherCmdSetName || state.Command == botFatherCmdSetDescription || state.Command == botFatherCmdSetAbout) {
+		infoEffects = s.hooks.BotInfoDeliveryEffects(ctx)
+	}
 	switch state.Command {
 	case botFatherCmdSetName:
-		_, err = s.SetBotInfo(ctx, botID, domain.BotInfoUpdate{SetName: true, Name: text})
+		_, err = s.SetBotInfoWithDelivery(ctx, botID, domain.BotInfoUpdate{SetName: true, Name: text}, infoEffects)
 		reply = okReply(err, fmt.Sprintf("Success! Name updated for @%s.", username), "Sorry, that name is invalid. Please try a different one.")
 	case botFatherCmdSetDescription:
-		_, err = s.SetBotInfo(ctx, botID, domain.BotInfoUpdate{SetDescription: true, Description: text})
+		_, err = s.SetBotInfoWithDelivery(ctx, botID, domain.BotInfoUpdate{SetDescription: true, Description: text}, infoEffects)
 		reply = okReply(err, "Success! Description updated.", "Sorry, that description is too long.")
 	case botFatherCmdSetAbout:
-		_, err = s.SetBotInfo(ctx, botID, domain.BotInfoUpdate{SetAbout: true, About: text})
+		_, err = s.SetBotInfoWithDelivery(ctx, botID, domain.BotInfoUpdate{SetAbout: true, About: text}, infoEffects)
 		reply = okReply(err, "Success! About section updated.", "Sorry, that about text is too long.")
 	case botFatherCmdSetCommands:
 		reply, err = s.applySetCommands(ctx, botID, text)

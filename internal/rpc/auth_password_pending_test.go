@@ -83,8 +83,9 @@ func TestAuthRecoverPasswordCompletesPendingSignIn(t *testing.T) {
 		Auth: auth,
 		Account: appaccount.NewService(passwords,
 			appaccount.WithLoginEmailVerification(memory.NewCodeStore(), sender, time.Minute, 3, 6)),
-		Users:    staticUsersService{user: domain.User{ID: userID, AccessHash: 7, Phone: "15550000042", FirstName: "Alice"}},
-		Sessions: sessions,
+		Users:          staticUsersService{user: domain.User{ID: userID, AccessHash: 7, Phone: "15550000042", FirstName: "Alice"}},
+		Sessions:       sessions,
+		DeliveryOutbox: memory.NewDeliveryOutboxStore(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	if _, err := router.onAuthRequestPasswordRecovery(ctx); err != nil {
@@ -99,6 +100,9 @@ func TestAuthRecoverPasswordCompletesPendingSignIn(t *testing.T) {
 	if auth.completePasswordCount != 1 || auth.completedPasswordKey != authKeyID || auth.completedPasswordUser != userID {
 		t.Fatalf("CompletePasswordSignIn count=%d key=%x user=%d, want one call for %x/%d",
 			auth.completePasswordCount, auth.completedPasswordKey, auth.completedPasswordUser, authKeyID, userID)
+	}
+	if len(auth.authorizationEffects) != 1 || auth.authorizationEffects[0].ExcludeAuthKeyID != authKeyID || auth.authorizationEffects[0].ExcludeSessionID != 77 {
+		t.Fatalf("password authorization effects = %+v, want pending raw key/session exclusion", auth.authorizationEffects)
 	}
 	if snap := sessions.snapshot(); snap.userID != userID || !snap.userResolved {
 		t.Fatalf("session user = %d resolved=%v, want %d resolved", snap.userID, snap.userResolved, userID)

@@ -587,65 +587,6 @@ func TestAccountProfileMutationResponsesKeepVectorOnlyUsernames(t *testing.T) {
 	}
 }
 
-func TestPremiumStatusProjectionSkipsOfflineUsernameRead(t *testing.T) {
-	const userID = int64(1000000888)
-	registry := newFakeUsernameRegistry()
-	registry.byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: userID}] = []domain.Username{
-		{Username: "premium_slot", Editable: true, Active: true, SortOrder: 0},
-		{Username: "premium_collectible", Active: true, SortOrder: 1, CollectibleID: 88},
-	}
-	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Sessions: sessions, Usernames: registry}, zaptest.NewLogger(t), clock.System)
-	u := domain.User{ID: userID, FirstName: "Premium", Username: "premium_slot"}
-
-	r.pushPremiumStatusUpdate(context.Background(), u)
-	if registry.peerCalls != 0 || sessions.lastUserPush() != nil {
-		t.Fatalf("offline premium push = registry reads:%d message:%T, want no work", registry.peerCalls, sessions.lastUserPush())
-	}
-
-	sessions.onlineUserIDs = []int64{userID}
-	r.pushPremiumStatusUpdate(context.Background(), u)
-	if registry.peerCalls != 1 {
-		t.Fatalf("online premium username reads = %d, want 1", registry.peerCalls)
-	}
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(updates.Users) != 1 {
-		t.Fatalf("online premium push = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
-	}
-	assertVectorOnlyUsernames(t, "premium status update", updates.Users[0].(*tg.User), []string{"premium_slot", "premium_collectible"})
-}
-
-func TestPremiumStatusProjectionBatchesOnlineUsers(t *testing.T) {
-	registry := newFakeUsernameRegistry()
-	users := []domain.User{
-		{ID: 101, FirstName: "One", Username: "one_slot"},
-		{ID: 102, FirstName: "Two", Username: "two_slot"},
-		{ID: 103, FirstName: "Offline", Username: "offline_slot"},
-	}
-	for _, u := range users {
-		registry.byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: u.ID}] = []domain.Username{
-			{Username: u.Username, Editable: true, Active: true, SortOrder: 0},
-			{Username: u.Username + "_collectible", Active: true, SortOrder: 1, CollectibleID: u.ID},
-		}
-	}
-	sessions := &captureSessions{onlineUserIDs: []int64{101, 102}}
-	r := New(Config{}, Deps{Sessions: sessions, Usernames: registry}, zaptest.NewLogger(t), clock.System)
-
-	r.pushPremiumStatusUpdates(context.Background(), []domain.User{users[0], users[1], users[0], users[2]})
-
-	if registry.batchCalls != 1 || registry.peerCalls != 0 {
-		t.Fatalf("premium batch username reads = batch:%d peer:%d, want 1/0", registry.batchCalls, registry.peerCalls)
-	}
-	if got, want := sessions.pushedUserIDs(), []int64{101, 102}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("premium batch pushed users = %v, want %v", got, want)
-	}
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(updates.Users) != 1 {
-		t.Fatalf("premium batch last push = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
-	}
-	assertVectorOnlyUsernames(t, "premium batch last user", updates.Users[0].(*tg.User), []string{"two_slot", "two_slot_collectible"})
-}
-
 func TestMessageEchoProjectsCompleteUsernamesInOneBatch(t *testing.T) {
 	registry := newFakeUsernameRegistry()
 	f := newUsernameProjectionFixture(t, registry)

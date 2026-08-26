@@ -30,7 +30,10 @@ func Run(logger *zap.Logger) error {
 }
 
 func runWithConfig(ctx context.Context, cfg config.SFUConfig, logger *zap.Logger) error {
-	instanceID := config.ResolveInstanceID(cfg.InstanceID)
+	instanceID, err := config.RequireInstanceID(cfg.InstanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance id: %w", err)
+	}
 	sfuControlURL := resolveControlURL(cfg)
 	sfuAdvertise := cfg.SFUAdvertiseIP
 	if sfuAdvertise == "" {

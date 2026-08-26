@@ -7,6 +7,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onMessagesGetQuickReplies(ctx context.Context, hash int64) (tg.MessagesQuickRepliesClass, error) {
@@ -60,12 +61,11 @@ func (r *Router) onMessagesReorderQuickReplies(ctx context.Context, order []int)
 	if !ok {
 		return false, premiumAccountRequiredErr()
 	}
-	mutation, err := svc.ReorderQuickReplies(ctx, userID, order)
+	_, err = svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountReorder, UserID: userID, Date: int(r.clock.Now().Unix()), Order: order,
+	}, quickReplyAccountDeliveryEffects)
 	if err != nil {
 		return false, businessAutomationErr(err)
-	}
-	if err := r.pushQuickReplyMutation(ctx, userID, mutation); err != nil {
-		return false, err
 	}
 	return true, nil
 }
@@ -82,12 +82,12 @@ func (r *Router) onMessagesEditQuickReplyShortcut(ctx context.Context, req *tg.M
 	if !ok {
 		return false, premiumAccountRequiredErr()
 	}
-	mutation, err := svc.RenameQuickReplyShortcut(ctx, userID, req.ShortcutID, req.Shortcut)
+	_, err = svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountRenameShortcut, UserID: userID, Date: int(r.clock.Now().Unix()),
+		ShortcutID: req.ShortcutID, Shortcut: req.Shortcut,
+	}, quickReplyAccountDeliveryEffects)
 	if err != nil {
 		return false, businessAutomationErr(err)
-	}
-	if err := r.pushQuickReplyMutation(ctx, userID, mutation); err != nil {
-		return false, err
 	}
 	return true, nil
 }
@@ -104,12 +104,11 @@ func (r *Router) onMessagesDeleteQuickReplyShortcut(ctx context.Context, shortcu
 	if !ok {
 		return false, shortcutInvalidErr()
 	}
-	mutation, err := svc.DeleteQuickReplyShortcut(ctx, userID, shortcutID)
+	_, err = svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountDeleteShortcut, UserID: userID, Date: int(r.clock.Now().Unix()), ShortcutID: shortcutID,
+	}, quickReplyAccountDeliveryEffects)
 	if err != nil {
 		return false, businessAutomationErr(err)
-	}
-	if err := r.pushQuickReplyMutation(ctx, userID, mutation); err != nil {
-		return false, err
 	}
 	return true, nil
 }
@@ -242,11 +241,14 @@ func (r *Router) onMessagesDeleteQuickReplyMessages(ctx context.Context, req *tg
 	if !ok {
 		return nil, shortcutInvalidErr()
 	}
-	mutation, err := svc.DeleteQuickReplyMessages(ctx, userID, req.ShortcutID, req.ID)
+	snapshot, err := svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountDeleteMessages, UserID: userID, Date: int(r.clock.Now().Unix()),
+		ShortcutID: req.ShortcutID, MessageIDs: req.ID,
+	}, quickReplyAccountDeliveryEffects)
 	if err != nil {
 		return nil, businessAutomationErr(err)
 	}
-	return r.quickReplyMutationUpdates(ctx, userID, mutation, nil)
+	return r.quickReplyMutationUpdates(ctx, userID, snapshot, nil)
 }
 
 func (r *Router) onMessagesSaveQuickReplyText(ctx context.Context, req *tg.MessagesSendMessageRequest) (tg.UpdatesClass, error) {
@@ -269,18 +271,22 @@ func (r *Router) onMessagesSaveQuickReplyText(ctx context.Context, req *tg.Messa
 	if !ok {
 		return nil, premiumAccountRequiredErr()
 	}
-	mutation, err := svc.SaveQuickReplyText(ctx, userID, shortcut, domain.QuickReplyMessage{
-		RandomID: req.RandomID,
-		Date:     int(r.clock.Now().Unix()),
-		Message:  req.Message,
-		// 快速回复模板与普通发送一致补服务端自动实体（url/@mention/#hashtag/bot command）。
-		Entities: domainMessageEntitiesForViewer(userID, r.augmentAutoEntities(req.Message, req.Entities)),
-	})
+	date := int(r.clock.Now().Unix())
+	snapshot, err := svc.MutateQuickReplies(ctx, store.QuickReplyAccountMutation{
+		Kind: store.QuickReplyAccountSaveText, UserID: userID, Date: date, Shortcut: shortcut,
+		Message: domain.QuickReplyMessage{
+			RandomID: req.RandomID,
+			Date:     date,
+			Message:  req.Message,
+			// 快速回复模板与普通发送一致补服务端自动实体（url/@mention/#hashtag/bot command）。
+			Entities: domainMessageEntitiesForViewer(userID, r.augmentAutoEntities(req.Message, req.Entities)),
+		},
+	}, quickReplyAccountDeliveryEffects)
 	if err != nil {
 		return nil, businessAutomationErr(err)
 	}
-	return r.quickReplyMutationUpdates(ctx, userID, mutation, []tg.UpdateClass{
-		&tg.UpdateMessageID{ID: mutation.Message.ID, RandomID: req.RandomID},
+	return r.quickReplyMutationUpdates(ctx, userID, snapshot, []tg.UpdateClass{
+		&tg.UpdateMessageID{ID: snapshot.Result.Message.ID, RandomID: req.RandomID},
 	})
 }
 
@@ -319,64 +325,44 @@ func (r *Router) quickReplyUsers(ctx context.Context, userID int64) []tg.UserCla
 	return []tg.UserClass{r.tgSelfUserWithUsernames(ctx, self)}
 }
 
-func (r *Router) quickReplyMutationUpdates(ctx context.Context, userID int64, mutation domain.QuickReplyMutation, prefix []tg.UpdateClass) (*tg.Updates, error) {
-	event, err := r.recordQuickReplyMutation(ctx, userID, mutation)
-	if err != nil {
-		return nil, err
-	}
+func (r *Router) quickReplyMutationUpdates(ctx context.Context, userID int64, snapshot store.QuickReplyAccountMutationSnapshot, prefix []tg.UpdateClass) (*tg.Updates, error) {
 	updates := append([]tg.UpdateClass(nil), prefix...)
-	if update := tgOtherUpdateFromEvent(event); update != nil {
-		updates = append(updates, update)
+	date := snapshot.Mutation.Date
+	if snapshot.Changed {
+		if len(snapshot.Effects) != 1 {
+			return nil, internalErr()
+		}
+		event := snapshot.Effects[0].Event
+		if update := tgOtherUpdateFromEvent(event); update != nil {
+			updates = append(updates, update)
+		}
+		updates = appendAuxPtsBookkeeping(updates, event)
+		date = event.Date
 	}
-	updates = appendAuxPtsBookkeeping(updates, event)
-	date := event.Date
 	if date == 0 {
 		date = int(r.clock.Now().Unix())
 	}
 	return &tg.Updates{Updates: updates, Users: r.quickReplyUsers(ctx, userID), Chats: []tg.ChatClass{}, Date: date, Seq: 0}, nil
 }
 
-func (r *Router) pushQuickReplyMutation(ctx context.Context, userID int64, mutation domain.QuickReplyMutation) error {
-	event, err := r.recordQuickReplyMutation(ctx, userID, mutation)
-	if err != nil {
-		return err
+func quickReplyAccountDeliveryEffects(snapshot store.QuickReplyAccountMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if !snapshot.Changed {
+		return nil, nil
 	}
-	updates := make([]tg.UpdateClass, 0, 2)
-	if update := tgOtherUpdateFromEvent(event); update != nil {
-		updates = append(updates, update)
-	}
-	updates = appendAuxPtsBookkeeping(updates, event)
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: updates,
-		Users:   r.quickReplyUsers(ctx, userID),
-		Chats:   []tg.ChatClass{},
-		Date:    event.Date,
-		Seq:     0,
-	})
-	return nil
-}
-
-func (r *Router) recordQuickReplyMutation(ctx context.Context, userID int64, mutation domain.QuickReplyMutation) (domain.UpdateEvent, error) {
-	if r.deps.Updates == nil {
-		return quickReplyEventFromMutation(userID, mutation, int(r.clock.Now().Unix())), nil
-	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	event, _, err := r.deps.Updates.RecordQuickReplyMutation(ctx, authKeyID, userID, mutation, rawAuthKeyIDForOrigin(ctx), sessionID)
-	if err != nil {
-		return domain.UpdateEvent{}, internalErr()
-	}
-	return event, nil
+	event := quickReplyEventFromMutation(snapshot.Mutation.UserID, snapshot.Result, snapshot.Mutation.Date)
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(snapshot.Mutation.UserID, event, [8]byte{}, 0)}, nil
 }
 
 func quickReplyEventFromMutation(userID int64, mutation domain.QuickReplyMutation, date int) domain.UpdateEvent {
 	event := domain.UpdateEvent{
-		UserID:     userID,
-		Date:       date,
-		QuickReply: mutation.QuickReply,
-		MaxID:      mutation.ShortcutID,
-		MessageIDs: append([]int(nil), mutation.MessageIDs...),
+		UserID:            userID,
+		Date:              date,
+		PtsCount:          1,
+		QuickReplies:      append([]domain.QuickReply(nil), mutation.List.QuickReplies...),
+		QuickReply:        mutation.QuickReply,
+		QuickReplyMessage: mutation.Message,
+		MaxID:             mutation.ShortcutID,
+		MessageIDs:        append([]int(nil), mutation.MessageIDs...),
 	}
 	switch mutation.Kind {
 	case domain.QuickReplyMutationNew:

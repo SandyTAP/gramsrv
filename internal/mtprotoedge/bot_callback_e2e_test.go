@@ -60,31 +60,35 @@ func newBotCallbackEnv(t *testing.T, ctx context.Context) *botCallbackEnv {
 
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
 	langPackStore := memory.NewLangPackStore()
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	botStore := memory.NewBotStore(userStore)
+	botStore.AttachDeliveryDependencies(dialogStore, deliveryOutbox)
 	botsService := botsapp.NewService(userStore, botStore, messageStore,
 		botsapp.WithLogger(zaptest.NewLogger(t).Named("bots")))
 	activeSessions := NewSessionManager(zaptest.NewLogger(t).Named("sessions"))
 	deps := rpc.Deps{
 		Auth: auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore,
 			memory.NewTempAuthKeyBindingStore(authKeyStore), "12345", auth.WithBotLogin(botStore)),
-		Account:       account.NewService(memory.NewPasswordStore()),
-		Help:          help.NewService(helpStore, helpStore),
-		Users:         users.NewService(userStore),
-		Updates:       updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		Contacts:      contacts.NewService(memory.NewContactStore()),
-		Dialogs:       dialogs.NewService(dialogStore),
-		Messages:      messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
-		Channels:      appchannels.NewService(memory.NewChannelStore()),
-		Bots:          botsService,
-		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
-		BotCallbacks:  storetest.NewBotCallbackRegistryStore(),
-		LangPack:      langpack.NewService(langPackStore),
-		Sessions:      activeSessions,
+		Account:        account.NewService(memory.NewPasswordStore()),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Contacts:       contacts.NewService(memory.NewContactStore()),
+		Dialogs:        dialogs.NewService(dialogStore),
+		Messages:       messageapp.NewService(messageStore, dialogStore, messageapp.WithBotResponder(botsService)),
+		Channels:       appchannels.NewService(memory.NewChannelStore()),
+		Bots:           botsService,
+		BotAPIUpdates:  memory.NewBotAPIUpdateStore(),
+		BotCallbacks:   storetest.NewBotCallbackRegistryStore(),
+		LangPack:       langpack.NewService(langPackStore),
+		Sessions:       activeSessions,
+		DeliveryOutbox: deliveryOutbox,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(router)
@@ -185,7 +189,7 @@ func TestBotInlineKeyboardCallbackFlow(t *testing.T) {
 	defer cancel()
 	env := newBotCallbackEnv(t, ctx)
 	owner, ownerStorage := registerOwner(t, ctx, env, "+15550004001", "Owner")
-	botUser, botToken, err := env.bots.CreateBot(context.Background(), owner.ID, "CB Bot", "cb_test_bot")
+	botUser, botToken, err := env.bots.CreateBotWithDelivery(context.Background(), owner.ID, "CB Bot", "cb_test_bot", edgeTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -381,7 +385,7 @@ func TestBotStartBotFlow(t *testing.T) {
 	defer cancel()
 	env := newBotCallbackEnv(t, ctx)
 	owner, ownerStorage := registerOwner(t, ctx, env, "+15550004002", "Owner")
-	_, botToken, err := env.bots.CreateBot(context.Background(), owner.ID, "Start Bot", "start_test_bot")
+	_, botToken, err := env.bots.CreateBotWithDelivery(context.Background(), owner.ID, "Start Bot", "start_test_bot", edgeTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}

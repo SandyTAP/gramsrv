@@ -13,29 +13,15 @@ import (
 	"telesrv/internal/domain"
 )
 
-// TestNotifyPeerBotVerificationUserInvalidatesAndPushesUpdateUser is the bot/user
-// half: a newly marked peer must reach every online account that already sees it,
-// through the same non-PTS updateUser shape the scam/fake flags use, and the pushed
-// tg.User must already carry bot_verification_icon:flags2.14.
-func TestNotifyPeerBotVerificationUserInvalidatesAndPushesUpdateUser(t *testing.T) {
+// User mark delivery is committed with the mark transaction. The notifier is
+// intentionally cache-only and must not retain an online-only second path.
+func TestNotifyPeerBotVerificationUserIsCacheOnly(t *testing.T) {
 	const (
-		shopID          = int64(2200000022)
-		onlineViewerID  = int64(1001)
-		offlineViewerID = int64(3003)
-		icon            = int64(9900001)
+		shopID         = int64(2200000022)
+		onlineViewerID = int64(1001)
 	)
-	users := &verifiedNotifyUsers{
-		user:     domain.User{ID: shopID, FirstName: "Shop", AccessHash: 22},
-		found:    true,
-		audience: []int64{shopID, onlineViewerID, offlineViewerID},
-	}
-	verify := newFakeBotVerifications()
-	verify.marks[domain.Peer{Type: domain.PeerTypeUser, ID: shopID}] = domain.CustomVerification{
-		VerifierBotID: 777000123, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: shopID},
-		IconDocumentID: icon, Description: "Verified by Acme Trust",
-	}
 	sessions := &captureSessions{onlineUserIDs: []int64{shopID, onlineViewerID}}
-	r := New(Config{}, Deps{Users: users, Sessions: sessions, BotVerifications: verify}, zap.NewNop(), clock.System)
+	r := New(Config{}, Deps{Sessions: sessions}, zap.NewNop(), clock.System)
 	seedUserFullProjection(t, r, onlineViewerID, shopID)
 	seedUserFullProjection(t, r, shopID, shopID)
 
@@ -51,46 +37,8 @@ func TestNotifyPeerBotVerificationUserInvalidatesAndPushesUpdateUser(t *testing.
 	if _, ok := r.userFullProjectionCache.Lookup(shopID, shopID); ok {
 		t.Fatal("target userFull projection survived the mark change")
 	}
-	if users.adminCalls != 1 {
-		t.Fatalf("authoritative account reads = %d, want 1", users.adminCalls)
-	}
-	// One read for the whole audience: the mark is a peer-wide fact, so the
-	// per-recipient push builder must not query it again for every recipient.
-	if verify.peerCalls != 1 || verify.batchCalls != 0 {
-		t.Fatalf("verification reads = peer %d / batch %d, want peer 1 / batch 0",
-			verify.peerCalls, verify.batchCalls)
-	}
-
-	// Offline audience members are skipped; they converge through the bumped peer
-	// read model on their next getDifference / getUsers.
-	pushed := sessions.pushedUserIDs()
-	if len(pushed) != 2 || pushed[0] != shopID || pushed[1] != onlineViewerID {
-		t.Fatalf("pushed user ids = %v", pushed)
-	}
-
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(updates.Updates) != 1 {
-		t.Fatalf("updates = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
-	}
-	refresh, ok := updates.Updates[0].(*tg.UpdateUser)
-	if !ok || refresh.UserID != shopID {
-		t.Fatalf("refresh = %T %+v", updates.Updates[0], updates.Updates[0])
-	}
-	if len(updates.Users) != 1 {
-		t.Fatalf("users = %+v", updates.Users)
-	}
-	pushedUser := &tg.User{}
-	tlRoundTrip(t, updates.Users[0].(*tg.User), pushedUser)
-	got, ok := pushedUser.GetBotVerificationIcon()
-	if !ok || got != icon {
-		t.Fatalf("pushed user bot_verification_icon = %d ok=%v, want %d on flags2.14", got, ok, icon)
-	}
-	if !pushedUser.Flags2.Has(14) {
-		t.Fatalf("pushed user flags2 = %032b, want bit 14", uint32(pushedUser.Flags2))
-	}
-	// The official checkmark is a separate mechanism and must not be implied.
-	if pushedUser.Verified || pushedUser.Scam || pushedUser.Fake {
-		t.Fatalf("mark push leaked moderation flags: %+v", pushedUser)
+	if pushed := sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("post-commit bot-verification hook pushed %v", pushed)
 	}
 }
 
@@ -240,10 +188,9 @@ func TestNotifyPeerBotVerificationWithoutServicesStillInvalidates(t *testing.T) 
 // TestNotifyPeerBotVerificationRejectsUnknownPeers pins the "explain, never panic"
 // contract for every peer the hook cannot act on.
 func TestNotifyPeerBotVerificationRejectsUnknownPeers(t *testing.T) {
-	users := &verifiedNotifyUsers{}
 	channels := &verifiedNotifyChannels{}
 	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Users: users, Channels: channels, Sessions: sessions}, zap.NewNop(), clock.System)
+	r := New(Config{}, Deps{Channels: channels, Sessions: sessions}, zap.NewNop(), clock.System)
 	ctx := context.Background()
 
 	for _, tc := range []struct {
@@ -255,7 +202,6 @@ func TestNotifyPeerBotVerificationRejectsUnknownPeers(t *testing.T) {
 		{"negative id", domain.Peer{Type: domain.PeerTypeChannel, ID: -1}, "invalid peer id"},
 		{"community peer", domain.Peer{Type: domain.PeerTypeCommunity, ID: 5005}, "unsupported peer type"},
 		{"empty type", domain.Peer{ID: 5005}, "unsupported peer type"},
-		{"missing user", domain.Peer{Type: domain.PeerTypeUser, ID: 2002}, "user 2002 not found"},
 		{"missing channel", domain.Peer{Type: domain.PeerTypeChannel, ID: 4004}, "channel 4004 not found"},
 	} {
 		err := r.NotifyPeerBotVerification(ctx, tc.peer)
@@ -298,38 +244,32 @@ func TestNotifyPeerBotVerificationReportsLookupFailures(t *testing.T) {
 	}
 }
 
-// TestSetCustomVerificationNotifiesAudience closes the loop: a successful
-// bots.setCustomVerification must itself drop the projections and push the refresh,
-// so the badge appears in a running client without a second RPC.
-func TestSetCustomVerificationNotifiesAudience(t *testing.T) {
+// The RPC fake mirrors the app/store contract: a user mark cannot become
+// visible unless its durable updateUser effect was built in the same mutation.
+func TestSetCustomVerificationBuildsDurableAudienceEffect(t *testing.T) {
 	fake := newFakeBotVerifications()
 	f := newBotVerificationFixture(t, fake)
-	// Production wiring: the service holds the router as its PeerNotifier, so the
-	// push happens once, in the service, for every driver of a mark change.
-	fake.notifier = f.router
 	f.enableVerifier(f.bot.ID, 9900003, true)
 	sessions := &captureSessions{onlineUserIDs: []int64{f.owner.ID, f.target.ID}}
 	f.router.deps.Sessions = sessions
-	seedUserFullProjection(t, f.router, f.owner.ID, f.target.ID)
 
 	ok, err := f.router.onBotsSetCustomVerification(WithUserID(context.Background(), f.owner.ID),
 		setCustomVerificationRequest(inputPeerUser(f.target), inputUser(f.bot), true, ""))
 	if err != nil || !ok {
 		t.Fatalf("grant = %v,%v, want true,nil", ok, err)
 	}
-	if _, cached := f.router.userFullProjectionCache.Lookup(f.owner.ID, f.target.ID); cached {
-		t.Fatal("userFull projection survived the grant")
+	if pushed := sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("grant used post-commit session push: %v", pushed)
 	}
-	if pushed := sessions.pushedUserIDs(); len(pushed) == 0 {
-		t.Fatal("grant pushed no refresh update")
+	if len(fake.deliveryEffects) != 1 || fake.deliveryEffects[0].TargetUserID != f.target.ID {
+		t.Fatalf("durable effects = %+v", fake.deliveryEffects)
 	}
-	updates, isUpdates := sessions.lastUserPush().(*tg.Updates)
-	if !isUpdates || len(updates.Users) == 0 {
-		t.Fatalf("push = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
+	decoded, err := decodeDeliveryUpdate(fake.deliveryEffects[0].Payload)
+	if err != nil {
+		t.Fatalf("decode durable effect: %v", err)
 	}
-	pushedUser := &tg.User{}
-	tlRoundTrip(t, updates.Users[0].(*tg.User), pushedUser)
-	if icon, set := pushedUser.GetBotVerificationIcon(); !set || icon != 9900003 {
-		t.Fatalf("pushed user icon = %d set=%v, want 9900003 on flags2.14", icon, set)
+	updates := decoded.(*tg.Updates)
+	if len(updates.Updates) != 1 || updates.Updates[0].(*tg.UpdateUser).UserID != f.target.ID {
+		t.Fatalf("durable update = %+v", updates.Updates)
 	}
 }

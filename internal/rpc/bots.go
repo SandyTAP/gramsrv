@@ -17,12 +17,11 @@ import (
 //     仅 bot 自己（调用者必须是 bot 账号）。
 //   - setBotInfo/getBotInfo：owner 经 bot:InputUser 代设，或 bot 自己（不带 bot 参数）。
 //
-// P2 范围：仅 default scope、单语言（非 default scope 与非空 lang_code 一律接受
-// 但不存储，避免覆盖全局——见各 handler 的 isDefaultBotCommandScope/lang_code 闸门）；
-// menu button 为 per-bot 全局（per-user 维度记 todo）。元数据写入由 service 在事务内
-// bump bot_info_version；命令变更后 bots_hooks.PushBotCommandsChanged 给在线相关用户
-// 推 updateBotCommands（扇出封顶 100，无 pts），离线/超界用户靠 version bump 在下次
-// getFullUser 重拉兜底。
+// Commands remain default-scope/default-language only. Bot info has a durable
+// per-language overlay with field-level fallback to the default users/bots
+// projection. Bot lifecycle/info/commands mutation, version and their frozen
+// durable non-PTS absolute effects commit at the BotStore aggregate boundary.
+// Menu button remains per-bot global (per-user dimension is separate scope).
 func (r *Router) registerBots(d *tlprofile.Dispatcher) {
 	registerRPC[*tg.BotsSendCustomRequestRequest](d, tlprofile.SemanticMethodBotsSendCustomRequest, func(ctx context.Context, layerRequest *tg.BotsSendCustomRequestRequest) (any, error) {
 		return r.onBotsSendCustomRequest(ctx, layerRequest)
@@ -239,7 +238,7 @@ func (r *Router) onBotsCreateBot(ctx context.Context, req *tg.BotsCreateBotReque
 	if err := r.validateBotManager(ctx, userID, req.ManagerID); err != nil {
 		return nil, err
 	}
-	u, _, err := r.deps.Bots.CreateBot(ctx, userID, req.Name, req.Username)
+	u, _, err := r.deps.Bots.CreateBotWithDelivery(ctx, userID, req.Name, req.Username, r.BotLifecycleDeliveryEffects(ctx))
 	if err != nil {
 		return nil, createBotErr(err)
 	}
@@ -301,11 +300,14 @@ func (r *Router) onBotsSetBotCommands(ctx context.Context, req *tg.BotsSetBotCom
 	if !isDefaultCommandsTarget(req.Scope, req.LangCode) {
 		return true, nil
 	}
-	if _, err := r.deps.Bots.SetBotCommands(ctx, botID, domainBotCommands(req.Commands)); err != nil {
+	version, err := r.deps.Bots.SetBotCommands(ctx, botID, domainBotCommands(req.Commands))
+	if err != nil {
 		return false, setBotCommandsErr(err)
 	}
-	r.invalidateChannelFullBotInfoCache()
-	r.invalidateRPCProjectionForUser(botID)
+	if version > 0 {
+		r.invalidateChannelFullBotInfoCache()
+		r.invalidateRPCProjectionForUser(botID)
+	}
 	return true, nil
 }
 
@@ -317,11 +319,14 @@ func (r *Router) onBotsResetBotCommands(ctx context.Context, req *tg.BotsResetBo
 	if !isDefaultCommandsTarget(req.Scope, req.LangCode) {
 		return true, nil
 	}
-	if _, err := r.deps.Bots.SetBotCommands(ctx, botID, nil); err != nil {
+	version, err := r.deps.Bots.SetBotCommands(ctx, botID, nil)
+	if err != nil {
 		return false, setBotCommandsErr(err)
 	}
-	r.invalidateChannelFullBotInfoCache()
-	r.invalidateRPCProjectionForUser(botID)
+	if version > 0 {
+		r.invalidateChannelFullBotInfoCache()
+		r.invalidateRPCProjectionForUser(botID)
+	}
 	return true, nil
 }
 
@@ -379,11 +384,8 @@ func (r *Router) onBotsSetBotInfo(ctx context.Context, req *tg.BotsSetBotInfoReq
 	if err != nil {
 		return false, err
 	}
-	// 非空 lang_code：本地化 name/about/description 接受但不存储（否则写穿全局列）。
-	if req.LangCode != "" {
-		return true, nil
-	}
 	var upd domain.BotInfoUpdate
+	upd.LangCode = req.LangCode
 	if name, ok := req.GetName(); ok {
 		upd.SetName, upd.Name = true, name
 	}
@@ -393,14 +395,17 @@ func (r *Router) onBotsSetBotInfo(ctx context.Context, req *tg.BotsSetBotInfoReq
 	if description, ok := req.GetDescription(); ok {
 		upd.SetDescription, upd.Description = true, description
 	}
-	if !upd.SetName && !upd.SetAbout && !upd.SetDescription {
+	if !upd.SetName && !upd.SetAbout && !upd.SetDescription && req.LangCode == "" {
 		return true, nil
 	}
-	if _, err := r.deps.Bots.SetBotInfo(ctx, botID, upd); err != nil {
+	version, err := r.deps.Bots.SetBotInfoWithDelivery(ctx, botID, upd, r.BotInfoDeliveryEffects(ctx))
+	if err != nil {
 		return false, setBotInfoErr(err)
 	}
-	r.invalidateChannelFullBotInfoCache()
-	r.invalidateRPCProjectionForUser(botID)
+	if version > 0 {
+		r.invalidateChannelFullBotInfoCache()
+		r.invalidateRPCProjectionForUser(botID)
+	}
 	return true, nil
 }
 
@@ -410,11 +415,11 @@ func (r *Router) onBotsGetBotInfo(ctx context.Context, req *tg.BotsGetBotInfoReq
 	if err != nil {
 		return nil, err
 	}
-	name, about, description, err := r.deps.Bots.GetBotInfo(ctx, botID)
+	values, err := r.deps.Bots.GetBotInfo(ctx, botID, req.LangCode)
 	if err != nil {
 		return nil, internalErr()
 	}
-	return &tg.BotsBotInfo{Name: name, About: about, Description: description}, nil
+	return &tg.BotsBotInfo{Name: values.Name, About: values.About, Description: values.Description}, nil
 }
 
 func (r *Router) onBotsSetBotMenuButton(ctx context.Context, req *tg.BotsSetBotMenuButtonRequest) (bool, error) {

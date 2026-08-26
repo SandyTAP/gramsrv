@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -373,13 +374,51 @@ RETURNING n.id, n.target_user_id, n.frozen_user_id, n.version, n.frozen, n.attem
 	return out, rows.Err()
 }
 
-func (s *AdminStore) CompleteAccountFreezeNotification(ctx context.Context, id, version int64, now time.Time) error {
-	_, err := s.db.Exec(ctx, `
+func (s *AdminStore) CommitAccountFreezeNotificationDelivery(ctx context.Context, id, version int64, payload []byte, now time.Time) error {
+	if s == nil || s.db == nil || id <= 0 || version <= 0 || len(payload) == 0 {
+		return fmt.Errorf("commit account freeze notification delivery: invalid input")
+	}
+	commit := func(tx pgx.Tx) error {
+		var targetUserID int64
+		var status string
+		err := tx.QueryRow(ctx, `
+SELECT target_user_id, status
+FROM account_freeze_notifications
+WHERE id = $1 AND version = $2
+FOR UPDATE`, id, version).Scan(&targetUserID, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("account freeze notification %d version %d is stale", id, version)
+		}
+		if err != nil {
+			return err
+		}
+		if status == "delivered" {
+			return nil
+		}
+		if status != "dispatching" {
+			return fmt.Errorf("account freeze notification %d version %d is not claimed", id, version)
+		}
+		effects := []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: targetUserID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, effects); err != nil {
+			return err
+		}
+		command, err := tx.Exec(ctx, `
 UPDATE account_freeze_notifications
 SET status = 'delivered', lease_until = NULL, last_error = '', updated_at = $3
-WHERE id = $1 AND version = $2`, id, version, now)
-	if err != nil {
-		return fmt.Errorf("complete account freeze notification: %w", err)
+WHERE id = $1 AND version = $2 AND status = 'dispatching'`, id, version, now)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return fmt.Errorf("account freeze notification %d version %d lost completion CAS", id, version)
+		}
+		return nil
 	}
-	return nil
+	if tx, ok := s.db.(pgx.Tx); ok {
+		return commit(tx)
+	}
+	return withTx(ctx, s.db, "commit account freeze notification delivery", commit)
 }

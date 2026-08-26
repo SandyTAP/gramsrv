@@ -3,10 +3,12 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // RevokeAuthorizationAuthKey is the domain-only hook used by the internal Admin API
@@ -23,6 +25,16 @@ func (r *Router) RevokeAuthorizationAuthKey(ctx context.Context, authKeyID [8]by
 	return errors.Join(revokeErr, clearErr)
 }
 
+// InvalidateUserProjection is a process-local cache operation invoked only
+// after an admin aggregate transaction commits. It never produces client
+// delivery; the corresponding absolute updateUser effects are already durable.
+func (r *Router) InvalidateUserProjection(userID int64) {
+	if r == nil || userID <= 0 {
+		return
+	}
+	r.invalidateRPCProjectionForUser(userID)
+}
+
 // NotifyChannelChanged is the domain-only hook used by the internal Admin API
 // after a channel/supergroup base fact changed.
 func (r *Router) NotifyChannelChanged(ctx context.Context, ch domain.Channel) error {
@@ -33,17 +45,30 @@ func (r *Router) NotifyChannelChanged(ctx context.Context, ch domain.Channel) er
 	return nil
 }
 
-// NotifyStarsBalanceChanged is the domain-only hook used by the internal Admin
-// API after the local Stars ledger balance has changed outside a client RPC.
-func (r *Router) NotifyStarsBalanceChanged(ctx context.Context, balance domain.StarsBalance) error {
-	if r == nil || balance.UserID == 0 {
-		return nil
+// StarsBalanceDeliveryEffects encodes the non-PTS absolute balance refresh
+// while the Stars aggregate transaction is still open.
+func (r *Router) StarsBalanceDeliveryEffects(balance domain.StarsBalance) ([]store.DeliveryEffect, error) {
+	return r.starsBalanceDeliveryEffects(balance, [8]byte{}, 0)
+}
+
+func (r *Router) starsBalanceDeliveryEffects(balance domain.StarsBalance, excludeAuthKeyID [8]byte, excludeSessionID int64) ([]store.DeliveryEffect, error) {
+	if r == nil || balance.UserID <= 0 {
+		return nil, fmt.Errorf("stars balance delivery requires a ledger owner")
 	}
-	r.pushUserUpdates(ctx, balance.UserID, &tg.Updates{
+	if (excludeAuthKeyID == ([8]byte{})) != (excludeSessionID == 0) {
+		return nil, fmt.Errorf("stars balance delivery exclusion requires raw auth key and session")
+	}
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateStarsBalance{Balance: &tg.StarsAmount{Amount: balance.Balance}}},
 		Date:    int(r.clock.Now().Unix()),
 	})
-	return nil
+	if err != nil {
+		return nil, err
+	}
+	return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+		TargetUserID: balance.UserID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID, Payload: payload,
+		RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	})}, nil
 }
 
 // NotifyAccountFreezeChanged invalidates target-scoped projections immediately

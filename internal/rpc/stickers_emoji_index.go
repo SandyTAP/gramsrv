@@ -46,29 +46,32 @@ func newEmojiStickerIndex(now func() time.Time) *emojiStickerIndex {
 // lookup 返回某 emoji 的贴纸文档 id；索引未建或过期时用 build 重建。
 // perf：重建在锁外执行（build 读目录缓存，I/O 不在临界区），避免 TTL 过期点把所有
 // 并发请求堵在互斥锁上。并发 stale 请求可能各自 build 一次（目录缓存自身 singleflight
-// 去重 PG，pack 遍历重复但廉价）。build 返回 nil（如目录读失败）时保留旧索引。
-func (idx *emojiStickerIndex) lookup(emoticon string, build func() map[string][]int64) []int64 {
+// 去重 PG，pack 遍历重复但廉价）。重建失败直接返回错误，不以旧索引伪装成功。
+func (idx *emojiStickerIndex) lookup(emoticon string, build func() (map[string][]int64, error)) ([]int64, error) {
 	idx.mu.RLock()
 	fresh := idx.ready && idx.now().Sub(idx.builtAt) < idx.ttl
 	if fresh {
 		out := append([]int64(nil), idx.byEmoji[emoticon]...)
 		idx.mu.RUnlock()
-		return out
+		return out, nil
 	}
 	idx.mu.RUnlock()
 
-	next := build() // 锁外重建
+	next, err := build() // 锁外重建
+	if err != nil {
+		return nil, err
+	}
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	// 复查：可能已有并发者在锁外重建并先一步换入。
 	stillStale := !idx.ready || idx.now().Sub(idx.builtAt) >= idx.ttl
-	if stillStale && next != nil {
+	if stillStale {
 		idx.byEmoji = next
 		idx.builtAt = idx.now()
 		idx.ready = true
 	}
-	return append([]int64(nil), idx.byEmoji[emoticon]...)
+	return append([]int64(nil), idx.byEmoji[emoticon]...), nil
 }
 
 // normalizeStickerEmoticon 去掉变体选择符（U+FE0F/U+FE0E）并裁剪空白，使客户端发的
@@ -103,13 +106,19 @@ func normalizeStickerSearchEmoticon(e string) string {
 }
 
 func (r *Router) onMessagesGetStickers(ctx context.Context, req *tg.MessagesGetStickersRequest) (tg.MessagesStickersClass, error) {
-	if req == nil || r.deps.Files == nil || r.emojiStickers == nil {
-		return &tg.MessagesStickers{Hash: 0, Stickers: []tg.DocumentClass{}}, nil
+	if req == nil {
+		return nil, inputRequestInvalidErr()
+	}
+	if r.deps.Files == nil || r.emojiStickers == nil {
+		return nil, internalErr()
 	}
 	searchKey := normalizeStickerSearchEmoticon(req.Emoticon)
-	docIDs := r.emojiStickers.lookup(searchKey, func() map[string][]int64 {
+	docIDs, err := r.emojiStickers.lookup(searchKey, func() (map[string][]int64, error) {
 		return r.buildEmojiStickerIndex(ctx)
 	})
+	if err != nil {
+		return nil, internalErr()
+	}
 	limit := maxStickersPerEmoji
 	if searchKey == greetingStickerCategoryKey {
 		limit = maxGreetingStickers
@@ -133,6 +142,9 @@ func (r *Router) onMessagesGetStickers(ctx context.Context, req *tg.MessagesGetS
 		return nil, internalErr()
 	}
 	byID := documentsByID(docs)
+	if !allDocumentsResolved(docIDs, byID) {
+		return nil, internalErr()
+	}
 	ordered := make([]domain.Document, 0, len(docIDs))
 	for _, id := range docIDs { // 保持索引顺序
 		if d, ok := byID[id]; ok {
@@ -143,12 +155,11 @@ func (r *Router) onMessagesGetStickers(ctx context.Context, req *tg.MessagesGetS
 }
 
 // buildEmojiStickerIndex 从所有（未归档）常规贴纸集的 Packs 构建 emoji→去重有序 docIDs。
-// 返回 nil 表示构建失败（保留旧索引）。
-func (r *Router) buildEmojiStickerIndex(ctx context.Context) map[string][]int64 {
+func (r *Router) buildEmojiStickerIndex(ctx context.Context) (map[string][]int64, error) {
 	// perf：从目录缓存读集（与 getAllStickers/featured 共用，TTL 内不打 PG）。
-	sets := r.stickerCatalogSets(ctx, domain.StickerSetKindStickers)
-	if sets == nil {
-		return nil // 目录读失败：保留旧索引（nil=不替换）
+	sets, err := r.stickerCatalogSets(ctx, domain.StickerSetKindStickers)
+	if err != nil {
+		return nil, err
 	}
 	byEmoji := make(map[string][]int64)
 	seen := make(map[string]map[int64]struct{})
@@ -201,5 +212,5 @@ func (r *Router) buildEmojiStickerIndex(ctx context.Context) map[string][]int64 
 			}
 		}
 	}
-	return byEmoji
+	return byEmoji, nil
 }

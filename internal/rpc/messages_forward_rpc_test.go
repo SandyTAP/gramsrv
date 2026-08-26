@@ -240,7 +240,7 @@ func TestMessagesForwardMessagesLoadsPrivateSourcesInSingleBatch(t *testing.T) {
 	}
 }
 
-func TestMessagesForwardMessagesChannelReplayDoesNotRepeatRealtimePayload(t *testing.T) {
+func TestMessagesForwardMessagesChannelReplayDoesNotPushDurablePayloadFromCore(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
 	owner, err := users.Create(ctx, domain.User{AccessHash: 51, Phone: "15550004011", FirstName: "Owner"})
@@ -275,8 +275,6 @@ func TestMessagesForwardMessagesChannelReplayDoesNotRepeatRealtimePayload(t *tes
 		Channels: channels,
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
-	cancelFanout := startChannelFanoutForTest(t, r)
-	defer cancelFanout()
 	reqCtx := WithSessionID(WithRawAuthKeyID(WithUserID(ctx, owner.ID), [8]byte{1}), 71)
 	to := &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
 	from := &tg.InputPeerUser{UserID: source.ID, AccessHash: source.AccessHash}
@@ -285,16 +283,8 @@ func TestMessagesForwardMessagesChannelReplayDoesNotRepeatRealtimePayload(t *tes
 	if _, err := r.onMessagesForwardMessages(reqCtx, firstReq); err != nil {
 		t.Fatalf("first forward: %v", err)
 	}
-	firstPushes := len(waitForPushedUserIDs(t, sessions, 1))
-	if firstPushes == 0 {
-		t.Fatal("first forward produced no realtime payload")
-	}
-
 	if _, err := r.onMessagesForwardMessages(reqCtx, firstReq); err != nil {
 		t.Fatalf("full replay: %v", err)
-	}
-	if got := len(sessions.pushedUserIDs()); got != firstPushes {
-		t.Fatalf("full replay realtime pushes = %d, want unchanged %d", got, firstPushes)
 	}
 
 	mixedReq := &tg.MessagesForwardMessagesRequest{
@@ -303,15 +293,16 @@ func TestMessagesForwardMessagesChannelReplayDoesNotRepeatRealtimePayload(t *tes
 		ID:       []int{7, 5},
 		RandomID: []int64{7001, 5001},
 	}
-	if _, err := r.onMessagesForwardMessages(reqCtx, mixedReq); err != nil {
+	mixed, err := r.onMessagesForwardMessages(reqCtx, mixedReq)
+	if err != nil {
 		t.Fatalf("mixed replay: %v", err)
 	}
-	if got := len(waitForPushedUserIDs(t, sessions, firstPushes+1)); got != firstPushes+1 {
-		t.Fatalf("mixed replay realtime pushes = %d, want %d", got, firstPushes+1)
+	if got := len(sessions.pushedUserIDs()); got != 0 {
+		t.Fatalf("Core pushed durable channel forward directly: %d", got)
 	}
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
+	updates, ok := mixed.(*tg.Updates)
 	if !ok {
-		t.Fatalf("mixed replay realtime payload = %T, want *tg.Updates", sessions.lastUserPush())
+		t.Fatalf("mixed replay echo = %T, want *tg.Updates", mixed)
 	}
 	newMessages := 0
 	for _, update := range updates.Updates {
@@ -319,8 +310,8 @@ func TestMessagesForwardMessagesChannelReplayDoesNotRepeatRealtimePayload(t *tes
 			newMessages++
 		}
 	}
-	if newMessages != 1 {
-		t.Fatalf("mixed replay realtime new-message updates = %d, want only newly committed item", newMessages)
+	if newMessages != 2 {
+		t.Fatalf("mixed replay echo new-message updates = %d, want replay plus newly committed item", newMessages)
 	}
 }
 

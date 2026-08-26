@@ -19,7 +19,7 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	set, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	set, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Fresh Pack",
 		ShortName:     "fresh_pack",
@@ -42,7 +42,7 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 		DocumentAccessHash: 1002,
 		Emoji:              "😄",
 		Keywords:           "smile, fresh",
-	})
+	}, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("add sticker: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 		t.Fatalf("added doc sticker ref = %d/%d/%v, want %d/%d/true", id, hash, ok, set.ID, set.AccessHash)
 	}
 
-	set, docs, err = svc.ChangeStickerPosition(ctx, 1000000001, 102, 1002, 0)
+	set, docs, err = svc.ChangeStickerPosition(ctx, 1000000001, 102, 1002, 0, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("change sticker position: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 		t.Fatalf("returned docs after move = %+v, want 102 then 101", docs)
 	}
 
-	set, docs, err = svc.RenameStickerSet(ctx, 1000000001, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID, AccessHash: set.AccessHash}, "Renamed Pack")
+	set, docs, err = svc.RenameStickerSet(ctx, 1000000001, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID, AccessHash: set.AccessHash}, "Renamed Pack", testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("rename sticker set: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 		t.Fatalf("renamed set=%+v docs=%d, want renamed with docs intact", set, len(docs))
 	}
 
-	set, docs, err = svc.RemoveStickerFromSet(ctx, 1000000001, 102, 1002)
+	set, docs, err = svc.RemoveStickerFromSet(ctx, 1000000001, 102, 1002, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("remove sticker: %v", err)
 	}
@@ -87,12 +87,12 @@ func TestManageStickerSetMutationsKeepSetAndDocumentsConsistent(t *testing.T) {
 		t.Fatalf("removed doc sticker ref = %d/%v, want detached", id, ok)
 	}
 
-	_, _, err = svc.RemoveStickerFromSet(ctx, 1000000001, 101, 1001)
+	_, _, err = svc.RemoveStickerFromSet(ctx, 1000000001, 101, 1001, testStickerSetDeliveryEffects)
 	if !errors.Is(err, domain.ErrStickerSetEmpty) {
 		t.Fatalf("remove last sticker err = %v, want ErrStickerSetEmpty", err)
 	}
 
-	kind, err := svc.DeleteStickerSet(ctx, 1000000001, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID, AccessHash: set.AccessHash})
+	kind, err := svc.DeleteStickerSet(ctx, 1000000001, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID, AccessHash: set.AccessHash}, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("delete sticker set: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestManageStickerSetRejectsNonCreator(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	set, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	set, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Fresh Pack",
 		ShortName:     "fresh_pack",
@@ -132,7 +132,7 @@ func TestManageStickerSetRejectsNonCreator(t *testing.T) {
 		DocumentID:         102,
 		DocumentAccessHash: 1002,
 		Emoji:              "😄",
-	})
+	}, testStickerSetDeliveryEffects)
 	if !errors.Is(err, domain.ErrStickerSetNotOwned) {
 		t.Fatalf("non-creator add err = %v, want ErrStickerSetNotOwned", err)
 	}
@@ -193,7 +193,7 @@ func TestAddStickerToSetAcceptsUploadedMaterial(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	set, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	set, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Fresh Pack",
 		ShortName:     "fresh_pack",
@@ -210,7 +210,7 @@ func TestAddStickerToSetAcceptsUploadedMaterial(t *testing.T) {
 		DocumentID:         202,
 		DocumentAccessHash: 2002,
 		Emoji:              "🎬",
-	})
+	}, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("add uploaded material: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestAddStickerToSetClonesDocumentWhenReusedAcrossSets(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	emojiSet, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	emojiSet, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Emoji Pack",
 		ShortName:     "emoji_pack",
@@ -248,7 +248,7 @@ func TestAddStickerToSetClonesDocumentWhenReusedAcrossSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create emoji set: %v", err)
 	}
-	stickerSet, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	stickerSet, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Sticker Pack",
 		ShortName:     "sticker_pack",
@@ -265,7 +265,7 @@ func TestAddStickerToSetClonesDocumentWhenReusedAcrossSets(t *testing.T) {
 		DocumentID:         401,
 		DocumentAccessHash: 4001,
 		Emoji:              "👋",
-	})
+	}, testStickerSetDeliveryEffects)
 	if err != nil {
 		t.Fatalf("add existing emoji doc to sticker set: %v", err)
 	}

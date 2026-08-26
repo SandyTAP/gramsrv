@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/iamxvbaba/td/tg"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type accountDefaultReactionService interface {
@@ -16,11 +17,11 @@ type accountReactionSettingsReader interface {
 
 type accountPaidReactionPrivacyService interface {
 	accountReactionSettingsReader
-	SetPaidReactionPrivacy(ctx context.Context, userID int64, privacy domain.PaidReactionPrivacy) (domain.AccountReactionSettings, error)
+	SetPaidReactionPrivacy(ctx context.Context, userID int64, privacy domain.PaidReactionPrivacy, effects store.DeliveryEffectsBuilder[domain.AccountReactionSettings]) (domain.AccountReactionSettings, error)
 }
 
-type messagePollUpdateRecorder interface {
-	RecordMessagePoll(ctx context.Context, authKeyID [8]byte, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error)
+type reliableUserEventRecorder interface {
+	RecordReliableUserEvent(ctx context.Context, stateAuthKeyID [8]byte, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 }
 
 type messageReactionUsageRecorder interface {
@@ -30,27 +31,6 @@ type messageReactionUsageRecorder interface {
 type channelParticipantReactionModerator interface {
 	DeleteParticipantReaction(ctx context.Context, userID int64, req domain.DeleteChannelParticipantReactionRequest) (domain.ChannelMessageReactionsResult, error)
 	DeleteParticipantReactions(ctx context.Context, userID int64, req domain.DeleteChannelParticipantReactionsRequest) (domain.DeleteChannelParticipantReactionsResult, error)
-}
-
-type scheduledMessagesService interface {
-	ScheduleMessage(ctx context.Context, userID int64, req domain.ScheduleMessageRequest) (domain.ScheduledMessage, error)
-	EditScheduledMessage(ctx context.Context, userID int64, req domain.EditScheduledMessageRequest) (domain.ScheduledMessage, error)
-	ListScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error)
-	GetScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error)
-	DeleteScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter, date int) ([]domain.ScheduledMessage, error)
-	ClaimScheduledMessages(ctx context.Context, userID int64, claim domain.ScheduledMessageClaim) ([]domain.ScheduledMessage, error)
-	ClaimDueScheduledMessages(ctx context.Context, now, limit, leaseSeconds int) ([]domain.ScheduledMessage, error)
-	MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int) error
-	ReleaseScheduledMessage(ctx context.Context, ownerUserID int64, id int, errText string) error
-	HasScheduledMessages(ctx context.Context, userID int64, peer domain.Peer) (bool, error)
-}
-
-type historyTTLMessagesService interface {
-	GetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer) (int, error)
-	SetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer, period int) error
-	DefaultHistoryTTL(ctx context.Context, userID int64) (int, error)
-	SetDefaultHistoryTTL(ctx context.Context, userID int64, period int) error
-	ClaimExpiredPrivateMessages(ctx context.Context, now, limit int) ([]domain.DeleteMessagesRequest, error)
 }
 
 type channelHistoryTTLService interface {

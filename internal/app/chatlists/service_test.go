@@ -8,13 +8,18 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/links"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+func newMemoryChatlistStore() *memory.ChatlistStore {
+	return memory.NewChatlistStore()
+}
 
 func TestSharedFolderInviteJoinUpdatesAndLeave(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	chatlists := memory.NewChatlistStore()
+	chatlists := newMemoryChatlistStore()
 	svc := NewService(chatlists, dialogs, WithSlugGenerator(func() (string, error) { return "slug-one", nil }))
 
 	ownerID := int64(1001)
@@ -142,7 +147,7 @@ func TestSharedFolderInviteJoinUpdatesAndLeave(t *testing.T) {
 func TestDeleteLastSharedFolderInviteClearsOwnerFlag(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	chatlists := memory.NewChatlistStore()
+	chatlists := newMemoryChatlistStore()
 	slugs := []string{"slug-a", "slug-b"}
 	svc := NewService(chatlists, dialogs, WithSlugGenerator(func() (string, error) {
 		slug := slugs[0]
@@ -184,7 +189,7 @@ func TestDeleteLastSharedFolderInviteClearsOwnerFlag(t *testing.T) {
 
 func TestSharedFolderSlugValidation(t *testing.T) {
 	ctx := context.Background()
-	svc := NewService(memory.NewChatlistStore(), memory.NewDialogStore())
+	svc := NewService(newMemoryChatlistStore(), memory.NewDialogStore())
 	if _, err := svc.CheckInvite(ctx, 2002, "bad!"); !errors.Is(err, domain.ErrChatlistInviteInvalid) {
 		t.Fatalf("CheckInvite bad slug err = %v, want ErrChatlistInviteInvalid", err)
 	}
@@ -197,7 +202,7 @@ func TestSharedFolderSlugValidation(t *testing.T) {
 func TestRevokedSharedFolderInviteRemainsListedButCannotBeImported(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	chatlists := memory.NewChatlistStore()
+	chatlists := newMemoryChatlistStore()
 	svc := NewService(chatlists, dialogs, WithSlugGenerator(func() (string, error) { return "slug-revoke", nil }))
 
 	ownerID := int64(1001)
@@ -240,7 +245,7 @@ func TestSharedFolderJoinUpdatesAndLeaveUseChannelMemberships(t *testing.T) {
 	dialogs := memory.NewDialogStore()
 	channels := &fakeChatlistChannels{}
 	svc := NewService(
-		memory.NewChatlistStore(),
+		newMemoryChatlistStore(),
 		dialogs,
 		WithChannels(channels),
 		WithSlugGenerator(func() (string, error) { return "slug-channel", nil }),
@@ -304,7 +309,7 @@ func TestSharedFolderPublicPeerFallsBackToSelfJoin(t *testing.T) {
 	dialogs := memory.NewDialogStore()
 	channels := &fakeChatlistChannels{publicOnly: true}
 	svc := NewService(
-		memory.NewChatlistStore(),
+		newMemoryChatlistStore(),
 		dialogs,
 		WithChannels(channels),
 		WithSlugGenerator(func() (string, error) { return "slug-public", nil }),
@@ -337,7 +342,7 @@ func TestSharedFolderPublicPeerFallsBackToSelfJoin(t *testing.T) {
 func TestExportInviteRejectsRuleBasedFolder(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	svc := NewService(memory.NewChatlistStore(), dialogs, WithSlugGenerator(func() (string, error) { return "slug-two", nil }))
+	svc := NewService(newMemoryChatlistStore(), dialogs, WithSlugGenerator(func() (string, error) { return "slug-two", nil }))
 	ownerID := int64(1001)
 	peer := domain.DialogFolderPeer{Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001}, AccessHash: 31}
 	if err := dialogs.UpsertFolder(ctx, ownerID, domain.DialogFolder{
@@ -356,7 +361,7 @@ func TestExportInviteRejectsRuleBasedFolder(t *testing.T) {
 func TestExportInviteRejectsUserPeers(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	svc := NewService(memory.NewChatlistStore(), dialogs, WithSlugGenerator(func() (string, error) { return "slug-user-peer", nil }))
+	svc := NewService(newMemoryChatlistStore(), dialogs, WithSlugGenerator(func() (string, error) { return "slug-user-peer", nil }))
 	ownerID := int64(1001)
 	peer := domain.DialogFolderPeer{Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 2002}, AccessHash: 22}
 	if err := dialogs.UpsertFolder(ctx, ownerID, domain.DialogFolder{
@@ -374,7 +379,7 @@ func TestExportInviteRejectsUserPeers(t *testing.T) {
 func TestChatlistInviteLimitUsesPremiumTier(t *testing.T) {
 	ctx := context.Background()
 	dialogs := memory.NewDialogStore()
-	chatlists := memory.NewChatlistStore()
+	chatlists := newMemoryChatlistStore()
 	ownerID := int64(1001)
 	peer := domain.DialogFolderPeer{Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001}, AccessHash: 31}
 	if err := dialogs.UpsertFolder(ctx, ownerID, domain.DialogFolder{
@@ -456,7 +461,13 @@ func (f *fakeChatlistChannels) InviteToChannel(_ context.Context, userID, channe
 	return fakeChatlistChannelResult(userIDs[0], channelID, domain.ChannelMemberActive, date), nil
 }
 
-func (f *fakeChatlistChannels) JoinChannel(_ context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error) {
+func (f *fakeChatlistChannels) JoinChannel(_ context.Context, userID, channelID int64, date int, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
+	if effects == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
+	}
+	if _, err := effects(store.ChannelPendingJoinDeliverySnapshot{}); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
 	f.joinIDs = append(f.joinIDs, channelID)
 	return fakeChatlistChannelResult(userID, channelID, domain.ChannelMemberActive, date), nil
 }

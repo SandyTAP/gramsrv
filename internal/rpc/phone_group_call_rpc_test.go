@@ -229,6 +229,31 @@ func TestGroupCallPushSkipsNonMemberOnlineCandidates(t *testing.T) {
 	}
 }
 
+func TestGroupCallServiceMessageIsNotDirectlyFannedOut(t *testing.T) {
+	f := newGroupCallFixture(t)
+	ownerCtx := f.userCtx(f.owner, 11)
+
+	response, err := f.router.onPhoneCreateGroupCall(ownerCtx, &tg.PhoneCreateGroupCallRequest{
+		Peer:     &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
+		RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("createGroupCall: %v", err)
+	}
+	if service := findUpdate[*tg.UpdateNewChannelMessage](t, response); service.Pts == 0 {
+		t.Fatal("RPC response service message must retain channel pts")
+	}
+	for _, record := range f.sessions.records() {
+		updates, ok := record.msg.(*tg.Updates)
+		if !ok {
+			continue
+		}
+		if err := validateTransientChannelUpdates(updates); err != nil {
+			t.Fatalf("Core group-call fanout contained channel PTS for user %d: %v", record.userID, err)
+		}
+	}
+}
+
 func TestGroupCallM0Lifecycle(t *testing.T) {
 	f := newGroupCallFixture(t)
 	ownerCtx := f.userCtx(f.owner, 11)

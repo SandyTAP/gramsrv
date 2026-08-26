@@ -108,7 +108,16 @@ func (r *GRPCRemote) Name() string {
 }
 
 func (r *GRPCRemote) Put(ctx context.Context, data []byte) (string, error) {
-	key, _, _, err := r.PutReader(ctx, bytes.NewReader(data))
+	key, _, _, err := r.putBlob(ctx, func(stream grpc.ClientStreamingClient[filedatapb.PutBlobChunk, filedatapb.BlobObjectResponse]) error {
+		for offset := 0; offset < len(data); {
+			end := min(offset+defaultGRPCPutBlobChunk, len(data))
+			if err := stream.Send(&filedatapb.PutBlobChunk{Data: data[offset:end]}); err != nil {
+				return fmt.Errorf("filedata grpc put_blob send: %w", err)
+			}
+			offset = end
+		}
+		return nil
+	})
 	return key, err
 }
 
@@ -119,26 +128,45 @@ func (r *GRPCRemote) PutReader(ctx context.Context, src io.Reader) (string, int6
 	if src == nil {
 		return "", 0, nil, fmt.Errorf("filedata put blob reader is nil")
 	}
+	return r.putBlob(ctx, func(stream grpc.ClientStreamingClient[filedatapb.PutBlobChunk, filedatapb.BlobObjectResponse]) error {
+		for {
+			bufferSize := putBlobReadBufferSize(src)
+			if bufferSize == 0 {
+				return nil
+			}
+			// SendMsg may retain the message for tracing or retry. Each read therefore
+			// gets an immutable buffer whose ownership moves to that message.
+			buf := make([]byte, bufferSize)
+			n, readErr := io.ReadFull(src, buf)
+			if n > 0 {
+				if err := stream.Send(&filedatapb.PutBlobChunk{Data: buf[:n]}); err != nil {
+					return fmt.Errorf("filedata grpc put_blob send: %w", err)
+				}
+			}
+			switch readErr {
+			case nil:
+				continue
+			case io.EOF, io.ErrUnexpectedEOF:
+				return nil
+			default:
+				return readErr
+			}
+		}
+	})
+}
+
+func (r *GRPCRemote) putBlob(ctx context.Context, send func(grpc.ClientStreamingClient[filedatapb.PutBlobChunk, filedatapb.BlobObjectResponse]) error) (string, int64, []byte, error) {
+	if r == nil || r.client == nil {
+		return "", 0, nil, ErrGRPCUnavailable
+	}
 	callCtx, cancel := r.withRequestTimeout(ctx)
 	defer cancel()
 	stream, err := r.client.PutBlob(r.withAuth(callCtx))
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("filedata grpc put_blob: %w", err)
 	}
-	buf := make([]byte, defaultGRPCPutBlobChunk)
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			if err := stream.Send(&filedatapb.PutBlobChunk{Data: append([]byte(nil), buf[:n]...)}); err != nil {
-				return "", 0, nil, fmt.Errorf("filedata grpc put_blob send: %w", err)
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return "", 0, nil, readErr
-		}
+	if err := send(stream); err != nil {
+		return "", 0, nil, err
 	}
 	res, err := stream.CloseAndRecv()
 	if err != nil {
@@ -147,7 +175,32 @@ func (r *GRPCRemote) PutReader(ctx context.Context, src io.Reader) (string, int6
 	if err := errorFromPB(res.GetErrorKind(), res.GetError()); err != nil {
 		return "", 0, nil, err
 	}
-	return res.GetObjectKey(), res.GetSize(), append([]byte(nil), res.GetSha256()...), nil
+	return res.GetObjectKey(), res.GetSize(), takePBBytes(&res.Sha256), nil
+}
+
+func putBlobReadBufferSize(src io.Reader) int {
+	remaining := -1
+	switch src := src.(type) {
+	case *bytes.Buffer:
+		remaining = src.Len()
+	case *bytes.Reader:
+		remaining = src.Len()
+	case *strings.Reader:
+		remaining = src.Len()
+	case *io.LimitedReader:
+		if src.N <= 0 {
+			remaining = 0
+		} else if src.N < int64(defaultGRPCPutBlobChunk) {
+			remaining = int(src.N)
+		}
+	}
+	if remaining == 0 {
+		return 0
+	}
+	if remaining > 0 {
+		return min(remaining, defaultGRPCPutBlobChunk)
+	}
+	return defaultGRPCPutBlobChunk
 }
 
 func (r *GRPCRemote) Get(ctx context.Context, objectKey string) ([]byte, error) {
@@ -172,7 +225,7 @@ func (r *GRPCRemote) GetRange(ctx context.Context, objectKey string, offset, lim
 	if err := errorFromPB(res.GetErrorKind(), res.GetError()); err != nil {
 		return nil, 0, err
 	}
-	return append([]byte(nil), res.GetData()...), res.GetTotal(), nil
+	return takePBBytes(&res.Data), res.GetTotal(), nil
 }
 
 func (r *GRPCRemote) PutUploadPart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (filesapp.UploadPartObject, error) {
@@ -185,7 +238,7 @@ func (r *GRPCRemote) PutUploadPart(ctx context.Context, ownerUserID, fileID int6
 		OwnerUserId: ownerUserID,
 		FileId:      fileID,
 		FilePart:    int32(part),
-		Data:        append([]byte(nil), data...),
+		Data:        data,
 	})
 	if err != nil {
 		return filesapp.UploadPartObject{}, fmt.Errorf("filedata grpc put_upload_part: %w", err)
@@ -197,7 +250,7 @@ func (r *GRPCRemote) PutUploadPart(ctx context.Context, ownerUserID, fileID int6
 		Backend:   domain.MediaBackend(res.GetBackend()),
 		ObjectKey: res.GetObjectKey(),
 		Size:      res.GetSize(),
-		SHA256:    append([]byte(nil), res.GetSha256()...),
+		SHA256:    takePBBytes(&res.Sha256),
 	}, nil
 }
 
@@ -214,7 +267,7 @@ func (r *GRPCRemote) GetUploadPart(ctx context.Context, objectKey string) ([]byt
 	if err := errorFromPB(res.GetErrorKind(), res.GetError()); err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), res.GetData()...), nil
+	return takePBBytes(&res.Data), nil
 }
 
 func (r *GRPCRemote) OpenUploadPart(ctx context.Context, objectKey string) (io.ReadCloser, error) {
@@ -277,7 +330,7 @@ func (r *GRPCRemote) AssembleUploadBlob(ctx context.Context, ownerUserID, fileID
 	return filesapp.AssembledUploadBlob{
 		ObjectKey: res.GetObjectKey(),
 		Size:      res.GetSize(),
-		SHA256:    append([]byte(nil), res.GetSha256()...),
+		SHA256:    takePBBytes(&res.Sha256),
 	}, nil
 }
 
@@ -301,7 +354,7 @@ func (r *GRPCRemote) saveFilePart(ctx context.Context, ownerUserID, fileID int64
 		FilePart:       int32(part),
 		FileTotalParts: int32(totalParts),
 		Big:            big,
-		Data:           append([]byte(nil), data...),
+		Data:           data,
 	})
 	if err != nil {
 		return false, fmt.Errorf("filedata grpc save_file_part: %w", err)
@@ -330,7 +383,7 @@ func (r *GRPCRemote) GetFile(ctx context.Context, req domain.FileDownloadRequest
 		return domain.FileChunk{}, false, err
 	}
 	return domain.FileChunk{
-		Bytes:    append([]byte(nil), res.GetData()...),
+		Bytes:    takePBBytes(&res.Data),
 		MimeType: res.GetMimeType(),
 		Total:    res.GetTotal(),
 	}, res.GetFound(), nil
@@ -357,10 +410,18 @@ func (r *GRPCRemote) GetFileHashes(ctx context.Context, req domain.FileHashReque
 		hashes = append(hashes, domain.FileHash{
 			Offset: hash.GetOffset(),
 			Limit:  int(hash.GetLimit()),
-			Hash:   append([]byte(nil), hash.GetHash()...),
+			Hash:   takePBBytes(&hash.Hash),
 		})
 	}
 	return hashes, res.GetFound(), nil
+}
+
+// takePBBytes moves a protobuf byte field into the domain result. Unary/client-
+// stream completion gives this client exclusive ownership of the response.
+func takePBBytes(field *[]byte) []byte {
+	data := *field
+	*field = nil
+	return data
 }
 
 func (r *GRPCRemote) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {

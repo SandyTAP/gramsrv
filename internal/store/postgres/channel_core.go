@@ -13,48 +13,21 @@ import (
 	"sort"
 	"strings"
 	"telesrv/internal/domain"
-	"telesrv/internal/store/postgres/sqlcgen"
 	"time"
 )
 
-// channelIDAtLeastAllocator 是 Redis 分配器的撞键自愈扩展：一次把计数器
-// 顶到 floor 之上，避免按 1 步进追赶大空洞。
-type channelIDAtLeastAllocator interface {
-	NextChannelIDAtLeast(ctx context.Context, floor int64) (int64, error)
-}
-
-// allocateFreshChannelID 分配未被占用的 channel id。计数器可能落后于
-// channels 表真实最大 id（Redis 快照回退、或测试 fallback 分配器绕过
-// Redis 直写同一库），盲用会撞主键且可能污染后续 channel message id
-// 分配；这里先点查预检，撞到就把分配器对账到表内最大 id 再取。
+// allocateFreshChannelID has exactly one authority. A stale or colliding
+// counter fails at the database uniqueness boundary; PostgreSQL never probes
+// MAX(id), rewrites Redis state or retries through another allocator.
 func (s *ChannelStore) allocateFreshChannelID(ctx context.Context) (int64, error) {
-	const maxAttempts = 4
 	channelID, err := s.ids.NextChannelID(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("allocate channel id: %w", err)
 	}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		var exists bool
-		if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM channels WHERE id = $1)`, channelID).Scan(&exists); err != nil {
-			return 0, fmt.Errorf("probe channel id %d: %w", channelID, err)
-		}
-		if !exists {
-			return channelID, nil
-		}
-		var maxID int64
-		if err := s.db.QueryRow(ctx, `SELECT COALESCE(MAX(id), 0) FROM channels`).Scan(&maxID); err != nil {
-			return 0, fmt.Errorf("load max channel id: %w", err)
-		}
-		if atLeast, ok := s.ids.(channelIDAtLeastAllocator); ok {
-			channelID, err = atLeast.NextChannelIDAtLeast(ctx, maxID)
-		} else {
-			channelID, err = s.ids.NextChannelID(ctx)
-		}
-		if err != nil {
-			return 0, fmt.Errorf("re-allocate channel id past %d: %w", maxID, err)
-		}
+	if channelID <= 0 {
+		return 0, fmt.Errorf("allocate channel id: invalid id %d", channelID)
 	}
-	return 0, fmt.Errorf("allocate channel id: counter still colliding after %d attempts (id %d)", maxAttempts, channelID)
+	return channelID, nil
 }
 
 func (s *ChannelStore) CreateChannel(ctx context.Context, req domain.CreateChannelRequest) (domain.CreateChannelResult, error) {
@@ -714,8 +687,4 @@ func isRetryablePostgresTxError(err error) bool {
 		return false
 	}
 	return pgErr.Code == "40P01" || pgErr.Code == "40001"
-}
-
-type pgChannelIDAllocator struct {
-	db sqlcgen.DBTX
 }

@@ -31,7 +31,7 @@ func TestChannelMemberCacheInvalidatesOnReadModelNotify(t *testing.T) {
 
 	rowCache := NewChannelRowCache(1000)
 	memberCache := NewChannelMemberCache(1000)
-	channels := NewChannelStore(pool,
+	channels := newTestChannelStore(pool,
 		WithChannelRowCache(rowCache),
 		WithChannelMemberCache(memberCache))
 
@@ -120,7 +120,7 @@ func TestChannelDialogLightInvalidatesOnChannelMemberAndDialogNotify(t *testing.
 
 	users := NewUserStore(pool)
 	owner := createTestUser(t, ctx, users, "+1888"+suffix+"91", "DialogLightChannelOwner", "")
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "DialogLightChannel " + suffix,

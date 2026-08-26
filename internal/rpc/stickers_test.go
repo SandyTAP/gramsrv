@@ -6,10 +6,41 @@ import (
 
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
+	appaccount "telesrv/internal/app/account"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
+	"telesrv/internal/store/memory"
 )
+
+const stickerReadTestUserID int64 = 1000000001
+
+func newStickerReadTestRouter(t *testing.T, files FilesService, installed ...domain.UserStickerSetMutationItem) (*Router, context.Context) {
+	t.Helper()
+	passwords := memory.NewPasswordStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	passwords.AttachDeliveryOutbox(delivery)
+	if len(installed) > 0 {
+		err := passwords.MutateUserStickerSets(context.Background(), domain.UserStickerSetMutation{
+			OwnerUserID: stickerReadTestUserID, Mutation: domain.UserStickerSetMutationInstall,
+			Items: append([]domain.UserStickerSetMutationItem(nil), installed...), Date: 1,
+		}, func(domain.UserStickerSetMutation) ([]store.DeliveryEffect, error) {
+			return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: stickerReadTestUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})}, nil
+		})
+		if err != nil {
+			t.Fatalf("seed installed sticker sets: %v", err)
+		}
+	}
+	r := New(Config{}, Deps{
+		Files: files, DeliveryOutbox: delivery,
+		Account: appaccount.NewService(passwords, appaccount.WithUserStickerSets(passwords)),
+	}, zaptest.NewLogger(t), clock.System)
+	return r, WithUserID(context.Background(), stickerReadTestUserID)
+}
 
 func TestStickerSetsCatalogHashMatchesTDesktopFormula(t *testing.T) {
 	sets := []domain.StickerSet{
@@ -67,7 +98,10 @@ func TestMessagesGetAllStickersUsesTDesktopHashForNotModified(t *testing.T) {
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files,
+		domain.UserStickerSetMutationItem{StickerSetID: 10, Kind: domain.StickerSetKindStickers},
+		domain.UserStickerSetMutationItem{StickerSetID: 11, Kind: domain.StickerSetKindStickers},
+	)
 
 	first, err := r.onMessagesGetAllStickers(ctx, 0)
 	if err != nil {
@@ -113,7 +147,7 @@ func TestAccountGetDefaultEmojiStatusesServesSynthesizedSet(t *testing.T) {
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files)
 
 	first, err := r.onAccountGetDefaultEmojiStatuses(ctx, 0)
 	if err != nil {
@@ -158,94 +192,27 @@ func TestAccountGetDefaultEmojiStatusesServesSynthesizedSet(t *testing.T) {
 	}
 }
 
-func TestAccountGetDefaultEmojiStatusesFallsBackWhenUnseeded(t *testing.T) {
-	ctx := context.Background()
-	r := &Router{deps: Deps{Files: &fakeFiles{}}}
+func TestAccountGetDefaultEmojiStatusesFailsWhenUnseeded(t *testing.T) {
+	r, ctx := newStickerReadTestRouter(t, &fakeFiles{})
 	res, err := r.onAccountGetDefaultEmojiStatuses(ctx, 0)
-	if err != nil {
-		t.Fatalf("getDefaultEmojiStatuses without seed: %v", err)
-	}
-	if _, ok := res.(*tg.AccountEmojiStatusesNotModified); !ok {
-		t.Fatalf("unseeded result = %T, want compat notModified stub", res)
+	if res != nil || !tgerr.Is(err, "INTERNAL_SERVER_ERROR") {
+		t.Fatalf("unseeded default statuses = %T %v, want INTERNAL", res, err)
 	}
 }
 
-func TestMessagesGetStickerSetAndroidPlaceholderUsesSeededSet(t *testing.T) {
-	ctx := context.Background()
-	docs := make(map[int64]domain.Document)
-	documentIDs := make([]int64, 0, androidPlaceholderStickerDocumentLimit+3)
-	for i := 0; i < androidPlaceholderStickerDocumentLimit+3; i++ {
-		id := int64(100 + i)
-		documentIDs = append(documentIDs, id)
-		docs[id] = domain.Document{ID: id, AccessHash: id + 1000, DCID: 2}
-	}
-	files := &fakeFiles{
-		docs: docs,
-		sets: map[domain.StickerSetKind][]domain.StickerSet{
-			domain.StickerSetKindSystem: {
-				{
-					ID:          77,
-					AccessHash:  7700,
-					ShortName:   "AnimatedEmojies",
-					Title:       "Animated Emoji",
-					Kind:        domain.StickerSetKindSystem,
-					SystemKey:   "animated_emoji",
-					Emojis:      true,
-					Count:       len(documentIDs),
-					Hash:        12345,
-					DocumentIDs: documentIDs,
-					Packs: []domain.StickerPack{{
-						Emoticon:    "🙂",
-						DocumentIDs: append([]int64(nil), documentIDs...),
-					}},
-					Keywords: []domain.StickerKeyword{{DocumentID: documentIDs[0], Keywords: []string{"placeholder"}}},
-				},
-			},
-		},
-	}
-	r := &Router{deps: Deps{Files: files}}
-
+func TestMessagesGetStickerSetDoesNotProjectClientPlaceholder(t *testing.T) {
+	files := &fakeFiles{sets: map[domain.StickerSetKind][]domain.StickerSet{
+		domain.StickerSetKindSystem: {{
+			ID: 77, AccessHash: 7700, ShortName: "AnimatedEmojies",
+			Kind: domain.StickerSetKindSystem, SystemKey: "animated_emoji",
+		}},
+	}}
+	r, ctx := newStickerReadTestRouter(t, files)
 	res, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
 		Stickerset: &tg.InputStickerSetShortName{ShortName: "tg_placeholders_android"},
 	})
-	if err != nil {
-		t.Fatalf("getStickerSet placeholder: %v", err)
-	}
-	full, ok := res.(*tg.MessagesStickerSet)
-	if !ok {
-		t.Fatalf("getStickerSet placeholder = %T, want *tg.MessagesStickerSet", res)
-	}
-	if full.Set.ID == 77 || full.Set.ShortName != "tg_placeholders_android" {
-		t.Fatalf("placeholder projection identity = %d/%q, want independent tg_placeholders_android", full.Set.ID, full.Set.ShortName)
-	}
-	if len(full.Documents) != androidPlaceholderStickerDocumentLimit || full.Set.Count != androidPlaceholderStickerDocumentLimit {
-		t.Fatalf("placeholder projection documents/count = %d/%d, want exactly %d", len(full.Documents), full.Set.Count, androidPlaceholderStickerDocumentLimit)
-	}
-	if full.Set.Hash == 0 || len(full.Packs) != 1 || len(full.Packs[0].Documents) != androidPlaceholderStickerDocumentLimit {
-		t.Fatalf("placeholder projection hash/packs = %d/%+v", full.Set.Hash, full.Packs)
-	}
-	if got := files.sets[domain.StickerSetKindSystem][0]; len(got.DocumentIDs) != androidPlaceholderStickerDocumentLimit+3 || got.ID != 77 {
-		t.Fatalf("source set mutated by projection: id=%d docs=%d", got.ID, len(got.DocumentIDs))
-	}
-
-	// 投影有独立 identity：客户端后续按返回的 id/access_hash 请求仍能解析，不会
-	// 与真正的 AnimatedEmoji set id/hash 缓存互相覆盖。
-	byID, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
-		Stickerset: &tg.InputStickerSetID{ID: full.Set.ID, AccessHash: full.Set.AccessHash},
-	})
-	if err != nil {
-		t.Fatalf("get placeholder projection by id: %v", err)
-	}
-	if byIDFull, ok := byID.(*tg.MessagesStickerSet); !ok || byIDFull.Set.ID != full.Set.ID || len(byIDFull.Documents) != androidPlaceholderStickerDocumentLimit {
-		t.Fatalf("placeholder projection by id = %T %+v", byID, byID)
-	}
-	if cached, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
-		Stickerset: &tg.InputStickerSetShortName{ShortName: "tg_placeholders_android"},
-		Hash:       full.Set.Hash,
-	}); err != nil {
-		t.Fatalf("get placeholder projection matching hash: %v", err)
-	} else if _, ok := cached.(*tg.MessagesStickerSetNotModified); !ok {
-		t.Fatalf("placeholder matching hash = %T, want NotModified", cached)
+	if res != nil || !tgerr.Is(err, "STICKERSET_INVALID") {
+		t.Fatalf("unpersisted client placeholder = %T %v, want STICKERSET_INVALID", res, err)
 	}
 }
 
@@ -270,7 +237,7 @@ func TestMessagesGetStickerSetHonorsNonZeroHash(t *testing.T) {
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files)
 
 	res, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
 		Stickerset: &tg.InputStickerSetID{ID: 10, AccessHash: 100},
@@ -297,21 +264,13 @@ func TestMessagesGetStickerSetHonorsNonZeroHash(t *testing.T) {
 	}
 }
 
-func TestMessagesGetStickerSetAndroidPlaceholderFallsBackToEmptyWithoutSeed(t *testing.T) {
-	ctx := context.Background()
-	r := &Router{deps: Deps{Files: &fakeFiles{}}}
+func TestMessagesGetStickerSetMissingPlaceholderFails(t *testing.T) {
+	r, ctx := newStickerReadTestRouter(t, &fakeFiles{})
 	res, err := r.onMessagesGetStickerSet(ctx, &tg.MessagesGetStickerSetRequest{
 		Stickerset: &tg.InputStickerSetShortName{ShortName: "tg_placeholders_android"},
 	})
-	if err != nil {
-		t.Fatalf("getStickerSet placeholder without seed: %v", err)
-	}
-	full, ok := res.(*tg.MessagesStickerSet)
-	if !ok {
-		t.Fatalf("getStickerSet placeholder without seed = %T, want *tg.MessagesStickerSet", res)
-	}
-	if len(full.Documents) != 0 {
-		t.Fatalf("placeholder without seed documents = %d, want empty compat set", len(full.Documents))
+	if res != nil || !tgerr.Is(err, "STICKERSET_INVALID") {
+		t.Fatalf("missing placeholder = %T %v, want STICKERSET_INVALID", res, err)
 	}
 }
 
@@ -348,11 +307,13 @@ func TestMessagesGetMaskStickersUsesMaskCatalog(t *testing.T) {
 				{ID: 10, AccessHash: 100, ShortName: "regular", Title: "Regular", Count: 1, Hash: 123, Installed: true},
 			},
 			domain.StickerSetKindMasks: {
-				{ID: 20, AccessHash: 200, ShortName: "masks", Title: "Masks", Count: 1, Hash: 789, Installed: true},
+				{ID: 20, AccessHash: 200, ShortName: "masks", Title: "Masks", Kind: domain.StickerSetKindMasks, Masks: true, Count: 1, Hash: 789, Installed: true},
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files,
+		domain.UserStickerSetMutationItem{StickerSetID: 20, Kind: domain.StickerSetKindMasks},
+	)
 
 	first, err := r.onMessagesGetMaskStickers(ctx, 0)
 	if err != nil {
@@ -394,7 +355,7 @@ func TestMessagesGetFeaturedStickersSurfacesSeededSets(t *testing.T) {
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files)
 
 	first, err := r.onMessagesGetFeaturedStickers(ctx, 0)
 	if err != nil {
@@ -458,7 +419,7 @@ func TestMessagesGetOldFeaturedStickersUsesFeaturedCatalog(t *testing.T) {
 			},
 		},
 	}
-	r := &Router{deps: Deps{Files: files}}
+	r, ctx := newStickerReadTestRouter(t, files)
 	res, err := r.onMessagesGetOldFeaturedStickers(ctx, &tg.MessagesGetOldFeaturedStickersRequest{Limit: 20})
 	if err != nil {
 		t.Fatalf("getOldFeaturedStickers: %v", err)
@@ -538,7 +499,9 @@ func TestStickerCatalogCacheShortCircuitsListStickerSets(t *testing.T) {
 			domain.StickerSetKindStickers: {{ID: 10, AccessHash: 100, ShortName: "one", Count: 1, Hash: 123, DocumentIDs: []int64{201}}},
 		},
 	}}
-	r := New(Config{}, Deps{Files: files}, zaptest.NewLogger(t), clock.System)
+	r, ctx := newStickerReadTestRouter(t, files,
+		domain.UserStickerSetMutationItem{StickerSetID: 10, Kind: domain.StickerSetKindStickers},
+	)
 
 	for i := 0; i < 3; i++ {
 		if _, err := r.onMessagesGetAllStickers(ctx, 0); err != nil {
@@ -554,8 +517,7 @@ func TestStickerCatalogCacheShortCircuitsListStickerSets(t *testing.T) {
 }
 
 func TestMessagesGetFeaturedStickersEmptyWithoutSeed(t *testing.T) {
-	ctx := context.Background()
-	r := &Router{deps: Deps{Files: &fakeFiles{}}}
+	r, ctx := newStickerReadTestRouter(t, &fakeFiles{})
 	res, err := r.onMessagesGetFeaturedStickers(ctx, 0)
 	if err != nil {
 		t.Fatalf("getFeaturedStickers without seed: %v", err)
@@ -581,7 +543,11 @@ func TestMessagesGetAvailableReactionsNotModified(t *testing.T) {
 			CenterIconID:        107,
 		},
 	}
-	files := &fakeFiles{reactions: reactions}
+	docs := make(map[int64]domain.Document)
+	for _, id := range reactions[0].DocumentIDs() {
+		docs[id] = domain.Document{ID: id, AccessHash: id + 1000, DCID: 2, MimeType: "application/x-tgsticker", Size: 10}
+	}
+	files := &fakeFiles{reactions: reactions, docs: docs}
 	r := &Router{deps: Deps{Files: files}}
 
 	first, err := r.onMessagesGetAvailableReactions(ctx, 0)

@@ -8,11 +8,12 @@ import (
 
 	appauth "telesrv/internal/app/auth"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 // TestBotStoreRoundTripPostgres 验证迁移 0090 的 bot 模型：BotFather 种子行、
-// CreateBotAccount 双行事务、空 phone 不撞唯一索引、token 轮换、对话状态。
+// CreateBotAccountWithDelivery 双行+outbox 事务、空 phone 不撞唯一索引、token 轮换、对话状态。
 func TestBotStoreRoundTripPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -61,11 +62,11 @@ func TestBotStoreRoundTripPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 	makeBot := func(i int) (domain.User, domain.BotProfile) {
-		u, p, err := bots.CreateBotAccount(ctx, domain.User{
+		u, p, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 			AccessHash: int64(100 + i),
 			FirstName:  fmt.Sprintf("IT Bot %d", i),
 			Username:   fmt.Sprintf("it%d_%d_bot", i, suffix),
-		}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: fmt.Sprintf("secret-%d-%d", i, suffix)})
+		}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: fmt.Sprintf("secret-%d-%d", i, suffix)}, testBotLifecycleEffects)
 		if err != nil {
 			t.Fatalf("create bot %d: %v", i, err)
 		}
@@ -84,11 +85,11 @@ func TestBotStoreRoundTripPostgres(t *testing.T) {
 	}
 
 	// username 冲突映射 ErrUsernameOccupied，且不留 users 孤儿行。
-	if _, _, err := bots.CreateBotAccount(ctx, domain.User{
+	if _, _, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 		AccessHash: 999,
 		FirstName:  "Dup",
 		Username:   bot1.Username,
-	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "x"}); err != domain.ErrUsernameOccupied {
+	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "x"}, testBotLifecycleEffects); err != domain.ErrUsernameOccupied {
 		t.Fatalf("duplicate username err = %v, want ErrUsernameOccupied", err)
 	}
 
@@ -142,19 +143,30 @@ func TestBotStoreRoundTripPostgres(t *testing.T) {
 
 	// P2 元数据写入 + bot_info_version bump（postgres 单事务）。
 	uBefore, _, _ := users.ByID(ctx, bot1.ID)
-	v1, err := bots.UpdateBotCommands(ctx, bot1.ID, []domain.BotCommand{{Command: "start", Description: "begin"}})
+	v1, changed, err := bots.UpdateBotCommandsWithDelivery(ctx, bot1.ID, []domain.BotCommand{{Command: "start", Description: "begin"}}, func(store.BotCommandsDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return nil, nil
+	})
 	if err != nil || v1 <= uBefore.BotInfoVersion {
 		t.Fatalf("UpdateBotCommands version = %d err=%v, want > %d", v1, err, uBefore.BotInfoVersion)
+	}
+	if !changed {
+		t.Fatal("UpdateBotCommands changed = false, want true")
 	}
 	gotBot, _, _ := bots.GetBot(ctx, bot1.ID)
 	if len(gotBot.Commands) != 1 || gotBot.Commands[0].Command != "start" {
 		t.Fatalf("commands = %+v, want [start]", gotBot.Commands)
 	}
-	v2, err := bots.UpdateBotInfo(ctx, bot1.ID, domain.BotInfoUpdate{
+	v2, changed, err := bots.UpdateBotInfoWithDelivery(ctx, bot1.ID, domain.BotInfoUpdate{
 		SetName: true, Name: "PG Bot", SetAbout: true, About: "pg about", SetDescription: true, Description: "pg desc",
+	}, func(snapshot store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, 0, len(snapshot.Audience))
+		for _, viewerID := range snapshot.Audience {
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{TargetUserID: viewerID, Payload: []byte{2}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload}))
+		}
+		return effects, nil
 	})
-	if err != nil || v2 <= v1 {
-		t.Fatalf("UpdateBotInfo version = %d err=%v, want > %d", v2, err, v1)
+	if err != nil || !changed || v2 <= v1 {
+		t.Fatalf("UpdateBotInfoWithDelivery version = %d err=%v, want > %d", v2, err, v1)
 	}
 	uAfter, _, _ := users.ByID(ctx, bot1.ID)
 	if uAfter.FirstName != "PG Bot" || uAfter.About != "pg about" {
@@ -222,7 +234,7 @@ func TestBotStoreRoundTripPostgres(t *testing.T) {
 		t.Fatalf("AllowBotSendMessage repeat = %v,%v, want false,nil", created, err)
 	}
 	// 不存在的 bot → ErrBotNotFound。
-	if _, err := bots.UpdateBotCommands(ctx, 424243, nil); err != domain.ErrBotNotFound {
+	if _, _, err := bots.UpdateBotCommandsWithDelivery(ctx, 424243, nil, func(store.BotCommandsDeliverySnapshot) ([]store.DeliveryEffect, error) { return nil, nil }); err != domain.ErrBotNotFound {
 		t.Fatalf("update missing bot err = %v, want ErrBotNotFound", err)
 	}
 

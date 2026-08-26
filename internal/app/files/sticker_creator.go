@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *Service) CheckStickerSetShortName(ctx context.Context, shortName string) (bool, error) {
@@ -58,11 +59,11 @@ func (s *Service) SuggestStickerSetShortName(ctx context.Context, title string, 
 	return "", domain.ErrStickerSetShortNameOccupied
 }
 
-func (s *Service) CreateStickerSet(ctx context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
-	if req.CreatorUserID <= 0 {
+func (s *Service) CreateInstalledStickerSet(ctx context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
+	if req.CreatorUserID <= 0 || effects == nil {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetCreatorInvalid
 	}
-	return s.createStickerSet(ctx, req)
+	return s.createStickerSet(ctx, req, effects)
 }
 
 // AdminCreateStickerSet creates an unowned pack for console-managed sticker or
@@ -73,10 +74,10 @@ func (s *Service) AdminCreateStickerSet(ctx context.Context, req domain.CreateSt
 	if strings.TrimSpace(req.ShortName) == "" {
 		return domain.StickerSet{}, nil, domain.ErrStickerSetShortNameInvalid
 	}
-	return s.createStickerSet(ctx, req)
+	return s.createStickerSet(ctx, req, nil)
 }
 
-func (s *Service) createStickerSet(ctx context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error) {
+func (s *Service) createStickerSet(ctx context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error) {
 	title := strings.TrimSpace(req.Title)
 	if err := validateStickerSetTitle(title); err != nil {
 		return domain.StickerSet{}, nil, err
@@ -191,11 +192,25 @@ func (s *Service) createStickerSet(ctx context.Context, req domain.CreateSticker
 		}
 	}
 	set.Hash = stickerSetHash(set)
-	if err := s.media.CreateStickerSet(ctx, set, updatedDocs); err != nil {
-		if errors.Is(err, domain.ErrStickerSetShortNameOccupied) {
+	var persistErr error
+	if req.CreatorUserID > 0 {
+		if effects == nil {
+			return domain.StickerSet{}, nil, store.ErrDeliveryOutboxRequired
+		}
+		set.Installed = true
+		set.InstalledDate = req.Date
+		persistErr = s.media.CreateInstalledStickerSetWithDelivery(ctx, set, updatedDocs, domain.UserStickerSet{
+			OwnerUserID: req.CreatorUserID, StickerSetID: set.ID, Kind: set.Kind,
+			InstalledDate: req.Date, OrderValue: int64(req.Date) << 32,
+		}, effects)
+	} else {
+		persistErr = s.media.AdminCreateStickerSet(ctx, set, updatedDocs)
+	}
+	if persistErr != nil {
+		if errors.Is(persistErr, domain.ErrStickerSetShortNameOccupied) {
 			return domain.StickerSet{}, nil, domain.ErrStickerSetShortNameOccupied
 		}
-		return domain.StickerSet{}, nil, err
+		return domain.StickerSet{}, nil, persistErr
 	}
 	ordered := orderDocuments(updatedDocs, set.DocumentIDs)
 	s.cacheStickerSet(set, ordered)

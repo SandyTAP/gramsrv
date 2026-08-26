@@ -750,7 +750,7 @@ func (r *Router) pushOnlinePeerStatusesToCurrentSession(ctx context.Context, use
 	if len(updates) == 0 {
 		return
 	}
-	r.pushCurrentSessionMessage(ctx, "push online peer statuses", &tg.Updates{
+	r.pushCurrentSessionTransient(ctx, "push online peer statuses", &tg.Updates{
 		Updates: updates,
 		Date:    int(r.clock.Now().Unix()),
 		Seq:     0,

@@ -4,7 +4,54 @@ import (
 	"context"
 	"sync"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
+
+func (s *captureDialogs) MutateAccountDialogs(_ context.Context, mutation store.DialogAccountMutation, effects store.DeliveryEffectsBuilder[store.DialogAccountMutationSnapshot]) (store.DialogAccountMutationSnapshot, error) {
+	snapshot := store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: true, FolderID: mutation.FolderID}
+	switch mutation.Kind {
+	case store.DialogAccountSaveDraft:
+		s.savedDraft = mutation.Draft
+	case store.DialogAccountDeleteDraft:
+		s.deletedDraft.peer, s.deletedDraft.topMessageID = mutation.Peer, mutation.TopMessageID
+	case store.DialogAccountClearDrafts:
+		snapshot.Drafts = append([]domain.DialogDraft(nil), s.drafts...)
+		s.drafts = nil
+		snapshot.Changed = len(snapshot.Drafts) > 0
+	case store.DialogAccountSetPinned:
+		s.peers = []domain.Peer{mutation.Peer}
+		if mutation.Peer.Type == domain.PeerTypeFolder {
+			s.archivePinned = mutation.Value
+		}
+		if snapshot.FolderID == 0 {
+			snapshot.FolderID = s.folderID
+		}
+	case store.DialogAccountReorderPinned:
+		s.folderID, s.peers = mutation.FolderID, append([]domain.Peer(nil), mutation.Peers...)
+		snapshot.Changed = !s.reorderNoChange
+	case store.DialogAccountSetUnreadMark, store.DialogAccountHidePeerSettings:
+		s.peers = []domain.Peer{mutation.Peer}
+	case store.DialogAccountUpsertFolder:
+		s.savedFolder = mutation.Folder
+	case store.DialogAccountDeleteFolder:
+		s.deletedFolderID = mutation.FolderID
+	case store.DialogAccountReorderFolders:
+		s.folderOrder = append([]int(nil), mutation.FolderOrder...)
+	case store.DialogAccountSetFolderTags:
+		s.tagsEnabled = mutation.Value
+	case store.DialogAccountEditPeerFolders:
+		s.folderPeers = append([]domain.FolderPeerUpdate(nil), mutation.FolderPeers...)
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return store.DialogAccountMutationSnapshot{}, err
+	}
+	for i := range intents {
+		intents[i].Event.Pts = i + 1
+	}
+	snapshot.Effects = intents
+	return snapshot, nil
+}
 
 type captureDialogs struct {
 	mu              sync.Mutex

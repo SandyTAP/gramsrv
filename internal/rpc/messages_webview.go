@@ -171,15 +171,11 @@ func (r *Router) onMessagesRequestAppWebView(ctx context.Context, req *tg.Messag
 			return nil, botInvalidErr()
 		}
 		if created {
-			res, err := r.sendBotAllowedServiceMessageWith(ctx, userID, bot.ID, domain.MessageBotAllowedAction{FromRequest: true})
+			_, err := r.sendBotAllowedServiceMessageWith(ctx, userID, bot.ID, domain.MessageBotAllowedAction{FromRequest: true})
 			if err != nil {
 				return nil, internalErr()
 			}
-			if !res.Duplicate {
-				senderUsers := r.usersForMessageUpdate(ctx, userID, res.SenderMessage)
-				senderChats := r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
-				r.pushUserMessage(ctx, userID, "push webview write allowed", tgPrivateMessageUpdates(res.SenderEvent, res.SenderMessage, 0, false, senderUsers, senderChats))
-			}
+			// The service-message store transaction owns update_event + dispatch_outbox.
 		}
 	}
 	now := r.clock.Now()
@@ -427,7 +423,7 @@ func (r *Router) sendWebViewDomainResultMessage(ctx context.Context, botID int64
 		return err
 	}
 	r.webviews.consumeContext(ctx, session.QueryID, session.BotQueryID)
-	r.pushUserMessage(ctx, session.UserID, "push webview result sent", &tg.Updates{
+	r.pushUserMessageTransient(ctx, session.UserID, "push webview result sent", &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateWebViewResultSent{QueryID: session.QueryID}},
 		Date:    int(now.Unix()),
 	})

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -23,7 +24,7 @@ func NewAIComposeStore(db sqlcgen.DBTX) *AIComposeStore {
 
 const aiComposeToneColumns = `id, access_hash, owner_user_id, slug, title, emoji_id, prompt, display_author, installs_count, created_at, updated_at`
 
-func (s *AIComposeStore) CreateAIComposeTone(ctx context.Context, tone domain.AIComposeTone) error {
+func (s *AIComposeStore) CreateAIComposeTone(ctx context.Context, tone domain.AIComposeTone, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	if tone.ID == 0 || tone.AccessHash == 0 || tone.OwnerUserID == 0 || tone.Slug == "" {
 		return domain.ErrAIComposeToneInvalid
 	}
@@ -35,49 +36,58 @@ func (s *AIComposeStore) CreateAIComposeTone(ctx context.Context, tone domain.AI
 	if tone.UpdatedAt > 0 {
 		updatedAt = time.Unix(tone.UpdatedAt, 0)
 	}
-	_, err := s.db.Exec(ctx, `
+	return withTx(ctx, s.db, "create ai compose tone", func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
 INSERT INTO ai_compose_tones (
   id, access_hash, owner_user_id, slug, title, emoji_id, prompt, display_author, installs_count, created_at, updated_at
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		tone.ID, tone.AccessHash, tone.OwnerUserID, tone.Slug, tone.Title, tone.EmojiID,
-		tone.Prompt, tone.DisplayAuthor, tone.InstallsCount, createdAt, updatedAt)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return domain.ErrAIComposeToneInvalid
+			tone.ID, tone.AccessHash, tone.OwnerUserID, tone.Slug, tone.Title, tone.EmojiID,
+			tone.Prompt, tone.DisplayAuthor, tone.InstallsCount, createdAt, updatedAt)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return domain.ErrAIComposeToneInvalid
+			}
+			return fmt.Errorf("insert ai compose tone: %w", err)
 		}
-		return fmt.Errorf("insert ai compose tone: %w", err)
-	}
-	return nil
+		return applyAIComposeToneEffects(ctx, tx, tone, effects)
+	})
 }
 
-func (s *AIComposeStore) UpdateAIComposeTone(ctx context.Context, tone domain.AIComposeTone) error {
+func (s *AIComposeStore) UpdateAIComposeTone(ctx context.Context, tone domain.AIComposeTone, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	updatedAt := time.Now()
 	if tone.UpdatedAt > 0 {
 		updatedAt = time.Unix(tone.UpdatedAt, 0)
 	}
-	tag, err := s.db.Exec(ctx, `
+	return withTx(ctx, s.db, "update ai compose tone", func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 UPDATE ai_compose_tones
 SET title = $3, emoji_id = $4, prompt = $5, display_author = $6, updated_at = $7
 WHERE id = $1 AND owner_user_id = $2`,
-		tone.ID, tone.OwnerUserID, tone.Title, tone.EmojiID, tone.Prompt, tone.DisplayAuthor, updatedAt)
-	if err != nil {
-		return fmt.Errorf("update ai compose tone: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrAIComposeToneNotFound
-	}
-	return nil
+			tone.ID, tone.OwnerUserID, tone.Title, tone.EmojiID, tone.Prompt, tone.DisplayAuthor, updatedAt)
+		if err != nil {
+			return fmt.Errorf("update ai compose tone: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAIComposeToneNotFound
+		}
+		return applyAIComposeToneEffects(ctx, tx, tone, effects)
+	})
 }
 
-func (s *AIComposeStore) DeleteAIComposeTone(ctx context.Context, ownerUserID, toneID int64) error {
-	tag, err := s.db.Exec(ctx, `DELETE FROM ai_compose_tones WHERE id = $1 AND owner_user_id = $2`, toneID, ownerUserID)
-	if err != nil {
-		return fmt.Errorf("delete ai compose tone: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrAIComposeToneNotFound
-	}
-	return nil
+func (s *AIComposeStore) DeleteAIComposeTone(ctx context.Context, ownerUserID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
+	return withTx(ctx, s.db, "delete ai compose tone", func(tx pgx.Tx) error {
+		tone, err := scanAIComposeTone(tx.QueryRow(ctx, `SELECT `+aiComposeToneColumns+` FROM ai_compose_tones WHERE id = $1 AND owner_user_id = $2 FOR UPDATE`, toneID, ownerUserID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAIComposeToneNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock ai compose tone for delete: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM ai_compose_tones WHERE id = $1`, toneID); err != nil {
+			return fmt.Errorf("delete ai compose tone: %w", err)
+		}
+		return applyAIComposeToneEffects(ctx, tx, tone, effects)
+	})
 }
 
 func (s *AIComposeStore) GetAIComposeToneByID(ctx context.Context, id, accessHash int64) (domain.AIComposeTone, bool, error) {
@@ -130,16 +140,16 @@ ORDER BY creator DESC, updated_at DESC, id ASC`, userID)
 	return out, rows.Err()
 }
 
-func (s *AIComposeStore) SaveAIComposeTone(ctx context.Context, userID, toneID int64) error {
+func (s *AIComposeStore) SaveAIComposeTone(ctx context.Context, userID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	return withTx(ctx, s.db, "save ai compose tone", func(tx pgx.Tx) error {
-		var ownerUserID int64
-		if err := tx.QueryRow(ctx, `SELECT owner_user_id FROM ai_compose_tones WHERE id = $1`, toneID).Scan(&ownerUserID); err != nil {
+		tone, err := scanAIComposeTone(tx.QueryRow(ctx, `SELECT `+aiComposeToneColumns+` FROM ai_compose_tones WHERE id = $1 FOR UPDATE`, toneID))
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrAIComposeToneNotFound
 			}
-			return fmt.Errorf("select ai compose tone owner: %w", err)
+			return fmt.Errorf("select ai compose tone: %w", err)
 		}
-		if ownerUserID == userID {
+		if tone.OwnerUserID == userID {
 			return nil
 		}
 		tag, err := tx.Exec(ctx, `
@@ -153,15 +163,46 @@ ON CONFLICT (user_id, tone_id) DO NOTHING`, userID, toneID)
 			if _, err := tx.Exec(ctx, `UPDATE ai_compose_tones SET installs_count = installs_count + 1 WHERE id = $1`, toneID); err != nil {
 				return fmt.Errorf("increment ai compose tone installs: %w", err)
 			}
+			tone.InstallsCount++
+			return applyAIComposeToneEffects(ctx, tx, tone, effects)
 		}
 		return nil
 	})
 }
 
-func (s *AIComposeStore) UnsaveAIComposeTone(ctx context.Context, userID, toneID int64) error {
-	_, err := s.db.Exec(ctx, `DELETE FROM ai_compose_tone_saves WHERE user_id = $1 AND tone_id = $2`, userID, toneID)
+func (s *AIComposeStore) UnsaveAIComposeTone(ctx context.Context, userID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
+	return withTx(ctx, s.db, "unsave ai compose tone", func(tx pgx.Tx) error {
+		tone, err := scanAIComposeTone(tx.QueryRow(ctx, `SELECT `+aiComposeToneColumns+` FROM ai_compose_tones WHERE id = $1 FOR UPDATE`, toneID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAIComposeToneNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("select ai compose tone for unsave: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM ai_compose_tone_saves WHERE user_id = $1 AND tone_id = $2`, userID, toneID)
+		if err != nil {
+			return fmt.Errorf("unsave ai compose tone: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		return applyAIComposeToneEffects(ctx, tx, tone, effects)
+	})
+}
+
+func applyAIComposeToneEffects(ctx context.Context, tx pgx.Tx, tone domain.AIComposeTone, build store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(tone.Clone())
 	if err != nil {
-		return fmt.Errorf("unsave ai compose tone: %w", err)
+		return fmt.Errorf("build ai compose delivery effects: %w", err)
+	}
+	if len(effects) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, effects); err != nil {
+		return fmt.Errorf("apply ai compose delivery effects: %w", err)
 	}
 	return nil
 }

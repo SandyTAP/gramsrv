@@ -72,9 +72,10 @@ type BrandingYAML struct {
 }
 
 type PostgresYAML struct {
-	DSN      string `yaml:"dsn"`
-	MaxConns *int   `yaml:"max_conns"`
-	MinConns *int   `yaml:"min_conns"`
+	DSN                     string `yaml:"dsn"`
+	MaxConns                *int   `yaml:"max_conns"`
+	MinConns                *int   `yaml:"min_conns"`
+	CounterRecoveryMaxConns *int   `yaml:"counter_recovery_max_conns"`
 }
 
 type RedisYAML struct {
@@ -213,6 +214,7 @@ func applyCommonYAML(b *envBuilder, y CommonYAML) error {
 	b.setString("TELESRV_POSTGRES_DSN", y.Postgres.DSN)
 	b.setInt("TELESRV_POSTGRES_MAX_CONNS", y.Postgres.MaxConns)
 	b.setInt("TELESRV_POSTGRES_MIN_CONNS", y.Postgres.MinConns)
+	b.setInt("TELESRV_POSTGRES_COUNTER_RECOVERY_MAX_CONNS", y.Postgres.CounterRecoveryMaxConns)
 	b.setString("TELESRV_REDIS_ADDR", y.Redis.Addr)
 	b.setString("TELESRV_REDIS_PASSWORD", y.Redis.Password)
 	b.setInt("TELESRV_REDIS_DB", y.Redis.DB)
@@ -263,25 +265,25 @@ func applyFileClientYAML(b *envBuilder, y GRPCClientYAML) error {
 	return nil
 }
 
-func applyEgressAckServerYAML(b *envBuilder, y GRPCServerYAML) {
-	b.setString("TELESRV_EGRESS_ACK_GRPC_ADDR", y.Addr)
-	b.setString("TELESRV_EGRESS_ACK_TOKEN", y.Token)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE", y.TLS.CertFile)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE", y.TLS.KeyFile)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE", y.TLS.ClientCAFile)
+func applyEgressDeliveryServerYAML(b *envBuilder, y GRPCServerYAML) {
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_ADDR", y.Addr)
+	b.setString("TELESRV_EGRESS_DELIVERY_TOKEN", y.Token)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE", y.TLS.CertFile)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE", y.TLS.KeyFile)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE", y.TLS.ClientCAFile)
 }
 
-func applyEgressAckClientYAML(b *envBuilder, y GRPCClientYAML) error {
-	b.setString("TELESRV_EGRESS_ACK_GRPC_RESOLVER", y.Resolver)
-	b.setList("TELESRV_EGRESS_ACK_GRPC_TARGETS", y.Targets)
-	b.setString("TELESRV_EGRESS_ACK_TOKEN", y.Token)
-	if err := b.setDuration("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", y.Timeout); err != nil {
+func applyEgressDeliveryClientYAML(b *envBuilder, y GRPCClientYAML) error {
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER", y.Resolver)
+	b.setList("TELESRV_EGRESS_DELIVERY_GRPC_TARGETS", y.Targets)
+	b.setString("TELESRV_EGRESS_DELIVERY_TOKEN", y.Token)
+	if err := b.setDuration("TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT", y.Timeout); err != nil {
 		return err
 	}
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE", y.TLS.CAFile)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME", y.TLS.ServerName)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE", y.TLS.CertFile)
-	b.setString("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE", y.TLS.KeyFile)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CA_FILE", y.TLS.CAFile)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_SERVER_NAME", y.TLS.ServerName)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE", y.TLS.CertFile)
+	b.setString("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_KEY_FILE", y.TLS.KeyFile)
 	return nil
 }
 

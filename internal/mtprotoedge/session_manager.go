@@ -88,12 +88,11 @@ const maxForceCloseParallelism = 64
 const defaultLocationRegistryOperationTimeout = 5 * time.Second
 
 type queuedPush struct {
-	t                 proto.MessageType
-	updates           *layerUpdatesFanout
-	reservation       *pendingPushReservation
-	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
-	channelDelivery   edgecontrol.ChannelDeliveryWatermark
-	at                time.Time
+	t               proto.MessageType
+	updates         *layerUpdatesFanout
+	reservation     *pendingPushReservation
+	channelDelivery edgecontrol.ChannelDeliveryWatermark
+	at              time.Time
 }
 
 type channelMembershipSync struct {
@@ -204,8 +203,9 @@ func notifySessionDestroyed(observer SessionLifecycleObserver, authKeyID [8]byte
 // 它只管理进程内运行态，持有可发送的活跃连接；协议可恢复事实由 auth key、客户端重连
 // 和 durable updates/difference 链路承担。所有方法并发安全。
 type SessionManager struct {
-	mu        sync.RWMutex
-	bySession map[sessionKey]*Conn
+	deliveryExecutor atomic.Pointer[deliveryExecutor]
+	mu               sync.RWMutex
+	bySession        map[sessionKey]*Conn
 	// logicalSessions owns MTProto resend state independently of physical Conn
 	// generations. It is bounded by the Server-wide tracked-body budget and a
 	// short offline retention window; ACK and destroy release bodies immediately.
@@ -924,7 +924,11 @@ func (m *SessionManager) BindUserForAuthKey(authKeyID [8]byte, sessionID, userID
 func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 	defer m.markLocationDirtyLocked(key)
 	m.setRawAuthKeyUserIdentityLocked(key.authKeyID, userID)
-	if old := c.userID.Swap(userID); old != 0 {
+	old := c.userID.Swap(userID)
+	if old != userID {
+		c.deliveryIdentityGeneration.Add(1)
+	}
+	if old != 0 {
 		removeUserIndex(m.byUser, old, key)
 		if old != userID {
 			m.markChannelMembershipDirtyLocked(old)
@@ -1305,6 +1309,7 @@ func (m *SessionManager) UnbindAuthKey(authKeyID [8]byte) int {
 			continue
 		}
 		if old := c.userID.Swap(0); old != 0 {
+			c.deliveryIdentityGeneration.Add(1)
 			removeUserIndex(m.byUser, old, key)
 			m.markChannelMembershipDirtyLocked(old)
 		}
@@ -1424,7 +1429,6 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				}
 			}
 			if err == nil {
-				encoded.outboxDeliveryRef = item.outboxDeliveryRef
 				err = c.SendBestEffortEncoded(ctx, item.t, encoded, 5*time.Second)
 			}
 			cancel()
@@ -1576,7 +1580,7 @@ func (m *SessionManager) queueOrSendPrepared(ctx context.Context, key sessionKey
 		return ErrSessionNotFound
 	}
 	if !c.receivesUpdates.Load() {
-		_ = m.queuePreparedLocked(key, t, updates, reservation, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{})
+		_ = m.queuePreparedLocked(key, t, updates, reservation, edgecontrol.ChannelDeliveryWatermark{})
 		m.mu.Unlock()
 		return nil
 	}
@@ -1622,7 +1626,7 @@ func (m *SessionManager) PushChannelUpdateToUserExceptAuthKeySession(ctx context
 		return 0, fmt.Errorf("invalid channel delivery watermark")
 	}
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, edgecontrol.OutboxDeliveryRef{}, delivery, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, delivery, func(c *Conn) error {
 		claim, ok := c.reserveChannelDeliveryWatermark(delivery)
 		if !ok {
 			return errChannelDeliverySkipped
@@ -1648,36 +1652,6 @@ func (m *SessionManager) PushChannelUpdateToUserExceptAuthKeySession(ctx context
 		claim.commit()
 		return nil
 	})
-}
-
-// PushOutboxUpdate implements the Edge-local outbox delivery confirmation
-// contract. The caller already selected this Edge instance through the shared
-// online location registry, so sent=0 means this Edge has no eligible target
-// sessions for the request.
-func (m *SessionManager) PushOutboxUpdate(ctx context.Context, req edgecontrol.OutboxPushRequest) (edgecontrol.OutboxPushResult, error) {
-	if m == nil {
-		return edgecontrol.OutboxPushResult{Status: edgecontrol.OutboxDeliveryNoKnownOnlineTargets}, nil
-	}
-	update, err := edgecontrol.DecodeOutboxUpdate(req.UpdateBytes)
-	if err != nil {
-		return edgecontrol.OutboxPushResult{Status: edgecontrol.OutboxDeliveryIndeterminate}, err
-	}
-	var (
-		sent int
-	)
-	if req.DeliveryTimeout > 0 {
-		sent, err = m.pushToUserBoundedAtLeastLayer(ctx, req.TargetUserID, &req.ExcludeAuthKeyID, req.ExcludeSessionID, 0, req.MessageType, update, req.DeliveryTimeout, req.DeliveryRef)
-	} else {
-		sent, err = m.pushToUserWithOutboxRef(ctx, req.TargetUserID, &req.ExcludeAuthKeyID, req.ExcludeSessionID, req.MessageType, update, req.DeliveryRef)
-	}
-	if err != nil {
-		return edgecontrol.OutboxPushResult{Sent: sent, Status: edgecontrol.OutboxDeliveryUnknown}, err
-	}
-	status := edgecontrol.OutboxDeliveryNoKnownOnlineTargets
-	if sent > 0 {
-		status = edgecontrol.OutboxDeliveryDelivered
-	}
-	return edgecontrol.OutboxPushResult{Sent: sent, Status: status}, nil
 }
 
 // PushToUserAuthKey 把 msg 定向投递给【绑定到 businessAuthKeyID 这台具体设备】且属于
@@ -1709,7 +1683,7 @@ func (m *SessionManager) PushToUserAuthKeyTransientCompatible(ctx context.Contex
 // discarded，同时保证获胜设备的其它连接不会误删刚建立的密聊。
 func (m *SessionManager) PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, 0, t, getUpdates, false, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1832,12 +1806,8 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 }
 
 func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass) (int, error) {
-	return m.pushToUserWithOutboxRef(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg, edgecontrol.OutboxDeliveryRef{})
-}
-
-func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, outboxRef edgecontrol.OutboxDeliveryRef) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, true, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1849,7 +1819,6 @@ func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int
 		if err != nil {
 			return err
 		}
-		encoded.outboxDeliveryRef = outboxRef
 		return c.SendEncoded(ctx, t, encoded)
 	})
 }
@@ -1861,7 +1830,7 @@ func (m *SessionManager) pushToUserWithOutboxRef(ctx context.Context, userID int
 // 「durable 兜底」丢弃。走 best-effort 发送，不阻塞调用方。
 func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, 0, t, getUpdates, false, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1879,7 +1848,7 @@ func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Con
 
 func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, 0, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, 0, t, getUpdates, false, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1897,7 +1866,7 @@ func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, us
 
 func (m *SessionManager) PushToUserTransientCompatible(ctx context.Context, userID int64, semantic tlprofile.SemanticID, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, 0, semantic, t, getUpdates, false, edgecontrol.OutboxDeliveryRef{}, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, 0, semantic, t, getUpdates, false, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1918,10 +1887,10 @@ func (m *SessionManager) PushToUserExceptAuthKeySessionBounded(ctx context.Conte
 }
 
 func (m *SessionManager) pushToUserBounded(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
-	return m.pushToUserBoundedAtLeastLayer(ctx, userID, excludeAuthKeyID, excludeSessionID, 0, t, msg, timeout, edgecontrol.OutboxDeliveryRef{})
+	return m.pushToUserBoundedAtLeastLayer(ctx, userID, excludeAuthKeyID, excludeSessionID, 0, t, msg, timeout)
 }
 
-func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration, outboxRef edgecontrol.OutboxDeliveryRef) (int, error) {
+func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -1947,7 +1916,7 @@ func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, user
 		defer cancel()
 	}
 	getUpdates := onceLayerUpdatesFanout(sendCtx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, 0, t, getUpdates, true, outboxRef, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, 0, t, getUpdates, true, edgecontrol.ChannelDeliveryWatermark{}, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1959,7 +1928,6 @@ func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, user
 		if err != nil {
 			return err
 		}
-		encoded.outboxDeliveryRef = outboxRef
 		remaining := timeout
 		if !deadline.IsZero() {
 			remaining = time.Until(deadline)
@@ -1972,10 +1940,20 @@ func (m *SessionManager) pushToUserBoundedAtLeastLayer(ctx context.Context, user
 }
 
 func newLayerUpdatesFanoutContext(ctx context.Context, msg tg.UpdatesClass) (*layerUpdatesFanout, error) {
+	return newRetainedLayerUpdatesFanoutContext(ctx, msg, nil, nil, 0)
+}
+
+func newRetainedLayerUpdatesFanoutContext(
+	ctx context.Context,
+	msg tg.UpdatesClass,
+	retain func(int) bool,
+	release func(int),
+	preparedLimit int,
+) (*layerUpdatesFanout, error) {
 	var updates *layerUpdatesFanout
 	err := withOutboundEncodeSlot(ctx, nil, func() error {
 		var err error
-		updates, err = newLayerUpdatesFanout(msg)
+		updates, err = newRetainedLayerUpdatesFanout(msg, retain, release, preparedLimit)
 		return err
 	})
 	return updates, err
@@ -1995,7 +1973,7 @@ func onceLayerUpdatesFanout(ctx context.Context, msg tg.UpdatesClass) func() (*l
 	}
 }
 
-func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, semantic tlprofile.SemanticID, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, channelDelivery edgecontrol.ChannelDeliveryWatermark, send func(*Conn) error) (int, error) {
 	// push fan-out 是连接层最热路径之一：debug 日志的字段构造（含 auth_key hex 格式化）
 	// 在关闭 debug 时也会求值，先查级别一次、按需记日志。
 	debug := m.log.Core().Enabled(zapcore.DebugLevel)
@@ -2056,7 +2034,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 					skipped++
 					continue
 				}
-				if pendingErr == nil && m.queuePreparedLocked(key, t, pendingUpdates, pendingReservation, outboxRef, channelDelivery) {
+				if pendingErr == nil && m.queuePreparedLocked(key, t, pendingUpdates, pendingReservation, channelDelivery) {
 					queued++
 					if debug {
 						m.log.Debug("Push queued (session not updates-ready)",
@@ -3244,7 +3222,7 @@ func (m *SessionManager) preparePendingPush(getUpdates func() (*layerUpdatesFano
 
 // queuePreparedLocked 暂存一条已冻结的主动推送，返回是否实际入队。
 // 调用方必须在锁外保持 reservation 的 producer ref，并在全部入队完成后 release。
-func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType, updates *layerUpdatesFanout, reservation *pendingPushReservation, outboxRef edgecontrol.OutboxDeliveryRef, channelDelivery edgecontrol.ChannelDeliveryWatermark) bool {
+func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType, updates *layerUpdatesFanout, reservation *pendingPushReservation, channelDelivery edgecontrol.ChannelDeliveryWatermark) bool {
 	q := m.pending[key]
 	// 过期保护：最早一条暂存已超过 pendingPushMaxAge（session 迟迟未 ready）时，丢整批并
 	// 不再囤这条，记 trace。避免「登录后从不 getState」的连接长期占用 pending 内存。
@@ -3262,12 +3240,11 @@ func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType
 	}
 	reservation.retain()
 	push := queuedPush{
-		t:                 t,
-		updates:           updates,
-		reservation:       reservation,
-		outboxDeliveryRef: outboxRef,
-		channelDelivery:   channelDelivery,
-		at:                time.Now(),
+		t:               t,
+		updates:         updates,
+		reservation:     reservation,
+		channelDelivery: channelDelivery,
+		at:              time.Now(),
 	}
 	if len(q) >= maxPendingPushesPerSession {
 		q[0].release()

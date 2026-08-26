@@ -32,7 +32,10 @@ func runWithConfig(logger *zap.Logger, cfg config.FileConfig, buildMeta common.B
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	instanceID := config.ResolveInstanceID(cfg.InstanceID)
+	instanceID, err := config.RequireInstanceID(cfg.InstanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance id: %w", err)
+	}
 	if err := common.ConfigureProcessGlobals(cfg); err != nil {
 		return err
 	}

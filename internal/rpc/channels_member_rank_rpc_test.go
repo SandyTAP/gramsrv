@@ -26,9 +26,12 @@ func TestChannelMemberRankRPC(t *testing.T) {
 	plain, _ := userStore.Create(ctx, domain.User{AccessHash: 73, Phone: "15550002403", FirstName: "Plain"})
 	other, _ := userStore.Create(ctx, domain.User{AccessHash: 74, Phone: "15550002404", FirstName: "Other"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{

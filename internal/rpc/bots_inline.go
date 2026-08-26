@@ -138,7 +138,7 @@ func (r *Router) onMessagesGetInlineBotResults(ctx context.Context, req *tg.Mess
 	if queryGeo != nil {
 		update.SetGeo(tgGeoPoint(*queryGeo))
 	}
-	r.pushUserMessage(ctx, bot.ID, "push bot inline query", &tg.Updates{
+	r.pushUserMessageTransient(ctx, bot.ID, "push bot inline query", &tg.Updates{
 		Updates: []tg.UpdateClass{update},
 		Date:    int(now.Unix()),
 	})
@@ -257,10 +257,16 @@ func (r *Router) onMessagesSendInlineBotResult(ctx context.Context, req *tg.Mess
 	if err != nil {
 		return nil, err
 	}
+	// Re-run the idempotent collection mutation on a duplicate send too: a
+	// previous attempt may have committed the message but failed before the
+	// account transaction. The collection upsert and durable delivery remain
+	// atomic with each other.
+	if err := r.autoSaveSentGif(ctx, userID, media); err != nil {
+		return nil, err
+	}
 	if !duplicate {
 		r.pushInlineBotSendFeedback(ctx, userID, results, result, updates)
 		r.inlines.consumeContext(ctx, req.QueryID)
-		r.autoSaveSentGif(ctx, userID, media)
 	}
 	return updates, nil
 }

@@ -10,10 +10,11 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-func (s *MessageStore) setSavedMessageTags(ctx context.Context, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s *MessageStore) setSavedMessageTags(ctx context.Context, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
 		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("set saved message tags: db does not support transactions")
@@ -83,18 +84,29 @@ INSERT INTO saved_message_reaction_tags (
 	if err := s.enrichPrivateMessageReactions(ctx, tx, req.UserID, messages); err != nil {
 		return domain.PrivateMessageReactionsResult{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("commit saved message tags tx: %w", err)
-	}
-	committed = true
 	reactions := domain.ChannelMessageReactions{AsTags: true}
 	if messages[0].Reactions != nil {
 		reactions = *messages[0].Reactions
 	}
-	return domain.PrivateMessageReactionsResult{
+	res := domain.PrivateMessageReactionsResult{
 		Messages:  messages,
 		Reactions: reactions,
-	}, nil
+	}
+	intents, err := effects(res)
+	if err != nil {
+		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("build saved message tag delivery effects: %w", err)
+	}
+	if len(intents) == 0 {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("apply saved message tag delivery effects: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("commit saved message tags tx: %w", err)
+	}
+	committed = true
+	return res, nil
 }
 
 func (s *MessageStore) enrichSavedMessageTags(ctx context.Context, db sqlcgen.DBTX, messages []domain.Message) error {
@@ -243,9 +255,12 @@ LIMIT $4`, req.UserID, savedPeerType, savedPeerID, int32(req.Limit))
 	return out, nil
 }
 
-func (s *MessageStore) UpsertSavedReactionTag(ctx context.Context, tag domain.SavedReactionTag) error {
+func (s *MessageStore) UpsertSavedReactionTag(ctx context.Context, tag domain.SavedReactionTag, effects store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error {
 	if tag.UserID == 0 || !tag.Reaction.Valid() || utf8.RuneCountInString(tag.Title) > 12 {
 		return domain.ErrReactionInvalid
+	}
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -299,6 +314,16 @@ ON CONFLICT (user_id, reaction_type, reaction_value)
 DO UPDATE SET title = EXCLUDED.title, reaction_count = 0, updated_at = now()`,
 		tag.UserID, string(tag.Reaction.Type), tag.Reaction.Value(), tag.Title); err != nil {
 		return fmt.Errorf("upsert saved reaction tag title: %w", err)
+	}
+	intents, err := effects(tag)
+	if err != nil {
+		return fmt.Errorf("build saved reaction tag title delivery effects: %w", err)
+	}
+	if len(intents) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply saved reaction tag title delivery effects: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit saved reaction tag title tx: %w", err)

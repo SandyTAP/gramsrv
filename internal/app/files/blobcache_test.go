@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"sync"
 	"testing"
 
 	"telesrv/internal/domain"
@@ -30,6 +31,36 @@ func TestBlobMetaCacheGetPutEvict(t *testing.T) {
 	if _, ok := c.get("c"); !ok {
 		t.Error("c should be present")
 	}
+}
+
+func TestBlobBytesCacheConcurrentSharedRangeOwnership(t *testing.T) {
+	cache := newBlobBytesCache(2 << 20)
+	cache.putOwned("blob", bytes.Repeat([]byte{'a'}, 64<<10))
+	var wg sync.WaitGroup
+	for reader := 0; reader < 8; reader++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				shared, ok := cache.getShared("blob")
+				if !ok || len(shared) != 64<<10 {
+					t.Errorf("shared cache read: ok=%v size=%d", ok, len(shared))
+					return
+				}
+				before := shared[0]
+				owned := sliceBlobBytes(shared, 0, int64(len(shared)))
+				owned[0] ^= 0xff
+				if shared[0] != before {
+					t.Error("owned range mutation changed immutable cache entry")
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		cache.putOwned("blob", bytes.Repeat([]byte{byte('a' + i%2)}, 64<<10))
+	}
+	wg.Wait()
 }
 
 // countingMediaStore 统计 GetFileBlob 次数，验证元数据缓存命中后不再查 PG。
@@ -94,8 +125,13 @@ func TestGetFileCachesMetadataAndSmallBlobBytes(t *testing.T) {
 	if blobs.getRangeCalls != 1 {
 		t.Errorf("getRangeCalls = %d, want 1", blobs.getRangeCalls)
 	}
+	c1.Bytes[0] = 'x'
+	c1Again, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:42", Offset: 0, Limit: 5})
+	if err != nil || !ok || string(c1Again.Bytes) != "01234" {
+		t.Fatalf("mutating returned chunk changed byte cache: chunk=%q ok=%v err=%v", c1Again.Bytes, ok, err)
+	}
 
-	// 第二次：同 location 命中元数据与字节缓存；[5,10) 直接从内存切片。
+	// 后续请求：同 location 命中元数据与字节缓存；[5,10) 直接从内存切片。
 	c2, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:42", Offset: 5, Limit: 5})
 	if err != nil || !ok {
 		t.Fatalf("getfile2 ok=%v err=%v", ok, err)

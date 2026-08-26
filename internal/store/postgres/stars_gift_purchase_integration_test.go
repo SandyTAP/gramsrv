@@ -3,14 +3,52 @@ package postgres
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
+
+var errInjectedStarsPurchaseOutbox = errors.New("injected stars purchase outbox failure")
+
+type failStarsPurchaseOutboxDB struct{ *pgxpool.Pool }
+
+func (db *failStarsPurchaseOutboxDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &failStarsPurchaseOutboxTx{Tx: tx}, nil
+}
+
+type failStarsPurchaseOutboxTx struct{ pgx.Tx }
+
+func (tx *failStarsPurchaseOutboxTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "INSERT INTO edge_delivery_outbox") {
+		return pgconn.CommandTag{}, errInjectedStarsPurchaseOutbox
+	}
+	return tx.Tx.Exec(ctx, query, args...)
+}
 
 type starsPurchaseAttempt struct {
 	result domain.StarsPurchaseResult
 	err    error
+}
+
+func starsPurchaseTestEffects(result domain.StarsPurchaseResult) ([]storepkg.DeliveryEffect, error) {
+	if result.Balance.UserID == 0 {
+		return nil, nil
+	}
+	return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+		TargetUserID:   result.Balance.UserID,
+		Payload:        []byte("stars-balance-test"),
+		RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+	})}, nil
 }
 
 func purchaseStarsTwiceConcurrently(t *testing.T, ctx context.Context, store *StarsPurchaseStore, req domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, domain.StarsPurchaseResult) {
@@ -20,7 +58,7 @@ func purchaseStarsTwiceConcurrently(t *testing.T, ctx context.Context, store *St
 	for range 2 {
 		go func() {
 			<-start
-			result, err := store.PurchaseStars(ctx, req)
+			result, err := store.PurchaseStarsWithDelivery(ctx, req, starsPurchaseTestEffects)
 			attempts <- starsPurchaseAttempt{result: result, err: err}
 		}()
 	}
@@ -59,6 +97,7 @@ func TestStarsFriendGiftPurchaseAtomicReplayAndValidationPostgres(t *testing.T) 
 		t.Fatalf("create recipient: %v", err)
 	}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id=ANY($1::bigint[])", []int64{buyer.ID, recipient.ID})
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_purchase_commands WHERE buyer_user_id=$1", buyer.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_purchase_forms WHERE buyer_user_id=$1", buyer.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_transactions WHERE user_id=$1", recipient.ID)
@@ -66,7 +105,7 @@ func TestStarsFriendGiftPurchaseAtomicReplayAndValidationPostgres(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id=ANY($1::bigint[])", []int64{buyer.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	store := NewStarsPurchaseStore(pool, messages)
 	issued, err := store.IssueStarsPurchaseForm(ctx, domain.StarsPurchaseForm{
 		Kind: domain.StarsPurchaseGift, BuyerUserID: buyer.ID, RecipientUserID: recipient.ID,
@@ -118,6 +157,10 @@ func TestStarsFriendGiftPurchaseAtomicReplayAndValidationPostgres(t *testing.T) 
 	if balance != 2500 || txnCount != 1 || commandCount != 1 {
 		t.Fatalf("replay footprint balance=%d txns=%d commands=%d", balance, txnCount, commandCount)
 	}
+	var balanceDeliveryCount int64
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1", recipient.ID).Scan(&balanceDeliveryCount); err != nil || balanceDeliveryCount != 1 {
+		t.Fatalf("recipient balance delivery count=%d err=%v, want 1", balanceDeliveryCount, err)
+	}
 	for _, userID := range []int64{buyer.ID, recipient.ID} {
 		var eventCount, outboxCount int64
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM user_update_events WHERE user_id=$1", userID).Scan(&eventCount); err != nil {
@@ -133,7 +176,7 @@ func TestStarsFriendGiftPurchaseAtomicReplayAndValidationPostgres(t *testing.T) 
 
 	tampered := req
 	tampered.Amount++
-	if _, err := store.PurchaseStars(ctx, tampered); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, tampered, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
 		t.Fatalf("tampered replay err=%v", err)
 	}
 	expired, err := store.IssueStarsPurchaseForm(ctx, domain.StarsPurchaseForm{
@@ -146,7 +189,7 @@ func TestStarsFriendGiftPurchaseAtomicReplayAndValidationPostgres(t *testing.T) 
 	}
 	expiredReq := req
 	expiredReq.FormID, expiredReq.Stars, expiredReq.Amount = expired.FormID, 1000, 99
-	if _, err := store.PurchaseStars(ctx, expiredReq); !errors.Is(err, domain.ErrStarsPurchaseFormExpired) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, expiredReq, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormExpired) {
 		t.Fatalf("expired form err=%v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT balance FROM stars_balances WHERE user_id=$1", recipient.ID).Scan(&balance); err != nil || balance != 2500 {
@@ -164,6 +207,7 @@ func TestStarsTopupPurchaseAtomicReplayAndPurposeBindingPostgres(t *testing.T) {
 		t.Fatalf("create buyer: %v", err)
 	}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id=$1", buyer.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_purchase_commands WHERE buyer_user_id=$1", buyer.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_purchase_forms WHERE buyer_user_id=$1", buyer.ID)
 		_, _ = pool.Exec(ctx, "DELETE FROM stars_transactions WHERE user_id=$1", buyer.ID)
@@ -188,6 +232,29 @@ func TestStarsTopupPurchaseAtomicReplayAndPurposeBindingPostgres(t *testing.T) {
 		},
 		Date: 1_700_000_100,
 	}
+	builderErr := errors.New("injected stars purchase builder failure")
+	if _, err := store.PurchaseStarsWithDelivery(ctx, req, func(domain.StarsPurchaseResult) ([]storepkg.DeliveryEffect, error) {
+		return nil, builderErr
+	}); !errors.Is(err, builderErr) {
+		t.Fatalf("builder failure = %v, want injected error", err)
+	}
+	failingStore := NewStarsPurchaseStore(&failStarsPurchaseOutboxDB{Pool: pool}, nil)
+	if _, err := failingStore.PurchaseStarsWithDelivery(ctx, req, starsPurchaseTestEffects); !errors.Is(err, errInjectedStarsPurchaseOutbox) {
+		t.Fatalf("outbox failure = %v, want injected error", err)
+	}
+	var failedBalance, failedTransactions, failedCommands, failedDeliveries int64
+	if err := pool.QueryRow(ctx, `SELECT
+COALESCE((SELECT balance FROM stars_balances WHERE user_id=$1),0),
+(SELECT count(*) FROM stars_transactions WHERE user_id=$1),
+(SELECT count(*) FROM stars_purchase_commands WHERE buyer_user_id=$1),
+(SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1)`, buyer.ID).
+		Scan(&failedBalance, &failedTransactions, &failedCommands, &failedDeliveries); err != nil {
+		t.Fatalf("load failed checkout footprint: %v", err)
+	}
+	if failedBalance != 0 || failedTransactions != 0 || failedCommands != 0 || failedDeliveries != 0 {
+		t.Fatalf("failed checkout leaked balance=%d txns=%d commands=%d deliveries=%d",
+			failedBalance, failedTransactions, failedCommands, failedDeliveries)
+	}
 	first, replay := purchaseStarsTwiceConcurrently(t, ctx, store, req)
 	if first.Duplicate || first.Balance.Balance != 2500 || first.TransactionID == "" {
 		t.Fatalf("first purchase = %+v", first)
@@ -209,15 +276,19 @@ func TestStarsTopupPurchaseAtomicReplayAndPurposeBindingPostgres(t *testing.T) {
 	if balance != 2500 || txnCount != 1 || commandCount != 1 {
 		t.Fatalf("replay footprint balance=%d txns=%d commands=%d", balance, txnCount, commandCount)
 	}
+	var balanceDeliveryCount int64
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1", buyer.ID).Scan(&balanceDeliveryCount); err != nil || balanceDeliveryCount != 1 {
+		t.Fatalf("buyer balance delivery count=%d err=%v, want 1", balanceDeliveryCount, err)
+	}
 
 	tampered := req
 	tampered.SpendPurposePeer.ID++
-	if _, err := store.PurchaseStars(ctx, tampered); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, tampered, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
 		t.Fatalf("tampered purpose replay err=%v", err)
 	}
 	otherBuyer := req
 	otherBuyer.BuyerUserID++
-	if _, err := store.PurchaseStars(ctx, otherBuyer); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, otherBuyer, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
 		t.Fatalf("cross-account form err=%v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT balance FROM stars_balances WHERE user_id=$1", buyer.ID).Scan(&balance); err != nil || balance != 2500 {
@@ -238,7 +309,7 @@ func TestStarsGiveawayPurchaseAtomicChannelPTSReplayAndInfoPostgres(t *testing.T
 	if err != nil {
 		t.Fatalf("create member: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Stars Giveaway " + suffix, Megagroup: true,
 		MemberUserIDs: []int64{member.ID}, Date: 1_700_000_000,
@@ -300,7 +371,7 @@ func TestStarsGiveawayPurchaseAtomicChannelPTSReplayAndInfoPostgres(t *testing.T
 	}
 	lateReplayReq := req
 	lateReplayReq.Date = purpose.UntilDate
-	lateReplay, err := store.PurchaseStars(ctx, lateReplayReq)
+	lateReplay, err := store.PurchaseStarsWithDelivery(ctx, lateReplayReq, starsPurchaseTestEffects)
 	if err != nil || !lateReplay.Duplicate || lateReplay.TransactionID != first.TransactionID ||
 		lateReplay.ChannelSend.Message.ID != first.ChannelSend.Message.ID || lateReplay.ChannelSend.Event.Pts != first.ChannelSend.Event.Pts {
 		t.Fatalf("giveaway replay after until_date=%+v err=%v first=%+v", lateReplay, err, first)
@@ -320,7 +391,7 @@ func TestStarsGiveawayPurchaseAtomicChannelPTSReplayAndInfoPostgres(t *testing.T
 	lateFirstReq.FormID = lateForm.FormID
 	lateFirstReq.Giveaway = &latePurpose
 	lateFirstReq.Date = purpose.UntilDate
-	if _, err := store.PurchaseStars(ctx, lateFirstReq); !errors.Is(err, domain.ErrStarsPurchaseFormExpired) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, lateFirstReq, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormExpired) {
 		t.Fatalf("first giveaway settlement at until_date err=%v, want form expired", err)
 	}
 	var campaigns, commands, messages, events, balanceRows, txns int64
@@ -360,7 +431,7 @@ func TestStarsGiveawayPurchaseAtomicChannelPTSReplayAndInfoPostgres(t *testing.T
 	changed := *purpose
 	changed.Users, changed.PerUserStars = 1, 1000
 	tampered.Giveaway = &changed
-	if _, err := store.PurchaseStars(ctx, tampered); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
+	if _, err := store.PurchaseStarsWithDelivery(ctx, tampered, starsPurchaseTestEffects); !errors.Is(err, domain.ErrStarsPurchaseFormInvalid) {
 		t.Fatalf("tampered giveaway replay err=%v", err)
 	}
 }

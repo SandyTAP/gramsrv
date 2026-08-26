@@ -248,10 +248,10 @@ type RPCInitConnectionObserver interface {
 	) error
 }
 
-// OutboxClientAck is emitted by Edge after a Telegram client msgs_ack resolves
-// to a tracked server frame carrying a durable outbox delivery ref.
-type OutboxClientAck struct {
-	Ref         edgecontrol.OutboxDeliveryRef
+// DeliveryClientAck is a non-authoritative late observation emitted after
+// msgs_ack resolves to an exact durable target-ledger identity.
+type DeliveryClientAck struct {
+	Tracking    edgecontrol.DeliveryTracking
 	AuthKeyID   [8]byte
 	SessionID   int64
 	ServerMsgID int64
@@ -367,9 +367,9 @@ type Options struct {
 	LayerRPC LayerRPCHandler
 	// Metrics 接收连接层指标。默认 NopMetrics。
 	Metrics Metrics
-	// OutboxClientAcked observes client msgs_ack for durable outbox pushes. It is
-	// a production wiring point for Egress ACK writeback, not a topology mode.
-	OutboxClientAcked func(OutboxClientAck)
+	// DeliveryClientAcked observes client msgs_ack for v3 durable delivery
+	// frames. It is a late evidence hook, not physical completion authority.
+	DeliveryClientAcked func(DeliveryClientAck)
 	// OnServing is called after the connection intake loops have been installed.
 	// It is a platform-neutral observation hook; all slow initialization must
 	// finish before ListenAndServe is entered.
@@ -513,21 +513,21 @@ type Server struct {
 	outboundControlBudget    *outboundTrackedBudget
 	outboundScratchPool      *outboundScratchPool
 
-	dc                int
-	strictDC          bool
-	key               exchange.PrivateKey
-	authKeys          store.AuthKeyStore
-	conns             *SessionManager
-	rpc               legacyRPCHandler
-	layerRPC          LayerRPCHandler
-	metrics           Metrics
-	onServing         func(net.Addr)
-	cipher            crypto.Cipher
-	clock             clock.Clock
-	rand              io.Reader
-	types             *tmap.Map
-	admission         *admissionController
-	outboxClientAcked func(OutboxClientAck)
+	dc                  int
+	strictDC            bool
+	key                 exchange.PrivateKey
+	authKeys            store.AuthKeyStore
+	conns               *SessionManager
+	rpc                 legacyRPCHandler
+	layerRPC            LayerRPCHandler
+	metrics             Metrics
+	onServing           func(net.Addr)
+	cipher              crypto.Cipher
+	clock               clock.Clock
+	rand                io.Reader
+	types               *tmap.Map
+	admission           *admissionController
+	deliveryClientAcked func(DeliveryClientAck)
 
 	rpcResults *rpcExecutionLedger
 	rpcRewrap  *rpcRewrapRegistry
@@ -575,7 +575,7 @@ func New(opts Options) *Server {
 		layerRPC:                 opts.LayerRPC,
 		metrics:                  opts.Metrics,
 		onServing:                opts.OnServing,
-		outboxClientAcked:        opts.OutboxClientAcked,
+		deliveryClientAcked:      opts.DeliveryClientAcked,
 		cipher:                   crypto.NewServerCipher(opts.Rand),
 		clock:                    opts.Clock,
 		rand:                     opts.Rand,
@@ -664,12 +664,12 @@ func (s *Server) buildConn(tc transport.Conn, lease *physicalTransportLease, key
 			s.rpcResults.Acknowledge(conn.authKeyID, conn.sessionID, reqMsgID)
 			s.rpcRewrap.acknowledge(conn, reqMsgID)
 		},
-		outboxClientAcked: func(conn *Conn, ref edgecontrol.OutboxDeliveryRef, serverMsgID int64) {
-			if s.outboxClientAcked == nil {
+		deliveryClientAcked: func(conn *Conn, ref edgecontrol.DeliveryTracking, serverMsgID int64) {
+			if s.deliveryClientAcked == nil {
 				return
 			}
-			s.outboxClientAcked(OutboxClientAck{
-				Ref:         ref,
+			s.deliveryClientAcked(DeliveryClientAck{
+				Tracking:    ref,
 				AuthKeyID:   conn.authKeyID,
 				SessionID:   conn.sessionID,
 				ServerMsgID: serverMsgID,

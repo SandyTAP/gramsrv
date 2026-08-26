@@ -16,7 +16,10 @@ type PasswordStore interface {
 // AccountReactionSettingsStore persists account-level reaction preferences.
 type AccountReactionSettingsStore interface {
 	GetReactionSettings(ctx context.Context, userID int64) (domain.AccountReactionSettings, bool, error)
-	SaveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings) error
+	SaveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings, effects DeliveryEffectsBuilder[domain.AccountReactionSettings]) error
+	// SaveReactionsNotifySettings persists the constructor-less reaction-notify
+	// preference. There is deliberately no fake Update or empty delivery effect.
+	SaveReactionsNotifySettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings) error
 }
 
 // AccountSettingsStore persists account-level singleton settings (global privacy,
@@ -38,7 +41,8 @@ type AccountSettingsBatchStore interface {
 type NotifySettingsStore interface {
 	GetNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope) (domain.PeerNotifySettings, bool, error)
 	SaveNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings) error
-	ResetNotifySettings(ctx context.Context, ownerUserID int64) error
+	SaveNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings, delivery DeliveryOutboxEnqueue) error
+	ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects DeliveryEffectsBuilder[NotifySettingsResetSnapshot]) error
 	// GetPeerNotifySettings batch-loads whole-peer (topic 0) settings for the dialog list.
 	GetPeerNotifySettings(ctx context.Context, ownerUserID int64, peers []domain.Peer) (map[domain.Peer]domain.PeerNotifySettings, error)
 	// AllPeerNotifySettings loads every whole-peer (topic 0) setting for one owner in a single
@@ -48,23 +52,39 @@ type NotifySettingsStore interface {
 	ListNotifyExceptions(ctx context.Context, ownerUserID int64) ([]domain.NotifyException, error)
 }
 
+type NotifySettingsResetSnapshot struct {
+	OwnerUserID int64
+	Scopes      []domain.NotifyScope
+}
+
+func ValidateNotifySettingsResetDeliveryEffects(snapshot NotifySettingsResetSnapshot, effects []DeliveryEffect) error {
+	if snapshot.OwnerUserID <= 0 || len(effects) != 1 {
+		return ErrDeliveryOutboxRequired
+	}
+	effect := effects[0]
+	if err := effect.Validate(); err != nil {
+		return err
+	}
+	if effect.Kind != DeliveryEffectAbsolute || effect.TargetUserID != snapshot.OwnerUserID ||
+		effect.ExcludeAuthKeyID != ([8]byte{}) || effect.ExcludeSessionID != 0 ||
+		effect.RecoveryPolicy != OutboxRecoveryAbsoluteReload {
+		return ErrDeliveryOutboxRequired
+	}
+	return nil
+}
+
 // StickerCollectionStore persists per-user personal sticker/GIF collections
 // (faved / recent / recent-attached stickers, saved GIFs).
 type StickerCollectionStore interface {
-	// SaveStickerCollectionItem adds (move-to-front, capped at max) or removes a document.
-	SaveStickerCollectionItem(ctx context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now, max int) error
+	MutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, effects DeliveryEffectsBuilder[domain.StickerCollectionMutation]) error
 	ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error)
-	ClearStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind) error
 }
 
 // UserStickerSetStore persists per-user installed sticker set state.
 // Sticker set metadata remains in MediaStore; this store only owns account-local
 // installation/archive/order facts.
 type UserStickerSetStore interface {
-	InstallUserStickerSet(ctx context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error
-	UninstallUserStickerSet(ctx context.Context, userID int64, setID int64) error
-	SetUserStickerSetArchived(ctx context.Context, userID int64, setID int64, archived bool, now int) error
-	ReorderUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, order []int64, now int) error
+	MutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation, effects DeliveryEffectsBuilder[domain.UserStickerSetMutation]) error
 	ListUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error)
 }
 
@@ -88,12 +108,8 @@ type BusinessAutomationStore interface {
 	ResolveBusinessChatLink(ctx context.Context, slug string, bumpViews bool) (domain.BusinessChatLink, bool, error)
 	ListQuickReplies(ctx context.Context, ownerUserID int64, includeTopMessages bool) (domain.QuickReplyList, error)
 	CheckQuickReplyShortcut(ctx context.Context, ownerUserID int64, shortcut string) (bool, error)
-	SaveQuickReplyText(ctx context.Context, ownerUserID int64, shortcut string, msg domain.QuickReplyMessage) (domain.QuickReplyMutation, error)
 	GetQuickReplyMessages(ctx context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMessages, error)
-	RenameQuickReplyShortcut(ctx context.Context, ownerUserID int64, shortcutID int, shortcut string) (domain.QuickReplyMutation, error)
-	ReorderQuickReplies(ctx context.Context, ownerUserID int64, order []int) (domain.QuickReplyMutation, error)
-	DeleteQuickReplyShortcut(ctx context.Context, ownerUserID int64, shortcutID int) (domain.QuickReplyMutation, error)
-	DeleteQuickReplyMessages(ctx context.Context, ownerUserID int64, shortcutID int, ids []int) (domain.QuickReplyMutation, error)
+	MutateQuickReplies(ctx context.Context, mutation QuickReplyAccountMutation, effects DeliveryEffectsBuilder[QuickReplyAccountMutationSnapshot]) (QuickReplyAccountMutationSnapshot, error)
 	ReserveBusinessAutomationDelivery(ctx context.Context, delivery domain.BusinessAutomationDelivery) (bool, error)
 	LastBusinessAutomationDelivery(ctx context.Context, ownerUserID, peerUserID int64, kind domain.BusinessAutomationKind) (domain.BusinessAutomationDelivery, bool, error)
 	GetConnectedBusinessBot(ctx context.Context, ownerUserID int64) (domain.ConnectedBusinessBot, bool, error)

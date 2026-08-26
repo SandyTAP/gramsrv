@@ -147,11 +147,11 @@ SELECT EXISTS (
 	if err := appendNewMessageEvent(ctx, qtx, msg); err != nil {
 		return domain.Message{}, err
 	}
-	if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+	if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 		TargetUserID:     userID,
 		Pts:              int32(msg.Pts),
 		EventType:        string(domain.UpdateEventNewMessage),
-		ExcludeAuthKeyID: 0,
+		ExcludeAuthKeyID: [8]byte{},
 		ExcludeSessionID: 0,
 	}); err != nil {
 		return domain.Message{}, fmt.Errorf("enqueue broadcast dispatch: %w", err)

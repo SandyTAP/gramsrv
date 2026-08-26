@@ -22,7 +22,7 @@ func TestPublicChannelAndMegagroupPreviewPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create viewer: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	var channelIDs []int64
 	t.Cleanup(func() {
 		if len(channelIDs) != 0 {
@@ -77,7 +77,8 @@ func TestPublicChannelAndMegagroupPreviewPostgres(t *testing.T) {
 			}
 			read, err := channels.ReadChannelHistory(ctx, domain.ReadChannelHistoryRequest{
 				UserID: viewer.ID, ChannelID: public.ID, MaxID: sent.Message.ID, Date: 1700009411 + i,
-			})
+			}, testChannelReadEffects)
+
 			if err != nil {
 				t.Fatalf("read public preview history: %v", err)
 			}
@@ -131,7 +132,7 @@ SELECT 1 FROM channel_dialogs WHERE channel_id = $1 AND user_id = $2
 			if memberExists || dialogExists {
 				t.Fatalf("public preview persisted member/dialog = %v/%v", memberExists, dialogExists)
 			}
-			if _, err := channels.JoinChannel(ctx, public.ID, viewer.ID, 1700009420+i); err != nil {
+			if _, err := channels.JoinChannel(ctx, public.ID, viewer.ID, 1700009420+i, testPendingJoinEffects); err != nil {
 				t.Fatalf("join public peer: %v", err)
 			}
 			if _, err := channels.LeaveChannel(ctx, public.ID, viewer.ID, 1700009430+i); err != nil {
@@ -200,7 +201,7 @@ func TestLinkedDiscussionGuestPeerDialogProjectionPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create outsider: %v", err)
 	}
-	channels := NewChannelStore(pool,
+	channels := newTestChannelStore(pool,
 		WithChannelRowCache(NewChannelRowCache(32)),
 		WithChannelMemberCache(NewChannelMemberCache(64)))
 	var channelIDs []int64

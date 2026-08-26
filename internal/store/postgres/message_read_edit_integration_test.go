@@ -32,7 +32,7 @@ func TestMessageStoreReadAndEditEmitDurableEvents(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -133,7 +133,7 @@ func TestMessageStoreEditCanHideEditedBadge(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -206,7 +206,7 @@ func TestMessageStoreReadHistoryStaleUnreadRepairDoesNotAppendPts(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
@@ -334,7 +334,7 @@ func TestMessageStoreReadHistoryClampsFutureMaxIDAndRepairsDialog(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
 	first, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,

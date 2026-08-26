@@ -59,7 +59,7 @@ func (r *Router) onMessagesCreateForumTopic(ctx context.Context, req *tg.Message
 	echoCache := newViewerPeerCache(r)
 	updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, sendRes, req.RandomID, echoCache)
 	if !res.Duplicate {
-		if err := r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil); err != nil {
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, sendRes); err != nil {
 			return nil, internalErr()
 		}
 	}
@@ -116,7 +116,7 @@ func (r *Router) onMessagesEditForumTopic(ctx context.Context, req *tg.MessagesE
 	}
 	echoCache := newViewerPeerCache(r)
 	updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, sendRes, 0, echoCache)
-	if err := r.enqueueChannelMessageFanout(ctx, userID, sendRes, nil); err != nil {
+	if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, sendRes); err != nil {
 		return nil, internalErr()
 	}
 	return updates, nil
@@ -148,9 +148,6 @@ func (r *Router) onMessagesUpdatePinnedForumTopic(ctx context.Context, req *tg.M
 		return nil, forumTopicError(err)
 	}
 	updates := r.pinnedForumTopicUpdates(userID, res.Channel, res.Topic.TopicID, res.Topic.Pinned)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.pinnedForumTopicUpdates(viewerUserID, res.Channel, res.Topic.TopicID, res.Topic.Pinned)
-	})
 	return updates, nil
 }
 
@@ -180,9 +177,6 @@ func (r *Router) onMessagesReorderPinnedForumTopics(ctx context.Context, req *tg
 		return nil, forumTopicError(err)
 	}
 	updates := r.pinnedForumTopicsOrderUpdates(userID, res.Channel, res.Order)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.pinnedForumTopicsOrderUpdates(viewerUserID, res.Channel, res.Order)
-	})
 	return updates, nil
 }
 
@@ -211,14 +205,6 @@ func (r *Router) onMessagesDeleteTopicHistory(ctx context.Context, req *tg.Messa
 		return nil, forumTopicError(err)
 	}
 	if res.Event.Pts != 0 {
-		r.enqueueChannelFanout(ctx, channelFanoutMessageBox, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-			return &tg.Updates{
-				Updates: []tg.UpdateClass{tgChannelUpdate(viewerUserID, res.Event)},
-				Chats:   []tg.ChatClass{tgChannelChatMin(viewerUserID, res.Channel)},
-				Date:    res.Event.Date,
-				Seq:     0,
-			}
-		})
 		return &tg.MessagesAffectedHistory{Pts: res.Event.Pts, PtsCount: res.Event.PtsCount, Offset: res.Offset}, nil
 	}
 	return &tg.MessagesAffectedHistory{Pts: res.Channel.Pts, PtsCount: 0, Offset: res.Offset}, nil

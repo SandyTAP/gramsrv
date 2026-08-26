@@ -707,9 +707,9 @@ func (s *Service) Claim(ctx context.Context, decision domain.VerificationDecisio
 // the decision is recorded: approval is the only path that flips the flag, so it
 // is also the last place the invariants can still be enforced. The flag itself
 // is set from inside the store transaction through PeerVerifier, so "approved"
-// and "verified" commit together. The post-commit push is best effort: the data
-// is already consistent, and a failed push must not turn a landed decision into
-// an error the panel would retry.
+// and "verified" commit together. User delivery is another effect of that same
+// transaction; the post-commit hook only invalidates caches. Channel delivery
+// remains owned by the channel aggregate.
 func (s *Service) Approve(ctx context.Context, decision domain.VerificationDecision) (domain.VerificationApplication, bool, error) {
 	st, err := s.verificationStore()
 	if err != nil {

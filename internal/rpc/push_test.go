@@ -3,8 +3,8 @@ package rpc
 import (
 	"context"
 	"testing"
-	"time"
 
+	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
@@ -19,37 +19,6 @@ type ordinaryOnlySessions struct {
 	userFound    bool
 	message      tg.UpdatesClass
 	pushUserIDs  []int64
-}
-
-type boundedTrapSessions struct {
-	ordinaryOnlySessions
-	boundedCalls int
-}
-
-func (s *boundedTrapSessions) PushToUserExceptAuthKeySessionBounded(context.Context, int64, [8]byte, int64, proto.MessageType, tg.UpdatesClass, time.Duration) (int, error) {
-	s.boundedCalls++
-	return 99, nil
-}
-
-func TestPushUserMessageDoesNotUseBoundedSessionPusher(t *testing.T) {
-	sessions := &boundedTrapSessions{}
-	router := &Router{
-		cfg:  Config{OutboundPushTimeout: time.Second},
-		log:  zaptest.NewLogger(t),
-		deps: Deps{Sessions: sessions},
-	}
-	ctx := WithAuthKeyID(WithSessionID(context.Background(), 77), [8]byte{1, 2, 3})
-
-	sent := router.pushUserMessage(ctx, 1000000001, "push ordinary test", &tg.Updates{Date: 1})
-	if sent != 1 {
-		t.Fatalf("sent = %d, want ordinary push result 1", sent)
-	}
-	if sessions.boundedCalls != 0 {
-		t.Fatalf("bounded calls = %d, want 0 for ordinary push", sessions.boundedCalls)
-	}
-	if ids := sessions.pushUserIDs; len(ids) != 1 || ids[0] != 1000000001 {
-		t.Fatalf("ordinary push target IDs = %v, want [1000000001]", ids)
-	}
 }
 
 func (s *ordinaryOnlySessions) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte) {
@@ -111,5 +80,24 @@ func TestPushUserMessageTransientWithoutCapabilityDoesNotFallbackToOrdinaryPush(
 	}
 	if ids := sessions.pushUserIDs; len(ids) != 0 {
 		t.Fatalf("ordinary push fallback target IDs = %v, want none", ids)
+	}
+}
+
+func TestPushLoginTokenAcceptedWithoutImmediateCapabilityDoesNotFallbackToOrdinaryPush(t *testing.T) {
+	sessions := &ordinaryOnlySessions{}
+	router := &Router{
+		log:   zaptest.NewLogger(t),
+		clock: clock.System,
+		deps:  Deps{Sessions: sessions},
+	}
+	target := loginTokenTarget{
+		rawAuthKeyID: [8]byte{9, 8, 7},
+		sessionID:    77,
+	}
+
+	router.pushLoginTokenAccepted(context.Background(), target)
+
+	if got := sessions.message; got != nil {
+		t.Fatalf("ordinary push fallback captured %#v, want nil", got)
 	}
 }

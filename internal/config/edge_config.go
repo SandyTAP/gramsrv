@@ -62,7 +62,7 @@ type CacheYAML struct {
 }
 
 type EdgeEgressYAML struct {
-	Ack GRPCClientYAML `yaml:"ack"`
+	Delivery GRPCClientYAML `yaml:"delivery"`
 }
 
 // LoadEdge reads the Edge role YAML config and returns the runtime snapshot used by the Edge process.
@@ -115,7 +115,7 @@ func LoadEdge() (EdgeConfig, error) {
 		if err := applyFileClientYAML(b, y.FileData); err != nil {
 			return err
 		}
-		return applyEgressAckClientYAML(b, y.Egress.Ack)
+		return applyEgressDeliveryClientYAML(b, y.Egress.Delivery)
 	})
 	if err != nil {
 		return EdgeConfig{}, err
@@ -174,14 +174,14 @@ type EdgeConfig struct {
 	CoreExecGRPCTLSClientKeyFile  string
 	CoreExecToken                 string
 
-	EgressAckGRPCResolver          string
-	EgressAckGRPCTargets           string
-	EgressAckGRPCRequestTimeout    time.Duration
-	EgressAckGRPCTLSCAFile         string
-	EgressAckGRPCTLSServerName     string
-	EgressAckGRPCTLSClientCertFile string
-	EgressAckGRPCTLSClientKeyFile  string
-	EgressAckToken                 string
+	EgressDeliveryGRPCResolver          string
+	EgressDeliveryGRPCTargets           string
+	EgressDeliveryGRPCRequestTimeout    time.Duration
+	EgressDeliveryGRPCTLSCAFile         string
+	EgressDeliveryGRPCTLSServerName     string
+	EgressDeliveryGRPCTLSClientCertFile string
+	EgressDeliveryGRPCTLSClientKeyFile  string
+	EgressDeliveryToken                 string
 
 	FileGRPCTargets           string
 	FileGRPCResolver          string
@@ -230,9 +230,9 @@ func edgeConfigFromConfig(c Config) EdgeConfig {
 		CoreExecGRPCResolver: c.CoreExecGRPCResolver, CoreExecGRPCTargets: c.CoreExecGRPCTargets, CoreExecGRPCRequestTimeout: c.CoreExecGRPCRequestTimeout,
 		CoreExecGRPCTLSCAFile: c.CoreExecGRPCTLSCAFile, CoreExecGRPCTLSServerName: c.CoreExecGRPCTLSServerName,
 		CoreExecGRPCTLSClientCertFile: c.CoreExecGRPCTLSClientCertFile, CoreExecGRPCTLSClientKeyFile: c.CoreExecGRPCTLSClientKeyFile, CoreExecToken: c.CoreExecToken,
-		EgressAckGRPCResolver: c.EgressAckGRPCResolver, EgressAckGRPCTargets: c.EgressAckGRPCTargets, EgressAckGRPCRequestTimeout: c.EgressAckGRPCRequestTimeout,
-		EgressAckGRPCTLSCAFile: c.EgressAckGRPCTLSCAFile, EgressAckGRPCTLSServerName: c.EgressAckGRPCTLSServerName,
-		EgressAckGRPCTLSClientCertFile: c.EgressAckGRPCTLSClientCertFile, EgressAckGRPCTLSClientKeyFile: c.EgressAckGRPCTLSClientKeyFile, EgressAckToken: c.EgressAckToken,
+		EgressDeliveryGRPCResolver: c.EgressDeliveryGRPCResolver, EgressDeliveryGRPCTargets: c.EgressDeliveryGRPCTargets, EgressDeliveryGRPCRequestTimeout: c.EgressDeliveryGRPCRequestTimeout,
+		EgressDeliveryGRPCTLSCAFile: c.EgressDeliveryGRPCTLSCAFile, EgressDeliveryGRPCTLSServerName: c.EgressDeliveryGRPCTLSServerName,
+		EgressDeliveryGRPCTLSClientCertFile: c.EgressDeliveryGRPCTLSClientCertFile, EgressDeliveryGRPCTLSClientKeyFile: c.EgressDeliveryGRPCTLSClientKeyFile, EgressDeliveryToken: c.EgressDeliveryToken,
 		FileGRPCTargets: c.FileGRPCTargets, FileGRPCResolver: c.FileGRPCResolver, FileGRPCRequestTimeout: c.FileGRPCRequestTimeout,
 		FileGRPCTLSCAFile: c.FileGRPCTLSCAFile, FileGRPCTLSServerName: c.FileGRPCTLSServerName,
 		FileGRPCTLSClientCertFile: c.FileGRPCTLSClientCertFile, FileGRPCTLSClientKeyFile: c.FileGRPCTLSClientKeyFile, FileToken: c.FileToken,

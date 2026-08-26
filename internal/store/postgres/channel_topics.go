@@ -77,42 +77,6 @@ WHERE id = $1`, channelID, enabled, nextTabs); err != nil {
 	return channel, nil
 }
 
-func (s *ChannelStore) SetChannelViewForumAsMessages(ctx context.Context, userID, channelID int64, enabled bool) (bool, error) {
-	if userID == 0 || channelID == 0 {
-		return false, nil
-	}
-	var changed bool
-	if err := s.db.QueryRow(ctx, `
-WITH target AS (
-    SELECT c.id AS channel_id, c.top_message_id, c.date AS top_message_date
-    FROM channels c
-    JOIN channel_members m ON m.channel_id = c.id
-    WHERE c.id = $2 AND m.user_id = $1 AND m.status = 'active' AND NOT c.deleted
-),
-ensured AS (
-    INSERT INTO channel_dialogs (user_id, channel_id, top_message_id, top_message_date)
-    SELECT $1, channel_id, top_message_id, top_message_date FROM target
-    ON CONFLICT (user_id, channel_id) DO NOTHING
-),
-updated_dialog AS (
-    UPDATE channel_dialogs d
-    SET view_forum_as_messages = $3, updated_at = now()
-    WHERE d.user_id = $1 AND d.channel_id = $2
-      AND EXISTS (SELECT 1 FROM target)
-      AND d.view_forum_as_messages IS DISTINCT FROM $3::boolean
-    RETURNING d.user_id
-)
-SELECT EXISTS (SELECT 1 FROM updated_dialog)::boolean`, userID, channelID, enabled).Scan(&changed); err != nil {
-		return false, fmt.Errorf("set channel view forum as messages: %w", err)
-	}
-	// 连接池写后同步失效本进程 dialog 缓存，保证同实例 read-your-write；
-	// 跨实例由 dialog_light NOTIFY 异步兜底。
-	if changed && s.dialogCacheActive(s.db) {
-		s.dialogCache.delete(userID, channelID)
-	}
-	return changed, nil
-}
-
 func (s *ChannelStore) CreateForumTopic(ctx context.Context, req domain.CreateChannelForumTopicRequest) (domain.CreateChannelForumTopicResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 || req.RandomID == 0 {
 		return domain.CreateChannelForumTopicResult{}, domain.ErrChannelInvalid

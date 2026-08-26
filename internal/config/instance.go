@@ -2,21 +2,23 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"strings"
-	"time"
+
+	"telesrv/internal/deliverycontract"
 )
 
-// ResolveInstanceID returns the configured stable instance ID, or a generated
-// process-local ID for short-lived development runs.
-func ResolveInstanceID(configured string) string {
-	if configured = strings.TrimSpace(configured); configured != "" {
-		return configured
+// RequireInstanceID validates the explicitly configured stable process
+// identity. Durable fencing and Redis ownership must never use a generated or
+// normalized fallback identity.
+func RequireInstanceID(configured string) (string, error) {
+	if configured == "" {
+		return "", fmt.Errorf("instance id is required")
 	}
-	host, err := os.Hostname()
-	if err != nil || strings.TrimSpace(host) == "" {
-		host = "host"
+	if strings.TrimSpace(configured) != configured {
+		return "", fmt.Errorf("instance id must be canonical")
 	}
-	host = strings.NewReplacer(" ", "-", ":", "-", "/", "-", "\\", "-").Replace(strings.TrimSpace(host))
-	return fmt.Sprintf("%s-%d-%d", host, os.Getpid(), time.Now().UnixNano())
+	if len(configured) > deliverycontract.MaxInstanceIDBytes {
+		return "", fmt.Errorf("instance id exceeds %d bytes", deliverycontract.MaxInstanceIDBytes)
+	}
+	return configured, nil
 }

@@ -62,18 +62,15 @@ func (r *Router) onMessagesSendVote(ctx context.Context, req *tg.MessagesSendVot
 			return nil, pollMutationErr(err)
 		}
 		r.logPollOutcome("sendVote applied", userID, res.PollID, res.Message.Media)
-		return r.channelPollUpdates(ctx, userID, peer, req.MsgID, res, true), nil
+		return r.channelPollUpdates(ctx, userID, peer, req.MsgID, res), nil
 	case domain.PeerTypeUser:
 		if r.deps.Messages == nil {
 			return nil, messageIDInvalidErr()
 		}
+		deliveryUsers := r.privatePollDeliveryUsers(ctx, userID, peer.ID)
 		res, err := r.deps.Messages.VoteMessagePoll(ctx, userID, domain.VotePrivateMessagePollRequest{
-			UserID:    userID,
-			Peer:      peer,
-			MessageID: req.MsgID,
-			Options:   req.Options,
-			Date:      now,
-		})
+			UserID: userID, Peer: peer, MessageID: req.MsgID, Options: req.Options, Date: now,
+		}, r.privatePollDeliveryEffects(ctx, userID, deliveryUsers, now))
 		if err != nil {
 			r.log.Warn("sendVote failed", zap.Error(err), zap.Int64("user_id", userID), zap.Int("msg_id", req.MsgID))
 			return nil, pollMutationErr(err)
@@ -83,7 +80,7 @@ func (r *Router) onMessagesSendVote(ctx context.Context, req *tg.MessagesSendVot
 				r.logPollOutcome("sendVote applied", userID, res.PollID, msg.Media)
 			}
 		}
-		return r.privatePollUpdates(ctx, userID, res), nil
+		return r.privatePollUpdates(ctx, userID, res)
 	default:
 		return nil, peerIDInvalidErr()
 	}

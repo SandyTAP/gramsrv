@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"github.com/iamxvbaba/td/clock"
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap/zaptest"
 	"strings"
@@ -45,7 +44,7 @@ func TestChannelRealtimeRecipientsPreferOnlineMembers(t *testing.T) {
 		return false
 	}
 
-	got := r.channelFanoutRecipients(ctx, channelFanoutMembers, created.Channel.ID, []int64{1002})
+	got := r.channelTransientRecipients(ctx, channelTransientMembers, created.Channel.ID, []int64{1002})
 	if !contains(got, 1999) {
 		t.Fatalf("recipients = %v, want online active member 1999", got)
 	}
@@ -53,7 +52,7 @@ func TestChannelRealtimeRecipientsPreferOnlineMembers(t *testing.T) {
 		t.Fatalf("recipients = %v, non-member online user leaked", got)
 	}
 	if !contains(got, 1002) {
-		t.Fatalf("recipients = %v, want explicit fallback recipient 1002", got)
+		t.Fatalf("recipients = %v, want explicitly affected recipient 1002", got)
 	}
 	onlines, err := r.onMessagesGetOnlines(WithUserID(ctx, 1001), &tg.InputPeerChannel{
 		ChannelID:  created.Channel.ID,
@@ -73,11 +72,14 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "15550002001", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 22, Phone: "15550002002", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	sessions := &captureScopedSessions{captureSessions: &captureSessions{}}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -87,8 +89,6 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 		t.Fatalf("create chat: %v", err)
 	}
 	channel := created.Updates.(*tg.Updates).Chats[0].(*tg.Channel)
-	cancelFanout := startChannelFanoutForTest(t, r)
-	defer cancelFanout()
 	sessions.clearMessages()
 
 	var authKeyID [8]byte
@@ -114,25 +114,8 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	if msg.PeerID.(*tg.PeerChannel).ChannelID != channel.ID || msg.Message != "hello channel" || !msg.Out {
 		t.Fatalf("channel message = %#v, want outgoing channel text", msg)
 	}
-	waitForPushedUserIDs(t, sessions.captureSessions, 1)
-	pushed := sessions.snapshot()
-	if pushed.userID != friend.ID || pushed.sessionID != 77 || pushed.messageType != proto.MessageFromServer {
-		t.Fatalf("pushed channel update = user %d exclude session %d type %v, want friend/exclude/from_server", pushed.userID, pushed.sessionID, pushed.messageType)
-	}
-	if gotAuthKeyID := sessions.scopedAuthKey(); gotAuthKeyID != authKeyID {
-		t.Fatalf("exclude auth_key_id = %x, want %x", gotAuthKeyID, authKeyID)
-	}
-	pushedUpdates, ok := pushed.message.(*tg.Updates)
-	if !ok || len(pushedUpdates.Updates) != 1 {
-		t.Fatalf("pushed channel update = %T %+v, want one updates container without updateMessageID", pushed.message, pushed.message)
-	}
-	pushedNew, ok := pushedUpdates.Updates[0].(*tg.UpdateNewChannelMessage)
-	if !ok {
-		t.Fatalf("pushed update[0] = %T, want updateNewChannelMessage", pushedUpdates.Updates[0])
-	}
-	pushedMsg := pushedNew.Message.(*tg.Message)
-	if pushedMsg.Out || pushedMsg.Message != "hello channel" {
-		t.Fatalf("pushed message = %#v, want incoming channel text for friend", pushedMsg)
+	if pushed := sessions.snapshot(); pushed.message != nil {
+		t.Fatalf("Core pushed durable channel update directly: %T", pushed.message)
 	}
 
 	history, err := r.onChannelsGetMessages(WithUserID(ctx, friend.ID), &tg.ChannelsGetMessagesRequest{
@@ -156,16 +139,17 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	}); err != nil || !ok {
 		t.Fatalf("channels.readMessageContents = ok %v err %v, want true", ok, err)
 	}
-	contentPush := sessions.snapshot()
-	if contentPush.userID != friend.ID || contentPush.sessionID != 88 || contentPush.messageType != proto.MessageFromServer {
-		t.Fatalf("content-read push = user %d exclude session %d type %v, want friend/exclude/from_server", contentPush.userID, contentPush.sessionID, contentPush.messageType)
+	contentItems := deliveryOutbox.Snapshot()
+	if len(contentItems) != 1 {
+		t.Fatalf("content-read durable deliveries = %+v, want one", contentItems)
 	}
-	if gotAuthKeyID := sessions.scopedAuthKey(); gotAuthKeyID != contentAuthKeyID {
-		t.Fatalf("content-read exclude auth_key_id = %x, want %x", gotAuthKeyID, contentAuthKeyID)
+	contentItem := contentItems[0]
+	if contentItem.TargetUserID != friend.ID || contentItem.ExcludeAuthKeyID != contentAuthKeyID || contentItem.ExcludeSessionID != 88 {
+		t.Fatalf("content-read durable target/exclusion = %d/%x/%d, want friend/%x/88", contentItem.TargetUserID, contentItem.ExcludeAuthKeyID, contentItem.ExcludeSessionID, contentAuthKeyID)
 	}
-	contentUpdates, ok := contentPush.message.(*tg.Updates)
-	if !ok || len(contentUpdates.Updates) != 1 {
-		t.Fatalf("content-read pushed message = %T %+v, want one update", contentPush.message, contentPush.message)
+	contentUpdates := requireDeliveryUpdates(t, contentItem)
+	if len(contentUpdates.Updates) != 1 {
+		t.Fatalf("content-read durable updates = %+v, want one update", contentUpdates.Updates)
 	}
 	contentRead, ok := contentUpdates.Updates[0].(*tg.UpdateChannelReadMessagesContents)
 	if !ok || contentRead.ChannelID != channel.ID || len(contentRead.Messages) != 1 || contentRead.Messages[0] != msg.ID {
@@ -201,13 +185,14 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	if err != nil || !readOK {
 		t.Fatalf("channels.readHistory = %v err %v, want true", readOK, err)
 	}
-	readPush := sessions.snapshot()
-	if readPush.userID != owner.ID || readPush.messageType != proto.MessageFromServer {
-		t.Fatalf("read outbox push = user %d type %v, want owner/from_server", readPush.userID, readPush.messageType)
+	readItems := deliveryOutbox.Snapshot()
+	if len(readItems) != 3 {
+		t.Fatalf("durable deliveries after channel read = %+v, want prior content plus reader inbox and sender outbox", readItems)
 	}
-	readPushUpdates, ok := readPush.message.(*tg.Updates)
-	if !ok || len(readPushUpdates.Updates) != 1 {
-		t.Fatalf("read outbox pushed message = %T %+v, want one update", readPush.message, readPush.message)
+	ownerReadItem := requireDeliveryItemForUser(t, readItems, owner.ID)
+	readPushUpdates := requireDeliveryUpdates(t, ownerReadItem)
+	if len(readPushUpdates.Updates) != 1 {
+		t.Fatalf("read outbox durable updates = %+v, want one update", readPushUpdates.Updates)
 	}
 	readOutbox, ok := readPushUpdates.Updates[0].(*tg.UpdateReadChannelOutbox)
 	if !ok || readOutbox.ChannelID != channel.ID || readOutbox.MaxID != msg.ID {
@@ -321,17 +306,18 @@ func TestChannelSendHistoryAndDifferenceRPC(t *testing.T) {
 	}
 }
 
-func TestChannelsReadMessageContentsClearsUnreadReactionAndPushesUpdate(t *testing.T) {
+func TestChannelsReadMessageContentsAtomicallyClearsAndQueuesUpdates(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 41, Phone: "15550002141", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 42, Phone: "15550002142", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
-	sessions := &captureScopedSessions{captureSessions: &captureSessions{}}
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -379,20 +365,26 @@ func TestChannelsReadMessageContentsClearsUnreadReactionAndPushesUpdate(t *testi
 	}); err != nil || !ok {
 		t.Fatalf("channels.readMessageContents = ok %v err %v, want true", ok, err)
 	}
-	pushed := sessions.snapshot()
-	if pushed.userID != owner.ID || pushed.sessionID != 99 || pushed.messageType != proto.MessageFromServer {
-		t.Fatalf("reaction read push = user %d session %d type %v, want owner/exclude/from_server", pushed.userID, pushed.sessionID, pushed.messageType)
+	items := deliveryOutbox.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("reaction read durable deliveries = %+v, want one", items)
 	}
-	if gotAuthKeyID := sessions.scopedAuthKey(); gotAuthKeyID != contentAuthKeyID {
-		t.Fatalf("reaction read exclude auth_key_id = %x, want %x", gotAuthKeyID, contentAuthKeyID)
+	item := items[0]
+	if item.TargetUserID != owner.ID || item.ExcludeAuthKeyID != contentAuthKeyID || item.ExcludeSessionID != 99 {
+		t.Fatalf("reaction read durable target/exclusion = %d/%x/%d, want owner/%x/99", item.TargetUserID, item.ExcludeAuthKeyID, item.ExcludeSessionID, contentAuthKeyID)
 	}
-	pushedUpdates, ok := pushed.message.(*tg.Updates)
-	if !ok || len(pushedUpdates.Updates) != 1 {
-		t.Fatalf("reaction read push = %T %+v, want one updateMessageReactions", pushed.message, pushed.message)
+	pushedUpdates := requireDeliveryUpdates(t, item)
+	if len(pushedUpdates.Updates) != 2 {
+		t.Fatalf("reaction read durable updates = %+v, want content-read and reaction refresh", pushedUpdates.Updates)
 	}
-	reactionUpdate, ok := pushedUpdates.Updates[0].(*tg.UpdateMessageReactions)
-	if !ok || reactionUpdate.MsgID != msgID {
-		t.Fatalf("reaction read update = %#v, want updateMessageReactions for %d", pushedUpdates.Updates[0], msgID)
+	var reactionUpdate *tg.UpdateMessageReactions
+	for _, update := range pushedUpdates.Updates {
+		if candidate, ok := update.(*tg.UpdateMessageReactions); ok {
+			reactionUpdate = candidate
+		}
+	}
+	if reactionUpdate == nil || reactionUpdate.MsgID != msgID {
+		t.Fatalf("reaction read updates = %+v, want updateMessageReactions for %d", pushedUpdates.Updates, msgID)
 	}
 	for _, recent := range reactionUpdate.Reactions.RecentReactions {
 		if recent.Unread {
@@ -412,18 +404,20 @@ func TestChannelsReadMessageContentsClearsUnreadReactionAndPushesUpdate(t *testi
 	}
 }
 
-func TestChannelReadHistoryProducesReadChannelInboxDifference(t *testing.T) {
+func TestChannelReadHistoryDurablyQueuesReadInboxWithoutAccountPTS(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 31, Phone: "15550002131", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 32, Phone: "15550002132", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	updates := appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore())
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
-		Updates:  updates,
-		Sessions: &captureSessions{},
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		Updates:        updates,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},
@@ -443,7 +437,12 @@ func TestChannelReadHistoryProducesReadChannelInboxDifference(t *testing.T) {
 	}
 	newUpdate := sent.(*tg.Updates).Updates[1].(*tg.UpdateNewChannelMessage)
 	msg := newUpdate.Message.(*tg.Message)
-	readOK, err := r.onChannelsReadHistory(WithUserID(ctx, friend.ID), &tg.ChannelsReadHistoryRequest{
+	friendCtx := WithUserID(ctx, friend.ID)
+	stateBefore, err := r.onUpdatesGetState(friendCtx)
+	if err != nil {
+		t.Fatalf("updates.getState before read: %v", err)
+	}
+	readOK, err := r.onChannelsReadHistory(friendCtx, &tg.ChannelsReadHistoryRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash},
 		MaxID:   msg.ID,
 	})
@@ -453,23 +452,35 @@ func TestChannelReadHistoryProducesReadChannelInboxDifference(t *testing.T) {
 	if !readOK {
 		t.Fatalf("channels.readHistory = false, want true")
 	}
-	diff, err := r.onUpdatesGetDifference(WithUserID(ctx, friend.ID), &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	stateAfter, err := r.onUpdatesGetState(friendCtx)
 	if err != nil {
-		t.Fatalf("updates.getDifference: %v", err)
+		t.Fatalf("updates.getState after read: %v", err)
 	}
-	full, ok := diff.(*tg.UpdatesDifference)
-	if !ok || len(full.OtherUpdates) != 1 {
-		t.Fatalf("difference = %T %+v, want one read channel inbox update", diff, diff)
+	if stateAfter.Pts != stateBefore.Pts {
+		t.Fatalf("account pts after channel read = %d, want unchanged %d", stateAfter.Pts, stateBefore.Pts)
 	}
-	read, ok := full.OtherUpdates[0].(*tg.UpdateReadChannelInbox)
+	diff, err := r.onUpdatesGetDifference(friendCtx, &tg.UpdatesGetDifferenceRequest{Pts: stateBefore.Pts})
+	if err != nil {
+		t.Fatalf("updates.getDifference after read: %v", err)
+	}
+	if _, ok := diff.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("account difference after channel read = %T %+v, want empty", diff, diff)
+	}
+	items := deliveryOutbox.Snapshot()
+	if len(items) != 2 {
+		t.Fatalf("channel read durable deliveries = %+v, want reader and sender", items)
+	}
+	friendItem := requireDeliveryItemForUser(t, items, friend.ID)
+	durable := requireDeliveryUpdates(t, friendItem)
+	if len(durable.Updates) != 1 {
+		t.Fatalf("reader durable updates = %+v, want one read inbox update", durable.Updates)
+	}
+	read, ok := durable.Updates[0].(*tg.UpdateReadChannelInbox)
 	if !ok || read.ChannelID != channel.ID || read.MaxID != msg.ID || read.StillUnreadCount != 0 {
-		t.Fatalf("difference update = %#v, want updateReadChannelInbox channel %d max %d", full.OtherUpdates[0], channel.ID, msg.ID)
+		t.Fatalf("durable update = %#v, want updateReadChannelInbox channel %d max %d", durable.Updates[0], channel.ID, msg.ID)
 	}
 	if read.Pts != newUpdate.Pts {
-		t.Fatalf("difference channel read pts = %d, want channel pts %d", read.Pts, newUpdate.Pts)
-	}
-	if len(full.Chats) != 1 {
-		t.Fatalf("difference chats = %d, want channel context", len(full.Chats))
+		t.Fatalf("durable channel read pts = %d, want channel pts %d", read.Pts, newUpdate.Pts)
 	}
 }
 
@@ -676,47 +687,66 @@ func TestChannelDifferenceIncludesExtraForwardSourceChannel(t *testing.T) {
 	}
 }
 
-func TestChannelReadHistoryWithReliableDispatchPushesCurrentSessionReadUpdate(t *testing.T) {
-	var authKeyID [8]byte
-	authKeyID[0] = 10
-	updates := &captureUpdates{
-		state: domain.UpdateState{Pts: 900, Date: 1700000102, Seq: 3},
+func TestChannelReadDeliveryUsesWireChannelPtsWithoutAuxAccountPTS(t *testing.T) {
+	effects, err := channelReadDeliveryEffects(1700000102)(domain.ReadChannelHistoryResult{
+		ChannelID: 12345, MaxID: 27, StillUnreadCount: 2, Changed: true, Pts: 42,
+		Dialog: domain.ChannelDialog{UserID: 1000000001},
+	})
+	if err != nil || len(effects) != 1 {
+		t.Fatalf("channel read effects = %+v, %v, want one", effects, err)
 	}
-	sessions := &captureSessions{}
-	r := New(Config{}, Deps{Updates: updates, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
-	ctx := WithSessionID(WithAuthKeyID(context.Background(), authKeyID), 77)
+	decoded, err := decodeDeliveryUpdate(effects[0].Payload)
+	if err != nil {
+		t.Fatalf("decode channel read delivery: %v", err)
+	}
+	updates, ok := decoded.(*tg.Updates)
+	if !ok || len(updates.Updates) != 1 {
+		t.Fatalf("delivery = %T %+v, want one update", decoded, decoded)
+	}
+	update, ok := updates.Updates[0].(*tg.UpdateReadChannelInbox)
+	if !ok || update.ChannelID != 12345 || update.Pts != 42 || update.MaxID != 27 || update.StillUnreadCount != 2 {
+		t.Fatalf("channel read update = %#v", updates.Updates[0])
+	}
+}
 
-	recorded, err := r.recordChannelReadInbox(ctx, 1000000001, domain.ReadChannelHistoryResult{
-		ChannelID:        12345,
-		MaxID:            27,
-		StillUnreadCount: 2,
-		Changed:          true,
-		Pts:              42,
+func TestChannelMessageContentsDeliveryBundlesAbsoluteRefresh(t *testing.T) {
+	const (
+		viewerID  = int64(1000000001)
+		channelID = int64(2000000001)
+		messageID = 27
+	)
+	authKeyID := [8]byte{0x27}
+	ctx := WithSessionID(WithAuthKeyID(context.Background(), authKeyID), 73)
+	reactions := domain.ChannelMessageReactions{
+		CanSeeList: true,
+		Results: []domain.ChannelMessageReactionCount{{
+			Reaction: domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "👍"}, Count: 1,
+		}},
+	}
+	effects, err := (&Router{}).channelMessageContentsDeliveryEffects(ctx, viewerID, 1_700_000_102)(domain.ReadChannelMessageContentsResult{
+		Channel:                         domain.Channel{ID: channelID, Megagroup: true},
+		Messages:                        []domain.ChannelMessage{{ID: messageID, ChannelID: channelID, Reactions: &reactions}},
+		ClearedUnreadReactionMessageIDs: []int{messageID},
 	})
 	if err != nil {
-		t.Fatalf("record channel read inbox: %v", err)
+		t.Fatalf("build channel contents effects: %v", err)
 	}
-	if recorded.Pts != 900 || recorded.ChannelPts != 42 || updates.excludeSessionID != 77 {
-		t.Fatalf("recorded event pts/channel_pts/session = %d/%d/%d, want durable pts 900, channel pts 42 and exclude session 77", recorded.Pts, recorded.ChannelPts, updates.excludeSessionID)
+	if len(effects) != 1 || effects[0].TargetUserID != viewerID || effects[0].ExcludeAuthKeyID != authKeyID || effects[0].ExcludeSessionID != 73 {
+		t.Fatalf("channel contents effects = %+v, want one viewer-scoped absolute effect", effects)
 	}
-	snap := sessions.snapshot()
-	if snap.sessionID != 77 || snap.messageType != proto.MessageFromServer {
-		t.Fatalf("current-session push target = session %d type %v, want session 77 server message", snap.sessionID, snap.messageType)
+	decoded, err := decodeDeliveryUpdate(effects[0].Payload)
+	if err != nil {
+		t.Fatalf("decode channel contents effect: %v", err)
 	}
-	updatesMsg, ok := snap.message.(*tg.Updates)
-	if !ok || len(updatesMsg.Updates) != 2 {
-		t.Fatalf("current-session push = %T %+v, want read update plus account pts bookkeeping", snap.message, snap.message)
+	updates := decoded.(*tg.Updates)
+	if len(updates.Updates) != 2 {
+		t.Fatalf("channel contents updates = %+v, want content-read and reaction refresh", updates.Updates)
 	}
-	update, ok := updatesMsg.Updates[0].(*tg.UpdateReadChannelInbox)
-	if !ok {
-		t.Fatalf("current-session update = %T, want *tg.UpdateReadChannelInbox", updatesMsg.Updates[0])
+	if _, ok := updates.Updates[0].(*tg.UpdateChannelReadMessagesContents); !ok {
+		t.Fatalf("channel contents update[0] = %T", updates.Updates[0])
 	}
-	if update.ChannelID != 12345 || update.Pts != 42 || update.MaxID != 27 || update.StillUnreadCount != 2 {
-		t.Fatalf("current-session channel read update = %+v, want channel=12345 pts=42 max=27 still=2", update)
-	}
-	bookkeeping, ok := updatesMsg.Updates[1].(*tg.UpdateDeleteMessages)
-	if !ok || len(bookkeeping.Messages) != 0 || bookkeeping.Pts != 900 || bookkeeping.PtsCount != 1 {
-		t.Fatalf("current-session bookkeeping = %#v, want empty updateDeleteMessages at account pts 900", updatesMsg.Updates[1])
+	if reaction, ok := updates.Updates[1].(*tg.UpdateMessageReactions); !ok || reaction.MsgID != messageID {
+		t.Fatalf("channel contents update[1] = %#v, want reaction refresh for %d", updates.Updates[1], messageID)
 	}
 }
 

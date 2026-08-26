@@ -13,22 +13,23 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func notifyRouter(t *testing.T) (*Router, *captureSessions) {
+func notifyRouter(t *testing.T) (*Router, *memory.DeliveryOutboxStore) {
 	t.Helper()
 	passwordStore := memory.NewPasswordStore()
-	sessions := &captureSessions{}
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
 	r := New(Config{}, Deps{
-		Account:  appaccount.NewService(passwordStore, appaccount.WithNotifySettings(passwordStore)),
-		Sessions: sessions,
+		Account:        appaccount.NewService(passwordStore, appaccount.WithNotifySettings(passwordStore)),
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
-	return r, sessions
+	return r, delivery
 }
 
 // TestNotifySettingsRoundTripAndDialogProjection 回归：get/update/reset NotifySettings
 // 此前是回显 stub（不持久化），mute 重启即丢、dialog 列表不反映静音。本测试验证
 // per-peer 持久化往返 + dialog 列表投影出 mute + updateNotifySettings 推送 + reset。
 func TestNotifySettingsRoundTripAndDialogProjection(t *testing.T) {
-	r, sessions := notifyRouter(t)
+	r, delivery := notifyRouter(t)
 	const viewer = int64(1000000001)
 	const peerID = int64(555)
 	ctx := WithUserID(context.Background(), viewer)
@@ -51,11 +52,10 @@ func TestNotifySettingsRoundTripAndDialogProjection(t *testing.T) {
 		t.Fatalf("update notify = ok %v err %v", ok, err)
 	}
 
-	// 推送 updateNotifySettings。
-	snap := sessions.snapshot()
-	updates, ok := snap.message.(*tg.Updates)
-	if !ok || len(updates.Updates) == 0 {
-		t.Fatalf("pushed message = %#v, want *tg.Updates with updates", snap.message)
+	// updateNotifySettings 与设置 mutation 由 store 同边界记入 durable outbox。
+	updates := lastQueuedDeliveryUpdates(t, delivery)
+	if len(updates.Updates) == 0 {
+		t.Fatalf("queued updates = %#v, want updateNotifySettings", updates)
 	}
 	upd, ok := updates.Updates[0].(*tg.UpdateNotifySettings)
 	if !ok {
@@ -238,8 +238,10 @@ func (s *countingNotifyService) AllPeerNotifySettings(ctx context.Context, userI
 // 缓存读取——重复 getDialogs 只加载一次（命中 0 PG），update/reset 失效后重载。
 func TestNotifySettingsDialogProjectionCached(t *testing.T) {
 	passwordStore := memory.NewPasswordStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
 	svc := &countingNotifyService{Service: appaccount.NewService(passwordStore, appaccount.WithNotifySettings(passwordStore))}
-	r := New(Config{}, Deps{Account: svc, Sessions: &captureSessions{}}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{Account: svc, DeliveryOutbox: delivery}, zaptest.NewLogger(t), clock.System)
 	const viewer = int64(1000000001)
 	ctx := WithUserID(context.Background(), viewer)
 

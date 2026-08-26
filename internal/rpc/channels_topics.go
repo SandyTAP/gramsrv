@@ -2,8 +2,11 @@ package rpc
 
 import (
 	"context"
+
 	"github.com/iamxvbaba/td/tg"
+
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onChannelsToggleForum(ctx context.Context, req *tg.ChannelsToggleForumRequest) (tg.UpdatesClass, error) {
@@ -13,7 +16,7 @@ func (r *Router) onChannelsToggleForum(ctx context.Context, req *tg.ChannelsTogg
 }
 
 func (r *Router) onChannelsToggleViewForumAsMessages(ctx context.Context, req *tg.ChannelsToggleViewForumAsMessagesRequest) (tg.UpdatesClass, error) {
-	if r.deps.Channels == nil {
+	if r.deps.Channels == nil || r.deps.Dialogs == nil {
 		return nil, notImplementedErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
@@ -24,34 +27,25 @@ func (r *Router) onChannelsToggleViewForumAsMessages(ctx context.Context, req *t
 	if err != nil {
 		return nil, err
 	}
-	changed, err := r.deps.Channels.SetViewForumAsMessages(ctx, userID, channelID, req.Enabled)
+	sessionID, _ := SessionIDFrom(ctx)
+	date := int(r.clock.Now().Unix())
+	snapshot, err := r.deps.Dialogs.MutateAccountDialogs(ctx, store.DialogAccountMutation{
+		Kind: store.DialogAccountSetChannelViewForum, UserID: userID, Date: date,
+		Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}, Value: req.Enabled,
+		ExcludeAuthKeyID: rawAuthKeyIDForOrigin(ctx), ExcludeSessionID: sessionID,
+	}, dialogAccountDeliveryEffects)
 	if err != nil {
 		return nil, channelInvalidErr(err)
 	}
-	if !changed {
-		return tgEmptyUpdates(int(r.clock.Now().Unix())), nil
+	if !snapshot.Changed {
+		return tgEmptyUpdates(date), nil
 	}
 	r.invalidateRPCProjectionForPeer(userID, domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
-	event := domain.UpdateEvent{
-		Type:     domain.UpdateEventChannelViewForum,
-		Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
-		Bool:     req.Enabled,
-		PtsCount: 1,
-		Date:     int(r.clock.Now().Unix()),
-	}
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordChannelViewForumAsMessages(ctx, authKeyID, userID, channelID, req.Enabled, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return nil, internalErr()
-		}
-	}
+	event := allocatedDialogEvent(snapshot)
 	out := tgUpdateForOutboxEvent(event)
 	if out == nil {
-		out = tgEmptyUpdates(event.Date)
+		return nil, internalErr()
 	}
-	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
 	return out, nil
 }
 
@@ -89,13 +83,6 @@ func (r *Router) onMessagesUpdatePinnedMessage(ctx context.Context, req *tg.Mess
 	}
 	r.invalidateRPCProjectionForChannel(res.Channel.ID)
 	updates := r.channelPinnedUpdates(userID, res)
-	// pin fan-out 异步化（设计 Phase 0），与已异步的 unpinAll(channels_stubs.go) 对齐。
-	// builder 无 Users 数组（仅 pinned update + ChatMin），无需 owner 预热。pin 的真实变更由
-	// UpdatePinnedChannelMessages{pts} 承载、可经 getChannelDifference 兜底，bundled 的无 pts
-	// UpdateChannel 对 pin 冗余（pts payload 已含变更），丢弃无害——与 unpinAll 取舍一致。
-	r.enqueueChannelFanout(ctx, channelFanoutMessageBox, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-		return r.channelPinnedUpdates(viewerUserID, res)
-	})
 	return updates, nil
 }
 

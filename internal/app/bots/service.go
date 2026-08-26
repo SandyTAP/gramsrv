@@ -32,16 +32,12 @@ type publicChannelUsernameResolver interface {
 }
 
 type stickerSetCreator interface {
-	CreateStickerSet(ctx context.Context, req domain.CreateStickerSetRequest) (domain.StickerSet, []domain.Document, error)
+	CreateInstalledStickerSet(ctx context.Context, req domain.CreateStickerSetRequest, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
 	ListCreatedStickerSets(ctx context.Context, userID int64, offsetID int64, limit int) ([]domain.StickerSet, int, error)
 	ResolveStickerSet(ctx context.Context, ref domain.StickerSetRef) (domain.StickerSet, []domain.Document, bool, error)
 	GetDocuments(ctx context.Context, ids []int64) ([]domain.Document, error)
-	AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput) (domain.StickerSet, []domain.Document, error)
-	RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64) (domain.StickerSet, []domain.Document, error)
-}
-
-type userStickerSetInstaller interface {
-	InstallUserStickerSet(ctx context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error
+	AddStickerToSet(ctx context.Context, actorUserID int64, ref domain.StickerSetRef, item domain.StickerSetItemInput, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
+	RemoveStickerFromSet(ctx context.Context, actorUserID int64, documentID int64, accessHash int64, effects store.DeliveryEffectsBuilder[store.StickerSetMutation]) (domain.StickerSet, []domain.Document, error)
 }
 
 type aiChatGenerator interface {
@@ -88,14 +84,21 @@ type verificationApplications interface {
 // router↔bots 的构造循环；这些能力都依赖 TL/连接层边界，不能在 app 层实现）：
 //   - RevokeBotSessions：token revoke 后撤销 bot 的全部已登录 session（删
 //     authorization + 强制断连）。
-//   - PushBotCommandsChanged：命令变更后给在线相关用户推 updateBotCommands
-//     （无 pts 的 ephemeral update，离线用户靠 bot_info_version bump 兜底）。
-//   - PushStickerSetsChanged：@Stickers 发布后给 creator 当前在线 session 推
-//     updateStickerSets；离线端靠持久化 install 状态 + 下次 getAllStickers 兜底。
+//   - BotLifecycleDeliveryEffects：在 bot account aggregate 内投影 owner 的
+//     durable non-PTS updateUser effect。
+//   - BotInfoDeliveryEffects：在 bot-info aggregate 内投影冻结受众的 durable
+//     non-PTS updateUser effects。
+//   - BotCommandsDeliveryEffects：在 bot commands transaction 内投影精确受众的
+//     durable non-PTS updateBotCommands effects。
+//   - StickerSetDeliveryEffects：在 sticker-set transaction 内构建并持久化
+//     updateStickerSets 的 durable non-PTS delivery fact。
 type RouterHooks interface {
 	RevokeBotSessions(ctx context.Context, botUserID int64) error
-	PushBotCommandsChanged(ctx context.Context, botUserID int64, commands []domain.BotCommand)
-	PushStickerSetsChanged(ctx context.Context, userID int64, kind domain.StickerSetKind)
+	BotLifecycleDeliveryEffects(ctx context.Context) store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]
+	BotInfoDeliveryEffects(ctx context.Context) store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	BotCommandsDeliveryEffects(ctx context.Context) store.DeliveryEffectsBuilder[store.BotCommandsDeliverySnapshot]
+	StickerSetDeliveryEffects(ctx context.Context, userID int64) store.DeliveryEffectsBuilder[store.StickerSetMutation]
+	InvalidateStickerSetCatalog(kind domain.StickerSetKind)
 }
 
 // TextDraftPusher 推送 @ChatBot AI 流式回复的 transient 文本草稿，由 rpc 层转换为
@@ -117,7 +120,6 @@ type Service struct {
 	blocker    blockChecker
 	channels   publicChannelUsernameResolver
 	stickers   stickerSetCreator
-	installer  userStickerSetInstaller
 	aiChat     aiChatGenerator
 	premium    premiumStorefront
 	gifCatalog interface {
@@ -206,15 +208,6 @@ func WithStickerSetCreator(c stickerSetCreator) Option {
 	return func(s *Service) {
 		if c != nil {
 			s.stickers = c
-		}
-	}
-}
-
-// WithUserStickerSets 注入 per-user sticker set 安装状态写入能力。
-func WithUserStickerSets(c userStickerSetInstaller) Option {
-	return func(s *Service) {
-		if c != nil {
-			s.installer = c
 		}
 	}
 }
@@ -534,10 +527,13 @@ func (s *Service) CheckUsername(ctx context.Context, ownerUserID int64, username
 	return true, nil
 }
 
-// CreateBot 创建一个新 bot 账号：users 行（is_bot, bot_info_version=1, 无 phone）+
-// bots 行（owner、token）。返回新账号与完整 token（唯一一次返回明文的途径之一）。
-func (s *Service) CreateBot(ctx context.Context, ownerUserID int64, name, username string) (domain.User, string, error) {
-	if s == nil || s.users == nil || s.bots == nil || ownerUserID == 0 {
+// CreateBotWithDelivery is the only bot-account creation boundary. The users
+// row, bots row and owner absolute delivery commit as one aggregate.
+func (s *Service) CreateBotWithDelivery(ctx context.Context, ownerUserID int64, name, username string, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, string, error) {
+	if effects == nil || s == nil || s.users == nil || s.bots == nil || ownerUserID == 0 {
+		if effects == nil {
+			return domain.User{}, "", store.ErrDeliveryOutboxRequired
+		}
 		return domain.User{}, "", domain.ErrBotNameInvalid
 	}
 	name = strings.TrimSpace(name)
@@ -570,16 +566,9 @@ func (s *Service) CreateBot(ctx context.Context, ownerUserID int64, name, userna
 	if err != nil {
 		return domain.User{}, "", err
 	}
-	u, profile, err := s.bots.CreateBotAccount(ctx, domain.User{
-		AccessHash:     accessHash,
-		FirstName:      name,
-		Username:       username,
-		Bot:            true,
-		BotInfoVersion: 1,
-	}, domain.BotProfile{
-		OwnerUserID: ownerUserID,
-		TokenSecret: secret,
-	})
+	u, profile, err := s.bots.CreateBotAccountWithDelivery(ctx, domain.User{
+		AccessHash: accessHash, FirstName: name, Username: username, Bot: true, BotInfoVersion: 1,
+	}, domain.BotProfile{OwnerUserID: ownerUserID, TokenSecret: secret}, effects)
 	if err != nil {
 		return domain.User{}, "", err
 	}
@@ -602,30 +591,13 @@ func (s *Service) ListOwnedBots(ctx context.Context, ownerUserID int64) ([]domai
 	return out, nil
 }
 
-// botAccountDeleter is the optional store capability used to permanently delete
-// a user-created bot. Only the Postgres store implements it, so the memory store
-// and other BotStore mocks are unaffected.
-type botAccountDeleter interface {
-	DeleteBotAccount(ctx context.Context, botUserID int64) (domain.User, error)
-}
-
-// DeleteBot permanently removes a user-created bot. System service bots are
-// rejected. Live sessions are dropped and the bot's caches are invalidated so
-// the deletion is visible immediately. Returns the tombstoned user.
-func (s *Service) DeleteBot(ctx context.Context, botUserID int64) (domain.User, error) {
-	if s == nil || s.bots == nil || botUserID == 0 {
+func (s *Service) DeleteBotWithDelivery(ctx context.Context, botUserID int64, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	if s == nil || s.bots == nil || botUserID == 0 || domain.IsSystemUserID(botUserID) {
 		return domain.User{}, domain.ErrBotNotFound
 	}
-	if domain.IsSystemUserID(botUserID) {
-		return domain.User{}, domain.ErrBotNotFound
-	}
-	deleter, ok := s.bots.(botAccountDeleter)
-	if !ok {
-		return domain.User{}, fmt.Errorf("bot deletion is not supported by the configured store")
-	}
-	// Session revocation is part of the deletion invariant: a deleted bot must
-	// never retain an authenticated connection. Fail closed before tombstoning
-	// when the hook is unavailable or revocation fails.
 	if s.hooks == nil {
 		return domain.User{}, domain.ErrBotSessionsNotRevoked
 	}
@@ -633,7 +605,7 @@ func (s *Service) DeleteBot(ctx context.Context, botUserID int64) (domain.User, 
 		s.log.Warn("revoke bot sessions before delete", zap.Int64("bot_user_id", botUserID), zap.Error(err))
 		return domain.User{}, domain.ErrBotSessionsNotRevoked
 	}
-	u, err := deleter.DeleteBotAccount(ctx, botUserID)
+	u, err := s.bots.DeleteBotAccountWithDelivery(ctx, botUserID, effects)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -707,7 +679,9 @@ func (s *Service) RevokeBotToken(ctx context.Context, ownerUserID, botUserID int
 
 // SetBotCommands 覆盖式写入 bot 的 default scope 命令（bots.setBotCommands /
 // BotFather /setcommands 共用收口）。校验命令名/描述/数量；写库（含 version bump）
-// 成功后给在线相关用户推 updateBotCommands。返回 bump 后的 bot_info_version。
+// command mutation、version bump 与精确私聊受众的 durable updateBotCommands
+// effects 在 BotStore 单事务提交。真实变更返回提交后的 bot_info_version，
+// 同值重放返回 0，供调用边界跳过缓存失效。
 func (s *Service) SetBotCommands(ctx context.Context, botUserID int64, commands []domain.BotCommand) (int, error) {
 	if len(commands) > domain.MaxBotCommands {
 		return 0, domain.ErrBotCommandInvalid
@@ -721,40 +695,19 @@ func (s *Service) SetBotCommands(ctx context.Context, botUserID int64, commands 
 		}
 		clean = append(clean, domain.BotCommand{Command: cmd, Description: desc, Ephemeral: c.Ephemeral})
 	}
-	// 同值短路：bot 框架启动时普遍无条件重发相同命令集，跳过可避免无意义的
-	// bot_info_version bump（驱动全体客户端多打一轮 getFullUser）与多余推送。
-	// 非原子（读后他写不影响正确性：要么对方已 bump、要么我们多 bump 一次）。
-	cur, found, err := s.botProfile(ctx, botUserID)
-	if err != nil {
-		return 0, err
-	}
-	if !found {
-		return 0, domain.ErrBotNotFound
-	}
-	if botCommandsEqual(cur.Commands, clean) {
-		return 0, nil // 无变更；调用方忽略返回的 version
-	}
-	version, err := s.bots.UpdateBotCommands(ctx, botUserID, clean)
-	if err != nil {
-		return 0, err
-	}
-	s.invalidateBotReadCaches(ctx, botUserID)
+	var effects store.DeliveryEffectsBuilder[store.BotCommandsDeliverySnapshot]
 	if s.hooks != nil {
-		s.hooks.PushBotCommandsChanged(ctx, botUserID, clean)
+		effects = s.hooks.BotCommandsDeliveryEffects(ctx)
 	}
-	return version, nil
-}
-
-func botCommandsEqual(a, b []domain.BotCommand) bool {
-	if len(a) != len(b) {
-		return false
+	version, changed, err := s.bots.UpdateBotCommandsWithDelivery(ctx, botUserID, clean, effects)
+	if err != nil {
+		return 0, err
 	}
-	for i := range a {
-		if a[i].Command != b[i].Command || a[i].Description != b[i].Description || a[i].Ephemeral != b[i].Ephemeral {
-			return false
-		}
+	if changed {
+		s.invalidateBotReadCaches(ctx, botUserID)
+		return version, nil
 	}
-	return true
+	return 0, nil
 }
 
 // GetBotCommands 返回 bot 的 default scope 命令。
@@ -769,9 +722,21 @@ func (s *Service) GetBotCommands(ctx context.Context, botUserID int64) ([]domain
 	return profile.Commands, nil
 }
 
-// SetBotInfo 更新 bot 的 name（users.first_name）/about（users.about）/description
-// （bots.description），返回 bump 后的 bot_info_version。
-func (s *Service) SetBotInfo(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate) (int, error) {
+// SetBotInfoWithDelivery updates either the default bot info or one explicit
+// language overlay, bumps bot_info_version and commits the frozen-viewer
+// absolute updateUser set in the same aggregate transaction.
+func (s *Service) SetBotInfoWithDelivery(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (int, error) {
+	if effects == nil {
+		return 0, store.ErrDeliveryOutboxRequired
+	}
+	if s == nil || s.bots == nil || botUserID <= 0 {
+		return 0, domain.ErrBotNotFound
+	}
+	langCode, ok := normalizeBotInfoLangCode(upd.LangCode)
+	if !ok {
+		return 0, domain.ErrBotInfoInvalid
+	}
+	upd.LangCode = langCode
 	if upd.SetName {
 		upd.Name = strings.TrimSpace(upd.Name)
 		if upd.Name == "" || utf8.RuneCountInString(upd.Name) > domain.MaxBotNameLength {
@@ -784,35 +749,54 @@ func (s *Service) SetBotInfo(ctx context.Context, botUserID int64, upd domain.Bo
 	if upd.SetDescription && utf8.RuneCountInString(upd.Description) > domain.MaxBotDescriptionLen {
 		return 0, domain.ErrBotInfoInvalid
 	}
-	if !upd.SetName && !upd.SetAbout && !upd.SetDescription {
+	if !upd.SetName && !upd.SetAbout && !upd.SetDescription && upd.LangCode == "" {
 		return 0, domain.ErrBotInfoInvalid
 	}
-	version, err := s.bots.UpdateBotInfo(ctx, botUserID, upd)
+	version, changed, err := s.bots.UpdateBotInfoWithDelivery(ctx, botUserID, upd, effects)
 	if err != nil {
 		return 0, err
 	}
-	s.invalidateBotReadCaches(ctx, botUserID)
-	return version, nil
+	if changed {
+		s.invalidateBotReadCaches(ctx, botUserID)
+		return version, nil
+	}
+	return 0, nil
 }
 
-// GetBotInfo 返回 bot 的 name/about/description（name=users.first_name、
-// about=users.about、description=bots.description）。
-func (s *Service) GetBotInfo(ctx context.Context, botUserID int64) (name, about, description string, err error) {
-	profile, found, err := s.botProfile(ctx, botUserID)
+func normalizeBotInfoLangCode(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	if len(value) > domain.MaxBotLangCodeLen || !utf8.ValidString(value) {
+		return "", false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return "", false
+		}
+	}
+	return strings.ToLower(value), true
+}
+
+// GetBotInfo returns an explicit localization with per-field fallback to the
+// default users/bots values.
+func (s *Service) GetBotInfo(ctx context.Context, botUserID int64, langCode string) (domain.BotInfoValues, error) {
+	if s == nil || s.bots == nil || botUserID <= 0 {
+		return domain.BotInfoValues{}, domain.ErrBotNotFound
+	}
+	langCode, ok := normalizeBotInfoLangCode(langCode)
+	if !ok {
+		return domain.BotInfoValues{}, domain.ErrBotInfoInvalid
+	}
+	values, found, err := s.bots.GetBotInfo(ctx, botUserID, langCode)
 	if err != nil {
-		return "", "", "", err
+		return domain.BotInfoValues{}, err
 	}
 	if !found {
-		return "", "", "", domain.ErrBotNotFound
+		return domain.BotInfoValues{}, domain.ErrBotNotFound
 	}
-	u, found, err := s.users.ByID(ctx, botUserID)
-	if err != nil {
-		return "", "", "", err
-	}
-	if !found {
-		return "", "", "", domain.ErrBotNotFound
-	}
-	return u.FirstName, u.About, profile.Description, nil
+	return values, nil
 }
 
 // SetBotMenuButton 设置 bot 的 menu button（per-bot 全局），返回新 bot_info_version。

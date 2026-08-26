@@ -36,7 +36,7 @@ func TestBotFatherTelegramLoginConfigurationFlow(t *testing.T) {
 	svc, users, bots, messages := newTestService(t)
 	svc.telegramLogin = newBotFatherTelegramLoginService(t)
 	owner := newOwner(t, users, "+1090")
-	bot, _, err := svc.CreateBot(context.Background(), owner.ID, "Login Demo", "login_demo_bot")
+	bot, _, err := svc.CreateBotWithDelivery(context.Background(), owner.ID, "Login Demo", "login_demo_bot", appBotLifecycleEffects)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestBotFatherTelegramLoginBatchAndCancelFlow(t *testing.T) {
 	svc, users, bots, messages := newTestService(t)
 	svc.telegramLogin = newBotFatherTelegramLoginService(t)
 	owner := newOwner(t, users, "+1091")
-	bot, _, err := svc.CreateBot(context.Background(), owner.ID, "Batch Login Demo", "batch_login_bot")
+	bot, _, err := svc.CreateBotWithDelivery(context.Background(), owner.ID, "Batch Login Demo", "batch_login_bot", appBotLifecycleEffects)
 	if err != nil {
 		t.Fatal(err)
 	}

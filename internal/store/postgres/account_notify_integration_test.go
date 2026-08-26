@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
 
 // TestNotifySettingsRoundTripPostgres 回归迁移 0005：per-scope 通知设置真实持久化
@@ -113,7 +114,11 @@ func TestNotifySettingsRoundTripPostgres(t *testing.T) {
 	}
 
 	// reset 清空全部作用域。
-	if err := store.ResetNotifySettings(ctx, u.ID); err != nil {
+	if err := store.ResetNotifySettingsWithDelivery(ctx, u.ID, func(snapshot storepkg.NotifySettingsResetSnapshot) ([]storepkg.DeliveryEffect, error) {
+		return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.OwnerUserID, Payload: []byte{1}, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 	if ex, _ := store.ListNotifyExceptions(ctx, u.ID); len(ex) != 0 {
@@ -124,5 +129,50 @@ func TestNotifySettingsRoundTripPostgres(t *testing.T) {
 	}
 	if _, found, _ := store.GetNotifySettings(ctx, u.ID, usersScope); found {
 		t.Fatalf("users default must be gone after reset")
+	}
+}
+
+func TestNotifySettingsAndDeliveryCommitAtomicallyPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	notify := NewPasswordStore(pool)
+	users := NewUserStore(pool)
+	u, err := users.Create(ctx, domain.User{AccessHash: 93, Phone: "+1664" + randomSuffix(t) + "01", FirstName: "NotifyAtomic"})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	scope := domain.NotifyScope{Kind: domain.NotifyScopePeer, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 7101}}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id = $1", u.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM notify_settings WHERE owner_user_id = $1", u.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", u.ID)
+	})
+
+	mute := 1234
+	bad := storepkg.DeliveryOutboxEnqueue{
+		TargetUserID: u.ID, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+	}
+	if err := notify.SaveNotifySettingsWithDelivery(ctx, u.ID, scope, domain.PeerNotifySettings{MuteUntil: &mute}, bad); err == nil {
+		t.Fatal("invalid delivery unexpectedly committed")
+	}
+	if _, found, err := notify.GetNotifySettings(ctx, u.ID, scope); err != nil || found {
+		t.Fatalf("setting survived rolled-back delivery: found=%v err=%v", found, err)
+	}
+
+	payload := []byte{1, 2, 3, 4}
+	good := bad
+	good.Payload = payload
+	if err := notify.SaveNotifySettingsWithDelivery(ctx, u.ID, scope, domain.PeerNotifySettings{MuteUntil: &mute}, good); err != nil {
+		t.Fatalf("save atomic notify delivery: %v", err)
+	}
+	if _, found, err := notify.GetNotifySettings(ctx, u.ID, scope); err != nil || !found {
+		t.Fatalf("committed setting: found=%v err=%v", found, err)
+	}
+	var gotPayload []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM edge_delivery_outbox WHERE target_user_id = $1 ORDER BY id DESC LIMIT 1`, u.ID).Scan(&gotPayload); err != nil {
+		t.Fatalf("load committed delivery: %v", err)
+	}
+	if string(gotPayload) != string(payload) {
+		t.Fatalf("delivery payload = %v, want %v", gotPayload, payload)
 	}
 }

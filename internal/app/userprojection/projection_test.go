@@ -36,7 +36,7 @@ func TestProjectorCollectiblePhonePrivacyAndExclusiveOverride(t *testing.T) {
 	const viewerID int64 = 8101
 	const standardID int64 = 8102
 	const exclusiveID int64 = 8103
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	rules := memory.NewPrivacyStore()
 	privacy := privacyapp.NewService(rules, contacts)
 	for _, ownerID := range []int64{standardID, exclusiveID} {
@@ -81,7 +81,7 @@ func TestProjectorCombinesProfilePhotosAndViewerContacts(t *testing.T) {
 	const viewerID int64 = 1001
 	const friendID int64 = 1002
 	const strangerID int64 = 1003
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	if _, err := contacts.Upsert(ctx, viewerID, domain.ContactInput{
 		ContactUserID: friendID,
 		Phone:         "1111",
@@ -134,11 +134,11 @@ func TestProjectorPersonalPhotoWinsOverProfile(t *testing.T) {
 	ctx := context.Background()
 	const viewerID int64 = 2001
 	const friendID int64 = 2002
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	if _, err := contacts.Upsert(ctx, viewerID, domain.ContactInput{ContactUserID: friendID, FirstName: "Friend"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
-	if _, _, err := contacts.SetPersonalPhoto(ctx, viewerID, friendID, 9100, 100); err != nil {
+	if _, _, err := contacts.SetPersonalPhotoWithDelivery(ctx, viewerID, friendID, 9100, 100, testPersonalPhotoEffects); err != nil {
 		t.Fatalf("set personal photo: %v", err)
 	}
 	projector := New(
@@ -161,7 +161,7 @@ func TestProjectorUsesFallbackWhenProfilePhotoHidden(t *testing.T) {
 	ctx := context.Background()
 	const viewerID int64 = 3001
 	const ownerID int64 = 3002
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	rules := memory.NewPrivacyStore()
 	privacy := privacyapp.NewService(rules, contacts)
 	if _, err := privacy.SetRules(ctx, ownerID, domain.PrivacyKeyProfilePhoto, []domain.PrivacyRule{{Kind: domain.PrivacyRuleDisallowAll}}); err != nil {
@@ -191,7 +191,7 @@ func TestProjectorContactWithoutKnownPhoneCannotBypassPhonePrivacy(t *testing.T)
 		viewerID = int64(3101)
 		ownerID  = int64(3102)
 	)
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	if _, err := contacts.Upsert(ctx, viewerID, domain.ContactInput{
 		ContactUserID: ownerID,
 		FirstName:     "Saved",
@@ -305,7 +305,7 @@ func TestForViewersEquivalentToForViewer(t *testing.T) {
 	)
 	viewers := []int64{v1, v2}
 
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	rules := memory.NewPrivacyStore()
 	privacy := privacyapp.NewService(rules, contacts)
 
@@ -313,7 +313,7 @@ func TestForViewersEquivalentToForViewer(t *testing.T) {
 		t.Fatalf("upsert contact: %v", err)
 	}
 	// v1 给 o2 设 personal photo：ForViewers 必须与 ForViewer 一样带出 viewer-specific 头像。
-	if _, _, err := contacts.SetPersonalPhoto(ctx, v1, o2, 9300, 300); err != nil {
+	if _, _, err := contacts.SetPersonalPhotoWithDelivery(ctx, v1, o2, 9300, 300, testPersonalPhotoEffects); err != nil {
 		t.Fatalf("set personal photo: %v", err)
 	}
 	if _, err := privacy.SetRules(ctx, o3, domain.PrivacyKeyStatusTimestamp, []domain.PrivacyRule{{Kind: domain.PrivacyRuleDisallowAll}}); err != nil {

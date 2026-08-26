@@ -32,6 +32,7 @@ INSERT INTO user_update_events (
   peer_id,
   filter_id,
   max_id,
+  top_msg_id,
   still_unread_count,
   channel_pts,
   tags_enabled,
@@ -60,8 +61,9 @@ INSERT INTO user_update_events (
   $21::int,
   $22::int,
   $23::int,
-  $24::boolean,
-  $25::int
+  $24::int,
+  $25::boolean,
+  $26::int
 )
 `
 
@@ -87,6 +89,7 @@ type AppendUserUpdateEventParams struct {
 	PeerID             *int64
 	FilterID           int32
 	MaxID              int32
+	TopMsgID           int32
 	StillUnreadCount   int32
 	ChannelPts         int32
 	TagsEnabled        bool
@@ -116,12 +119,69 @@ func (q *Queries) AppendUserUpdateEvent(ctx context.Context, arg AppendUserUpdat
 		arg.PeerID,
 		arg.FilterID,
 		arg.MaxID,
+		arg.TopMsgID,
 		arg.StillUnreadCount,
 		arg.ChannelPts,
 		arg.TagsEnabled,
 		arg.FolderID,
 	)
 	return err
+}
+
+const batchGetQuickReplyUpdatePayloads = `-- name: BatchGetQuickReplyUpdatePayloads :many
+WITH input AS MATERIALIZED (
+  SELECT u.user_id, p.pts, u.ord
+  FROM unnest($1::bigint[]) WITH ORDINALITY AS u(user_id, ord)
+  JOIN unnest($2::int[]) WITH ORDINALITY AS p(pts, ord) USING (ord)
+)
+SELECT
+  e.user_id,
+  e.pts,
+  COALESCE(e.quick_replies::text, '[]')::text AS quick_replies_json,
+  COALESCE(e.quick_reply_message::text, '{}')::text AS quick_reply_message_json
+FROM input i
+JOIN user_update_events e ON e.user_id = i.user_id AND e.pts = i.pts
+ORDER BY i.ord
+`
+
+type BatchGetQuickReplyUpdatePayloadsParams struct {
+	UserIds []int64
+	PtsList []int32
+}
+
+type BatchGetQuickReplyUpdatePayloadsRow struct {
+	UserID                int64
+	Pts                   int32
+	QuickRepliesJson      string
+	QuickReplyMessageJson string
+}
+
+// Quick Reply durable snapshots are stored on the event row. Hydrate an exact
+// set of (user_id, pts) pairs in one round trip; never cross-product users and
+// PTS values and never fall back to per-event QueryRow calls.
+func (q *Queries) BatchGetQuickReplyUpdatePayloads(ctx context.Context, arg BatchGetQuickReplyUpdatePayloadsParams) ([]BatchGetQuickReplyUpdatePayloadsRow, error) {
+	rows, err := q.db.Query(ctx, batchGetQuickReplyUpdatePayloads, arg.UserIds, arg.PtsList)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BatchGetQuickReplyUpdatePayloadsRow
+	for rows.Next() {
+		var i BatchGetQuickReplyUpdatePayloadsRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.Pts,
+			&i.QuickRepliesJson,
+			&i.QuickReplyMessageJson,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const batchListDispatchEvents = `-- name: BatchListDispatchEvents :many
@@ -146,6 +206,7 @@ SELECT
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
+  e.top_msg_id,
   e.still_unread_count,
   e.channel_pts,
   e.tags_enabled,
@@ -285,6 +346,7 @@ type BatchListDispatchEventsRow struct {
 	EventPeerID                    int64
 	FilterID                       int32
 	MaxID                          int32
+	TopMsgID                       int32
 	StillUnreadCount               int32
 	ChannelPts                     int32
 	TagsEnabled                    bool
@@ -422,6 +484,7 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.EventPeerID,
 			&i.FilterID,
 			&i.MaxID,
+			&i.TopMsgID,
 			&i.StillUnreadCount,
 			&i.ChannelPts,
 			&i.TagsEnabled,
@@ -536,206 +599,6 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 	return items, nil
 }
 
-const claimDispatchOutbox = `-- name: ClaimDispatchOutbox :many
-WITH picked_heads AS (
-  SELECT h.target_user_id, h.head_id
-  FROM dispatch_outbox_user_heads h
-  WHERE (
-        h.status = 'pending'
-        AND h.next_attempt_at <= now()
-      )
-      OR (
-        h.status = 'dispatching'
-        AND h.updated_at < now() - make_interval(secs => $1::int)
-      )
-  ORDER BY h.next_attempt_at ASC, h.target_user_id ASC, h.head_pts ASC, h.head_id ASC
-  LIMIT $2
-  FOR UPDATE OF h SKIP LOCKED
-)
-UPDATE dispatch_outbox d
-SET
-  status = 'dispatching',
-  attempts = d.attempts + 1,
-  updated_at = now()
-FROM picked_heads p
-WHERE d.target_user_id = p.target_user_id
-  AND d.id = p.head_id
-RETURNING
-  d.id,
-  d.target_user_id,
-  d.pts,
-  d.event_type,
-  d.exclude_auth_key_id,
-  d.exclude_session_id,
-  d.attempts
-`
-
-type ClaimDispatchOutboxParams struct {
-	LeaseSeconds int32
-	LimitCount   int32
-}
-
-type ClaimDispatchOutboxRow struct {
-	ID               int64
-	TargetUserID     int64
-	Pts              int32
-	EventType        string
-	ExcludeAuthKeyID int64
-	ExcludeSessionID int64
-	Attempts         int32
-}
-
-// durable head 表只保留每用户一行，并同步 head 的 readiness。claim 先锁
-// lane head 再更新对应 outbox 行，既不会扫描 backlog，也不会并发领取同一用户。
-func (q *Queries) ClaimDispatchOutbox(ctx context.Context, arg ClaimDispatchOutboxParams) ([]ClaimDispatchOutboxRow, error) {
-	rows, err := q.db.Query(ctx, claimDispatchOutbox, arg.LeaseSeconds, arg.LimitCount)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ClaimDispatchOutboxRow
-	for rows.Next() {
-		var i ClaimDispatchOutboxRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.TargetUserID,
-			&i.Pts,
-			&i.EventType,
-			&i.ExcludeAuthKeyID,
-			&i.ExcludeSessionID,
-			&i.Attempts,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const claimDispatchOutboxShards = `-- name: ClaimDispatchOutboxShards :many
-WITH picked_heads AS (
-  SELECT h.target_user_id, h.head_id
-  FROM dispatch_outbox_user_heads h
-  -- 256 与 store.DispatchOutboxLogicalShards、0069 generated column 是同一
-  -- schema 常量；不得随 worker 数变化。
-  WHERE h.logical_shard = ANY($1::smallint[])
-    AND (
-      (
-        h.status = 'pending'
-        AND h.next_attempt_at <= now()
-      )
-      OR (
-        h.status = 'dispatching'
-        AND h.updated_at < now() - make_interval(secs => $2::int)
-      )
-    )
-  ORDER BY h.next_attempt_at ASC, h.target_user_id ASC, h.head_pts ASC, h.head_id ASC
-  LIMIT $3
-  FOR UPDATE OF h SKIP LOCKED
-)
-UPDATE dispatch_outbox d
-SET
-  status = 'dispatching',
-  attempts = d.attempts + 1,
-  updated_at = now()
-FROM picked_heads p
-WHERE d.target_user_id = p.target_user_id
-  AND d.id = p.head_id
-RETURNING
-  d.id,
-  d.target_user_id,
-  d.pts,
-  d.event_type,
-  d.exclude_auth_key_id,
-  d.exclude_session_id,
-  d.attempts
-`
-
-type ClaimDispatchOutboxShardsParams struct {
-	ShardIds     []int16
-	LeaseSeconds int32
-	LimitCount   int32
-}
-
-type ClaimDispatchOutboxShardsRow struct {
-	ID               int64
-	TargetUserID     int64
-	Pts              int32
-	EventType        string
-	ExcludeAuthKeyID int64
-	ExcludeSessionID int64
-	Attempts         int32
-}
-
-// 固定 logical shard 由 target_user_id 决定；运行时 worker 只领取分配给自己的
-// shard 集合，因此同一用户永远只有一条串行 lane，而不同用户可并行。
-func (q *Queries) ClaimDispatchOutboxShards(ctx context.Context, arg ClaimDispatchOutboxShardsParams) ([]ClaimDispatchOutboxShardsRow, error) {
-	rows, err := q.db.Query(ctx, claimDispatchOutboxShards, arg.ShardIds, arg.LeaseSeconds, arg.LimitCount)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ClaimDispatchOutboxShardsRow
-	for rows.Next() {
-		var i ClaimDispatchOutboxShardsRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.TargetUserID,
-			&i.Pts,
-			&i.EventType,
-			&i.ExcludeAuthKeyID,
-			&i.ExcludeSessionID,
-			&i.Attempts,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const deleteFailedDispatchOutbox = `-- name: DeleteFailedDispatchOutbox :one
-WITH doomed AS MATERIALIZED (
-  SELECT h.target_user_id, h.head_id AS id
-  FROM dispatch_outbox_user_heads h
-  WHERE h.status = 'failed'
-    AND h.updated_at < now() - make_interval(secs => $1::int)
-  ORDER BY h.updated_at ASC, h.target_user_id ASC, h.head_id ASC
-  LIMIT $2
-  FOR UPDATE OF h SKIP LOCKED
-),
-deleted AS (
-  DELETE FROM dispatch_outbox d
-  USING doomed x
-  WHERE d.target_user_id = x.target_user_id
-    AND d.id = x.id
-  RETURNING d.id
-)
-SELECT count(*)::int AS deleted_count
-FROM deleted
-`
-
-type DeleteFailedDispatchOutboxParams struct {
-	OlderThanSeconds int32
-	LimitCount       int32
-}
-
-// failed 只能成为 lane head；从 head 表开始并先锁 head，既走 0074 的小索引，也与
-// claim/completion 保持同一 user_heads→outbox 锁序。删除的只是在线任务，durable
-// user_update_events 不动，故客户端仍可经 difference 恢复。
-func (q *Queries) DeleteFailedDispatchOutbox(ctx context.Context, arg DeleteFailedDispatchOutboxParams) (int32, error) {
-	row := q.db.QueryRow(ctx, deleteFailedDispatchOutbox, arg.OlderThanSeconds, arg.LimitCount)
-	var deleted_count int32
-	err := row.Scan(&deleted_count)
-	return deleted_count, err
-}
-
 const enqueueDispatch = `-- name: EnqueueDispatch :exec
 INSERT INTO dispatch_outbox (
   target_user_id,
@@ -743,8 +606,13 @@ INSERT INTO dispatch_outbox (
   event_type,
   exclude_auth_key_id,
   exclude_session_id
-) VALUES (
-  $1, $2, $3, $4, $5
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5
 )
 ON CONFLICT DO NOTHING
 `
@@ -753,7 +621,7 @@ type EnqueueDispatchParams struct {
 	TargetUserID     int64
 	Pts              int32
 	EventType        string
-	ExcludeAuthKeyID int64
+	ExcludeAuthKeyID []byte
 	ExcludeSessionID int64
 }
 
@@ -803,6 +671,7 @@ SELECT
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
+  e.top_msg_id,
   e.still_unread_count,
   e.channel_pts,
   e.tags_enabled,
@@ -945,6 +814,7 @@ type ListUserUpdateEventsAfterRow struct {
 	EventPeerID                    int64
 	FilterID                       int32
 	MaxID                          int32
+	TopMsgID                       int32
 	StillUnreadCount               int32
 	ChannelPts                     int32
 	TagsEnabled                    bool
@@ -1080,6 +950,7 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.EventPeerID,
 			&i.FilterID,
 			&i.MaxID,
+			&i.TopMsgID,
 			&i.StillUnreadCount,
 			&i.ChannelPts,
 			&i.TagsEnabled,
@@ -1192,123 +1063,6 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 		return nil, err
 	}
 	return items, nil
-}
-
-const markDispatchDelivered = `-- name: MarkDispatchDelivered :execrows
-WITH locked_head AS MATERIALIZED (
-  SELECT h.target_user_id
-  FROM dispatch_outbox_user_heads h
-  WHERE h.target_user_id = $3::bigint
-  FOR UPDATE
-)
-DELETE FROM dispatch_outbox d
-USING locked_head h
-WHERE d.target_user_id = h.target_user_id
-  AND d.id = $1::bigint
-  AND d.status = 'dispatching'
-  AND d.attempts = $2::int
-`
-
-type MarkDispatchDeliveredParams struct {
-	ID               int64
-	ExpectedAttempts int32
-	TargetUserID     int64
-}
-
-// 删除在线 outbox 行；消息事实仍在 message_boxes/user_update_events，
-// 客户端漏掉实时推送时通过 updates.getDifference 恢复。
-// claim 的锁序是 user_heads→outbox；completion 必须先显式锁同一 head 再删 outbox，
-// 否则租约过期 claim 与完成恰好竞争时会形成 outbox→head / head→outbox 环路。
-func (q *Queries) MarkDispatchDelivered(ctx context.Context, arg MarkDispatchDeliveredParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markDispatchDelivered, arg.ID, arg.ExpectedAttempts, arg.TargetUserID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const markDispatchDeliveredBatch = `-- name: MarkDispatchDeliveredBatch :execrows
-WITH input AS MATERIALIZED (
-  SELECT tu.target_user_id, di.id, ea.attempts
-  FROM unnest($1::bigint[]) WITH ORDINALITY AS tu(target_user_id, ord)
-  JOIN unnest($2::bigint[]) WITH ORDINALITY AS di(id, ord) USING (ord)
-  JOIN unnest($3::int[]) WITH ORDINALITY AS ea(attempts, ord) USING (ord)
-),
-locked_heads AS MATERIALIZED (
-  SELECT h.target_user_id
-  FROM dispatch_outbox_user_heads h
-  JOIN (SELECT DISTINCT target_user_id FROM input) i USING (target_user_id)
-  -- Match ClaimDispatchOutbox[Shards] exactly. A stale-lease claim may lock several
-  -- dispatching heads while this completion batch locks the same set; a different
-  -- multi-row order would merely move the deadlock one level up.
-  ORDER BY h.next_attempt_at, h.target_user_id, h.head_pts, h.head_id
-  FOR UPDATE OF h
-)
-DELETE FROM dispatch_outbox d
-USING input i, locked_heads h
-WHERE d.target_user_id = h.target_user_id
-  AND d.target_user_id = i.target_user_id
-  AND d.id = i.id
-  AND d.status = 'dispatching'
-  AND d.attempts = i.attempts
-`
-
-type MarkDispatchDeliveredBatchParams struct {
-	TargetUserIds    []int64
-	Ids              []int64
-	ExpectedAttempts []int32
-}
-
-// 批量删除一批在线 outbox 行；target_user_id 入 WHERE 命中唯一索引并避免串删。
-func (q *Queries) MarkDispatchDeliveredBatch(ctx context.Context, arg MarkDispatchDeliveredBatchParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markDispatchDeliveredBatch, arg.TargetUserIds, arg.Ids, arg.ExpectedAttempts)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const markDispatchFailed = `-- name: MarkDispatchFailed :execrows
-WITH locked_head AS MATERIALIZED (
-  SELECT h.target_user_id
-  FROM dispatch_outbox_user_heads h
-  WHERE h.target_user_id = $4::bigint
-  FOR UPDATE
-)
-UPDATE dispatch_outbox d
-SET
-  status = CASE WHEN d.attempts >= 5 THEN 'failed' ELSE 'pending' END,
-  next_attempt_at = CASE
-    WHEN d.attempts >= 5 THEN d.next_attempt_at
-    ELSE now() + make_interval(secs => LEAST(60, d.attempts * d.attempts))
-  END,
-  last_error = $1::text,
-  updated_at = now()
-FROM locked_head h
-WHERE d.target_user_id = h.target_user_id
-  AND d.id = $2::bigint
-  AND d.status = 'dispatching'
-  AND d.attempts = $3::int
-`
-
-type MarkDispatchFailedParams struct {
-	LastError        string
-	ID               int64
-	ExpectedAttempts int32
-	TargetUserID     int64
-}
-
-func (q *Queries) MarkDispatchFailed(ctx context.Context, arg MarkDispatchFailedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markDispatchFailed,
-		arg.LastError,
-		arg.ID,
-		arg.ExpectedAttempts,
-		arg.TargetUserID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
 
 const maxUserPts = `-- name: MaxUserPts :one

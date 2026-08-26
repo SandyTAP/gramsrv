@@ -123,28 +123,28 @@ type Config struct {
 	CoreExecGRPCTLSClientKeyFile  string
 	// CoreExecToken 是 CoreExec gRPC API/client 共用的 bearer token；Core 与 Edge 入口必填。
 	CoreExecToken string
-	// EgressAckGRPCAddr 是 Egress 暴露 late client ACK 写回 API 的内部监听地址。
-	EgressAckGRPCAddr string
-	// EgressAckGRPCResolver 选择 Edge -> Egress ACK gRPC 服务发现 provider：static 或 dns。
-	EgressAckGRPCResolver string
-	// EgressAckGRPCTargets 是 Edge 调用 Egress ACK gRPC API 的多 endpoint 列表。
-	EgressAckGRPCTargets string
-	// EgressAckGRPCRequestTimeout 是 Edge -> Egress ACK gRPC unary request 默认 deadline。
-	EgressAckGRPCRequestTimeout time.Duration
-	// EgressAckGRPCTLSCertFile/EgressAckGRPCTLSKeyFile 是 Egress ACK gRPC server TLS 证书与私钥；二者必须同时配置。
-	EgressAckGRPCTLSCertFile string
-	EgressAckGRPCTLSKeyFile  string
-	// EgressAckGRPCTLSClientCAFile 配置后，Egress ACK gRPC server 要求并验证 Edge client certificate。
-	EgressAckGRPCTLSClientCAFile string
-	// EgressAckGRPCTLSCAFile 是 Edge 调 Egress ACK gRPC 时信任的 root CA bundle。
-	EgressAckGRPCTLSCAFile string
-	// EgressAckGRPCTLSServerName 是 Edge gRPC client 校验证书时使用的 server name。
-	EgressAckGRPCTLSServerName string
-	// EgressAckGRPCTLSClientCertFile/EgressAckGRPCTLSClientKeyFile 是 Edge gRPC client certificate；二者必须同时配置。
-	EgressAckGRPCTLSClientCertFile string
-	EgressAckGRPCTLSClientKeyFile  string
-	// EgressAckToken 是 Egress ACK gRPC API/client 共用的 bearer token。
-	EgressAckToken string
+	// EgressDeliveryGRPCAddr 是 Egress 暴露 late client ACK 写回 API 的内部监听地址。
+	EgressDeliveryGRPCAddr string
+	// EgressDeliveryGRPCResolver 选择 Edge -> Egress Delivery gRPC 服务发现 provider：static 或 dns。
+	EgressDeliveryGRPCResolver string
+	// EgressDeliveryGRPCTargets 是 Edge 调用 Egress Delivery gRPC API 的多 endpoint 列表。
+	EgressDeliveryGRPCTargets string
+	// EgressDeliveryGRPCRequestTimeout 是 Edge -> Egress Delivery gRPC unary request 默认 deadline。
+	EgressDeliveryGRPCRequestTimeout time.Duration
+	// EgressDeliveryGRPCTLSCertFile/EgressDeliveryGRPCTLSKeyFile 是 Egress Delivery gRPC server TLS 证书与私钥；二者必须同时配置。
+	EgressDeliveryGRPCTLSCertFile string
+	EgressDeliveryGRPCTLSKeyFile  string
+	// EgressDeliveryGRPCTLSClientCAFile 配置后，Egress Delivery gRPC server 要求并验证 Edge client certificate。
+	EgressDeliveryGRPCTLSClientCAFile string
+	// EgressDeliveryGRPCTLSCAFile 是 Edge 调 Egress Delivery gRPC 时信任的 root CA bundle。
+	EgressDeliveryGRPCTLSCAFile string
+	// EgressDeliveryGRPCTLSServerName 是 Edge gRPC client 校验证书时使用的 server name。
+	EgressDeliveryGRPCTLSServerName string
+	// EgressDeliveryGRPCTLSClientCertFile/EgressDeliveryGRPCTLSClientKeyFile 是 Edge gRPC client certificate；二者必须同时配置。
+	EgressDeliveryGRPCTLSClientCertFile string
+	EgressDeliveryGRPCTLSClientKeyFile  string
+	// EgressDeliveryToken 是 Egress Delivery gRPC API/client 共用的 bearer token。
+	EgressDeliveryToken string
 	// FileGRPCAddr 是独立 FileData 服务的内部监听地址；cmd/telesrv-file 必须配置。
 	FileGRPCAddr string
 	// FileGRPCTargets 是 Core/Edge 调 FileData 的目标列表，逗号分隔。
@@ -240,6 +240,9 @@ type Config struct {
 	PostgresMaxConns int
 	// PostgresMinConns 是启动时预热的 pgxpool 连接数，降低 TDesktop 冷启动并发 RPC 的建连等待。
 	PostgresMinConns int
+	// PostgresCounterRecoveryMaxConns 是 Redis durable counter 冷恢复专用 PostgreSQL
+	// 连接池上限。该池必须与业务事务池物理独立，避免事务持有主池连接时恢复计数器形成自锁。
+	PostgresCounterRecoveryMaxConns int
 	// RedisAddr 是高频易失态（验证码、限流计数、update 队列）的 Redis 地址。
 	RedisAddr string
 	// RedisPassword 是 Redis 密码；开发默认空。
@@ -418,16 +421,16 @@ type Config struct {
 	// OutboxLeaseTimeout 是 'dispatching' 行被判定为租约过期、允许其它 worker 重新 claim 的时长。
 	// 取值需大于单批投递耗时，否则会重复推送；过大则 worker 崩溃后积压恢复变慢。
 	OutboxLeaseTimeout time.Duration
-	// OutboxPoisonRetention 是 terminal failed outbox head 的隔离窗口。隔离期内保留
-	// last_error 供排障，期满只删除在线投递任务；durable user_update_events 仍保留，
-	// 客户端可经 updates.getDifference 恢复。
-	OutboxPoisonRetention time.Duration
-	// OutboxPoisonCleanupInterval 独立于大表 retention 周期清理 terminal failed head，
-	// 避免一条确定性坏事件长期冻结同账号更高 pts 的在线投递 lane。
-	OutboxPoisonCleanupInterval time.Duration
+	// DeliveryAttemptTimeout freezes the absolute durable Edge command lifetime
+	// at database claim time. It is independent from transient Redis admission.
+	DeliveryAttemptTimeout time.Duration
+	// DeliveryClockSkewAllowance delays database retry after the Edge wire fence
+	// so old/new attempts cannot overlap across hosts.
+	DeliveryClockSkewAllowance time.Duration
 	// OutboundPushTimeout 是 telesrv-egress 等待 Edge 确认 outbound 队列接受的最长时间。
 	OutboundPushTimeout time.Duration
-	// SendRateLimit 是账号级发送窗口内允许的消息条数；<=0 表示关闭发送限流。
+	// SendRateLimit 是显式部署策略下账号级发送窗口内允许的消息条数；<=0 表示关闭。
+	// 默认关闭：durable admission/backpressure 负责系统容量，不能把正常客户端快发误判成洪泛。
 	SendRateLimit int
 	// SendRateWindow 是发送限流窗口。
 	SendRateWindow time.Duration
@@ -897,18 +900,18 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		CoreExecGRPCTLSClientCertFile:        envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_CERT_FILE", ""),
 		CoreExecGRPCTLSClientKeyFile:         envAllowEmptyOr("TELESRV_CORE_EXEC_GRPC_TLS_CLIENT_KEY_FILE", ""),
 		CoreExecToken:                        envOr("TELESRV_CORE_EXEC_TOKEN", ""),
-		EgressAckGRPCAddr:                    envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_ADDR", ""),
-		EgressAckGRPCResolver:                strings.ToLower(strings.TrimSpace(envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "static"))),
-		EgressAckGRPCTargets:                 envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TARGETS", ""),
-		EgressAckGRPCRequestTimeout:          envDurationOr("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", 5*time.Second),
-		EgressAckGRPCTLSCertFile:             envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE", ""),
-		EgressAckGRPCTLSKeyFile:              envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE", ""),
-		EgressAckGRPCTLSClientCAFile:         envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE", ""),
-		EgressAckGRPCTLSCAFile:               envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE", ""),
-		EgressAckGRPCTLSServerName:           envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME", ""),
-		EgressAckGRPCTLSClientCertFile:       envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE", ""),
-		EgressAckGRPCTLSClientKeyFile:        envAllowEmptyOr("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE", ""),
-		EgressAckToken:                       envOr("TELESRV_EGRESS_ACK_TOKEN", ""),
+		EgressDeliveryGRPCAddr:               envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_ADDR", ""),
+		EgressDeliveryGRPCResolver:           strings.ToLower(strings.TrimSpace(envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER", "static"))),
+		EgressDeliveryGRPCTargets:            envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TARGETS", ""),
+		EgressDeliveryGRPCRequestTimeout:     envDurationOr("TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT", 5*time.Second),
+		EgressDeliveryGRPCTLSCertFile:        envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE", ""),
+		EgressDeliveryGRPCTLSKeyFile:         envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE", ""),
+		EgressDeliveryGRPCTLSClientCAFile:    envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE", ""),
+		EgressDeliveryGRPCTLSCAFile:          envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CA_FILE", ""),
+		EgressDeliveryGRPCTLSServerName:      envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_SERVER_NAME", ""),
+		EgressDeliveryGRPCTLSClientCertFile:  envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE", ""),
+		EgressDeliveryGRPCTLSClientKeyFile:   envAllowEmptyOr("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_KEY_FILE", ""),
+		EgressDeliveryToken:                  envOr("TELESRV_EGRESS_DELIVERY_TOKEN", ""),
 		FileGRPCAddr:                         envAllowEmptyOr("TELESRV_FILE_GRPC_ADDR", ""),
 		FileGRPCTargets:                      envAllowEmptyOr("TELESRV_FILE_GRPC_TARGETS", ""),
 		FileGRPCResolver:                     strings.ToLower(strings.TrimSpace(envOr("TELESRV_FILE_GRPC_RESOLVER", "static"))),
@@ -955,14 +958,15 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		// Desktop 的端口转发只在 IPv4 监听，IPv6 连接要等 ~1s 超时才回退 IPv4（实测 localhost
 		// 建连 1.0s vs 127.0.0.1 6ms）。冷连接洪峰下池扩容的新连接各等 1s → pre-handler 惊群卡顿。
 		// 生产由 TELESRV_POSTGRES_DSN 覆盖；该默认值仅作用于本地开发。
-		PostgresDSN:      envOr("TELESRV_POSTGRES_DSN", "postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_v2?sslmode=disable"),
-		PostgresMaxConns: envIntOr("TELESRV_POSTGRES_MAX_CONNS", 50),
-		PostgresMinConns: envIntOr("TELESRV_POSTGRES_MIN_CONNS", 16),
-		RedisAddr:        envOr("TELESRV_REDIS_ADDR", "127.0.0.1:6399"), // 同理避开 localhost→IPv6 回退延迟
-		RedisPassword:    envOr("TELESRV_REDIS_PASSWORD", ""),
-		RedisDB:          envIntOr("TELESRV_REDIS_DB", 0),
-		InstanceID:       strings.TrimSpace(envAllowEmptyOr("TELESRV_INSTANCE_ID", "")),
-		EdgeLocationTTL:  envDurationOr("TELESRV_EDGE_LOCATION_TTL", 90*time.Second),
+		PostgresDSN:                     envOr("TELESRV_POSTGRES_DSN", "postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_v2?sslmode=disable"),
+		PostgresMaxConns:                envIntOr("TELESRV_POSTGRES_MAX_CONNS", 50),
+		PostgresMinConns:                envIntOr("TELESRV_POSTGRES_MIN_CONNS", 16),
+		PostgresCounterRecoveryMaxConns: envIntOr("TELESRV_POSTGRES_COUNTER_RECOVERY_MAX_CONNS", 4),
+		RedisAddr:                       envOr("TELESRV_REDIS_ADDR", "127.0.0.1:6399"), // 同理避开 localhost→IPv6 回退延迟
+		RedisPassword:                   envOr("TELESRV_REDIS_PASSWORD", ""),
+		RedisDB:                         envIntOr("TELESRV_REDIS_DB", 0),
+		InstanceID:                      strings.TrimSpace(envAllowEmptyOr("TELESRV_INSTANCE_ID", "")),
+		EdgeLocationTTL:                 envDurationOr("TELESRV_EDGE_LOCATION_TTL", 90*time.Second),
 		EdgeLocationHeartbeatInterval: envDurationOr(
 			"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL", 30*time.Second,
 		),
@@ -1043,30 +1047,28 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		ChannelBoostCacheMaxEntries:   envIntOr("TELESRV_CHANNEL_BOOST_CACHE_MAX", 100000),
 		ChannelBoostCacheTTL:          envDurationOr("TELESRV_CHANNEL_BOOST_CACHE_TTL", 10*time.Second),
 
-		OutboxWorkers:         envIntOr("TELESRV_OUTBOX_WORKERS", 4),
-		OutboxBatch:           envIntOr("TELESRV_OUTBOX_BATCH", 100),
-		OutboxLeaseTimeout:    envDurationOr("TELESRV_OUTBOX_LEASE_TIMEOUT", 30*time.Second),
-		OutboxPoisonRetention: envDurationOr("TELESRV_OUTBOX_POISON_RETENTION", time.Minute),
-		OutboxPoisonCleanupInterval: envDurationOr(
-			"TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL", 15*time.Second,
-		),
-		OutboundPushTimeout:    envDurationOr("TELESRV_OUTBOUND_PUSH_TIMEOUT", 200*time.Millisecond),
-		SendRateLimit:          envIntOr("TELESRV_SEND_RATE_LIMIT", 30),
-		SendRateWindow:         envDurationOr("TELESRV_SEND_RATE_WINDOW", time.Minute),
-		CatchupRateLimit:       envIntOr("TELESRV_CATCHUP_RATE_LIMIT", 0),
-		CatchupRateWindow:      envDurationOr("TELESRV_CATCHUP_RATE_WINDOW", time.Minute),
-		ChannelNudgeMaxTargets: envIntOr("TELESRV_CHANNEL_NUDGE_MAX_TARGETS", 0),
-		UpdateEventRetention:   envDurationOr("TELESRV_UPDATE_EVENT_RETENTION", 168*time.Hour),
-		BotAPIUpdateRetention:  envDurationOr("TELESRV_BOT_API_UPDATE_RETENTION", 24*time.Hour),
-		OrphanAuthKeyRetention: envDurationOr("TELESRV_ORPHAN_AUTH_KEY_RETENTION", 24*time.Hour),
-		RetentionInterval:      envDurationOr("TELESRV_RETENTION_INTERVAL", time.Hour),
-		RetentionBatch:         envIntOr("TELESRV_RETENTION_BATCH", 10000),
-		UploadPartTTL:          envDurationOr("TELESRV_UPLOAD_PART_TTL", 24*time.Hour),
-		UploadPartGCInterval:   envDurationOr("TELESRV_UPLOAD_PART_GC_INTERVAL", 30*time.Minute),
-		UploadPartGCBatch:      envIntOr("TELESRV_UPLOAD_PART_GC_BATCH", 10000),
-		UploadInFlightMaxBytes: envInt64Or("TELESRV_UPLOAD_INFLIGHT_MAX_BYTES", 4194304000),
-		UploadInFlightMaxParts: envIntOr("TELESRV_UPLOAD_INFLIGHT_MAX_PARTS", 8000),
-		UploadInFlightMaxFiles: envIntOr("TELESRV_UPLOAD_INFLIGHT_MAX_FILES", 64),
+		OutboxWorkers:              envIntOr("TELESRV_OUTBOX_WORKERS", 4),
+		OutboxBatch:                envIntOr("TELESRV_OUTBOX_BATCH", 100),
+		OutboxLeaseTimeout:         envDurationOr("TELESRV_OUTBOX_LEASE_TIMEOUT", 30*time.Second),
+		DeliveryAttemptTimeout:     envDurationOr("TELESRV_DELIVERY_ATTEMPT_TIMEOUT", 2*time.Second),
+		DeliveryClockSkewAllowance: envDurationOr("TELESRV_DELIVERY_CLOCK_SKEW_ALLOWANCE", time.Second),
+		OutboundPushTimeout:        envDurationOr("TELESRV_OUTBOUND_PUSH_TIMEOUT", 200*time.Millisecond),
+		SendRateLimit:              envIntOr("TELESRV_SEND_RATE_LIMIT", 0),
+		SendRateWindow:             envDurationOr("TELESRV_SEND_RATE_WINDOW", time.Minute),
+		CatchupRateLimit:           envIntOr("TELESRV_CATCHUP_RATE_LIMIT", 0),
+		CatchupRateWindow:          envDurationOr("TELESRV_CATCHUP_RATE_WINDOW", time.Minute),
+		ChannelNudgeMaxTargets:     envIntOr("TELESRV_CHANNEL_NUDGE_MAX_TARGETS", 0),
+		UpdateEventRetention:       envDurationOr("TELESRV_UPDATE_EVENT_RETENTION", 168*time.Hour),
+		BotAPIUpdateRetention:      envDurationOr("TELESRV_BOT_API_UPDATE_RETENTION", 24*time.Hour),
+		OrphanAuthKeyRetention:     envDurationOr("TELESRV_ORPHAN_AUTH_KEY_RETENTION", 24*time.Hour),
+		RetentionInterval:          envDurationOr("TELESRV_RETENTION_INTERVAL", time.Hour),
+		RetentionBatch:             envIntOr("TELESRV_RETENTION_BATCH", 10000),
+		UploadPartTTL:              envDurationOr("TELESRV_UPLOAD_PART_TTL", 24*time.Hour),
+		UploadPartGCInterval:       envDurationOr("TELESRV_UPLOAD_PART_GC_INTERVAL", 30*time.Minute),
+		UploadPartGCBatch:          envIntOr("TELESRV_UPLOAD_PART_GC_BATCH", 10000),
+		UploadInFlightMaxBytes:     envInt64Or("TELESRV_UPLOAD_INFLIGHT_MAX_BYTES", 4194304000),
+		UploadInFlightMaxParts:     envIntOr("TELESRV_UPLOAD_INFLIGHT_MAX_PARTS", 8000),
+		UploadInFlightMaxFiles:     envIntOr("TELESRV_UPLOAD_INFLIGHT_MAX_FILES", 64),
 
 		CallRingTimeout:        envDurationOr("TELESRV_CALL_RING_TIMEOUT", 90*time.Second),
 		CallTombstoneTTL:       envDurationOr("TELESRV_CALL_TOMBSTONE_TTL", 60*time.Second),
@@ -1248,13 +1250,22 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 	if err := validateCoreExecGRPCTLSConfig(cfg); err != nil {
 		return Config{}, err
 	}
-	if cfg.EgressAckGRPCRequestTimeout <= 0 || cfg.EgressAckGRPCRequestTimeout > time.Minute {
-		return Config{}, fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
+	if cfg.EgressDeliveryGRPCRequestTimeout <= 0 || cfg.EgressDeliveryGRPCRequestTimeout > time.Minute {
+		return Config{}, fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT must be greater than zero and at most 1m")
 	}
-	if err := validateEgressAckGRPCResolverConfig(cfg); err != nil {
+	if cfg.DeliveryAttemptTimeout <= 0 || cfg.DeliveryAttemptTimeout > time.Minute {
+		return Config{}, fmt.Errorf("TELESRV_DELIVERY_ATTEMPT_TIMEOUT must be greater than zero and at most 1m")
+	}
+	if cfg.DeliveryClockSkewAllowance <= 0 || cfg.DeliveryClockSkewAllowance > 10*time.Second {
+		return Config{}, fmt.Errorf("TELESRV_DELIVERY_CLOCK_SKEW_ALLOWANCE must be greater than zero and at most 10s")
+	}
+	if cfg.OutboxLeaseTimeout <= cfg.DeliveryAttemptTimeout+cfg.DeliveryClockSkewAllowance+100*time.Millisecond {
+		return Config{}, fmt.Errorf("TELESRV_OUTBOX_LEASE_TIMEOUT must exceed delivery attempt timeout plus clock skew allowance by more than 100ms")
+	}
+	if err := validateEgressDeliveryGRPCResolverConfig(cfg); err != nil {
 		return Config{}, err
 	}
-	if err := validateEgressAckGRPCTLSConfig(cfg); err != nil {
+	if err := validateEgressDeliveryGRPCTLSConfig(cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.FileGRPCRequestTimeout <= 0 || cfg.FileGRPCRequestTimeout > time.Minute {
@@ -1314,25 +1325,25 @@ func validateCoreExecGRPCTLSConfig(cfg Config) error {
 	return nil
 }
 
-func validateEgressAckGRPCResolverConfig(cfg Config) error {
-	switch strings.ToLower(strings.TrimSpace(cfg.EgressAckGRPCResolver)) {
+func validateEgressDeliveryGRPCResolverConfig(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.EgressDeliveryGRPCResolver)) {
 	case "", "static", "dns":
 		return nil
 	default:
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_RESOLVER must be static or dns")
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER must be static or dns")
 	}
 }
 
-func validateEgressAckGRPCTLSConfig(cfg Config) error {
-	if (strings.TrimSpace(cfg.EgressAckGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.EgressAckGRPCTLSKeyFile) == "") {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE must be configured together")
+func validateEgressDeliveryGRPCTLSConfig(cfg Config) error {
+	if (strings.TrimSpace(cfg.EgressDeliveryGRPCTLSCertFile) == "") != (strings.TrimSpace(cfg.EgressDeliveryGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE must be configured together")
 	}
-	if strings.TrimSpace(cfg.EgressAckGRPCTLSClientCAFile) != "" &&
-		(strings.TrimSpace(cfg.EgressAckGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.EgressAckGRPCTLSKeyFile) == "") {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE")
+	if strings.TrimSpace(cfg.EgressDeliveryGRPCTLSClientCAFile) != "" &&
+		(strings.TrimSpace(cfg.EgressDeliveryGRPCTLSCertFile) == "" || strings.TrimSpace(cfg.EgressDeliveryGRPCTLSKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE requires TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE and TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE")
 	}
-	if (strings.TrimSpace(cfg.EgressAckGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.EgressAckGRPCTLSClientKeyFile) == "") {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
+	if (strings.TrimSpace(cfg.EgressDeliveryGRPCTLSClientCertFile) == "") != (strings.TrimSpace(cfg.EgressDeliveryGRPCTLSClientKeyFile) == "") {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE and TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_KEY_FILE must be configured together")
 	}
 	return nil
 }
@@ -1400,8 +1411,8 @@ func validateSFUOwnerConfig(cfg Config) error {
 	if strings.Contains(strings.TrimSpace(cfg.CoreExecToken), "\n") || strings.Contains(strings.TrimSpace(cfg.CoreExecToken), "\r") {
 		return fmt.Errorf("TELESRV_CORE_EXEC_TOKEN must not contain newlines")
 	}
-	if strings.Contains(strings.TrimSpace(cfg.EgressAckToken), "\n") || strings.Contains(strings.TrimSpace(cfg.EgressAckToken), "\r") {
-		return fmt.Errorf("TELESRV_EGRESS_ACK_TOKEN must not contain newlines")
+	if strings.Contains(strings.TrimSpace(cfg.EgressDeliveryToken), "\n") || strings.Contains(strings.TrimSpace(cfg.EgressDeliveryToken), "\r") {
+		return fmt.Errorf("TELESRV_EGRESS_DELIVERY_TOKEN must not contain newlines")
 	}
 	if strings.Contains(strings.TrimSpace(cfg.FileToken), "\n") || strings.Contains(strings.TrimSpace(cfg.FileToken), "\r") {
 		return fmt.Errorf("TELESRV_FILE_TOKEN must not contain newlines")

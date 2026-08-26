@@ -125,7 +125,7 @@ func TestCollectibleUsernameResolveAndSearchUseActiveRegistry(t *testing.T) {
 		t.Fatalf("search inactive user collectible = %+v err=%v", hidden, err)
 	}
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: userPeer.ID,
 		Title:         "Unrelated collectible channel",

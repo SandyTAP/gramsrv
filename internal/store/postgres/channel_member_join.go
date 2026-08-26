@@ -8,12 +8,16 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-func (s *ChannelStore) JoinChannel(ctx context.Context, channelID, userID int64, date int) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) JoinChannel(ctx context.Context, channelID, userID int64, date int, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if channelID == 0 || userID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -50,6 +54,13 @@ func (s *ChannelStore) JoinChannel(ctx context.Context, channelID, userID int64,
 	}
 	if channel.JoinRequest {
 		if err := s.recordPublicJoinRequestTx(ctx, tx, channel, userID, date); err != nil {
+			return domain.CreateChannelResult{}, err
+		}
+		snapshot, err := pendingJoinDeliverySnapshotTx(ctx, tx, channel)
+		if err != nil {
+			return domain.CreateChannelResult{}, err
+		}
+		if err := applyPendingJoinDeliveryTx(ctx, tx, snapshot, effects); err != nil {
 			return domain.CreateChannelResult{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -127,6 +138,9 @@ WHERE channel_id = $1 AND user_id = $2`, channelID, userID, member.ReadInboxMaxI
 		return domain.CreateChannelResult{}, err
 	}
 	if err := enqueueWelcomeMessageDeliveriesTx(ctx, tx, channelID, []domain.ChannelMember{member}); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	if err := applyPendingJoinDeliveryTx(ctx, tx, store.ChannelPendingJoinDeliverySnapshot{}, effects); err != nil {
 		return domain.CreateChannelResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

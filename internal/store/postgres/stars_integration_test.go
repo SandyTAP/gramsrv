@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // TestStarsLedgerPostgres 回归迁移 0009：Stars 本地账本对真实 PG 的原子语义
@@ -124,5 +125,41 @@ func TestStarsLedgerPostgres(t *testing.T) {
 		if ascending.Transactions[i].Amount != amount {
 			t.Fatalf("ascending[%d].amount = %d, want %d", i, ascending.Transactions[i].Amount, amount)
 		}
+	}
+}
+
+func TestStarsDeliveryBuilderFailureRollsBackLedgerPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	users := NewUserStore(pool)
+	user, err := users.Create(ctx, domain.User{AccessHash: 93, Phone: "+1666" + randomSuffix(t), FirstName: "StarsRollback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id=$1", user.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_transactions WHERE user_id=$1", user.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_balances WHERE user_id=$1", user.ID)
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id=$1", user.ID)
+	})
+	wantErr := errors.New("encode failed")
+	stars := NewStarsStore(pool)
+	if _, err := stars.CreditWithDelivery(ctx, user.ID, 50, domain.StarsReasonAdjust, domain.Peer{}, 1, "admin", "", func(domain.StarsBalance) ([]store.DeliveryEffect, error) {
+		return nil, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("CreditWithDelivery error = %v", err)
+	}
+	if balance, err := stars.GetBalance(ctx, user.ID); err != nil || balance.Balance != 0 {
+		t.Fatalf("balance after rollback = %+v err=%v", balance, err)
+	}
+	var transactions, deliveries int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM stars_transactions WHERE user_id=$1", user.ID).Scan(&transactions); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1", user.ID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if transactions != 0 || deliveries != 0 {
+		t.Fatalf("rollback left transactions=%d deliveries=%d", transactions, deliveries)
 	}
 }

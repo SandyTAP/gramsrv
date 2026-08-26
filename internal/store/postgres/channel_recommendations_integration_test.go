@@ -73,7 +73,7 @@ VALUES
 		t.Fatalf("insert membership index: %v", err)
 	}
 
-	store := NewChannelStore(pool)
+	store := newTestChannelStore(pool)
 	source, err := store.ListChannelRecommendations(ctx, domain.ChannelRecommendationsRequest{
 		UserID:          owner.ID,
 		SourceChannelID: sourceID,

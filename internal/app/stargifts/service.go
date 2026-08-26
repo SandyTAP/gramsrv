@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,20 +40,7 @@ type Service struct {
 	gifts []domain.StarGift
 	byID  map[int64]domain.StarGift
 	hash  int
-
-	formMu sync.Mutex
-	forms  map[starGiftPurchaseFormKey]domain.StarGiftPurchaseForm
 }
-
-type starGiftPurchaseFormKey struct {
-	buyerUserID int64
-	formID      int64
-}
-
-// AtomicPurchaseConfigured reports whether the production aggregate
-// coordinator is installed. It lets the RPC package keep its isolated memory
-// test adapter without silently downgrading PostgreSQL deployments.
-func (s *Service) AtomicPurchaseConfigured() bool { return s != nil && s.lifecycle != nil }
 
 type Option func(*Service)
 
@@ -105,7 +91,7 @@ func WithRevenueWithdrawalProvider(provider ChannelRevenueWithdrawalProvider) Op
 }
 
 func NewService(st store.StarGiftStore, blobs BlobBackend, dc int, opts ...Option) *Service {
-	service := &Service{store: st, blobs: blobs, dc: dc, forms: make(map[starGiftPurchaseFormKey]domain.StarGiftPurchaseForm)}
+	service := &Service{store: st, blobs: blobs, dc: dc}
 	for _, opt := range opts {
 		opt(service)
 	}
@@ -562,70 +548,24 @@ func (s *Service) GrantUnique(ctx context.Context, req domain.AdminStarGiftGrant
 	return result, err
 }
 
-func (s *Service) Purchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error) {
-	if s == nil || s.lifecycle == nil {
+func (s *Service) PurchaseWithDelivery(ctx context.Context, req domain.StarGiftPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error) {
+	if s == nil || s.lifecycle == nil || effects == nil {
 		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftUnavailable
 	}
-	result, err := s.lifecycle.PurchaseStarGift(ctx, req)
+	result, err := s.lifecycle.PurchaseStarGiftWithDelivery(ctx, req, effects)
 	if err == nil {
 		s.InvalidateStarGiftCatalog()
 	}
 	return result, err
 }
 
-// IssuePurchaseForm creates one fresh payment intent. PostgreSQL persists the
-// intent so server restarts cannot turn a valid checkout into an unbound
-// payment. The bounded in-memory branch exists only for isolated RPC tests.
+// IssuePurchaseForm creates one durable payment intent. A lifecycle store is
+// mandatory; there is no process-local checkout compatibility path.
 func (s *Service) IssuePurchaseForm(ctx context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error) {
-	if !validPurchaseForm(form) {
+	if s == nil || s.lifecycle == nil || !validPurchaseForm(form) {
 		return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftFormPurposeInvalid
 	}
-	if s != nil && s.lifecycle != nil {
-		return s.lifecycle.IssueStarGiftPurchaseForm(ctx, form)
-	}
-	if s == nil {
-		return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftUnavailable
-	}
-	s.formMu.Lock()
-	defer s.formMu.Unlock()
-	for key, existing := range s.forms {
-		if existing.ExpiresAt < form.IssuedAt {
-			delete(s.forms, key)
-		}
-	}
-	for attempt := 0; attempt < 8; attempt++ {
-		formID, err := randomPositiveInt64()
-		if err != nil {
-			return domain.StarGiftPurchaseForm{}, err
-		}
-		key := starGiftPurchaseFormKey{buyerUserID: form.BuyerUserID, formID: formID}
-		if _, exists := s.forms[key]; exists {
-			continue
-		}
-		form.FormID = formID
-		s.forms[key] = form
-		return form, nil
-	}
-	return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftUnavailable
-}
-
-// ValidatePurchaseForm is a read-only preflight used for precise RPC errors.
-// The PostgreSQL purchase transaction repeats this validation while holding a
-// row lock; callers must not treat this preflight as the atomicity boundary.
-func (s *Service) ValidatePurchaseForm(ctx context.Context, req domain.StarGiftPurchaseRequest) error {
-	if s != nil && s.lifecycle != nil {
-		return s.lifecycle.ValidateStarGiftPurchaseForm(ctx, req)
-	}
-	if s == nil || req.FormID == 0 {
-		return domain.ErrStarGiftFormExpired
-	}
-	s.formMu.Lock()
-	defer s.formMu.Unlock()
-	form, ok := s.forms[starGiftPurchaseFormKey{buyerUserID: req.BuyerUserID, formID: req.FormID}]
-	if !ok || form.ExpiresAt < req.Date {
-		return domain.ErrStarGiftFormExpired
-	}
-	return validatePurchaseFormIntent(form, req)
+	return s.lifecycle.IssueStarGiftPurchaseForm(ctx, form)
 }
 
 func validPurchaseForm(form domain.StarGiftPurchaseForm) bool {
@@ -634,18 +574,6 @@ func validPurchaseForm(form domain.StarGiftPurchaseForm) bool {
 		form.GiftID > 0 && form.RevisionID > 0 && form.ChargeStars > 0 && form.IssuedAt > 0 &&
 		form.ExpiresAt == form.IssuedAt+600 &&
 		(domain.PremiumGiftMessage{Text: form.Message, Entities: form.MessageEntities}).Valid()
-}
-
-func validatePurchaseFormIntent(form domain.StarGiftPurchaseForm, req domain.StarGiftPurchaseRequest) error {
-	if form.BuyerUserID != req.BuyerUserID || form.To != req.To || form.GiftID != req.GiftID ||
-		form.IncludeUpgrade != req.IncludeUpgrade || form.HideName != req.HideName || form.Message != req.Message ||
-		!slices.Equal(form.MessageEntities, req.MessageEntities) {
-		return domain.ErrStarGiftFormPurposeInvalid
-	}
-	if form.RevisionID != req.RevisionID || form.ChargeStars != req.ChargeStars {
-		return domain.ErrStarGiftFormAmountMismatch
-	}
-	return nil
 }
 
 func (s *Service) ListResale(ctx context.Context, filter domain.StarGiftResaleFilter) (domain.StarGiftResalePage, error) {
@@ -1051,18 +979,11 @@ func (s *Service) ToggleSaved(ctx context.Context, ref domain.SavedStarGiftRef, 
 	return s.store.SetUnsaved(ctx, ref, unsaved)
 }
 
-// Convert keeps the in-memory/catalog store primitive available to isolated
-// tests and non-production adapters. RPC production paths must use
-// ConvertAggregate so balance credit and terminal state cannot split.
-func (s *Service) Convert(ctx context.Context, ref domain.SavedStarGiftRef) (domain.SavedStarGift, error) {
-	return s.store.MarkConverted(ctx, ref)
-}
-
-func (s *Service) ConvertAggregate(ctx context.Context, req domain.StarGiftConvertRequest) (domain.StarGiftConvertResult, error) {
-	if s == nil || s.lifecycle == nil {
+func (s *Service) ConvertAggregateWithDelivery(ctx context.Context, req domain.StarGiftConvertRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftConvertResult]) (domain.StarGiftConvertResult, error) {
+	if s == nil || s.lifecycle == nil || effects == nil {
 		return domain.StarGiftConvertResult{}, domain.ErrStarGiftUnavailable
 	}
-	return s.lifecycle.ConvertStarGift(ctx, req)
+	return s.lifecycle.ConvertStarGiftWithDelivery(ctx, req, effects)
 }
 
 func randomPositiveInt64() (int64, error) {

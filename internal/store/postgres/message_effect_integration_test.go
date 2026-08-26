@@ -35,7 +35,7 @@ func TestSendPrivateEffectSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	const effect = int64(5104841169784993603)
 
 	res, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{

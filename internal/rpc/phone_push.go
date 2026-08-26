@@ -32,7 +32,7 @@ func (r *Router) phoneCallUpdatesWith(ctx context.Context, view tg.PhoneCallClas
 // pushPhoneCall 把 call 当前状态按 targetUserID 视角推给其全部在线设备
 // （ctx 携带的发起设备会被 pushUserMessage 的 except 语义排除）。
 func (r *Router) pushPhoneCall(ctx context.Context, targetUserID int64, call domain.PhoneCall, logMessage string) int {
-	return r.pushUserMessage(ctx, targetUserID, logMessage, r.phoneCallUpdates(ctx, call, targetUserID))
+	return r.pushUserMessageTransient(ctx, targetUserID, logMessage, r.phoneCallUpdates(ctx, call, targetUserID))
 }
 
 // pushPhoneCallToDevice 只把 phoneCall 状态推给一台精确的物理 session。
@@ -68,7 +68,7 @@ func (r *Router) pushPhoneCallToDevice(ctx context.Context, targetUserID int64, 
 // ctx 必须是接听设备的请求上下文：except 语义恰好把赢家排除在外。
 func (r *Router) pushPhoneCallStopRinging(ctx context.Context, call domain.PhoneCall) int {
 	upd := r.phoneCallUpdatesWith(ctx, tgPhoneCallStopRinging(call), call, call.ParticipantID)
-	return r.pushUserMessage(ctx, call.ParticipantID, "phone call stop ringing", upd)
+	return r.pushUserMessageTransient(ctx, call.ParticipantID, "phone call stop ringing", upd)
 }
 
 // pushPhoneCallDiscardedBoth 把终态推给双方全部设备（发起设备由 ctx except 排除，
@@ -98,5 +98,5 @@ func (r *Router) pushPhoneSignalingData(ctx context.Context, targetUserID int64,
 			return
 		}
 	}
-	r.pushUserMessage(ctx, targetUserID, "phone call signaling", upd)
+	r.pushUserMessageTransient(ctx, targetUserID, "phone call signaling", upd)
 }

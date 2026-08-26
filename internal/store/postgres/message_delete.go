@@ -309,11 +309,11 @@ WHERE sender_user_id = $1
 			if err := appendDeleteMessagesEvent(ctx, q, event); err != nil {
 				return res, err
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID:     userID,
 				Pts:              int32(event.Pts),
 				EventType:        string(domain.UpdateEventDeleteMessages),
-				ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+				ExcludeAuthKeyID: dispatchAuthKeyID,
 				ExcludeSessionID: dispatchSessionID,
 			}); err != nil {
 				return res, fmt.Errorf("enqueue delete messages dispatch: %w", err)
@@ -337,7 +337,7 @@ WHERE sender_user_id = $1
 			}); err != nil {
 				return res, fmt.Errorf("advance dialog read inbox after delete correction: %w", err)
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID: userID,
 				Pts:          int32(correction.Pts),
 				EventType:    string(domain.UpdateEventReadHistoryInbox),
@@ -377,11 +377,11 @@ WHERE sender_user_id = $1
 			}); err != nil {
 				return res, fmt.Errorf("advance history clear read inbox: %w", err)
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID:     userID,
 				Pts:              int32(readPts),
 				EventType:        string(domain.UpdateEventReadHistoryInbox),
-				ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+				ExcludeAuthKeyID: dispatchAuthKeyID,
 				ExcludeSessionID: dispatchSessionID,
 			}); err != nil {
 				return res, fmt.Errorf("enqueue history clear read dispatch: %w", err)
@@ -397,11 +397,11 @@ WHERE sender_user_id = $1
 			if err := appendUserUpdateEvent(ctx, db, q, userID, editEvent); err != nil {
 				return res, fmt.Errorf("append history clear edit event: %w", err)
 			}
-			if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+			if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 				TargetUserID:     userID,
 				Pts:              int32(editPts),
 				EventType:        string(domain.UpdateEventEditMessage),
-				ExcludeAuthKeyID: authKeyIDToInt64(dispatchAuthKeyID),
+				ExcludeAuthKeyID: dispatchAuthKeyID,
 				ExcludeSessionID: dispatchSessionID,
 			}); err != nil {
 				return res, fmt.Errorf("enqueue history clear edit dispatch: %w", err)

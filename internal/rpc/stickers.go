@@ -8,31 +8,31 @@ import (
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap"
 
-	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
 )
 
 // 本文件把 reaction / sticker 资源 RPC 接到真实 seed 数据（documents / sticker_sets /
-// available_reactions）；Files 服务缺失或资源未导入时回退到 tdesktop 兼容 stub。
+// available_reactions）。缺失依赖或缺失 sticker-set 事实直接失败，不构造兼容数据。
 
 func (r *Router) onMessagesGetAvailableReactions(ctx context.Context, hash int) (tg.MessagesAvailableReactionsClass, error) {
 	if r.deps.Files == nil {
-		return tdesktop.AvailableReactions(hash), nil
+		return nil, internalErr()
 	}
 	reactions, err := r.deps.Files.ListAvailableReactions(ctx)
 	if err != nil {
 		return nil, internalErr()
 	}
-	if len(reactions) == 0 {
-		return tdesktop.AvailableReactions(hash), nil
-	}
-	docs, err := r.deps.Files.GetDocuments(ctx, reactionDocumentIDs(reactions))
+	documentIDs := reactionDocumentIDs(reactions)
+	docs, err := r.deps.Files.GetDocuments(ctx, documentIDs)
 	if err != nil {
 		return nil, internalErr()
 	}
 	docByID := documentsByID(docs)
+	if !allDocumentsResolved(documentIDs, docByID) {
+		return nil, internalErr()
+	}
 	catalogHash := availableReactionsHash(reactions, docByID)
-	if hash == catalogHash {
+	if hash != 0 && hash == catalogHash {
 		return &tg.MessagesAvailableReactionsNotModified{}, nil
 	}
 	return tgAvailableReactions(reactions, docByID, catalogHash), nil
@@ -45,7 +45,7 @@ func (r *Router) onMessagesGetAvailableEffects(ctx context.Context, hash int) (t
 		return &tg.MessagesAvailableEffects{Hash: 0, Effects: []tg.AvailableEffect{}, Documents: []tg.DocumentClass{}}
 	}
 	if r.deps.Files == nil {
-		return empty(), nil
+		return nil, internalErr()
 	}
 	effects, catalogHash, err := r.deps.Files.AvailableEffects(ctx)
 	if err != nil {
@@ -59,27 +59,35 @@ func (r *Router) onMessagesGetAvailableEffects(ctx context.Context, hash int) (t
 	if hash == catalogHash {
 		return &tg.MessagesAvailableEffectsNotModified{}, nil
 	}
-	docs, err := r.deps.Files.GetDocuments(ctx, effectDocumentIDs(effects))
+	documentIDs := effectDocumentIDs(effects)
+	docs, err := r.deps.Files.GetDocuments(ctx, documentIDs)
 	if err != nil {
 		return nil, internalErr()
 	}
-	return tgAvailableEffects(effects, documentsByID(docs), catalogHash), nil
+	docByID := documentsByID(docs)
+	if !allDocumentsResolved(documentIDs, docByID) {
+		return nil, internalErr()
+	}
+	return tgAvailableEffects(effects, docByID, catalogHash), nil
 }
 
 func (r *Router) onMessagesGetStickerSet(ctx context.Context, req *tg.MessagesGetStickerSetRequest) (tg.MessagesStickerSetClass, error) {
-	if req == nil || r.deps.Files == nil {
-		return tdesktop.StickerSet(req), nil
+	if req == nil {
+		return nil, stickersetInvalidErr()
+	}
+	if r.deps.Files == nil {
+		return nil, internalErr()
 	}
 	ref, ok := stickerSetRefFromInput(req.Stickerset)
 	if !ok {
-		return tdesktop.StickerSet(req), nil
+		return nil, stickersetInvalidErr()
 	}
 	set, docs, found, err := r.deps.Files.ResolveStickerSet(ctx, ref)
 	if err != nil {
 		return nil, internalErr()
 	}
-	// 观测：量化客户端反复请求哪些集（同集重试 vs 大量不同集）。未 seed 集走 stub，
-	// 由 ResolveStickerSet 的负缓存短路 PG；这里只记 ref 与命中情况。
+	// 量化客户端反复请求哪些集（同集重试 vs 大量不同集）。ResolveStickerSet
+	// 自身的负缓存会短路重复 miss；这里不投影任何替代集合。
 	if r.log != nil {
 		r.log.Debug("getStickerSet",
 			zap.String("ref_kind", string(ref.Kind)),
@@ -91,25 +99,7 @@ func (r *Router) onMessagesGetStickerSet(ctx context.Context, req *tg.MessagesGe
 		)
 	}
 	if !found {
-		if fallbackSet, fallbackDocs, fallbackFound, fallbackErr := r.resolvePlaceholderStickerSet(ctx, ref); fallbackErr != nil {
-			return nil, internalErr()
-		} else if fallbackFound {
-			if r.log != nil {
-				r.log.Debug("getStickerSet placeholder fallback",
-					zap.String("short_name", ref.ShortName),
-					zap.Int64("fallback_set_id", fallbackSet.ID),
-					zap.String("fallback_short_name", fallbackSet.ShortName),
-					zap.Int("documents", len(fallbackDocs)),
-					zap.Int("response_hash", fallbackSet.Hash),
-				)
-			}
-			if req.Hash != 0 && req.Hash == fallbackSet.Hash {
-				return &tg.MessagesStickerSetNotModified{}, nil
-			}
-			return tgMessagesStickerSet(fallbackSet, fallbackDocs), nil
-		}
-		// 未 seed 的系统集 / 未知短名：回退兼容 stub，避免破坏客户端。
-		return tdesktop.StickerSet(req), nil
+		return nil, stickersetInvalidErr()
 	}
 	if req.Hash != 0 && req.Hash == set.Hash {
 		return &tg.MessagesStickerSetNotModified{}, nil
@@ -119,146 +109,6 @@ func (r *Router) onMessagesGetStickerSet(ctx context.Context, req *tg.MessagesGe
 		return nil, err
 	}
 	return tgMessagesStickerSet(set, docs), nil
-}
-
-func (r *Router) resolvePlaceholderStickerSet(ctx context.Context, ref domain.StickerSetRef) (domain.StickerSet, []domain.Document, bool, error) {
-	placeholder, ok := clientPlaceholderStickerSet(ref)
-	if !ok {
-		return domain.StickerSet{}, nil, false, nil
-	}
-	for _, candidate := range placeholderStickerSetCandidates() {
-		set, docs, found, err := r.deps.Files.ResolveStickerSet(ctx, candidate)
-		if err != nil || !found {
-			if err != nil {
-				return domain.StickerSet{}, nil, false, err
-			}
-			continue
-		}
-		if len(docs) >= androidPlaceholderStickerDocumentLimit {
-			projectedSet, projectedDocs := projectClientPlaceholderStickerSet(placeholder, set, docs)
-			if len(projectedDocs) == androidPlaceholderStickerDocumentLimit {
-				return projectedSet, projectedDocs, true, nil
-			}
-		}
-	}
-	return domain.StickerSet{}, nil, false, nil
-}
-
-const androidPlaceholderStickerDocumentLimit = 7
-
-// Android 的两个内建 placeholder 名称没有独立 seed。兼容投影使用稳定的独立
-// identity，避免复用 AnimatedEmoji 的 set id/hash 后与真正的 598 文档缓存互相覆盖。
-var clientPlaceholderStickerSets = []domain.StickerSet{
-	{
-		ID:         7_776_100_000_000_001,
-		AccessHash: 7_776_100_000_000_101,
-		ShortName:  "tg_placeholders_android",
-		Title:      "Android Placeholders",
-		Kind:       domain.StickerSetKindSystem,
-		Official:   true,
-	},
-	{
-		ID:         7_776_100_000_000_002,
-		AccessHash: 7_776_100_000_000_102,
-		ShortName:  "tg_superplaceholders_android_2",
-		Title:      "Android Super Placeholders",
-		Kind:       domain.StickerSetKindSystem,
-		Official:   true,
-	},
-}
-
-func clientPlaceholderStickerSet(ref domain.StickerSetRef) (domain.StickerSet, bool) {
-	for _, set := range clientPlaceholderStickerSets {
-		switch ref.Kind {
-		case domain.StickerSetRefByShortName:
-			if ref.ShortName == set.ShortName {
-				return set, true
-			}
-		case domain.StickerSetRefByID:
-			if ref.ID == set.ID && ref.AccessHash == set.AccessHash {
-				return set, true
-			}
-		}
-	}
-	return domain.StickerSet{}, false
-}
-
-func projectClientPlaceholderStickerSet(placeholder, source domain.StickerSet, docs []domain.Document) (domain.StickerSet, []domain.Document) {
-	docByID := documentsByID(docs)
-	selectedDocs := make([]domain.Document, 0, androidPlaceholderStickerDocumentLimit)
-	selectedIDs := make([]int64, 0, androidPlaceholderStickerDocumentLimit)
-	selected := make(map[int64]struct{}, androidPlaceholderStickerDocumentLimit)
-	for _, id := range source.DocumentIDs {
-		if len(selectedDocs) == androidPlaceholderStickerDocumentLimit {
-			break
-		}
-		doc, found := docByID[id]
-		if !found {
-			continue
-		}
-		if _, duplicate := selected[id]; duplicate {
-			continue
-		}
-		selected[id] = struct{}{}
-		selectedIDs = append(selectedIDs, id)
-		selectedDocs = append(selectedDocs, doc)
-	}
-
-	placeholder.Animated = source.Animated
-	placeholder.Videos = source.Videos
-	placeholder.Emojis = source.Emojis
-	placeholder.TextColor = source.TextColor
-	placeholder.Count = len(selectedIDs)
-	placeholder.DocumentIDs = selectedIDs
-	placeholder.Hash = projectedStickerSetHash(selectedIDs)
-	placeholder.Packs = filterStickerPacks(source.Packs, selected)
-	placeholder.Keywords = filterStickerKeywords(source.Keywords, selected)
-	return placeholder, selectedDocs
-}
-
-func projectedStickerSetHash(ids []int64) int {
-	hash := int(tdesktopCountHash(ids) & 0x7fffffff)
-	if hash == 0 && len(ids) > 0 {
-		return 1
-	}
-	return hash
-}
-
-func filterStickerPacks(packs []domain.StickerPack, selected map[int64]struct{}) []domain.StickerPack {
-	out := make([]domain.StickerPack, 0, len(packs))
-	for _, pack := range packs {
-		filtered := domain.StickerPack{Emoticon: pack.Emoticon}
-		for _, id := range pack.DocumentIDs {
-			if _, ok := selected[id]; ok {
-				filtered.DocumentIDs = append(filtered.DocumentIDs, id)
-			}
-		}
-		if len(filtered.DocumentIDs) > 0 {
-			out = append(out, filtered)
-		}
-	}
-	return out
-}
-
-func filterStickerKeywords(keywords []domain.StickerKeyword, selected map[int64]struct{}) []domain.StickerKeyword {
-	out := make([]domain.StickerKeyword, 0, len(keywords))
-	for _, keyword := range keywords {
-		if _, ok := selected[keyword.DocumentID]; ok {
-			out = append(out, keyword)
-		}
-	}
-	return out
-}
-
-func placeholderStickerSetCandidates() []domain.StickerSetRef {
-	return []domain.StickerSetRef{
-		{Kind: domain.StickerSetRefBySystem, SystemKey: "emoji_generic_animations"},
-		{Kind: domain.StickerSetRefBySystem, SystemKey: "animated_emoji_animations"},
-		{Kind: domain.StickerSetRefByShortName, ShortName: "EmojiGenericAnimations"},
-		{Kind: domain.StickerSetRefByShortName, ShortName: "EmojiAnimations"},
-		{Kind: domain.StickerSetRefBySystem, SystemKey: "animated_emoji"},
-		{Kind: domain.StickerSetRefByShortName, ShortName: "AnimatedEmojies"},
-	}
 }
 
 func (r *Router) onMessagesGetAllStickers(ctx context.Context, hash int64) (tg.MessagesAllStickersClass, error) {
@@ -274,9 +124,12 @@ func (r *Router) onMessagesGetEmojiStickerGroups(ctx context.Context, hash int) 
 		return &tg.MessagesEmojiGroups{Hash: 0, Groups: []tg.EmojiGroupClass{}}
 	}
 	if r.deps.Files == nil {
-		return empty(), nil
+		return nil, internalErr()
 	}
-	sets := r.stickerCatalogSets(ctx, domain.StickerSetKindEmoji)
+	sets, err := r.stickerCatalogSets(ctx, domain.StickerSetKindEmoji)
+	if err != nil {
+		return nil, internalErr()
+	}
 	visible := make([]domain.StickerSet, 0, len(sets))
 	for _, set := range sets {
 		if set.ID == 0 || set.Archived {
@@ -311,16 +164,12 @@ func (r *Router) onMessagesGetMaskStickers(ctx context.Context, hash int64) (tg.
 }
 
 func (r *Router) allStickersForKind(ctx context.Context, hash int64, kind domain.StickerSetKind) (tg.MessagesAllStickersClass, error) {
-	if r.deps.Files == nil {
-		return messagesAllStickersEmpty(hash), nil
+	if r.deps.Files == nil || r.deps.Account == nil {
+		return nil, internalErr()
 	}
-	sets, handled, err := r.installedStickerSetsForViewer(ctx, kind)
+	sets, err := r.installedStickerSetsForViewer(ctx, kind)
 	if err != nil {
 		return nil, err
-	}
-	if !handled {
-		// 兼容无 per-user 安装态的测试/旧内存路径：从目录缓存读全局 installed 标志。
-		sets = installedGlobalStickerSets(r.stickerCatalogSets(ctx, kind))
 	}
 	if len(sets) == 0 {
 		return messagesAllStickersEmpty(hash), nil
@@ -332,38 +181,37 @@ func (r *Router) allStickersForKind(ctx context.Context, hash int64, kind domain
 	return &tg.MessagesAllStickers{Hash: catalogHash, Sets: tgStickerSets(sets)}, nil
 }
 
-func (r *Router) installedStickerSetsForViewer(ctx context.Context, kind domain.StickerSetKind) ([]domain.StickerSet, bool, error) {
-	svc, ok := r.userStickerSetSvc()
-	if !ok {
-		return nil, false, nil
+func (r *Router) installedStickerSetsForViewer(ctx context.Context, kind domain.StickerSetKind) ([]domain.StickerSet, error) {
+	if r.deps.Account == nil || r.deps.Files == nil {
+		return nil, internalErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil || userID == 0 {
-		if err != nil {
-			return nil, true, internalErr()
-		}
-		return nil, true, nil
+		return nil, internalErr()
 	}
-	userSets, _, err := svc.ListUserStickerSets(ctx, userID, kind, nil, 0, domain.MaxInstalledStickerSets)
+	userSets, _, err := r.deps.Account.ListUserStickerSets(ctx, userID, kind, nil, 0, domain.MaxInstalledStickerSets)
 	if err != nil {
-		return nil, true, internalErr()
+		return nil, internalErr()
 	}
 	out := make([]domain.StickerSet, 0, len(userSets))
 	for _, item := range userSets {
-		if item.Archived || item.StickerSetID == 0 {
+		if item.Archived {
 			continue
+		}
+		if item.StickerSetID == 0 {
+			return nil, internalErr()
 		}
 		set, _, found, err := r.deps.Files.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: item.StickerSetID})
 		if err != nil {
-			return nil, true, internalErr()
+			return nil, internalErr()
 		}
 		if !found || set.ID == 0 || set.Deleted || userStickerSetKind(set) != kind {
-			continue
+			return nil, internalErr()
 		}
 		set = stickerSetWithoutViewerInstallState(set)
 		out = append(out, stickerSetWithViewerInstallItem(set, item))
 	}
-	return out, true, nil
+	return out, nil
 }
 
 func (r *Router) stickerSetsWithViewerInstallState(ctx context.Context, kind domain.StickerSetKind, sets []domain.StickerSet) ([]domain.StickerSet, error) {
@@ -374,18 +222,17 @@ func (r *Router) stickerSetsWithViewerInstallState(ctx context.Context, kind dom
 		byID[set.ID] = len(out)
 		out = append(out, set)
 	}
-	svc, ok := r.userStickerSetSvc()
-	if !ok {
-		return out, nil
+	if r.deps.Account == nil {
+		return nil, internalErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return nil, internalErr()
 	}
 	if userID == 0 {
-		return out, nil
+		return nil, internalErr()
 	}
-	userSets, _, err := svc.ListUserStickerSets(ctx, userID, kind, nil, 0, domain.MaxInstalledStickerSets)
+	userSets, _, err := r.deps.Account.ListUserStickerSets(ctx, userID, kind, nil, 0, domain.MaxInstalledStickerSets)
 	if err != nil {
 		return nil, internalErr()
 	}
@@ -423,16 +270,6 @@ func stickerSetWithViewerInstallItem(set domain.StickerSet, item domain.UserStic
 	return set
 }
 
-func installedGlobalStickerSets(sets []domain.StickerSet) []domain.StickerSet {
-	out := make([]domain.StickerSet, 0, len(sets))
-	for _, set := range sets {
-		if set.Installed && !set.Archived {
-			out = append(out, set)
-		}
-	}
-	return out
-}
-
 // featuredCoversPerSet 限制每个 featured 集解析的封面贴纸数量（trending 预览用）。
 const featuredCoversPerSet = 5
 
@@ -456,10 +293,13 @@ func (r *Router) onMessagesGetOldFeaturedStickers(ctx context.Context, req *tg.M
 // 时发生（一次批量 GetDocuments），避免每次请求都解析封面。
 func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind domain.StickerSetKind) (tg.MessagesFeaturedStickersClass, error) {
 	if r.deps.Files == nil {
-		return messagesFeaturedStickersEmpty(hash), nil
+		return nil, internalErr()
 	}
 	// perf：从目录缓存读集（TTL 内 hash 命中不打 PG，封面仅 cache-miss 解析）。
-	sets := r.stickerCatalogSets(ctx, kind)
+	sets, err := r.stickerCatalogSets(ctx, kind)
+	if err != nil {
+		return nil, internalErr()
+	}
 	visible := make([]domain.StickerSet, 0, len(sets))
 	for _, s := range sets {
 		if s.ID == 0 || s.Archived {
@@ -470,7 +310,6 @@ func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind d
 	if len(visible) == 0 {
 		return messagesFeaturedStickersEmpty(hash), nil
 	}
-	var err error
 	visible, err = r.stickerSetsWithViewerInstallState(ctx, kind, visible)
 	if err != nil {
 		return nil, err
@@ -480,7 +319,10 @@ func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind d
 		// 关键 perf 短路：目录未变直接返回，不解析任何封面文档。
 		return &tg.MessagesFeaturedStickersNotModified{Count: len(visible)}, nil
 	}
-	covers := r.resolveFeaturedCovers(ctx, visible)
+	covers, err := r.resolveFeaturedCovers(ctx, visible)
+	if err != nil {
+		return nil, internalErr()
+	}
 	covered := make([]tg.StickerSetCoveredClass, 0, len(visible))
 	for _, s := range visible {
 		covered = append(covered, featuredCoveredSet(s, covers))
@@ -494,7 +336,7 @@ func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind d
 }
 
 // resolveFeaturedCovers 批量解析所有 featured 集的前若干封面文档（一次查询）。
-func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.StickerSet) map[int64]domain.Document {
+func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.StickerSet) (map[int64]domain.Document, error) {
 	ids := make([]int64, 0, len(sets)*featuredCoversPerSet)
 	for _, s := range sets {
 		for i, id := range s.DocumentIDs {
@@ -507,16 +349,20 @@ func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.Sticke
 		}
 	}
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	docs, err := r.deps.Files.GetDocuments(ctx, ids)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return documentsByID(docs)
+	docByID := documentsByID(docs)
+	if !allDocumentsResolved(ids, docByID) {
+		return nil, domain.ErrStickerInvalid
+	}
+	return docByID, nil
 }
 
-// featuredCoveredSet 用已解析的封面构造 covered set；无封面时回退 noCovered。
+// featuredCoveredSet 用已解析的封面构造 covered set；集合本身无封面时返回 noCovered。
 func featuredCoveredSet(s domain.StickerSet, covers map[int64]domain.Document) tg.StickerSetCoveredClass {
 	out := make([]tg.DocumentClass, 0, featuredCoversPerSet)
 	for i, id := range s.DocumentIDs {
@@ -539,6 +385,18 @@ func documentsByID(docs []domain.Document) map[int64]domain.Document {
 		m[d.ID] = d
 	}
 	return m
+}
+
+func allDocumentsResolved(ids []int64, byID map[int64]domain.Document) bool {
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := byID[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // availableReactionsHash covers every domain field that contributes to the TL

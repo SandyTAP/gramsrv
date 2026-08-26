@@ -5,13 +5,32 @@ import (
 	"fmt"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
-// NotifyPeerUsernamesChanged is the domain-only edge hook invoked after a
-// collectible username registry mutation commits. It invalidates the cached
-// peer projection and pushes the ordinary non-PTS updateUser/updateChannel
-// refresh to online viewers. The shared projection paths preload the registry
-// once, so fan-out cannot turn the change into an N+1 query.
+// UsernameAudienceDeliveryEffects projects every user snapshot frozen by the
+// username aggregate into the standard durable, non-PTS updateUser effects.
+// Channel-only mutations deliberately produce an empty snapshot: their
+// updateChannel delivery remains owned by the channel aggregate.
+func (r *Router) UsernameAudienceDeliveryEffects(snapshot store.UsernameAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	if r == nil {
+		return nil, fmt.Errorf("username audience delivery router is not configured")
+	}
+	effects := make([]store.DeliveryEffect, 0)
+	for _, user := range snapshot.Users {
+		projected, err := r.UserAudienceDeliveryEffects(user)
+		if err != nil {
+			return nil, err
+		}
+		effects = append(effects, projected...)
+	}
+	return effects, nil
+}
+
+// NotifyPeerUsernamesChanged is now only the channel/cache hook invoked after a
+// collectible username registry mutation commits. User delivery is a mandatory
+// effect in the username store transaction; this hook must never recreate a
+// post-commit user producer.
 func (r *Router) NotifyPeerUsernamesChanged(ctx context.Context, peer domain.Peer) error {
 	if r == nil {
 		return nil
@@ -31,17 +50,7 @@ func (r *Router) NotifyPeerUsernamesChanged(ctx context.Context, peer domain.Pee
 
 func (r *Router) notifyUserUsernamesChanged(ctx context.Context, userID int64) error {
 	r.invalidateRPCProjectionForUser(userID)
-	if r.deps.Users == nil {
-		return nil
-	}
-	user, found, err := r.verificationUser(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("notify peer usernames changed: load user %d: %w", userID, err)
-	}
-	if !found || user.ID == 0 {
-		return fmt.Errorf("notify peer usernames changed: user %d not found", userID)
-	}
-	return r.NotifyUserModerationFlagsChanged(ctx, user)
+	return nil
 }
 
 func (r *Router) notifyChannelUsernamesChanged(ctx context.Context, channelID int64) error {

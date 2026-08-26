@@ -199,9 +199,8 @@ func (r *Router) onPhoneInviteConferenceCallParticipant(ctx context.Context, req
 	}
 	users := r.tgUsersForIDs(ctx, scope.userID, []int64{scope.userID, target.ID})
 	out := tgPrivateMessageUpdates(res.SenderEvent, res.SenderMessage, 0, false, users, nil)
-	recipientUsers := r.tgUsersForIDs(ctx, target.ID, []int64{scope.userID, target.ID})
-	r.pushUserMessage(ctx, target.ID, "conference invite",
-		tgPrivateMessageUpdates(res.RecipientEvent, res.RecipientMessage, 0, false, recipientUsers, nil))
+	// SendPrivateText commits the recipient update_event and dispatch_outbox in
+	// the message transaction. The RPC layer must not duplicate it via sessions.
 	return out, nil
 }
 
@@ -385,7 +384,7 @@ func (r *Router) onPhoneGetGroupCallChainBlocks(ctx context.Context, req *tg.Pho
 func (r *Router) pushConferenceChainBlocks(ctx context.Context, call domain.GroupCall, subChainID int, blocks [][]byte, nextOffset int) {
 	recipients := r.conferenceCallRecipients(ctx, call.ID)
 	for _, viewerID := range recipients {
-		r.pushUserMessage(ctx, viewerID, "conference chain blocks",
+		r.pushUserMessageTransient(ctx, viewerID, "conference chain blocks",
 			r.conferenceChainBlocksUpdates(ctx, viewerID, call, subChainID, blocks, nextOffset))
 	}
 }

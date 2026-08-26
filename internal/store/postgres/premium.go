@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -589,13 +590,16 @@ func premiumFormIssueMatches(requested, stored domain.PremiumPaymentForm) bool {
 		premiumEntitiesEqual(requested.Message.Entities, stored.Message.Entities)
 }
 
-func (s *PremiumStore) PurchasePremium(ctx context.Context, req domain.PremiumPurchaseRequest) (domain.PremiumPurchaseResult, error) {
+func (s *PremiumStore) PurchasePremiumWithDelivery(ctx context.Context, req domain.PremiumPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error) {
 	req.CommandKey = strings.TrimSpace(req.CommandKey)
 	if s == nil || s.db == nil || s.messages == nil || req.BuyerUserID <= 0 ||
 		req.FormID <= 0 || req.RecipientUserID <= 0 || req.Months <= 0 ||
 		req.Date <= 0 || req.CommandKey == "" ||
 		len(req.CommandKey) > 256 || !req.Message.Valid() {
 		return domain.PremiumPurchaseResult{}, domain.ErrPremiumFormInvalid
+	}
+	if effects == nil {
+		return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if replay, found, err := s.loadPremiumPurchaseReplay(ctx, req); err != nil || found {
 		return replay, err
@@ -648,7 +652,18 @@ func (s *PremiumStore) PurchasePremium(ctx context.Context, req domain.PremiumPu
 			return nil
 		},
 		after: func(ctx context.Context, tx pgx.Tx, sent domain.SendPrivateTextResult) error {
-			_, err := tx.Exec(ctx, `UPDATE premium_payment_intents
+			result.Send = sent
+			intents, err := effects(result)
+			if err != nil {
+				return fmt.Errorf("build premium purchase delivery: %w", err)
+			}
+			if err := store.ValidatePremiumPurchaseDeliveryEffects(req, result, intents); err != nil {
+				return err
+			}
+			if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+				return fmt.Errorf("enqueue premium purchase delivery: %w", err)
+			}
+			_, err = tx.Exec(ctx, `UPDATE premium_payment_intents
 SET sender_message_id=$2,recipient_message_id=$3,updated_at=now()
 WHERE form_id=$1 AND status='paid'`, req.FormID, nullableMessageID(sent.SenderMessage.ID),
 				nullableMessageID(sent.RecipientMessage.ID))
@@ -1148,6 +1163,17 @@ FROM stars_transactions WHERE id=$1`, out.Intent.StarsTransactionID).Scan(
 }
 
 func (s *PremiumStore) SweepPremiumEntitlements(ctx context.Context, now, limit int) ([]domain.User, error) {
+	return s.sweepPremiumEntitlements(ctx, now, limit, nil)
+}
+
+func (s *PremiumStore) SweepPremiumEntitlementsWithDelivery(ctx context.Context, now, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
+	if effects == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	return s.sweepPremiumEntitlements(ctx, now, limit, effects)
+}
+
+func (s *PremiumStore) sweepPremiumEntitlements(ctx context.Context, now, limit int, effects store.DeliveryEffectsBuilder[[]domain.User]) ([]domain.User, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
 	}
@@ -1216,12 +1242,39 @@ premium_updated_at=to_timestamp($3),updated_at=now() WHERE id=$1`,
 				users = append(users, user)
 			}
 		}
+		if effects != nil && len(users) != 0 {
+			intents, err := effects(users)
+			if err != nil {
+				return fmt.Errorf("build premium expiry delivery: %w", err)
+			}
+			if err := store.ValidateUserBatchDeliveryEffects(users, intents); err != nil {
+				return err
+			}
+			if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return users, err
 }
 
 func (s *PremiumStore) GrantPremiumEntitlement(ctx context.Context, req domain.PremiumAdminGrantRequest) (
+	domain.PremiumEntitlement, domain.User, error,
+) {
+	return s.grantPremiumEntitlement(ctx, req, nil)
+}
+
+func (s *PremiumStore) GrantPremiumEntitlementWithDelivery(ctx context.Context, req domain.PremiumAdminGrantRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (
+	domain.PremiumEntitlement, domain.User, error,
+) {
+	if effects == nil {
+		return domain.PremiumEntitlement{}, domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.grantPremiumEntitlement(ctx, req, effects)
+}
+
+func (s *PremiumStore) grantPremiumEntitlement(ctx context.Context, req domain.PremiumAdminGrantRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (
 	domain.PremiumEntitlement, domain.User, error,
 ) {
 	req.CommandKey, req.Reason = strings.TrimSpace(req.CommandKey), strings.TrimSpace(req.Reason)
@@ -1283,6 +1336,18 @@ VALUES($1,$2,$3,'admin_grant',$4,$5,jsonb_build_object(
 		if err != nil || !found {
 			return domain.ErrPremiumRecipientInvalid
 		}
+		if effects != nil {
+			intents, err := effects([]domain.User{user})
+			if err != nil {
+				return fmt.Errorf("build premium grant delivery: %w", err)
+			}
+			if err := store.ValidateUserBatchDeliveryEffects([]domain.User{user}, intents); err != nil {
+				return err
+			}
+			if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -1324,6 +1389,21 @@ WHERE source='admin' AND source_user_id=$1 AND command_key=$2`, req.ActorUserID,
 func (s *PremiumStore) RevokePremiumEntitlements(
 	ctx context.Context,
 	req domain.PremiumAdminRevokeRequest,
+) (domain.User, error) {
+	return s.revokePremiumEntitlements(ctx, req, nil)
+}
+
+func (s *PremiumStore) RevokePremiumEntitlementsWithDelivery(ctx context.Context, req domain.PremiumAdminRevokeRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.revokePremiumEntitlements(ctx, req, effects)
+}
+
+func (s *PremiumStore) revokePremiumEntitlements(
+	ctx context.Context,
+	req domain.PremiumAdminRevokeRequest,
+	effects store.DeliveryEffectsBuilder[[]domain.User],
 ) (domain.User, error) {
 	req.CommandKey, req.Reason = strings.TrimSpace(req.CommandKey), strings.TrimSpace(req.Reason)
 	if s == nil || s.db == nil || req.UserID <= 0 || req.ActorUserID <= 0 ||
@@ -1376,6 +1456,18 @@ VALUES($1,$2,NULLIF($3,0),'admin_revoke',$4,$5,jsonb_build_object('revoked_count
 		if err != nil || !found {
 			return domain.ErrPremiumRecipientInvalid
 		}
+		if effects != nil {
+			intents, err := effects([]domain.User{user})
+			if err != nil {
+				return fmt.Errorf("build premium revoke delivery: %w", err)
+			}
+			if err := store.ValidateUserBatchDeliveryEffects([]domain.User{user}, intents); err != nil {
+				return err
+			}
+			if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil && isUniqueViolation(err) {
@@ -1408,6 +1500,21 @@ WHERE actor_user_id=$1 AND action='admin_revoke' AND command_key=$2`,
 }
 
 func (s *PremiumStore) RefundPremiumPayment(ctx context.Context, req domain.PremiumRefundRequest) (
+	domain.PremiumPurchaseResult, error,
+) {
+	return s.refundPremiumPayment(ctx, req, nil)
+}
+
+func (s *PremiumStore) RefundPremiumPaymentWithDelivery(ctx context.Context, req domain.PremiumRefundRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (
+	domain.PremiumPurchaseResult, error,
+) {
+	if effects == nil {
+		return domain.PremiumPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	return s.refundPremiumPayment(ctx, req, effects)
+}
+
+func (s *PremiumStore) refundPremiumPayment(ctx context.Context, req domain.PremiumRefundRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (
 	domain.PremiumPurchaseResult, error,
 ) {
 	req.CommandKey, req.Reason = strings.TrimSpace(req.CommandKey), strings.TrimSpace(req.Reason)
@@ -1499,6 +1606,23 @@ metadata) VALUES($1,$2,$3,$4,'refund',$5,$6,jsonb_build_object(
 				Months: months, DurationDays: durationDays, AmountStars: amount, PlanVersion: planVersion},
 			Entitlement: entitlement, User: user,
 			Balance: domain.StarsBalance{UserID: buyerID, Balance: balance, Granted: granted},
+		}
+		if effects != nil {
+			intents, err := effects(result)
+			if err != nil {
+				return fmt.Errorf("build premium refund delivery: %w", err)
+			}
+			if len(intents) != 2 {
+				return fmt.Errorf("premium refund delivery requires user and stars effects")
+			}
+			for i := range intents {
+				if err := intents[i].Validate(); err != nil || intents[i].Kind != store.DeliveryEffectAbsolute {
+					return fmt.Errorf("premium refund delivery effect %d is invalid: %w", i, err)
+				}
+			}
+			if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

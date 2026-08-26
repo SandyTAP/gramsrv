@@ -40,7 +40,7 @@ func TestForViewerUserIDsUsesActualPairsAndMatchesScalarProjection(t *testing.T)
 		ownerA  = int64(2101)
 		ownerB  = int64(2102)
 	)
-	contacts := memory.NewContactStore()
+	contacts := newTestContactStore()
 	// Seed both requested and cross-viewer rows. A dense matrix would expose the
 	// cross aliases/photos; the sparse request must never ask for those pairs.
 	for _, input := range []struct {
@@ -61,7 +61,7 @@ func TestForViewerUserIDsUsesActualPairsAndMatchesScalarProjection(t *testing.T)
 			t.Fatalf("upsert %d->%d: %v", input.viewer, input.owner, err)
 		}
 		if input.photo != 0 {
-			if _, _, err := contacts.SetPersonalPhoto(ctx, input.viewer, input.owner, input.photo, 100); err != nil {
+			if _, _, err := contacts.SetPersonalPhotoWithDelivery(ctx, input.viewer, input.owner, input.photo, 100, testPersonalPhotoEffects); err != nil {
 				t.Fatalf("personal photo %d->%d: %v", input.viewer, input.owner, err)
 			}
 		}

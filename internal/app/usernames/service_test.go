@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 var (
@@ -71,6 +72,36 @@ func (f *fakeRegistry) ReorderUsernames(_ context.Context, _ domain.Peer, order 
 func (f *fakeRegistry) DeactivateAllUsernames(_ context.Context, peer domain.Peer) (bool, error) {
 	f.clears = append(f.clears, peer)
 	return f.changed, nil
+}
+
+func (f *fakeRegistry) SetUsernameActiveWithDelivery(ctx context.Context, peer domain.Peer, username string, active bool, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if !f.changed {
+		return f.SetUsernameActive(ctx, peer, username, active)
+	}
+	if err := applyFakeUsernameDelivery(peer, effects); err != nil {
+		return false, err
+	}
+	return f.SetUsernameActive(ctx, peer, username, active)
+}
+
+func (f *fakeRegistry) ReorderUsernamesWithDelivery(ctx context.Context, peer domain.Peer, order []string, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if !f.changed {
+		return f.ReorderUsernames(ctx, peer, order)
+	}
+	if err := applyFakeUsernameDelivery(peer, effects); err != nil {
+		return false, err
+	}
+	return f.ReorderUsernames(ctx, peer, order)
+}
+
+func (f *fakeRegistry) DeactivateAllUsernamesWithDelivery(ctx context.Context, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if !f.changed {
+		return f.DeactivateAllUsernames(ctx, peer)
+	}
+	if err := applyFakeUsernameDelivery(peer, effects); err != nil {
+		return false, err
+	}
+	return f.DeactivateAllUsernames(ctx, peer)
 }
 
 // fakeCollectibles records the lifecycle commands and serves stored assets.
@@ -139,6 +170,50 @@ func (f *fakeCollectibles) DeleteCollectibleUsername(_ context.Context, req doma
 	return true, nil
 }
 
+func (f *fakeCollectibles) MintCollectibleUsernameWithDelivery(ctx context.Context, req domain.MintCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if !f.created {
+		return f.MintCollectibleUsername(ctx, req)
+	}
+	if err := applyFakeUsernameDelivery(req.Owner, effects); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	return f.MintCollectibleUsername(ctx, req)
+}
+
+func (f *fakeCollectibles) TransferCollectibleUsernameWithDelivery(ctx context.Context, req domain.TransferCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if !f.changed {
+		return f.TransferCollectibleUsername(ctx, req)
+	}
+	previous := f.assets[strings.ToLower(req.Username)].Owner
+	if err := applyFakeUsernameDeliveryEffects(effects, previous, req.To); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	return f.TransferCollectibleUsername(ctx, req)
+}
+
+func (f *fakeCollectibles) RevokeCollectibleUsernameWithDelivery(ctx context.Context, req domain.RevokeCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if !f.changed {
+		return f.RevokeCollectibleUsername(ctx, req)
+	}
+	previous := f.assets[strings.ToLower(req.Username)].Owner
+	if err := applyFakeUsernameDelivery(previous, effects); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	return f.RevokeCollectibleUsername(ctx, req)
+}
+
+func (f *fakeCollectibles) DeleteCollectibleUsernameWithDelivery(ctx context.Context, req domain.DeleteCollectibleUsernameRequest, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	current, found := f.assets[strings.ToLower(req.Username)]
+	if !found {
+		return false, nil
+	}
+	previous := current.Owner
+	if err := applyFakeUsernameDelivery(previous, effects); err != nil {
+		return false, err
+	}
+	return f.DeleteCollectibleUsername(ctx, req)
+}
+
 func (f *fakeCollectibles) CollectibleUsername(_ context.Context, username string) (domain.CollectibleUsername, error) {
 	asset, ok := f.assets[strings.ToLower(username)]
 	if !ok {
@@ -186,7 +261,50 @@ func newTestService(t *testing.T, registry *fakeRegistry, collectibles *fakeColl
 		WithNotifier(notifier),
 		WithClock(func() time.Time { return testClock }),
 	}
-	return NewService(append(base, opts...)...), notifier
+	service := NewService(append(base, opts...)...)
+	service.SetUserAudienceDelivery(fakeUsernameDeliveryEffects)
+	return service, notifier
+}
+
+func applyFakeUsernameDelivery(peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot]) error {
+	return applyFakeUsernameDeliveryEffects(effects, peer)
+}
+
+func applyFakeUsernameDeliveryEffects(effects store.DeliveryEffectsBuilder[store.UsernameAudienceDeliverySnapshot], peers ...domain.Peer) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	snapshot := store.UsernameAudienceDeliverySnapshot{}
+	seen := make(map[int64]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[peer.ID]; duplicate {
+			continue
+		}
+		seen[peer.ID] = struct{}{}
+		snapshot.Users = append(snapshot.Users, store.UserAudienceDeliverySnapshot{
+			User: domain.User{ID: peer.ID}, Audience: []int64{peer.ID},
+		})
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return err
+	}
+	return store.ValidateUsernameAudienceDeliveryEffects(snapshot, intents)
+}
+
+func fakeUsernameDeliveryEffects(snapshot store.UsernameAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	effects := make([]store.DeliveryEffect, 0)
+	for _, user := range snapshot.Users {
+		for _, viewerID := range user.Audience {
+			effects = append(effects, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: viewerID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+	}
+	return effects, nil
 }
 
 func TestPeerUsernamesProjectsStoredOrder(t *testing.T) {
@@ -260,8 +378,8 @@ func TestToggleUsernameNormalizesBeforeStore(t *testing.T) {
 	if len(registry.toggles) != 1 || registry.toggles[0].username != "Nft_One" || !registry.toggles[0].active {
 		t.Fatalf("store toggles = %#v, want normalized Nft_One", registry.toggles)
 	}
-	if len(notifier.peers) != 1 || notifier.peers[0] != testUser {
-		t.Fatalf("notified peers = %#v, want the toggled peer", notifier.peers)
+	if len(notifier.peers) != 0 {
+		t.Fatalf("user mutation used post-commit notifier: %#v", notifier.peers)
 	}
 }
 
@@ -328,8 +446,8 @@ func TestReorderUsernamesNormalizesPermutation(t *testing.T) {
 	if len(registry.orders) != 1 || strings.Join(registry.orders[0], ",") != "zeta,alpha,editable" {
 		t.Fatalf("store order = %#v, want normalized zeta,alpha,editable", registry.orders)
 	}
-	if len(notifier.peers) != 1 {
-		t.Fatalf("notified peers = %#v, want one", notifier.peers)
+	if len(notifier.peers) != 0 {
+		t.Fatalf("user mutation used post-commit notifier: %#v", notifier.peers)
 	}
 }
 
@@ -531,8 +649,8 @@ func TestMintNotifiesOwnerOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Mint assigned: %v", err)
 	}
-	if len(notifier.peers) != 1 || notifier.peers[0] != testUser {
-		t.Fatalf("notified peers = %#v, want the assigned owner", notifier.peers)
+	if len(notifier.peers) != 0 {
+		t.Fatalf("assigned user used post-commit notifier: %#v", notifier.peers)
 	}
 }
 
@@ -552,12 +670,8 @@ func TestTransferNotifiesPreviousAndNewOwner(t *testing.T) {
 	if len(collectibles.transfers) != 1 || collectibles.transfers[0].Username != "Alpha" {
 		t.Fatalf("stored transfer = %#v, want normalized username", collectibles.transfers)
 	}
-	if len(notifier.peers) != 2 {
-		t.Fatalf("notified peers = %#v, want previous and new owner", notifier.peers)
-	}
-	seen := map[domain.Peer]bool{notifier.peers[0]: true, notifier.peers[1]: true}
-	if !seen[testUser] || !seen[testChannel] {
-		t.Fatalf("notified peers = %#v, want %v and %v", notifier.peers, testUser, testChannel)
+	if len(notifier.peers) != 1 || notifier.peers[0] != testChannel {
+		t.Fatalf("notified peers = %#v, want only channel %v", notifier.peers, testChannel)
 	}
 }
 
@@ -577,8 +691,8 @@ func TestRevokeNotifiesPreviousOwner(t *testing.T) {
 	if asset.Status != domain.CollectibleUsernameStatusBurned {
 		t.Fatalf("asset status = %q, want burned", asset.Status)
 	}
-	if len(notifier.peers) != 1 || notifier.peers[0] != testUser {
-		t.Fatalf("notified peers = %#v, want the previous owner", notifier.peers)
+	if len(notifier.peers) != 0 {
+		t.Fatalf("revoked user used post-commit notifier: %#v", notifier.peers)
 	}
 }
 
@@ -668,7 +782,7 @@ func TestNilServiceIsSafe(t *testing.T) {
 
 func TestNotifierFailureDoesNotFailTheMutation(t *testing.T) {
 	registry := newFakeRegistry()
-	registry.lists[testUser] = []domain.Username{
+	registry.lists[testChannel] = []domain.Username{
 		{Username: "editable", Active: true, Editable: true},
 		{Username: "alpha", Active: true, CollectibleID: 1},
 	}
@@ -678,16 +792,16 @@ func TestNotifierFailureDoesNotFailTheMutation(t *testing.T) {
 		WithCollectibleStore(newFakeCollectibles()),
 		WithNotifier(notifier),
 	)
+	service.SetUserAudienceDelivery(fakeUsernameDeliveryEffects)
 
-	changed, err := service.ToggleUsername(context.Background(), testUser, "alpha", false)
+	changed, err := service.ToggleUsername(context.Background(), testChannel, "alpha", false)
 	if err != nil || !changed {
 		t.Fatalf("ToggleUsername = %v, %v; committed mutation must survive a failed push", changed, err)
 	}
 }
 
-// TestServiceDeleteNotifiesPreviousOwner covers the hard delete: the request is
-// normalised and validated before the store is touched, and the peer that held
-// the asset is invalidated so its projection stops advertising the username.
+// TestServiceDeleteNotifiesPreviousOwner covers the hard delete: user delivery
+// is committed as an aggregate effect and never uses the post-commit channel hook.
 func TestServiceDeleteNotifiesPreviousOwner(t *testing.T) {
 	ctx := context.Background()
 	registry := newFakeRegistry()
@@ -707,8 +821,8 @@ func TestServiceDeleteNotifiesPreviousOwner(t *testing.T) {
 	if len(collectibles.deletes) != 1 || collectibles.deletes[0].Username != "Gone" {
 		t.Fatalf("store received %+v, want the normalised name", collectibles.deletes)
 	}
-	if len(notifier.peers) != 1 || notifier.peers[0] != holder {
-		t.Fatalf("notified peers = %#v, want the previous owner %+v", notifier.peers, holder)
+	if len(notifier.peers) != 0 {
+		t.Fatalf("deleted user owner used post-commit notifier: %#v", notifier.peers)
 	}
 
 	// An invalid name never reaches the store.

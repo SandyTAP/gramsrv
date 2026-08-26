@@ -236,7 +236,7 @@ func (r *Router) mutateTodoMedia(ctx context.Context, inputPeer tg.InputPeerClas
 			return nil, channelEditErr(err)
 		}
 		updates := r.channelEditMessageUpdates(ctx, userID, res)
-		if err := r.enqueueChannelEditMessageFanout(ctx, userID, res); err != nil {
+		if err := r.enqueueBotAPIChannelEditMessageUpdate(ctx, userID, res); err != nil {
 			return nil, internalErr()
 		}
 		return updates, nil

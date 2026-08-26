@@ -340,11 +340,12 @@ func TestSignInDifferentUserDoesNotClearFreshlyBoundUpdateState(t *testing.T) {
 	updates := &captureUpdates{}
 	sessions := &captureSessions{authKeyID: authKeyID, authKeyResolved: true, userID: 1000000001, userResolved: true}
 	r := New(Config{}, Deps{
-		Auth:     auth,
-		Updates:  updates,
-		Sessions: sessions,
+		Auth:           auth,
+		Updates:        updates,
+		Sessions:       sessions,
+		DeliveryOutbox: memory.NewDeliveryOutboxStore(),
 	}, zaptest.NewLogger(t), clock.System)
-	ctx := WithUserID(WithAuthKeyID(WithSessionID(context.Background(), 77), authKeyID), 1000000001)
+	ctx := WithUserID(WithRawAuthKeyID(WithAuthKeyID(WithSessionID(context.Background(), 77), authKeyID), authKeyID), 1000000001)
 
 	_, err := r.onAuthSignIn(ctx, &tg.AuthSignInRequest{PhoneNumber: "15550000002", PhoneCodeHash: "hash", PhoneCode: "12345"})
 	if err != nil {

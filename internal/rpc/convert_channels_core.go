@@ -515,7 +515,7 @@ func tgChannel(viewerUserID int64, ch domain.Channel, self *domain.ChannelMember
 	}
 	out.SetDefaultBannedRights(tgDefaultChatBannedRights(ch.DefaultBannedRights))
 	// 群通话 banner 数据源：call_active/call_not_empty flag（Android 对 flag 依赖
-	// 更重，call_not_empty 翻转时还会经 pushChannelStateToMembers 补推）。
+	// 更重，call_not_empty 翻转时还会发出 transient channel-state invalidation）。
 	out.CallActive = ch.ActiveCallID != 0
 	out.CallNotEmpty = ch.ActiveCallNotEmpty
 	if ch.Monoforum {

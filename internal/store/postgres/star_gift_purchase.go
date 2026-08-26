@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -95,11 +96,11 @@ charge_stars,issued_at,expires_at FROM star_gift_purchase_forms WHERE buyer_user
 	return nil
 }
 
-func (s *StarGiftLifecycleStore) PurchaseStarGift(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error) {
+func (s *StarGiftLifecycleStore) PurchaseStarGiftWithDelivery(ctx context.Context, req domain.StarGiftPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error) {
 	req.CommandKey = strings.TrimSpace(req.CommandKey)
 	if s == nil || s.db == nil || req.BuyerUserID <= 0 || !validLifecyclePeer(req.To) || req.GiftID <= 0 ||
 		req.FormID == 0 || req.CommandKey == "" || len(req.CommandKey) > 256 || req.Date <= 0 ||
-		!(domain.PremiumGiftMessage{Text: req.Message, Entities: req.MessageEntities}).Valid() {
+		effects == nil || !(domain.PremiumGiftMessage{Text: req.Message, Entities: req.MessageEntities}).Valid() {
 		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftInvalid
 	}
 	if replay, found, err := s.loadStarGiftPurchaseReplay(ctx, req, domain.SendPrivateTextResult{}); err != nil || found {
@@ -109,7 +110,7 @@ func (s *StarGiftLifecycleStore) PurchaseStarGift(ctx context.Context, req domai
 		return domain.StarGiftPurchaseResult{}, err
 	}
 	if req.To.Type == domain.PeerTypeChannel {
-		return s.purchaseStarGiftToChannel(ctx, req)
+		return s.purchaseStarGiftToChannel(ctx, req, effects)
 	}
 	if s.messages == nil {
 		return domain.StarGiftPurchaseResult{}, domain.ErrStarGiftUnavailable
@@ -155,7 +156,11 @@ func (s *StarGiftLifecycleStore) PurchaseStarGift(ctx context.Context, req domai
 				return err
 			}
 			result.Saved.ID = id
-			return s.insertStarGiftPurchaseCommand(ctx, tx, req, result.Saved.ID, result.Gift.Stars+result.Saved.PrepaidUpgradeStars, result.Balance.Balance)
+			if err := s.insertStarGiftPurchaseCommand(ctx, tx, req, result.Saved.ID, result.Gift.Stars+result.Saved.PrepaidUpgradeStars, result.Balance.Balance); err != nil {
+				return err
+			}
+			result.Send = sent
+			return applyStarGiftPurchaseDeliveryEffectsTx(ctx, tx, result, effects)
 		},
 	}
 	sent, err := s.messages.sendPrivateTextWithHooks(ctx, messageReq, hooks)
@@ -175,7 +180,7 @@ func (s *StarGiftLifecycleStore) PurchaseStarGift(ctx context.Context, req domai
 	return result, nil
 }
 
-func (s *StarGiftLifecycleStore) purchaseStarGiftToChannel(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error) {
+func (s *StarGiftLifecycleStore) purchaseStarGiftToChannel(ctx context.Context, req domain.StarGiftPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error) {
 	var result domain.StarGiftPurchaseResult
 	err := withTx(ctx, s.db, "purchase star gift for channel", func(tx pgx.Tx) error {
 		if err := validateStarGiftPurchaseForm(ctx, tx, req, true); err != nil {
@@ -209,7 +214,7 @@ func (s *StarGiftLifecycleStore) purchaseStarGiftToChannel(ctx context.Context, 
 			return err
 		}
 		result = domain.StarGiftPurchaseResult{Gift: gift, Saved: saved, Balance: balance}
-		return nil
+		return applyStarGiftPurchaseDeliveryEffectsTx(ctx, tx, result, effects)
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -223,6 +228,20 @@ func (s *StarGiftLifecycleStore) purchaseStarGiftToChannel(ctx context.Context, 
 	// immediate delivery failure leaves a durable job for the lifecycle sweeper.
 	_, _ = s.dispatchChannelStarGiftNotifications(ctx, req.Date, maxChannelStarGiftNotificationRecipients, result.Saved.ID)
 	return result, nil
+}
+
+func applyStarGiftPurchaseDeliveryEffectsTx(ctx context.Context, tx pgx.Tx, result domain.StarGiftPurchaseResult, build store.DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) error {
+	intents, err := build(result)
+	if err != nil {
+		return fmt.Errorf("build star gift purchase delivery: %w", err)
+	}
+	if err := store.ValidateStarGiftPurchaseDeliveryEffects(result, intents); err != nil {
+		return err
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return fmt.Errorf("apply star gift purchase delivery: %w", err)
+	}
+	return nil
 }
 
 func (s *StarGiftLifecycleStore) prepareStarGiftPurchase(ctx context.Context, tx pgx.Tx, req domain.StarGiftPurchaseRequest) (domain.StarGift, domain.SavedStarGift, domain.StarsBalance, error) {

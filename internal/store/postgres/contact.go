@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -478,14 +479,20 @@ upserted AS (
     note_entities = EXCLUDED.note_entities,
     mutual = contacts.mutual OR EXCLUDED.mutual,
     updated_at = now()
-  RETURNING *
+  WHERE contacts.contact_phone IS DISTINCT FROM EXCLUDED.contact_phone
+     OR contacts.contact_first_name IS DISTINCT FROM EXCLUDED.contact_first_name
+     OR contacts.contact_last_name IS DISTINCT FROM EXCLUDED.contact_last_name
+     OR contacts.note IS DISTINCT FROM EXCLUDED.note
+     OR contacts.note_entities IS DISTINCT FROM EXCLUDED.note_entities
+     OR contacts.mutual IS DISTINCT FROM (contacts.mutual OR EXCLUDED.mutual)
+  RETURNING contact_user_id
 ),
 reverse_updated AS (
   UPDATE contacts c
   SET mutual = true,
       updated_at = now()
-  FROM upserted u
-  WHERE c.user_id = u.contact_user_id
+  FROM input i
+  WHERE c.user_id = i.contact_user_id
     AND c.contact_user_id = $1::bigint
     AND NOT c.mutual
   RETURNING c.user_id
@@ -514,14 +521,33 @@ SELECT
   u.emoji_status_collectible_id,
   u.emoji_status_collectible,
   u.last_seen_at,
+  EXISTS (SELECT 1 FROM upserted up WHERE up.contact_user_id = c.contact_user_id)::boolean AS owner_changed,
   EXISTS (SELECT 1 FROM reverse_updated ru WHERE ru.user_id = c.contact_user_id)::boolean AS reverse_mutual_changed
-FROM upserted c
+FROM input i
+JOIN contacts c ON c.user_id = i.user_id AND c.contact_user_id = i.contact_user_id
 JOIN users u ON u.id = c.contact_user_id
-JOIN input i ON i.contact_user_id = c.contact_user_id
 ORDER BY i.ord
 `
 
 func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []domain.ContactInput) ([]domain.Contact, error) {
+	rows, err := s.upsertManyWithChanges(ctx, userID, inputs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.Contact, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.Contact)
+	}
+	return out, nil
+}
+
+type contactUpsertMutationRow struct {
+	Contact              domain.Contact
+	OwnerChanged         bool
+	ReverseMutualChanged bool
+}
+
+func (s *ContactStore) upsertManyWithChanges(ctx context.Context, userID int64, inputs []domain.ContactInput) ([]contactUpsertMutationRow, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
@@ -554,7 +580,7 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 		return nil, fmt.Errorf("upsert contacts many: %w", err)
 	}
 	defer rows.Close()
-	out := make([]domain.Contact, 0, len(contactUserIDs))
+	out := make([]contactUpsertMutationRow, 0, len(contactUserIDs))
 	for rows.Next() {
 		var (
 			contactUserID        int64
@@ -580,6 +606,7 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 			emojiCollectibleID   *int64
 			emojiCollectibleJSON []byte
 			lastSeenAt           int64
+			ownerChanged         bool
 			reverseMutualChanged bool
 		)
 		if err := rows.Scan(
@@ -606,16 +633,19 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 			&emojiCollectibleID,
 			&emojiCollectibleJSON,
 			&lastSeenAt,
+			&ownerChanged,
 			&reverseMutualChanged,
 		); err != nil {
 			return nil, fmt.Errorf("scan upsert contacts many: %w", err)
 		}
-		_ = reverseMutualChanged
 		entities, err := decodeMessageEntities(noteEntitiesJSON)
 		if err != nil {
 			return nil, fmt.Errorf("decode contact note entities: %w", err)
 		}
-		out = append(out, contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, false, 0, int(premiumUntil), emojiStatusDocID, int(emojiStatusUntil), emojiCollectibleID, emojiCollectibleJSON, int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual, closeFriend))
+		out = append(out, contactUpsertMutationRow{
+			Contact:      contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, false, 0, int(premiumUntil), emojiStatusDocID, int(emojiStatusUntil), emojiCollectibleID, emojiCollectibleJSON, int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual, closeFriend),
+			OwnerChanged: ownerChanged, ReverseMutualChanged: reverseMutualChanged,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate upsert contacts many: %w", err)
@@ -711,23 +741,50 @@ func closeFriendsEditDiff(before, after map[int64]struct{}) domain.CloseFriendsE
 	return result
 }
 
-func (s *ContactStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
-	tag, err := s.db.Exec(ctx, `
+func (s *ContactStore) SetPersonalPhotoWithDelivery(ctx context.Context, viewerUserID, contactUserID, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
+	if viewerUserID <= 0 || contactUserID <= 0 || effects == nil {
+		return domain.Contact{}, false, store.ErrDeliveryOutboxRequired
+	}
+	var contact domain.Contact
+	var found bool
+	err := withTx(ctx, s.db, "set contact personal photo with delivery", func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 UPDATE contacts
 SET personal_photo_id = $3,
     personal_photo_date = CASE WHEN $3::bigint = 0 THEN 0 ELSE $4::int END,
     updated_at = now()
 WHERE user_id = $1
-  AND contact_user_id = $2
-`, userID, contactUserID, photoID, date)
+  AND contact_user_id = $2`, viewerUserID, contactUserID, photoID, date)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		contact, found, err = NewContactStore(tx).Get(ctx, viewerUserID, contactUserID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("contact overlay disappeared after locked update")
+		}
+		snapshot := store.ContactPersonalPhotoDeliverySnapshot{
+			ViewerUserID: viewerUserID, ContactUserID: contactUserID,
+			Contact: contact, PhotoID: photoID,
+		}
+		intents, err := effects(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := store.ValidateContactPersonalPhotoDeliveryEffects(snapshot, intents); err != nil {
+			return err
+		}
+		return applyAbsoluteDeliveryEffectsTx(ctx, tx, intents)
+	})
 	if err != nil {
-		return domain.Contact{}, false, fmt.Errorf("set contact personal photo: %w", err)
+		return domain.Contact{}, false, fmt.Errorf("set contact personal photo with delivery: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return domain.Contact{}, false, nil
-	}
-	contact, found, err := s.Get(ctx, userID, contactUserID)
-	return contact, found, err
+	return contact, found, nil
 }
 
 func (s *ContactStore) PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error) {

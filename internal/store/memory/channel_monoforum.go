@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -32,8 +33,24 @@ func (s *ChannelStore) SendMonoforumMessage(_ context.Context, req domain.SendMo
 		}
 		req.IdempotencyFingerprint = fingerprint
 	}
+	var aggregateDialogs *DialogStore
+	var aggregateEvents *UpdateEventStore
+	if req.ClearDraft {
+		s.dialogAggregateMu.RLock()
+		aggregateDialogs, aggregateEvents = s.dialogAggregate, s.accountEvents
+		s.dialogAggregateMu.RUnlock()
+		if aggregateDialogs == nil || aggregateEvents == nil {
+			return domain.SendChannelMessageResult{}, store.ErrDeliveryOutboxRequired
+		}
+		aggregateDialogs.mu.Lock()
+		defer aggregateDialogs.mu.Unlock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if req.ClearDraft {
+		aggregateEvents.mu.Lock()
+		defer aggregateEvents.mu.Unlock()
+	}
 	if req.RandomID != 0 {
 		if replay, found, replayErr := s.lookupChannelSendReplayLocked(domain.ChannelSendReplayRequest{
 			ChannelID:              req.MonoforumID,
@@ -101,6 +118,27 @@ func (s *ChannelStore) SendMonoforumMessage(_ context.Context, req domain.SendMo
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
+	var draftSnapshot store.DialogAccountMutationSnapshot
+	var draftEffects []store.DeliveryEffect
+	if req.ClearDraft {
+		topMessageID := 0
+		if req.ReplyTo != nil && req.ReplyTo.TopMessageID > 0 {
+			topMessageID = req.ReplyTo.TopMessageID
+		}
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.SenderUserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: req.MonoforumID}, TopMessageID: topMessageID,
+		}
+		_, changed := aggregateDialogs.drafts[mutation.UserID][draftKey(mutation.Peer, mutation.TopMessageID)]
+		draftSnapshot = store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		draftEffects, err = sendDraftClearEffects(draftSnapshot)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(draftSnapshot, draftEffects); err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("validate memory monoforum-send draft effects: %w", err)
+		}
+	}
 	pts := s.nextChannelPtsLocked(req.MonoforumID)
 	msgID := s.nextChannelMessageIDLocked(req.MonoforumID)
 	msg := domain.ChannelMessage{
@@ -162,7 +200,13 @@ func (s *ChannelStore) SendMonoforumMessage(_ context.Context, req domain.SendMo
 			recipients = append(recipients, userID)
 		}
 	}
-	return domain.SendChannelMessageResult{Channel: cloneChannel(channel), Message: cloneChannelMessage(msg), Event: cloneChannelEvent(event), Recipients: uniqueNonZero(recipients, 0), SenderStarsBalance: senderBalance}, nil
+	var draftEvent domain.UpdateEvent
+	if len(draftEffects) == 1 {
+		delete(aggregateDialogs.drafts[req.SenderUserID], draftKey(draftSnapshot.Mutation.Peer, draftSnapshot.Mutation.TopMessageID))
+		draftEvent = aggregateEvents.appendLocked(req.SenderUserID, draftEffects[0].Event, true)
+		aggregateEvents.dispatches[req.SenderUserID] = append(aggregateEvents.dispatches[req.SenderUserID], memoryUpdateDispatch{Pts: draftEvent.Pts})
+	}
+	return domain.SendChannelMessageResult{Channel: cloneChannel(channel), Message: cloneChannelMessage(msg), Event: cloneChannelEvent(event), Recipients: uniqueNonZero(recipients, 0), SenderStarsBalance: senderBalance, DraftEvent: draftEvent}, nil
 }
 
 // findMonoforumDuplicateLocked 按 (sender, saved_peer, random_id) 查 monoforum 子会话内的重发消息。

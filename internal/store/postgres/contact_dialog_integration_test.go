@@ -7,7 +7,21 @@ import (
 
 	contactsapp "telesrv/internal/app/contacts"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
+
+func postgresContactMutationEffects(snapshot store.ContactMutationSnapshot) ([]store.DeliveryEffect, error) {
+	out := make([]store.DeliveryEffect, 0, len(snapshot.RequiredEvents)+1)
+	for _, required := range snapshot.RequiredEvents {
+		out = append(out, store.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, [8]byte{}, 0))
+	}
+	if snapshot.PhonePrivacyChanged {
+		out = append(out, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.OwnerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		}))
+	}
+	return out, nil
+}
 
 func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 	pool := testPool(t)
@@ -24,22 +38,22 @@ func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 
 	contactStore := NewContactStore(pool)
 	contacts := contactsapp.NewService(contactStore, users)
-	if _, err := contacts.AddContact(ctx, owner.ID, domain.ContactInput{
+	if _, err := contacts.AddContactWithDelivery(ctx, owner.ID, domain.ContactInput{
 		ContactUserID: friend.ID,
 		Phone:         "10001",
 		FirstName:     "OwnerRemark",
 		LastName:      "A",
 		Note:          "first note",
-	}); err != nil {
+	}, 1700000000, postgresContactMutationEffects); err != nil {
 		t.Fatalf("owner add contact: %v", err)
 	}
-	if _, err := contacts.AddContact(ctx, altOwner.ID, domain.ContactInput{
+	if _, err := contacts.AddContactWithDelivery(ctx, altOwner.ID, domain.ContactInput{
 		ContactUserID: friend.ID,
 		Phone:         "20002",
 		FirstName:     "AltRemark",
 		LastName:      "B",
 		Note:          "alt note",
-	}); err != nil {
+	}, 1700000000, postgresContactMutationEffects); err != nil {
 		t.Fatalf("alt owner add contact: %v", err)
 	}
 
@@ -62,9 +76,9 @@ func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 	}
 
 	beforeHash := ownerList.Hash
-	updated, err := contacts.UpdateContactNote(ctx, owner.ID, friend.ID, "fresh note", []domain.MessageEntity{
+	updated, err := contacts.UpdateContactNoteWithDelivery(ctx, owner.ID, friend.ID, "fresh note", []domain.MessageEntity{
 		{Type: domain.MessageEntityBold, Offset: 0, Length: 5},
-	})
+	}, 1700000001, postgresContactMutationEffects)
 	if err != nil {
 		t.Fatalf("update contact note: %v", err)
 	}
@@ -132,10 +146,10 @@ func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 		t.Fatalf("owner contact after clear = %+v, want false", ownerList.Contacts[0])
 	}
 
-	if _, err := contacts.AddContact(ctx, friend.ID, domain.ContactInput{
+	if _, err := contacts.AddContactWithDelivery(ctx, friend.ID, domain.ContactInput{
 		ContactUserID: owner.ID,
 		FirstName:     "OwnerBack",
-	}); err != nil {
+	}, 1700000002, postgresContactMutationEffects); err != nil {
 		t.Fatalf("friend reciprocal add: %v", err)
 	}
 	ownerContact, found, err := contactStore.Get(ctx, owner.ID, friend.ID)
@@ -153,7 +167,7 @@ func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 		t.Fatalf("friend contact = %+v found=%v, want mutual after reciprocal add", friendContact, found)
 	}
 
-	deleted, err := contacts.DeleteContacts(ctx, owner.ID, []int64{friend.ID})
+	deleted, err := contacts.DeleteContactsWithDelivery(ctx, owner.ID, []int64{friend.ID}, 1700000003, postgresContactMutationEffects)
 	if err != nil {
 		t.Fatalf("delete owner contact: %v", err)
 	}
@@ -187,14 +201,14 @@ func TestDialogUserViewUsesContactProfileAndDialogFlags(t *testing.T) {
 	})
 
 	contacts := contactsapp.NewService(NewContactStore(pool), users)
-	if _, err := contacts.AddContact(ctx, ownerA.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "RemarkA"}); err != nil {
+	if _, err := contacts.AddContactWithDelivery(ctx, ownerA.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "RemarkA"}, 1700000000, postgresContactMutationEffects); err != nil {
 		t.Fatalf("owner A add contact: %v", err)
 	}
-	if _, err := contacts.AddContact(ctx, ownerB.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "RemarkB"}); err != nil {
+	if _, err := contacts.AddContactWithDelivery(ctx, ownerB.ID, domain.ContactInput{ContactUserID: friend.ID, FirstName: "RemarkB"}, 1700000000, postgresContactMutationEffects); err != nil {
 		t.Fatalf("owner B add contact: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    friend.ID,
 		RecipientUserID: ownerA.ID,
@@ -309,7 +323,7 @@ func TestDialogStoreMarkReadClampsAndRecomputesUnread(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent := make([]domain.SendPrivateTextResult, 0, 3)
 	for i, body := range []string{"one", "two", "three"} {
 		got, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{

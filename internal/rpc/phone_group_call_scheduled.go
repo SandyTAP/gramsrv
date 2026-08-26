@@ -67,13 +67,11 @@ func (r *Router) onPhoneStartScheduledGroupCall(ctx context.Context, in tg.Input
 	} else {
 		r.log.Warn("scheduled group call started service message", zap.Int64("channel_id", channel.ID), zap.Error(err))
 	}
-	// 扇出：updateGroupCall（schedule_date 已清，客户端据此自动入会）+ 服务消息。
-	// 订阅者与普通在线成员走同一在线扇出；离线订阅者的推送提醒（push notification）
+	// Core 仅瞬时推送 updateGroupCall（schedule_date 已清，客户端据此自动入会）；
+	// service event 只由 durable channel lane 投递，并保留在当前 RPC response。
+	// 订阅者与普通在线成员走同一瞬时信令路径；离线订阅者的推送提醒（push notification）
 	// 属通知系统范围，当前不实现（记矩阵 todo）。
 	r.pushGroupCallUpdate(ctx, channel, call)
-	if serviceRes.Event.Pts != 0 {
-		r.pushGroupCallServiceMessage(ctx, scope.userID, serviceRes)
-	}
 	out := r.groupCallUpdateContainer(ctx, scope.userID, channel,
 		groupCallUpdateFor(channel, call, scope.userID, true, r.cfg.PublicBaseURL), nil)
 	if serviceRes.Event.Pts != 0 {
@@ -106,7 +104,7 @@ func (r *Router) onPhoneToggleGroupCallStartSubscription(ctx context.Context, re
 	call.ScheduleStartSubscribed = req.Subscribed
 	// 订阅是 per-viewer 私有状态：响应给本设备，推送同步本人其它在线设备即可。
 	update := groupCallUpdateFor(scope.channel, call, scope.userID, scope.canManage(), r.cfg.PublicBaseURL)
-	r.pushUserMessage(ctx, scope.userID, "schedule subscription update",
+	r.pushUserMessageTransient(ctx, scope.userID, "schedule subscription update",
 		r.groupCallUpdateContainer(ctx, scope.userID, scope.channel, update, nil))
 	return r.groupCallUpdateContainer(ctx, scope.userID, scope.channel, update, nil), nil
 }

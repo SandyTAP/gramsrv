@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 
 	"telesrv/internal/domain"
 )
@@ -21,6 +22,21 @@ type StarsStore interface {
 	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string) (domain.StarsBalance, error)
 	// ListTransactions 按方向与顺序做 keyset 分页，返回一页流水 + 当前余额。
 	ListTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error)
+	// Client-visible ledger mutations use these mandatory aggregate methods so
+	// the balance, transaction row and absolute delivery fact commit together.
+	CreditWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error)
+	DebitWithDelivery(ctx context.Context, userID, amount, startingGrant int64, reason domain.StarsTransactionReason, peer domain.Peer, date int, title, desc string, effects DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error)
+}
+
+func ValidateStarsBalanceDeliveryEffects(userID int64, effects []DeliveryEffect) error {
+	if userID <= 0 || len(effects) != 1 {
+		return fmt.Errorf("stars balance delivery requires exactly one target effect")
+	}
+	effect := effects[0]
+	if effect.Kind != DeliveryEffectAbsolute || effect.TargetUserID != userID {
+		return fmt.Errorf("stars balance delivery target does not match ledger owner")
+	}
+	return effect.Validate()
 }
 
 // StarsPurchaseStore owns fiat self-topup, friend-gift and giveaway-launch
@@ -28,11 +44,19 @@ type StarsStore interface {
 // atomically; exact form retries return the original receipt.
 type StarsPurchaseStore interface {
 	IssueStarsPurchaseForm(context.Context, domain.StarsPurchaseForm) (domain.StarsPurchaseForm, error)
-	PurchaseStars(context.Context, domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error)
+	PurchaseStarsWithDelivery(context.Context, domain.StarsPurchaseRequest, DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error)
+	GetStarsGiveawayInfo(context.Context, int64, int64, int, int) (domain.StarsGiveawayInfo, error)
 }
 
-// StarsGiveawayStore exposes the viewer-specific state of launch cards without
-// forcing lightweight purchase-store fakes to implement the read model.
-type StarsGiveawayStore interface {
-	GetStarsGiveawayInfo(context.Context, int64, int64, int, int) (domain.StarsGiveawayInfo, error)
+// ValidateStarsPurchaseDeliveryEffects enforces the exact non-PTS balance
+// owner affected by a checkout. Giveaways do not mutate a user ledger and
+// therefore must not manufacture a balance delivery.
+func ValidateStarsPurchaseDeliveryEffects(result domain.StarsPurchaseResult, effects []DeliveryEffect) error {
+	if result.Balance.UserID == 0 {
+		if len(effects) != 0 {
+			return fmt.Errorf("stars purchase without user ledger mutation requires no delivery effects")
+		}
+		return nil
+	}
+	return ValidateStarsBalanceDeliveryEffects(result.Balance.UserID, effects)
 }

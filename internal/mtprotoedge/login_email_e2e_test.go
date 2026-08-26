@@ -75,6 +75,8 @@ func TestLoginEmailEndToEnd(t *testing.T) {
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	updateEventStore := memory.NewUpdateEventStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	emailSender := &loginEmailTestSender{}
 	accountService := account.NewService(passwordStore,
 		account.WithUsers(userStore),
@@ -92,11 +94,12 @@ func TestLoginEmailEndToEnd(t *testing.T) {
 		}))
 
 	deps := rpc.Deps{
-		Auth:    authService,
-		Account: accountService,
-		Help:    help.NewService(helpStore, helpStore),
-		Users:   users.NewService(userStore),
-		Updates: updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
+		Auth:           authService,
+		Account:        accountService,
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
+		DeliveryOutbox: deliveryOutbox,
 
 		Contacts: contacts.NewService(memory.NewContactStore()),
 		Dialogs:  dialogs.NewService(dialogStore),

@@ -18,38 +18,23 @@ func (r *Router) onChannelsReadMessageContents(ctx context.Context, req *tg.Chan
 	if err != nil {
 		return false, internalErr()
 	}
+	if err := r.requireAccountDelivery(userID, "channels.readMessageContents"); err != nil {
+		return false, err
+	}
 	channelID, err := r.channelIDFromInput(ctx, userID, req.Channel)
 	if err != nil {
 		return false, err
 	}
-	read, err := r.deps.Channels.ReadMessageContents(ctx, userID, domain.ReadChannelMessageContentsRequest{
+	_, err = r.deps.Channels.ReadMessageContents(ctx, userID, domain.ReadChannelMessageContentsRequest{
 		UserID:    userID,
 		ChannelID: channelID,
 		IDs:       req.ID,
-	})
+	}, r.channelMessageContentsDeliveryEffects(ctx, userID, int(r.clock.Now().Unix())))
 	if err != nil {
 		if errors.Is(err, domain.ErrMessageIDInvalid) {
 			return false, messageIDInvalidErr()
 		}
 		return false, channelInvalidErr(err)
-	}
-	if ids := readChannelMessageContentIDs(read.Messages); len(ids) > 0 {
-		r.pushUserUpdates(ctx, userID, &tg.Updates{
-			Updates: []tg.UpdateClass{&tg.UpdateChannelReadMessagesContents{
-				ChannelID: read.Channel.ID,
-				Messages:  ids,
-			}},
-			Users: []tg.UserClass{},
-			Chats: []tg.ChatClass{tgChannelChatMin(userID, read.Channel)},
-			Date:  int(r.clock.Now().Unix()),
-			Seq:   0,
-		})
-	}
-	if len(read.ClearedUnreadReactionMessageIDs) > 0 {
-		r.pushUserUpdates(ctx, userID, r.channelMessagesReactionsUpdates(ctx, userID, domain.ChannelMessageReactionsResult{
-			Channel:  read.Channel,
-			Messages: read.Messages,
-		}, read.ClearedUnreadReactionMessageIDs))
 	}
 	return true, nil
 }
@@ -65,27 +50,26 @@ func (r *Router) onChannelsReadHistory(ctx context.Context, req *tg.ChannelsRead
 	if err != nil {
 		return false, internalErr()
 	}
+	if err := r.requireAccountDelivery(userID, "channels.readHistory"); err != nil {
+		return false, err
+	}
 	channelID, err := r.channelIDFromInput(ctx, userID, req.Channel)
 	if err != nil {
 		return false, err
 	}
+	date := int(r.clock.Now().Unix())
 	read, err := r.deps.Channels.ReadHistory(ctx, userID, domain.ReadChannelHistoryRequest{
 		UserID:    userID,
 		ChannelID: channelID,
 		MaxID:     req.MaxID,
-		Date:      int(r.clock.Now().Unix()),
-	})
+		Date:      date,
+	}, channelReadDeliveryEffects(date))
 	if err != nil {
 		return false, channelInvalidErr(err)
 	}
 	if read.ReadOnly {
 		return true, nil
 	}
-	if _, err := r.recordChannelReadInbox(ctx, userID, read); err != nil {
-		return false, err
-	}
-	r.pushChannelReadOutboxUpdates(ctx, read.ChannelID, read.OutboxUpdates)
-	r.advanceForumGeneralReadAfterChannelRead(ctx, userID, read)
 	return true, nil
 }
 

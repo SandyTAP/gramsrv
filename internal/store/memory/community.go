@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type CommunityStore struct {
@@ -26,17 +27,20 @@ type CommunityStore struct {
 	links       map[int64]map[domain.Peer]domain.CommunityPeerLink
 	requests    map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest
 	states      map[int64]map[int64]domain.CommunityUserState
+	outbox      *DeliveryOutboxStore
 }
 
-func NewCommunityStore(users *UserStore, channels *ChannelStore, bots *BotStore, dialogs *DialogStore) *CommunityStore {
+func NewCommunityStore(users *UserStore, channels *ChannelStore, bots *BotStore, dialogs *DialogStore, outbox *DeliveryOutboxStore) *CommunityStore {
 	return &CommunityStore{
 		users: users, channels: channels, bots: bots, dialogs: dialogs,
 		nextID: 3000000000, nextHash: 990000000000,
 		communities: map[int64]domain.Community{}, members: map[int64]map[int64]domain.CommunityMember{},
 		links: map[int64]map[domain.Peer]domain.CommunityPeerLink{}, requests: map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest{},
-		states: map[int64]map[int64]domain.CommunityUserState{},
+		states: map[int64]map[int64]domain.CommunityUserState{}, outbox: outbox,
 	}
 }
+
+func (s *CommunityStore) DeliveryOutbox() *DeliveryOutboxStore { return s.outbox }
 
 func cloneCommunity(c domain.Community) domain.Community {
 	c.PhotoStripped = append([]byte(nil), c.PhotoStripped...)
@@ -47,6 +51,214 @@ func cloneCommunityView(v domain.CommunityView) domain.CommunityView {
 	v.Links = append([]domain.CommunityPeerLink(nil), v.Links...)
 	v.ServiceMessages = append([]domain.SendChannelMessageResult(nil), v.ServiceMessages...)
 	return v
+}
+
+type memoryCommunityTransactionSnapshot struct {
+	nextID, nextHash int64
+	communities      map[int64]domain.Community
+	members          map[int64]map[int64]domain.CommunityMember
+	links            map[int64]map[domain.Peer]domain.CommunityPeerLink
+	requests         map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest
+	states           map[int64]map[int64]domain.CommunityUserState
+	users            map[int64]domain.User
+	channelNextID    int64
+	channels         map[int64]domain.Channel
+	channelMembers   map[int64]map[int64]domain.ChannelMember
+	channelMessages  map[int64][]domain.ChannelMessage
+	channelEvents    map[int64][]domain.ChannelUpdateEvent
+	channelRetain    map[int64]domain.ChannelUpdateRetentionCheckpoint
+	channelMsgSeq    map[int64]int
+	channelPtsSeq    map[int64]int
+}
+
+func cloneCommunityMembers(in map[int64]map[int64]domain.CommunityMember) map[int64]map[int64]domain.CommunityMember {
+	out := make(map[int64]map[int64]domain.CommunityMember, len(in))
+	for communityID, byUser := range in {
+		cloned := make(map[int64]domain.CommunityMember, len(byUser))
+		for userID, member := range byUser {
+			cloned[userID] = member
+		}
+		out[communityID] = cloned
+	}
+	return out
+}
+
+func cloneCommunityLinks(in map[int64]map[domain.Peer]domain.CommunityPeerLink) map[int64]map[domain.Peer]domain.CommunityPeerLink {
+	out := make(map[int64]map[domain.Peer]domain.CommunityPeerLink, len(in))
+	for communityID, byPeer := range in {
+		cloned := make(map[domain.Peer]domain.CommunityPeerLink, len(byPeer))
+		for peer, link := range byPeer {
+			cloned[peer] = link
+		}
+		out[communityID] = cloned
+	}
+	return out
+}
+
+func cloneCommunityRequests(in map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest) map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest {
+	out := make(map[int64]map[domain.Peer]domain.CommunityPeerLinkRequest, len(in))
+	for communityID, byPeer := range in {
+		cloned := make(map[domain.Peer]domain.CommunityPeerLinkRequest, len(byPeer))
+		for peer, request := range byPeer {
+			cloned[peer] = request
+		}
+		out[communityID] = cloned
+	}
+	return out
+}
+
+func cloneCommunityStates(in map[int64]map[int64]domain.CommunityUserState) map[int64]map[int64]domain.CommunityUserState {
+	out := make(map[int64]map[int64]domain.CommunityUserState, len(in))
+	for communityID, byUser := range in {
+		cloned := make(map[int64]domain.CommunityUserState, len(byUser))
+		for userID, state := range byUser {
+			cloned[userID] = state
+		}
+		out[communityID] = cloned
+	}
+	return out
+}
+
+func cloneMemoryChannelMembers(in map[int64]map[int64]domain.ChannelMember) map[int64]map[int64]domain.ChannelMember {
+	out := make(map[int64]map[int64]domain.ChannelMember, len(in))
+	for channelID, byUser := range in {
+		cloned := make(map[int64]domain.ChannelMember, len(byUser))
+		for userID, member := range byUser {
+			cloned[userID] = member
+		}
+		out[channelID] = cloned
+	}
+	return out
+}
+
+func (s *CommunityStore) transactionSnapshotLocked() memoryCommunityTransactionSnapshot {
+	snapshot := memoryCommunityTransactionSnapshot{
+		nextID: s.nextID, nextHash: s.nextHash,
+		communities: make(map[int64]domain.Community, len(s.communities)),
+		members:     cloneCommunityMembers(s.members), links: cloneCommunityLinks(s.links),
+		requests: cloneCommunityRequests(s.requests), states: cloneCommunityStates(s.states),
+	}
+	for id, community := range s.communities {
+		snapshot.communities[id] = cloneCommunity(community)
+	}
+	if s.users != nil {
+		s.users.mu.RLock()
+		snapshot.users = make(map[int64]domain.User, len(s.users.byID))
+		for id, user := range s.users.byID {
+			snapshot.users[id] = user
+		}
+		s.users.mu.RUnlock()
+	}
+	if s.channels != nil {
+		s.channels.mu.RLock()
+		snapshot.channelNextID = s.channels.nextID
+		snapshot.channels = make(map[int64]domain.Channel, len(s.channels.channels))
+		for id, channel := range s.channels.channels {
+			snapshot.channels[id] = cloneChannel(channel)
+		}
+		snapshot.channelMembers = cloneMemoryChannelMembers(s.channels.members)
+		snapshot.channelMessages = make(map[int64][]domain.ChannelMessage, len(s.channels.messages))
+		for id, messages := range s.channels.messages {
+			cloned := make([]domain.ChannelMessage, len(messages))
+			for i := range messages {
+				cloned[i] = cloneChannelMessage(messages[i])
+			}
+			snapshot.channelMessages[id] = cloned
+		}
+		snapshot.channelEvents = make(map[int64][]domain.ChannelUpdateEvent, len(s.channels.events))
+		for id, events := range s.channels.events {
+			cloned := make([]domain.ChannelUpdateEvent, len(events))
+			for i := range events {
+				cloned[i] = cloneChannelEvent(events[i])
+			}
+			snapshot.channelEvents[id] = cloned
+		}
+		snapshot.channelRetain = make(map[int64]domain.ChannelUpdateRetentionCheckpoint, len(s.channels.retention))
+		for id, checkpoint := range s.channels.retention {
+			snapshot.channelRetain[id] = checkpoint
+		}
+		snapshot.channelMsgSeq = make(map[int64]int, len(s.channels.msgSeq))
+		for id, value := range s.channels.msgSeq {
+			snapshot.channelMsgSeq[id] = value
+		}
+		snapshot.channelPtsSeq = make(map[int64]int, len(s.channels.ptsSeq))
+		for id, value := range s.channels.ptsSeq {
+			snapshot.channelPtsSeq[id] = value
+		}
+		s.channels.mu.RUnlock()
+	}
+	return snapshot
+}
+
+func (s *CommunityStore) restoreTransactionLocked(snapshot memoryCommunityTransactionSnapshot) {
+	s.nextID, s.nextHash = snapshot.nextID, snapshot.nextHash
+	s.communities, s.members, s.links = snapshot.communities, snapshot.members, snapshot.links
+	s.requests, s.states = snapshot.requests, snapshot.states
+	if s.users != nil && snapshot.users != nil {
+		s.users.mu.Lock()
+		s.users.byID = snapshot.users
+		s.users.mu.Unlock()
+	}
+	if s.channels != nil && snapshot.channels != nil {
+		s.channels.mu.Lock()
+		s.channels.nextID = snapshot.channelNextID
+		s.channels.channels, s.channels.members = snapshot.channels, snapshot.channelMembers
+		s.channels.messages, s.channels.events = snapshot.channelMessages, snapshot.channelEvents
+		s.channels.retention = snapshot.channelRetain
+		s.channels.msgSeq, s.channels.ptsSeq = snapshot.channelMsgSeq, snapshot.channelPtsSeq
+		s.channels.mu.Unlock()
+	}
+}
+
+func applyMemoryCommunityDeliveryEffects(ctx context.Context, outbox *DeliveryOutboxStore, snapshot store.CommunityDeliverySnapshot, build store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) error {
+	if build == nil || outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return err
+	}
+	if len(effects) != len(snapshot.Targets) {
+		return errors.New("community delivery effect count does not match target count")
+	}
+	expected := make(map[int64]struct{}, len(snapshot.Targets))
+	for _, target := range snapshot.Targets {
+		expected[target.TargetUserID] = struct{}{}
+	}
+	for _, effect := range effects {
+		if effect.Kind != store.DeliveryEffectAbsolute {
+			return errors.New("community delivery effect must be absolute")
+		}
+		if _, ok := expected[effect.TargetUserID]; !ok {
+			return errors.New("community delivery effect has unexpected target")
+		}
+		delete(expected, effect.TargetUserID)
+	}
+	if len(expected) != 0 {
+		return errors.New("community delivery effect omits target")
+	}
+	_, err = applyDeliveryEffects(ctx, effects, outbox, nil)
+	return err
+}
+
+func withMemoryCommunityDelivery[T any](ctx context.Context, s *CommunityStore, build store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot], mutate func() (T, store.CommunityDeliverySnapshot, error)) (T, error) {
+	var zero T
+	if build == nil || s.outbox == nil {
+		return zero, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rollback := s.transactionSnapshotLocked()
+	result, snapshot, err := mutate()
+	if err != nil {
+		s.restoreTransactionLocked(rollback)
+		return zero, err
+	}
+	if err := applyMemoryCommunityDeliveryEffects(ctx, s.outbox, snapshot, build); err != nil {
+		s.restoreTransactionLocked(rollback)
+		return zero, err
+	}
+	return result, nil
 }
 
 func (s *CommunityStore) communityLocked(id int64) (domain.Community, error) {
@@ -174,6 +386,36 @@ func (s *CommunityStore) viewLocked(userID, id int64) (domain.CommunityView, err
 		return v.Links[i].Peer.ID < v.Links[j].Peer.ID
 	})
 	return v, nil
+}
+
+func (s *CommunityStore) deliverySnapshotLocked(communityID int64, targetUserIDs ...int64) (store.CommunityDeliverySnapshot, error) {
+	seen := make(map[int64]struct{}, len(targetUserIDs))
+	snapshot := store.CommunityDeliverySnapshot{Targets: make([]store.CommunityDeliveryTarget, 0, len(targetUserIDs))}
+	for _, targetUserID := range targetUserIDs {
+		if targetUserID <= 0 {
+			return store.CommunityDeliverySnapshot{}, domain.ErrCommunityInvalid
+		}
+		if _, duplicate := seen[targetUserID]; duplicate {
+			continue
+		}
+		seen[targetUserID] = struct{}{}
+		view, err := s.viewLocked(targetUserID, communityID)
+		if errors.Is(err, domain.ErrCommunityPrivate) {
+			err = nil
+		}
+		if err != nil {
+			return store.CommunityDeliverySnapshot{}, err
+		}
+		snapshot.Targets = append(snapshot.Targets, store.CommunityDeliveryTarget{TargetUserID: targetUserID, View: cloneCommunityView(view)})
+	}
+	return snapshot, nil
+}
+
+func memoryActorCommunityDeliverySnapshot(actorUserID int64, view domain.CommunityView, changed bool) store.CommunityDeliverySnapshot {
+	if !changed {
+		return store.CommunityDeliverySnapshot{}
+	}
+	return store.CommunityDeliverySnapshot{Targets: []store.CommunityDeliveryTarget{{TargetUserID: actorUserID, View: cloneCommunityView(view)}}}
 }
 
 func (s *CommunityStore) GetCommunity(_ context.Context, userID, id int64) (domain.CommunityView, error) {
@@ -372,51 +614,53 @@ func (s *CommunityStore) actorLocked(id, user int64) (domain.Community, domain.C
 	return c, m, nil
 }
 
-func (s *CommunityStore) ToggleCommunityPeerLink(_ context.Context, req domain.CommunityTogglePeerLinkRequest) (domain.CommunityTogglePeerLinkResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, m, e := s.actorLocked(req.CommunityID, req.ActorUserID)
-	if e != nil {
-		return domain.CommunityTogglePeerLinkResult{}, e
-	}
-	if req.Deleted {
-		if !m.CanManageLinkedPeers() {
-			return domain.CommunityTogglePeerLinkResult{}, domain.ErrCommunityAdminRequired
+func (s *CommunityStore) ToggleCommunityPeerLink(ctx context.Context, req domain.CommunityTogglePeerLinkRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error) {
+	return withMemoryCommunityDelivery(ctx, s, effects, func() (domain.CommunityTogglePeerLinkResult, store.CommunityDeliverySnapshot, error) {
+		finish := func(result domain.CommunityTogglePeerLinkResult, targetUserIDs ...int64) (domain.CommunityTogglePeerLinkResult, store.CommunityDeliverySnapshot, error) {
+			snapshot, err := s.deliverySnapshotLocked(req.CommunityID, targetUserIDs...)
+			return result, snapshot, err
 		}
-		if _, ok := s.links[c.ID][req.Peer]; !ok {
-			return domain.CommunityTogglePeerLinkResult{}, domain.ErrCommunityPeerInvalid
-		}
-		if e := s.setPeerLinkLocked(req.Peer, 0); e != nil {
-			return domain.CommunityTogglePeerLinkResult{}, e
-		}
-		serviceMessage, e := s.appendCommunityServiceMessageLocked(req.Peer, req.ActorUserID, req.Date, 0)
+		c, m, e := s.actorLocked(req.CommunityID, req.ActorUserID)
 		if e != nil {
-			_ = s.setPeerLinkLocked(req.Peer, c.ID)
-			return domain.CommunityTogglePeerLinkResult{}, e
+			return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
 		}
-		delete(s.links[c.ID], req.Peer)
-		return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, ServiceMessage: serviceMessage, Removed: true}, nil
-	}
-	if m.CanManageLinkedPeers() {
-		l, e := s.insertLinkLocked(c.ID, req.ActorUserID, req.Peer, req.Visibility, req.Date)
-		if e != nil {
-			return domain.CommunityTogglePeerLinkResult{}, e
+		if req.Deleted {
+			if !m.CanManageLinkedPeers() {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, domain.ErrCommunityAdminRequired
+			}
+			if _, ok := s.links[c.ID][req.Peer]; !ok {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, domain.ErrCommunityPeerInvalid
+			}
+			if e := s.setPeerLinkLocked(req.Peer, 0); e != nil {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
+			}
+			serviceMessage, e := s.appendCommunityServiceMessageLocked(req.Peer, req.ActorUserID, req.Date, 0)
+			if e != nil {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
+			}
+			delete(s.links[c.ID], req.Peer)
+			return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, ServiceMessage: serviceMessage, Removed: true}, req.ActorUserID)
 		}
-		serviceMessage, e := s.appendCommunityServiceMessageLocked(req.Peer, req.ActorUserID, req.Date, c.ID)
-		if e != nil {
-			s.unlinkLocked(c.ID, req.Peer)
-			return domain.CommunityTogglePeerLinkResult{}, e
+		if m.CanManageLinkedPeers() {
+			l, e := s.insertLinkLocked(c.ID, req.ActorUserID, req.Peer, req.Visibility, req.Date)
+			if e != nil {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
+			}
+			serviceMessage, e := s.appendCommunityServiceMessageLocked(req.Peer, req.ActorUserID, req.Date, c.ID)
+			if e != nil {
+				return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
+			}
+			return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, Link: &l, ServiceMessage: serviceMessage}, req.ActorUserID)
 		}
-		return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, Link: &l, ServiceMessage: serviceMessage}, nil
-	}
-	if c.DefaultBannedRights.ManageLinkedPeers {
-		return domain.CommunityTogglePeerLinkResult{}, domain.ErrCommunityAdminRequired
-	}
-	if e := s.validatePeerLocked(req.ActorUserID, req.Peer); e != nil {
-		return domain.CommunityTogglePeerLinkResult{}, e
-	}
-	s.requests[c.ID][req.Peer] = domain.CommunityPeerLinkRequest{CommunityID: c.ID, Peer: req.Peer, RequestedBy: req.ActorUserID, Visibility: req.Visibility, Date: req.Date}
-	return domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, RequestCreated: true}, nil
+		if c.DefaultBannedRights.ManageLinkedPeers {
+			return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, domain.ErrCommunityAdminRequired
+		}
+		if e := s.validatePeerLocked(req.ActorUserID, req.Peer); e != nil {
+			return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, e
+		}
+		s.requests[c.ID][req.Peer] = domain.CommunityPeerLinkRequest{CommunityID: c.ID, Peer: req.Peer, RequestedBy: req.ActorUserID, Visibility: req.Visibility, Date: req.Date}
+		return finish(domain.CommunityTogglePeerLinkResult{Community: c, Peer: req.Peer, RequestCreated: true})
+	})
 }
 
 func (s *CommunityStore) appendCommunityServiceMessageLocked(peer domain.Peer, actorUserID int64, date int, communityID int64) (*domain.SendChannelMessageResult, error) {
@@ -443,24 +687,31 @@ func (s *CommunityStore) appendCommunityServiceMessageLocked(peer domain.Peer, a
 	}, nil
 }
 
-func (s *CommunityStore) SetCommunityCollapsed(_ context.Context, user, id int64, collapsed bool) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	c, _, e := s.actorLocked(id, user)
-	if e != nil {
-		s.mu.Unlock()
-		return domain.CommunityView{}, false, e
+func (s *CommunityStore) SetCommunityCollapsed(ctx context.Context, user, id int64, collapsed bool, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
 	}
-	state := s.states[id][user]
-	changed := state.Collapsed != collapsed
-	state.CommunityID, state.UserID, state.Collapsed = id, user, collapsed
-	if !collapsed {
-		state.Pinned = false
-		state.PinnedOrder = 0
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		c, _, e := s.actorLocked(id, user)
+		if e != nil {
+			return result{}, store.CommunityDeliverySnapshot{}, e
+		}
+		state := s.states[id][user]
+		changed := state.Collapsed != collapsed
+		state.CommunityID, state.UserID, state.Collapsed = id, user, collapsed
+		if !collapsed {
+			state.Pinned = false
+			state.PinnedOrder = 0
+		}
+		s.states[id][user] = state
+		view, e := s.viewLocked(user, c.ID)
+		return result{view: view, changed: changed}, memoryActorCommunityDeliverySnapshot(user, view, changed), e
+	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
 	}
-	s.states[id][user] = state
-	v, e := s.viewLocked(user, c.ID)
-	s.mu.Unlock()
-	return v, changed, e
+	return out.view, out.changed, nil
 }
 
 func encodeMemoryCommunityOffset(n int) string {
@@ -582,73 +833,88 @@ func (s *CommunityStore) decideLocked(actor, id int64, p domain.Peer, reject boo
 	}
 	return domain.CommunityTogglePeerLinkResult{Community: c, Peer: p, RequestedBy: r.RequestedBy, Link: &l, ServiceMessage: serviceMessage}, nil
 }
-func (s *CommunityStore) DecideCommunityPeerLinkRequest(_ context.Context, actor, id int64, p domain.Peer, reject bool, date int) (domain.CommunityTogglePeerLinkResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.decideLocked(actor, id, p, reject, date)
-}
-func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(_ context.Context, actor, id int64, reject bool, date int) ([]domain.CommunityTogglePeerLinkResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, m, e := s.actorLocked(id, actor)
-	if e != nil {
-		return nil, e
-	}
-	if !m.CanManageLinkedPeers() {
-		return nil, domain.ErrCommunityAdminRequired
-	}
-	peers := make([]domain.Peer, 0, len(s.requests[id]))
-	for p := range s.requests[id] {
-		peers = append(peers, p)
-	}
-	sort.Slice(peers, func(i, j int) bool {
-		if peers[i].Type != peers[j].Type {
-			return peers[i].Type < peers[j].Type
+func (s *CommunityStore) DecideCommunityPeerLinkRequest(ctx context.Context, actor, id int64, p domain.Peer, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityTogglePeerLinkResult, error) {
+	return withMemoryCommunityDelivery(ctx, s, effects, func() (domain.CommunityTogglePeerLinkResult, store.CommunityDeliverySnapshot, error) {
+		result, err := s.decideLocked(actor, id, p, reject, date)
+		if err != nil {
+			return domain.CommunityTogglePeerLinkResult{}, store.CommunityDeliverySnapshot{}, err
 		}
-		return peers[i].ID < peers[j].ID
+		if reject {
+			return result, store.CommunityDeliverySnapshot{}, nil
+		}
+		snapshot, err := s.deliverySnapshotLocked(id, actor, result.RequestedBy)
+		return result, snapshot, err
 	})
-	if reject {
-		s.requests[id] = map[domain.Peer]domain.CommunityPeerLinkRequest{}
-		return make([]domain.CommunityTogglePeerLinkResult, len(peers)), nil
-	}
-	channels, bots := 0, 0
-	for p := range s.links[id] {
-		if p.Type == domain.PeerTypeChannel {
-			channels++
-		} else {
-			bots++
-		}
-	}
-	for _, p := range peers {
-		if p.Type == domain.PeerTypeChannel {
-			channels++
-		} else {
-			bots++
-		}
-		if channels > domain.MaxCommunityPeers || bots > domain.MaxCommunityBotPeers {
-			return nil, domain.ErrCommunityPeersTooMuch
-		}
-		r := s.requests[id][p]
-		if e := s.validatePeerLocked(r.RequestedBy, p); e != nil {
-			return nil, e
-		}
-	}
-	out := []domain.CommunityTogglePeerLinkResult{}
-	for _, p := range peers {
-		r := s.requests[id][p]
-		l, e := s.insertLinkLocked(id, r.RequestedBy, p, r.Visibility, date)
+}
+func (s *CommunityStore) DecideAllCommunityPeerLinkRequests(ctx context.Context, actor, id int64, reject bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) ([]domain.CommunityTogglePeerLinkResult, error) {
+	return withMemoryCommunityDelivery(ctx, s, effects, func() ([]domain.CommunityTogglePeerLinkResult, store.CommunityDeliverySnapshot, error) {
+		_, m, e := s.actorLocked(id, actor)
 		if e != nil {
-			return nil, e
+			return nil, store.CommunityDeliverySnapshot{}, e
 		}
-		delete(s.requests[id], p)
-		serviceMessage, e := s.appendCommunityServiceMessageLocked(p, actor, date, s.communities[id].ID)
-		if e != nil {
-			s.unlinkLocked(id, p)
-			return nil, e
+		if !m.CanManageLinkedPeers() {
+			return nil, store.CommunityDeliverySnapshot{}, domain.ErrCommunityAdminRequired
 		}
-		out = append(out, domain.CommunityTogglePeerLinkResult{Community: s.communities[id], Peer: p, RequestedBy: r.RequestedBy, Link: &l, ServiceMessage: serviceMessage})
-	}
-	return out, nil
+		peers := make([]domain.Peer, 0, len(s.requests[id]))
+		for p := range s.requests[id] {
+			peers = append(peers, p)
+		}
+		sort.Slice(peers, func(i, j int) bool {
+			if peers[i].Type != peers[j].Type {
+				return peers[i].Type < peers[j].Type
+			}
+			return peers[i].ID < peers[j].ID
+		})
+		if reject {
+			s.requests[id] = map[domain.Peer]domain.CommunityPeerLinkRequest{}
+			return make([]domain.CommunityTogglePeerLinkResult, len(peers)), store.CommunityDeliverySnapshot{}, nil
+		}
+		channels, bots := 0, 0
+		for p := range s.links[id] {
+			if p.Type == domain.PeerTypeChannel {
+				channels++
+			} else {
+				bots++
+			}
+		}
+		for _, p := range peers {
+			if p.Type == domain.PeerTypeChannel {
+				channels++
+			} else {
+				bots++
+			}
+			if channels > domain.MaxCommunityPeers || bots > domain.MaxCommunityBotPeers {
+				return nil, store.CommunityDeliverySnapshot{}, domain.ErrCommunityPeersTooMuch
+			}
+			r := s.requests[id][p]
+			if e := s.validatePeerLocked(r.RequestedBy, p); e != nil {
+				return nil, store.CommunityDeliverySnapshot{}, e
+			}
+		}
+		out := []domain.CommunityTogglePeerLinkResult{}
+		for _, p := range peers {
+			r := s.requests[id][p]
+			l, e := s.insertLinkLocked(id, r.RequestedBy, p, r.Visibility, date)
+			if e != nil {
+				return nil, store.CommunityDeliverySnapshot{}, e
+			}
+			delete(s.requests[id], p)
+			serviceMessage, e := s.appendCommunityServiceMessageLocked(p, actor, date, s.communities[id].ID)
+			if e != nil {
+				return nil, store.CommunityDeliverySnapshot{}, e
+			}
+			out = append(out, domain.CommunityTogglePeerLinkResult{Community: s.communities[id], Peer: p, RequestedBy: r.RequestedBy, Link: &l, ServiceMessage: serviceMessage})
+		}
+		targets := make([]int64, 0, len(out)+1)
+		if len(out) > 0 {
+			targets = append(targets, actor)
+		}
+		for _, result := range out {
+			targets = append(targets, result.RequestedBy)
+		}
+		snapshot, e := s.deliverySnapshotLocked(id, targets...)
+		return out, snapshot, e
+	})
 }
 
 func (s *CommunityStore) GetCommunityParticipantJoinedChats(_ context.Context, user, id, participant int64) (domain.CommunityParticipantJoinedChats, error) {
@@ -694,9 +960,7 @@ func (s *CommunityStore) GetCommunityParticipantJoinedChats(_ context.Context, u
 	return out, nil
 }
 
-func (s *CommunityStore) ToggleCommunityParticipantBanned(_ context.Context, actor, id, participant int64, unban bool, date int) (domain.CommunityParticipantBanResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *CommunityStore) toggleCommunityParticipantBannedLocked(actor, id, participant int64, unban bool, date int) (domain.CommunityParticipantBanResult, error) {
 	c, m, e := s.actorLocked(id, actor)
 	if e != nil {
 		return domain.CommunityParticipantBanResult{}, e
@@ -778,6 +1042,26 @@ func (s *CommunityStore) ToggleCommunityParticipantBanned(_ context.Context, act
 	}
 	result.Changed = !alreadyKicked || len(result.ChannelBans) > 0 || len(result.RemovedLinks) > 0
 	return result, nil
+}
+
+func (s *CommunityStore) ToggleCommunityParticipantBanned(ctx context.Context, actor, id, participant int64, unban bool, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityParticipantBanResult, error) {
+	return withMemoryCommunityDelivery(ctx, s, effects, func() (domain.CommunityParticipantBanResult, store.CommunityDeliverySnapshot, error) {
+		result, err := s.toggleCommunityParticipantBannedLocked(actor, id, participant, unban, date)
+		if err != nil {
+			return domain.CommunityParticipantBanResult{}, store.CommunityDeliverySnapshot{}, err
+		}
+		snapshot := store.CommunityDeliverySnapshot{}
+		if result.Changed && !unban {
+			community := cloneCommunity(s.communities[id])
+			view := domain.CommunityView{
+				Community: community,
+				Self:      domain.CommunityMember{CommunityID: id, UserID: participant},
+				Forbidden: true,
+			}
+			snapshot.Targets = []store.CommunityDeliveryTarget{{TargetUserID: participant, View: view}}
+		}
+		return result, snapshot, nil
+	})
 }
 
 func (s *CommunityStore) allParticipantsLocked(id int64) []domain.CommunityMember {
@@ -899,59 +1183,93 @@ func (s *CommunityStore) editViewLocked(user, id int64, can func(domain.Communit
 	v, e := s.viewLocked(user, id)
 	return v, changed, e
 }
-func (s *CommunityStore) EditCommunityTitle(_ context.Context, user, id int64, title string) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
-		if c.Title == title {
-			return false
-		}
-		c.Title = title
-		return true
+func (s *CommunityStore) EditCommunityTitle(ctx context.Context, user, id int64, title string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, changed, err := s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
+			if c.Title == title {
+				return false
+			}
+			c.Title = title
+			return true
+		})
+		return result{view: view, changed: changed}, memoryActorCommunityDeliverySnapshot(user, view, changed), err
 	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
+	}
+	return out.view, out.changed, nil
 }
-func (s *CommunityStore) EditCommunityAbout(_ context.Context, user, id int64, about string) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
-		if c.About == about {
-			return false
-		}
-		c.About = about
-		return true
+func (s *CommunityStore) EditCommunityAbout(ctx context.Context, user, id int64, about string, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, changed, err := s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
+			if c.About == about {
+				return false
+			}
+			c.About = about
+			return true
+		})
+		return result{view: view, changed: changed}, memoryActorCommunityDeliverySnapshot(user, view, changed), err
 	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
+	}
+	return out.view, out.changed, nil
 }
-func (s *CommunityStore) EditCommunityDefaultBannedRights(_ context.Context, user, id int64, rights domain.ChannelBannedRights) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
-		if c.DefaultBannedRights == rights {
-			return false
-		}
-		c.DefaultBannedRights = rights
-		return true
+func (s *CommunityStore) EditCommunityDefaultBannedRights(ctx context.Context, user, id int64, rights domain.ChannelBannedRights, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, changed, err := s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
+			if c.DefaultBannedRights == rights {
+				return false
+			}
+			c.DefaultBannedRights = rights
+			return true
+		})
+		return result{view: view, changed: changed}, memoryActorCommunityDeliverySnapshot(user, view, changed), err
 	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
+	}
+	return out.view, out.changed, nil
 }
-func (s *CommunityStore) SetCommunityPhoto(_ context.Context, user, id int64, photo *domain.Photo, date int) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
-		pid, dc := int64(0), 0
-		var stripped []byte
-		if photo != nil {
-			pid, dc = photo.ID, photo.DCID
-			stripped = domain.StrippedFromSizes(photo.Sizes)
-		}
-		if c.PhotoID == pid && c.PhotoDCID == dc && string(c.PhotoStripped) == string(stripped) {
-			return false
-		}
-		c.PhotoID, c.PhotoDCID, c.PhotoStripped = pid, dc, append([]byte(nil), stripped...)
-		return true
+func (s *CommunityStore) SetCommunityPhoto(ctx context.Context, user, id int64, photo *domain.Photo, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, changed, err := s.editViewLocked(user, id, domain.CommunityMember.CanChangeInfo, func(c *domain.Community) bool {
+			pid, dc := int64(0), 0
+			var stripped []byte
+			if photo != nil {
+				pid, dc = photo.ID, photo.DCID
+				stripped = domain.StrippedFromSizes(photo.Sizes)
+			}
+			if c.PhotoID == pid && c.PhotoDCID == dc && string(c.PhotoStripped) == string(stripped) {
+				return false
+			}
+			c.PhotoID, c.PhotoDCID, c.PhotoStripped = pid, dc, append([]byte(nil), stripped...)
+			return true
+		})
+		return result{view: view, changed: changed}, memoryActorCommunityDeliverySnapshot(user, view, changed), err
 	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
+	}
+	return out.view, out.changed, nil
 }
-func (s *CommunityStore) EditCommunityAdmin(_ context.Context, req domain.CommunityEditAdminRequest) (domain.CommunityView, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *CommunityStore) editCommunityAdminLocked(req domain.CommunityEditAdminRequest) (domain.CommunityView, bool, error) {
 	c, m, e := s.actorLocked(req.CommunityID, req.ActorUserID)
 	if e != nil {
 		return domain.CommunityView{}, false, e
@@ -986,9 +1304,32 @@ func (s *CommunityStore) EditCommunityAdmin(_ context.Context, req domain.Commun
 	return v, true, e
 }
 
-func (s *CommunityStore) DeleteCommunity(_ context.Context, user, id int64, date int) (domain.CommunityView, []domain.Peer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *CommunityStore) EditCommunityAdmin(ctx context.Context, req domain.CommunityEditAdminRequest, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, bool, error) {
+	type result struct {
+		view    domain.CommunityView
+		changed bool
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, changed, err := s.editCommunityAdminLocked(req)
+		if err != nil {
+			return result{}, store.CommunityDeliverySnapshot{}, err
+		}
+		snapshot := store.CommunityDeliverySnapshot{}
+		if changed {
+			snapshot, err = s.deliverySnapshotLocked(req.CommunityID, req.ActorUserID, req.UserID)
+			if err != nil {
+				return result{}, store.CommunityDeliverySnapshot{}, err
+			}
+		}
+		return result{view: view, changed: changed}, snapshot, nil
+	})
+	if err != nil {
+		return domain.CommunityView{}, false, err
+	}
+	return out.view, out.changed, nil
+}
+
+func (s *CommunityStore) deleteCommunityLocked(user, id int64, date int) (domain.CommunityView, []domain.Peer, error) {
 	c, m, e := s.actorLocked(id, user)
 	if e != nil {
 		return domain.CommunityView{}, nil, e
@@ -1020,6 +1361,25 @@ func (s *CommunityStore) DeleteCommunity(_ context.Context, user, id int64, date
 	delete(s.requests, id)
 	delete(s.states, id)
 	return domain.CommunityView{Community: c, Self: m, Forbidden: true, ServiceMessages: serviceMessages}, peers, nil
+}
+
+func (s *CommunityStore) DeleteCommunity(ctx context.Context, user, id int64, date int, effects store.DeliveryEffectsBuilder[store.CommunityDeliverySnapshot]) (domain.CommunityView, []domain.Peer, error) {
+	type result struct {
+		view  domain.CommunityView
+		peers []domain.Peer
+	}
+	out, err := withMemoryCommunityDelivery(ctx, s, effects, func() (result, store.CommunityDeliverySnapshot, error) {
+		view, peers, err := s.deleteCommunityLocked(user, id, date)
+		if err != nil {
+			return result{}, store.CommunityDeliverySnapshot{}, err
+		}
+		snapshot := store.CommunityDeliverySnapshot{Targets: []store.CommunityDeliveryTarget{{TargetUserID: user, View: cloneCommunityView(view)}}}
+		return result{view: view, peers: peers}, snapshot, nil
+	})
+	if err != nil {
+		return domain.CommunityView{}, nil, err
+	}
+	return out.view, out.peers, nil
 }
 func (s *CommunityStore) SetCommunityPinned(_ context.Context, user, id int64, pinned bool) (bool, error) {
 	s.mu.Lock()

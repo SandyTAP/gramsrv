@@ -79,7 +79,10 @@ func (r *Router) onStickersCreateStickerSet(ctx context.Context, req *tg.Sticker
 	} else if req.Masks {
 		kind = domain.StickerSetKindMasks
 	}
-	set, docs, err := r.deps.Files.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	if err := r.requireAccountDelivery(userID, "stickers.createStickerSet"); err != nil {
+		return nil, err
+	}
+	set, docs, err := r.deps.Files.CreateInstalledStickerSet(ctx, domain.CreateStickerSetRequest{
 		CreatorUserID:   userID,
 		Title:           req.Title,
 		ShortName:       req.ShortName,
@@ -90,19 +93,11 @@ func (r *Router) onStickersCreateStickerSet(ctx context.Context, req *tg.Sticker
 		Items:           items,
 		Software:        req.Software,
 		Date:            int(r.clock.Now().Unix()),
-	})
+	}, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return nil, stickerSetCreateErr(err)
 	}
-	if svc, ok := r.userStickerSetSvc(); ok {
-		if err := svc.InstallUserStickerSet(ctx, userID, set.ID, userStickerSetKind(set), false, int(r.clock.Now().Unix())); err != nil {
-			return nil, internalErr()
-		}
-		set.Installed = true
-		set.InstalledDate = int(r.clock.Now().Unix())
-	}
 	r.invalidateStickerCatalog(userStickerSetKind(set))
-	r.pushStickerSetsUpdate(ctx, userID, userStickerSetKind(set))
 	return tgMessagesStickerSet(set, docs), nil
 }
 
@@ -151,12 +146,15 @@ func (r *Router) onStickersAddStickerToSet(ctx context.Context, req *tg.Stickers
 	if !ok {
 		return nil, stickerFileInvalidErr()
 	}
+	if err := r.requireAccountDelivery(userID, "stickers.addStickerToSet"); err != nil {
+		return nil, err
+	}
 	set, docs, err := r.deps.Files.AddStickerToSet(ctx, userID, ref, domain.StickerSetItemInput{
 		DocumentID:         documentID,
 		DocumentAccessHash: accessHash,
 		Emoji:              req.Sticker.Emoji,
 		Keywords:           req.Sticker.Keywords,
-	})
+	}, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return nil, stickerSetManagementErr(err)
 	}
@@ -173,7 +171,10 @@ func (r *Router) onStickersRemoveStickerFromSet(ctx context.Context, input tg.In
 	if !ok {
 		return nil, stickerFileInvalidErr()
 	}
-	set, docs, err := r.deps.Files.RemoveStickerFromSet(ctx, userID, documentID, accessHash)
+	if err := r.requireAccountDelivery(userID, "stickers.removeStickerFromSet"); err != nil {
+		return nil, err
+	}
+	set, docs, err := r.deps.Files.RemoveStickerFromSet(ctx, userID, documentID, accessHash, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return nil, stickerSetManagementErr(err)
 	}
@@ -193,7 +194,10 @@ func (r *Router) onStickersChangeStickerPosition(ctx context.Context, req *tg.St
 	if !ok {
 		return nil, stickerFileInvalidErr()
 	}
-	set, docs, err := r.deps.Files.ChangeStickerPosition(ctx, userID, documentID, accessHash, req.Position)
+	if err := r.requireAccountDelivery(userID, "stickers.changeStickerPosition"); err != nil {
+		return nil, err
+	}
+	set, docs, err := r.deps.Files.ChangeStickerPosition(ctx, userID, documentID, accessHash, req.Position, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return nil, stickerSetManagementErr(err)
 	}
@@ -213,7 +217,10 @@ func (r *Router) onStickersRenameStickerSet(ctx context.Context, req *tg.Sticker
 	if !ok {
 		return nil, stickersetInvalidErr()
 	}
-	set, docs, err := r.deps.Files.RenameStickerSet(ctx, userID, ref, req.Title)
+	if err := r.requireAccountDelivery(userID, "stickers.renameStickerSet"); err != nil {
+		return nil, err
+	}
+	set, docs, err := r.deps.Files.RenameStickerSet(ctx, userID, ref, req.Title, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return nil, stickerSetManagementErr(err)
 	}
@@ -230,12 +237,14 @@ func (r *Router) onStickersDeleteStickerSet(ctx context.Context, input tg.InputS
 	if !ok {
 		return false, stickersetInvalidErr()
 	}
-	kind, err := r.deps.Files.DeleteStickerSet(ctx, userID, ref)
+	if err := r.requireAccountDelivery(userID, "stickers.deleteStickerSet"); err != nil {
+		return false, err
+	}
+	kind, err := r.deps.Files.DeleteStickerSet(ctx, userID, ref, r.stickerSetMutationDeliveryEffects(ctx, userID))
 	if err != nil {
 		return false, stickerSetManagementErr(err)
 	}
 	r.invalidateStickerCatalog(kind)
-	r.pushStickerSetsUpdate(ctx, userID, kind)
 	return true, nil
 }
 
@@ -253,7 +262,6 @@ func (r *Router) stickerSetActorUserID(ctx context.Context) (int64, error) {
 func (r *Router) notifyStickerSetMutated(ctx context.Context, userID int64, set domain.StickerSet) {
 	kind := userStickerSetKind(set)
 	r.invalidateStickerCatalog(kind)
-	r.pushStickerSetsUpdate(ctx, userID, kind)
 }
 
 func (r *Router) stickerSetCreatorUserID(ctx context.Context, input tg.InputUserClass) (int64, error) {

@@ -11,6 +11,7 @@ import (
 
 	"telesrv/deploy"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
@@ -71,7 +72,7 @@ func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
 		t.Fatalf("publish lifecycle pool: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
 		StarsProceedsPermille: 900, TONProceedsPermille: 900,
 	}))
@@ -82,7 +83,7 @@ func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
 		BuyerUserID: sourcePayer.ID, To: ownerPeer, GiftID: entry.Gift.ID,
 		CommandKey: "source-purchase-" + suffix, Date: now,
 	})
-	sourcePurchase, err := lifecycle.PurchaseStarGift(ctx, sourcePurchaseReq)
+	sourcePurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, sourcePurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil || sourcePurchase.Saved.PrepaidUpgradeHash == "" {
 		t.Fatalf("purchase sender-prepaid gift = %+v err %v", sourcePurchase, err)
 	}
@@ -129,7 +130,54 @@ func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
 
 	purchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
 		GiftID: entry.Gift.ID, CommandKey: "purchase-" + suffix, Date: now, Message: "hello"})
-	purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	ownerBeforeFailure, err := gifts.ListByOwner(ctx, ownerPeer, false, "", domain.MaxSavedStarGiftsLimit)
+	if err != nil {
+		t.Fatalf("list owner gifts before failed purchase: %v", err)
+	}
+	buyerBalanceBeforeFailure, err := stars.GetBalance(ctx, buyer.ID)
+	if err != nil {
+		t.Fatalf("load buyer balance before failed purchase: %v", err)
+	}
+	var buyerDeliveriesBeforeFailure, purchaseCommandsBeforeFailure int64
+	if err := pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1),
+(SELECT count(*) FROM star_gift_purchase_commands WHERE buyer_user_id=$1 AND command_key=$2)`,
+		buyer.ID, purchaseReq.CommandKey).Scan(&buyerDeliveriesBeforeFailure, &purchaseCommandsBeforeFailure); err != nil {
+		t.Fatalf("load purchase footprint before failure: %v", err)
+	}
+	purchaseBuilderErr := errors.New("injected star gift purchase builder failure")
+	if _, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, purchaseReq, func(domain.StarGiftPurchaseResult) ([]store.DeliveryEffect, error) {
+		return nil, purchaseBuilderErr
+	}); !errors.Is(err, purchaseBuilderErr) {
+		t.Fatalf("purchase builder failure = %v, want injected error", err)
+	}
+	failingDB := &failStarsPurchaseOutboxDB{Pool: pool}
+	outboxFailingLifecycle := NewStarGiftLifecycleStore(failingDB, newTestMessageStore(failingDB), 1_000_000)
+	if _, err := outboxFailingLifecycle.PurchaseStarGiftWithDelivery(ctx, purchaseReq, starGiftPurchaseTestEffects); !errors.Is(err, errInjectedStarsPurchaseOutbox) {
+		t.Fatalf("purchase outbox failure = %v, want injected error", err)
+	}
+	ownerAfterFailure, err := gifts.ListByOwner(ctx, ownerPeer, false, "", domain.MaxSavedStarGiftsLimit)
+	if err != nil {
+		t.Fatalf("list owner gifts after failed purchase: %v", err)
+	}
+	buyerBalanceAfterFailure, err := stars.GetBalance(ctx, buyer.ID)
+	if err != nil {
+		t.Fatalf("load buyer balance after failed purchase: %v", err)
+	}
+	var buyerDeliveriesAfterFailure, purchaseCommandsAfterFailure int64
+	if err := pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1),
+(SELECT count(*) FROM star_gift_purchase_commands WHERE buyer_user_id=$1 AND command_key=$2)`,
+		buyer.ID, purchaseReq.CommandKey).Scan(&buyerDeliveriesAfterFailure, &purchaseCommandsAfterFailure); err != nil {
+		t.Fatalf("load purchase footprint after failure: %v", err)
+	}
+	if ownerAfterFailure.Count != ownerBeforeFailure.Count || buyerBalanceAfterFailure.Balance != buyerBalanceBeforeFailure.Balance ||
+		buyerDeliveriesAfterFailure != buyerDeliveriesBeforeFailure || purchaseCommandsAfterFailure != purchaseCommandsBeforeFailure {
+		t.Fatalf("failed purchase leaked gifts=%d->%d balance=%d->%d deliveries=%d->%d commands=%d->%d",
+			ownerBeforeFailure.Count, ownerAfterFailure.Count, buyerBalanceBeforeFailure.Balance, buyerBalanceAfterFailure.Balance,
+			buyerDeliveriesBeforeFailure, buyerDeliveriesAfterFailure, purchaseCommandsBeforeFailure, purchaseCommandsAfterFailure)
+	}
+	purchased, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, purchaseReq, starGiftPurchaseTestEffects)
 	if err != nil {
 		t.Fatalf("purchase gift: %v", err)
 	}
@@ -147,11 +195,16 @@ func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
 		senderOrdinaryAction.PrepaidUpgradeHash != purchased.Saved.PrepaidUpgradeHash {
 		t.Fatalf("ordinary sender purchase projection = %+v", senderOrdinaryAction)
 	}
-	replayedPurchase, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	replayedPurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, purchaseReq, starGiftPurchaseTestEffects)
 	if err != nil || !replayedPurchase.Duplicate || replayedPurchase.Saved.ID != purchased.Saved.ID || replayedPurchase.Balance.Balance != 9950 ||
 		replayedPurchase.Send.SenderMessage.ID != purchased.Send.SenderMessage.ID ||
 		replayedPurchase.Send.RecipientMessage.ID != purchased.Send.RecipientMessage.ID {
 		t.Fatalf("purchase replay = %+v err %v", replayedPurchase, err)
+	}
+	var buyerDeliveriesAfterReplay int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1`, buyer.ID).
+		Scan(&buyerDeliveriesAfterReplay); err != nil || buyerDeliveriesAfterReplay != buyerDeliveriesBeforeFailure+1 {
+		t.Fatalf("purchase replay balance deliveries=%d err=%v, want %d", buyerDeliveriesAfterReplay, err, buyerDeliveriesBeforeFailure+1)
 	}
 	verifyPrepaidViewerProjectionMigrationNoop(t, ctx, pool, purchased.Saved.ID, owner.ID, buyer.ID,
 		purchased.Send.RecipientMessage.ID, purchased.Send.SenderMessage.ID)
@@ -456,9 +509,13 @@ WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, upgraded.Send.RecipientMess
 	if !valid {
 		t.Fatalf("resold collectible cannot project emoji status: %+v", resold.Unique)
 	}
-	if _, err := users.UpdateEmojiStatus(ctx, resaleBuyer.ID, domain.UserEmojiStatus{
+	wornStatus := domain.UserEmojiStatus{
 		DocumentID:  selected.DocumentID,
 		Collectible: selected,
+	}
+	if _, _, err := users.UpdateEmojiStatusWithEvent(ctx, resaleBuyer.ID, wornStatus, domain.UpdateEvent{
+		Type: domain.UpdateEventUserEmojiStatus, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: resaleBuyer.ID},
+		EmojiStatus: wornStatus, Date: now + 143, PtsCount: 1,
 	}); err != nil {
 		t.Fatalf("wear resold collectible: %v", err)
 	}
@@ -558,7 +615,7 @@ WHERE target_user_id=$1 AND pts=$2 AND event_type='user_emoji_status'`, resaleBu
 	// catalog gift are identical to the first purchase.
 	secondPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
 		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "purchase-second-" + suffix, Date: now + 145})
-	secondPurchase, err := lifecycle.PurchaseStarGift(ctx, secondPurchaseReq)
+	secondPurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, secondPurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil {
 		t.Fatalf("purchase second prepaid gift: %v", err)
 	}
@@ -770,7 +827,7 @@ WHERE user_id=$1 AND command_key=$2`, owner.ID, craftReq.CommandKey).Scan(&outpu
 	// retry replays the receipt, while a fresh command cannot consume it again.
 	thirdPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
 		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "purchase-third-" + suffix, Date: now + 148})
-	thirdPurchase, err := lifecycle.PurchaseStarGift(ctx, thirdPurchaseReq)
+	thirdPurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, thirdPurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil {
 		t.Fatalf("purchase third prepaid gift: %v", err)
 	}
@@ -912,7 +969,7 @@ func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
 			t.Fatalf("grant channel lifecycle stars to %d: %v", user.ID, err)
 		}
 	}
-	channelStore := NewChannelStore(pool)
+	channelStore := newTestChannelStore(pool)
 	created, err := channelStore.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: actor.ID, Title: "Gift Channel " + suffix, Megagroup: true, Date: now,
 		MemberUserIDs: []int64{notifyAdmin.ID, mutedAdmin.ID, noPostAdmin.ID, ordinaryMember.ID},
@@ -977,7 +1034,7 @@ func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish channel gift pool: %v", err)
 	}
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
 		StarsProceedsPermille: 900, TONProceedsPermille: 900,
 	}))
@@ -993,7 +1050,7 @@ func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
 	}
 	channelPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
 		GiftID: entry.Gift.ID, CommandKey: "channel-purchase-" + suffix, Date: now + 1})
-	purchased, err := lifecycle.PurchaseStarGift(ctx, channelPurchaseReq)
+	purchased, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, channelPurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil || purchased.Saved.SavedID <= 0 || purchased.Balance.Balance != 9950 {
 		t.Fatalf("atomic channel purchase = %+v err %v", purchased, err)
 	}
@@ -1110,7 +1167,7 @@ FROM channel_admin_log_events WHERE channel_id=$1 AND event_type='send_message' 
 		Scan(&channelPrice, &channelPrepaidAmount); err != nil || channelPrice != "100" || channelPrepaidAmount != nil {
 		t.Fatalf("channel ordinary action price=%q prepaid=%v err=%v", channelPrice, channelPrepaidAmount, err)
 	}
-	if replay, err := lifecycle.PurchaseStarGift(ctx, channelPurchaseReq); err != nil || !replay.Duplicate {
+	if replay, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, channelPurchaseReq, starGiftPurchaseTestEffects); err != nil || !replay.Duplicate {
 		t.Fatalf("channel purchase replay = %+v err %v", replay, err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
@@ -1125,8 +1182,8 @@ WHERE saved_gift_id=$1 AND target_user_id=$4`, purchased.Saved.ID, mutedAdmin.ID
 		t.Fatalf("insert delayed channel conversion notification: %v", err)
 	}
 
-	converted, err := lifecycle.ConvertStarGift(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
-		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 2})
+	converted, err := lifecycle.ConvertStarGiftWithDelivery(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 2}, starGiftConvertTestEffects)
 	if err != nil || !converted.Saved.Converted || converted.OwnerBalance != 20 || len(converted.SourceEdits) != 2 {
 		t.Fatalf("atomic channel conversion = %+v err %v", converted, err)
 	}
@@ -1191,8 +1248,8 @@ WHERE job.saved_gift_id=$1 AND job.target_user_id=$2`, purchased.Saved.ID, muted
 		starsPage.Transactions[0].Amount != 20 || starsPage.Transactions[0].Reason != domain.StarsReasonGift {
 		t.Fatalf("channel stars transaction projection = %+v err %v", starsPage, err)
 	}
-	if _, err := lifecycle.ConvertStarGift(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
-		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 3}); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
+	if _, err := lifecycle.ConvertStarGiftWithDelivery(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 3}, starGiftConvertTestEffects); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
 		t.Fatalf("repeated channel conversion err = %v, want already converted", err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT balance FROM channel_stars_balances WHERE channel_id=$1`, created.Channel.ID).Scan(&channelBalance); err != nil || channelBalance != 20 {
@@ -1204,7 +1261,7 @@ WHERE job.saved_gift_id=$1 AND job.target_user_id=$2`, purchased.Saved.ID, muted
 	// together; the payment is also visible in channel Recent Actions.
 	channelPrepayTargetReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
 		GiftID: entry.Gift.ID, CommandKey: "channel-prepay-target-" + suffix, Date: now + 4})
-	channelPrepayTarget, err := lifecycle.PurchaseStarGift(ctx, channelPrepayTargetReq)
+	channelPrepayTarget, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, channelPrepayTargetReq, starGiftPurchaseTestEffects)
 	if err != nil || channelPrepayTarget.Saved.PrepaidUpgradeHash == "" {
 		t.Fatalf("channel prepay target purchase = %+v err %v", channelPrepayTarget, err)
 	}
@@ -1303,7 +1360,7 @@ WHERE channel_id=$1 AND message::text LIKE '%prepaid_upgrade%'`, created.Channel
 		BuyerUserID: outsidePayer.ID, To: channelPeer, GiftID: entry.Gift.ID,
 		CommandKey: "channel-outside-purchase-" + suffix, Date: now + 4,
 	})
-	outsidePurchase, err := lifecycle.PurchaseStarGift(ctx, outsidePurchaseReq)
+	outsidePurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, outsidePurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil || outsidePurchase.Saved.PrepaidUpgradeHash == "" || outsidePurchase.Balance.Balance != 9950 {
 		t.Fatalf("outside payer channel purchase = %+v err %v", outsidePurchase, err)
 	}
@@ -1404,7 +1461,7 @@ WHERE saved_gift_id=$1 AND target_user_id=$2`, outsidePurchase.Saved.ID, actor.I
 	}
 	prepaidPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
 		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "channel-prepaid-purchase-" + suffix, Date: now + 4})
-	prepaidPurchase, err := lifecycle.PurchaseStarGift(ctx, prepaidPurchaseReq)
+	prepaidPurchase, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, prepaidPurchaseReq, starGiftPurchaseTestEffects)
 	if err != nil || prepaidPurchase.Saved.PrepaidUpgradeStars != 100 || prepaidPurchase.Saved.SavedID <= 0 {
 		t.Fatalf("channel prepaid gift purchase = %+v err %v", prepaidPurchase, err)
 	}
@@ -1606,7 +1663,7 @@ WHERE channel_id=$1 AND message #>> '{Action,StarGiftUnique,saved_id}'=$2`,
 	invalidChannelReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID,
 		To: domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID + 999999}, GiftID: entry.Gift.ID,
 		CommandKey: "invalid-channel-purchase-" + suffix, Date: now + 2})
-	_, err = lifecycle.PurchaseStarGift(ctx, invalidChannelReq)
+	_, err = lifecycle.PurchaseStarGiftWithDelivery(ctx, invalidChannelReq, starGiftPurchaseTestEffects)
 	if err == nil {
 		t.Fatal("purchase to missing channel unexpectedly succeeded")
 	}
@@ -1755,7 +1812,7 @@ func TestStarGiftCraftFailureConsumesThreeInputsPostgres(t *testing.T) {
 		t.Fatalf("publish three-input collectible: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000,
 		WithStarGiftCraftDraw(func(upper int) (int, error) { return upper - 1, nil }))
 	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
@@ -1768,7 +1825,7 @@ func TestStarGiftCraftFailureConsumesThreeInputsPostgres(t *testing.T) {
 			BuyerUserID: buyer.ID, To: ownerPeer, GiftID: entry.Gift.ID, IncludeUpgrade: true,
 			CommandKey: fmt.Sprintf("three-input-purchase-%s-%d", suffix, i), Date: now + i,
 		})
-		purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+		purchased, err := lifecycle.PurchaseStarGiftWithDelivery(ctx, purchaseReq, starGiftPurchaseTestEffects)
 		if err != nil {
 			t.Fatalf("purchase three-input gift %d: %v", i, err)
 		}

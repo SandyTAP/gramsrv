@@ -99,16 +99,20 @@ func TestPasskeyEndToEnd(t *testing.T) {
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	updateEventStore := memory.NewUpdateEventStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authorizationStore := memory.NewAuthorizationStore()
+	authorizationStore.AttachDeliveryOutbox(deliveryOutbox)
 	passkeyService := passkeyapp.NewService(memory.NewPasskeyStore(), memory.NewPasskeyChallengeStore(), rpID, dc)
 
 	deps := rpc.Deps{
-		Auth: auth.NewService(userStore, memory.NewAuthorizationStore(), memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code,
+		Auth: auth.NewService(userStore, authorizationStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), code,
 			auth.WithLoginMessages(messageStore, dialogStore),
 			auth.WithLoginCodeDelivery(memory.NewLoginCodeDeliveryStore(messageStore, updateEventStore))),
-		Account: account.NewService(memory.NewPasswordStore(), account.WithUsers(userStore)),
-		Help:    help.NewService(helpStore, helpStore),
-		Users:   users.NewService(userStore),
-		Updates: updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
+		Account:        account.NewService(memory.NewPasswordStore(), account.WithUsers(userStore)),
+		Help:           help.NewService(helpStore, helpStore),
+		Users:          users.NewService(userStore),
+		Updates:        updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
+		DeliveryOutbox: deliveryOutbox,
 
 		Contacts: contacts.NewService(memory.NewContactStore()),
 		Dialogs:  dialogs.NewService(dialogStore),

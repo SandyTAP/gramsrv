@@ -33,11 +33,10 @@ func TestMessagePartitionSeekPlansUseIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create recipient: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
-	})
+	cleanupDispatchUser(t, pool, sender.ID)
+	cleanupDispatchUser(t, pool, recipient.ID)
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	var first domain.SendPrivateTextResult
 	for i := 0; i < 3; i++ {
 		sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
@@ -55,10 +54,13 @@ func TestMessagePartitionSeekPlansUseIndexes(t *testing.T) {
 		}
 	}
 	if _, err := pool.Exec(ctx, `
-		UPDATE dispatch_outbox
-		SET status = 'dispatching',
+		UPDATE dispatch_outbox_lanes
+		SET state = 'leased',
+		    lease_fence = lease_fence + 1,
+		    lease_owner = 'plan-test',
+		    lease_until = now() - interval '1 minute',
 		    updated_at = now() - interval '1 minute'
-		WHERE target_user_id = $1
+		WHERE stream_id = $1
 	`, recipient.ID); err != nil {
 		t.Fatalf("mark dispatch stale: %v", err)
 	}
@@ -194,26 +196,23 @@ ORDER BY owner_user_id ASC, box_id ASC
 	requireUniquePartitionCountAtMost(t, deleteByPrivatePlan, `message_boxes_p\d+`, 2)
 
 	dispatchPlan := explainText(t, ctx, tx, `
-WITH picked_heads AS (
-  SELECT h.target_user_id, h.head_id, h.head_pts
-  FROM dispatch_outbox_user_heads h
-  WHERE h.logical_shard = ANY($1::smallint[])
-    AND (
-      (h.status = 'pending' AND h.next_attempt_at <= now())
-      OR
-      (h.status = 'dispatching' AND h.updated_at < now() - interval '30 seconds')
-    )
-  ORDER BY h.next_attempt_at ASC, h.target_user_id ASC, h.head_pts ASC, h.head_id ASC
+WITH picked_lanes AS (
+  SELECT l.stream_id, l.head_item_id, l.head_sequence
+  FROM dispatch_outbox_lanes l
+  WHERE l.logical_shard = ANY($1::smallint[])
+    AND l.state = 'leased'
+    AND l.lease_until <= now()
+  ORDER BY l.lease_until, l.stream_id, l.head_sequence, l.head_item_id
   LIMIT 100
-  FOR UPDATE OF h SKIP LOCKED
+  FOR UPDATE OF l SKIP LOCKED
 )
 SELECT d.target_user_id, d.pts, d.id
-FROM picked_heads h
+FROM picked_lanes l
 JOIN dispatch_outbox d
-  ON d.target_user_id = h.target_user_id
- AND d.id = h.head_id
+  ON d.target_user_id = l.stream_id
+ AND d.id = l.head_item_id
 `, []int16{int16(recipient.ID % 256)})
-	requirePlanContains(t, dispatchPlan, "dispatch_outbox_user_heads_dispatching_shard_idx")
+	requirePlanContains(t, dispatchPlan, "dispatch_outbox_lanes_lease_shard_idx")
 	requirePlanContains(t, dispatchPlan, "dispatch_outbox")
 	requirePlanContains(t, dispatchPlan, "Index")
 	requirePlanNotMatches(t, dispatchPlan, `dispatch_outbox_p\d+`)
@@ -221,17 +220,17 @@ JOIN dispatch_outbox d
 
 	failedCleanupPlan := explainText(t, ctx, tx, `
 WITH doomed AS MATERIALIZED (
-  SELECT target_user_id, head_id AS id
-  FROM dispatch_outbox_user_heads
-  WHERE status = 'failed'
+  SELECT stream_id AS target_user_id, head_item_id AS id
+  FROM dispatch_outbox_lanes
+  WHERE state = 'failed'
     AND updated_at < now() - interval '1 minute'
-  ORDER BY updated_at ASC, target_user_id ASC, head_id ASC
+  ORDER BY updated_at, stream_id, head_item_id
   LIMIT 100
 )
 SELECT target_user_id, id
 FROM doomed
 `)
-	requirePlanContains(t, failedCleanupPlan, "dispatch_outbox_user_heads_failed_cleanup_idx")
+	requirePlanContains(t, failedCleanupPlan, "dispatch_outbox_lanes_failed_cleanup_idx")
 	requirePlanNotContains(t, failedCleanupPlan, "Seq Scan")
 }
 

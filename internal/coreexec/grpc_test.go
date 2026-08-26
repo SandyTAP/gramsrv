@@ -25,6 +25,7 @@ import (
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"github.com/iamxvbaba/td/tlprofile"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -54,6 +55,21 @@ import (
 )
 
 var grpcTestPhoneSequence atomic.Uint32
+
+type floodWaitDispatchHandler struct {
+	Handler
+}
+
+func (h *floodWaitDispatchHandler) DispatchAdmitted(
+	context.Context,
+	[8]byte,
+	int64,
+	int64,
+	uint64,
+	tlprofile.Admission,
+) (tlprofile.Result, string, error) {
+	return nil, "messages.sendMessage", tgerr.New(420, "FLOOD_WAIT_51")
+}
 
 func nextGRPCTestPhone() string {
 	return fmt.Sprintf("+1555%07d", grpcTestPhoneSequence.Add(1))
@@ -107,6 +123,26 @@ func TestGRPCRemoteDispatchRoundTripExactLayer(t *testing.T) {
 	}
 }
 
+func TestGRPCRemotePreservesFloodWaitCodeAndMessage(t *testing.T) {
+	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	remote, cleanup := newBufGRPCRemote(t, &floodWaitDispatchHandler{Handler: coreRouter}, edgeRouter, "secret", "secret")
+	defer cleanup()
+
+	admitted := admitHelpGetConfigForGRPCTest(t, remote)
+	result, method, err := remote.DispatchAdmitted(context.Background(), [8]byte{1}, 10, 20, 30, admitted)
+	if result != nil || method != "messages.sendMessage" {
+		t.Fatalf("dispatch result=%T method=%q, want nil/messages.sendMessage", result, method)
+	}
+	var rpcErr *tgerr.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("dispatch error=%T %v, want *tgerr.Error", err, err)
+	}
+	if rpcErr.Code != 420 || rpcErr.Message != "FLOOD_WAIT_51" {
+		t.Fatalf("dispatch rpc error=(%d,%q), want (420,FLOOD_WAIT_51)", rpcErr.Code, rpcErr.Message)
+	}
+}
+
 func TestGRPCRemoteDispatchCarriesIdentityHint(t *testing.T) {
 	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
 	coreCapture := &captureIdentityHintHandler{Handler: coreRouter}
@@ -146,10 +182,13 @@ func TestGRPCRemoteDispatchCarriesIdentityHint(t *testing.T) {
 func TestGRPCRemoteAuthenticatedDispatchSeesSignUpBinding(t *testing.T) {
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{
-		Auth:  auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
-		Users: users.NewService(userStore),
+		Auth:           auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
+		Users:          users.NewService(userStore),
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
 	remote, cleanup := newBufGRPCRemote(t, coreRouter, edgeRouter, "secret", "secret")
@@ -247,6 +286,27 @@ func TestGRPCRemoteHasNoLocalDispatchFallback(t *testing.T) {
 	}
 	if _, _, err := remote.DispatchAdmitted(context.Background(), [8]byte{1}, 10, 20, 30, admitted); !errors.Is(err, ErrRemoteRPCUnavailable) {
 		t.Fatalf("dispatch without coreexec client err = %v, want ErrRemoteRPCUnavailable", err)
+	}
+}
+
+func TestGRPCRemoteDiscardAdmittedReleasesCapturedWire(t *testing.T) {
+	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	remote := NewGRPCRemote(edgeRouter, nil, nil)
+	admitted, err := tryAdmitHelpGetConfigForGRPCTest(remote)
+	if err != nil {
+		t.Fatalf("admit through edge codec: %v", err)
+	}
+	if remote.pendingCount != 1 {
+		t.Fatalf("pending admissions = %d, want 1", remote.pendingCount)
+	}
+	if !remote.DiscardAdmitted(admitted.Prepared().Identity()) {
+		t.Fatal("DiscardAdmitted did not release captured admission")
+	}
+	if remote.pendingCount != 0 {
+		t.Fatalf("pending admissions after discard = %d, want 0", remote.pendingCount)
+	}
+	if _, ok := remote.peek(admitted.Prepared().Identity()); ok {
+		t.Fatal("discarded admission retained captured wire")
 	}
 }
 
@@ -809,6 +869,8 @@ func TestGRPCRemoteAccountDeleteTeardownCommitsAfterResultDelivery(t *testing.T)
 		t.Fatal(err)
 	}
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	authSvc := auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345")
 	if err := authKeyStore.Save(ctx, store.AuthKeyData{ID: authKeyID, CreatedAt: time.Now().Unix()}); err != nil {
@@ -1434,12 +1496,15 @@ func TestGRPCRemoteStaticTargetsCommitPostResponseActionsAcrossCores(t *testing.
 func TestGRPCRemoteStaticTargetsShareAuthenticatedSessionAcrossCores(t *testing.T) {
 	userStore := memory.NewUserStore()
 	authzStore := memory.NewAuthorizationStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	codeStore := memory.NewCodeStore()
 	coreDeps := func() rpc.Deps {
 		return rpc.Deps{
-			Auth:  auth.NewService(userStore, authzStore, codeStore, authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
-			Users: users.NewService(userStore),
+			Auth:           auth.NewService(userStore, authzStore, codeStore, authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
+			Users:          users.NewService(userStore),
+			DeliveryOutbox: deliveryOutbox,
 		}
 	}
 	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)

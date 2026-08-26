@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *BotStore) withBotInfoBumpRawTx(ctx context.Context, botUserID int64, fn func(pgx.Tx) error) (int, error) {
@@ -383,22 +384,60 @@ FROM attach_menu_user_states WHERE user_id=$1 AND bot_user_id=$2`, userID, botUs
 	return state, true, nil
 }
 
-func (s *BotStore) SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState) (domain.BotAttachMenuState, error) {
+func (s *BotStore) SetAttachMenuState(ctx context.Context, state domain.BotAttachMenuState, effects store.DeliveryEffectsBuilder[domain.BotAttachMenuState]) (domain.BotAttachMenuState, error) {
 	if state.UserID == 0 || state.BotUserID == 0 || state.UserID == state.BotUserID {
 		return domain.BotAttachMenuState{}, domain.ErrBotAttachMenuInvalid
 	}
-	_, err := s.db.Exec(ctx, `
+	var result domain.BotAttachMenuState
+	err := withTx(ctx, s.db, "set attach menu state", func(tx pgx.Tx) error {
+		var previous domain.BotAttachMenuState
+		err := tx.QueryRow(ctx, `
+SELECT user_id, bot_user_id, enabled, write_allowed
+FROM attach_menu_user_states
+WHERE user_id=$1 AND bot_user_id=$2
+FOR UPDATE`, state.UserID, state.BotUserID).Scan(
+			&previous.UserID, &previous.BotUserID, &previous.Enabled, &previous.WriteAllowed,
+		)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lock attach menu state: %w", err)
+		}
+		found := err == nil
+		state.WriteAllowed = state.WriteAllowed || previous.WriteAllowed
+		if found && state.Enabled == previous.Enabled && state.WriteAllowed == previous.WriteAllowed {
+			result = previous
+			return nil
+		}
+		_, err = tx.Exec(ctx, `
 INSERT INTO attach_menu_user_states (user_id, bot_user_id, enabled, write_allowed)
 VALUES ($1,$2,$3,$4)
 ON CONFLICT (user_id, bot_user_id) DO UPDATE SET
   enabled=EXCLUDED.enabled,
   write_allowed=attach_menu_user_states.write_allowed OR EXCLUDED.write_allowed,
   updated_at=now()`,
-		state.UserID, state.BotUserID, state.Enabled, state.WriteAllowed)
+			state.UserID, state.BotUserID, state.Enabled, state.WriteAllowed)
+		if err != nil {
+			return fmt.Errorf("set attach menu state: %w", err)
+		}
+		result = state
+		if effects == nil {
+			return store.ErrDeliveryOutboxRequired
+		}
+		intents, err := effects(result)
+		if err != nil {
+			return fmt.Errorf("build attach menu delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return store.ErrDeliveryOutboxRequired
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply attach menu delivery effects: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return domain.BotAttachMenuState{}, fmt.Errorf("set attach menu state: %w", err)
+		return domain.BotAttachMenuState{}, err
 	}
-	return s.GetAttachMenuStateValue(ctx, state.UserID, state.BotUserID)
+	return result, nil
 }
 
 func (s *BotStore) GetAttachMenuStateValue(ctx context.Context, userID, botUserID int64) (domain.BotAttachMenuState, error) {

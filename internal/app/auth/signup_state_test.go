@@ -27,7 +27,7 @@ func TestSignUpRequiresCorrectSignInAndConsumesMarkerOnce(t *testing.T) {
 	if _, _, err := svc.SignUp(ctx, domain.Authorization{}, phone, hash, "Direct", "Bypass"); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("direct SignUp err=%v, want ErrCodeInvalid", err)
 	}
-	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "00000"); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "00000", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("wrong SignIn err=%v, want ErrCodeInvalid", err)
 	}
 	if rec, found, err := codes.Get(ctx, hash); err != nil || !found || rec.SignUpVerified {
@@ -41,7 +41,7 @@ func TestSignUpRequiresCorrectSignInAndConsumesMarkerOnce(t *testing.T) {
 	if rec, found, err := codes.Get(ctx, hash); err != nil || !found || !rec.SignUpVerified || rec.IssuedUserID != 0 {
 		t.Fatalf("verified record=%+v found=%v err=%v", rec, found, err)
 	}
-	if _, msg, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345"); err != nil || !needSignUp || msg.ID != 0 {
+	if _, msg, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); err != nil || !needSignUp || msg.ID != 0 {
 		t.Fatalf("idempotent SignIn needSignUp=%v message=%+v err=%v", needSignUp, msg, err)
 	}
 	u, _, err := svc.SignUp(ctx, domain.Authorization{}, phone, hash, "Verified", "User")
@@ -166,7 +166,7 @@ func TestOwnerTransferAcrossVerifyInvalidatesHashPermanently(t *testing.T) {
 	codes.afterVerify = func() {
 		_, createErr = users.Create(ctx, domain.User{Phone: phone, FirstName: "NewOwner"})
 	}
-	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345"); !errors.Is(err, ErrCodeInvalid) || needSignUp {
+	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) || needSignUp {
 		t.Fatalf("SignIn across owner transfer needSignUp=%v err=%v, want invalid", needSignUp, err)
 	}
 	if createErr != nil {
@@ -202,7 +202,7 @@ func TestPasswordLookupFailureNeverCreatesOrChangesAuthorization(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendCode: %v", err)
 		}
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, target.Phone, hash, "12345"); !errors.Is(err, lookupErr) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, target.Phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, lookupErr) {
 			t.Fatalf("SignIn err=%v, want password lookup failure", err)
 		}
 		if got, found, err := authz.ByAuthKey(ctx, key); err != nil || found {
@@ -220,7 +220,7 @@ func TestPasswordLookupFailureNeverCreatesOrChangesAuthorization(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendCode: %v", err)
 		}
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, target.Phone, hash, "12345"); !errors.Is(err, lookupErr) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, target.Phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, lookupErr) {
 			t.Fatalf("SignIn err=%v, want password lookup failure", err)
 		}
 		got, found, err := authz.ByAuthKey(ctx, key)
@@ -247,11 +247,11 @@ func TestOwnerTransferAwayAndBackCannotReviveLoginHash(t *testing.T) {
 			t.Fatalf("SendCode: %v", err)
 		}
 		users.setOwnerView(phone, other, true)
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345"); !errors.Is(err, ErrCodeInvalid) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 			t.Fatalf("SignIn after 0->B owner transfer err=%v, want invalid", err)
 		}
 		users.resetOwnerView()
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345"); !errors.Is(err, ErrCodeExpired) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeExpired) {
 			t.Fatalf("SignIn after 0->B->0 err=%v, want expired", err)
 		}
 	})
@@ -278,7 +278,7 @@ func TestOwnerTransferAwayAndBackCannotReviveLoginHash(t *testing.T) {
 			t.Fatalf("ResendCode after A->B err=%v, want invalid", err)
 		}
 		users.resetOwnerView()
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, ownerA.Phone, hash, "12345"); !errors.Is(err, ErrCodeExpired) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, ownerA.Phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeExpired) {
 			t.Fatalf("SignIn after A->B->A err=%v, want expired", err)
 		}
 	})
@@ -305,7 +305,7 @@ func TestOwnerTransferAwayAndBackCannotReviveLoginHash(t *testing.T) {
 			t.Fatalf("CancelCode after A->B err=%v, want invalid", err)
 		}
 		users.resetOwnerView()
-		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, ownerA.Phone, hash, "12345"); !errors.Is(err, ErrCodeExpired) {
+		if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, ownerA.Phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeExpired) {
 			t.Fatalf("SignIn after canceled A->B->A err=%v, want expired", err)
 		}
 	})
@@ -341,10 +341,10 @@ func TestEmailSetupVerificationAuthorizesSignUpWithout777000Message(t *testing.T
 	if _, _, err := authSvc.SignUp(ctx, domain.Authorization{}, phone, hash, "Direct", "Email"); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("SignUp before email setup err=%v, want ErrCodeInvalid", err)
 	}
-	if _, _, _, err := authSvc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345"); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := authSvc.SignIn(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("WebK SignIn with setup-required placeholder err=%v, want ErrCodeInvalid", err)
 	}
-	if _, _, _, err := authSvc.SignInWithEmail(ctx, domain.Authorization{}, phone, hash, "12345"); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := authSvc.SignInWithEmail(ctx, domain.Authorization{}, phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("native SignInWithEmail with setup-required placeholder err=%v, want ErrCodeInvalid", err)
 	}
 	if _, _, err := accountSvc.SendLoginEmailCode(ctx, 0, phone, hash, "new@example.test", true); err != nil {
@@ -363,7 +363,7 @@ func TestEmailSetupVerificationAuthorizesSignUpWithout777000Message(t *testing.T
 	if rec, found, err := codes.Get(ctx, hash); err != nil || !found || !rec.SignUpVerified || rec.Channel != codeChannelEmailLogin {
 		t.Fatalf("email-verified phone code=%+v found=%v err=%v", rec, found, err)
 	}
-	if _, msg, needSignUp, err := authSvc.SignInWithEmail(ctx, domain.Authorization{}, phone, hash, sender.code); err != nil || !needSignUp || msg.ID != 0 {
+	if _, msg, needSignUp, err := authSvc.SignInWithEmail(ctx, domain.Authorization{}, phone, hash, sender.code, testAuthorizationDelivery); err != nil || !needSignUp || msg.ID != 0 {
 		t.Fatalf("SignInWithEmail after setup needSignUp=%v message=%+v err=%v", needSignUp, msg, err)
 	}
 	u, msg, err := authSvc.SignUp(ctx, domain.Authorization{}, phone, hash, "Email", "User")

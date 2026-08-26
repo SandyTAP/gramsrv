@@ -15,6 +15,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
+	"telesrv/internal/store/memory"
 )
 
 func TestAuthLoginTokenAcceptedByAndroidBindsTargetSession(t *testing.T) {
@@ -34,10 +35,11 @@ func TestAuthLoginTokenAcceptedByAndroidBindsTargetSession(t *testing.T) {
 		scannerUserID: {ID: scannerUserID, FirstName: "Alice", Phone: "15550001001"},
 	}}
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Auth:        auth,
-		Sessions:    sessions,
-		Users:       users,
-		LoginTokens: newTestLoginTokenStore(),
+		Auth:           auth,
+		Sessions:       sessions,
+		Users:          users,
+		LoginTokens:    newTestLoginTokenStore(),
+		DeliveryOutbox: memory.NewDeliveryOutboxStore(),
 	}, zaptest.NewLogger(t), clock.System)
 
 	targetCtx := WithClientInfo(
@@ -98,6 +100,9 @@ func TestAuthLoginTokenAcceptedByAndroidBindsTargetSession(t *testing.T) {
 	}
 	if auth.acceptedAuth.DeviceModel != "WebA" {
 		t.Fatalf("accepted device = %q, want WebA", auth.acceptedAuth.DeviceModel)
+	}
+	if len(auth.authorizationEffects) != 1 || auth.authorizationEffects[0].ExcludeAuthKeyID != targetRawAuthKeyID || auth.authorizationEffects[0].ExcludeSessionID != targetSession {
+		t.Fatalf("QR authorization effects = %+v, want target raw key/session exclusion", auth.authorizationEffects)
 	}
 	if authorization.Hash == 0 {
 		t.Fatal("authorization hash is zero")

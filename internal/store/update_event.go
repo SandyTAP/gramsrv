@@ -21,3 +21,9 @@ type EventCursor struct {
 	UserID int64
 	Pts    int
 }
+
+// DispatchUpdateEventStore is the sole Egress event-loading boundary. Durable
+// dispatch never degrades to per-item ListAfter calls.
+type DispatchUpdateEventStore interface {
+	BatchByCursor(ctx context.Context, cursors []EventCursor) ([]domain.UpdateEvent, error)
+}

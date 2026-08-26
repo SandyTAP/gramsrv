@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -22,9 +23,12 @@ func NewPhoneChangeStore(db sqlcgen.DBTX) *PhoneChangeStore {
 	return &PhoneChangeStore{db: db, q: sqlcgen.New(db)}
 }
 
-func (s *PhoneChangeStore) ChangePhone(ctx context.Context, req domain.PhoneChangeRequest) (domain.PhoneChangeResult, error) {
+func (s *PhoneChangeStore) ChangePhoneWithDelivery(ctx context.Context, req domain.PhoneChangeRequest, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.PhoneChangeResult, error) {
 	if s == nil || req.UserID == 0 || !domain.ValidPhone(req.Phone) {
 		return domain.PhoneChangeResult{}, domain.ErrPhoneNumberInvalid
+	}
+	if effects == nil {
+		return domain.PhoneChangeResult{}, store.ErrDeliveryOutboxRequired
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -71,6 +75,21 @@ func (s *PhoneChangeStore) ChangePhone(ctx context.Context, req domain.PhoneChan
 		}
 		return domain.PhoneChangeResult{}, fmt.Errorf("update user phone: %w", err)
 	}
+	updated := userFromModel(row)
+	snapshot, err := userDeliverySnapshotTx(ctx, tx, updated)
+	if err != nil {
+		return domain.PhoneChangeResult{}, fmt.Errorf("load phone change delivery snapshot: %w", err)
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return domain.PhoneChangeResult{}, fmt.Errorf("build phone change delivery: %w", err)
+	}
+	if err := store.ValidatePhoneChangeDeliveryEffects(req, snapshot, intents); err != nil {
+		return domain.PhoneChangeResult{}, err
+	}
+	if err := applyAbsoluteDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.PhoneChangeResult{}, fmt.Errorf("enqueue phone change delivery: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		if isUniqueConstraint(err, "users_phone_unique_idx") {
 			return domain.PhoneChangeResult{}, domain.ErrPhoneNumberOccupied
@@ -78,5 +97,5 @@ func (s *PhoneChangeStore) ChangePhone(ctx context.Context, req domain.PhoneChan
 		return domain.PhoneChangeResult{}, fmt.Errorf("commit phone change: %w", err)
 	}
 	committed = true
-	return domain.PhoneChangeResult{User: userFromModel(row), Changed: true}, nil
+	return domain.PhoneChangeResult{User: updated, Changed: true}, nil
 }

@@ -346,12 +346,12 @@ WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID, sharedMed
 		if err := appendUserUpdateEvent(ctx, tx, q, ref.UserID, event); err != nil {
 			return nil, fmt.Errorf("append channel star gift viewer edit event: %w", err)
 		}
-		excludeAuthKeyID, excludeSessionID := int64(0), int64(0)
+		excludeAuthKeyID, excludeSessionID := [8]byte{}, int64(0)
 		if ref.UserID == originUserID {
-			excludeAuthKeyID = authKeyIDToInt64(originAuthKeyID)
+			excludeAuthKeyID = originAuthKeyID
 			excludeSessionID = originSessionID
 		}
-		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 			TargetUserID: ref.UserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
 			ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
 		}); err != nil {

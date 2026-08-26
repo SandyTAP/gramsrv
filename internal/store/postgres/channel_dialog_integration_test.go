@@ -28,7 +28,7 @@ func TestChannelStoreListDialogsUsesDateAndOffset(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	older, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Older Dialog " + suffix,
@@ -96,7 +96,7 @@ func TestChannelStoreListDialogsWarmsDialogCache(t *testing.T) {
 	})
 
 	cache := NewChannelDialogCache(16)
-	channels := NewChannelStore(pool, WithChannelDialogCache(cache))
+	channels := newTestChannelStore(pool, WithChannelDialogCache(cache))
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Dialog Warm " + suffix,
@@ -149,7 +149,7 @@ func TestChannelStoreListDialogsScansChannelWallpaper(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Dialog Wallpaper " + suffix,
@@ -221,7 +221,7 @@ func TestChannelStoreListDialogsDerivesRecipientTopWithoutWriteFanout(t *testing
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Dialog Top " + suffix,
@@ -238,7 +238,7 @@ func TestChannelStoreListDialogsDerivesRecipientTopWithoutWriteFanout(t *testing
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000331,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial service message: %v", err)
 	}
 	sent, err := channels.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
@@ -314,7 +314,7 @@ FROM unnest($1::bigint[]) AS t(id)`, ids, owner.ID); err != nil {
 		t.Fatalf("bulk insert channel member index: %v", err)
 	}
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	var cursor domain.Dialog
 	var sixth domain.ChannelDialogList
 	for page := 0; page < 6; page++ {
@@ -412,7 +412,7 @@ VALUES ($1, $2, $3, 1, 1700000500)`, owner.ID, archivedID, domain.DialogArchiveF
 		t.Fatalf("archive oldest channel dialog: %v", err)
 	}
 
-	archive, err := NewChannelStore(pool).ListChannelDialogs(ctx, owner.ID, domain.DialogFilter{
+	archive, err := newTestChannelStore(pool).ListChannelDialogs(ctx, owner.ID, domain.DialogFilter{
 		HasFolderID: true,
 		FolderID:    domain.DialogArchiveFolderID,
 		Limit:       10,

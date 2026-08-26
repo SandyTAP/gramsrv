@@ -197,7 +197,7 @@ func (r *Router) onMessagesSetTyping(ctx context.Context, req *tg.MessagesSetTyp
 				}},
 				Date: int(r.clock.Now().Unix()),
 			}
-			r.pushChannelViewerUpdates(ctx, 0, peer.ID, nil, func(int64) *tg.Updates {
+			r.pushTransientChannelViewerUpdates(ctx, 0, peer.ID, nil, func(int64) *tg.Updates {
 				return updates
 			})
 		}

@@ -249,7 +249,7 @@ func TestPublicChannelAndMegagroupPreviewStayReadableForNonMember(t *testing.T) 
 			if _, err := channels.GetChannel(ctx, viewer.ID, public.ID); err != nil {
 				t.Fatalf("public preview became forbidden after participant miss: %v", err)
 			}
-			if _, err := channels.JoinChannel(ctx, viewer.ID, public.ID, 1700004020+i); err != nil {
+			if _, err := channels.JoinChannel(ctx, viewer.ID, public.ID, 1700004020+i, testPendingJoinEffects); err != nil {
 				t.Fatalf("join public peer: %v", err)
 			}
 			if _, err := channels.LeaveChannel(ctx, viewer.ID, public.ID, 1700004030+i); err != nil {

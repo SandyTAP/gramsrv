@@ -14,6 +14,7 @@ import (
 	"telesrv/internal/app/contacts"
 	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 const (
@@ -302,7 +303,7 @@ func (r *Router) onContactsBlock(ctx context.Context, req *tg.ContactsBlockReque
 		}
 	}
 	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-		_ = r.recordPeerSettings(ctx, userID, peer, settings)
+		_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
 	}
 	r.invalidateRPCProjectionForViewer(userID)
 	return true, nil
@@ -336,7 +337,7 @@ func (r *Router) onContactsUnblock(ctx context.Context, req *tg.ContactsUnblockR
 		}
 	}
 	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-		_ = r.recordPeerSettings(ctx, userID, peer, settings)
+		_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
 	}
 	r.invalidateRPCProjectionForViewer(userID)
 	return true, nil
@@ -445,7 +446,7 @@ func (r *Router) applyContactBlocklistChange(ctx context.Context, userID int64, 
 	}
 	if r.deps.Contacts != nil {
 		if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-			_ = r.recordPeerSettings(ctx, userID, peer, settings)
+			_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
 		}
 	}
 	return nil
@@ -595,7 +596,7 @@ func (r *Router) onContactsGetContactIDs(ctx context.Context, hash int64) ([]int
 
 func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputPhoneContact) (*tg.ContactsImportedContacts, error) {
 	if r.deps.Contacts == nil {
-		return &tg.ContactsImportedContacts{}, nil
+		return nil, internalErr()
 	}
 	if len(input) > maxContactImportBatch {
 		return nil, limitInvalidErr()
@@ -623,7 +624,8 @@ func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputP
 			NoteEntities: entities,
 		})
 	}
-	res, err := r.deps.Contacts.ImportContacts(ctx, userID, items)
+	date := int(r.clock.Now().Unix())
+	res, err := r.deps.Contacts.ImportContactsWithDelivery(ctx, userID, items, date, r.contactMutationDeliveryEffects())
 	if err != nil {
 		r.log.Warn("contacts.importContacts service failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int("contacts", len(items)))...)
 		return nil, internalErr()
@@ -640,36 +642,13 @@ func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputP
 	}
 	r.applyPeerReadModels(ctx, userID, out.Users, nil)
 	out.RetryContacts = append(out.RetryContacts, res.RetryContacts...)
-	for _, contact := range res.Contacts {
-		peer := domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}
-		settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer)
-		if err != nil {
-			r.log.Warn("contacts.importContacts peer settings failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int64("peer_user_id", contact.User.ID))...)
-			return nil, internalErr()
-		}
-		if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
-			r.log.Warn("contacts.importContacts record peer settings failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int64("peer_user_id", contact.User.ID))...)
-			return nil, internalErr()
-		}
-		if contact.Mutual {
-			if err := r.recordAcceptedContactTargetUpdates(ctx, userID, contact.User.ID); err != nil {
-				r.log.Warn("contacts.importContacts record accepted target failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int64("peer_user_id", contact.User.ID))...)
-				return nil, err
-			}
-		}
-	}
-	if err := r.recordContactsReset(ctx, userID); err != nil {
-		r.log.Warn("contacts.importContacts record contacts reset failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int("contacts", len(items)))...)
-		return nil, internalErr()
-	}
 	r.invalidateRPCProjectionForViewer(userID)
-	r.pushContactsReset(ctx, userID)
 	return out, nil
 }
 
 func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddContactRequest) (tg.UpdatesClass, error) {
 	if r.deps.Contacts == nil {
-		return &tg.Updates{Date: int(r.clock.Now().Unix())}, nil
+		return nil, internalErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
@@ -690,7 +669,8 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 	if !validContactInput(req.Phone, req.FirstName, req.LastName, note, len(entities)) {
 		return nil, limitInvalidErr()
 	}
-	contact, err := r.deps.Contacts.AddContact(ctx, userID, domain.ContactInput{
+	date := int(r.clock.Now().Unix())
+	contact, err := r.deps.Contacts.AddContactWithDelivery(ctx, userID, domain.ContactInput{
 		ContactUserID:            target.ID,
 		Phone:                    req.Phone,
 		FirstName:                req.FirstName,
@@ -698,7 +678,7 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 		Note:                     note,
 		NoteEntities:             entities,
 		AddPhonePrivacyException: req.AddPhonePrivacyException,
-	})
+	}, date, r.contactMutationDeliveryEffects())
 	if err != nil {
 		return nil, contactErr(err)
 	}
@@ -717,19 +697,7 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 		updates.Updates = append(updates.Updates, &tg.UpdateUser{UserID: peerUser.ID})
 	}
 	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
-	if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
-		return nil, internalErr()
-	}
-	if err := r.recordContactsReset(ctx, userID); err != nil {
-		return nil, internalErr()
-	}
-	if contact.Mutual {
-		if err := r.recordAcceptedContactTargetUpdates(ctx, userID, contact.User.ID); err != nil {
-			return nil, err
-		}
-	}
 	r.invalidateRPCProjectionForViewer(userID)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	if hasNote {
 		r.pushContactNoteRefreshAfterDurableReset(ctx, userID, peerUser)
 	}
@@ -738,7 +706,7 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 
 func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserClass) (tg.UpdatesClass, error) {
 	if r.deps.Contacts == nil {
-		return &tg.Updates{Date: int(r.clock.Now().Unix())}, nil
+		return nil, internalErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
@@ -751,7 +719,8 @@ func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserCla
 	if !found || target.ID == userID {
 		return nil, contactIDInvalidErr()
 	}
-	contact, err := r.deps.Contacts.AcceptContact(ctx, userID, target.ID)
+	date := int(r.clock.Now().Unix())
+	contact, err := r.deps.Contacts.AcceptContactWithDelivery(ctx, userID, target.ID, date, r.contactMutationDeliveryEffects())
 	if err != nil {
 		return nil, contactErr(err)
 	}
@@ -763,25 +732,13 @@ func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserCla
 	peerUser := contactUserForUpdates(contact)
 	updates := r.contactPeerSettingsUpdates(ctx, userID, peerUser, settings, true)
 	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
-	if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
-		return nil, internalErr()
-	}
-	if err := r.recordContactsReset(ctx, userID); err != nil {
-		return nil, internalErr()
-	}
-
-	if err := r.recordAcceptedContactTargetUpdates(ctx, userID, target.ID); err != nil {
-		return nil, err
-	}
-
 	r.invalidateRPCProjectionForViewer(userID)
-	r.requireReliableDispatchForUserUpdate(ctx, userID, updates)
 	return updates, nil
 }
 
 func (r *Router) onContactsDeleteContacts(ctx context.Context, ids []tg.InputUserClass) (tg.UpdatesClass, error) {
 	if r.deps.Contacts == nil {
-		return &tg.Updates{Date: int(r.clock.Now().Unix())}, nil
+		return nil, internalErr()
 	}
 	if len(ids) > maxContactDeleteBatch {
 		return nil, limitInvalidErr()
@@ -806,15 +763,17 @@ func (r *Router) onContactsDeleteContacts(ctx context.Context, ids []tg.InputUse
 		if !found || u.ID == userID {
 			continue
 		}
+		if _, ok := seen[u.ID]; ok {
+			continue
+		}
+		seen[u.ID] = struct{}{}
 		contactIDs = append(contactIDs, u.ID)
 		u.Contact = false
 		u.Mutual = false
-		if _, ok := seen[u.ID]; !ok {
-			users = append(users, r.tgUser(u))
-			seen[u.ID] = struct{}{}
-		}
+		users = append(users, r.tgUser(u))
 	}
-	if _, err := r.deps.Contacts.DeleteContacts(ctx, userID, contactIDs); err != nil {
+	date := int(r.clock.Now().Unix())
+	if _, err := r.deps.Contacts.DeleteContactsWithDelivery(ctx, userID, contactIDs, date, r.contactMutationDeliveryEffects()); err != nil {
 		return nil, internalErr()
 	}
 	updates := make([]tg.UpdateClass, 0, len(contactIDs))
@@ -825,26 +784,17 @@ func (r *Router) onContactsDeleteContacts(ctx context.Context, ids []tg.InputUse
 		})
 	}
 	if len(contactIDs) > 0 {
-		for _, id := range contactIDs {
-			if err := r.recordPeerSettings(ctx, userID, domain.Peer{Type: domain.PeerTypeUser, ID: id}, domain.PeerSettings{AddContact: true, BlockContact: true}); err != nil {
-				return nil, internalErr()
-			}
-		}
 		updates = append(updates, &tg.UpdateContactsReset{})
-		if err := r.recordContactsReset(ctx, userID); err != nil {
-			return nil, internalErr()
-		}
 	}
 	r.invalidateRPCProjectionForViewer(userID)
 	r.applyUsernamesToPeerObjects(ctx, users, nil)
-	out := &tg.Updates{Updates: updates, Users: users, Date: int(r.clock.Now().Unix())}
-	r.requireReliableDispatchForUserUpdate(ctx, userID, out)
+	out := &tg.Updates{Updates: updates, Users: users, Date: date}
 	return out, nil
 }
 
 func (r *Router) onContactsUpdateContactNote(ctx context.Context, req *tg.ContactsUpdateContactNoteRequest) (bool, error) {
 	if r.deps.Contacts == nil {
-		return true, nil
+		return false, internalErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
@@ -861,12 +811,10 @@ func (r *Router) onContactsUpdateContactNote(ctx context.Context, req *tg.Contac
 	if err != nil {
 		return false, err
 	}
-	contact, err := r.deps.Contacts.UpdateContactNote(ctx, userID, target.ID, note, entities)
+	date := int(r.clock.Now().Unix())
+	contact, err := r.deps.Contacts.UpdateContactNoteWithDelivery(ctx, userID, target.ID, note, entities, date, r.contactMutationDeliveryEffects())
 	if err != nil {
 		return false, contactErr(err)
-	}
-	if err := r.recordContactsReset(ctx, userID); err != nil {
-		return false, internalErr()
 	}
 	r.invalidateRPCProjectionForViewer(userID)
 	peerUser := contactUserForUpdates(contact)
@@ -1080,7 +1028,7 @@ func (r *Router) contactNoteRefreshUpdates(ctx context.Context, viewerUserID int
 // other loaded TDesktop profiles refetch users.getFullUser immediately. Offline
 // correctness does not depend on it.
 func (r *Router) pushContactNoteRefreshAfterDurableReset(ctx context.Context, userID int64, peerUser domain.User) {
-	if r.deps.Updates == nil || peerUser.ID == 0 {
+	if peerUser.ID == 0 {
 		return
 	}
 	r.pushUserMessageTransient(
@@ -1089,6 +1037,29 @@ func (r *Router) pushContactNoteRefreshAfterDurableReset(ctx context.Context, us
 		"push contact note full-user refresh",
 		r.contactNoteRefreshUpdates(ctx, userID, peerUser, int(r.clock.Now().Unix()), false),
 	)
+}
+
+func (r *Router) contactMutationDeliveryEffects() store.DeliveryEffectsBuilder[store.ContactMutationSnapshot] {
+	return func(snapshot store.ContactMutationSnapshot) ([]store.DeliveryEffect, error) {
+		out := make([]store.DeliveryEffect, 0, len(snapshot.RequiredEvents)+1)
+		for _, required := range snapshot.RequiredEvents {
+			out = append(out, store.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, [8]byte{}, 0))
+		}
+		if snapshot.PhonePrivacyChanged {
+			if snapshot.PhonePrivacyRules == nil {
+				return nil, store.ErrContactMutationInvalid
+			}
+			payload, err := r.privacyDeliveryPayloadBuilder()(*snapshot.PhonePrivacyRules)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: snapshot.OwnerUserID, Payload: payload,
+				RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			}))
+		}
+		return out, nil
+	}
 }
 
 func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, peerUser domain.User, settings domain.PeerSettings, includeSelf bool) *tg.Updates {
@@ -1114,90 +1085,23 @@ func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, p
 	return out
 }
 
-func (r *Router) recordAcceptedContactTargetUpdates(ctx context.Context, userID, targetUserID int64) error {
-	if targetUserID == 0 || targetUserID == userID {
-		return nil
-	}
-	peer := domain.Peer{Type: domain.PeerTypeUser, ID: userID}
-	settings, err := r.deps.Contacts.GetPeerSettings(ctx, targetUserID, peer)
-	if err != nil {
-		return internalErr()
-	}
-	var zeroAuthKeyID [8]byte
-	if err := r.recordPeerSettingsForUser(ctx, zeroAuthKeyID, targetUserID, peer, settings, zeroAuthKeyID, 0); err != nil {
-		return internalErr()
-	}
-	if err := r.recordContactsResetForUser(ctx, zeroAuthKeyID, targetUserID, zeroAuthKeyID, 0); err != nil {
-		return internalErr()
-	}
-	peerUser := domain.User{ID: userID}
-	if r.deps.Users != nil {
-		u, found, err := r.deps.Users.ByID(ctx, targetUserID, userID)
-		if err != nil {
-			return internalErr()
-		}
-		if found {
-			peerUser = u
-		}
-	}
-	updates := r.contactPeerSettingsUpdates(ctx, targetUserID, peerUser, settings, true)
-	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
-	r.requireReliableDispatchForUserUpdate(ctx, targetUserID, updates)
-	return nil
-}
-
-func (r *Router) pushContactsReset(ctx context.Context, userID int64) {
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateContactsReset{}},
-		Date:    int(r.clock.Now().Unix()),
-		Seq:     0,
-	})
-}
-
-func (r *Router) recordContactsReset(ctx context.Context, userID int64) error {
+// recordBlockPeerSettings is retained only for the separately scoped blocklist
+// aggregate; contact relationship mutations never call this RPC-side recorder.
+func (r *Router) recordBlockPeerSettings(ctx context.Context, userID int64, peer domain.Peer, settings domain.PeerSettings) error {
 	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	return r.recordContactsResetForUser(ctx, authKeyID, userID, rawAuthKeyIDForOrigin(ctx), sessionID)
-}
-
-func (r *Router) recordContactsResetForUser(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	event, _, err := r.deps.Updates.RecordContactsReset(ctx, stateAuthKeyID, userID, excludeAuthKeyID, excludeSessionID)
-	if err == nil && excludeSessionID != 0 {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	}
+	_, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, [8]byte{}, 0)
 	return err
-}
-
-func (r *Router) recordPeerSettings(ctx context.Context, userID int64, peer domain.Peer, settings domain.PeerSettings) error {
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	return r.recordPeerSettingsForUser(ctx, authKeyID, userID, peer, settings, rawAuthKeyIDForOrigin(ctx), sessionID)
 }
 
 func (r *Router) recordPeerStoryBlocked(ctx context.Context, userID int64, peer domain.Peer, blocked bool) error {
 	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	event, _, err := r.deps.Updates.RecordPeerStoryBlocked(ctx, authKeyID, userID, peer, blocked, rawAuthKeyIDForOrigin(ctx), sessionID)
-	if err == nil && sessionID != 0 {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	}
-	return err
-}
-
-func (r *Router) recordPeerSettingsForUser(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
-	if r.deps.Updates == nil || userID == 0 {
-		return nil
-	}
-	event, _, err := r.deps.Updates.RecordPeerSettings(ctx, stateAuthKeyID, userID, peer, settings, excludeAuthKeyID, excludeSessionID)
-	if err == nil && excludeSessionID != 0 {
-		r.bookkeepAuxPtsForCurrentSession(ctx, event)
-	}
+	_, _, err := r.deps.Updates.RecordPeerStoryBlocked(ctx, authKeyID, userID, peer, blocked, [8]byte{}, 0)
 	return err
 }
 
@@ -1216,10 +1120,6 @@ func (r *Router) requireReliableDispatchForUserUpdate(_ context.Context, userID 
 		zap.Int64("user_id", userID),
 		zap.Int("updates", count),
 	)
-}
-
-func (r *Router) pushUserUpdates(ctx context.Context, userID int64, updates *tg.Updates) int {
-	return r.pushUserMessage(ctx, userID, "push user updates", updates)
 }
 
 func tgPeerSettings(settings domain.PeerSettings) tg.PeerSettings {

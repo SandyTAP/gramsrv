@@ -304,10 +304,7 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 		return r.onMessagesGetMyStickers(ctx, layerRequest)
 	})
 	registerRPC[*tg.MessagesGetArchivedStickersRequest](d, tlprofile.SemanticMethodMessagesGetArchivedStickers, func(ctx context.Context, req *tg.MessagesGetArchivedStickersRequest) (any, error) {
-		return &tg.MessagesArchivedStickers{
-			Count: 0,
-			Sets:  []tg.StickerSetCoveredClass{},
-		}, nil
+		return r.onMessagesGetArchivedStickers(ctx, req)
 	})
 	registerRPC[*tg.MessagesGetStickerSetRequest](d, tlprofile.SemanticMethodMessagesGetStickerSet, func(ctx context.Context, layerRequest *tg.MessagesGetStickerSetRequest) (any, error) {
 		return r.onMessagesGetStickerSet(ctx, layerRequest)
@@ -667,50 +664,41 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 		}
 		peer, peerErr := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
 		if peerErr == nil && peer.Type == domain.PeerTypeChannel && r.deps.Channels != nil {
-			read, err := r.deps.Channels.ReadHistory(ctx, userID, domain.ReadChannelHistoryRequest{
+			if err := r.requireAccountDelivery(userID, "messages.readHistory.channel"); err != nil {
+				return nil, err
+			}
+			date := int(r.clock.Now().Unix())
+			_, err := r.deps.Channels.ReadHistory(ctx, userID, domain.ReadChannelHistoryRequest{
 				UserID:    userID,
 				ChannelID: peer.ID,
 				MaxID:     req.MaxID,
-				Date:      int(r.clock.Now().Unix()),
-			})
+				Date:      date,
+			}, channelReadDeliveryEffects(date))
 			if err != nil {
 				return nil, channelInvalidErr(err)
-			}
-			event, err := r.recordChannelReadInbox(ctx, userID, read)
-			if err != nil {
-				return nil, err
-			}
-			r.pushChannelReadOutboxUpdates(ctx, read.ChannelID, read.OutboxUpdates)
-			r.advanceForumGeneralReadAfterChannelRead(ctx, userID, read)
-			if event.Pts != 0 {
-				return &tg.MessagesAffectedMessages{Pts: event.Pts, PtsCount: event.PtsCount}, nil
 			}
 			return r.affectedMessages(ctx, id, userID)
 		}
 		if peerErr != nil {
 			return nil, peerErr
 		}
-		if r.deps.Messages != nil {
-			sessionID, _ := SessionIDFrom(ctx)
-			read, err := r.deps.Messages.ReadHistory(ctx, userID, domain.ReadHistoryRequest{
-				OwnerUserID:     userID,
-				Peer:            peer,
-				MaxID:           req.MaxID,
-				Date:            int(r.clock.Now().Unix()),
-				OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
-				OriginSessionID: sessionID,
-			})
-			if err != nil {
-				return nil, internalErr()
-			}
-			if read.Changed && read.InboxEvent.Pts != 0 {
-				r.pushCurrentReadHistoryEvent(ctx, read.InboxEvent)
-				r.pushReadHistoryEvent(ctx, read.OwnerUserID, read.InboxEvent)
-				if read.OutboxChanged && read.OutboxEvent.Pts != 0 {
-					r.pushReadHistoryEvent(ctx, read.OutboxUserID, read.OutboxEvent)
-				}
-				return &tg.MessagesAffectedMessages{Pts: read.InboxEvent.Pts, PtsCount: read.InboxEvent.PtsCount}, nil
-			}
+		if r.deps.Messages == nil {
+			return nil, internalErr()
+		}
+		sessionID, _ := SessionIDFrom(ctx)
+		read, err := r.deps.Messages.ReadHistory(ctx, userID, domain.ReadHistoryRequest{
+			OwnerUserID:     userID,
+			Peer:            peer,
+			MaxID:           req.MaxID,
+			Date:            int(r.clock.Now().Unix()),
+			OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
+			OriginSessionID: sessionID,
+		})
+		if err != nil {
+			return nil, internalErr()
+		}
+		if read.Changed && read.InboxEvent.Pts != 0 {
+			return &tg.MessagesAffectedMessages{Pts: read.InboxEvent.Pts, PtsCount: read.InboxEvent.PtsCount}, nil
 		}
 		return r.affectedMessages(ctx, id, userID)
 	})

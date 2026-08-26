@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
 
 // TestStickerCollectionsRoundTripPostgres 回归迁移 0006：个人贴纸/GIF 集合持久化
@@ -15,15 +16,19 @@ func TestStickerCollectionsRoundTripPostgres(t *testing.T) {
 	store := NewPasswordStore(pool)
 
 	const owner = int64(778899001)
-	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DELETE FROM user_sticker_collections WHERE owner_user_id = $1", owner) })
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox_lanes WHERE stream_id = $1", owner)
+		_, _ = pool.Exec(ctx, "DELETE FROM edge_delivery_outbox WHERE target_user_id = $1", owner)
+		_, _ = pool.Exec(ctx, "DELETE FROM user_sticker_collections WHERE owner_user_id = $1", owner)
+	})
 	_, _ = pool.Exec(ctx, "DELETE FROM user_sticker_collections WHERE owner_user_id = $1", owner)
 
 	faved := domain.StickerCollectionFaved
 	// fave 101 then 102 → 最新在前。
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 101, false, 1000, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationSave, DocumentID: 101, Date: 1000}); err != nil {
 		t.Fatalf("fave 101: %v", err)
 	}
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 102, false, 1001, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationSave, DocumentID: 102, Date: 1001}); err != nil {
 		t.Fatalf("fave 102: %v", err)
 	}
 	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 2 || ids[0] != 102 || ids[1] != 101 {
@@ -31,7 +36,7 @@ func TestStickerCollectionsRoundTripPostgres(t *testing.T) {
 	}
 
 	// 重 fave 101（更新 used_at）→ 移到最前。
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 101, false, 1002, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationSave, DocumentID: 101, Date: 1002}); err != nil {
 		t.Fatalf("re-fave 101: %v", err)
 	}
 	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 2 || ids[0] != 101 {
@@ -39,26 +44,32 @@ func TestStickerCollectionsRoundTripPostgres(t *testing.T) {
 	}
 
 	// used_at 只有秒精度：同秒保存仍必须严格按最后一次 mutation 排序。
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 102, false, 3000, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationSave, DocumentID: 102, Date: 3000}); err != nil {
 		t.Fatalf("same-second fave 102: %v", err)
 	}
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 101, false, 3000, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationSave, DocumentID: 101, Date: 3000}); err != nil {
 		t.Fatalf("same-second re-fave 101: %v", err)
 	}
 	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 2 || ids[0] != 101 || ids[1] != 102 {
 		t.Fatalf("same-second order = %v, want [101 102]", ids)
 	}
 
-	// 截断：max=2，加第 3 个挤掉最旧。
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 103, false, 1003, 2); err != nil {
-		t.Fatalf("fave 103 (max 2): %v", err)
+	// Capacity is a domain invariant; callers cannot override it. Exercise the
+	// smaller recent-attached cap without a test-only max parameter.
+	for i := 1; i <= domain.MaxRecentStickers+1; i++ {
+		if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{
+			OwnerUserID: owner, Kind: domain.StickerCollectionRecentAttached,
+			Mutation: domain.StickerCollectionMutationSave, DocumentID: int64(10_000 + i), Date: 1003 + i,
+		}); err != nil {
+			t.Fatalf("save recent-attached %d: %v", i, err)
+		}
 	}
-	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 2 || ids[0] != 103 || ids[1] != 101 {
-		t.Fatalf("faved after trim = %v, want [103 101]", ids)
+	if ids := stickerIDs(t, store, ctx, owner, domain.StickerCollectionRecentAttached); len(ids) != domain.MaxRecentStickers || ids[0] != 10_000+domain.MaxRecentStickers+1 {
+		t.Fatalf("recent-attached after trim = %v", ids)
 	}
 
 	// 类别隔离：recent 与 faved 独立。
-	if err := store.SaveStickerCollectionItem(ctx, owner, domain.StickerCollectionRecent, 999, false, 2000, 30); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: domain.StickerCollectionRecent, Mutation: domain.StickerCollectionMutationSave, DocumentID: 999, Date: 2000}); err != nil {
 		t.Fatalf("save recent: %v", err)
 	}
 	if ids := stickerIDs(t, store, ctx, owner, domain.StickerCollectionRecent); len(ids) != 1 || ids[0] != 999 {
@@ -69,13 +80,13 @@ func TestStickerCollectionsRoundTripPostgres(t *testing.T) {
 	}
 
 	// unsave + clear。
-	if err := store.SaveStickerCollectionItem(ctx, owner, faved, 101, true, 0, 100); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationUnsave, DocumentID: 101}); err != nil {
 		t.Fatalf("unsave 101: %v", err)
 	}
-	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 1 || ids[0] != 103 {
-		t.Fatalf("faved after unsave = %v, want [103]", ids)
+	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 1 || ids[0] != 102 {
+		t.Fatalf("faved after unsave = %v, want [102]", ids)
 	}
-	if err := store.ClearStickerCollection(ctx, owner, faved); err != nil {
+	if err := mutateStickerCollectionPG(ctx, store, domain.StickerCollectionMutation{OwnerUserID: owner, Kind: faved, Mutation: domain.StickerCollectionMutationClear}); err != nil {
 		t.Fatalf("clear faved: %v", err)
 	}
 	if ids := stickerIDs(t, store, ctx, owner, faved); len(ids) != 0 {
@@ -85,6 +96,14 @@ func TestStickerCollectionsRoundTripPostgres(t *testing.T) {
 	if ids := stickerIDs(t, store, ctx, owner, domain.StickerCollectionRecent); len(ids) != 1 {
 		t.Fatalf("recent gone after clearing faved: %v", ids)
 	}
+}
+
+func mutateStickerCollectionPG(ctx context.Context, passwordStore *PasswordStore, mutation domain.StickerCollectionMutation) error {
+	return passwordStore.MutateStickerCollection(ctx, mutation, func(domain.StickerCollectionMutation) ([]storepkg.DeliveryEffect, error) {
+		return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: mutation.OwnerUserID, Payload: []byte{1}, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	})
 }
 
 func stickerIDs(t *testing.T, store *PasswordStore, ctx context.Context, owner int64, kind domain.StickerCollectionKind) []int64 {

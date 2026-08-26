@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestContactProjectionForViewerUserIDsPostgresDoesNotCrossPairs(t *testing.T) {
@@ -58,7 +59,11 @@ func TestContactProjectionForViewerUserIDsPostgresDoesNotCrossPairs(t *testing.T
 		}); err != nil {
 			t.Fatalf("Upsert %d->%d: %v", row.viewer, row.owner, err)
 		}
-		if _, found, err := contacts.SetPersonalPhoto(ctx, row.viewer, row.owner, row.photo, 1700000001); err != nil || !found {
+		if _, found, err := contacts.SetPersonalPhotoWithDelivery(ctx, row.viewer, row.owner, row.photo, 1700000001, func(snapshot store.ContactPersonalPhotoDeliverySnapshot) ([]store.DeliveryEffect, error) {
+			return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: snapshot.ViewerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})}, nil
+		}); err != nil || !found {
 			t.Fatalf("SetPersonalPhoto %d->%d: found=%v err=%v", row.viewer, row.owner, found, err)
 		}
 	}

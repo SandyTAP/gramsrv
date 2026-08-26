@@ -51,17 +51,10 @@ func TestAccountResetAuthorizationKeepsProtocolKeyAndReturnsRPC401(t *testing.T)
 		t.Fatalf("bind target authorization: %v", err)
 	}
 
-	r := New(Config{}, Deps{
-		Auth:  authService,
-		Files: &fakeFiles{},
-	}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{Auth: authService}, zaptest.NewLogger(t), clock.System)
 
 	var warmTarget bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{
-		FileID:   1,
-		FilePart: 0,
-		Bytes:    []byte{1},
-	}).Encode(&warmTarget); err != nil {
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&warmTarget); err != nil {
 		t.Fatalf("encode target warm-up RPC: %v", err)
 	}
 	if _, err := r.Dispatch(ctx, targetAuthKeyID, 101, &warmTarget); err != nil {
@@ -89,11 +82,7 @@ func TestAccountResetAuthorizationKeepsProtocolKeyAndReturnsRPC401(t *testing.T)
 	}
 
 	var afterRevoke bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{
-		FileID:   1,
-		FilePart: 1,
-		Bytes:    []byte{2},
-	}).Encode(&afterRevoke); err != nil {
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&afterRevoke); err != nil {
 		t.Fatalf("encode target post-revoke RPC: %v", err)
 	}
 	if _, err := r.Dispatch(ctx, targetAuthKeyID, 103, &afterRevoke); !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {

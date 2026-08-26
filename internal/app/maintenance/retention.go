@@ -7,11 +7,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// DispatchOutboxRetentionStore 清理彻底失败（已放弃重试）的 outbox 死任务。
-type DispatchOutboxRetentionStore interface {
-	DeleteFailed(ctx context.Context, olderThan time.Duration, limit int) (int, error)
-}
-
 // TempAuthKeyRetentionStore 回收过期的 PFS temp auth key（含未绑定 key）。
 type TempAuthKeyRetentionStore interface {
 	DeleteExpired(ctx context.Context, expiredBefore int64, limit int) (int, error)
@@ -30,13 +25,9 @@ type OrphanAuthKeyRetentionStore interface {
 	DeleteOrphaned(ctx context.Context, olderThan time.Duration, limit int, protected [][8]byte) (int, error)
 }
 
-type ActiveRawAuthKeyProvider interface {
-	ActiveRawAuthKeyIDs() [][8]byte
-}
-
 // ActiveRawAuthKeySnapshotProvider exposes the distributed active raw-key
-// snapshot. Unlike the legacy in-process provider, it can fail; orphan auth-key
-// GC must stop for that pass rather than delete against an incomplete view.
+// snapshot. It can fail; orphan auth-key GC must stop for that pass rather than
+// delete against an incomplete view.
 type ActiveRawAuthKeySnapshotProvider interface {
 	ActiveRawAuthKeySnapshot(ctx context.Context) ([][8]byte, error)
 }
@@ -96,14 +87,6 @@ const botAPIConfirmedGrace = 15 * time.Minute
 // 晚一天删除用于吸收客户端轮换/诊断窗口，不会延长协议有效期。
 const tempAuthKeyExpiryGrace = 24 * time.Hour
 
-const (
-	// terminal failed outbox 只承担短期诊断隔离；它不是 durable update log。
-	// 删除该任务会由 head trigger 立即放行同账号下一 pts，而 user_update_events
-	// 继续保留，在线漏推由正常 difference 路径补偿。
-	defaultOutboxPoisonRetention = time.Minute
-	defaultOutboxPoisonInterval  = 15 * time.Second
-)
-
 // RetentionWorker 周期性回收存储中的死数据。
 //
 // 注意：TDesktop 不支持账号级 updates.differenceTooLong（api_updates.cpp 收到该响应只
@@ -112,8 +95,6 @@ const (
 // 前缀；落后或缺 state 的任一设备都会把 floor 压回 0。客户端偶然带回已确认前的旧 pts 时，
 // updates 服务通过普通 differenceSlice checkpoint 推进，不发送 differenceTooLong。
 type RetentionWorker struct {
-	outbox                      DispatchOutboxRetentionStore
-	edgeDeliveryOutbox          DispatchOutboxRetentionStore
 	tempKeys                    TempAuthKeyRetentionStore // 可为 nil（不回收 temp key 绑定）
 	authKeySessionLayers        AuthKeySessionLayerRetentionStore
 	botAPIUpdates               BotAPIUpdateRetentionStore // 可为 nil（不回收 Bot API 队列）
@@ -124,7 +105,6 @@ type RetentionWorker struct {
 	authDeliveryReports         AuthDeliveryReportRetentionStore
 	moderation                  ModerationRetentionStore
 	orphanAuthKeys              OrphanAuthKeyRetentionStore
-	activeAuthKeys              ActiveRawAuthKeyProvider
 	activeAuthKeySnapshot       ActiveRawAuthKeySnapshotProvider
 	activeAuthKeyHeartbeat      ActiveAuthKeyHeartbeatStore
 	logger                      *zap.Logger
@@ -133,13 +113,11 @@ type RetentionWorker struct {
 	orphanRetention             time.Duration
 	clientTelemetryRetention    time.Duration
 	authDeliveryReportRetention time.Duration
-	outboxPoisonRetention       time.Duration
-	outboxPoisonInterval        time.Duration
 	interval                    time.Duration
 	batch                       int
 }
 
-func NewRetentionWorker(outbox DispatchOutboxRetentionStore, tempKeys TempAuthKeyRetentionStore, logger *zap.Logger, retention, interval time.Duration, batch int) *RetentionWorker {
+func NewRetentionWorker(tempKeys TempAuthKeyRetentionStore, logger *zap.Logger, retention, interval time.Duration, batch int) *RetentionWorker {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -153,38 +131,12 @@ func NewRetentionWorker(outbox DispatchOutboxRetentionStore, tempKeys TempAuthKe
 		batch = 10000
 	}
 	return &RetentionWorker{
-		outbox:                outbox,
-		tempKeys:              tempKeys,
-		logger:                logger,
-		retention:             retention,
-		outboxPoisonRetention: defaultOutboxPoisonRetention,
-		outboxPoisonInterval:  defaultOutboxPoisonInterval,
-		interval:              interval,
-		batch:                 batch,
+		tempKeys:  tempKeys,
+		logger:    logger,
+		retention: retention,
+		interval:  interval,
+		batch:     batch,
 	}
-}
-
-// WithDispatchOutboxPoisonPolicy 配置 terminal failed head 的独立短隔离与清理周期。
-// 该周期不能复用 durable update 的周级保留期，否则一条确定性构造错误会冻结该
-// 用户整条在线 pts lane。<=0 分别回退到 1m/15s 的安全默认值。
-func (w *RetentionWorker) WithDispatchOutboxPoisonPolicy(retention, interval time.Duration) *RetentionWorker {
-	if retention <= 0 {
-		retention = defaultOutboxPoisonRetention
-	}
-	if interval <= 0 {
-		interval = defaultOutboxPoisonInterval
-	}
-	w.outboxPoisonRetention = retention
-	w.outboxPoisonInterval = interval
-	return w
-}
-
-// WithEdgeDeliveryOutboxPoisonStore enables the same short terminal-failed
-// cleanup policy for non-PTS edge_delivery_outbox rows. It is deliberately
-// wired separately so startup cannot accidentally bound only the PTS lane.
-func (w *RetentionWorker) WithEdgeDeliveryOutboxPoisonStore(store DispatchOutboxRetentionStore) *RetentionWorker {
-	w.edgeDeliveryOutbox = store
-	return w
 }
 
 // WithBotAPIUpdateRetention 启用 bot_api_updates 队列回收；retention <=0 时用官方语义默认 24h。
@@ -251,10 +203,9 @@ func (w *RetentionWorker) WithModerationRetention(store ModerationRetentionStore
 
 // WithOrphanAuthKeyRetention 启用未授权握手 key 的有界回收。active 必须提供 raw key，
 // 不能提供 temp→perm business key；否则未登录或 PFS 连接会被误判为 orphan。
-func (w *RetentionWorker) WithOrphanAuthKeyRetention(store OrphanAuthKeyRetentionStore, active ActiveRawAuthKeyProvider, retention time.Duration) *RetentionWorker {
+func (w *RetentionWorker) WithOrphanAuthKeyRetention(store OrphanAuthKeyRetentionStore, active ActiveRawAuthKeySnapshotProvider, retention time.Duration) *RetentionWorker {
 	w.orphanAuthKeys = store
-	w.activeAuthKeys = active
-	w.activeAuthKeySnapshot, _ = active.(ActiveRawAuthKeySnapshotProvider)
+	w.activeAuthKeySnapshot = active
 	w.activeAuthKeyHeartbeat, _ = store.(ActiveAuthKeyHeartbeatStore)
 	w.orphanRetention = retention
 	return w
@@ -264,8 +215,6 @@ func (w *RetentionWorker) Run(ctx context.Context) {
 	w.runOnce(ctx)
 	retentionTicker := time.NewTicker(w.interval)
 	defer retentionTicker.Stop()
-	poisonTicker := time.NewTicker(w.outboxPoisonInterval)
-	defer poisonTicker.Stop()
 	var (
 		heartbeatTicker *time.Ticker
 		heartbeatC      <-chan time.Time
@@ -281,8 +230,6 @@ func (w *RetentionWorker) Run(ctx context.Context) {
 			return
 		case <-retentionTicker.C:
 			w.runRetentionOnce(ctx)
-		case <-poisonTicker.C:
-			w.runOutboxPoisonOnce(ctx)
 		case <-heartbeatC:
 			w.heartbeatActiveAuthKeys(ctx)
 		}
@@ -290,37 +237,7 @@ func (w *RetentionWorker) Run(ctx context.Context) {
 }
 
 func (w *RetentionWorker) runOnce(ctx context.Context) {
-	w.runOutboxPoisonOnce(ctx)
 	w.runRetentionOnce(ctx)
-}
-
-func (w *RetentionWorker) runOutboxPoisonOnce(ctx context.Context) {
-	w.runOutboxPoisonStore(ctx, w.outbox, "dispatch_outbox")
-	w.runOutboxPoisonStore(ctx, w.edgeDeliveryOutbox, "edge_delivery_outbox")
-}
-
-func (w *RetentionWorker) runOutboxPoisonStore(ctx context.Context, store DispatchOutboxRetentionStore, table string) {
-	if store == nil {
-		return
-	}
-	outboxDeleted, err := store.DeleteFailed(ctx, w.outboxPoisonRetention, w.batch)
-	if err != nil {
-		w.logger.Error("清理 terminal failed outbox 失败",
-			zap.String("signal", table+"_poison_cleanup_failed"),
-			zap.String("outbox", table),
-			zap.Duration("quarantine", w.outboxPoisonRetention),
-			zap.Error(err),
-		)
-	} else if outboxDeleted > 0 {
-		// Error 级结构化信号刻意保留：发生 terminal failed 代表确定性编码、事件缺失
-		// 或其它不可自动重试故障。任务删除只解冻在线 lane，不会删除 durable event。
-		w.logger.Error("terminal failed outbox 已结束隔离并释放用户 lane",
-			zap.String("signal", table+"_poison_released"),
-			zap.String("outbox", table),
-			zap.Int("deleted", outboxDeleted),
-			zap.Duration("quarantine", w.outboxPoisonRetention),
-		)
-	}
 }
 
 func (w *RetentionWorker) runRetentionOnce(ctx context.Context) {
@@ -438,7 +355,7 @@ func (w *RetentionWorker) runRetentionOnce(ctx context.Context) {
 }
 
 func (w *RetentionWorker) orphanHeartbeatInterval() time.Duration {
-	if w.activeAuthKeyHeartbeat == nil || (w.activeAuthKeys == nil && w.activeAuthKeySnapshot == nil) || w.orphanRetention <= 0 {
+	if w.activeAuthKeyHeartbeat == nil || w.activeAuthKeySnapshot == nil || w.orphanRetention <= 0 {
 		return 0
 	}
 	interval := w.orphanRetention / 3
@@ -452,7 +369,7 @@ func (w *RetentionWorker) orphanHeartbeatInterval() time.Duration {
 }
 
 func (w *RetentionWorker) heartbeatActiveAuthKeys(ctx context.Context) {
-	if w.activeAuthKeys == nil && w.activeAuthKeySnapshot == nil {
+	if w.activeAuthKeySnapshot == nil {
 		return
 	}
 	protected, ok := w.activeRawAuthKeySnapshot(ctx)
@@ -462,11 +379,14 @@ func (w *RetentionWorker) heartbeatActiveAuthKeys(ctx context.Context) {
 	w.touchActiveAuthKeys(ctx, protected)
 }
 
-// touchActiveAuthKeys returns false only when a configured durable heartbeat failed. A store that
-// predates the optional heartbeat interface keeps single-instance behavior.
+// touchActiveAuthKeys requires the durable database heartbeat boundary. Orphan
+// deletion is unsafe without both the distributed snapshot and that heartbeat.
 func (w *RetentionWorker) touchActiveAuthKeys(ctx context.Context, protected [][8]byte) bool {
 	if w.activeAuthKeyHeartbeat == nil {
-		return true
+		w.logger.Error("缺少 active raw auth key heartbeat，本轮跳过 orphan GC",
+			zap.String("signal", "active_raw_auth_key_heartbeat_missing"),
+		)
+		return false
 	}
 	if err := w.activeAuthKeyHeartbeat.TouchActiveRawAuthKeys(ctx, protected); err != nil {
 		w.logger.Error("刷新 active raw auth key heartbeat 失败，本轮跳过 orphan GC",
@@ -480,21 +400,21 @@ func (w *RetentionWorker) touchActiveAuthKeys(ctx context.Context, protected [][
 }
 
 func (w *RetentionWorker) activeRawAuthKeySnapshot(ctx context.Context) ([][8]byte, bool) {
-	if w.activeAuthKeySnapshot != nil {
-		protected, err := w.activeAuthKeySnapshot.ActiveRawAuthKeySnapshot(ctx)
-		if err != nil {
-			w.logger.Error("读取 active raw auth key snapshot 失败，本轮跳过 orphan GC",
-				zap.String("signal", "active_raw_auth_key_snapshot_failed"),
-				zap.Error(err),
-			)
-			return nil, false
-		}
-		return compactRawAuthKeyIDs(protected), true
+	if w.activeAuthKeySnapshot == nil {
+		w.logger.Error("缺少 active raw auth key snapshot，本轮跳过 orphan GC",
+			zap.String("signal", "active_raw_auth_key_snapshot_missing"),
+		)
+		return nil, false
 	}
-	if w.activeAuthKeys == nil {
-		return nil, true
+	protected, err := w.activeAuthKeySnapshot.ActiveRawAuthKeySnapshot(ctx)
+	if err != nil {
+		w.logger.Error("读取 active raw auth key snapshot 失败，本轮跳过 orphan GC",
+			zap.String("signal", "active_raw_auth_key_snapshot_failed"),
+			zap.Error(err),
+		)
+		return nil, false
 	}
-	return compactRawAuthKeyIDs(w.activeAuthKeys.ActiveRawAuthKeyIDs()), true
+	return compactRawAuthKeyIDs(protected), true
 }
 
 func compactRawAuthKeyIDs(ids [][8]byte) [][8]byte {

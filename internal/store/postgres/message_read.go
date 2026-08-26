@@ -182,11 +182,11 @@ WHERE d.user_id = $1
 	if err := appendUserUpdateEvent(ctx, tx, qtx, req.OwnerUserID, res.Event); err != nil {
 		return res, fmt.Errorf("append read message contents event: %w", err)
 	}
-	if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+	if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 		TargetUserID:     req.OwnerUserID,
 		Pts:              int32(pts),
 		EventType:        string(domain.UpdateEventReadMessageContents),
-		ExcludeAuthKeyID: authKeyIDToInt64(req.OriginAuthKeyID),
+		ExcludeAuthKeyID: req.OriginAuthKeyID,
 		ExcludeSessionID: req.OriginSessionID,
 	}); err != nil {
 		return res, fmt.Errorf("enqueue read message contents dispatch: %w", err)
@@ -242,7 +242,7 @@ RETURNING box_id`, senderID, senderPrivateMessageIDs[senderID])
 		if err := appendUserUpdateEvent(ctx, tx, qtx, senderID, event); err != nil {
 			return res, fmt.Errorf("append sender content read event: %w", err)
 		}
-		if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 			TargetUserID: senderID,
 			Pts:          int32(senderPts),
 			EventType:    string(domain.UpdateEventReadMessageContents),

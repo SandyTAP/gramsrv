@@ -280,7 +280,7 @@ func (r *Router) editChannelInlineBotMessage(ctx context.Context, botID int64, t
 	if err != nil {
 		return false, channelEditErr(err)
 	}
-	if err := r.enqueueChannelEditMessageFanout(ctx, target.SenderUserID, res); err != nil {
+	if err := r.enqueueBotAPIChannelEditMessageUpdate(ctx, target.SenderUserID, res); err != nil {
 		return false, internalErr()
 	}
 	return true, nil

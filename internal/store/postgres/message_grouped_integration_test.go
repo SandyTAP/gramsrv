@@ -35,7 +35,7 @@ func TestSendPrivateGroupedIDSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	const groupedID = int64(880000000123)
 
 	// 同一 album 的两条消息共享 grouped_id。
@@ -127,7 +127,7 @@ func TestSendChannelGroupedIDSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Album Channel " + suffix,

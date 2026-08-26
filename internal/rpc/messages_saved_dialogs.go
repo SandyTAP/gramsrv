@@ -3,9 +3,11 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/iamxvbaba/td/tg"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // Saved Messages 分会话（saved dialogs）真实实现。
@@ -162,37 +164,17 @@ func (r *Router) onMessagesToggleSavedDialogPin(ctx context.Context, req *tg.Mes
 	}
 	pinned := req.GetPinned()
 	if r.deps.Messages == nil {
-		return true, nil
+		return false, internalErr()
 	}
-	changed, err := r.deps.Messages.ToggleSavedDialogPin(ctx, userID, peers[0], pinned)
+	_, err = r.deps.Messages.MutateSavedDialogs(ctx, userID, store.SavedDialogMutation{
+		Kind: store.SavedDialogSetPinned, UserID: userID, Date: int(r.clock.Now().Unix()),
+		Peer: peers[0], Pinned: pinned,
+	}, savedDialogDeliveryEffects)
 	if err != nil {
 		if errors.Is(err, domain.ErrPinnedSavedDialogsTooMuch) {
 			return false, savedPinnedTooMuchErr()
 		}
 		return false, internalErr()
-	}
-	if changed {
-		date := int(r.clock.Now().Unix())
-		var recorded domain.UpdateEvent
-		if r.deps.Updates != nil {
-			authKeyID, _ := AuthKeyIDFrom(ctx)
-			sessionID, _ := SessionIDFrom(ctx)
-			event, state, err := r.deps.Updates.RecordSavedDialogPinned(ctx, authKeyID, userID, peers[0], pinned, rawAuthKeyIDForOrigin(ctx), sessionID)
-			if err != nil {
-				return false, internalErr()
-			}
-			date = state.Date
-			recorded = event
-		}
-		r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-		r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{&tg.UpdateSavedDialogPinned{
-				Pinned: pinned,
-				Peer:   tgDialogPeer(peers[0]),
-			}}, recorded),
-			Date: date,
-			Seq:  0,
-		})
 	}
 	return true, nil
 }
@@ -210,37 +192,35 @@ func (r *Router) onMessagesReorderPinnedSavedDialogs(ctx context.Context, req *t
 		return false, err
 	}
 	if r.deps.Messages == nil {
-		return true, nil
+		return false, internalErr()
 	}
-	if err := r.deps.Messages.ReorderPinnedSavedDialogs(ctx, userID, peers, req.GetForce()); err != nil {
+	if _, err := r.deps.Messages.MutateSavedDialogs(ctx, userID, store.SavedDialogMutation{
+		Kind: store.SavedDialogReorder, UserID: userID, Date: int(r.clock.Now().Unix()),
+		Order: peers, Force: req.GetForce(),
+	}, savedDialogDeliveryEffects); err != nil {
 		if errors.Is(err, domain.ErrPinnedSavedDialogsTooMuch) {
 			return false, savedPinnedTooMuchErr()
 		}
 		return false, internalErr()
 	}
-	date := int(r.clock.Now().Unix())
-	var recorded domain.UpdateEvent
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, state, err := r.deps.Updates.RecordPinnedSavedDialogs(ctx, authKeyID, userID, peers, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return false, internalErr()
-		}
-		date = state.Date
-		recorded = event
-	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, recorded)
-	update := &tg.UpdatePinnedSavedDialogs{}
-	if len(peers) > 0 {
-		update.SetOrder(tgDialogPeers(peers))
-	}
-	r.requireReliableDispatchForUserUpdate(ctx, userID, &tg.Updates{
-		Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, recorded),
-		Date:    date,
-		Seq:     0,
-	})
 	return true, nil
+}
+
+func savedDialogDeliveryEffects(snapshot store.SavedDialogMutationSnapshot) ([]store.DeliveryEffect, error) {
+	if !snapshot.Changed {
+		return nil, nil
+	}
+	m := snapshot.Mutation
+	event := domain.UpdateEvent{Date: m.Date, PtsCount: 1}
+	switch m.Kind {
+	case store.SavedDialogSetPinned:
+		event.Type, event.Peer, event.Bool = domain.UpdateEventSavedDialogPinned, m.Peer, m.Pinned
+	case store.SavedDialogReorder:
+		event.Type, event.Peers = domain.UpdateEventPinnedSavedDialogs, append([]domain.Peer(nil), snapshot.Order...)
+	default:
+		return nil, fmt.Errorf("unsupported saved dialog mutation %q", m.Kind)
+	}
+	return []store.DeliveryEffect{store.AccountPTSDeliveryEffect(m.UserID, event, [8]byte{}, 0)}, nil
 }
 
 // tgMessagesSavedDialogs 把业务结果转 TL 输出：Full 映射 savedDialogs（已到

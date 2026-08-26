@@ -17,7 +17,6 @@ type SuggestedPostDispatcher struct {
 	log      *zap.Logger
 	interval time.Duration
 	batch    int
-	enqueue  func(context.Context, int64, domain.ToggleSuggestedPostApprovalResult) error
 }
 
 func NewSuggestedPostDispatcher(router *Router, log *zap.Logger) *SuggestedPostDispatcher {
@@ -26,7 +25,6 @@ func NewSuggestedPostDispatcher(router *Router, log *zap.Logger) *SuggestedPostD
 	}
 	return &SuggestedPostDispatcher{
 		router: router, log: log, interval: time.Second, batch: 50,
-		enqueue: router.enqueueSuggestedPostApprovalFanout,
 	}
 }
 
@@ -55,13 +53,13 @@ func (d *SuggestedPostDispatcher) DispatchOnce(ctx context.Context) bool {
 	if err != nil {
 		d.log.Warn("process suggested post lifecycle", zap.Error(err))
 	}
-	enqueued := false
+	processed := false
 	for _, result := range results {
-		if err := d.enqueue(ctx, 0, result); err != nil {
-			d.log.Warn("enqueue suggested post approval fanout", zap.Error(err))
+		if err := d.router.enqueueSuggestedPostBotAPIUpdate(ctx, 0, result); err != nil {
+			d.log.Warn("enqueue suggested post Bot API update", zap.Error(err))
 			continue
 		}
-		enqueued = true
+		processed = true
 	}
-	return enqueued
+	return processed
 }

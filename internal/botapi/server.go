@@ -31,7 +31,7 @@ type BotsService interface {
 }
 
 type UsersService interface {
-	UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error)
+	UpdateEmojiStatusWithEvent(ctx context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error)
 }
 
 type WebAppService interface {
@@ -1312,7 +1312,7 @@ func (h *handler) setUserEmojiStatus(w http.ResponseWriter, r *http.Request, bot
 		}
 		until = n
 	}
-	if _, err := h.users.UpdateEmojiStatus(r.Context(), userID, domain.UserEmojiStatus{DocumentID: documentID, Until: until}); err != nil {
+	if _, _, err := h.users.UpdateEmojiStatusWithEvent(r.Context(), userID, domain.UserEmojiStatus{DocumentID: documentID, Until: until}, int(time.Now().Unix())); err != nil {
 		if errors.Is(err, domain.ErrPremiumRequired) {
 			writeAPIError(w, http.StatusBadRequest, "PREMIUM_ACCOUNT_REQUIRED")
 			return

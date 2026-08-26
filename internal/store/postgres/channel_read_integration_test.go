@@ -38,7 +38,7 @@ func TestChannelStoreReadOutboxDoesNotRegressSenderDialogUnread(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Read Outbox " + suffix,
@@ -65,7 +65,7 @@ func TestChannelStoreReadOutboxDoesNotRegressSenderDialogUnread(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     ownerMsg.Message.ID,
 		Date:      1700000342,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("member read owner message: %v", err)
 	}
 	memberMsg, err := channels.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
@@ -94,7 +94,8 @@ func TestChannelStoreReadOutboxDoesNotRegressSenderDialogUnread(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     memberMsg.Message.ID,
 		Date:      1700000344,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("owner read member message: %v", err)
 	}
@@ -140,7 +141,7 @@ func TestChannelStoreReadHistoryNoopDoesNotRewriteDialogState(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Read Noop " + suffix,
@@ -167,7 +168,8 @@ func TestChannelStoreReadHistoryNoopDoesNotRewriteDialogState(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000442,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("first read history: %v", err)
 	}
@@ -194,7 +196,8 @@ WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID, stableUpdatedAt);
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000443,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("repeat read history: %v", err)
 	}
@@ -244,7 +247,7 @@ func TestChannelStoreChannelUnreadExcludesOwnOutgoing(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Own Unread " + suffix,
@@ -313,7 +316,8 @@ WHERE channel_id = $1 AND user_id = $2`, channelID, owner.ID); err != nil {
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000352,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("read owner channel history: %v", err)
 	}
@@ -362,7 +366,7 @@ func TestChannelStoreBroadcastUnreadDerivesDespiteStaleCache(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Broadcast Unread " + suffix,
@@ -379,7 +383,7 @@ func TestChannelStoreBroadcastUnreadDerivesDespiteStaleCache(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000334,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial broadcast service message: %v", err)
 	}
 	sent, err := channels.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
@@ -469,7 +473,7 @@ func TestChannelStoreLargeMegagroupUnreadDerivesDespiteStaleCache(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Large Unread " + suffix,
@@ -486,7 +490,7 @@ func TestChannelStoreLargeMegagroupUnreadDerivesDespiteStaleCache(t *testing.T) 
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000337,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial large service message: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -563,7 +567,7 @@ WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID).Scan(&storedTop, 
 		ChannelID: channelID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000339,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("local clear large history: %v", err)
 	}
@@ -611,7 +615,7 @@ func TestChannelStoreLargeMegagroupUnreadSkipsDeletedHole(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Deleted Hole " + suffix,
@@ -628,7 +632,7 @@ func TestChannelStoreLargeMegagroupUnreadSkipsDeletedHole(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000340,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial deleted-hole service message: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -709,7 +713,7 @@ func TestChannelStoreSmallMegagroupDeleteDerivesUnread(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Small Delete Cache " + suffix,
@@ -726,7 +730,7 @@ func TestChannelStoreSmallMegagroupDeleteDerivesUnread(t *testing.T) {
 		ChannelID: channelID,
 		MaxID:     created.Message.ID,
 		Date:      1700000345,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial service message: %v", err)
 	}
 	first, err := channels.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
@@ -836,7 +840,7 @@ func TestChannelStoreDeleteMessagesMaintainsUnreadMentionIndex(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Mention Delete " + suffix,
@@ -999,7 +1003,7 @@ func TestChannelStoreReadMessageContentsClearsVisibleUnreadReactions(t *testing.
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, friend.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Visible Reaction " + suffix,
@@ -1055,7 +1059,7 @@ func TestChannelStoreReadMessageContentsClearsVisibleUnreadReactions(t *testing.
 		UserID:    owner.ID,
 		ChannelID: channelID,
 		IDs:       []int{sent.Message.ID},
-	})
+	}, testChannelMessageContentsEffects)
 	if err != nil {
 		t.Fatalf("read channel message contents: %v", err)
 	}
@@ -1109,7 +1113,7 @@ func TestChannelReadOutboxDerivesFromPublicWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sender: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Watermark " + suffix,
@@ -1135,7 +1139,7 @@ func TestChannelReadOutboxDerivesFromPublicWatermark(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
 		Date:      1700000402,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("owner read history: %v", err)
 	}
 

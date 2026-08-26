@@ -22,6 +22,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/officialgifts"
+	"telesrv/internal/store"
 )
 
 const (
@@ -204,7 +205,7 @@ type accountFreezeBatchStore interface {
 
 type accountFreezeNotificationStore interface {
 	ClaimAccountFreezeNotifications(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]domain.AccountFreezeNotification, error)
-	CompleteAccountFreezeNotification(ctx context.Context, id, version int64, now time.Time) error
+	CommitAccountFreezeNotificationDelivery(ctx context.Context, id, version int64, payload []byte, now time.Time) error
 }
 
 type AuthService interface {
@@ -220,14 +221,14 @@ type AuthKeyRevoker interface {
 type UsersService interface {
 	AdminUser(ctx context.Context, userID int64) (domain.User, bool, error)
 	GrantPremium(ctx context.Context, userID int64, months int) (domain.User, error)
-	SetVerified(ctx context.Context, userID int64, verified bool) (domain.User, error)
-	SetScamFake(ctx context.Context, userID int64, scam, fake bool) (domain.User, error)
-	SetSupport(ctx context.Context, userID int64, support bool) (domain.User, error)
-	UpdateUsername(ctx context.Context, userID int64, username string) (domain.User, error)
-	UpdateColor(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error)
-	UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error)
-	UpdateProfile(ctx context.Context, userID int64, update domain.UserProfileUpdate) (domain.User, error)
-	SetPhone(ctx context.Context, userID int64, phone string) (domain.User, error)
+	SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	SetScamFakeWithDelivery(ctx context.Context, userID int64, scam, fake bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	SetSupportWithDelivery(ctx context.Context, userID int64, support bool, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateUsernameWithDelivery(ctx context.Context, userID int64, username string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateColorWithDelivery(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateEmojiStatusWithDelivery(ctx context.Context, userID int64, status domain.UserEmojiStatus, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminUpdateProfileWithDelivery(ctx context.Context, userID int64, update domain.UserProfileUpdate, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
+	AdminSetPhoneWithDelivery(ctx context.Context, userID int64, phone string, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.User, error)
 }
 
 type AccountService interface {
@@ -238,8 +239,8 @@ type AccountService interface {
 }
 
 type StarsService interface {
-	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
-	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
+	CreditWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error)
+	DebitWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error)
 }
 
 type BroadcastService interface {
@@ -253,21 +254,16 @@ type PremiumService interface {
 	UpsertPlan(ctx context.Context, req domain.PremiumPlanUpsertRequest) (domain.PremiumPlan, error)
 	Entitlements(ctx context.Context, userID int64, limit int) ([]domain.PremiumEntitlement, error)
 	Payment(ctx context.Context, paymentIntentID int64) (domain.PremiumPaymentDetails, bool, error)
-	Grant(ctx context.Context, req domain.PremiumAdminGrantRequest) (domain.PremiumEntitlement, domain.User, error)
-	Revoke(ctx context.Context, req domain.PremiumAdminRevokeRequest) (domain.User, error)
-	Refund(ctx context.Context, req domain.PremiumRefundRequest) (domain.PremiumPurchaseResult, error)
+	GrantWithDelivery(ctx context.Context, req domain.PremiumAdminGrantRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.PremiumEntitlement, domain.User, error)
+	RevokeWithDelivery(ctx context.Context, req domain.PremiumAdminRevokeRequest, effects store.DeliveryEffectsBuilder[[]domain.User]) (domain.User, error)
+	RefundWithDelivery(ctx context.Context, req domain.PremiumRefundRequest, effects store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]) (domain.PremiumPurchaseResult, error)
 }
 
-type StarsNotifier interface {
-	NotifyStarsBalanceChanged(ctx context.Context, balance domain.StarsBalance) error
-}
-
-type UserNotifier interface {
-	NotifyUserChanged(ctx context.Context, u domain.User) error
-}
-
-type UserModerationNotifier interface {
-	NotifyUserModerationFlagsChanged(ctx context.Context, u domain.User) error
+// UserProjectionCache is a post-commit cache operation only. Reliable client
+// delivery is owned by each aggregate transaction and never routed through this
+// port.
+type UserProjectionCache interface {
+	InvalidateUserProjection(userID int64)
 }
 
 type AccountFreezeNotifier interface {
@@ -321,15 +317,20 @@ type AvatarResolver interface {
 	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
 	ValidateAvatarUpload(data []byte) bool
 	CreateAvatarFromBytes(ctx context.Context, data []byte) (domain.Photo, error)
-	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error)
+	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]) (store.ProfilePhotoMutation, bool, error)
+}
+
+type AvatarDeliveryProjector interface {
+	ProfilePhotoDeliveryEffects(ctx context.Context, user domain.User) store.DeliveryEffectsBuilder[store.ProfilePhotoMutation]
+	ProfilePhotoCommitted(userID int64)
 }
 
 // BotService creates bot accounts on behalf of the admin. It mirrors the
 // owner-scoped /newbot flow: a bot is a users row (is_bot=true) plus a bots row
 // owned by ownerUserID, and the returned token is shown once to the operator.
 type BotService interface {
-	CreateBot(ctx context.Context, ownerUserID int64, name, username string) (domain.User, string, error)
-	DeleteBot(ctx context.Context, botUserID int64) (domain.User, error)
+	CreateBotWithDelivery(ctx context.Context, ownerUserID int64, name, username string, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, string, error)
+	DeleteBotWithDelivery(ctx context.Context, botUserID int64, effects store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot]) (domain.User, error)
 	AdminExportBotToken(ctx context.Context, botUserID int64) (string, error)
 }
 
@@ -393,11 +394,11 @@ type CollectibleUsernamesService interface {
 }
 
 type CollectiblePhonesService interface {
-	MintCollectiblePhone(context.Context, domain.MintCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error)
-	UpdateCollectiblePhonePrice(context.Context, domain.UpdateCollectiblePhonePriceRequest) (domain.CollectiblePhone, bool, error)
-	TransferCollectiblePhone(context.Context, domain.TransferCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error)
-	RevokeCollectiblePhone(context.Context, domain.RevokeCollectiblePhoneRequest) (domain.CollectiblePhone, bool, error)
-	DeleteCollectiblePhone(context.Context, domain.DeleteCollectiblePhoneRequest) (bool, error)
+	MintCollectiblePhoneWithDelivery(context.Context, domain.MintCollectiblePhoneRequest, store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error)
+	UpdateCollectiblePhonePriceWithDelivery(context.Context, domain.UpdateCollectiblePhonePriceRequest, store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error)
+	TransferCollectiblePhoneWithDelivery(context.Context, domain.TransferCollectiblePhoneRequest, store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error)
+	RevokeCollectiblePhoneWithDelivery(context.Context, domain.RevokeCollectiblePhoneRequest, store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (domain.CollectiblePhone, bool, error)
+	DeleteCollectiblePhoneWithDelivery(context.Context, domain.DeleteCollectiblePhoneRequest, store.DeliveryEffectsBuilder[store.CollectiblePhoneDeliverySnapshot]) (bool, error)
 	CollectiblePhone(context.Context, string) (domain.CollectiblePhone, error)
 	CollectiblePhoneByID(context.Context, int64) (domain.CollectiblePhone, error)
 	ListCollectiblePhones(context.Context, domain.CollectiblePhoneFilter) ([]domain.CollectiblePhone, error)
@@ -431,35 +432,38 @@ type GiftGranter interface {
 }
 
 type Dependencies struct {
-	Commands               CommandRepository
-	Restrictions           RestrictionStore
-	Auth                   AuthService
-	Revoker                AuthKeyRevoker
-	Users                  UsersService
-	Account                AccountService
-	Photos                 AvatarResolver
-	Stars                  StarsService
-	Premium                PremiumService
-	StarsNotifier          StarsNotifier
-	UserNotifier           UserNotifier
-	UserModerationNotifier UserModerationNotifier
-	FreezeNotifier         AccountFreezeNotifier
-	Channels               ChannelsService
-	ChannelNotifier        ChannelNotifier
-	Messages               MessagesService
-	Gifts                  GiftsService
-	GiftGranter            GiftGranter
-	OfficialGifts          OfficialGiftsSource
-	Bots                   BotService
-	Broadcast              BroadcastService
-	Emoji                  EmojiService
-	StickerSets            StickerSetsService
-	GifCatalog             GifCatalogService
-	Moderation             ModerationService
-	Usernames              CollectibleUsernamesService
-	CollectiblePhones      CollectiblePhonesService
-	Rating                 AccountRatingService
-	Verification           VerificationService
+	Commands              CommandRepository
+	Restrictions          RestrictionStore
+	Auth                  AuthService
+	Revoker               AuthKeyRevoker
+	Users                 UsersService
+	UserAudienceDelivery  store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	Account               AccountService
+	Photos                AvatarResolver
+	AvatarDelivery        AvatarDeliveryProjector
+	Stars                 StarsService
+	StarsDelivery         store.DeliveryEffectsBuilder[domain.StarsBalance]
+	Premium               PremiumService
+	PremiumUserDelivery   store.DeliveryEffectsBuilder[[]domain.User]
+	PremiumRefundDelivery store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]
+	UserProjectionCache   UserProjectionCache
+	FreezeNotifier        AccountFreezeNotifier
+	Channels              ChannelsService
+	ChannelNotifier       ChannelNotifier
+	Messages              MessagesService
+	Gifts                 GiftsService
+	GiftGranter           GiftGranter
+	OfficialGifts         OfficialGiftsSource
+	Bots                  BotService
+	Broadcast             BroadcastService
+	Emoji                 EmojiService
+	StickerSets           StickerSetsService
+	GifCatalog            GifCatalogService
+	Moderation            ModerationService
+	Usernames             CollectibleUsernamesService
+	CollectiblePhones     CollectiblePhonesService
+	Rating                AccountRatingService
+	Verification          VerificationService
 	// BotVerification is the third-party mechanism, wired separately from
 	// Verification: the two never read each other's state.
 	BotVerification BotVerificationService
@@ -467,37 +471,40 @@ type Dependencies struct {
 }
 
 type Service struct {
-	commands               CommandRepository
-	restrictions           RestrictionStore
-	auth                   AuthService
-	revoker                AuthKeyRevoker
-	users                  UsersService
-	account                AccountService
-	photos                 AvatarResolver
-	stars                  StarsService
-	premium                PremiumService
-	starsNotifier          StarsNotifier
-	userNotifier           UserNotifier
-	userModerationNotifier UserModerationNotifier
-	freezeNotifier         AccountFreezeNotifier
-	channels               ChannelsService
-	channelNotifier        ChannelNotifier
-	messages               MessagesService
-	gifts                  GiftsService
-	giftGranter            GiftGranter
-	officialGifts          OfficialGiftsSource
-	bots                   BotService
-	broadcast              BroadcastService
-	emoji                  EmojiService
-	stickerSets            StickerSetsService
-	gifCatalog             GifCatalogService
-	moderation             ModerationService
-	usernames              CollectibleUsernamesService
-	collectiblePhones      CollectiblePhonesService
-	rating                 AccountRatingService
-	verification           VerificationService
-	botVerification        BotVerificationService
-	now                    func() time.Time
+	commands              CommandRepository
+	restrictions          RestrictionStore
+	auth                  AuthService
+	revoker               AuthKeyRevoker
+	users                 UsersService
+	userAudienceDelivery  store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	account               AccountService
+	photos                AvatarResolver
+	avatarDelivery        AvatarDeliveryProjector
+	stars                 StarsService
+	starsDelivery         store.DeliveryEffectsBuilder[domain.StarsBalance]
+	premium               PremiumService
+	premiumUserDelivery   store.DeliveryEffectsBuilder[[]domain.User]
+	premiumRefundDelivery store.DeliveryEffectsBuilder[domain.PremiumPurchaseResult]
+	userProjectionCache   UserProjectionCache
+	freezeNotifier        AccountFreezeNotifier
+	channels              ChannelsService
+	channelNotifier       ChannelNotifier
+	messages              MessagesService
+	gifts                 GiftsService
+	giftGranter           GiftGranter
+	officialGifts         OfficialGiftsSource
+	bots                  BotService
+	broadcast             BroadcastService
+	emoji                 EmojiService
+	stickerSets           StickerSetsService
+	gifCatalog            GifCatalogService
+	moderation            ModerationService
+	usernames             CollectibleUsernamesService
+	collectiblePhones     CollectiblePhonesService
+	rating                AccountRatingService
+	verification          VerificationService
+	botVerification       BotVerificationService
+	now                   func() time.Time
 }
 
 func NewService(deps Dependencies) *Service {
@@ -521,6 +528,9 @@ func (s *Service) Configure(deps Dependencies) *Service {
 	if deps.Users != nil {
 		s.users = deps.Users
 	}
+	if deps.UserAudienceDelivery != nil {
+		s.userAudienceDelivery = deps.UserAudienceDelivery
+	}
 	if deps.Account != nil {
 		s.account = deps.Account
 	}
@@ -530,17 +540,23 @@ func (s *Service) Configure(deps Dependencies) *Service {
 	if deps.Stars != nil {
 		s.stars = deps.Stars
 	}
+	if deps.StarsDelivery != nil {
+		s.starsDelivery = deps.StarsDelivery
+	}
 	if deps.Premium != nil {
 		s.premium = deps.Premium
 	}
-	if deps.StarsNotifier != nil {
-		s.starsNotifier = deps.StarsNotifier
+	if deps.PremiumUserDelivery != nil {
+		s.premiumUserDelivery = deps.PremiumUserDelivery
 	}
-	if deps.UserNotifier != nil {
-		s.userNotifier = deps.UserNotifier
+	if deps.PremiumRefundDelivery != nil {
+		s.premiumRefundDelivery = deps.PremiumRefundDelivery
 	}
-	if deps.UserModerationNotifier != nil {
-		s.userModerationNotifier = deps.UserModerationNotifier
+	if deps.UserProjectionCache != nil {
+		s.userProjectionCache = deps.UserProjectionCache
+	}
+	if deps.AvatarDelivery != nil {
+		s.avatarDelivery = deps.AvatarDelivery
 	}
 	if deps.FreezeNotifier != nil {
 		s.freezeNotifier = deps.FreezeNotifier
@@ -1338,12 +1354,12 @@ func (s *Service) ClaimAccountFreezeNotifications(ctx context.Context, now time.
 	return store.ClaimAccountFreezeNotifications(ctx, now, limit, lease)
 }
 
-func (s *Service) CompleteAccountFreezeNotification(ctx context.Context, id, version int64, now time.Time) error {
+func (s *Service) CommitAccountFreezeNotificationDelivery(ctx context.Context, id, version int64, payload []byte, now time.Time) error {
 	store, ok := s.restrictions.(accountFreezeNotificationStore)
 	if !ok {
-		return nil
+		return fmt.Errorf("account freeze notification delivery store is not configured")
 	}
-	return store.CompleteAccountFreezeNotification(ctx, id, version, now)
+	return store.CommitAccountFreezeNotificationDelivery(ctx, id, version, payload, now)
 }
 
 func validateAccountFreeze(freeze domain.AccountFreeze) error {
@@ -1467,7 +1483,7 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 	if req.EntitlementID < 0 || (req.Months > 0 && req.EntitlementID != 0) {
 		return CommandResult{}, fmt.Errorf("entitlement_id is only valid when months is 0")
 	}
-	if s == nil || s.users == nil {
+	if s == nil || s.users == nil || s.premium == nil || s.premiumUserDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
 	}
 	if req.EntitlementID > 0 && s.premium == nil {
@@ -1492,41 +1508,34 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
 		var updated domain.User
-		if s.premium != nil {
-			actorID := premiumAdminActorID(req.Actor)
-			if req.Months == 0 {
-				updated, err = s.premium.Revoke(ctx, domain.PremiumAdminRevokeRequest{
-					UserID: req.UserID, ActorUserID: actorID, Date: int(s.now().Unix()),
-					Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID), EntitlementID: req.EntitlementID,
-				})
-			} else {
-				durationDays := req.Months * 30
-				if plan, planErr := s.premium.Plan(ctx, req.Months); planErr == nil {
-					durationDays = plan.DurationDays
-				} else if !errors.Is(planErr, domain.ErrPremiumPlanUnavailable) {
-					return CommandResult{}, planErr
-				}
-				var entitlement domain.PremiumEntitlement
-				entitlement, updated, err = s.premium.Grant(ctx, domain.PremiumAdminGrantRequest{
-					UserID: req.UserID, ActorUserID: actorID, Months: req.Months,
-					DurationDays: durationDays, Date: int(s.now().Unix()),
-					Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID),
-				})
-				if err == nil {
-					details["entitlement_id"] = entitlement.ID
-				}
-			}
+		actorID := premiumAdminActorID(req.Actor)
+		if req.Months == 0 {
+			updated, err = s.premium.RevokeWithDelivery(ctx, domain.PremiumAdminRevokeRequest{
+				UserID: req.UserID, ActorUserID: actorID, Date: int(s.now().Unix()),
+				Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID), EntitlementID: req.EntitlementID,
+			}, s.premiumUserDelivery)
 		} else {
-			updated, err = s.users.GrantPremium(ctx, req.UserID, req.Months)
+			durationDays := req.Months * 30
+			if plan, planErr := s.premium.Plan(ctx, req.Months); planErr == nil {
+				durationDays = plan.DurationDays
+			} else if !errors.Is(planErr, domain.ErrPremiumPlanUnavailable) {
+				return CommandResult{}, planErr
+			}
+			var entitlement domain.PremiumEntitlement
+			entitlement, updated, err = s.premium.GrantWithDelivery(ctx, domain.PremiumAdminGrantRequest{
+				UserID: req.UserID, ActorUserID: actorID, Months: req.Months,
+				DurationDays: durationDays, Date: int(s.now().Unix()),
+				Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID),
+			}, s.premiumUserDelivery)
+			if err == nil {
+				details["entitlement_id"] = entitlement.ID
+			}
 		}
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_premium_until"] = updated.PremiumUntil
 		details["updated_premium_active"] = updated.PremiumActiveAt(s.now().Unix())
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		msg := "premium updated"
 		if req.Months == 0 {
 			msg = "premium cleared"
@@ -1539,7 +1548,7 @@ func (s *Service) RefundPremium(ctx context.Context, req RefundPremiumRequest) (
 	if req.PaymentIntentID <= 0 {
 		return CommandResult{}, fmt.Errorf("payment_intent_id is required")
 	}
-	if s == nil || s.premium == nil {
+	if s == nil || s.premium == nil || s.premiumRefundDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin premium dependency is not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionRefundPremium, 0, domain.Peer{}, req, func() (CommandResult, error) {
@@ -1547,13 +1556,13 @@ func (s *Service) RefundPremium(ctx context.Context, req RefundPremiumRequest) (
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		result, err := s.premium.Refund(ctx, domain.PremiumRefundRequest{
+		result, err := s.premium.RefundWithDelivery(ctx, domain.PremiumRefundRequest{
 			PaymentIntentID: req.PaymentIntentID,
 			ActorUserID:     premiumAdminActorID(req.Actor),
 			Date:            int(s.now().Unix()),
 			Reason:          req.Reason,
 			CommandKey:      strings.TrimSpace(req.CommandID),
-		})
+		}, s.premiumRefundDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
@@ -1563,12 +1572,6 @@ func (s *Service) RefundPremium(ctx context.Context, req RefundPremiumRequest) (
 		details["months"] = result.Form.Months
 		details["updated_premium_until"] = result.User.PremiumUntil
 		details["updated_stars_balance"] = result.Balance.Balance
-		if err := s.notifyUserChanged(ctx, result.User); err != nil {
-			details["user_notify_error"] = err.Error()
-		}
-		if err := s.notifyStarsBalanceChanged(ctx, result.Balance); err != nil {
-			details["stars_notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "premium payment refunded", Details: details}, nil
 	})
 }
@@ -1663,7 +1666,7 @@ func (s *Service) GrantStars(ctx context.Context, req GrantStarsRequest) (Comman
 	if req.Amount <= 0 || req.Amount > maxStarsGrant {
 		return CommandResult{}, fmt.Errorf("amount must be between 1 and %d", maxStarsGrant)
 	}
-	if s == nil || s.users == nil || s.stars == nil {
+	if s == nil || s.users == nil || s.stars == nil || s.starsDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin stars dependencies are not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionGrantStars, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -1683,15 +1686,12 @@ func (s *Service) GrantStars(ctx context.Context, req GrantStarsRequest) (Comman
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		balance, err := s.stars.Credit(ctx, req.UserID, req.Amount, domain.StarsReasonAdjust, domain.Peer{}, "Admin Stars grant", req.Reason)
+		balance, err := s.stars.CreditWithDelivery(ctx, req.UserID, req.Amount, domain.StarsReasonAdjust, domain.Peer{}, "Admin Stars grant", req.Reason, s.starsDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_balance"] = balance.Balance
 		details["starting_grant_applied"] = balance.Granted
-		if err := s.notifyStarsBalanceChanged(ctx, balance); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "stars granted", Details: details}, nil
 	})
 }
@@ -1703,7 +1703,7 @@ func (s *Service) DebitStars(ctx context.Context, req DebitStarsRequest) (Comman
 	if req.Amount <= 0 || req.Amount > maxStarsGrant {
 		return CommandResult{}, fmt.Errorf("amount must be between 1 and %d", maxStarsGrant)
 	}
-	if s == nil || s.users == nil || s.stars == nil {
+	if s == nil || s.users == nil || s.stars == nil || s.starsDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin stars dependencies are not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionDebitStars, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -1718,14 +1718,11 @@ func (s *Service) DebitStars(ctx context.Context, req DebitStarsRequest) (Comman
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		balance, err := s.stars.Debit(ctx, req.UserID, req.Amount, domain.StarsReasonAdjust, domain.Peer{}, "Admin Stars debit", req.Reason)
+		balance, err := s.stars.DebitWithDelivery(ctx, req.UserID, req.Amount, domain.StarsReasonAdjust, domain.Peer{}, "Admin Stars debit", req.Reason, s.starsDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_balance"] = balance.Balance
-		if err := s.notifyStarsBalanceChanged(ctx, balance); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "stars debited", Details: details}, nil
 	})
 }
@@ -1737,7 +1734,7 @@ func (s *Service) SetVerified(ctx context.Context, req SetVerifiedRequest) (Comm
 	if domain.IsSystemUserID(req.UserID) && !req.Verified {
 		return CommandResult{}, fmt.Errorf("system user verification cannot be removed")
 	}
-	if s == nil || s.users == nil {
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionSetVerified, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -1756,14 +1753,11 @@ func (s *Service) SetVerified(ctx context.Context, req SetVerifiedRequest) (Comm
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.SetVerified(ctx, req.UserID, req.Verified)
+		updated, err := s.users.SetVerifiedWithDelivery(ctx, req.UserID, req.Verified, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_verified"] = updated.Verified
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "verified updated", Details: details}, nil
 	})
 }
@@ -1774,11 +1768,11 @@ func (s *Service) SetUserFlags(ctx context.Context, req SetUserFlagsRequest) (Co
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
-	}
 	if req.Scam && req.Fake {
 		return CommandResult{}, domain.ErrPeerModerationFlagsInvalid
+	}
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionSetUserFlags, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
 		u, found, err := s.users.AdminUser(ctx, req.UserID)
@@ -1796,15 +1790,12 @@ func (s *Service) SetUserFlags(ctx context.Context, req SetUserFlagsRequest) (Co
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.SetScamFake(ctx, req.UserID, req.Scam, req.Fake)
+		updated, err := s.users.SetScamFakeWithDelivery(ctx, req.UserID, req.Scam, req.Fake, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_scam"] = updated.Scam
 		details["updated_fake"] = updated.Fake
-		if err := s.notifyUserModerationFlagsChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "user flags updated", Details: details}, nil
 	})
 }
@@ -1814,7 +1805,7 @@ func (s *Service) SetSupport(ctx context.Context, req SetSupportRequest) (Comman
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionSetSupport, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -1829,14 +1820,11 @@ func (s *Service) SetSupport(ctx context.Context, req SetSupportRequest) (Comman
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.SetSupport(ctx, req.UserID, req.Support)
+		updated, err := s.users.SetSupportWithDelivery(ctx, req.UserID, req.Support, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_support"] = updated.Support
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
 		return CommandResult{Message: "support updated", Details: details}, nil
 	})
 }
@@ -1972,8 +1960,8 @@ func (s *Service) SetUsername(ctx context.Context, req SetUsernameRequest) (Comm
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user delivery dependencies are not configured")
 	}
 	username := strings.TrimSpace(strings.TrimPrefix(req.Username, "@"))
 	req.Username = username
@@ -1989,14 +1977,12 @@ func (s *Service) SetUsername(ctx context.Context, req SetUsernameRequest) (Comm
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.UpdateUsername(ctx, req.UserID, username)
+		updated, err := s.users.AdminUpdateUsernameWithDelivery(ctx, req.UserID, username, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
 		details["updated_username"] = updated.Username
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(updated.ID)
 		return CommandResult{Message: "username updated", Details: details}, nil
 	})
 }
@@ -2008,8 +1994,8 @@ func (s *Service) SetProfile(ctx context.Context, req SetProfileRequest) (Comman
 	if domain.IsSystemUserID(req.UserID) {
 		return CommandResult{}, fmt.Errorf("system user profile cannot be changed")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user delivery dependencies are not configured")
 	}
 	req.FirstName = strings.TrimSpace(req.FirstName)
 	req.LastName = strings.TrimSpace(req.LastName)
@@ -2031,16 +2017,14 @@ func (s *Service) SetProfile(ctx context.Context, req SetProfileRequest) (Comman
 		if req.DryRun {
 			return CommandResult{Message: "profile update validated", Details: details}, nil
 		}
-		updated, err := s.users.UpdateProfile(ctx, req.UserID, domain.UserProfileUpdate{
+		updated, err := s.users.AdminUpdateProfileWithDelivery(ctx, req.UserID, domain.UserProfileUpdate{
 			FirstName: req.FirstName, HasFirstName: true,
 			LastName: req.LastName, HasLastName: true,
-		})
+		}, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(updated.ID)
 		return CommandResult{Message: "profile updated", Details: details}, nil
 	})
 }
@@ -2049,8 +2033,8 @@ func (s *Service) SetPhone(ctx context.Context, req SetPhoneRequest) (CommandRes
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizePhone(req.Phone)
 	if !domain.ValidPhone(req.Phone) {
@@ -2075,14 +2059,12 @@ func (s *Service) SetPhone(ctx context.Context, req SetPhoneRequest) (CommandRes
 		if req.DryRun {
 			return CommandResult{Message: "phone update validated", Details: details}, nil
 		}
-		updated, err := s.users.SetPhone(ctx, req.UserID, req.Phone)
+		updated, err := s.users.AdminSetPhoneWithDelivery(ctx, req.UserID, req.Phone, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["changed"] = u.Phone != updated.Phone
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(updated.ID)
 		return CommandResult{Message: "phone updated", Details: details}, nil
 	})
 }
@@ -2146,7 +2128,7 @@ func (s *Service) SetAccountAvatar(ctx context.Context, req SetAccountAvatarRequ
 	if domain.IsSystemUserID(req.UserID) {
 		return CommandResult{}, fmt.Errorf("system user avatar cannot be changed")
 	}
-	if s == nil || s.users == nil || s.photos == nil {
+	if s == nil || s.users == nil || s.photos == nil || s.avatarDelivery == nil {
 		return CommandResult{}, fmt.Errorf("admin avatar dependencies are not configured")
 	}
 	if len(req.Data) == 0 || len(req.Data) > MaxAccountAvatarBytes || !s.photos.ValidateAvatarUpload(req.Data) {
@@ -2175,15 +2157,14 @@ func (s *Service) SetAccountAvatar(ctx context.Context, req SetAccountAvatarRequ
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
-		if _, found, err := s.photos.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, req.UserID, domain.ProfilePhotoKindProfile, photo.ID, int(s.now().Unix())); err != nil {
+		effects := s.avatarDelivery.ProfilePhotoDeliveryEffects(ctx, u)
+		if _, found, err := s.photos.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, req.UserID, domain.ProfilePhotoKindProfile, photo.ID, int(s.now().Unix()), effects); err != nil {
 			return CommandResult{Details: details}, err
 		} else if !found {
 			return CommandResult{Details: details}, domain.ErrPhotoInvalid
 		}
 		details["photo_id"] = strconv.FormatInt(photo.ID, 10)
-		if err := s.notifyUserChanged(ctx, u); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.avatarDelivery.ProfilePhotoCommitted(req.UserID)
 		return CommandResult{Message: "avatar updated", Details: details}, nil
 	})
 }
@@ -2193,8 +2174,8 @@ func (s *Service) SetUserColor(ctx context.Context, req SetUserColorRequest) (Co
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user delivery dependencies are not configured")
 	}
 	color := domain.PeerColor{HasColor: req.HasColor, Color: req.Color, BackgroundEmojiID: req.BackgroundEmojiID}
 	return s.runCommand(ctx, req.CommandMeta, ActionSetUserColor, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -2202,13 +2183,11 @@ func (s *Service) SetUserColor(ctx context.Context, req SetUserColorRequest) (Co
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.UpdateColor(ctx, req.UserID, req.ForProfile, color)
+		updated, err := s.users.AdminUpdateColorWithDelivery(ctx, req.UserID, req.ForProfile, color, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(updated.ID)
 		return CommandResult{Message: "user color updated", Details: details}, nil
 	})
 }
@@ -2218,8 +2197,8 @@ func (s *Service) SetUserEmojiStatus(ctx context.Context, req SetUserEmojiStatus
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if s == nil || s.users == nil {
-		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	if s == nil || s.users == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin user delivery dependencies are not configured")
 	}
 	status := domain.UserEmojiStatus{DocumentID: req.DocumentID, Until: req.Until}
 	return s.runCommand(ctx, req.CommandMeta, ActionSetUserEmojiStatus, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
@@ -2227,13 +2206,11 @@ func (s *Service) SetUserEmojiStatus(ctx context.Context, req SetUserEmojiStatus
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
-		updated, err := s.users.UpdateEmojiStatus(ctx, req.UserID, status)
+		updated, err := s.users.AdminUpdateEmojiStatusWithDelivery(ctx, req.UserID, status, s.userAudienceDelivery)
 		if err != nil {
 			return CommandResult{}, err
 		}
-		if err := s.notifyUserChanged(ctx, updated); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(updated.ID)
 		return CommandResult{Message: "user emoji status updated", Details: details}, nil
 	})
 }
@@ -2243,8 +2220,8 @@ func (s *Service) SetUserEmojiStatus(ctx context.Context, req SetUserEmojiStatus
 // users+bots rows and returns the freshly minted token in the result details so
 // the operator can copy it once.
 func (s *Service) CreateBot(ctx context.Context, req CreateBotRequest) (CommandResult, error) {
-	if s == nil || s.bots == nil {
-		return CommandResult{}, fmt.Errorf("admin bot dependency is not configured")
+	if s == nil || s.bots == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin bot delivery dependencies are not configured")
 	}
 	if req.OwnerUserID <= 0 {
 		return CommandResult{}, fmt.Errorf("owner_user_id is required")
@@ -2268,14 +2245,12 @@ func (s *Service) CreateBot(ctx context.Context, req CreateBotRequest) (CommandR
 		if req.DryRun {
 			return CommandResult{Message: "bot creation validated", Details: details}, nil
 		}
-		bot, token, err := s.bots.CreateBot(ctx, req.OwnerUserID, name, username)
+		bot, token, err := s.bots.CreateBotWithDelivery(ctx, req.OwnerUserID, name, username, s.botLifecycleDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["bot_user_id"] = bot.ID
-		if err := s.notifyUserChanged(ctx, bot); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(bot.ID)
 		return CommandResult{
 			Message:          "bot created",
 			Details:          details,
@@ -2326,8 +2301,8 @@ func truncateBroadcastPreview(message string) string {
 // the target is a non-system bot; the confirm stage tombstones the account and
 // invalidates its token. System bots are rejected outright.
 func (s *Service) DeleteBot(ctx context.Context, req DeleteBotRequest) (CommandResult, error) {
-	if s == nil || s.bots == nil {
-		return CommandResult{}, fmt.Errorf("admin bot dependency is not configured")
+	if s == nil || s.bots == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("admin bot delivery dependencies are not configured")
 	}
 	if req.BotUserID <= 0 {
 		return CommandResult{}, fmt.Errorf("bot_user_id is required")
@@ -2351,15 +2326,22 @@ func (s *Service) DeleteBot(ctx context.Context, req DeleteBotRequest) (CommandR
 		if req.DryRun {
 			return CommandResult{Message: "bot deletion validated", Details: details}, nil
 		}
-		deleted, err := s.bots.DeleteBot(ctx, req.BotUserID)
+		deleted, err := s.bots.DeleteBotWithDelivery(ctx, req.BotUserID, s.botLifecycleDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["deleted"] = true
-		if err := s.notifyUserChanged(ctx, deleted); err != nil {
-			details["notify_error"] = err.Error()
-		}
+		s.invalidateUserProjection(deleted.ID)
 		return CommandResult{Message: "bot deleted", Details: details}, nil
+	})
+}
+
+func (s *Service) botLifecycleDeliveryEffects(snapshot store.BotLifecycleDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	if s == nil || s.userAudienceDelivery == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	return s.userAudienceDelivery(store.UserAudienceDeliverySnapshot{
+		User: snapshot.Bot, Audience: []int64{snapshot.OwnerUserID},
 	})
 }
 
@@ -2665,8 +2647,8 @@ func (s *Service) CollectiblePhoneTransfers(ctx context.Context, id int64, limit
 }
 
 func (s *Service) MintCollectiblePhone(ctx context.Context, req MintCollectiblePhoneRequest) (CommandResult, error) {
-	if s == nil || s.collectiblePhones == nil {
-		return CommandResult{}, fmt.Errorf("collectible phone dependency is not configured")
+	if s == nil || s.collectiblePhones == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("collectible phone delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	if req.Tier == "" {
@@ -2697,21 +2679,23 @@ func (s *Service) MintCollectiblePhone(ctx context.Context, req MintCollectibleP
 			return CommandResult{Message: "collectible phone mint validated", Details: details}, nil
 		}
 		domainReq.CommandKey = "admin-collectible-phone-mint:" + req.CommandID
-		a, created, err := s.collectiblePhones.MintCollectiblePhone(ctx, domainReq)
+		a, created, err := s.collectiblePhones.MintCollectiblePhoneWithDelivery(ctx, domainReq, s.collectiblePhoneDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["collectible_id"] = strconv.FormatInt(a.ID, 10)
 		details["created"] = created
 		details["status"] = string(a.Status)
-		s.notifyCollectiblePhoneOwners(ctx, 0, a.OwnerUserID)
+		if created {
+			s.invalidateUserProjection(a.OwnerUserID)
+		}
 		return CommandResult{Message: "collectible phone minted", Details: details}, nil
 	})
 }
 
 func (s *Service) UpdateCollectiblePhonePrice(ctx context.Context, req UpdateCollectiblePhonePriceRequest) (CommandResult, error) {
-	if s == nil || s.collectiblePhones == nil {
-		return CommandResult{}, fmt.Errorf("collectible phone dependency is not configured")
+	if s == nil || s.collectiblePhones == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("collectible phone delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
@@ -2732,19 +2716,21 @@ func (s *Service) UpdateCollectiblePhonePrice(ctx context.Context, req UpdateCol
 		if req.DryRun {
 			return CommandResult{Message: "collectible phone price update validated", Details: details}, nil
 		}
-		u, changed, err := s.collectiblePhones.UpdateCollectiblePhonePrice(ctx, d)
+		updated, changed, err := s.collectiblePhones.UpdateCollectiblePhonePriceWithDelivery(ctx, d, s.collectiblePhoneDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["changed"] = changed
-		s.notifyCollectiblePhoneOwners(ctx, u.OwnerUserID)
+		if changed {
+			s.invalidateUserProjection(updated.OwnerUserID)
+		}
 		return CommandResult{Message: "collectible phone price updated", Details: details}, nil
 	})
 }
 
 func (s *Service) TransferCollectiblePhone(ctx context.Context, req TransferCollectiblePhoneRequest) (CommandResult, error) {
-	if s == nil || s.collectiblePhones == nil {
-		return CommandResult{}, fmt.Errorf("collectible phone dependency is not configured")
+	if s == nil || s.collectiblePhones == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("collectible phone delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	d := domain.TransferCollectiblePhoneRequest{Phone: req.Phone, ToUserID: req.ToUserID, Actor: req.Actor, Reason: req.Reason}
@@ -2761,19 +2747,21 @@ func (s *Service) TransferCollectiblePhone(ctx context.Context, req TransferColl
 			return CommandResult{Message: "collectible phone transfer validated", Details: details}, nil
 		}
 		d.CommandKey = "admin-collectible-phone-transfer:" + req.CommandID
-		u, changed, err := s.collectiblePhones.TransferCollectiblePhone(ctx, d)
+		updated, changed, err := s.collectiblePhones.TransferCollectiblePhoneWithDelivery(ctx, d, s.collectiblePhoneDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["changed"] = changed
-		s.notifyCollectiblePhoneOwners(ctx, a.OwnerUserID, u.OwnerUserID)
+		if changed {
+			s.invalidateUserProjection(a.OwnerUserID, updated.OwnerUserID)
+		}
 		return CommandResult{Message: "collectible phone transferred", Details: details}, nil
 	})
 }
 
 func (s *Service) RevokeCollectiblePhone(ctx context.Context, req RevokeCollectiblePhoneRequest) (CommandResult, error) {
-	if s == nil || s.collectiblePhones == nil {
-		return CommandResult{}, fmt.Errorf("collectible phone dependency is not configured")
+	if s == nil || s.collectiblePhones == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("collectible phone delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	d := domain.RevokeCollectiblePhoneRequest{Phone: req.Phone, Burn: req.Burn, Actor: req.Actor, Reason: req.Reason}
@@ -2790,20 +2778,22 @@ func (s *Service) RevokeCollectiblePhone(ctx context.Context, req RevokeCollecti
 			return CommandResult{Message: "collectible phone revoke validated", Details: details}, nil
 		}
 		d.CommandKey = "admin-collectible-phone-revoke:" + req.CommandID
-		u, changed, err := s.collectiblePhones.RevokeCollectiblePhone(ctx, d)
+		u, changed, err := s.collectiblePhones.RevokeCollectiblePhoneWithDelivery(ctx, d, s.collectiblePhoneDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["changed"] = changed
 		details["status"] = string(u.Status)
-		s.notifyCollectiblePhoneOwners(ctx, a.OwnerUserID, 0)
+		if changed {
+			s.invalidateUserProjection(a.OwnerUserID)
+		}
 		return CommandResult{Message: "collectible phone revoked", Details: details}, nil
 	})
 }
 
 func (s *Service) DeleteCollectiblePhone(ctx context.Context, req DeleteCollectiblePhoneRequest) (CommandResult, error) {
-	if s == nil || s.collectiblePhones == nil {
-		return CommandResult{}, fmt.Errorf("collectible phone dependency is not configured")
+	if s == nil || s.collectiblePhones == nil || s.userAudienceDelivery == nil {
+		return CommandResult{}, fmt.Errorf("collectible phone delivery dependencies are not configured")
 	}
 	req.Phone = domain.NormalizeCollectiblePhone(req.Phone)
 	if !domain.ValidCollectiblePhone(req.Phone) {
@@ -2818,30 +2808,31 @@ func (s *Service) DeleteCollectiblePhone(ctx context.Context, req DeleteCollecti
 		if req.DryRun {
 			return CommandResult{Message: "collectible phone delete validated", Details: details}, nil
 		}
-		deleted, err := s.collectiblePhones.DeleteCollectiblePhone(ctx, domain.DeleteCollectiblePhoneRequest{Phone: req.Phone, Actor: req.Actor, Reason: req.Reason, CommandKey: "admin-collectible-phone-delete:" + req.CommandID})
+		deleted, err := s.collectiblePhones.DeleteCollectiblePhoneWithDelivery(ctx, domain.DeleteCollectiblePhoneRequest{Phone: req.Phone, Actor: req.Actor, Reason: req.Reason, CommandKey: "admin-collectible-phone-delete:" + req.CommandID}, s.collectiblePhoneDeliveryEffects)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["deleted"] = deleted
-		s.notifyCollectiblePhoneOwners(ctx, a.OwnerUserID, 0)
+		if deleted {
+			s.invalidateUserProjection(a.OwnerUserID)
+		}
 		return CommandResult{Message: "collectible phone deleted", Details: details}, nil
 	})
 }
 
-func (s *Service) notifyCollectiblePhoneOwners(ctx context.Context, ids ...int64) {
-	seen := map[int64]struct{}{}
-	for _, id := range ids {
-		if id <= 0 {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		if u, found, err := s.users.AdminUser(ctx, id); err == nil && found {
-			_ = s.notifyUserChanged(ctx, u)
-		}
+func (s *Service) collectiblePhoneDeliveryEffects(snapshot store.CollectiblePhoneDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	if s == nil || s.userAudienceDelivery == nil {
+		return nil, store.ErrDeliveryOutboxRequired
 	}
+	out := make([]store.DeliveryEffect, 0)
+	for _, user := range snapshot.Users {
+		effects, err := s.userAudienceDelivery(user)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, effects...)
+	}
+	return out, nil
 }
 
 // RecomputeAccountRating rebuilds one user's composite rating from the current
@@ -4494,18 +4485,21 @@ func resultFromCommand(cmd domain.AdminCommand) CommandResult {
 	return result
 }
 
-func (s *Service) notifyUserChanged(ctx context.Context, u domain.User) error {
-	if s == nil || s.userNotifier == nil {
-		return nil
+func (s *Service) invalidateUserProjection(userIDs ...int64) {
+	if s == nil || s.userProjectionCache == nil {
+		return
 	}
-	return s.userNotifier.NotifyUserChanged(ctx, u)
-}
-
-func (s *Service) notifyUserModerationFlagsChanged(ctx context.Context, u domain.User) error {
-	if s == nil || s.userModerationNotifier == nil {
-		return s.notifyUserChanged(ctx, u)
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[userID]; duplicate {
+			continue
+		}
+		seen[userID] = struct{}{}
+		s.userProjectionCache.InvalidateUserProjection(userID)
 	}
-	return s.userModerationNotifier.NotifyUserModerationFlagsChanged(ctx, u)
 }
 
 func (s *Service) notifyAccountFreezeChanged(ctx context.Context, freeze domain.AccountFreeze) error {
@@ -4513,13 +4507,6 @@ func (s *Service) notifyAccountFreezeChanged(ctx context.Context, freeze domain.
 		return nil
 	}
 	return s.freezeNotifier.NotifyAccountFreezeChanged(ctx, freeze)
-}
-
-func (s *Service) notifyStarsBalanceChanged(ctx context.Context, balance domain.StarsBalance) error {
-	if s == nil || s.starsNotifier == nil {
-		return nil
-	}
-	return s.starsNotifier.NotifyStarsBalanceChanged(ctx, balance)
 }
 
 func (s *Service) notifyChannelChanged(ctx context.Context, ch domain.Channel) error {

@@ -36,11 +36,11 @@ func TestTelegramLoginStorePostgresAtomicStateAndCodeConsumption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create oidc owner: %v", err)
 	}
-	bot, _, err := bots.CreateBotAccount(ctx, domain.User{
+	bot, _, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 		AccessHash: suffix + 102,
 		FirstName:  "OIDC Test Bot",
 		Username:   fmt.Sprintf("oidc_%09d_bot", suffix),
-	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "bot-secret"})
+	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "bot-secret"}, testBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create oidc bot: %v", err)
 	}
@@ -295,9 +295,9 @@ func TestTelegramLoginStorePostgresNativeCallbackAndRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot, _, err := bots.CreateBotAccount(ctx, domain.User{
+	bot, _, err := bots.CreateBotAccountWithDelivery(ctx, domain.User{
 		AccessHash: suffix + 302, FirstName: "Native Login Bot", Username: fmt.Sprintf("native_%09d_bot", suffix),
-	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "native-bot-secret"})
+	}, domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "native-bot-secret"}, testBotLifecycleEffects)
 	if err != nil {
 		t.Fatal(err)
 	}

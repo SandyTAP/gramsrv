@@ -20,7 +20,6 @@ type chatlistMembershipKey struct {
 	localFilterID int
 }
 
-// NewChatlistStore creates an in-memory ChatlistStore.
 func NewChatlistStore() *ChatlistStore {
 	return &ChatlistStore{
 		nextInvite:  1,

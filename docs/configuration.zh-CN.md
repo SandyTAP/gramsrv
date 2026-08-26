@@ -60,16 +60,16 @@
 | `TELESRV_FILE_GRPC_TLS_SERVER_NAME` | string / 空 | Edge/Core gRPC client 校验 FileData server certificate 时使用的 server name；非空也会启用 TLS。 |
 | `TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge/Core 调用 FileData gRPC 时使用的 client certificate 与私钥；二者必须同时配置。 |
 | `TELESRV_FILE_TOKEN` | secret string / 空 | FileData gRPC API bearer token；`cmd/telesrv-file`、`cmd/telesrv-edge` 与 `cmd/telesrv-core` 都必须显式配置非空值，且不得包含换行。FileData 只承接上传分片、静态 blob range 和 materialize 数据面，不是消息/媒体权限权威。 |
-| `TELESRV_EGRESS_ACK_GRPC_ADDR` | address / 空 | `cmd/telesrv-egress` 暴露 late client ACK 写回 API 的内部监听地址。Egress 入口必须配置此项；Edge fabric 服务级确认已足够推进 online outbox，该 API 只用于 indeterminate 写出后的迟到 `msgs_ack`，并同时支持 PTS `dispatch_outbox` 与 non-PTS `edge_delivery_outbox`（后者使用 `pts=0` fence）。 |
-| `TELESRV_EGRESS_ACK_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> Egress ACK gRPC 服务发现 provider。规则与 CoreExec resolver 相同：`static` 读取逗号分隔 `host:port` endpoint，`dns` 只读取一个裸 `host:port` 或显式 `dns:///name:port` / `dns://authority:port/name:port` target。非法值阻止启动。 |
-| `TELESRV_EGRESS_ACK_GRPC_TARGETS` | resolver target(s) / 空 | `cmd/telesrv-edge` 必填的 Egress ACK gRPC endpoint 输入。Edge 在发布 MTProto listener 前会执行 health + `GetInfo` 握手；不可达、token 错误或协议版本不兼容都会 fail fast，避免客户端连接到无法推进 PTS outbox 或 non-PTS delivery queue ACK 的 Edge。 |
-| `TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Edge -> Egress ACK gRPC unary 调用默认 deadline；仅当上游 ctx 没有 deadline 时补上。必须大于 `0` 且不超过 `1m`。 |
-| `TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE` | path / 空 | Egress ACK gRPC server TLS 证书与私钥；二者必须同时配置。为空时保持本地/开发默认明文 gRPC。 |
-| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | Egress ACK gRPC server 用于验证 Edge client certificate 的 CA bundle；配置后启用 mTLS，并要求 server TLS cert/key 同时配置。 |
-| `TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE` | path / 空 | Edge gRPC client 信任 Egress ACK server certificate 的 root CA bundle；配置后客户端使用 TLS。 |
-| `TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME` | string / 空 | Edge gRPC client 校验 Egress ACK server certificate 时使用的 server name；非空也会启用 TLS。 |
-| `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge 调用 Egress ACK gRPC 时使用的 client certificate 与私钥；二者必须同时配置。 |
-| `TELESRV_EGRESS_ACK_TOKEN` | secret string / 空 | Egress ACK gRPC API bearer token；`cmd/telesrv-edge` 与 `cmd/telesrv-egress` 都必须显式配置非空值，且不得包含换行。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_ADDR` | address / 空 | `cmd/telesrv-egress` 暴露 late client ACK 写回 API 的内部监听地址。Egress 入口必须配置此项；Edge fabric 服务级确认已足够推进 online outbox，该 API 只用于 indeterminate 写出后的迟到 `msgs_ack`，并同时支持 PTS `dispatch_outbox` 与 non-PTS `edge_delivery_outbox`（后者使用 `pts=0` fence）。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER` | `static`/`dns` / `static` | Edge -> Egress Delivery gRPC 服务发现 provider。规则与 CoreExec resolver 相同：`static` 读取逗号分隔 `host:port` endpoint，`dns` 只读取一个裸 `host:port` 或显式 `dns:///name:port` / `dns://authority:port/name:port` target。非法值阻止启动。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TARGETS` | resolver target(s) / 空 | `cmd/telesrv-edge` 必填的 Egress Delivery gRPC endpoint 输入。Edge 在发布 MTProto listener 前会执行 health + `GetInfo` 握手；不可达、token 错误或协议版本不兼容都会 fail fast，避免客户端连接到无法推进 PTS outbox 或 non-PTS delivery queue ACK 的 Edge。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT` | duration / `5s` | Edge -> Egress Delivery gRPC batch 调用默认 deadline；仅当上游 ctx 没有 deadline 时补上。client ACK 使用有界 micro-batch，不保留旧 unary fallback。必须大于 `0` 且不超过 `1m`。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE` / `TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE` | path / 空 | Egress Delivery gRPC server TLS 证书与私钥；二者必须同时配置。为空时保持本地/开发默认明文 gRPC。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE` | path / 空 | Egress Delivery gRPC server 用于验证 Edge client certificate 的 CA bundle；配置后启用 mTLS，并要求 server TLS cert/key 同时配置。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TLS_CA_FILE` | path / 空 | Edge gRPC client 信任 Egress Delivery server certificate 的 root CA bundle；配置后客户端使用 TLS。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TLS_SERVER_NAME` | string / 空 | Edge gRPC client 校验 Egress Delivery server certificate 时使用的 server name；非空也会启用 TLS。 |
+| `TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE` / `TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_KEY_FILE` | path / 空 | Edge 调用 Egress Delivery gRPC 时使用的 client certificate 与私钥；二者必须同时配置。 |
+| `TELESRV_EGRESS_DELIVERY_TOKEN` | secret string / 空 | Egress Delivery gRPC API bearer token；`cmd/telesrv-edge` 与 `cmd/telesrv-egress` 都必须显式配置非空值，且不得包含换行。 |
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | 在 MTProto 监听端口启用 MTProto-over-WebSocket 分流。 |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | 浏览器 WebSocket origin 白名单；`*` 只用于临时调试。 |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | 全局物理连接 admission 上限；负数关闭该门禁。 |
@@ -462,6 +462,7 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_v2?sslmode=disable` | 主业务持久库；本地 `main` / `v2` 因迁移历史不同，分别使用 `telesrv_main` / `telesrv_v2`；生产必须替换开发凭证与 TLS 策略。 |
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | pgxpool 最大连接数；`<=0` 使用 pgx 默认值，该默认通常不足以覆盖生产 outbox/RPC 并发。 |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool 预热最小连接数。 |
+| `TELESRV_POSTGRES_COUNTER_RECOVERY_MAX_CONNS` | positive int / `4` | Redis box/channel 计数器冷恢复专用 PostgreSQL 池上限；必须独立于业务事务池，配置非正数时 Core 启动失败。YAML: `postgres.counter_recovery_max_conns`。 |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | 验证码、限流、共享更新/缓存易失态使用的 Redis。 |
 | `TELESRV_REDIS_PASSWORD` | secret string / 空 | Redis 密码。 |
 | `TELESRV_REDIS_DB` | int / `0` | Redis 逻辑库编号。 |
@@ -596,10 +597,10 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_OUTBOX_WORKERS` | int / `4` | `cmd/telesrv-egress` 并发 outbox worker 数；稳定逻辑分片保持 PTS `dispatch_outbox` 与 non-PTS `edge_delivery_outbox` 的单用户队头顺序。 |
 | `TELESRV_OUTBOX_BATCH` | int / `100` | `cmd/telesrv-egress` 每批最大 claim 行数；增大提高吞吐，也增加 DB/推送突发。 |
 | `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | `dispatching` 行可被其它 Egress 重新 claim 的超时；必须大于最坏单批投递耗时。 |
-| `TELESRV_OUTBOX_POISON_RETENTION` | duration / `1m` | terminal failed 投递头的排障保留窗口；durable update 仍可经 difference 恢复。 |
-| `TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL` | duration / `15s` | terminal failed head 清理周期，独立于大表 retention。 |
-| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | Egress 等待 Edge 确认在线 update 入队的最长时间；超时视为未确认投递，保留 durable outbox 等待 lease/reclaim。 |
-| `TELESRV_SEND_RATE_LIMIT` | int / `30` | 单账号每发送窗口允许的消息数；`<=0` 关闭。 |
+| `TELESRV_DELIVERY_ATTEMPT_TIMEOUT` | duration / `2s` | 数据库 claim 时冻结的 Edge 物理命令绝对生命周期；projection、Redis 排队、Edge admission 与最终 socket 写都受同一 `CommandNotAfter` 约束，不可续期。 |
+| `TELESRV_DELIVERY_CLOCK_SKEW_ALLOWANCE` | duration / `1s` | wire 截止后数据库再等待的跨主机时钟偏差预算；fresh fence 只能在该宽限后的 `EvidenceDeadline` 产生。必须为正且不超过 `10s`。 |
+| `TELESRV_OUTBOUND_PUSH_TIMEOUT` | duration / `200ms` | Redis/远端 admission 单次 I/O 上限；durable 正确性截止由 `TELESRV_DELIVERY_ATTEMPT_TIMEOUT` 冻结，不复用该瞬态超时。 |
+| `TELESRV_SEND_RATE_LIMIT` | int / `0` | 可选的单账号发送策略；默认关闭。显式设为 `>0` 时按窗口计数并以标准 `FLOOD_WAIT_n` 拒绝超额请求；系统容量由 durable admission/backpressure 单独约束。 |
 | `TELESRV_SEND_RATE_WINDOW` | duration / `1m` | 发送限流窗口。 |
 | `TELESRV_CATCHUP_RATE_LIMIT` | int / `0` | 单用户每窗口 difference/catch-up RPC 数；`<=0` 关闭。 |
 | `TELESRV_CATCHUP_RATE_WINDOW` | duration / `1m` | catch-up 限流窗口。 |
@@ -787,4 +788,4 @@ Core 的 `star_gifts.export.ton` 仅在 `mode: ton` 时启用正式链路：
 
 ## 12. 生产部署最低检查清单
 
-生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、CoreExec/FileData/Egress ACK/SFU gRPC control TLS/mTLS、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。启用 TON Star Gift 时还必须完成固定 lite server/checkpoint/collection code hash、独立 capability/bot/relayer secret、单用户 allowlist、`mint.enabled: false` 预检，以及完整的 testnet/canary/回滚门禁。
+生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、CoreExec/FileData/Egress Delivery/SFU gRPC control TLS/mTLS、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。启用 TON Star Gift 时还必须完成固定 lite server/checkpoint/collection code hash、独立 capability/bot/relayer secret、单用户 allowlist、`mint.enabled: false` 预检，以及完整的 testnet/canary/回滚门禁。

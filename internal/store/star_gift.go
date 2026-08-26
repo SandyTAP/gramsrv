@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 
 	"telesrv/internal/domain"
 )
@@ -57,10 +58,6 @@ type StarGiftStore interface {
 	CountByOwner(ctx context.Context, owner domain.Peer) (int, error)
 	// SetUnsaved 切换礼物在资料的展示（saveStarGift）；返回是否命中一行。
 	SetUnsaved(ctx context.Context, ref domain.SavedStarGiftRef, unsaved bool) (bool, error)
-	// MarkConverted 幂等地把礼物标记为已转换（convertStarGift），返回该行供调用方据 ConvertStars
-	// 入账；已转换返回 domain.ErrStarGiftAlreadyConverted，不存在返回 domain.ErrStarGiftNotFound。
-	MarkConverted(ctx context.Context, ref domain.SavedStarGiftRef) (domain.SavedStarGift, error)
-
 	ListCollections(ctx context.Context, owner domain.Peer) ([]domain.StarGiftCollection, error)
 	CreateCollection(ctx context.Context, owner domain.Peer, title string, savedGiftIDs []int64) (domain.StarGiftCollection, error)
 	UpdateCollection(ctx context.Context, owner domain.Peer, collectionID int, patch domain.StarGiftCollectionPatch) (domain.StarGiftCollection, error)
@@ -84,8 +81,8 @@ type StarGiftUpgradeStore interface {
 type StarGiftLifecycleStore interface {
 	IssueStarGiftPurchaseForm(ctx context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error)
 	ValidateStarGiftPurchaseForm(ctx context.Context, req domain.StarGiftPurchaseRequest) error
-	PurchaseStarGift(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error)
-	ConvertStarGift(ctx context.Context, req domain.StarGiftConvertRequest) (domain.StarGiftConvertResult, error)
+	PurchaseStarGiftWithDelivery(ctx context.Context, req domain.StarGiftPurchaseRequest, effects DeliveryEffectsBuilder[domain.StarGiftPurchaseResult]) (domain.StarGiftPurchaseResult, error)
+	ConvertStarGiftWithDelivery(ctx context.Context, req domain.StarGiftConvertRequest, effects DeliveryEffectsBuilder[domain.StarGiftConvertResult]) (domain.StarGiftConvertResult, error)
 	ListResaleStarGifts(ctx context.Context, filter domain.StarGiftResaleFilter) (domain.StarGiftResalePage, error)
 	UniqueStarGiftValueInfo(ctx context.Context, uniqueGiftID int64) (domain.StarGiftValueInfo, error)
 	SetStarGiftListing(ctx context.Context, req domain.StarGiftListingRequest) (domain.UniqueStarGift, error)
@@ -121,4 +118,31 @@ type StarGiftLifecycleStore interface {
 	// SweepStarGiftLifecycle advances time-driven offer/auction aggregates and
 	// drains their durable notification/delivery outboxes in bounded batches.
 	SweepStarGiftLifecycle(ctx context.Context, now, limit int) error
+}
+
+func ValidateStarGiftPurchaseDeliveryEffects(result domain.StarGiftPurchaseResult, effects []DeliveryEffect) error {
+	if result.Balance.UserID <= 0 {
+		return fmt.Errorf("star gift purchase requires buyer balance snapshot")
+	}
+	return ValidateStarsBalanceDeliveryEffects(result.Balance.UserID, effects)
+}
+
+func ValidateStarGiftConvertDeliveryEffects(result domain.StarGiftConvertResult, effects []DeliveryEffect) error {
+	switch result.Saved.Owner.Type {
+	case domain.PeerTypeUser:
+		if result.Saved.ConvertStars <= 0 {
+			if len(effects) != 0 {
+				return fmt.Errorf("zero-value star gift conversion requires no balance delivery")
+			}
+			return nil
+		}
+		return ValidateStarsBalanceDeliveryEffects(result.Saved.Owner.ID, effects)
+	case domain.PeerTypeChannel:
+		if len(effects) != 0 {
+			return fmt.Errorf("channel star gift conversion must not deliver an administrator balance")
+		}
+		return nil
+	default:
+		return fmt.Errorf("star gift conversion owner is invalid")
+	}
 }

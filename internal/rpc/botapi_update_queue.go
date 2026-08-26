@@ -496,6 +496,19 @@ func (r *Router) enqueueBotAPIChannelMessageUpdate(ctx context.Context, originUs
 	return r.enqueueBotAPIChannelMessageUpdateForBots(ctx, res, botIDs)
 }
 
+func skipDeliverySet(ids []int64) map[int64]struct{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	set := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id != 0 {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
 func (r *Router) enqueueBotAPIChannelMessageUpdateForBots(ctx context.Context, res domain.SendChannelMessageResult, botIDs []int64) error {
 	if r == nil || res.Duplicate || res.Message.ID <= 0 || res.Message.ChannelID == 0 || len(botIDs) == 0 {
 		return nil

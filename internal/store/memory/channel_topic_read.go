@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // memoryTopicRead 是单个 (channel,user,topic) 的已读水位。
@@ -103,12 +104,35 @@ func (s *ChannelStore) channelTopicUnreadCountLocked(viewerUserID, channelID int
 }
 
 // ReadChannelTopicHistory 推进 viewer 在 forum 单话题的 per-topic 已读水位（不碰频道级）。
-func (s *ChannelStore) ReadChannelTopicHistory(_ context.Context, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error) {
-	if req.UserID == 0 || req.ChannelID == 0 || req.TopicID <= 0 {
-		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelInvalid
+func (s *ChannelStore) ReadChannelTopicHistory(ctx context.Context, req domain.ReadChannelTopicHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelTopicHistoryResult]) (domain.ReadChannelTopicHistoryResult, error) {
+	if effects == nil {
+		return domain.ReadChannelTopicHistoryResult{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotChannelReadStateLocked(req.ChannelID)
+	result, err := s.readChannelTopicHistoryLocked(req)
+	if err != nil || !result.Changed {
+		return result, err
+	}
+	intents, err := effects(result)
+	if err == nil && len(intents) == 0 {
+		err = store.ErrDeliveryOutboxRequired
+	}
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	}
+	if err != nil {
+		s.restoreChannelReadStateLocked(req.ChannelID, snapshot)
+		return domain.ReadChannelTopicHistoryResult{}, err
+	}
+	return result, nil
+}
+
+func (s *ChannelStore) readChannelTopicHistoryLocked(req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error) {
+	if req.UserID == 0 || req.ChannelID == 0 || req.TopicID <= 0 {
+		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelInvalid
+	}
 	channel, member, err := s.channelAndMemberOrLinkedGuestLocked(req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, err

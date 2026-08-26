@@ -397,19 +397,24 @@ func (s *Service) handleStickersAddEmoji(ctx context.Context, state domain.BotCh
 		}
 		return botReply{Text: "That document is already in this pack. Send another sticker material document, or /cancel."}
 	}
+	if s.hooks == nil {
+		return internalReply()
+	}
+	effects := s.hooks.StickerSetDeliveryEffects(ctx, state.UserID)
+	if effects == nil {
+		return internalReply()
+	}
 	set, _, err = s.stickers.AddStickerToSet(ctx, state.UserID, ref, domain.StickerSetItemInput{
 		DocumentID:         docID,
 		DocumentAccessHash: docHash,
 		Emoji:              emoji,
-	})
+	}, effects)
 	if err != nil {
 		return s.stickersBotEditError(state.UserID, err)
 	}
+	s.hooks.InvalidateStickerSetCatalog(stickersBotSetKind(set))
 	if err := s.bots.DeleteBotChatState(ctx, domain.StickersBotUserID, state.UserID); err != nil {
 		s.log.Error("stickersbot: delete add state", zap.Int64("user_id", state.UserID), zap.Error(err))
-	}
-	if s.hooks != nil {
-		s.hooks.PushStickerSetsChanged(ctx, state.UserID, stickersBotSetKind(set))
 	}
 	return botReply{Text: fmt.Sprintf("Done. Added to %s.\n\n%s", stickersBotSetTitle(set), s.stickersBotPublicURL(set))}
 }
@@ -435,21 +440,26 @@ func (s *Service) handleStickersDeleteDocument(ctx context.Context, state domain
 	if !docHasSet || docSetID != setID || docSetHash != setHash {
 		return botReply{Text: "That sticker is not from the selected pack. Send a sticker from that pack, or /cancel."}
 	}
-	set, _, err := s.stickers.RemoveStickerFromSet(ctx, state.UserID, doc.ID, doc.AccessHash)
+	if s.hooks == nil {
+		return internalReply()
+	}
+	effects := s.hooks.StickerSetDeliveryEffects(ctx, state.UserID)
+	if effects == nil {
+		return internalReply()
+	}
+	set, _, err := s.stickers.RemoveStickerFromSet(ctx, state.UserID, doc.ID, doc.AccessHash, effects)
 	if err != nil {
 		return s.stickersBotEditError(state.UserID, err)
 	}
+	s.hooks.InvalidateStickerSetCatalog(stickersBotSetKind(set))
 	if err := s.bots.DeleteBotChatState(ctx, domain.StickersBotUserID, state.UserID); err != nil {
 		s.log.Error("stickersbot: delete remove state", zap.Int64("user_id", state.UserID), zap.Error(err))
-	}
-	if s.hooks != nil {
-		s.hooks.PushStickerSetsChanged(ctx, state.UserID, stickersBotSetKind(set))
 	}
 	return botReply{Text: fmt.Sprintf("Done. Removed from %s.\n\n%s", stickersBotSetTitle(set), s.stickersBotPublicURL(set))}
 }
 
 func (s *Service) handleStickersShortName(ctx context.Context, state domain.BotChatState, raw string) botReply {
-	if s.stickers == nil || s.installer == nil {
+	if s.stickers == nil || s.hooks == nil {
 		return botReply{Text: "Sticker pack creation is not available right now. Please try again later."}
 	}
 	shortName := normalizeStickersBotShortName(raw)
@@ -463,7 +473,11 @@ func (s *Service) handleStickersShortName(ctx context.Context, state domain.BotC
 		return botReply{Text: "Add at least one sticker material document before publishing."}
 	}
 	kind := stickersBotKindFromState(state)
-	set, _, err := s.stickers.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	effects := s.hooks.StickerSetDeliveryEffects(ctx, state.UserID)
+	if effects == nil {
+		return internalReply()
+	}
+	set, _, err := s.stickers.CreateInstalledStickerSet(ctx, domain.CreateStickerSetRequest{
 		CreatorUserID: state.UserID,
 		Title:         state.Draft[stickersBotDraftTitle],
 		ShortName:     shortName,
@@ -471,20 +485,13 @@ func (s *Service) handleStickersShortName(ctx context.Context, state domain.BotC
 		Items:         stickersBotCreateItems(items),
 		Software:      stickersBotCreateSoftware,
 		Date:          int(s.now().Unix()),
-	})
+	}, effects)
 	if err != nil {
 		return s.stickersBotCreateError(state.UserID, err)
 	}
-	installKind := stickersBotSetKind(set)
-	if err := s.installer.InstallUserStickerSet(ctx, state.UserID, set.ID, installKind, false, int(s.now().Unix())); err != nil {
-		s.log.Error("stickersbot: install created set", zap.Int64("user_id", state.UserID), zap.Int64("set_id", set.ID), zap.Error(err))
-		return internalReply()
-	}
+	s.hooks.InvalidateStickerSetCatalog(stickersBotSetKind(set))
 	if err := s.bots.DeleteBotChatState(ctx, domain.StickersBotUserID, state.UserID); err != nil {
 		s.log.Error("stickersbot: delete published state", zap.Int64("user_id", state.UserID), zap.Error(err))
-	}
-	if s.hooks != nil {
-		s.hooks.PushStickerSetsChanged(ctx, state.UserID, installKind)
 	}
 	return botReply{Text: "Done. Your pack is published and installed.\n\n" + s.stickersBotPublicURL(set)}
 }

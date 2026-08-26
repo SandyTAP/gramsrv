@@ -10,6 +10,7 @@ import (
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) registerAiCompose(d *tlprofile.Dispatcher) {
@@ -65,17 +66,20 @@ func (r *Router) onAicomposeCreateTone(ctx context.Context, req *tg.AicomposeCre
 	if err != nil {
 		return nil, err
 	}
+	effects, err := r.aiComposeToneEffects(ctx, userID)
+	if err != nil {
+		return nil, internalErr()
+	}
 	tone, err := r.deps.AICompose.CreateTone(ctx, domain.AIComposeToneInput{
 		UserID:        userID,
 		DisplayAuthor: req.DisplayAuthor,
 		EmojiID:       req.EmojiID,
 		Title:         req.Title,
 		Prompt:        req.Prompt,
-	})
+	}, effects)
 	if err != nil {
 		return nil, aiComposeErr(err)
 	}
-	r.pushAIComposeTonesChanged(ctx, userID)
 	return r.tgAIComposeTone(ctx, userID, tone), nil
 }
 
@@ -111,11 +115,14 @@ func (r *Router) onAicomposeUpdateTone(ctx context.Context, req *tg.AicomposeUpd
 		v := req.Prompt
 		update.Prompt = &v
 	}
-	tone, err := r.deps.AICompose.UpdateTone(ctx, update)
+	effects, err := r.aiComposeToneEffects(ctx, userID)
+	if err != nil {
+		return nil, internalErr()
+	}
+	tone, err := r.deps.AICompose.UpdateTone(ctx, update, effects)
 	if err != nil {
 		return nil, aiComposeErr(err)
 	}
-	r.pushAIComposeTonesChanged(ctx, userID)
 	return r.tgAIComposeTone(ctx, userID, tone), nil
 }
 
@@ -131,10 +138,13 @@ func (r *Router) onAicomposeSaveTone(ctx context.Context, req *tg.AicomposeSaveT
 	if err != nil {
 		return false, err
 	}
-	if err := r.deps.AICompose.SaveTone(ctx, userID, ref, req.Unsave); err != nil {
+	effects, err := r.aiComposeToneEffects(ctx, userID)
+	if err != nil {
+		return false, internalErr()
+	}
+	if err := r.deps.AICompose.SaveTone(ctx, userID, ref, req.Unsave, effects); err != nil {
 		return false, aiComposeErr(err)
 	}
-	r.pushAIComposeTonesChanged(ctx, userID)
 	return true, nil
 }
 
@@ -150,10 +160,13 @@ func (r *Router) onAicomposeDeleteTone(ctx context.Context, tone tg.InputAiCompo
 	if err != nil {
 		return false, err
 	}
-	if err := r.deps.AICompose.DeleteTone(ctx, userID, ref); err != nil {
+	effects, err := r.aiComposeToneEffects(ctx, userID)
+	if err != nil {
+		return false, internalErr()
+	}
+	if err := r.deps.AICompose.DeleteTone(ctx, userID, ref, effects); err != nil {
 		return false, aiComposeErr(err)
 	}
-	r.pushAIComposeTonesChanged(ctx, userID)
 	return true, nil
 }
 
@@ -330,11 +343,24 @@ func (r *Router) tgAIComposeTone(_ context.Context, userID int64, in domain.AICo
 	return out
 }
 
-func (r *Router) pushAIComposeTonesChanged(ctx context.Context, userID int64) {
-	r.pushUserMessageTransient(ctx, userID, "push ai compose tones update", &tg.UpdateShort{
+func (r *Router) aiComposeToneEffects(ctx context.Context, userID int64) (store.DeliveryEffectsBuilder[domain.AIComposeTone], error) {
+	if err := r.requireAccountDelivery(userID, "aicompose tone mutation"); err != nil {
+		return nil, err
+	}
+	payload, err := encodeDeliveryUpdate(&tg.UpdateShort{
 		Update: &tg.UpdateAiComposeTones{},
 		Date:   int(r.clock.Now().Unix()),
 	})
+	if err != nil {
+		return nil, err
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(domain.AIComposeTone) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}, nil
 }
 
 func aiComposeErr(err error) error {

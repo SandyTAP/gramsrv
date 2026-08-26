@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap"
 )
 
@@ -51,11 +50,7 @@ func (d *ExpiryDispatcher) dispatchPrivate(ctx context.Context, now int) bool {
 	if d.router.deps.Messages == nil {
 		return false
 	}
-	ttlSvc, ok := d.router.deps.Messages.(historyTTLMessagesService)
-	if !ok {
-		return false
-	}
-	requests, err := ttlSvc.ClaimExpiredPrivateMessages(ctx, now, d.batch)
+	requests, err := d.router.deps.Messages.ClaimExpiredPrivateMessages(ctx, now, d.batch)
 	if err != nil {
 		d.log.Warn("claim expired private messages", zap.Error(err))
 		return false
@@ -83,14 +78,11 @@ func (d *ExpiryDispatcher) dispatchChannels(ctx context.Context, now int) bool {
 		return false
 	}
 	for _, req := range requests {
-		res, err := d.router.deps.Channels.DeleteMessages(ctx, req.UserID, req)
+		_, err := d.router.deps.Channels.DeleteMessages(ctx, req.UserID, req)
 		if err != nil {
 			d.log.Warn("delete expired channel messages", zap.Int64("channel_id", req.ChannelID), zap.Ints("ids", req.IDs), zap.Error(err))
 			continue
 		}
-		d.router.enqueueChannelFanout(ctx, channelFanoutMessageBox, req.UserID, req.ChannelID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-			return d.router.channelDeleteMessagesUpdates(viewerUserID, res.Channel, res.Event)
-		})
 	}
 	return len(requests) > 0
 }

@@ -29,7 +29,7 @@ func TestChannelStoreEnablingDirectMessagesCreatesMonoforum(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Mono Broadcast " + suffix, Broadcast: true, Date: 1700000900,
 	})
@@ -73,7 +73,8 @@ func TestChannelStoreEnablingDirectMessagesCreatesMonoforum(t *testing.T) {
 	}
 	read, err := channels.ReadChannelHistory(ctx, domain.ReadChannelHistoryRequest{
 		UserID: owner.ID, ChannelID: monoID, MaxID: mfTop, Date: 1700000901,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("read synthetic monoforum history: %v", err)
 	}

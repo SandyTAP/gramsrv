@@ -31,7 +31,7 @@ func TestChannelUpdateRetentionFloorDifferenceAndDirtyCheckpointPostgres(t *test
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Retention PG " + suffix,
@@ -128,7 +128,7 @@ func TestDeleteExpiredChannelUpdateEventsContinuesPastCandidatePagePostgres(t *t
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	for i := 0; i < 320; i++ {
 		created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 			CreatorUserID: owner.ID,
@@ -175,7 +175,7 @@ func TestDeleteExpiredChannelUpdateEventsIsolatesGapAndContinuesPostgres(t *test
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	bad, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Retention bad " + suffix, Megagroup: true, Date: 1,
 	})

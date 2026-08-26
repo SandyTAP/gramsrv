@@ -18,28 +18,20 @@ type channelPaidReactionReplayService interface {
 	ReplayPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, bool, error)
 }
 
-// channelPaidReactionUpdates 为某 viewer 构造一条 updateMessageReactions：把消息已有的普通
-// reaction 与付费 ReactionPaid（总星数 + top reactors）合并。非请求者走 min 语义（置 Min，
-// 客户端忽略 chosen 保留本地态），避免把请求者视角串给他人。
-func (r *Router) channelPaidReactionUpdates(ctx context.Context, requestUserID, viewerUserID int64, res domain.ChannelMessagePaidReactionResult, ids []int) *tg.Updates {
-	isRequester := viewerUserID == requestUserID
+// channelPaidReactionResponseUpdates builds only the current RPC caller's
+// projection. Egress owns every other session/viewer projection.
+func (r *Router) channelPaidReactionResponseUpdates(ctx context.Context, viewerUserID int64, res domain.ChannelMessagePaidReactionResult) *tg.Updates {
 	base := domain.ChannelMessageReactions{}
 	if res.Message.Reactions != nil {
 		base = *res.Message.Reactions
 	}
-	paid := clonePaidForViewer(res.Paid, isRequester)
+	paid := res.Paid
 	base.Paid = &paid
 	mr := tgMessageReactions(viewerUserID, &base)
 	if mr == nil {
 		mr = &tg.MessageReactions{Results: []tg.ReactionCount{}}
 	}
-	if !isRequester {
-		mr.Min = true
-	}
 	msgID := res.Message.ID
-	if msgID == 0 && len(ids) > 0 {
-		msgID = ids[0]
-	}
 	update := &tg.UpdateMessageReactions{
 		Peer:      &tg.PeerChannel{ChannelID: res.Channel.ID},
 		MsgID:     msgID,
@@ -76,23 +68,8 @@ func (r *Router) channelPaidReactionUpdates(ctx context.Context, requestUserID, 
 	}
 }
 
-// clonePaidForViewer 返回付费聚合的副本；非请求者抹除 My/MyStars（min 语义防串视角）。
-func clonePaidForViewer(paid domain.ChannelMessagePaidReactions, isRequester bool) domain.ChannelMessagePaidReactions {
-	out := paid
-	out.TopReactors = make([]domain.PaidReactor, len(paid.TopReactors))
-	copy(out.TopReactors, paid.TopReactors)
-	if !isRequester {
-		out.MyStars = 0
-		out.MyAnonymous = false
-		for i := range out.TopReactors {
-			out.TopReactors[i].My = false
-		}
-	}
-	return out
-}
-
 // injectPaidReaction 把付费 reaction 注入 MessageReactions：ReactionPaid 计数置首位、填充
-// top reactors 排行。My/chosen 完全由 paid 的视角数据驱动（调用方对他人视角已抹除 My/MyStars）。
+// top reactors 排行。My/chosen 完全由调用者视角的 paid 数据驱动。
 func injectPaidReaction(mr *tg.MessageReactions, paid domain.ChannelMessagePaidReactions) {
 	if paid.TotalStars <= 0 {
 		return

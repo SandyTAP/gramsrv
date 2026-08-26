@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestModerationFlagsRejectImpossibleStateAtPostgresBoundary(t *testing.T) {
@@ -22,7 +23,7 @@ func TestModerationFlagsRejectImpossibleStateAtPostgresBoundary(t *testing.T) {
 		t.Fatal("users CHECK constraint accepted scam=true,fake=true")
 	}
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: user.ID,
 		Title:         "Moderation " + suffix,
@@ -46,6 +47,27 @@ func TestModerationFlagsRejectImpossibleStateAtPostgresBoundary(t *testing.T) {
 	gotChannel, err := channels.GetChannelByID(ctx, created.Channel.ID)
 	if err != nil || gotChannel.Scam || gotChannel.Fake {
 		t.Fatalf("channel after rejected writes=%+v err=%v", gotChannel, err)
+	}
+}
+
+func TestUserAudienceDeliveryFailureRollsBackModerationFlagPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	users := NewUserStore(pool)
+	user := createTestUser(t, ctx, users, "+1782"+randomSuffix(t)+"71", "ModerationRollback", "")
+	wantErr := errors.New("encode failed")
+	if _, err := users.SetVerifiedWithDelivery(ctx, user.ID, true, func(store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return nil, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("SetVerifiedWithDelivery error = %v", err)
+	}
+	current, found, err := users.ByID(ctx, user.ID)
+	if err != nil || !found || current.Verified {
+		t.Fatalf("user after rollback = %+v found=%v err=%v", current, found, err)
+	}
+	var deliveries int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM edge_delivery_outbox WHERE target_user_id=$1", user.ID).Scan(&deliveries); err != nil || deliveries != 0 {
+		t.Fatalf("deliveries after rollback = %d err=%v", deliveries, err)
 	}
 }
 
@@ -111,7 +133,7 @@ WHERE target_user_id = ANY($1::bigint[])
 		t.Fatalf("profile outbox count=%d err=%v", outboxCount, err)
 	}
 
-	audience, err := users.ModerationFlagAudience(ctx, target.ID, 4096)
+	audience, err := moderationFlagAudience(ctx, pool, target.ID, maxModerationFlagAudience)
 	if err != nil {
 		t.Fatalf("moderation audience: %v", err)
 	}
@@ -147,7 +169,7 @@ func TestChannelModerationFlagsDoNotAdvanceMemberAccountPts(t *testing.T) {
 	ctx := context.Background()
 	suffix := randomSuffix(t)
 	users := NewUserStore(pool)
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	events := NewUpdateEventStore(pool)
 
 	owner := createTestUser(t, ctx, users, "+1783"+suffix+"71", "FlagOwner", "")

@@ -14,7 +14,7 @@ import (
 func TestSignInWithEmailCompletesLogin(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
-	authz := memory.NewAuthorizationStore()
+	authz := newAuthorizationStoreWithDelivery()
 	dialogs := memory.NewDialogStore()
 	messages := memory.NewMessageStore(dialogs)
 	svc := NewService(users, authz, memory.NewCodeStore(), nil, nil, "12345",
@@ -40,10 +40,10 @@ func TestSignInWithEmailCompletesLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCode signin: %v", err)
 	}
-	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009001", hash, "anything-goes"); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009001", hash, "anything-goes", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("SignInWithEmail arbitrary nonempty code err=%v, want ErrCodeInvalid", err)
 	}
-	got, _, needSignUp, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009001", hash, "12345")
+	got, _, needSignUp, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009001", hash, "12345", testAuthorizationDelivery)
 	if err != nil {
 		t.Fatalf("SignInWithEmail: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestSignInWithEmailRejectsEmptyCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
-	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{}, "+15550009002", hash, "   "); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{}, "+15550009002", hash, "   ", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("SignInWithEmail empty code err = %v, want ErrCodeInvalid", err)
 	}
 }
@@ -103,7 +103,7 @@ func TestSignInWithEmailStillHonorsTwoFactor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCode signin: %v", err)
 	}
-	got, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009003", hash, "12345")
+	got, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, "+15550009003", hash, "12345", testAuthorizationDelivery)
 	if !errors.Is(err, domain.ErrSessionPasswordNeeded) {
 		t.Fatalf("SignInWithEmail err = %v, want ErrSessionPasswordNeeded", err)
 	}

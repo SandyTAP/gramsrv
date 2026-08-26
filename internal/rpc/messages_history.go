@@ -353,6 +353,9 @@ func (r *Router) onMessagesReadDiscussion(ctx context.Context, req *tg.MessagesR
 	if r.deps.Channels == nil {
 		return true, nil
 	}
+	if err := r.requireAccountDelivery(userID, "messages.readDiscussion"); err != nil {
+		return false, err
+	}
 	now := int(r.clock.Now().Unix())
 	// forum 话题已读：req.MsgID 是话题 id，推进 per-topic 水位（不碰频道级，消除话题间已读串扰），
 	// 向自己其它设备下发 DiscussionInbox、向话题内发送者下发 DiscussionOutbox 回执。不经
@@ -363,26 +366,8 @@ func (r *Router) onMessagesReadDiscussion(ctx context.Context, req *tg.MessagesR
 		TopicID:   req.MsgID,
 		MaxID:     req.ReadMaxID,
 		Date:      now,
-	})
+	}, channelTopicReadDeliveryEffects(userID, now))
 	if terr == nil {
-		if topicRes.Changed {
-			if err := r.recordChannelDiscussionInbox(ctx, userID, peer.ID, topicRes.TopicID, topicRes.MaxID, topicRes.Pts); err != nil {
-				return false, err
-			}
-			r.pushChannelDiscussionOutboxUpdates(ctx, peer.ID, topicRes.TopicID, topicRes.OutboxUpdates)
-		}
-		// 保守叠加：同时推进频道级 inbox 水位，保持 getDialogs/getPeerDialogs 会话总未读不退化。
-		if read, rerr := r.deps.Channels.ReadHistory(ctx, userID, domain.ReadChannelHistoryRequest{
-			UserID:    userID,
-			ChannelID: peer.ID,
-			MaxID:     req.ReadMaxID,
-			Date:      now,
-		}); rerr == nil {
-			if _, err := r.recordChannelReadInbox(ctx, userID, read); err != nil {
-				return false, err
-			}
-			r.pushChannelReadOutboxUpdates(ctx, read.ChannelID, read.OutboxUpdates)
-		}
 		return topicRes.Changed, nil
 	}
 	if !errors.Is(terr, domain.ErrChannelForumMissing) {
@@ -421,14 +406,10 @@ func (r *Router) onMessagesReadDiscussion(ctx context.Context, req *tg.MessagesR
 		ChannelID: readChannelID,
 		MaxID:     req.ReadMaxID,
 		Date:      now,
-	})
+	}, channelReadDeliveryEffects(now))
 	if err != nil {
 		return false, channelInvalidErr(err)
 	}
-	if _, err := r.recordChannelReadInbox(ctx, userID, read); err != nil {
-		return false, err
-	}
-	r.pushChannelReadOutboxUpdates(ctx, read.ChannelID, read.OutboxUpdates)
 	return read.Changed, nil
 }
 

@@ -5,9 +5,10 @@ import (
 	"sort"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
-func (s *MessageStore) setSavedMessageTagsLocked(req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s *MessageStore) setSavedMessageTagsLocked(ctx context.Context, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	var target domain.Message
 	for _, msg := range s.m[req.UserID] {
 		if msg.ID == req.MessageID &&
@@ -24,6 +25,8 @@ func (s *MessageStore) setSavedMessageTagsLocked(req domain.SetPrivateMessageRea
 			return domain.PrivateMessageReactionsResult{}, domain.ErrReactionInvalid
 		}
 	}
+	previous, existed := s.savedMessageTags[req.UserID][target.ID]
+	previous = append([]domain.MessageReaction(nil), previous...)
 	if len(req.Reactions) == 0 {
 		if byMessage := s.savedMessageTags[req.UserID]; byMessage != nil {
 			delete(byMessage, target.ID)
@@ -40,10 +43,32 @@ func (s *MessageStore) setSavedMessageTagsLocked(req domain.SetPrivateMessageRea
 	item := cloneMessage(target)
 	reactions := s.savedMessageTagsForMessageLocked(item)
 	item.Reactions = cloneChannelMessageReactionsPtr(&reactions)
-	return domain.PrivateMessageReactionsResult{
+	res := domain.PrivateMessageReactionsResult{
 		Messages:  []domain.Message{item},
 		Reactions: reactions,
-	}, nil
+	}
+	intents, err := effects(res)
+	if err == nil && len(intents) == 0 {
+		err = store.ErrDeliveryOutboxRequired
+	}
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	}
+	if err != nil {
+		if existed {
+			if s.savedMessageTags[req.UserID] == nil {
+				s.savedMessageTags[req.UserID] = make(map[int][]domain.MessageReaction)
+			}
+			s.savedMessageTags[req.UserID][target.ID] = previous
+		} else if byMessage := s.savedMessageTags[req.UserID]; byMessage != nil {
+			delete(byMessage, target.ID)
+			if len(byMessage) == 0 {
+				delete(s.savedMessageTags, req.UserID)
+			}
+		}
+		return domain.PrivateMessageReactionsResult{}, err
+	}
+	return res, nil
 }
 
 func (s *MessageStore) savedMessageTagsForMessageLocked(msg domain.Message) domain.ChannelMessageReactions {
@@ -112,9 +137,12 @@ func (s *MessageStore) ListSavedReactionTags(_ context.Context, req domain.Saved
 	return out, nil
 }
 
-func (s *MessageStore) UpsertSavedReactionTag(_ context.Context, tag domain.SavedReactionTag) error {
+func (s *MessageStore) UpsertSavedReactionTag(ctx context.Context, tag domain.SavedReactionTag, effects store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error {
 	if tag.UserID == 0 || !tag.Reaction.Valid() {
 		return domain.ErrReactionInvalid
+	}
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
 	key := tag.Reaction.Key()
 	s.mu.Lock()
@@ -145,15 +173,37 @@ func (s *MessageStore) UpsertSavedReactionTag(_ context.Context, tag domain.Save
 	if !found {
 		return domain.ErrReactionInvalid
 	}
+	previousTitle, hadTitle := s.savedTagTitles[tag.UserID][key]
 	if tag.Title == "" {
 		if titles := s.savedTagTitles[tag.UserID]; titles != nil {
 			delete(titles, key)
 		}
-		return nil
+	} else {
+		if s.savedTagTitles[tag.UserID] == nil {
+			s.savedTagTitles[tag.UserID] = make(map[string]string)
+		}
+		s.savedTagTitles[tag.UserID][key] = tag.Title
 	}
-	if s.savedTagTitles[tag.UserID] == nil {
-		s.savedTagTitles[tag.UserID] = make(map[string]string)
+	intents, err := effects(tag)
+	if err == nil && len(intents) == 0 {
+		err = store.ErrDeliveryOutboxRequired
 	}
-	s.savedTagTitles[tag.UserID][key] = tag.Title
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	}
+	if err != nil {
+		if hadTitle {
+			if s.savedTagTitles[tag.UserID] == nil {
+				s.savedTagTitles[tag.UserID] = make(map[string]string)
+			}
+			s.savedTagTitles[tag.UserID][key] = previousTitle
+		} else if titles := s.savedTagTitles[tag.UserID]; titles != nil {
+			delete(titles, key)
+			if len(titles) == 0 {
+				delete(s.savedTagTitles, tag.UserID)
+			}
+		}
+		return err
+	}
 	return nil
 }

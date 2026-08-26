@@ -81,6 +81,7 @@ func newInlineBotRPCTestFixture(t *testing.T) inlineBotRPCTestFixture {
 	users := memory.NewUserStore()
 	botStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messageStore := memory.NewMessageStore(dialogs)
 	bots := botsapp.NewService(users, botStore, messageStore)
 	messages := appmessages.NewService(messageStore, dialogs)
@@ -114,7 +115,7 @@ func newInlineBotRPCTestFixture(t *testing.T) inlineBotRPCTestFixture {
 	if err != nil {
 		t.Fatalf("create peer: %v", err)
 	}
-	bot, _, err := bots.CreateBot(ctx, owner.ID, "Inline Bot", "inline_shape_bot")
+	bot, _, err := bots.CreateBotWithDelivery(ctx, owner.ID, "Inline Bot", "inline_shape_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -1923,7 +1924,7 @@ func TestInlineBotValidation(t *testing.T) {
 		t.Fatalf("duplicate inline result err = %v, want RESULT_ID_DUPLICATE", err)
 	}
 
-	disabledBot, _, err := f.bots.CreateBot(ctx, f.owner.ID, "Disabled Inline Bot", "disabled_inline_bot")
+	disabledBot, _, err := f.bots.CreateBotWithDelivery(ctx, f.owner.ID, "Disabled Inline Bot", "disabled_inline_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create disabled bot: %v", err)
 	}

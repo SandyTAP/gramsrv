@@ -9,16 +9,20 @@ import (
 	"hash"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 	"time"
 )
 
-func (s *MessageStore) SetMessageReactions(ctx context.Context, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s *MessageStore) SetMessageReactions(ctx context.Context, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	if req.UserID == 0 || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
 	}
 	if len(req.Reactions) > domain.MaxChannelMessageReactionsPerUser {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
+	}
+	if effects == nil {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
 	}
 	req.Reactions = domain.TrimMessageReactionsToUserMax(req.Reactions, req.ReactionsPerUserMax)
 	if req.Date == 0 {
@@ -30,7 +34,7 @@ func (s *MessageStore) SetMessageReactions(ctx context.Context, req domain.SetPr
 		}
 	}
 	if req.Peer.ID == req.UserID {
-		return s.setSavedMessageTags(ctx, req)
+		return s.setSavedMessageTags(ctx, req, effects)
 	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
@@ -167,6 +171,16 @@ WHERE d.user_id = $1
 			res.Reactions = *msg.Reactions
 			break
 		}
+	}
+	intents, err := effects(res)
+	if err != nil {
+		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("build private reaction delivery effects: %w", err)
+	}
+	if len(intents) == 0 && len(res.Messages) > 0 {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
+	}
+	if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("apply private reaction delivery effects: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.PrivateMessageReactionsResult{}, fmt.Errorf("commit set message reactions tx: %w", err)

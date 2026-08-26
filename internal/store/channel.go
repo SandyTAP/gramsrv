@@ -14,6 +14,32 @@ const MaxActiveChannelMemberPairs = 65536
 
 var ErrActiveChannelMemberPairsLimit = errors.New("active channel membership pair limit exceeded")
 
+// ChannelPendingJoinDeliveryTarget is one transaction-consistent,
+// viewer-specific pending join-request projection. Pending and RecentUsers are
+// the complete bounded snapshot after the owning mutation, so the builder only
+// encodes and never performs a nested store read.
+type ChannelPendingJoinDeliveryTarget struct {
+	TargetUserID int64
+	Channel      domain.Channel
+	Pending      domain.ChannelPendingJoinRequests
+	RecentUsers  []domain.User
+}
+
+// ChannelPendingJoinDeliverySnapshot is the authoritative admin audience for
+// one pending-request mutation. Empty is meaningful for an idempotent replay.
+type ChannelPendingJoinDeliverySnapshot struct {
+	Targets []ChannelPendingJoinDeliveryTarget
+}
+
+// ChannelAvailableMinDeliverySnapshot freezes the owner-local available-min
+// boundary after a history clear. TargetUserID is zero for a no-op or a
+// for-everyone deletion, and the builder must then return no effects.
+type ChannelAvailableMinDeliverySnapshot struct {
+	TargetUserID   int64
+	Channel        domain.Channel
+	AvailableMinID int
+}
+
 // ChannelStore persists Telegram channels/supergroups and their single-copy messages.
 type ChannelStore interface {
 	CreateChannel(ctx context.Context, req domain.CreateChannelRequest) (domain.CreateChannelResult, error)
@@ -28,7 +54,7 @@ type ChannelStore interface {
 	GetParticipant(ctx context.Context, viewerUserID, channelID, participantUserID int64) (domain.ChannelMember, error)
 	FutureCreatorAfterLeave(ctx context.Context, channelID, userID int64) (domain.ChannelMember, error)
 	InviteToChannel(ctx context.Context, channelID, inviterUserID int64, userIDs []int64, date int) (domain.CreateChannelResult, error)
-	JoinChannel(ctx context.Context, channelID, userID int64, date int) (domain.CreateChannelResult, error)
+	JoinChannel(ctx context.Context, channelID, userID int64, date int, effects DeliveryEffectsBuilder[ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	LeaveChannel(ctx context.Context, channelID, userID int64, date int) (domain.CreateChannelResult, error)
 	EditChannelTitle(ctx context.Context, req domain.EditChannelTitleRequest) (domain.EditChannelTitleResult, error)
 	SetChannelWallpaper(ctx context.Context, req domain.SetChannelWallpaperRequest) (domain.SetChannelWallpaperResult, error)
@@ -102,7 +128,7 @@ type ChannelStore interface {
 	SendMonoforumMessage(ctx context.Context, req domain.SendMonoforumMessageRequest) (domain.SendChannelMessageResult, error)
 	EditChannelMessage(ctx context.Context, req domain.EditChannelMessageRequest) (domain.EditChannelMessageResult, error)
 	DeleteChannelMessages(ctx context.Context, req domain.DeleteChannelMessagesRequest) (domain.DeleteChannelMessagesResult, error)
-	DeleteChannelHistory(ctx context.Context, req domain.DeleteChannelHistoryRequest) (domain.DeleteChannelHistoryResult, error)
+	DeleteChannelHistory(ctx context.Context, req domain.DeleteChannelHistoryRequest, effects DeliveryEffectsBuilder[ChannelAvailableMinDeliverySnapshot]) (domain.DeleteChannelHistoryResult, error)
 	DeleteChannelParticipantHistory(ctx context.Context, req domain.DeleteChannelParticipantHistoryRequest) (domain.DeleteChannelHistoryResult, error)
 	UpdatePinnedMessage(ctx context.Context, req domain.UpdateChannelPinnedMessageRequest) (domain.UpdateChannelPinnedMessageResult, error)
 	UnpinAllChannelMessages(ctx context.Context, req domain.UnpinAllChannelMessagesRequest) (domain.UpdateChannelPinnedMessageResult, error)
@@ -114,7 +140,7 @@ type ChannelStore interface {
 	// date==0 时由实现取当前时间。
 	EnsurePermanentInvite(ctx context.Context, channelID, adminUserID int64, date int) (domain.ChannelInvite, error)
 	CheckInvite(ctx context.Context, userID int64, hash string, date int) (domain.CheckChannelInviteResult, error)
-	ImportInvite(ctx context.Context, req domain.ImportChannelInviteRequest) (domain.CreateChannelResult, error)
+	ImportInvite(ctx context.Context, req domain.ImportChannelInviteRequest, effects DeliveryEffectsBuilder[ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	ListExportedInvites(ctx context.Context, req domain.ChannelInviteListRequest) (domain.ChannelInviteList, error)
 	GetExportedInvite(ctx context.Context, req domain.GetChannelInviteRequest) (domain.ChannelInvite, error)
 	EditExportedInvite(ctx context.Context, req domain.EditChannelInviteRequest) (domain.EditChannelInviteResult, error)
@@ -123,8 +149,8 @@ type ChannelStore interface {
 	ListAdminsWithInvites(ctx context.Context, userID, channelID int64) ([]domain.ChannelAdminInviteCount, error)
 	ListInviteImporters(ctx context.Context, req domain.ChannelInviteImportersRequest) (domain.ChannelInviteImporterList, error)
 	PendingJoinRequests(ctx context.Context, channelID int64, limit int) (domain.ChannelPendingJoinRequests, error)
-	HideChatJoinRequest(ctx context.Context, req domain.HideChannelJoinRequestRequest) (domain.CreateChannelResult, error)
-	HideAllChatJoinRequests(ctx context.Context, req domain.HideChannelJoinRequestsRequest) (domain.CreateChannelResult, error)
+	HideChatJoinRequest(ctx context.Context, req domain.HideChannelJoinRequestRequest, effects DeliveryEffectsBuilder[ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
+	HideAllChatJoinRequests(ctx context.Context, req domain.HideChannelJoinRequestsRequest, effects DeliveryEffectsBuilder[ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error)
 	ListChannelDialogs(ctx context.Context, viewerUserID int64, filter domain.DialogFilter) (domain.ChannelDialogList, error)
 	GetChannelDialogs(ctx context.Context, viewerUserID int64, channelIDs []int64) (domain.ChannelDialogList, error)
 	ListCommonChannels(ctx context.Context, req domain.CommonChannelsRequest) (domain.CommonChannelsResult, error)
@@ -140,7 +166,6 @@ type ChannelStore interface {
 	// 该 folder 内不在 order 中的置顶。
 	ReorderChannelPinnedDialogs(ctx context.Context, userID int64, folderID int, order []domain.Peer, force bool) (bool, error)
 	SetChannelDialogUnreadMark(ctx context.Context, userID, channelID int64, unread bool) (bool, error)
-	SetChannelViewForumAsMessages(ctx context.Context, userID, channelID int64, enabled bool) (bool, error)
 	ListChannelUnreadMarked(ctx context.Context, userID int64) ([]domain.Peer, error)
 	EditChannelPeerFolders(ctx context.Context, userID int64, peers []domain.FolderPeerUpdate) error
 	// CountChannelArchiveUnread 统计归档中有未读（含手动标记）的频道会话数
@@ -160,19 +185,18 @@ type ChannelStore interface {
 	SearchChannelMedia(ctx context.Context, viewerUserID, channelID int64, req domain.MediaSearchRequest) (domain.ChannelHistory, error)
 	// CountChannelMediaCategories 返回某频道对当前 viewer 可见消息按基础媒体类别聚合的精确计数。
 	CountChannelMediaCategories(ctx context.Context, viewerUserID, channelID int64) (domain.MediaCategoryCounts, error)
-	ChannelPollFanoutViews(ctx context.Context, channelID int64, msgID int, viewers []int64, now int) (domain.ChannelPollFanoutViews, error)
 	ListStoryMessageForwards(ctx context.Context, req domain.StoryMessageForwardListRequest) (domain.StoryMessageForwardList, error)
 	GetChannelMessageForInlineBot(ctx context.Context, botID, channelID int64, id int) (domain.Channel, domain.ChannelMessage, bool, error)
-	ReadChannelMessageContents(ctx context.Context, req domain.ReadChannelMessageContentsRequest) (domain.ReadChannelMessageContentsResult, error)
+	ReadChannelMessageContents(ctx context.Context, req domain.ReadChannelMessageContentsRequest, effects DeliveryEffectsBuilder[domain.ReadChannelMessageContentsResult]) (domain.ReadChannelMessageContentsResult, error)
 	ListChannelReplies(ctx context.Context, viewerUserID int64, filter domain.ChannelRepliesFilter) (domain.ChannelHistory, error)
 	ListChannelUnreadMentions(ctx context.Context, viewerUserID int64, filter domain.ChannelUnreadMentionsFilter) (domain.ChannelHistory, error)
 	ReadChannelMentions(ctx context.Context, req domain.ReadChannelMentionsRequest) (domain.ReadChannelMentionsResult, error)
 	ListChannelUnreadReactions(ctx context.Context, viewerUserID int64, filter domain.ChannelUnreadReactionsFilter) (domain.ChannelHistory, error)
 	ReadChannelReactions(ctx context.Context, req domain.ReadChannelReactionsRequest) (domain.ReadChannelReactionsResult, error)
 	GetDiscussionMessage(ctx context.Context, viewerUserID, channelID int64, msgID int) (domain.ChannelDiscussionMessage, error)
-	ReadChannelHistory(ctx context.Context, req domain.ReadChannelHistoryRequest) (domain.ReadChannelHistoryResult, error)
+	ReadChannelHistory(ctx context.Context, req domain.ReadChannelHistoryRequest, effects DeliveryEffectsBuilder[domain.ReadChannelHistoryResult]) (domain.ReadChannelHistoryResult, error)
 	// ReadChannelTopicHistory 推进 forum 单话题的 per-viewer 已读水位（不碰频道级），返回需推进 outbox 的发送者。
-	ReadChannelTopicHistory(ctx context.Context, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error)
+	ReadChannelTopicHistory(ctx context.Context, req domain.ReadChannelTopicHistoryRequest, effects DeliveryEffectsBuilder[domain.ReadChannelTopicHistoryResult]) (domain.ReadChannelTopicHistoryResult, error)
 	// GeneralForumTopic 现算 forum General 话题（id=1）对 viewer 的状态（per-topic 水位，不被普通话题串扰）。
 	GeneralForumTopic(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelForumTopic, error)
 	ListMessageReadParticipants(ctx context.Context, req domain.ChannelReadParticipantsRequest) (domain.ChannelReadParticipantsResult, error)
@@ -199,14 +223,13 @@ type ChannelStore interface {
 	FilterChannelMessageAudienceIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
 	MaxChannelPts(ctx context.Context, channelID int64) (int, error)
 	// MaxChannelPtsBatch returns existing channel watermarks with one bounded store round trip.
-	// Missing/deleted ids are omitted so a stale process-local membership key cannot poison the
-	// entire fan-out recovery sweep.
+	// Missing/deleted IDs are omitted; this is a read-model/difference helper, not a Core fan-out trigger.
 	MaxChannelPtsBatch(ctx context.Context, channelIDs []int64) (map[int64]int, error)
 	// SetActiveCall 写入/清除（callID=0）channel 行上的活跃群通话关联
 	//（channel.call_active/call_not_empty flag 与 channelFull.call 的数据源）。
 	SetActiveCall(ctx context.Context, channelID, callID, callAccessHash int64, notEmpty bool) (domain.Channel, error)
 	// AppendCallServiceMessage 生成群通话服务消息（started/ended/invite，带频道
-	// pts），Recipients 为活跃成员（rpc 据此扇出 updateNewChannelMessage）。
+	// pts）；可靠投递由同一 mutation 产生的频道 delivery event 驱动。
 	AppendCallServiceMessage(ctx context.Context, channelID, senderUserID int64, date int, action domain.ChannelMessageAction) (domain.SendChannelMessageResult, error)
 	// AppendStarGiftAdminLog 记录频道 Star gift 的 Recent Actions 快照，不插入频道历史、不推进 pts。
 	AppendStarGiftAdminLog(ctx context.Context, channelID, senderUserID int64, savedID int64, date int, action domain.ChannelMessageAction) error

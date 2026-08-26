@@ -7,6 +7,7 @@ import (
 
 	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // accountNotifySettingsService 是 per-scope 通知设置持久化的可选扩展，由
@@ -14,7 +15,8 @@ import (
 type accountNotifySettingsService interface {
 	GetNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope) (domain.PeerNotifySettings, error)
 	SaveNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings) error
-	ResetNotifySettings(ctx context.Context, ownerUserID int64) error
+	SaveNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings, delivery store.DeliveryOutboxEnqueue) error
+	ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot]) error
 	PeerNotifySettings(ctx context.Context, ownerUserID int64, peers []domain.Peer) (map[domain.Peer]domain.PeerNotifySettings, error)
 	AllPeerNotifySettings(ctx context.Context, ownerUserID int64) (map[domain.Peer]domain.PeerNotifySettings, error)
 	ListNotifyExceptions(ctx context.Context, ownerUserID int64) ([]domain.NotifyException, error)
@@ -88,14 +90,14 @@ func (r *Router) onAccountUpdateNotifySettings(ctx context.Context, req *tg.Acco
 		return false, peerIDInvalidErr()
 	}
 	settings := domainPeerNotifySettings(req.Settings)
-	if svc, ok := r.accountNotifySvc(); ok {
-		if err := svc.SaveNotifySettings(ctx, userID, scope, settings); err != nil {
-			return false, internalErr()
-		}
-		r.notifySettings.Delete(userID)
+	if err := r.requireAccountDelivery(userID, "account.updateNotifySettings"); err != nil {
+		return false, err
 	}
-	// 推 updateNotifySettings 给本人其它在线设备（多设备静音同步）。
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
+	svc, ok := r.accountNotifySvc()
+	if !ok {
+		return false, internalErr()
+	}
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateNotifySettings{
 			Peer:           tgNotifyPeer(scope),
 			NotifySettings: *tgPeerNotifySettings(&settings),
@@ -104,6 +106,17 @@ func (r *Router) onAccountUpdateNotifySettings(ctx context.Context, req *tg.Acco
 		Chats: []tg.ChatClass{},
 		Date:  int(r.clock.Now().Unix()),
 	})
+	if err != nil {
+		return false, internalErr()
+	}
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	if err := svc.SaveNotifySettingsWithDelivery(ctx, userID, scope, settings, store.DeliveryOutboxEnqueue{
+		TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+		Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	}); err != nil {
+		return false, internalErr()
+	}
+	r.notifySettings.Delete(userID)
 	return true, nil
 }
 
@@ -112,13 +125,55 @@ func (r *Router) onAccountResetNotifySettings(ctx context.Context) (bool, error)
 	if err != nil {
 		return false, internalErr()
 	}
-	if svc, ok := r.accountNotifySvc(); ok {
-		if err := svc.ResetNotifySettings(ctx, userID); err != nil {
-			return false, internalErr()
-		}
-		r.notifySettings.Delete(userID)
+	if err := r.requireAccountDelivery(userID, "account.resetNotifySettings"); err != nil {
+		return false, err
 	}
+	if r.deps.Account == nil {
+		return false, internalErr()
+	}
+	if err := r.deps.Account.ResetNotifySettingsWithDelivery(ctx, userID, r.notifySettingsResetDeliveryEffects()); err != nil {
+		return false, internalErr()
+	}
+	r.notifySettings.Delete(userID)
 	return true, nil
+}
+
+func (r *Router) notifySettingsResetDeliveryEffects() store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot] {
+	return func(snapshot store.NotifySettingsResetSnapshot) ([]store.DeliveryEffect, error) {
+		scopes := append([]domain.NotifyScope(nil), snapshot.Scopes...)
+		scopes = append(scopes,
+			domain.NotifyScope{Kind: domain.NotifyScopeUsers},
+			domain.NotifyScope{Kind: domain.NotifyScopeChats},
+			domain.NotifyScope{Kind: domain.NotifyScopeBroadcasts},
+		)
+		seen := make(map[domain.NotifyScope]struct{}, len(scopes))
+		updates := make([]tg.UpdateClass, 0, len(scopes))
+		for _, scope := range scopes {
+			if _, exists := seen[scope]; exists {
+				continue
+			}
+			if scope.Kind != domain.NotifyScopeUsers && scope.Kind != domain.NotifyScopeChats &&
+				scope.Kind != domain.NotifyScopeBroadcasts &&
+				(scope.Kind != domain.NotifyScopePeer || scope.Peer.ID <= 0 || scope.Peer.Type == "") {
+				return nil, store.ErrDeliveryOutboxRequired
+			}
+			seen[scope] = struct{}{}
+			updates = append(updates, &tg.UpdateNotifySettings{
+				Peer: tgNotifyPeer(scope), NotifySettings: *tgPeerNotifySettings(nil),
+			})
+		}
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: updates, Users: []tg.UserClass{}, Chats: []tg.ChatClass{},
+			Date: int(r.clock.Now().Unix()), Seq: 0,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.OwnerUserID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
 }
 
 // onAccountGetNotifyExceptions 返回"有自定义通知设置的会话"全局索引：每条异常一个

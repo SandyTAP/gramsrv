@@ -50,9 +50,9 @@ type BotVerificationService interface {
 	// Verifier status.
 	Verifiers(ctx context.Context, enabledOnly bool, limit int) ([]domain.BotVerifierSettings, error)
 	VerifierSettings(ctx context.Context, botID int64) (domain.BotVerifierSettings, error)
-	GrantVerifier(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error)
-	SetVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error)
-	RevokeVerifier(ctx context.Context, botID int64) (bool, error)
+	GrantVerifierWithDelivery(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, bool, error)
+	SetVerifierEnabledWithDelivery(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, bool, error)
+	RevokeVerifierWithDelivery(ctx context.Context, botID int64) (bool, error)
 
 	// Granted marks.
 	Marks(ctx context.Context, filter domain.CustomVerificationFilter) ([]domain.CustomVerification, error)
@@ -336,16 +336,19 @@ func (s *Service) GrantBotVerifier(ctx context.Context, req GrantBotVerifierRequ
 			}
 			return CommandResult{Message: message, Details: details}, nil
 		}
-		stored, err := s.botVerification.GrantVerifier(ctx, settings)
+		stored, changed, err := s.botVerification.GrantVerifierWithDelivery(ctx, settings)
 		if err != nil {
 			return CommandResult{Details: details}, botVerificationError(err)
 		}
 		details["version"] = strconv.FormatInt(stored.Version, 10)
 		details["enabled"] = stored.Enabled
-		details["changed"] = true
+		details["changed"] = changed
 		message := "bot verifier status granted"
 		if exists {
 			message = "bot verifier status updated"
+		}
+		if !changed {
+			message = "bot verifier was already in the requested state"
 		}
 		return CommandResult{Message: message, Details: details}, nil
 	})
@@ -387,17 +390,18 @@ func (s *Service) SetBotVerifierEnabled(ctx context.Context, req SetBotVerifierE
 			}
 			return CommandResult{Message: message, Details: details}, nil
 		}
-		stored, err := s.botVerification.SetVerifierEnabled(ctx, req.BotID, req.Enabled)
+		stored, changed, err := s.botVerification.SetVerifierEnabledWithDelivery(ctx, req.BotID, req.Enabled)
 		if err != nil {
 			return CommandResult{Details: details}, botVerificationError(err)
 		}
 		details["version"] = strconv.FormatInt(stored.Version, 10)
 		details["enabled"] = stored.Enabled
+		details["changed"] = changed
 		message := "bot verifier enabled"
 		if !req.Enabled {
 			message = "bot verifier disabled"
 		}
-		if noop {
+		if !changed {
 			message = "bot verifier was already in that state"
 		}
 		return CommandResult{Message: message, Details: details}, nil
@@ -442,7 +446,7 @@ func (s *Service) RevokeBotVerifier(ctx context.Context, req RevokeBotVerifierRe
 			}
 			return CommandResult{Message: message, Details: details}, nil
 		}
-		removed, err := s.botVerification.RevokeVerifier(ctx, req.BotID)
+		removed, err := s.botVerification.RevokeVerifierWithDelivery(ctx, req.BotID)
 		if err != nil {
 			return CommandResult{Details: details}, botVerificationError(err)
 		}

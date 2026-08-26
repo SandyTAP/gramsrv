@@ -203,7 +203,7 @@ func TestStarGiftTONExportLeaseFencingPostgres(t *testing.T) {
 		t.Fatalf("second export err=%v, want externalization pending", err)
 	}
 
-	lifecycle := NewStarGiftLifecycleStore(pool, NewMessageStore(pool), 0)
+	lifecycle := NewStarGiftLifecycleStore(pool, newTestMessageStore(pool), 0)
 	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
 		ActorUserID: owner.ID, Ref: conflictReq.Ref, Date: now + 2,
 		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 50},
@@ -861,7 +861,7 @@ func grantTONExportTestGift(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 	if err != nil {
 		t.Fatalf("publish TON export collectible: %v", err)
 	}
-	granted, err := NewStarGiftUpgradeStore(pool, NewMessageStore(pool)).GrantUniqueStarGift(ctx, domain.AdminStarGiftGrant{
+	granted, err := NewStarGiftUpgradeStore(pool, newTestMessageStore(pool)).GrantUniqueStarGift(ctx, domain.AdminStarGiftGrant{
 		SenderID: domain.OfficialSystemUserID, Recipient: domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID},
 		GiftID: entry.Gift.ID, Upgrade: true, CommandKey: "ton-export-grant-" + suffix, Date: now,
 		ModelAttributeID: revision.Models[0].ID, PatternAttributeID: revision.Patterns[0].ID, BackdropAttributeID: revision.Backdrops[0].ID,

@@ -22,7 +22,7 @@ func TestChannelStoreSetChannelVerifiedRefreshesRowCache(t *testing.T) {
 	})
 
 	cache := NewChannelRowCache(8)
-	channels := NewChannelStore(pool, WithChannelRowCache(cache))
+	channels := newTestChannelStore(pool, WithChannelRowCache(cache))
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "verified channel " + suffix,

@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type welcomeRPCService struct {
@@ -104,6 +105,13 @@ func (s *welcomeRPCUsers) ByID(context.Context, int64, int64) (domain.User, bool
 }
 func (s *welcomeRPCUsers) ByIDs(context.Context, int64, []int64) ([]domain.User, error) {
 	return []domain.User{s.user}, nil
+}
+func (s *welcomeRPCUsers) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	user := testUserWithEmojiStatus(s.user, status)
+	return user, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+func (s *welcomeRPCUsers) UpdatePersonalChannelWithDelivery(_ context.Context, _ int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	return testUserPersonalChannelMutation(s.user, channelID, effects)
 }
 
 func newWelcomeRPCRouter(t *testing.T) (*Router, *welcomeRPCService, context.Context, *tg.InputPeerChannel) {

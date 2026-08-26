@@ -38,18 +38,18 @@ func (r *Router) onAccountChangePhone(ctx context.Context, req *tg.AccountChange
 	if !ok || authKeyID == ([8]byte{}) {
 		return nil, authKeyUnregisteredErr()
 	}
-	sessionID, _ := SessionIDFrom(ctx)
-	originRawAuthKeyID := rawAuthKeyIDForOrigin(ctx)
-	result, err := r.deps.Account.ChangePhone(
+	originRawAuthKeyID, originSessionID := deliveryExclusionFromContext(ctx)
+	result, err := r.deps.Account.ChangePhoneWithDelivery(
 		ctx,
 		userID,
 		authKeyID,
 		originRawAuthKeyID,
-		sessionID,
+		originSessionID,
 		req.PhoneNumber,
 		req.PhoneCodeHash,
 		req.PhoneCode,
 		int(r.clock.Now().Unix()),
+		r.phoneChangeDeliveryEffectsBuilder(ctx, originRawAuthKeyID, originSessionID),
 	)
 	if err != nil {
 		return nil, phoneChangeErr(err)
@@ -58,11 +58,5 @@ func (r *Router) onAccountChangePhone(ctx context.Context, req *tg.AccountChange
 		return nil, internalErr()
 	}
 	r.invalidateRPCProjectionForUser(result.User.ID)
-	if result.Changed {
-		// account.changePhone returns the authoritative self User to the current
-		// session. Other online sessions receive a non-PTS updateUser; offline
-		// sessions converge on their next full-user/startup read.
-		r.pushPremiumStatusUpdate(ctx, result.User)
-	}
 	return r.tgSelfUserWithUsernames(ctx, result.User), nil
 }

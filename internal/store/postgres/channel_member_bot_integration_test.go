@@ -14,7 +14,7 @@ func TestChannelStoreListActiveChannelBotMembers(t *testing.T) {
 
 	users := NewUserStore(pool)
 	bots := NewBotStore(pool)
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 
 	owner, err := users.Create(ctx, domain.User{AccessHash: 8901, Phone: "+1888" + suffix + "01", FirstName: "BotOwner"})
 	if err != nil {
@@ -24,9 +24,10 @@ func TestChannelStoreListActiveChannelBotMembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create friend: %v", err)
 	}
-	bot, _, err := bots.CreateBotAccount(ctx,
+	bot, _, err := bots.CreateBotAccountWithDelivery(ctx,
 		domain.User{AccessHash: 8903, FirstName: "MemberBot", Username: "member_" + suffix + "_bot"},
 		domain.BotProfile{OwnerUserID: owner.ID, TokenSecret: "secret_" + suffix},
+		testBotLifecycleEffects,
 	)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
@@ -93,7 +94,7 @@ func TestChannelStoreGetParticipantsHidesAnonymousAdminFromRegularMember(t *test
 	suffix := randomSuffix(t)
 
 	users := NewUserStore(pool)
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 
 	owner, err := users.Create(ctx, domain.User{AccessHash: 8911, Phone: "+1889" + suffix + "01", FirstName: "Owner"})
 	if err != nil {

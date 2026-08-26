@@ -24,9 +24,12 @@ func TestChannelsReadHistoryAdvancesForumGeneralReadRPC(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 71, Phone: "15550007301", FirstName: "Owner"})
 	member, _ := userStore.Create(ctx, domain.User{AccessHash: 72, Phone: "15550007302", FirstName: "Member"})
 	channelStore := memory.NewChannelStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(deliveryOutbox)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 
 	ownerCtx := WithUserID(ctx, owner.ID)
@@ -136,6 +139,23 @@ func TestChannelsReadHistoryAdvancesForumGeneralReadRPC(t *testing.T) {
 	}
 	if after := generalUnread(); after != 0 {
 		t.Fatalf("General unread after channels.readHistory = %d, want 0 (channel-level read covers General)", after)
+	}
+	items := deliveryOutbox.Snapshot()
+	if len(items) != 4 {
+		t.Fatalf("forum read durable deliveries = %+v, want reader/sender effects for topic and channel read", items)
+	}
+	counts := map[int64]int{}
+	for _, item := range items {
+		counts[item.TargetUserID]++
+	}
+	if counts[member.ID] != 2 || counts[owner.ID] != 2 {
+		t.Fatalf("forum read durable target counts = %+v, want two reader and two sender effects", counts)
+	}
+	for _, item := range items {
+		updates := requireDeliveryUpdates(t, item)
+		if len(updates.Updates) == 0 {
+			t.Fatalf("forum read durable delivery for %d has no updates", item.TargetUserID)
+		}
 	}
 }
 

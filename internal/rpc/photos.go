@@ -3,14 +3,12 @@ package rpc
 import (
 	"context"
 	"errors"
-	"time"
 
-	"github.com/iamxvbaba/td/proto"
 	"github.com/iamxvbaba/td/tg"
-	"go.uber.org/zap"
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // registerPhotos 注册 photos.* RPC handler（头像上传 / 切换 / 查询 / 删除）。
@@ -45,6 +43,9 @@ func (r *Router) onPhotosUploadProfilePhoto(ctx context.Context, req *tg.PhotosU
 	if !ok || userID == 0 {
 		return nil, photoInvalidErr()
 	}
+	if err := r.requireAccountDelivery(userID, "photos.uploadProfilePhoto"); err != nil {
+		return nil, err
+	}
 	targetUserID := userID
 	var botTarget domain.User
 	bot, hasBot := req.GetBot()
@@ -69,17 +70,23 @@ func (r *Router) onPhotosUploadProfilePhoto(ctx context.Context, req *tg.PhotosU
 	if err != nil {
 		return nil, err
 	}
-	photo, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind, photo.ID, int(r.clock.Now().Unix()))
+	base, err := r.profilePhotoDeliveryBase(ctx, userID, botTarget)
+	if err != nil {
+		return nil, err
+	}
+	effects := r.profilePhotoDeliveryEffects(ctx, userID, base, botTarget.ID != 0, kind)
+	mutation, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind, photo.ID, int(r.clock.Now().Unix()), effects)
 	if err != nil {
 		return nil, internalErr()
 	}
 	if !found {
 		return nil, photoInvalidErr()
 	}
+	photo = mutation.Current
 	if botTarget.ID != 0 {
-		return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, photo, kind), nil
+		return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, photo, kind)
 	}
-	return r.photosPhotoForSelf(ctx, userID, photo, kind), nil
+	return r.photosPhotoForSelf(ctx, userID, photo, kind)
 }
 
 func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosUpdateProfilePhotoRequest) (*tg.PhotosPhoto, error) {
@@ -92,6 +99,9 @@ func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosU
 	}
 	if !ok || userID == 0 {
 		return nil, photoInvalidErr()
+	}
+	if err := r.requireAccountDelivery(userID, "photos.updateProfilePhoto"); err != nil {
+		return nil, err
 	}
 	targetUserID := userID
 	var botTarget domain.User
@@ -108,26 +118,47 @@ func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosU
 	}
 	switch in := req.ID.(type) {
 	case *tg.InputPhoto:
-		photo, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind, in.ID, int(r.clock.Now().Unix()))
+		base, err := r.profilePhotoDeliveryBase(ctx, userID, botTarget)
+		if err != nil {
+			return nil, err
+		}
+		effects := r.profilePhotoDeliveryEffects(ctx, userID, base, botTarget.ID != 0, kind)
+		mutation, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind, in.ID, int(r.clock.Now().Unix()), effects)
 		if err != nil {
 			return nil, internalErr()
 		}
 		if !found {
 			return nil, photoInvalidErr()
 		}
+		photo := mutation.Current
 		if botTarget.ID != 0 {
-			return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, photo, kind), nil
+			return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, photo, kind)
 		}
-		return r.photosPhotoForSelf(ctx, userID, photo, kind), nil
+		return r.photosPhotoForSelf(ctx, userID, photo, kind)
 	default:
-		// InputPhotoEmpty：移除当前头像（停用现有当前照片）。
-		if cur, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind); err == nil && found {
-			_, _ = r.deps.Files.DeleteProfilePhotosKind(ctx, domain.PeerTypeUser, targetUserID, kind, []int64{cur.ID})
+		base, err := r.profilePhotoDeliveryBase(ctx, userID, botTarget)
+		if err != nil {
+			return nil, err
+		}
+		cur, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, targetUserID, kind)
+		if err != nil {
+			return nil, internalErr()
+		}
+		var photo domain.Photo
+		if found {
+			effects := r.profilePhotoDeliveryEffects(ctx, userID, base, botTarget.ID != 0, kind)
+			mutation, err := r.deps.Files.DeleteProfilePhotosKind(ctx, domain.PeerTypeUser, targetUserID, kind, []int64{cur.ID}, effects)
+			if err != nil {
+				return nil, internalErr()
+			}
+			if mutation.HasCurrent {
+				photo = mutation.Current
+			}
 		}
 		if botTarget.ID != 0 {
-			return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, domain.Photo{}, kind), nil
+			return r.photosPhotoForBotTarget(ctx, userID, botTarget.ID, photo, kind)
 		}
-		return r.photosPhotoForSelf(ctx, userID, domain.Photo{}, kind), nil
+		return r.photosPhotoForSelf(ctx, userID, photo, kind)
 	}
 }
 
@@ -156,7 +187,7 @@ func (r *Router) resolveProfilePhotoBotTarget(ctx context.Context, ownerUserID i
 }
 
 func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.PhotosUploadContactProfilePhotoRequest) (*tg.PhotosPhoto, error) {
-	if r.deps.Files == nil || r.deps.Users == nil {
+	if r.deps.Files == nil || r.deps.Users == nil || r.deps.Contacts == nil {
 		return nil, notImplementedErr()
 	}
 	userID, ok, err := r.currentUserID(ctx)
@@ -177,11 +208,16 @@ func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.
 	if err != nil {
 		return nil, err
 	}
-	if mediaFlags == 0 && req.GetSave() {
-		if r.deps.Contacts == nil {
-			return nil, notImplementedErr()
+	if !req.GetSuggest() {
+		if err := r.requireAccountDelivery(userID, "photos.uploadContactProfilePhoto"); err != nil {
+			return nil, err
 		}
-		if _, err := r.deps.Contacts.ClearPersonalPhoto(ctx, userID, target.ID, int(r.clock.Now().Unix())); err != nil {
+	}
+	if mediaFlags == 0 && req.GetSave() {
+		if _, err := r.deps.Contacts.ClearPersonalPhotoWithDelivery(
+			ctx, userID, target.ID, int(r.clock.Now().Unix()),
+			r.contactPersonalPhotoDeliveryEffects(ctx, target.ID),
+		); err != nil {
 			return nil, contactErr(err)
 		}
 		r.invalidateRPCProjectionForPeer(userID, domain.Peer{Type: domain.PeerTypeUser, ID: target.ID})
@@ -198,21 +234,42 @@ func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.
 		if r.deps.Messages == nil {
 			return nil, notImplementedErr()
 		}
-		res, err := r.sendSuggestedProfilePhotoMessage(ctx, userID, target.ID, photo)
+		_, err := r.sendSuggestedProfilePhotoMessage(ctx, userID, target.ID, photo)
 		if err != nil {
 			return nil, err
 		}
-		r.pushSuggestedProfilePhotoCurrentSession(ctx, userID, res)
 		return r.photosPhotoForUser(ctx, userID, target.ID, photo), nil
 	}
-	if r.deps.Contacts == nil {
-		return nil, notImplementedErr()
-	}
-	if _, err := r.deps.Contacts.SetPersonalPhoto(ctx, userID, target.ID, photo, int(r.clock.Now().Unix())); err != nil {
+	if _, err := r.deps.Contacts.SetPersonalPhotoWithDelivery(
+		ctx, userID, target.ID, photo, int(r.clock.Now().Unix()),
+		r.contactPersonalPhotoDeliveryEffects(ctx, target.ID),
+	); err != nil {
 		return nil, contactErr(err)
 	}
 	r.invalidateRPCProjectionForPeer(userID, domain.Peer{Type: domain.PeerTypeUser, ID: target.ID})
 	return r.photosPhotoForUserWithPersonalPhoto(ctx, userID, target.ID, photo), nil
+}
+
+func (r *Router) contactPersonalPhotoDeliveryEffects(ctx context.Context, targetUserID int64) store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot store.ContactPersonalPhotoDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		if snapshot.ContactUserID != targetUserID {
+			return nil, store.ErrDeliveryOutboxRequired
+		}
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: targetUserID}},
+			Users:   []tg.UserClass{}, Chats: []tg.ChatClass{},
+			Date: int(r.clock.Now().Unix()), Seq: 0,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID:     snapshot.ViewerUserID,
+			ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
 }
 
 type profilePhotoUploadRequest interface {
@@ -376,7 +433,6 @@ func (r *Router) sendSuggestedProfilePhotoMessage(ctx context.Context, userID, t
 	if err != nil {
 		return domain.SendPrivateTextResult{}, err
 	}
-	sessionID, _ := SessionIDFrom(ctx)
 	photoCopy := photo
 	res, err := r.deps.Messages.SendPrivateText(ctx, userID, domain.SendPrivateTextRequest{
 		SenderUserID:    userID,
@@ -389,9 +445,12 @@ func (r *Router) sendSuggestedProfilePhotoMessage(ctx context.Context, userID, t
 				Photo: &photoCopy,
 			},
 		},
-		Date:             int(r.clock.Now().Unix()),
-		OriginAuthKeyID:  rawAuthKeyIDForOrigin(ctx),
-		OriginSessionID:  sessionID,
+		Date: int(r.clock.Now().Unix()),
+		// photos.photo does not echo the created sender-box message or its PTS.
+		// Keep the origin in the transactional dispatch audience so the current
+		// session consumes the same durable event as every other device.
+		OriginAuthKeyID:  [8]byte{},
+		OriginSessionID:  0,
 		RecipientBlocked: recipientBlocked,
 	})
 	if err != nil {
@@ -406,21 +465,6 @@ func contactProfilePhotoSuggestRandomID(userID, targetUserID, photoID, nowNano i
 		return photoID
 	}
 	return id
-}
-
-func (r *Router) pushSuggestedProfilePhotoCurrentSession(ctx context.Context, userID int64, res domain.SendPrivateTextResult) {
-	if res.SenderMessage.ID == 0 || res.SenderEvent.Pts == 0 {
-		return
-	}
-	updates := tgPrivateMessageUpdates(
-		res.SenderEvent,
-		res.SenderMessage,
-		0,
-		false,
-		r.usersForMessageUpdate(ctx, userID, res.SenderMessage),
-		r.chatsForMessageUpdate(ctx, userID, res.SenderMessage),
-	)
-	r.pushCurrentSessionMessage(ctx, "push suggested profile photo service message", updates)
 }
 
 func (r *Router) onPhotosGetUserPhotos(ctx context.Context, req *tg.PhotosGetUserPhotosRequest) (tg.PhotosPhotosClass, error) {
@@ -489,6 +533,9 @@ func (r *Router) onPhotosDeletePhotos(ctx context.Context, id []tg.InputPhotoCla
 	if !ok || userID == 0 {
 		return nil, photoInvalidErr()
 	}
+	if err := r.requireAccountDelivery(userID, "photos.deletePhotos"); err != nil {
+		return nil, err
+	}
 	ids := make([]int64, 0, len(id))
 	for _, in := range id {
 		if photo, isPhoto := in.(*tg.InputPhoto); isPhoto && photo.ID != 0 {
@@ -498,7 +545,12 @@ func (r *Router) onPhotosDeletePhotos(ctx context.Context, id []tg.InputPhotoCla
 	if len(ids) == 0 {
 		return []int64{}, nil
 	}
-	deleted, err := r.deps.Files.DeleteProfilePhotos(ctx, domain.PeerTypeUser, userID, ids)
+	base, err := r.profilePhotoDeliveryBase(ctx, userID, domain.User{})
+	if err != nil {
+		return nil, err
+	}
+	effects := r.profilePhotoDeliveryEffects(ctx, userID, base, false, domain.ProfilePhotoKindProfile)
+	mutation, err := r.deps.Files.DeleteProfilePhotos(ctx, domain.PeerTypeUser, userID, ids, effects)
 	if err != nil {
 		return nil, internalErr()
 	}
@@ -507,59 +559,50 @@ func (r *Router) onPhotosDeletePhotos(ctx context.Context, id []tg.InputPhotoCla
 	// 向全部在线 session（含当前）推 updateUser + fresh self（对齐参考实现 deletePhotos 的
 	// SyncPushUpdates），否则其它设备与当前设备（DrKLO 本地删除逻辑同样不重建 has_video）
 	// 头像停留在旧状态。
-	if deleted > 0 && r.deps.Users != nil {
-		if self, err := r.deps.Users.Self(ctx, userID); err == nil {
-			r.pushSelfPhotoUpdate(ctx, self)
-		}
-	}
+	_ = mutation
 	return ids, nil
 }
 
 // photosPhotoForSelf 组装 photos.photo 响应（新照片 + 带头像的 self user），并在头像变更后
 // 向该账号其它在线设备推送，使其即时刷新头像。仅由 uploadProfilePhoto / updateProfilePhoto
 // 等头像变更路径调用（只读路径不得使用，否则会误触发推送）。
-func (r *Router) photosPhotoForSelf(ctx context.Context, userID int64, photo domain.Photo, kind domain.ProfilePhotoKind) *tg.PhotosPhoto {
+func (r *Router) photosPhotoForSelf(ctx context.Context, userID int64, photo domain.Photo, kind domain.ProfilePhotoKind) (*tg.PhotosPhoto, error) {
 	out := &tg.PhotosPhoto{Photo: tgPhoto(photo), Users: []tg.UserClass{}}
 	r.invalidateRPCProjectionForUser(userID)
 	if r.deps.Users == nil {
-		return out
+		return out, nil
 	}
 	self, err := r.deps.Users.Self(ctx, userID)
 	if err != nil {
-		return out
+		return out, nil
 	}
 	if kind == domain.ProfilePhotoKindProfile {
 		applyProfilePhotoToUser(&self, photo)
 	}
 	projected := r.tgSelfUser(self)
-	pushed := r.tgSelfUser(self)
-	r.applyUsernamesToPeerObjects(ctx, []tg.UserClass{projected, pushed}, nil)
+	r.applyUsernamesToPeerObjects(ctx, []tg.UserClass{projected}, nil)
 	out.Users = append(out.Users, projected)
-	r.pushSelfPhotoUpdateWithUser(ctx, self, pushed)
-	return out
+	return out, nil
 }
 
-func (r *Router) photosPhotoForBotTarget(ctx context.Context, viewerUserID, botUserID int64, photo domain.Photo, kind domain.ProfilePhotoKind) *tg.PhotosPhoto {
+func (r *Router) photosPhotoForBotTarget(ctx context.Context, viewerUserID, botUserID int64, photo domain.Photo, kind domain.ProfilePhotoKind) (*tg.PhotosPhoto, error) {
 	out := &tg.PhotosPhoto{Photo: tgPhoto(photo), Users: []tg.UserClass{}}
 	r.invalidateRPCProjectionForUser(botUserID)
 	if r.deps.Users == nil {
-		return out
+		return out, nil
 	}
 	bot, found, err := r.deps.Users.ByID(ctx, viewerUserID, botUserID)
 	if err != nil || !found {
-		return out
+		return out, nil
 	}
 	if kind == domain.ProfilePhotoKindProfile {
 		applyProfilePhotoToUser(&bot, photo)
 	}
 	projected := r.tgUser(bot)
-	_ = r.applyBotCanEditToUser(ctx, viewerUserID, bot, projected)
-	pushed := r.tgUser(bot)
-	_ = r.applyBotCanEditToUser(ctx, viewerUserID, bot, pushed)
-	r.applyUsernamesToPeerObjects(ctx, []tg.UserClass{projected, pushed}, nil)
+	projected.SetBotCanEdit(true)
+	r.applyUsernamesToPeerObjects(ctx, []tg.UserClass{projected}, nil)
 	out.Users = append(out.Users, projected)
-	r.pushBotPhotoUpdateToOwner(ctx, viewerUserID, bot, pushed)
-	return out
+	return out, nil
 }
 
 func (r *Router) photosPhotoForUser(ctx context.Context, viewerUserID, targetUserID int64, photo domain.Photo) *tg.PhotosPhoto {
@@ -614,73 +657,74 @@ func applyProfilePhotoToUser(user *domain.User, photo domain.Photo) {
 	user.PhotoHasVideo = domain.PhotoHasVideo(photo.Sizes)
 }
 
-// pushSelfPhotoUpdate 向该账号全部在线设备（含当前 session）推送头像变更，对齐参考实现
-// SyncPushUpdates 的全 session 语义。updateUserName 不含 photo 无法刷新头像；updateUser 只是
-// 「该 user 变了」的信号（TDesktop 仅当 peer 已 full-loaded 时才 forceFull 重拉）；最可靠是在
-// Updates.Users 带上含新 userProfilePhoto 的完整 self user，TDesktop 经
-// processUser→setPhoto→peerUpdated(Photo) 即时刷新。
-//
-// 当前 session 不能只依赖 RPC 返回：DrKLO Android 的 uploadProfilePhoto 响应回调
-// （ProfileActivity/SettingsActivity.didUploadPhoto、PhotoUtilities）不消费
-// photos.photo.users，而是手工重建 userProfilePhoto——只填 photo_id/photo_small/photo_big，
-// 丢掉 has_video/stripped_thumb；emoji/sticker markup 头像的本地渲染
-// （ImageReceiver.setForUserOrChat → VectorAvatarThumbDrawable）要求
-// user.photo.has_video==true，缺推送时该设备要等到下一次拿到 fresh self user（通常是重启）
-// 才会显示 emoji 头像。当前 session 的回显延迟发送，保证到达时客户端已处理完自己的
-// RPC 响应回调（否则 Android 回调会把推送刚修好的 photo 再次覆盖回无 has_video 的形状）。
-func (r *Router) pushSelfPhotoUpdate(ctx context.Context, self domain.User) {
-	if self.ID == 0 {
-		return
+func (r *Router) profilePhotoDeliveryBase(ctx context.Context, viewerUserID int64, bot domain.User) (domain.User, error) {
+	if r.deps.Users == nil {
+		return domain.User{}, internalErr()
 	}
-	r.pushSelfPhotoUpdateWithUser(ctx, self, r.tgSelfUserWithUsernames(ctx, self))
+	if bot.ID != 0 {
+		return bot, nil
+	}
+	self, err := r.deps.Users.Self(ctx, viewerUserID)
+	if err != nil || self.ID == 0 {
+		return domain.User{}, internalErr()
+	}
+	return self, nil
 }
 
-func (r *Router) pushSelfPhotoUpdateWithUser(ctx context.Context, self domain.User, projected *tg.User) {
-	if self.ID == 0 || projected == nil {
-		return
+func (r *Router) profilePhotoDeliveryEffects(ctx context.Context, recipientUserID int64, base domain.User, botTarget bool, kind domain.ProfilePhotoKind) store.DeliveryEffectsBuilder[store.ProfilePhotoMutation] {
+	var baseProjection *tg.User
+	if botTarget {
+		baseProjection = r.tgUser(base)
+		baseProjection.SetBotCanEdit(true)
+		r.applyUsernamesToPeerObjects(ctx, []tg.UserClass{baseProjection}, nil)
+	} else {
+		baseProjection = r.tgSelfUserWithUsernames(ctx, base)
 	}
-	updates := selfPhotoUpdates(self, int(r.clock.Now().Unix()), projected)
-	r.pushUserUpdates(ctx, self.ID, updates)
-	r.pushSelfPhotoUpdateToCurrentSession(ctx, updates)
-}
-
-func (r *Router) pushBotPhotoUpdateToOwner(ctx context.Context, ownerUserID int64, bot domain.User, projected *tg.User) {
-	if ownerUserID == 0 || bot.ID == 0 || projected == nil {
-		return
-	}
-	updates := selfPhotoUpdates(bot, int(r.clock.Now().Unix()), projected)
-	r.pushUserUpdates(ctx, ownerUserID, updates)
-	r.pushSelfPhotoUpdateToCurrentSession(ctx, updates)
-}
-
-// defaultSelfPhotoEchoPushDelay 是头像变更后向当前 session 回显 updateUser 的延迟：
-// 必须晚于 RPC 结果写出与客户端响应回调，否则 DrKLO 的手工 photo 重建会覆盖回显内容。
-// updateUser 无 pts，晚到/丢失不影响 difference 正确性。
-const defaultSelfPhotoEchoPushDelay = 500 * time.Millisecond
-
-// pushSelfPhotoUpdateToCurrentSession 延迟向当前 session 回显头像变更 updates。
-// ctx 值在调度前捕获（请求 ctx 在 handler 返回后即失效）。
-func (r *Router) pushSelfPhotoUpdateToCurrentSession(ctx context.Context, updates *tg.Updates) {
-	if r.deps.Sessions == nil || updates == nil {
-		return
-	}
-	sessionID, ok := SessionIDFrom(ctx)
-	if !ok {
-		return
-	}
-	rawAuthKeyID := rawAuthKeyIDForOrigin(ctx)
-	push := func() {
-		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := r.deps.Sessions.PushToSessionForAuthKey(pushCtx, rawAuthKeyID, sessionID, proto.MessageFromServer, updates); err != nil {
-			r.log.Debug("push self photo update to current session", zap.Int64("session_id", sessionID), zap.Error(err))
+	usernames, hasUsernames := baseProjection.GetUsernames()
+	usernames = append([]tg.Username(nil), usernames...)
+	deliveryDate := int(r.clock.Now().Unix())
+	return func(snapshot store.ProfilePhotoMutation) ([]store.DeliveryEffect, error) {
+		if snapshot.OwnerType != domain.PeerTypeUser || snapshot.OwnerID != base.ID || snapshot.Kind != kind {
+			return nil, errors.New("profile photo delivery snapshot does not match target")
 		}
+		projectedUser := base
+		if kind == domain.ProfilePhotoKindProfile {
+			if snapshot.HasCurrent {
+				applyProfilePhotoToUser(&projectedUser, snapshot.Current)
+			} else {
+				applyProfilePhotoToUser(&projectedUser, domain.Photo{})
+			}
+		}
+		var projected *tg.User
+		if botTarget {
+			projected = r.tgUser(projectedUser)
+			projected.SetBotCanEdit(true)
+		} else {
+			projected = r.tgSelfUser(projectedUser)
+		}
+		if hasUsernames {
+			projected.SetUsernames(append([]tg.Username(nil), usernames...))
+		}
+		payload, err := encodeDeliveryUpdate(selfPhotoUpdates(projectedUser, deliveryDate, projected))
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: recipientUserID,
+			Payload:      payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	}
-	if r.selfPhotoEchoPushDelay <= 0 {
-		push()
-		return
-	}
-	time.AfterFunc(r.selfPhotoEchoPushDelay, push)
+}
+
+// ProfilePhotoDeliveryEffects is the admin aggregate boundary. It returns the
+// same immutable self-user projection used by photos.* without exposing TL
+// types outside RPC.
+func (r *Router) ProfilePhotoDeliveryEffects(ctx context.Context, user domain.User) store.DeliveryEffectsBuilder[store.ProfilePhotoMutation] {
+	return r.profilePhotoDeliveryEffects(ctx, user.ID, user, false, domain.ProfilePhotoKindProfile)
+}
+
+func (r *Router) ProfilePhotoCommitted(userID int64) {
+	r.invalidateRPCProjectionForUser(userID)
 }
 
 func selfPhotoUpdates(self domain.User, date int, user tg.UserClass) *tg.Updates {

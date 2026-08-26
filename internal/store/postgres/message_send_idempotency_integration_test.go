@@ -27,7 +27,7 @@ func TestMessageStorePrivateRandomIDConflictMatrix(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID, other.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	base := domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -96,7 +96,7 @@ func TestMessageStorePrivateRandomIDReplaySelfAndBlocked(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{self.ID, sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	selfReq := domain.SendPrivateTextRequest{
 		SenderUserID: self.ID, RecipientUserID: self.ID, RandomID: 772001,
 		Message: "saved note", Date: 1700001100,
@@ -166,7 +166,7 @@ func TestMessageStorePrivateRandomIDReplayUsesCurrentSnapshotAndDurableDelete(t 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	type replayState struct {
 		events int
 		outbox int
@@ -272,7 +272,7 @@ func TestMessageStoreConcurrentPrivateHookReplayRunsHookOnce(t *testing.T) {
 	})
 
 	db := &observedBeginDB{Pool: pool, secondBegin: make(chan struct{})}
-	messages := NewMessageStore(db)
+	messages := newTestMessageStore(db)
 	req := domain.SendPrivateTextRequest{
 		SenderUserID: sender.ID, RecipientUserID: recipient.ID, RandomID: 775001,
 		Message: "concurrent hook replay", Date: 1700001400,
@@ -379,12 +379,12 @@ func TestMessageStorePrivateRandomIDConflictFallbackUsesTransactionConnection(t 
 	boxIDs := &perUserCounterAllocator{}
 	db := &beginHookDB{Pool: pool}
 	db.before = func(ctx context.Context) error {
-		_, err := NewMessageStore(pool, WithMessageAllocators(boxIDs)).SendPrivateText(ctx, req)
+		_, err := newTestMessageStore(pool, WithMessageAllocators(boxIDs)).SendPrivateText(ctx, req)
 		return err
 	}
 	deadlineCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	got, err := NewMessageStore(db, WithMessageAllocators(boxIDs)).SendPrivateText(deadlineCtx, req)
+	got, err := newTestMessageStore(db, WithMessageAllocators(boxIDs)).SendPrivateText(deadlineCtx, req)
 	if err != nil {
 		t.Fatalf("conflict fallback with MaxConns=1: %v", err)
 	}

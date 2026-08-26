@@ -191,7 +191,7 @@ func (r *Router) memberOverrideParticipant(ctx context.Context, scope *groupCall
 		Version:      scope.call.Version, // overrides 不推进 version
 	}
 	out := r.groupCallUpdateContainer(ctx, scope.userID, scope.channel, update, []int64{targetID})
-	r.pushUserMessage(ctx, scope.userID, "group call override", out)
+	r.pushUserMessageTransient(ctx, scope.userID, "group call override", out)
 	return out, nil
 }
 
@@ -308,7 +308,6 @@ func (r *Router) onPhoneInviteToGroupCall(ctx context.Context, req *tg.PhoneInvi
 	if err != nil {
 		return nil, internalErr()
 	}
-	r.pushGroupCallServiceMessage(ctx, scope.userID, res)
 	out := r.groupCallUpdateContainer(ctx, scope.userID, res.Channel, nil, targetIDs)
 	out.Updates = nil
 	if msgUpdate := tgChannelUpdate(scope.userID, res.Event); msgUpdate != nil {

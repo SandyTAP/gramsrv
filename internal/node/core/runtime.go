@@ -276,7 +276,7 @@ func liveStreamDep(s *livestream.Service) rpc.LiveStreamsService {
 // then, and going through the services keeps their cache refresh behaviour.
 type verificationPeerVerifier struct {
 	users interface {
-		SetVerified(ctx context.Context, userID int64, verified bool) (domain.User, error)
+		SetVerifiedWithDelivery(ctx context.Context, userID int64, verified bool, effects storepkg.DeliveryEffectsBuilder[storepkg.UserAudienceDeliverySnapshot]) (domain.User, error)
 	}
 	channels interface {
 		SetVerified(ctx context.Context, channelID int64, verified bool) (domain.Channel, error)
@@ -285,21 +285,25 @@ type verificationPeerVerifier struct {
 	// cached channel row is dropped on the flag write, exactly as the pooled store
 	// does it.
 	channelRowCache *postgres.ChannelRowCache
+	userDelivery    storepkg.DeliveryEffectsBuilder[storepkg.UserAudienceDeliverySnapshot]
 }
 
-func (v verificationPeerVerifier) SetUserVerified(ctx context.Context, userID int64, verified bool) error {
+func (v *verificationPeerVerifier) SetUserVerified(ctx context.Context, userID int64, verified bool) error {
+	if v == nil || v.userDelivery == nil {
+		return storepkg.ErrDeliveryOutboxRequired
+	}
 	if tx, ok := postgres.VerificationTxFromContext(ctx); ok {
-		_, err := postgres.NewUserStore(tx).SetVerified(ctx, userID, verified)
+		_, err := postgres.NewUserStore(tx).SetVerifiedWithDelivery(ctx, userID, verified, v.userDelivery)
 		return err
 	}
 	if v.users == nil {
 		return fmt.Errorf("verification peer verifier: user service is not wired")
 	}
-	_, err := v.users.SetVerified(ctx, userID, verified)
+	_, err := v.users.SetVerifiedWithDelivery(ctx, userID, verified, v.userDelivery)
 	return err
 }
 
-func (v verificationPeerVerifier) SetChannelVerified(ctx context.Context, channelID int64, verified bool) error {
+func (v *verificationPeerVerifier) SetChannelVerified(ctx context.Context, channelID int64, verified bool) error {
 	if tx, ok := postgres.VerificationTxFromContext(ctx); ok {
 		opts := []postgres.ChannelStoreOption(nil)
 		if v.channelRowCache != nil {
@@ -315,7 +319,7 @@ func (v verificationPeerVerifier) SetChannelVerified(ctx context.Context, channe
 	return err
 }
 
-var _ verificationapp.PeerVerifier = verificationPeerVerifier{}
+var _ verificationapp.PeerVerifier = (*verificationPeerVerifier)(nil)
 
 // botVerificationMarkApplier writes a third-party mark on the decision's own
 // transaction when there is one.
@@ -336,11 +340,46 @@ func (a botVerificationMarkApplier) GrantCustomVerification(ctx context.Context,
 	return a.store.GrantCustomVerification(ctx, mark)
 }
 
+func (a botVerificationMarkApplier) GrantCustomVerificationWithDelivery(
+	ctx context.Context,
+	mark domain.CustomVerification,
+	effects storepkg.DeliveryEffectsBuilder[storepkg.UserAudienceDeliverySnapshot],
+) (domain.CustomVerification, bool, error) {
+	if effects == nil {
+		return domain.CustomVerification{}, false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if tx, ok := postgres.VerificationTxFromContext(ctx); ok {
+		return postgres.NewBotVerificationStore(tx).GrantCustomVerificationWithDelivery(ctx, mark, effects)
+	}
+	if a.store == nil {
+		return domain.CustomVerification{}, false, fmt.Errorf("bot verification mark applier: store is not wired")
+	}
+	return a.store.GrantCustomVerificationWithDelivery(ctx, mark, effects)
+}
+
 func (a botVerificationMarkApplier) RevokeCustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (bool, error) {
 	if tx, ok := postgres.VerificationTxFromContext(ctx); ok {
 		return postgres.NewBotVerificationStore(tx).RevokeCustomVerification(ctx, verifierBotID, peer)
 	}
 	return a.store.RevokeCustomVerification(ctx, verifierBotID, peer)
+}
+
+func (a botVerificationMarkApplier) RevokeCustomVerificationWithDelivery(
+	ctx context.Context,
+	verifierBotID int64,
+	peer domain.Peer,
+	effects storepkg.DeliveryEffectsBuilder[storepkg.UserAudienceDeliverySnapshot],
+) (bool, error) {
+	if effects == nil {
+		return false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if tx, ok := postgres.VerificationTxFromContext(ctx); ok {
+		return postgres.NewBotVerificationStore(tx).RevokeCustomVerificationWithDelivery(ctx, verifierBotID, peer, effects)
+	}
+	if a.store == nil {
+		return false, fmt.Errorf("bot verification mark applier: store is not wired")
+	}
+	return a.store.RevokeCustomVerificationWithDelivery(ctx, verifierBotID, peer, effects)
 }
 
 var _ botverificationapp.MarkApplier = botVerificationMarkApplier{}
@@ -357,9 +396,6 @@ func (n compositeBotVerificationNotifier) NotifyPeerBotVerification(ctx context.
 	if err := n.cache.NotifyPeerVerified(ctx, peer); err != nil && n.cache.log != nil {
 		n.cache.log.Warn("invalidate peer caches after third-party verification change",
 			zap.String("peer_type", string(peer.Type)), zap.Int64("peer_id", peer.ID), zap.Error(err))
-	}
-	if n.edge == nil {
-		return nil
 	}
 	return n.edge.NotifyPeerBotVerification(ctx, peer)
 }
@@ -416,9 +452,6 @@ func (n compositeVerificationNotifier) NotifyPeerVerified(ctx context.Context, p
 	if err := n.cache.NotifyPeerVerified(ctx, peer); err != nil && n.cache.log != nil {
 		n.cache.log.Warn("invalidate peer caches after verification change",
 			zap.String("peer_type", string(peer.Type)), zap.Int64("peer_id", peer.ID), zap.Error(err))
-	}
-	if n.edge == nil {
-		return nil
 	}
 	return n.edge.NotifyPeerVerified(ctx, peer)
 }
@@ -503,7 +536,10 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	if err := common.ConfigureProcessGlobals(cfg); err != nil {
 		return err
 	}
-	instanceID := config.ResolveInstanceID(cfg.InstanceID)
+	instanceID, err := config.RequireInstanceID(cfg.InstanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance id: %w", err)
+	}
 
 	// tg.Layer 由当前导入的 canonical schema 生成；纳入未来 Layer 后无需
 	// 在 telesrv 另维护一份常量。
@@ -543,6 +579,11 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer pool.Close()
+	counterRecovery, err := postgres.OpenCounterRecovery(ctx, cfg.PostgresDSN, cfg.PostgresCounterRecoveryMaxConns)
+	if err != nil {
+		return fmt.Errorf("connect postgres counter recovery: %w", err)
+	}
+	defer counterRecovery.Close()
 	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
 		stat := pool.Stat()
 		return []obsmetrics.GaugeSample{
@@ -555,6 +596,20 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 			{Name: "telesrv_postgres_pool_acquire_wait_seconds", Value: stat.AcquireDuration().Seconds()},
 			{Name: "telesrv_postgres_pool_empty_acquire_count", Value: float64(stat.EmptyAcquireCount())},
 			{Name: "telesrv_postgres_pool_canceled_acquire_count", Value: float64(stat.CanceledAcquireCount())},
+		}
+	})
+	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
+		stat := counterRecovery.Stat()
+		if stat == nil {
+			return nil
+		}
+		return []obsmetrics.GaugeSample{
+			{Name: "telesrv_postgres_counter_recovery_pool_connections", Labels: []obsmetrics.Label{{Name: "state", Value: "total"}}, Value: float64(stat.TotalConns())},
+			{Name: "telesrv_postgres_counter_recovery_pool_connections", Labels: []obsmetrics.Label{{Name: "state", Value: "acquired"}}, Value: float64(stat.AcquiredConns())},
+			{Name: "telesrv_postgres_counter_recovery_pool_connections", Labels: []obsmetrics.Label{{Name: "state", Value: "idle"}}, Value: float64(stat.IdleConns())},
+			{Name: "telesrv_postgres_counter_recovery_pool_max_connections", Value: float64(stat.MaxConns())},
+			{Name: "telesrv_postgres_counter_recovery_pool_acquire_wait_seconds", Value: stat.AcquireDuration().Seconds()},
+			{Name: "telesrv_postgres_counter_recovery_pool_empty_acquire_count", Value: float64(stat.EmptyAcquireCount())},
 		}
 	})
 
@@ -633,7 +688,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	updateStateStore := postgres.NewUpdateStateStore(pool)
 	updateEventStore := postgres.NewUpdateEventStore(pool, postgres.WithUpdateEventLogger(logger.Named("store").Named("updates")))
 	phoneChangeStore := postgres.NewPhoneChangeStore(pool)
-	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(cfg.OutboxLeaseTimeout))
 	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool, postgres.WithDeliveryLeaseTimeout(cfg.OutboxLeaseTimeout))
 	bootstrapUpdateStore := postgres.NewBootstrapUpdateJobStore(pool)
 	botAPIUpdateStore := postgres.NewBotAPIUpdateStore(pool)
@@ -645,9 +699,9 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	moderationReportStore := postgres.NewModerationReportStore(pool)
 	authDeliveryReportStore := postgres.NewAuthDeliveryReportStore(pool)
 	clientTelemetryStore := postgres.NewClientTelemetryStore(pool)
-	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
-	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, postgres.NewChannelIDCounterSource(pool))
-	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, postgres.NewChannelMessageIDCounterSource(pool))
+	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, counterRecovery.MessageBoxSource())
+	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, counterRecovery.ChannelIDSource())
+	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, counterRecovery.ChannelMessageIDSource())
 	projectionStores := nodeprojection.NewStores(pool, rdb, nodeprojection.StoreConfig{
 		ChannelRowCacheMaxEntries:    cfg.ChannelRowCacheMaxEntries,
 		ChannelMemberCacheMaxEntries: cfg.ChannelMemberCacheMaxEntries,
@@ -819,13 +873,11 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		Restrictions:  adminStore,
 		OfficialGifts: officialgifts.New(cfg.OfficialGiftsDir),
 	})
-	go maintenance.NewRetentionWorker(dispatchOutboxStore, tempAuthKeyStore, logger.Named("maintenance").Named("retention"),
+	go maintenance.NewRetentionWorker(tempAuthKeyStore, logger.Named("maintenance").Named("retention"),
 		cfg.UpdateEventRetention,
 		cfg.RetentionInterval,
 		cfg.RetentionBatch,
-	).WithDispatchOutboxPoisonPolicy(cfg.OutboxPoisonRetention, cfg.OutboxPoisonCleanupInterval).
-		WithEdgeDeliveryOutboxPoisonStore(deliveryOutboxStore).
-		WithBotAPIUpdateRetention(botAPIUpdateStore, cfg.BotAPIUpdateRetention).
+	).WithBotAPIUpdateRetention(botAPIUpdateStore, cfg.BotAPIUpdateRetention).
 		WithAuthKeySessionLayerRetention(authKeyStore).
 		WithLoginCodeDeliveryRetention(messageStore).
 		WithClientTelemetryRetention(clientTelemetryStore, 30*24*time.Hour).
@@ -861,7 +913,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	}
 
 	botStore := postgres.NewBotStore(pool)
-	accountLifecycleStore := postgres.NewAccountLifecycleStore(pool)
+	accountLifecycleStore := postgres.NewAccountLifecycleStore(pool, boxIDAllocator)
 	accountOptions := []account.ServiceOption{
 		account.WithReactionSettings(passwordStore),
 		account.WithAccountSettings(passwordStore),
@@ -925,7 +977,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		botsapp.WithUserCache(userCache),
 		botsapp.WithStickerSetCreator(filesService),
 		botsapp.WithGifCatalog(filesService),
-		botsapp.WithUserStickerSets(accountService),
 		botsapp.WithTelegramLogin(telegramLoginService),
 		botsapp.WithDialogRateLimiter(rateLimiter, cfg.VerificationBotRateLimit, cfg.VerificationBotRateWindow),
 		botsapp.WithPublicBaseURL(cfg.PublicBaseURL))
@@ -1152,9 +1203,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		dialogs.WithPremiumChecker(usersService.PremiumActive),
 		dialogs.WithReadModelVersions(readModelVersionStore),
 	)
-	// 编译期保证 *users.Service 满足 channel fan-out 跨 viewer 投影预热的可选能力；签名漂移会在
-	// 这里立刻断编译，而非在运行时静默退化回 O(viewer) 逐 viewer 投影。
-	var _ rpc.BatchViewerUsersResolver = usersService
 	channelsService := channelapp.NewService(channelStore,
 		channelapp.WithBotProfileResolver(botsService),
 		channelapp.WithReadModelVersions(readModelVersionStore),
@@ -1251,17 +1299,18 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	// this service; the bot and the panel are only its two surfaces.
 	verificationStore := postgres.NewVerificationStore(pool)
 	verificationLogger := logger.Named("app").Named("verification")
+	verificationVerifier := &verificationPeerVerifier{
+		users:           usersService,
+		channels:        channelsService,
+		channelRowCache: channelRowCache,
+	}
 	verificationService := verificationapp.NewService(
 		verificationapp.WithStore(verificationStore),
 		verificationapp.WithUserDirectory(usersService),
 		verificationapp.WithBotDirectory(botsService),
 		verificationapp.WithChannelDirectory(channelsService),
 		verificationapp.WithAccountFreezeProvider(adminService),
-		verificationapp.WithPeerVerifier(verificationPeerVerifier{
-			users:           usersService,
-			channels:        channelsService,
-			channelRowCache: channelRowCache,
-		}),
+		verificationapp.WithPeerVerifier(verificationVerifier),
 		verificationapp.WithRateLimiter(rateLimiter, cfg.VerificationApplyRateLimit, cfg.VerificationApplyRateWindow),
 		verificationapp.WithEnabled(cfg.VerificationEnabled),
 		verificationapp.WithAllowUserTargets(cfg.VerificationAllowUserTargets),
@@ -1397,6 +1446,9 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		Inline:                  inlineRegistryStore,
 		Limiter:                 rateLimiter,
 	}, logger.Named("rpc"), clock.System)
+	verificationVerifier.userDelivery = router.UserAudienceDeliveryEffects
+	usernamesService.SetUserAudienceDelivery(router.UsernameAudienceDeliveryEffects)
+	botVerificationService.SetUserAudienceDelivery(router.UserAudienceDeliveryEffects)
 	if _, err := coreexec.StartGRPC(ctx, coreexec.GRPCServerConfig{
 		Addr:              cfg.CoreExecGRPCAddr,
 		InstanceID:        instanceID,
@@ -1433,85 +1485,64 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		go runRemoteSFUOwnerHeartbeat()
 	}
 	adminService.Configure(adminapp.Dependencies{
-		Auth:                   authService,
-		Revoker:                router,
-		Users:                  usersService,
-		Account:                accountService,
-		Photos:                 filesService,
-		Stars:                  starsService,
-		Premium:                premiumService,
-		StarsNotifier:          router,
-		UserNotifier:           router,
-		UserModerationNotifier: router,
-		FreezeNotifier:         router,
-		Channels:               channelsService,
-		ChannelNotifier:        router,
-		Messages:               messagesService,
-		Gifts:                  giftsService,
-		GiftGranter:            router,
-		Bots:                   botsService,
-		Broadcast:              broadcastService,
-		Emoji:                  filesService,
-		StickerSets:            filesService,
-		GifCatalog:             filesService,
-		Moderation:             moderationService,
-		Usernames:              usernamesService,
-		CollectiblePhones:      collectiblePhoneStore,
-		Rating:                 ratingService,
-		Verification:           verificationService,
-		BotVerification:        botVerificationService,
+		Auth:                  authService,
+		Revoker:               router,
+		Users:                 usersService,
+		UserAudienceDelivery:  router.UserAudienceDeliveryEffects,
+		Account:               accountService,
+		Photos:                filesService,
+		AvatarDelivery:        router,
+		Stars:                 starsService,
+		StarsDelivery:         router.StarsBalanceDeliveryEffects,
+		Premium:               premiumService,
+		PremiumUserDelivery:   router.PremiumUserDeliveryEffects,
+		PremiumRefundDelivery: router.PremiumRefundDeliveryEffects,
+		UserProjectionCache:   router,
+		FreezeNotifier:        router,
+		Channels:              channelsService,
+		ChannelNotifier:       router,
+		Messages:              messagesService,
+		Gifts:                 giftsService,
+		GiftGranter:           router,
+		Bots:                  botsService,
+		Broadcast:             broadcastService,
+		Emoji:                 filesService,
+		StickerSets:           filesService,
+		GifCatalog:            filesService,
+		Moderation:            moderationService,
+		Usernames:             usernamesService,
+		CollectiblePhones:     collectiblePhoneStore,
+		Rating:                ratingService,
+		Verification:          verificationService,
+		BotVerification:       botVerificationService,
 	})
 	// The RPC edge owns the tg.* projection cache and the standard non-PTS
 	// updateUser/updateChannel refresh, so committed registry mutations are
 	// visible to online viewers immediately.
 	usernamesService.SetPeerUsernameNotifier(router)
-	// The badge change is a peer fact the protocol edge caches and pushes, so the
-	// verification service gets the same hook the username registry uses. The
-	// assertion is deliberately dynamic: NotifyPeerVerified lands with the edge
-	// agent, and until then only projection invalidation is wired — a decision can
-	// then never be masked by a stale projection, and clients converge on their next
-	// authoritative peer read.
-	if notifier, ok := any(router).(verificationapp.PeerNotifier); ok {
-		// Compose rather than choose: the decision writes users.verified inside the
-		// verification transaction (through postgres.VerificationTxFromContext), so it
-		// bypasses users.Service and its cache refresh. Dropping the shared user:base
-		// entry before the edge builds the pushed tg.User is what keeps the badge in
-		// that push from being one beat stale; the cross-instance read-model listener
-		// would otherwise only catch up asynchronously.
-		verificationService.SetPeerNotifier(compositeVerificationNotifier{
-			cache: rpcProjectionVerificationNotifier{
-				invalidator: router,
-				users:       userCache,
-				log:         verificationLogger,
-			},
-			edge: notifier,
-		})
-	} else {
-		verificationService.SetPeerNotifier(rpcProjectionVerificationNotifier{
+	// The badge change is a peer fact the protocol edge caches and projects. The
+	// concrete Router is a compile-time mandatory notifier; production startup no
+	// longer carries a cache-only capability fallback.
+	verificationService.SetPeerNotifier(compositeVerificationNotifier{
+		cache: rpcProjectionVerificationNotifier{
 			invalidator: router,
 			users:       userCache,
 			log:         verificationLogger,
-		})
-		logger.Warn("verification badge update push is not implemented by the RPC edge; only projection invalidation is wired",
-			zap.String("expected_hook", "rpc.Router.NotifyPeerVerified"))
-	}
+		},
+		edge: router,
+	})
 	// The third-party mark lives on the same peer projections as the official flag,
 	// so it needs the same edge hook. Composed with the cache drop for the same reason:
 	// the mark can be written on the decision's own transaction, bypassing the app
 	// services that would otherwise refresh the shared user:base entry.
-	if notifier, ok := any(router).(botverificationapp.PeerNotifier); ok {
-		botVerificationService.SetPeerNotifier(compositeBotVerificationNotifier{
-			cache: rpcProjectionVerificationNotifier{
-				invalidator: router,
-				users:       userCache,
-				log:         verificationLogger,
-			},
-			edge: notifier,
-		})
-	} else {
-		logger.Warn("third-party verification push is not implemented by the RPC edge",
-			zap.String("expected_hook", "rpc.Router.NotifyPeerBotVerification"))
-	}
+	botVerificationService.SetPeerNotifier(compositeBotVerificationNotifier{
+		cache: rpcProjectionVerificationNotifier{
+			invalidator: router,
+			users:       userCache,
+			log:         verificationLogger,
+		},
+		edge: router,
+	})
 	go ratingapp.NewRecomputeWorker(ratingService, logger.Named("rating").Named("recompute"),
 		cfg.RatingRecomputeInterval, cfg.RatingRecomputeBatch).Run(ctx)
 	// Applicant notifications are delivered from a durable outbox, never inside the
@@ -1535,7 +1566,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		)
 	}
 	moderationActionExecutor := moderationapp.NewActionExecutor(
-		adminService, channelsService, router, accountLifecycleStore,
+		adminService, channelsService, accountLifecycleStore,
 		moderationActionOptions...,
 	)
 	go moderationapp.NewActionWorker(
@@ -1580,7 +1611,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	go rpc.NewExpiryDispatcher(router, logger.Named("rpc").Named("expiry")).Run(ctx)
 	go rpc.NewPhoneExpiryDispatcher(router, logger.Named("rpc").Named("phone-expiry"), cfg.CallExpiryInterval).Run(ctx)
 	go rpc.NewGroupCallSweepDispatcher(router, logger.Named("rpc").Named("groupcall-sweep"), cfg.GroupCallSweepInterval, cfg.GroupCallCheckTTL).Run(ctx)
-	go router.RunChannelFanout(ctx)
 	go router.RunBotAPIEnqueue(ctx)
 	go router.RunPresenceSweeper(ctx, time.Minute)
 	go router.RunPremiumSweeper(ctx, cfg.PremiumSweepInterval, cfg.PremiumSweepBatch)

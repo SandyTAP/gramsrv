@@ -7,6 +7,27 @@ import (
 	"telesrv/internal/domain"
 )
 
+// ProfilePhotoMutation is the immutable post-mutation snapshot used to build
+// the reliable non-PTS notification in the same transaction.
+type ProfilePhotoMutation struct {
+	OwnerType  domain.PeerType
+	OwnerID    int64
+	Kind       domain.ProfilePhotoKind
+	DeletedIDs []int64
+	Current    domain.Photo
+	HasCurrent bool
+}
+
+// StickerSetMutation is the immutable post-mutation snapshot supplied to a
+// durable delivery builder while the sticker-set transaction is still open.
+// Installation is populated only for create-and-install, which commits the
+// set, creator installation and notification as one database transaction.
+type StickerSetMutation struct {
+	Set          domain.StickerSet
+	Installation *domain.UserStickerSet
+	Deleted      bool
+}
+
 // MediaStore 持久化媒体元数据：上传分片、blob 索引、文档/照片注册表、
 // 贴纸集、可用 reaction、头像历史。blob 字节本身由 blob backend 按 object_key 读写，
 // 本接口只管 file_blobs 索引行。
@@ -49,12 +70,11 @@ type MediaStore interface {
 
 	// 贴纸集 / 可用 reaction。
 	PutStickerSet(ctx context.Context, set domain.StickerSet) error
-	CreateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error
-	UpdateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error
-	DeleteStickerSet(ctx context.Context, setID int64, creatorUserID int64) error
-	// AdminDeleteStickerSet is DeleteStickerSet without the creator_user_id
-	// match, for admin-console management of seed-imported and user-created
-	// packs alike.
+	AdminCreateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error
+	CreateInstalledStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, docs []domain.Document, installation domain.UserStickerSet, effects DeliveryEffectsBuilder[StickerSetMutation]) error
+	AdminUpdateStickerSet(ctx context.Context, set domain.StickerSet, docs []domain.Document) error
+	UpdateStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, docs []domain.Document, effects DeliveryEffectsBuilder[StickerSetMutation]) error
+	DeleteStickerSetWithDelivery(ctx context.Context, set domain.StickerSet, effects DeliveryEffectsBuilder[StickerSetMutation]) error
 	AdminDeleteStickerSet(ctx context.Context, setID int64) error
 	GetStickerSetByID(ctx context.Context, id int64) (domain.StickerSet, bool, error)
 	GetStickerSetByShortName(ctx context.Context, shortName string) (domain.StickerSet, bool, error)
@@ -76,4 +96,6 @@ type MediaStore interface {
 	ListProfilePhotoDetailsKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, offset, limit int, maxID int64) (photos []domain.Photo, total int, err error)
 	DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64) ([]int64, error)
 	DeleteProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64) ([]int64, error)
+	SetProfilePhotoKindWithDelivery(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int, effects DeliveryEffectsBuilder[ProfilePhotoMutation]) (ProfilePhotoMutation, bool, error)
+	DeleteProfilePhotosKindWithDelivery(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoIDs []int64, effects DeliveryEffectsBuilder[ProfilePhotoMutation]) (ProfilePhotoMutation, error)
 }

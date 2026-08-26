@@ -184,36 +184,6 @@ func (s *captureUpdates) RecordNewStoryReaction(_ context.Context, authKeyID [8]
 	})
 }
 
-func (s *captureUpdates) RecordQuickReplyMutation(_ context.Context, authKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	s.captureExclude(excludeAuthKeyID, excludeSessionID)
-	event := domain.UpdateEvent{
-		Date:              mutation.Date,
-		QuickReplies:      append([]domain.QuickReply(nil), mutation.List.QuickReplies...),
-		QuickReply:        mutation.QuickReply,
-		QuickReplyMessage: mutation.Message,
-		MessageIDs:        append([]int(nil), mutation.MessageIDs...),
-		MaxID:             mutation.ShortcutID,
-	}
-	switch mutation.Kind {
-	case domain.QuickReplyMutationNew:
-		event.Type = domain.UpdateEventNewQuickReply
-	case domain.QuickReplyMutationDelete:
-		event.Type = domain.UpdateEventDeleteQuickReply
-	case domain.QuickReplyMutationMessage:
-		event.Type = domain.UpdateEventQuickReplyMessage
-	case domain.QuickReplyMutationIDs:
-		event.Type = domain.UpdateEventDeleteQuickReplyMessages
-	default:
-		event.Type = domain.UpdateEventQuickReplies
-	}
-	return s.recordCapturedEvent(authKeyID, userID, event)
-}
-
-func (s *captureUpdates) RecordChannelState(_ context.Context, authKeyID [8]byte, userID, channelID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	s.captureExclude(excludeAuthKeyID, excludeSessionID)
-	return s.recordCapturedEvent(authKeyID, userID, domain.UpdateEvent{Type: domain.UpdateEventChannelState, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}})
-}
-
 func (s *captureUpdates) RecordContactsReset(_ context.Context, authKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	s.captureExclude(excludeAuthKeyID, excludeSessionID)
 	return s.recordCapturedEvent(authKeyID, userID, domain.UpdateEvent{Type: domain.UpdateEventContactsReset})
@@ -277,15 +247,6 @@ func (s *captureUpdates) RecordDialogFiltersReload(_ context.Context, authKeyID 
 func (s *captureUpdates) RecordFolderPeers(_ context.Context, authKeyID [8]byte, userID int64, peers []domain.FolderPeerUpdate, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	s.captureExclude(excludeAuthKeyID, excludeSessionID)
 	return s.recordCapturedEvent(authKeyID, userID, domain.UpdateEvent{Type: domain.UpdateEventFolderPeers, FolderPeers: append([]domain.FolderPeerUpdate(nil), peers...)})
-}
-
-func (s *captureUpdates) RecordChannelViewForumAsMessages(_ context.Context, authKeyID [8]byte, userID, channelID int64, enabled bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	s.captureExclude(excludeAuthKeyID, excludeSessionID)
-	return s.recordCapturedEvent(authKeyID, userID, domain.UpdateEvent{
-		Type: domain.UpdateEventChannelViewForum,
-		Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
-		Bool: enabled,
-	})
 }
 
 func (s *captureUpdates) RecordChannelDiscussionInbox(_ context.Context, authKeyID [8]byte, userID, channelID int64, topicID, maxID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {

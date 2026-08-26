@@ -2,12 +2,12 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
-	"telesrv/internal/edgecontrol"
 	"telesrv/internal/store"
 )
 
@@ -43,7 +43,7 @@ func (r *Router) usernameDeliveryPayloadBuilder(ctx context.Context) store.UserD
 		if vector, ok := pushedSelf.GetUsernames(); ok && len(vector) > 0 {
 			usernames = vector
 		}
-		return edgecontrol.EncodeOutboxUpdate(&tg.Updates{
+		return encodeDeliveryUpdate(&tg.Updates{
 			Updates: []tg.UpdateClass{&tg.UpdateUserName{
 				UserID:    u.ID,
 				FirstName: u.FirstName,
@@ -59,7 +59,7 @@ func (r *Router) usernameDeliveryPayloadBuilder(ctx context.Context) store.UserD
 func (r *Router) selfUserRefreshDeliveryPayloadBuilder(ctx context.Context) store.UserDeliveryPayloadBuilder {
 	return func(snapshot store.UserDeliverySnapshot) ([]byte, error) {
 		u := snapshot.User
-		return edgecontrol.EncodeOutboxUpdate(&tg.Updates{
+		return encodeDeliveryUpdate(&tg.Updates{
 			Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: u.ID}},
 			Users:   []tg.UserClass{r.tgSelfUserFromDeliverySnapshot(ctx, snapshot)},
 			Date:    int(r.clock.Now().Unix()),
@@ -67,9 +67,47 @@ func (r *Router) selfUserRefreshDeliveryPayloadBuilder(ctx context.Context) stor
 	}
 }
 
+func (r *Router) selfUserAbsoluteReloadEffects(ctx context.Context) store.DeliveryEffectsBuilder[store.UserDeliverySnapshot] {
+	buildPayload := r.selfUserRefreshDeliveryPayloadBuilder(ctx)
+	return func(snapshot store.UserDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		payload, err := buildPayload(snapshot)
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.User.ID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func (r *Router) phoneChangeDeliveryEffectsBuilder(ctx context.Context, excludeAuthKeyID [8]byte, excludeSessionID int64) store.DeliveryEffectsBuilder[store.UserDeliverySnapshot] {
+	return func(snapshot store.UserDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		if snapshot.User.ID <= 0 || snapshot.User.Phone == "" {
+			return nil, fmt.Errorf("phone change delivery requires updated user snapshot")
+		}
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateUserPhone{
+				UserID: snapshot.User.ID,
+				Phone:  snapshot.User.Phone,
+			}},
+			Users: []tg.UserClass{r.tgSelfUserFromDeliverySnapshot(ctx, snapshot)},
+			Date:  int(r.clock.Now().Unix()),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.User.ID, ExcludeAuthKeyID: excludeAuthKeyID,
+			ExcludeSessionID: excludeSessionID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
 func (r *Router) privacyDeliveryPayloadBuilder() store.PrivacyDeliveryPayloadBuilder {
 	return func(rules domain.PrivacyRules) ([]byte, error) {
-		return edgecontrol.EncodeOutboxUpdate(&tg.Updates{
+		return encodeDeliveryUpdate(&tg.Updates{
 			Updates: []tg.UpdateClass{&tg.UpdatePrivacy{
 				Key:   tgPrivacyKey(rules.Key),
 				Rules: tgPrivacyRules(rules.Rules),

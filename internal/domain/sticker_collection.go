@@ -62,6 +62,56 @@ type StickerCollectionItem struct {
 	Date       int
 }
 
+// StickerCollectionMutationKind identifies the complete write requested for
+// one account-local sticker/GIF collection. Callers submit this immutable DTO
+// to the store together with a mandatory durable-delivery effect builder.
+type StickerCollectionMutationKind uint8
+
+const (
+	StickerCollectionMutationInvalid StickerCollectionMutationKind = iota
+	StickerCollectionMutationSave
+	StickerCollectionMutationUnsave
+	StickerCollectionMutationClear
+)
+
+type StickerCollectionMutation struct {
+	OwnerUserID int64
+	Kind        StickerCollectionKind
+	Mutation    StickerCollectionMutationKind
+	DocumentID  int64
+	Date        int
+}
+
+// UserStickerSetMutationKind is the account-local installed-set state
+// transition. A single DTO can carry the whole messages.toggleStickerSets
+// vector so production stores execute it as one transaction and one set-based
+// SQL statement.
+type UserStickerSetMutationKind uint8
+
+const (
+	UserStickerSetMutationInvalid UserStickerSetMutationKind = iota
+	UserStickerSetMutationInstall
+	UserStickerSetMutationUninstall
+	UserStickerSetMutationArchive
+	UserStickerSetMutationUnarchive
+	UserStickerSetMutationReorder
+)
+
+type UserStickerSetMutationItem struct {
+	StickerSetID int64
+	Kind         StickerSetKind
+}
+
+type UserStickerSetMutation struct {
+	OwnerUserID int64
+	Mutation    UserStickerSetMutationKind
+	Items       []UserStickerSetMutationItem
+	Kind        StickerSetKind
+	Order       []int64
+	Archived    bool
+	Date        int
+}
+
 // UserStickerSet 是某个账号安装/归档的一条 sticker set 状态。
 // set 元数据、文档和 packs 仍由 media/files 模块维护；这里仅保存用户视角。
 type UserStickerSet struct {

@@ -114,9 +114,6 @@ func (r *Router) onMessagesSendMessage(ctx context.Context, req *tg.MessagesSend
 		}
 		if replay.found {
 			duplicate = true
-			if req.ClearDraft {
-				r.clearDraftAfterSend(ctx, userID, peer, replyTo)
-			}
 			updates, projectionErr := r.monoforumSendUpdatesStrict(ctx, userID, replay.channel.Channel, savedPeer, replay.channel)
 			if projectionErr != nil {
 				sendErr = projectionErr

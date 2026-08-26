@@ -6,20 +6,8 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
-
-type userStickerSetService interface {
-	InstallUserStickerSet(ctx context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error
-	UninstallUserStickerSet(ctx context.Context, userID int64, setID int64) error
-	SetUserStickerSetArchived(ctx context.Context, userID int64, setID int64, archived bool, now int) error
-	ReorderUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, order []int64, now int) error
-	ListUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error)
-}
-
-func (r *Router) userStickerSetSvc() (userStickerSetService, bool) {
-	svc, ok := r.deps.Account.(userStickerSetService)
-	return svc, ok
-}
 
 func (r *Router) onMessagesInstallStickerSet(ctx context.Context, req *tg.MessagesInstallStickerSetRequest) (tg.MessagesStickerSetInstallResultClass, error) {
 	if req == nil {
@@ -33,12 +21,14 @@ func (r *Router) onMessagesInstallStickerSet(ctx context.Context, req *tg.Messag
 	if err != nil {
 		return nil, err
 	}
-	if svc, ok := r.userStickerSetSvc(); ok {
-		if err := svc.InstallUserStickerSet(ctx, userID, set.ID, userStickerSetKind(set), req.Archived, int(r.clock.Now().Unix())); err != nil {
-			return nil, internalErr()
-		}
+	kind := userStickerSetKind(set)
+	if err := r.mutateUserStickerSets(ctx, domain.UserStickerSetMutation{
+		OwnerUserID: userID, Mutation: domain.UserStickerSetMutationInstall,
+		Items:    []domain.UserStickerSetMutationItem{{StickerSetID: set.ID, Kind: kind}},
+		Archived: req.Archived, Date: int(r.clock.Now().Unix()),
+	}); err != nil {
+		return nil, err
 	}
-	r.pushStickerSetsUpdate(ctx, userID, userStickerSetKind(set))
 	return &tg.MessagesStickerSetInstallResultSuccess{}, nil
 }
 
@@ -51,12 +41,13 @@ func (r *Router) onMessagesUninstallStickerSet(ctx context.Context, input tg.Inp
 	if err != nil {
 		return false, err
 	}
-	if svc, ok := r.userStickerSetSvc(); ok {
-		if err := svc.UninstallUserStickerSet(ctx, userID, set.ID); err != nil {
-			return false, internalErr()
-		}
+	if err := r.mutateUserStickerSets(ctx, domain.UserStickerSetMutation{
+		OwnerUserID: userID, Mutation: domain.UserStickerSetMutationUninstall,
+		Items: []domain.UserStickerSetMutationItem{{StickerSetID: set.ID, Kind: userStickerSetKind(set)}},
+		Date:  int(r.clock.Now().Unix()),
+	}); err != nil {
+		return false, err
 	}
-	r.pushStickerSetsUpdate(ctx, userID, userStickerSetKind(set))
 	return true, nil
 }
 
@@ -69,16 +60,22 @@ func (r *Router) onMessagesReorderStickerSets(ctx context.Context, req *tg.Messa
 		return false, internalErr()
 	}
 	kind := stickerSetKindFromFlags(req.Masks, req.Emojis)
-	order := uniqueNonZeroInt64s(req.Order, domain.MaxInstalledStickerSets)
-	if len(order) == 0 {
+	if len(req.Order) > domain.MaxInstalledStickerSets {
+		return false, limitInvalidErr()
+	}
+	if len(req.Order) == 0 {
 		return true, nil
 	}
-	if svc, ok := r.userStickerSetSvc(); ok {
-		if err := svc.ReorderUserStickerSets(ctx, userID, kind, order, int(r.clock.Now().Unix())); err != nil {
-			return false, internalErr()
-		}
+	order := append([]int64(nil), req.Order...)
+	if !validUniqueStickerSetIDs(order) {
+		return false, inputRequestInvalidErr()
 	}
-	r.pushStickerSetsOrderUpdate(ctx, userID, kind, order)
+	if err := r.mutateUserStickerSets(ctx, domain.UserStickerSetMutation{
+		OwnerUserID: userID, Mutation: domain.UserStickerSetMutationReorder,
+		Kind: kind, Order: order, Date: int(r.clock.Now().Unix()),
+	}); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -93,8 +90,17 @@ func (r *Router) onMessagesToggleStickerSets(ctx context.Context, req *tg.Messag
 	if len(req.Stickersets) > domain.MaxInstalledStickerSets {
 		return false, limitInvalidErr()
 	}
-	svc, hasSvc := r.userStickerSetSvc()
-	kinds := make(map[domain.StickerSetKind]bool)
+	modeFlags := 0
+	for _, enabled := range []bool{req.Uninstall, req.Archive, req.Unarchive} {
+		if enabled {
+			modeFlags++
+		}
+	}
+	if modeFlags > 1 {
+		return false, inputRequestInvalidErr()
+	}
+	items := make([]domain.UserStickerSetMutationItem, 0, len(req.Stickersets))
+	seen := make(map[int64]struct{}, len(req.Stickersets))
 	now := int(r.clock.Now().Unix())
 	for _, input := range req.Stickersets {
 		set, _, err := r.resolveInstallableStickerSet(ctx, input)
@@ -102,31 +108,28 @@ func (r *Router) onMessagesToggleStickerSets(ctx context.Context, req *tg.Messag
 			return false, err
 		}
 		kind := userStickerSetKind(set)
-		kinds[kind] = true
-		if !hasSvc {
-			continue
+		if _, duplicate := seen[set.ID]; duplicate {
+			return false, inputRequestInvalidErr()
 		}
-		switch {
-		case req.Uninstall:
-			if err := svc.UninstallUserStickerSet(ctx, userID, set.ID); err != nil {
-				return false, internalErr()
-			}
-		case req.Archive:
-			if err := svc.SetUserStickerSetArchived(ctx, userID, set.ID, true, now); err != nil {
-				return false, internalErr()
-			}
-		case req.Unarchive:
-			if err := svc.SetUserStickerSetArchived(ctx, userID, set.ID, false, now); err != nil {
-				return false, internalErr()
-			}
-		default:
-			if err := svc.InstallUserStickerSet(ctx, userID, set.ID, kind, false, now); err != nil {
-				return false, internalErr()
-			}
-		}
+		seen[set.ID] = struct{}{}
+		items = append(items, domain.UserStickerSetMutationItem{StickerSetID: set.ID, Kind: kind})
 	}
-	for kind := range kinds {
-		r.pushStickerSetsUpdate(ctx, userID, kind)
+	if len(items) == 0 {
+		return true, nil
+	}
+	mutationKind := domain.UserStickerSetMutationInstall
+	switch {
+	case req.Uninstall:
+		mutationKind = domain.UserStickerSetMutationUninstall
+	case req.Archive:
+		mutationKind = domain.UserStickerSetMutationArchive
+	case req.Unarchive:
+		mutationKind = domain.UserStickerSetMutationUnarchive
+	}
+	if err := r.mutateUserStickerSets(ctx, domain.UserStickerSetMutation{
+		OwnerUserID: userID, Mutation: mutationKind, Items: items, Date: now,
+	}); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -137,7 +140,7 @@ func (r *Router) onMessagesGetMyStickers(ctx context.Context, req *tg.MessagesGe
 		return nil, internalErr()
 	}
 	if r.deps.Files == nil {
-		return &tg.MessagesMyStickers{Count: 0, Sets: []tg.StickerSetCoveredClass{}}, nil
+		return nil, internalErr()
 	}
 	limit := 50
 	var offsetID int64
@@ -163,6 +166,45 @@ func (r *Router) onMessagesGetMyStickers(ctx context.Context, req *tg.MessagesGe
 		covered = append(covered, &tg.StickerSetNoCovered{Set: tgStickerSet(set)})
 	}
 	return &tg.MessagesMyStickers{Count: total, Sets: covered}, nil
+}
+
+func (r *Router) onMessagesGetArchivedStickers(ctx context.Context, req *tg.MessagesGetArchivedStickersRequest) (*tg.MessagesArchivedStickers, error) {
+	if req == nil || r.deps.Account == nil || r.deps.Files == nil {
+		return nil, internalErr()
+	}
+	if req.Masks && req.Emojis {
+		return nil, inputRequestInvalidErr()
+	}
+	if req.OffsetID < 0 {
+		return nil, offsetInvalidErr()
+	}
+	limit := req.Limit
+	if limit < 0 || limit > domain.MaxInstalledStickerSets {
+		return nil, limitInvalidErr()
+	}
+	if limit == 0 {
+		limit = 50
+	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	kind := stickerSetKindFromFlags(req.Masks, req.Emojis)
+	archived := true
+	items, total, err := r.deps.Account.ListUserStickerSets(ctx, userID, kind, &archived, req.OffsetID, limit)
+	if err != nil {
+		return nil, internalErr()
+	}
+	covered := make([]tg.StickerSetCoveredClass, 0, len(items))
+	for _, item := range items {
+		set, _, found, err := r.deps.Files.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: item.StickerSetID})
+		if err != nil || !found || set.ID == 0 || set.Deleted || userStickerSetKind(set) != kind {
+			return nil, internalErr()
+		}
+		set = stickerSetWithViewerInstallItem(stickerSetWithoutViewerInstallState(set), item)
+		covered = append(covered, &tg.StickerSetNoCovered{Set: tgStickerSet(set)})
+	}
+	return &tg.MessagesArchivedStickers{Count: total, Sets: covered}, nil
 }
 
 func (r *Router) resolveInstallableStickerSet(ctx context.Context, input tg.InputStickerSetClass) (domain.StickerSet, []domain.Document, error) {
@@ -208,29 +250,21 @@ func stickerSetKindFromFlags(masks, emojis bool) domain.StickerSetKind {
 	}
 }
 
-func uniqueNonZeroInt64s(in []int64, max int) []int64 {
-	if max <= 0 {
-		max = len(in)
-	}
-	out := make([]int64, 0, len(in))
+func validUniqueStickerSetIDs(in []int64) bool {
 	seen := make(map[int64]struct{}, len(in))
 	for _, v := range in {
-		if v == 0 {
-			continue
+		if v <= 0 {
+			return false
 		}
 		if _, ok := seen[v]; ok {
-			continue
+			return false
 		}
 		seen[v] = struct{}{}
-		out = append(out, v)
-		if len(out) >= max {
-			break
-		}
 	}
-	return out
+	return true
 }
 
-func (r *Router) pushStickerSetsUpdate(ctx context.Context, userID int64, kind domain.StickerSetKind) {
+func stickerSetsUpdate(kind domain.StickerSetKind) *tg.UpdateStickerSets {
 	update := &tg.UpdateStickerSets{}
 	switch kind {
 	case domain.StickerSetKindMasks:
@@ -238,15 +272,10 @@ func (r *Router) pushStickerSetsUpdate(ctx context.Context, userID int64, kind d
 	case domain.StickerSetKindEmoji:
 		update.SetEmojis(true)
 	}
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{update},
-		Users:   []tg.UserClass{},
-		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
-	})
+	return update
 }
 
-func (r *Router) pushStickerSetsOrderUpdate(ctx context.Context, userID int64, kind domain.StickerSetKind, order []int64) {
+func stickerSetsOrderUpdate(kind domain.StickerSetKind, order []int64) *tg.UpdateStickerSetsOrder {
 	update := &tg.UpdateStickerSetsOrder{Order: append([]int64(nil), order...)}
 	switch kind {
 	case domain.StickerSetKindMasks:
@@ -254,10 +283,78 @@ func (r *Router) pushStickerSetsOrderUpdate(ctx context.Context, userID int64, k
 	case domain.StickerSetKindEmoji:
 		update.SetEmojis(true)
 	}
-	r.pushUserUpdates(ctx, userID, &tg.Updates{
-		Updates: []tg.UpdateClass{update},
-		Users:   []tg.UserClass{},
-		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
-	})
+	return update
+}
+
+func userStickerSetMutationKinds(mutation domain.UserStickerSetMutation) []domain.StickerSetKind {
+	if mutation.Mutation == domain.UserStickerSetMutationReorder {
+		return []domain.StickerSetKind{mutation.Kind}
+	}
+	out := make([]domain.StickerSetKind, 0, len(mutation.Items))
+	seen := make(map[domain.StickerSetKind]struct{}, len(mutation.Items))
+	for _, item := range mutation.Items {
+		if _, exists := seen[item.Kind]; exists {
+			continue
+		}
+		seen[item.Kind] = struct{}{}
+		out = append(out, item.Kind)
+	}
+	return out
+}
+
+func (r *Router) stickerSetDeliveryEffects(ctx context.Context, userID int64) store.DeliveryEffectsBuilder[domain.UserStickerSetMutation] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot domain.UserStickerSetMutation) ([]store.DeliveryEffect, error) {
+		updates := make([]tg.UpdateClass, 0, 3)
+		if snapshot.Mutation == domain.UserStickerSetMutationReorder {
+			updates = append(updates, stickerSetsOrderUpdate(snapshot.Kind, snapshot.Order))
+		} else {
+			for _, kind := range userStickerSetMutationKinds(snapshot) {
+				updates = append(updates, stickerSetsUpdate(kind))
+			}
+		}
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: updates, Users: []tg.UserClass{}, Chats: []tg.ChatClass{}, Date: int(r.clock.Now().Unix()),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func (r *Router) stickerSetMutationDeliveryEffects(ctx context.Context, userID int64) store.DeliveryEffectsBuilder[store.StickerSetMutation] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot store.StickerSetMutation) ([]store.DeliveryEffect, error) {
+		payload, err := encodeDeliveryUpdate(&tg.Updates{
+			Updates: []tg.UpdateClass{stickerSetsUpdate(userStickerSetKind(snapshot.Set))},
+			Users:   []tg.UserClass{}, Chats: []tg.ChatClass{}, Date: int(r.clock.Now().Unix()),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, ExcludeAuthKeyID: excludeAuthKeyID, ExcludeSessionID: excludeSessionID,
+			Payload: payload, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func (r *Router) mutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation) error {
+	if r.deps.Account == nil {
+		return internalErr()
+	}
+	if err := r.requireAccountDelivery(mutation.OwnerUserID, "messages.userStickerSetMutation"); err != nil {
+		return err
+	}
+	if err := r.deps.Account.MutateUserStickerSets(ctx, mutation, r.stickerSetDeliveryEffects(ctx, mutation.OwnerUserID)); err != nil {
+		return internalErr()
+	}
+	for _, kind := range userStickerSetMutationKinds(mutation) {
+		r.invalidateStickerCatalog(kind)
+	}
+	return nil
 }

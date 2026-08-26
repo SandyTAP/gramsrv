@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // savedDialogTopsLocked 聚合 self-chat 按 saved_peer 分组的 top message。
@@ -159,61 +160,93 @@ func (s *MessageStore) ListSavedDialogsByPeers(_ context.Context, userID int64, 
 	return out, nil
 }
 
-func (s *MessageStore) ToggleSavedDialogPin(_ context.Context, userID int64, peer domain.Peer, pinned bool) (bool, error) {
-	if userID == 0 || peer.Type == "" || peer.ID == 0 {
-		return false, fmt.Errorf("toggle saved dialog pin: invalid input")
+func (s *MessageStore) MutateSavedDialogs(_ context.Context, mutation store.SavedDialogMutation, effects store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error) {
+	if err := mutation.Validate(); err != nil {
+		return store.SavedDialogMutationSnapshot{}, err
+	}
+	if effects == nil {
+		return store.SavedDialogMutationSnapshot{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	idx := s.savedPinIndexLocked(userID, peer)
-	if !pinned {
-		if idx < 0 {
-			return false, nil
+	events := s.updateEvents
+	if events == nil {
+		return store.SavedDialogMutationSnapshot{}, store.ErrDeliveryOutboxRequired
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	before := append([]domain.Peer(nil), s.savedPins[mutation.UserID]...)
+	after := append([]domain.Peer(nil), before...)
+	switch mutation.Kind {
+	case store.SavedDialogSetPinned:
+		index := savedDialogPeerIndex(after, mutation.Peer)
+		if mutation.Pinned && index < 0 {
+			if len(after) >= domain.MaxPinnedSavedDialogs {
+				return store.SavedDialogMutationSnapshot{}, domain.ErrPinnedSavedDialogsTooMuch
+			}
+			after = append([]domain.Peer{mutation.Peer}, after...)
+		} else if !mutation.Pinned && index >= 0 {
+			after = append(after[:index], after[index+1:]...)
 		}
-		s.savedPins[userID] = append(s.savedPins[userID][:idx], s.savedPins[userID][idx+1:]...)
-		return true, nil
-	}
-	if idx >= 0 {
-		return false, nil
-	}
-	if len(s.savedPins[userID]) >= domain.MaxPinnedSavedDialogs {
-		return false, domain.ErrPinnedSavedDialogsTooMuch
-	}
-	s.savedPins[userID] = append([]domain.Peer{peer}, s.savedPins[userID]...)
-	return true, nil
-}
-
-func (s *MessageStore) ReorderPinnedSavedDialogs(_ context.Context, userID int64, order []domain.Peer, force bool) error {
-	if userID == 0 {
-		return fmt.Errorf("reorder pinned saved dialogs: missing user id")
-	}
-	if len(order) > domain.MaxPinnedSavedDialogs {
-		return domain.ErrPinnedSavedDialogsTooMuch
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := make([]domain.Peer, 0, len(order))
-	seen := make(map[domain.Peer]struct{}, len(order))
-	for _, peer := range order {
-		if peer.Type == "" || peer.ID == 0 {
-			continue
-		}
-		if _, ok := seen[peer]; ok {
-			continue
-		}
-		seen[peer] = struct{}{}
-		next = append(next, peer)
-	}
-	if !force {
-		// 非 force：order 之外的既有置顶保持原相对顺序排在后面。
-		for _, peer := range s.savedPins[userID] {
-			if _, ok := seen[peer]; !ok {
-				next = append(next, peer)
+	case store.SavedDialogReorder:
+		after = append([]domain.Peer(nil), mutation.Order...)
+		if !mutation.Force {
+			seen := make(map[domain.Peer]struct{}, len(after))
+			for _, peer := range after {
+				seen[peer] = struct{}{}
+			}
+			for _, peer := range before {
+				if _, exists := seen[peer]; !exists {
+					after = append(after, peer)
+				}
 			}
 		}
+		if len(after) > domain.MaxPinnedSavedDialogs {
+			return store.SavedDialogMutationSnapshot{}, domain.ErrPinnedSavedDialogsTooMuch
+		}
 	}
-	s.savedPins[userID] = next
-	return nil
+	snapshot := store.SavedDialogMutationSnapshot{
+		Mutation: mutation, Changed: !savedDialogPeerOrderEqual(before, after), Order: append([]domain.Peer(nil), after...),
+	}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("build memory saved dialog effects: %w", err)
+	}
+	if err := store.ValidateSavedDialogEffects(snapshot, intents); err != nil {
+		return store.SavedDialogMutationSnapshot{}, fmt.Errorf("validate memory saved dialog effects: %w", err)
+	}
+	if len(intents) == 1 {
+		event := events.appendLocked(mutation.UserID, intents[0].Event, true)
+		events.dispatches[mutation.UserID] = append(events.dispatches[mutation.UserID], memoryUpdateDispatch{Pts: event.Pts})
+		intents[0].Event = event
+		if event.Pts > s.nextPts[mutation.UserID] {
+			s.nextPts[mutation.UserID] = event.Pts
+		}
+	}
+	s.savedPins[mutation.UserID] = after
+	snapshot.Effects = intents
+	return snapshot, nil
+}
+
+func savedDialogPeerIndex(peers []domain.Peer, target domain.Peer) int {
+	for i, peer := range peers {
+		if peer == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func savedDialogPeerOrderEqual(a, b []domain.Peer) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *MessageStore) DeleteSavedHistory(_ context.Context, req domain.DeleteSavedHistoryRequest) (domain.DeleteSavedHistoryResult, error) {

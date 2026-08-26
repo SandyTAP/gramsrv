@@ -131,13 +131,10 @@ type PeerDirectory interface {
 	ChannelDirectory
 }
 
-// PeerNotifier is the protocol edge hook invoked after a mark has already
-// committed: it drops the cached peer projections and pushes the change to online
-// clients. rpc.Router implements it (NotifyPeerBotVerification).
-//
-// A push failure never invalidates a committed mark, so it is logged rather than
-// returned: retrying the mutation would be wrong, and the next authoritative peer
-// read repairs the projection anyway.
+// PeerNotifier is the channel/cache protocol hook invoked after a mark has
+// already committed. User-target delivery is a mandatory store effect and must
+// never be recreated here. rpc.Router implements it
+// (NotifyPeerBotVerification).
 type PeerNotifier interface {
 	NotifyPeerBotVerification(ctx context.Context, peer domain.Peer) error
 }
@@ -166,7 +163,9 @@ type IconResolver interface {
 // there, which is why this port is optional.
 type MarkApplier interface {
 	GrantCustomVerification(ctx context.Context, mark domain.CustomVerification) (domain.CustomVerification, bool, error)
+	GrantCustomVerificationWithDelivery(ctx context.Context, mark domain.CustomVerification, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (domain.CustomVerification, bool, error)
 	RevokeCustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (bool, error)
+	RevokeCustomVerificationWithDelivery(ctx context.Context, verifierBotID int64, peer domain.Peer, effects store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) (bool, error)
 }
 
 // ApplicantNotifier delivers a decision to the applicant as a message from the
@@ -195,6 +194,10 @@ type Service struct {
 	documents IconResolver
 	applicant ApplicantNotifier
 	marks     MarkApplier
+	// userDelivery is mandatory for user-target mark mutations. The router is
+	// created after this service in Core, so it can be installed post-construction
+	// through SetUserAudienceDelivery; channel targets do not use it.
+	userDelivery store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
 
 	limiter       RateLimiter
 	requestLimit  int
@@ -283,6 +286,17 @@ func WithMarkApplier(applier MarkApplier) Option {
 	}
 }
 
+// WithUserAudienceDelivery installs the protocol-boundary projector for
+// user-target updateUser effects. It is deliberately not optional at mutation
+// time: a missing builder fails the mark transaction closed.
+func WithUserAudienceDelivery(builder store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) Option {
+	return func(s *Service) {
+		if builder != nil {
+			s.userDelivery = builder
+		}
+	}
+}
+
 // WithApplicantNotifier injects the verifier-bot delivery port.
 func WithApplicantNotifier(notifier ApplicantNotifier) Option {
 	return func(s *Service) {
@@ -300,6 +314,16 @@ func (s *Service) SetPeerNotifier(notifier PeerNotifier) {
 		return
 	}
 	s.peers = notifier
+}
+
+// SetUserAudienceDelivery installs the late-bound RPC projector after the
+// router exists. This mirrors SetPeerNotifier without retaining a user
+// post-commit notification path.
+func (s *Service) SetUserAudienceDelivery(builder store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]) {
+	if s == nil || builder == nil {
+		return
+	}
+	s.userDelivery = builder
 }
 
 // SetApplicantNotifier installs the verifier-bot delivery port after
@@ -423,6 +447,23 @@ func (s *Service) markApplier(st Store) MarkApplier {
 	return st
 }
 
+func (s *Service) userDeliveryFor(peer domain.Peer) (store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot], error) {
+	if peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+		return nil, domain.ErrCustomVerificationTargetInvalid
+	}
+	if s == nil || s.userDelivery == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	return s.userDelivery, nil
+}
+
+func (s *Service) verifierSettingsDelivery() (store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot], error) {
+	if s == nil || s.userDelivery == nil {
+		return nil, store.ErrDeliveryOutboxRequired
+	}
+	return s.userDelivery, nil
+}
+
 // readStore is the gate for the operator-facing reads. Unlike writeStore it
 // ignores the feature flag: an admin panel must still be able to show what was
 // granted while the feature is switched off, which is also how it can be audited
@@ -505,9 +546,9 @@ func (s *Service) VerifierSettingsBatch(ctx context.Context, botIDs []int64) (ma
 //
 // changed reports whether anything actually moved: re-applying an identical mark
 // or revoking an absent one answers false with no error, which is what keeps a
-// retrying client from seeing a spurious failure. The peer push only runs when
-// something moved, and its failure is logged rather than returned: the data is
-// already consistent and re-running the mutation would be wrong.
+// retrying client from seeing a spurious failure. User targets commit their
+// frozen-audience updateUser effects with the mark; channel targets retain the
+// aggregate's post-commit projection notifier.
 func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCustomVerificationRequest) (bool, error) {
 	st, err := s.writeStore()
 	if err != nil {
@@ -528,11 +569,20 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 		// verifier must still be able to strip its mark from a peer that has since
 		// been deleted or become unresolvable, which is exactly when stripping it
 		// matters most.
-		removed, err := st.RevokeCustomVerification(ctx, req.VerifierBotID, req.Peer)
+		var removed bool
+		if req.Peer.Type == domain.PeerTypeUser {
+			builder, buildErr := s.userDeliveryFor(req.Peer)
+			if buildErr != nil {
+				return false, buildErr
+			}
+			removed, err = st.RevokeCustomVerificationWithDelivery(ctx, req.VerifierBotID, req.Peer, builder)
+		} else {
+			removed, err = st.RevokeCustomVerification(ctx, req.VerifierBotID, req.Peer)
+		}
 		if err != nil {
 			return false, err
 		}
-		if removed {
+		if removed && req.Peer.Type == domain.PeerTypeChannel {
 			s.notifyPeer(ctx, req.Peer, "revoke")
 		}
 		return removed, nil
@@ -543,6 +593,13 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 	description, err := settings.DescriptionFor(req.CustomDescription)
 	if err != nil {
 		return false, err
+	}
+	var userDelivery store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	if req.Peer.Type == domain.PeerTypeUser {
+		userDelivery, err = s.userDeliveryFor(req.Peer)
+		if err != nil {
+			return false, err
+		}
 	}
 	// The stored mark is compared before writing, so an idempotent re-apply is
 	// reported as changed=false instead of burning a version and pushing an update
@@ -559,16 +616,24 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 	} else if err := s.checkVerifierQuota(ctx, st, req.VerifierBotID); err != nil {
 		return false, err
 	}
-	if _, _, err := st.GrantCustomVerification(ctx, domain.CustomVerification{
+	mark := domain.CustomVerification{
 		VerifierBotID:   req.VerifierBotID,
 		Peer:            req.Peer,
 		IconDocumentID:  settings.IconDocumentID,
 		Description:     description,
 		GrantedByUserID: req.CallerUserID,
-	}); err != nil {
+	}
+	if req.Peer.Type == domain.PeerTypeUser {
+		_, _, err = st.GrantCustomVerificationWithDelivery(ctx, mark, userDelivery)
+	} else {
+		_, _, err = st.GrantCustomVerification(ctx, mark)
+	}
+	if err != nil {
 		return false, err
 	}
-	s.notifyPeer(ctx, req.Peer, "grant")
+	if req.Peer.Type == domain.PeerTypeChannel {
+		s.notifyPeer(ctx, req.Peer, "grant")
+	}
 	return true, nil
 }
 
@@ -624,7 +689,7 @@ func (s *Service) Icons(ctx context.Context, activeOnly bool, limit int) ([]doma
 // Verifier status (operator actions)
 // ---------------------------------------------------------------------------
 
-// GrantVerifier grants or updates a bot's verifier status.
+// GrantVerifierWithDelivery grants or updates a bot's verifier status.
 //
 // Everything is validated before the write, because a verifier row is the
 // authority every later mark derives from:
@@ -637,75 +702,75 @@ func (s *Service) Icons(ctx context.Context, activeOnly bool, limit int) ([]doma
 //     this bot (a reserved entry belongs to one verifier only);
 //   - the icon's custom emoji document really exists, so the badge renders.
 //
-// The push afterwards is for the *bot itself*: its botInfo.verifier_settings just
-// changed. The peers it has marked are deliberately not fanned out -- a verifier
-// may hold up to domain.MaxCustomVerificationsPerVerifier marks, and turning one
-// operator action into ten thousand pushes would be a self-inflicted stampede.
-// Their projections converge on the next authoritative read (getUsers /
-// getFullUser / getDifference), which is the same convergence the peer read-model
-// version already guarantees.
-func (s *Service) GrantVerifier(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
+// User projections are frozen and appended to the absolute outbox by the store
+// transaction. Affected channel projections are returned as a bounded transient
+// authoritative-reload hint after commit; they are not account PTS and are never
+// expanded into one durable row per channel member.
+func (s *Service) GrantVerifierWithDelivery(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, bool, error) {
 	st, err := s.writeStore()
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
 	settings.CompanyName = strings.TrimSpace(settings.CompanyName)
 	settings.DefaultDescription = strings.TrimSpace(settings.DefaultDescription)
 	settings.GrantedBy = strings.TrimSpace(settings.GrantedBy)
 	settings.GrantReason = strings.TrimSpace(settings.GrantReason)
 	if err := settings.Validate(); err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
 	if err := s.checkVerifierBot(ctx, settings.BotID); err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
 	if err := s.checkCatalogueIcon(ctx, st, settings.BotID, settings.IconDocumentID); err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
-	stored, err := st.UpsertBotVerifierSettings(ctx, settings)
+	delivery, err := s.verifierSettingsDelivery()
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
-	s.notifyPeer(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: stored.BotID}, "grant_verifier")
-	return stored, nil
+	mutation, err := st.UpsertBotVerifierSettingsWithDelivery(ctx, settings, delivery)
+	if err != nil {
+		return domain.BotVerifierSettings{}, false, err
+	}
+	if mutation.Changed {
+		s.notifyVerifierChannels(ctx, mutation.AffectedChannelIDs, "grant_verifier")
+	}
+	return mutation.Settings, mutation.Changed, nil
 }
 
-// SetVerifierEnabled flips the operator kill switch. The verifier keeps its row
+// SetVerifierEnabledWithDelivery flips the operator kill switch. The verifier keeps its row
 // and the marks it granted, but it can grant nothing new and stops advertising
 // itself, so flipping the switch back restores exactly what was there.
 //
-// A no-op flip is detected before the write, so it neither burns a version nor
-// pushes an update: an admin panel toggling to the current value must not look
-// like a change in the audit trail.
-func (s *Service) SetVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
+// A no-op flip is detected under the store's verifier lock, so it neither burns
+// a version nor appends delivery: an admin panel toggling to the current value
+// must not look like a change in the audit trail.
+func (s *Service) SetVerifierEnabledWithDelivery(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, bool, error) {
 	st, err := s.writeStore()
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
 	if botID <= 0 {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+		return domain.BotVerifierSettings{}, false, domain.ErrVerifierNotFound
 	}
-	current, err := st.BotVerifierSettings(ctx, botID)
+	delivery, err := s.verifierSettingsDelivery()
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
-	if current.Enabled == enabled {
-		return current, nil
-	}
-	stored, err := st.SetBotVerifierEnabled(ctx, botID, enabled)
+	mutation, err := st.SetBotVerifierEnabledWithDelivery(ctx, botID, enabled, delivery)
 	if err != nil {
-		return domain.BotVerifierSettings{}, err
+		return domain.BotVerifierSettings{}, false, err
 	}
-	// Only the verifier's own botInfo is pushed; see GrantVerifier for why its
-	// marked peers are left to converge on their next authoritative read.
-	s.notifyPeer(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: botID}, "set_verifier_enabled")
-	return stored, nil
+	if mutation.Changed {
+		s.notifyVerifierChannels(ctx, mutation.AffectedChannelIDs, "set_verifier_enabled")
+	}
+	return mutation.Settings, mutation.Changed, nil
 }
 
-// RevokeVerifier removes verifier status entirely. Its marks cascade away with it
+// RevokeVerifierWithDelivery removes verifier status entirely. Its marks cascade away with it
 // in the store, because a mark whose verifier no longer exists has nothing to
 // render; the applications survive as history, since they reference users.
-func (s *Service) RevokeVerifier(ctx context.Context, botID int64) (bool, error) {
+func (s *Service) RevokeVerifierWithDelivery(ctx context.Context, botID int64) (bool, error) {
 	st, err := s.writeStore()
 	if err != nil {
 		return false, err
@@ -713,14 +778,18 @@ func (s *Service) RevokeVerifier(ctx context.Context, botID int64) (bool, error)
 	if botID <= 0 {
 		return false, domain.ErrVerifierNotFound
 	}
-	removed, err := st.DeleteBotVerifierSettings(ctx, botID)
+	delivery, err := s.verifierSettingsDelivery()
 	if err != nil {
 		return false, err
 	}
-	if removed {
-		s.notifyPeer(ctx, domain.Peer{Type: domain.PeerTypeUser, ID: botID}, "revoke_verifier")
+	mutation, err := st.DeleteBotVerifierSettingsWithDelivery(ctx, botID, delivery)
+	if err != nil {
+		return false, err
 	}
-	return removed, nil
+	if mutation.Changed {
+		s.notifyVerifierChannels(ctx, mutation.AffectedChannelIDs, "revoke_verifier")
+	}
+	return mutation.Changed, nil
 }
 
 // Verifiers lists verifier bots for the admin panel.
@@ -766,11 +835,20 @@ func (s *Service) RevokeMark(ctx context.Context, verifierBotID int64, peer doma
 	if !markablePeer(peer) {
 		return false, domain.ErrCustomVerificationTargetInvalid
 	}
-	removed, err := st.RevokeCustomVerification(ctx, verifierBotID, peer)
+	var removed bool
+	if peer.Type == domain.PeerTypeUser {
+		builder, buildErr := s.userDeliveryFor(peer)
+		if buildErr != nil {
+			return false, buildErr
+		}
+		removed, err = st.RevokeCustomVerificationWithDelivery(ctx, verifierBotID, peer, builder)
+	} else {
+		removed, err = st.RevokeCustomVerification(ctx, verifierBotID, peer)
+	}
 	if err != nil {
 		return false, err
 	}
-	if removed {
+	if removed && peer.Type == domain.PeerTypeChannel {
 		s.notifyPeer(ctx, peer, "revoke_mark")
 	}
 	return removed, nil
@@ -963,13 +1041,20 @@ func (s *Service) Approve(ctx context.Context, requestID, version int64, decided
 		}
 	}
 	description := s.approvedDescription(settings, current.RequestedDescription)
+	var userDelivery store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	if current.Peer.Type == domain.PeerTypeUser {
+		userDelivery, err = s.userDeliveryFor(current.Peer)
+		if err != nil {
+			return domain.CustomVerificationRequest{}, false, err
+		}
+	}
 	applier := s.markApplier(st)
 	stored, changed, err := st.DecideCustomVerificationRequest(ctx, requestID, version, domain.CustomVerificationApproved, decidedBy, reason, note,
 		// The callback's ctx carries the decision's transaction, so the grant is
 		// written through the applier rather than the pooled store: the mark and the
 		// approval have to land or fail together.
 		func(ctx context.Context, decided domain.CustomVerificationRequest) error {
-			_, _, err := applier.GrantCustomVerification(ctx, domain.CustomVerification{
+			mark := domain.CustomVerification{
 				VerifierBotID:  decided.VerifierBotID,
 				Peer:           decided.Peer,
 				IconDocumentID: settings.IconDocumentID,
@@ -977,14 +1062,21 @@ func (s *Service) Approve(ctx context.Context, requestID, version int64, decided
 				// The grant is attributed to the verifier bot: the decision was made
 				// through its queue, not by the applicant who filed it.
 				GrantedByUserID: decided.VerifierBotID,
-			})
+			}
+			if decided.Peer.Type == domain.PeerTypeUser {
+				_, _, err := applier.GrantCustomVerificationWithDelivery(ctx, mark, userDelivery)
+				return err
+			}
+			_, _, err := applier.GrantCustomVerification(ctx, mark)
 			return err
 		})
 	if err != nil {
 		return domain.CustomVerificationRequest{}, false, err
 	}
 	if changed {
-		s.notifyPeer(ctx, stored.Peer, "approve")
+		if stored.Peer.Type == domain.PeerTypeChannel {
+			s.notifyPeer(ctx, stored.Peer, "approve")
+		}
 		s.notifyApplicant(ctx, stored)
 	}
 	return stored, changed, nil
@@ -1040,20 +1132,34 @@ func (s *Service) RevokeRequest(ctx context.Context, requestID, version int64, d
 	if current.Status == domain.CustomVerificationRevoked {
 		return current, false, nil
 	}
+	var userDelivery store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot]
+	if current.Peer.Type == domain.PeerTypeUser {
+		userDelivery, err = s.userDeliveryFor(current.Peer)
+		if err != nil {
+			return domain.CustomVerificationRequest{}, false, err
+		}
+	}
 	applier := s.markApplier(st)
 	stored, changed, err := st.DecideCustomVerificationRequest(ctx, requestID, version, domain.CustomVerificationRevoked, decidedBy, reason, note,
 		// Written through the decision's own transaction, like the approval above.
 		func(ctx context.Context, decided domain.CustomVerificationRequest) error {
 			// A mark that is already gone is not an error: the operator may have
 			// stripped it directly, and the application still has to reach "revoked".
-			_, err := applier.RevokeCustomVerification(ctx, decided.VerifierBotID, decided.Peer)
+			var err error
+			if decided.Peer.Type == domain.PeerTypeUser {
+				_, err = applier.RevokeCustomVerificationWithDelivery(ctx, decided.VerifierBotID, decided.Peer, userDelivery)
+			} else {
+				_, err = applier.RevokeCustomVerification(ctx, decided.VerifierBotID, decided.Peer)
+			}
 			return err
 		})
 	if err != nil {
 		return domain.CustomVerificationRequest{}, false, err
 	}
 	if changed {
-		s.notifyPeer(ctx, stored.Peer, "revoke_request")
+		if stored.Peer.Type == domain.PeerTypeChannel {
+			s.notifyPeer(ctx, stored.Peer, "revoke_request")
+		}
 		s.notifyApplicant(ctx, stored)
 	}
 	return stored, changed, nil
@@ -1434,10 +1540,9 @@ func (s *Service) controls(ctx context.Context, applicantUserID int64, peer doma
 // Notifications
 // ---------------------------------------------------------------------------
 
-// notifyPeer drops the cached peer projections and pushes the mark change to
-// online clients. The mutation has already committed, so a failure is logged and
-// swallowed: retrying the mutation would be wrong, and the next authoritative peer
-// read repairs the projection anyway.
+// notifyPeer is retained for channel mutations and cache invalidation only.
+// User-target mark mutations commit their delivery effects in the store
+// transaction and must not call this as a second producer.
 func (s *Service) notifyPeer(ctx context.Context, peer domain.Peer, action string) {
 	if s == nil || s.peers == nil || peer.ID <= 0 {
 		return
@@ -1448,6 +1553,12 @@ func (s *Service) notifyPeer(ctx context.Context, peer domain.Peer, action strin
 			zap.String("peer_type", string(peer.Type)),
 			zap.Int64("peer_id", peer.ID),
 			zap.Error(err))
+	}
+}
+
+func (s *Service) notifyVerifierChannels(ctx context.Context, channelIDs []int64, action string) {
+	for _, channelID := range channelIDs {
+		s.notifyPeer(ctx, domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}, action)
 	}
 }
 

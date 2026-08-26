@@ -300,9 +300,9 @@ WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, req.PayerUserID, box.BoxI
 		if err := appendUserUpdateEvent(ctx, tx, q, req.PayerUserID, event); err != nil {
 			return nil, fmt.Errorf("append prepaid star gift sender edit event: %w", err)
 		}
-		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, q, dispatchEnqueue{
 			TargetUserID: req.PayerUserID, Pts: int32(pts), EventType: string(domain.UpdateEventEditMessage),
-			ExcludeAuthKeyID: authKeyIDToInt64(req.OriginAuthKeyID), ExcludeSessionID: req.OriginSessionID,
+			ExcludeAuthKeyID: req.OriginAuthKeyID, ExcludeSessionID: req.OriginSessionID,
 		}); err != nil {
 			return nil, fmt.Errorf("enqueue prepaid star gift sender edit: %w", err)
 		}

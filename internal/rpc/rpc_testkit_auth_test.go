@@ -4,7 +4,15 @@ import (
 	"context"
 	"sync"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
+
+func authorizationDeliveryTestContext(ctx context.Context) context.Context {
+	authKeyID := [8]byte{0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}
+	ctx = WithAuthKeyID(ctx, authKeyID)
+	ctx = WithRawAuthKeyID(ctx, authKeyID)
+	return WithSessionID(ctx, 909)
+}
 
 type captureAuthService struct {
 	bindTempCalls         int
@@ -35,6 +43,7 @@ type captureAuthService struct {
 	completedPasswordKey  [8]byte
 	completedPasswordUser int64
 	completePasswordCount int
+	authorizationEffects  []store.DeliveryEffect
 	codeDelivery          domain.AuthCodeDelivery
 	signInCount           int
 	signInPhone           string
@@ -103,15 +112,15 @@ func (s *blockingUserAuthService) CancelCode(context.Context, string, string) er
 	return nil
 }
 
-func (s *blockingUserAuthService) SignIn(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+func (s *blockingUserAuthService) SignIn(context.Context, domain.Authorization, string, string, string, store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
 	return domain.User{}, domain.Message{}, false, nil
 }
 
-func (s *blockingUserAuthService) SignInWithEmail(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+func (s *blockingUserAuthService) SignInWithEmail(context.Context, domain.Authorization, string, string, string, store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
 	return domain.User{}, domain.Message{}, false, nil
 }
 
-func (s *blockingUserAuthService) BindVerifiedLogin(_ context.Context, _ domain.Authorization, userID int64) (domain.User, error) {
+func (s *blockingUserAuthService) BindVerifiedLogin(_ context.Context, _ domain.Authorization, userID int64, _ store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, error) {
 	return domain.User{ID: userID}, nil
 }
 
@@ -119,7 +128,7 @@ func (s *blockingUserAuthService) SignUp(context.Context, domain.Authorization, 
 	return domain.User{}, domain.Message{}, nil
 }
 
-func (s *blockingUserAuthService) AcceptLoginToken(context.Context, domain.Authorization, int64) (domain.Authorization, error) {
+func (s *blockingUserAuthService) AcceptLoginToken(context.Context, domain.Authorization, int64, store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.Authorization, error) {
 	return domain.Authorization{}, nil
 }
 
@@ -159,7 +168,7 @@ func (s *blockingUserAuthService) PendingPasswordUserID(context.Context, [8]byte
 	return 0, false, nil
 }
 
-func (s *blockingUserAuthService) CompletePasswordSignIn(context.Context, [8]byte, int64) error {
+func (s *blockingUserAuthService) CompletePasswordSignIn(context.Context, [8]byte, int64, store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
 	return nil
 }
 
@@ -201,33 +210,46 @@ func (s *captureAuthService) CancelCode(context.Context, string, string) error {
 	return nil
 }
 
-func (s *captureAuthService) SignIn(_ context.Context, _ domain.Authorization, phone, hash, code string) (domain.User, domain.Message, bool, error) {
+func (s *captureAuthService) SignIn(_ context.Context, a domain.Authorization, phone, hash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
 	s.signInCount++
 	s.signInPhone = phone
 	s.signInHash = hash
 	s.signInCode = code
 	if s.signInUser.ID != 0 {
+		if err := s.captureAuthorizationDelivery(a, s.signInUser, delivery); err != nil {
+			return domain.User{}, domain.Message{}, false, err
+		}
 		return s.signInUser, domain.Message{}, false, nil
 	}
 	return domain.User{}, domain.Message{}, false, nil
 }
 
-func (s *captureAuthService) SignInWithEmail(_ context.Context, _ domain.Authorization, phone, hash, code string) (domain.User, domain.Message, bool, error) {
+func (s *captureAuthService) SignInWithEmail(_ context.Context, a domain.Authorization, phone, hash, code string, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, domain.Message, bool, error) {
 	s.signInWithEmailCount++
 	s.signInWithEmailPhone = phone
 	s.signInWithEmailHash = hash
 	s.signInWithEmailCode = code
 	if s.signInUser.ID != 0 {
+		if err := s.captureAuthorizationDelivery(a, s.signInUser, delivery); err != nil {
+			return domain.User{}, domain.Message{}, false, err
+		}
 		return s.signInUser, domain.Message{}, false, nil
 	}
 	return domain.User{}, domain.Message{}, false, nil
 }
 
-func (s *captureAuthService) BindVerifiedLogin(_ context.Context, _ domain.Authorization, userID int64) (domain.User, error) {
+func (s *captureAuthService) BindVerifiedLogin(_ context.Context, a domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.User, error) {
 	if s.signInUser.ID != 0 {
+		if err := s.captureAuthorizationDelivery(a, s.signInUser, delivery); err != nil {
+			return domain.User{}, err
+		}
 		return s.signInUser, nil
 	}
-	return domain.User{ID: userID}, nil
+	u := domain.User{ID: userID}
+	if err := s.captureAuthorizationDelivery(a, u, delivery); err != nil {
+		return domain.User{}, err
+	}
+	return u, nil
 }
 
 func (s *captureAuthService) SignUp(_ context.Context, a domain.Authorization, phone, hash, first, last string) (domain.User, domain.Message, error) {
@@ -242,8 +264,11 @@ func (s *captureAuthService) SignUp(_ context.Context, a domain.Authorization, p
 	return domain.User{}, domain.Message{}, nil
 }
 
-func (s *captureAuthService) AcceptLoginToken(_ context.Context, a domain.Authorization, userID int64) (domain.Authorization, error) {
+func (s *captureAuthService) AcceptLoginToken(_ context.Context, a domain.Authorization, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) (domain.Authorization, error) {
 	a.UserID = userID
+	if err := s.captureAuthorizationDelivery(a, domain.User{ID: userID}, delivery); err != nil {
+		return domain.Authorization{}, err
+	}
 	if a.Hash == 0 {
 		a.Hash = 77
 	}
@@ -344,9 +369,25 @@ func (s *captureAuthService) PendingPasswordUserID(context.Context, [8]byte) (in
 	return s.pendingPasswordUserID, s.pendingPassword, nil
 }
 
-func (s *captureAuthService) CompletePasswordSignIn(_ context.Context, authKeyID [8]byte, userID int64) error {
+func (s *captureAuthService) CompletePasswordSignIn(_ context.Context, authKeyID [8]byte, userID int64, delivery store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if err := s.captureAuthorizationDelivery(domain.Authorization{AuthKeyID: authKeyID}, domain.User{ID: userID}, delivery); err != nil {
+		return err
+	}
 	s.completedPasswordKey = authKeyID
 	s.completedPasswordUser = userID
 	s.completePasswordCount++
+	return nil
+}
+
+func (s *captureAuthService) captureAuthorizationDelivery(a domain.Authorization, user domain.User, build store.DeliveryEffectsBuilder[store.AuthorizationDeliverySnapshot]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	a.UserID = user.ID
+	effects, err := build(store.AuthorizationDeliverySnapshot{Authorization: a, User: user})
+	if err != nil {
+		return err
+	}
+	s.authorizationEffects = append([]store.DeliveryEffect(nil), effects...)
 	return nil
 }

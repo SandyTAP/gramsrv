@@ -34,7 +34,40 @@ type blockingFirstPersonalPhotoStore struct {
 	firstUsed bool
 }
 
+func testCachedContactMutationEffects(snapshot store.ContactMutationSnapshot) ([]store.DeliveryEffect, error) {
+	out := make([]store.DeliveryEffect, 0, len(snapshot.RequiredEvents))
+	for _, required := range snapshot.RequiredEvents {
+		out = append(out, store.AccountPTSDeliveryEffect(required.TargetUserID, required.Event, [8]byte{}, 0))
+	}
+	return out, nil
+}
+
+func mutateCachedContact(ctx context.Context, cached *CachedContactStore, kind store.ContactMutationKind, name string) error {
+	mutation := store.ContactMutation{
+		Kind: kind, OwnerUserID: 1, ContactUserIDs: []int64{2}, Date: 1700000000,
+		PeerSettings: []store.ContactMutationPeerSettings{{TargetUserID: 1, PeerUserID: 2, Settings: domain.PeerSettings{BlockContact: true}}},
+	}
+	if kind == store.ContactMutationAdd {
+		mutation.ContactUserIDs = nil
+		mutation.Inputs = []domain.ContactInput{{ContactUserID: 2, FirstName: name}}
+	}
+	_, err := cached.MutateContacts(ctx, mutation, testCachedContactMutationEffects)
+	return err
+}
+
 type stalePersonalPhotoWritebackContextKey struct{}
+
+func newTestContactStore() *memory.ContactStore {
+	contacts := memory.NewContactStore()
+	contacts.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
+	return contacts
+}
+
+func testPersonalPhotoEffects(snapshot store.ContactPersonalPhotoDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+		TargetUserID: snapshot.ViewerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	})}, nil
+}
 
 // stalePersonalPhotoWritebackStore deterministically models an older mutation
 // that commits first but returns to the cache wrapper after a newer mutation.
@@ -49,8 +82,8 @@ type stalePersonalPhotoWritebackStore struct {
 	staleReadCalls int
 }
 
-func (s *stalePersonalPhotoWritebackStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
-	contact, found, err := s.ContactStore.SetPersonalPhoto(ctx, userID, contactUserID, photoID, date)
+func (s *stalePersonalPhotoWritebackStore) SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
+	contact, found, err := s.ContactStore.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, photoID, date, effects)
 	if err != nil || !found || ctx.Value(stalePersonalPhotoWritebackContextKey{}) != true {
 		return contact, found, err
 	}
@@ -116,8 +149,8 @@ func (s *blockingFirstPersonalPhotoStore) PersonalPhotos(ctx context.Context, us
 	return s.ContactStore.PersonalPhotos(ctx, userID, contactUserIDs)
 }
 
-func (s *blockingFirstPersonalPhotoStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
-	return s.ContactStore.SetPersonalPhoto(ctx, userID, contactUserID, photoID, date)
+func (s *blockingFirstPersonalPhotoStore) SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
+	return s.ContactStore.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, photoID, date, effects)
 }
 
 func waitForCacheTestSignal(t *testing.T, ch <-chan struct{}) {
@@ -164,14 +197,14 @@ func (s *countingContactStore) PersonalPhotos(ctx context.Context, userID int64,
 	return s.ContactStore.PersonalPhotos(ctx, userID, contactUserIDs)
 }
 
-func (s *countingContactStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
+func (s *countingContactStore) SetPersonalPhotoWithDelivery(ctx context.Context, userID, contactUserID int64, photoID int64, date int, effects store.DeliveryEffectsBuilder[store.ContactPersonalPhotoDeliverySnapshot]) (domain.Contact, bool, error) {
 	s.setPersonalPhotoHit++
-	return s.ContactStore.SetPersonalPhoto(ctx, userID, contactUserID, photoID, date)
+	return s.ContactStore.SetPersonalPhotoWithDelivery(ctx, userID, contactUserID, photoID, date, effects)
 }
 
 func TestCachedContactStoreCachesProjectionReads(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{
 		ContactUserID: 2,
 		FirstName:     "Alice",
@@ -220,17 +253,17 @@ func TestCachedContactStoreCachesProjectionReads(t *testing.T) {
 
 func TestCachedContactStoreContactProjectionForViewersUsesViewerOwnedPairCache(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("seed viewer 1 contact: %v", err)
 	}
-	if _, _, err := base.SetPersonalPhoto(ctx, 1, 2, 9101, 100); err != nil {
+	if _, _, err := base.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9101, 100, testPersonalPhotoEffects); err != nil {
 		t.Fatalf("seed viewer 1 personal photo: %v", err)
 	}
 	if _, err := base.Upsert(ctx, 3, domain.ContactInput{ContactUserID: 2, FirstName: "Bob"}); err != nil {
 		t.Fatalf("seed viewer 3 contact: %v", err)
 	}
-	if _, _, err := base.SetPersonalPhoto(ctx, 3, 2, 9103, 100); err != nil {
+	if _, _, err := base.SetPersonalPhotoWithDelivery(ctx, 3, 2, 9103, 100, testPersonalPhotoEffects); err != nil {
 		t.Fatalf("seed viewer 3 personal photo: %v", err)
 	}
 	counting := &countingContactStore{ContactStore: base}
@@ -301,7 +334,7 @@ func TestCachedContactStorePairSnapshotsAreCompact(t *testing.T) {
 }
 
 func TestCachedContactStorePairSnapshotsUseNilForNegativeAndClonePositiveValues(t *testing.T) {
-	cached := NewCachedContactStore(memory.NewContactStore(), time.Hour)
+	cached := NewCachedContactStore(newTestContactStore(), time.Hour)
 	now := time.Unix(1000, 0)
 	expireAt := now.Add(time.Hour)
 	contact := domain.Contact{
@@ -392,7 +425,7 @@ func TestCachedContactStoreLargeDenseProjectionDoesNotPollutePairCache(t *testin
 		t.Fatal("admission accepted a batch above the documented cell limit")
 	}
 
-	counting := &countingContactStore{ContactStore: memory.NewContactStore()}
+	counting := &countingContactStore{ContactStore: newTestContactStore()}
 	cached := NewCachedContactStore(counting, time.Hour)
 	seedKey := contactProjectionKey{viewerUserID: 1, contactUserID: 2}
 	cached.mu.Lock()
@@ -433,7 +466,7 @@ func TestCachedContactStoreLargeDenseProjectionDoesNotPollutePairCache(t *testin
 
 func TestCachedContactStoreContactProjectionSkipsColdReadForKnownNonContact(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("seed contact: %v", err)
 	}
@@ -460,7 +493,7 @@ func TestCachedContactStoreContactProjectionSkipsColdReadForKnownNonContact(t *t
 
 func TestCachedContactStoreCachesLargeReverseContactBatch(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	owners := make([]int64, 32)
 	for i := range owners {
 		owners[i] = int64(i + 1)
@@ -503,7 +536,7 @@ func TestCachedContactStoreCachesLargeReverseContactBatch(t *testing.T) {
 
 func TestCachedContactStoreReversePairsUsePerEntryLRU(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	for ownerID := int64(1); ownerID <= 3; ownerID++ {
 		if _, err := base.Upsert(ctx, ownerID, domain.ContactInput{
 			ContactUserID: 9001,
@@ -535,7 +568,7 @@ func TestCachedContactStoreReversePairsUsePerEntryLRU(t *testing.T) {
 
 func TestCachedContactStoreInvalidatesAccountSnapshotAfterMutation(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
@@ -549,7 +582,7 @@ func TestCachedContactStoreInvalidatesAccountSnapshotAfterMutation(t *testing.T)
 	if first[2].FirstName != "Alice" {
 		t.Fatalf("first = %+v, want Alice", first[2])
 	}
-	if _, err := cached.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alicia"}); err != nil {
+	if err := mutateCachedContact(ctx, cached, store.ContactMutationAdd, "Alicia"); err != nil {
 		t.Fatalf("upsert through cache: %v", err)
 	}
 	second, err := cached.GetMany(ctx, 1, []int64{2})
@@ -572,15 +605,13 @@ func TestCachedContactStorePublishedSnapshotsStayImmutableDuringMutations(t *tes
 		{
 			name: "upsert",
 			mutate: func(ctx context.Context, cached *CachedContactStore) error {
-				_, err := cached.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "After"})
-				return err
+				return mutateCachedContact(ctx, cached, store.ContactMutationAdd, "After")
 			},
 		},
 		{
 			name: "delete",
 			mutate: func(ctx context.Context, cached *CachedContactStore) error {
-				_, err := cached.Delete(ctx, 1, []int64{2})
-				return err
+				return mutateCachedContact(ctx, cached, store.ContactMutationDelete, "")
 			},
 		},
 		{
@@ -593,7 +624,7 @@ func TestCachedContactStorePublishedSnapshotsStayImmutableDuringMutations(t *tes
 		{
 			name: "personal_photo",
 			mutate: func(ctx context.Context, cached *CachedContactStore) error {
-				_, found, err := cached.SetPersonalPhoto(ctx, 1, 2, 9002, 101)
+				_, found, err := cached.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9002, 101, testPersonalPhotoEffects)
 				if err == nil && !found {
 					return fmt.Errorf("contact not found")
 				}
@@ -605,11 +636,11 @@ func TestCachedContactStorePublishedSnapshotsStayImmutableDuringMutations(t *tes
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			base := memory.NewContactStore()
+			base := newTestContactStore()
 			if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Before"}); err != nil {
 				t.Fatalf("seed contact: %v", err)
 			}
-			if _, found, err := base.SetPersonalPhoto(ctx, 1, 2, 9001, 100); err != nil || !found {
+			if _, found, err := base.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9001, 100, testPersonalPhotoEffects); err != nil || !found {
 				t.Fatalf("seed personal photo: %v found=%v", err, found)
 			}
 			cached := NewCachedContactStore(base, 0)
@@ -682,7 +713,7 @@ func TestCachedContactStorePublishedSnapshotsStayImmutableDuringMutations(t *tes
 
 func TestCachedContactStoreExternalInvalidationAndFlush(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
@@ -722,7 +753,7 @@ func TestCachedContactStoreExternalInvalidationAndFlush(t *testing.T) {
 
 func TestCachedContactStoreDoesNotRefillStaleSnapshotAfterInvalidation(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("seed contact: %v", err)
 	}
@@ -779,11 +810,11 @@ func TestCachedContactStoreDoesNotRefillStaleSnapshotAfterInvalidation(t *testin
 
 func TestCachedContactStoreInvalidatesPersonalPhoto(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
-	if _, found, err := base.SetPersonalPhoto(ctx, 1, 2, 9001, 100); err != nil || !found {
+	if _, found, err := base.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9001, 100, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("set personal photo: %v found=%v", err, found)
 	}
 	counting := &countingContactStore{ContactStore: base}
@@ -810,7 +841,7 @@ func TestCachedContactStoreInvalidatesPersonalPhoto(t *testing.T) {
 		t.Fatalf("PersonalPhotos calls = %d, want 1", counting.personalPhotoCalls)
 	}
 
-	if _, found, err := cached.SetPersonalPhoto(ctx, 1, 2, 9002, 101); err != nil || !found {
+	if _, found, err := cached.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9002, 101, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("cached set personal photo: %v found=%v", err, found)
 	}
 	third, err := cached.PersonalPhotos(ctx, 1, []int64{2})
@@ -833,11 +864,11 @@ func TestCachedContactStoreInvalidatesPersonalPhoto(t *testing.T) {
 
 func TestCachedContactStoreDoesNotRefillStalePersonalPhotoAfterInvalidation(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
-	if _, found, err := base.SetPersonalPhoto(ctx, 1, 2, 9001, 100); err != nil || !found {
+	if _, found, err := base.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9001, 100, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("seed personal photo: %v found=%v", err, found)
 	}
 	first, err := base.PersonalPhotos(ctx, 1, []int64{2})
@@ -863,7 +894,7 @@ func TestCachedContactStoreDoesNotRefillStalePersonalPhotoAfterInvalidation(t *t
 	}()
 	waitForCacheTestSignal(t, blocking.started)
 
-	if _, found, err := cached.SetPersonalPhoto(ctx, 1, 2, 9002, 101); err != nil || !found {
+	if _, found, err := cached.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9002, 101, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("update personal photo while first load is blocked: %v found=%v", err, found)
 	}
 	close(blocking.release)
@@ -884,11 +915,11 @@ func TestCachedContactStoreDoesNotRefillStalePersonalPhotoAfterInvalidation(t *t
 
 func TestCachedContactStoreOlderPersonalPhotoMutationCannotReinsertStalePair(t *testing.T) {
 	ctx := context.Background()
-	base := memory.NewContactStore()
+	base := newTestContactStore()
 	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
 		t.Fatalf("seed contact: %v", err)
 	}
-	if _, found, err := base.SetPersonalPhoto(ctx, 1, 2, 9000, 99); err != nil || !found {
+	if _, found, err := base.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9000, 99, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("seed personal photo: %v found=%v", err, found)
 	}
 	inner := &stalePersonalPhotoWritebackStore{
@@ -908,13 +939,13 @@ func TestCachedContactStoreOlderPersonalPhotoMutationCannotReinsertStalePair(t *
 	}
 	olderResult := make(chan setResult, 1)
 	go func() {
-		_, found, err := cached.SetPersonalPhoto(olderCtx, 1, 2, 9001, 100)
+		_, found, err := cached.SetPersonalPhotoWithDelivery(olderCtx, 1, 2, 9001, 100, testPersonalPhotoEffects)
 		olderResult <- setResult{found: found, err: err}
 	}()
 	waitForCacheTestSignal(t, inner.started)
 
 	// The newer DB commit completes and invalidates the warm snapshot first.
-	if _, found, err := cached.SetPersonalPhoto(ctx, 1, 2, 9002, 101); err != nil || !found {
+	if _, found, err := cached.SetPersonalPhotoWithDelivery(ctx, 1, 2, 9002, 101, testPersonalPhotoEffects); err != nil || !found {
 		t.Fatalf("newer personal photo mutation: %v found=%v", err, found)
 	}
 	close(inner.release)

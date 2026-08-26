@@ -2,10 +2,13 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
+	"time"
 )
 
 // PasswordStore 是 store.PasswordStore 的内存实现。
@@ -29,6 +32,30 @@ type PasswordStore struct {
 	connectedBusinessBotPeerStates map[connectedBusinessBotPeerKey]domain.ConnectedBusinessBotPeerState
 	nextQuickReplyID               map[int64]int
 	nextQuickReplyMessageID        map[int64]int
+	deliveryOutbox                 *DeliveryOutboxStore
+	updateEvents                   *UpdateEventStore
+}
+
+// AttachDeliveryOutbox wires the production-shaped durable boundary used by
+// account mutation tests. PostgreSQL owns the real single-transaction commit.
+func (s *PasswordStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.deliveryOutbox = outbox
+	s.mu.Unlock()
+}
+
+// AttachUpdateEventStore binds quick-reply account mutations to the same
+// event/dispatch stream consumed by updates.getDifference.
+func (s *PasswordStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	if s == nil || events == nil {
+		return
+	}
+	s.mu.Lock()
+	s.updateEvents = events
+	s.mu.Unlock()
 }
 
 type businessAutomationDeliveryKey struct {
@@ -64,6 +91,7 @@ func NewPasswordStore() *PasswordStore {
 		connectedBusinessBotPeerStates: make(map[connectedBusinessBotPeerKey]domain.ConnectedBusinessBotPeerState),
 		nextQuickReplyID:               make(map[int64]int),
 		nextQuickReplyMessageID:        make(map[int64]int),
+		updateEvents:                   NewUpdateEventStore(),
 	}
 }
 
@@ -137,7 +165,31 @@ func (s *PasswordStore) GetReactionSettings(_ context.Context, userID int64) (do
 	return cloneAccountReactionSettings(settings), ok, nil
 }
 
-func (s *PasswordStore) SaveReactionSettings(_ context.Context, userID int64, settings domain.AccountReactionSettings) error {
+func (s *PasswordStore) SaveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings, effects store.DeliveryEffectsBuilder[domain.AccountReactionSettings]) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	settings = cloneAccountReactionSettings(settings)
+	intents, err := effects(settings)
+	if err != nil {
+		return err
+	}
+	s.mu.RLock()
+	outbox := s.deliveryOutbox
+	s.mu.RUnlock()
+	if _, err := applyDeliveryEffects(ctx, intents, outbox, nil); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.reactions[userID] = settings
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *PasswordStore) SaveReactionsNotifySettings(_ context.Context, userID int64, settings domain.AccountReactionSettings) error {
+	if userID <= 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
 	s.mu.Lock()
 	s.reactions[userID] = cloneAccountReactionSettings(settings)
 	s.mu.Unlock()
@@ -211,14 +263,73 @@ func (s *PasswordStore) SaveNotifySettings(_ context.Context, ownerUserID int64,
 	return nil
 }
 
-func (s *PasswordStore) ResetNotifySettings(_ context.Context, ownerUserID int64) error {
+func (s *PasswordStore) SaveNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings, delivery store.DeliveryOutboxEnqueue) error {
+	s.mu.RLock()
+	outbox := s.deliveryOutbox
+	s.mu.RUnlock()
+	if outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	// Validate and append before the infallible in-memory map assignment. This
+	// fake has no cross-resource rollback; production correctness is provided by
+	// PasswordStore's PostgreSQL transaction above.
+	if _, err := applyDeliveryEffects(ctx, []store.DeliveryEffect{store.AbsoluteDeliveryEffect(delivery)}, outbox, nil); err != nil {
+		return err
+	}
+	return s.SaveNotifySettings(ctx, ownerUserID, scope, settings)
+}
+
+func (s *PasswordStore) ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot]) error {
+	if ownerUserID <= 0 || effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	outbox := s.deliveryOutbox
+	if outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	snapshot := store.NotifySettingsResetSnapshot{OwnerUserID: ownerUserID}
+	for key := range s.notifySettings {
+		if key.owner != ownerUserID {
+			continue
+		}
+		scope := domain.NotifyScope{Kind: key.kind, TopicID: key.topicID}
+		if key.kind == domain.NotifyScopePeer {
+			scope.Peer = domain.Peer{Type: key.peerType, ID: key.peerID}
+		}
+		snapshot.Scopes = append(snapshot.Scopes, scope)
+	}
+	sort.Slice(snapshot.Scopes, func(i, j int) bool {
+		a, b := snapshot.Scopes[i], snapshot.Scopes[j]
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.Peer.Type != b.Peer.Type {
+			return a.Peer.Type < b.Peer.Type
+		}
+		if a.Peer.ID != b.Peer.ID {
+			return a.Peer.ID < b.Peer.ID
+		}
+		return a.TopicID < b.TopicID
+	})
+	intents, err := effects(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := store.ValidateNotifySettingsResetDeliveryEffects(snapshot, intents); err != nil {
+		return err
+	}
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(outbox, intents, time.Now()); err != nil {
+		return err
+	}
 	for key := range s.notifySettings {
 		if key.owner == ownerUserID {
 			delete(s.notifySettings, key)
 		}
 	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -227,39 +338,45 @@ type stickerCollectionKey struct {
 	kind  domain.StickerCollectionKind
 }
 
-func (s *PasswordStore) SaveStickerCollectionItem(_ context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now, max int) error {
-	if userID == 0 || documentID == 0 {
-		return domain.ErrStickerInvalid
+func (s *PasswordStore) MutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, effects store.DeliveryEffectsBuilder[domain.StickerCollectionMutation]) error {
+	if err := validateMemoryStickerCollectionMutation(mutation); err != nil {
+		return err
 	}
-	if max <= 0 {
-		max = domain.MaxStickerCollectionItems(kind)
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := stickerCollectionKey{owner: userID, kind: kind}
-	cur := s.stickerCollections[key]
-	// 移除既有同 id 项。
-	next := make([]domain.StickerCollectionItem, 0, len(cur)+1)
-	for _, it := range cur {
-		if it.DocumentID == documentID {
-			continue
+	intents, err := effects(mutation)
+	if err != nil {
+		return fmt.Errorf("build sticker collection delivery effects: %w", err)
+	}
+	return s.withAbsoluteDeliveryEffects(ctx, intents, func() {
+		key := stickerCollectionKey{owner: mutation.OwnerUserID, kind: mutation.Kind}
+		switch mutation.Mutation {
+		case domain.StickerCollectionMutationClear:
+			delete(s.stickerCollections, key)
+		case domain.StickerCollectionMutationSave, domain.StickerCollectionMutationUnsave:
+			cur := s.stickerCollections[key]
+			next := make([]domain.StickerCollectionItem, 0, len(cur)+1)
+			for _, it := range cur {
+				if it.DocumentID != mutation.DocumentID {
+					next = append(next, it)
+				}
+			}
+			if mutation.Mutation == domain.StickerCollectionMutationSave {
+				next = append([]domain.StickerCollectionItem{{DocumentID: mutation.DocumentID, Date: mutation.Date}}, next...)
+				if max := domain.MaxStickerCollectionItems(mutation.Kind); len(next) > max {
+					next = next[:max]
+				}
+			}
+			s.stickerCollections[key] = next
 		}
-		next = append(next, it)
-	}
-	if unsave {
-		s.stickerCollections[key] = next
-		return nil
-	}
-	// 最新置顶 + 截断。
-	next = append([]domain.StickerCollectionItem{{DocumentID: documentID, Date: now}}, next...)
-	if len(next) > max {
-		next = next[:max]
-	}
-	s.stickerCollections[key] = next
-	return nil
+	})
 }
 
 func (s *PasswordStore) ListStickerCollection(_ context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error) {
+	if userID <= 0 || !validMemoryStickerCollectionKind(kind) {
+		return nil, domain.ErrStickerInvalid
+	}
 	if limit <= 0 || limit > domain.MaxStickerCollectionItems(kind) {
 		limit = domain.MaxStickerCollectionItems(kind)
 	}
@@ -272,81 +389,71 @@ func (s *PasswordStore) ListStickerCollection(_ context.Context, userID int64, k
 	return append([]domain.StickerCollectionItem(nil), cur...), nil
 }
 
-func (s *PasswordStore) ClearStickerCollection(_ context.Context, userID int64, kind domain.StickerCollectionKind) error {
-	s.mu.Lock()
-	delete(s.stickerCollections, stickerCollectionKey{owner: userID, kind: kind})
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *PasswordStore) InstallUserStickerSet(_ context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error {
-	if userID == 0 || setID == 0 {
-		return domain.ErrStickerInvalid
+func (s *PasswordStore) MutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation, effects store.DeliveryEffectsBuilder[domain.UserStickerSetMutation]) error {
+	if err := validateMemoryUserStickerSetMutation(mutation); err != nil {
+		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sets := s.userStickerSets[userID]
-	if sets == nil {
-		sets = make(map[int64]domain.UserStickerSet)
-		s.userStickerSets[userID] = sets
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	order := int64(installedDate) << 32
-	sets[setID] = domain.UserStickerSet{
-		OwnerUserID:   userID,
-		StickerSetID:  setID,
-		Kind:          kind,
-		Archived:      archived,
-		InstalledDate: installedDate,
-		OrderValue:    order,
+	mutation.Items = append([]domain.UserStickerSetMutationItem(nil), mutation.Items...)
+	mutation.Order = append([]int64(nil), mutation.Order...)
+	intents, err := effects(mutation)
+	if err != nil {
+		return fmt.Errorf("build user sticker set delivery effects: %w", err)
 	}
-	return nil
-}
-
-func (s *PasswordStore) UninstallUserStickerSet(_ context.Context, userID int64, setID int64) error {
-	s.mu.Lock()
-	if sets := s.userStickerSets[userID]; sets != nil {
-		delete(sets, setID)
-	}
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *PasswordStore) SetUserStickerSetArchived(_ context.Context, userID int64, setID int64, archived bool, now int) error {
-	s.mu.Lock()
-	if sets := s.userStickerSets[userID]; sets != nil {
-		if item, ok := sets[setID]; ok {
-			item.Archived = archived
-			if !archived && now > 0 {
-				item.OrderValue = int64(now) << 32
+	return s.withAbsoluteDeliveryEffects(ctx, intents, func() {
+		sets := s.userStickerSets[mutation.OwnerUserID]
+		if sets == nil {
+			sets = make(map[int64]domain.UserStickerSet)
+			s.userStickerSets[mutation.OwnerUserID] = sets
+		}
+		switch mutation.Mutation {
+		case domain.UserStickerSetMutationInstall:
+			base := int64(mutation.Date) << 32
+			for i, input := range mutation.Items {
+				installedDate := mutation.Date
+				if current, ok := sets[input.StickerSetID]; ok && current.InstalledDate != 0 {
+					installedDate = current.InstalledDate
+				}
+				sets[input.StickerSetID] = domain.UserStickerSet{
+					OwnerUserID: mutation.OwnerUserID, StickerSetID: input.StickerSetID,
+					Kind: input.Kind, Archived: mutation.Archived, InstalledDate: installedDate,
+					OrderValue: base - int64(i),
+				}
 			}
-			sets[setID] = item
+		case domain.UserStickerSetMutationUninstall:
+			for _, input := range mutation.Items {
+				delete(sets, input.StickerSetID)
+			}
+		case domain.UserStickerSetMutationArchive, domain.UserStickerSetMutationUnarchive:
+			archived := mutation.Mutation == domain.UserStickerSetMutationArchive
+			for _, input := range mutation.Items {
+				if item, ok := sets[input.StickerSetID]; ok {
+					item.Archived = archived
+					if !archived && mutation.Date > 0 {
+						item.OrderValue = int64(mutation.Date) << 32
+					}
+					sets[input.StickerSetID] = item
+				}
+			}
+		case domain.UserStickerSetMutationReorder:
+			orderValue := int64(mutation.Date) << 32
+			for _, id := range mutation.Order {
+				if item, ok := sets[id]; ok && item.Kind == mutation.Kind {
+					item.OrderValue = orderValue
+					sets[id] = item
+				}
+				orderValue--
+			}
 		}
-	}
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *PasswordStore) ReorderUserStickerSets(_ context.Context, userID int64, kind domain.StickerSetKind, order []int64, now int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sets := s.userStickerSets[userID]
-	if sets == nil {
-		return nil
-	}
-	orderValue := int64(now) << 32
-	for _, id := range order {
-		item, ok := sets[id]
-		if !ok || item.Kind != kind {
-			continue
-		}
-		item.OrderValue = orderValue
-		sets[id] = item
-		orderValue--
-	}
-	return nil
+	})
 }
 
 func (s *PasswordStore) ListUserStickerSets(_ context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error) {
+	if userID <= 0 || !validMemoryInstalledStickerSetKind(kind) {
+		return nil, 0, domain.ErrStickerInvalid
+	}
 	if limit <= 0 || limit > domain.MaxInstalledStickerSets {
 		limit = domain.MaxInstalledStickerSets
 	}
@@ -384,6 +491,122 @@ func (s *PasswordStore) ListUserStickerSets(_ context.Context, userID int64, kin
 		items = items[:limit]
 	}
 	return append([]domain.UserStickerSet(nil), items...), total, nil
+}
+
+// withAbsoluteDeliveryEffects is the memory store's transaction boundary for
+// account-local mutations. Both resource mutexes stay held until the account
+// snapshot and every outbox row have been installed, so concurrent readers
+// cannot observe either half early. All fallible validation happens before the
+// first write; the callback is deliberately infallible map mutation only.
+func (s *PasswordStore) withAbsoluteDeliveryEffects(ctx context.Context, effects []store.DeliveryEffect, mutate func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(effects) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	for i := range effects {
+		if err := effects[i].Validate(); err != nil {
+			return fmt.Errorf("delivery effect %d: %w", i, err)
+		}
+		if effects[i].Kind != store.DeliveryEffectAbsolute {
+			return fmt.Errorf("delivery effect %d: sticker account mutations require absolute delivery", i)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	outbox := s.deliveryOutbox
+	if outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	if err := appendAbsoluteDeliveryEffectsLocked(outbox, effects, time.Now()); err != nil {
+		return err
+	}
+	mutate()
+	return nil
+}
+
+func validateMemoryStickerCollectionMutation(mutation domain.StickerCollectionMutation) error {
+	if mutation.OwnerUserID <= 0 || !validMemoryStickerCollectionKind(mutation.Kind) {
+		return domain.ErrStickerInvalid
+	}
+	switch mutation.Mutation {
+	case domain.StickerCollectionMutationSave, domain.StickerCollectionMutationUnsave:
+		if mutation.DocumentID <= 0 {
+			return domain.ErrStickerInvalid
+		}
+	case domain.StickerCollectionMutationClear:
+		if mutation.DocumentID != 0 {
+			return domain.ErrStickerInvalid
+		}
+	default:
+		return domain.ErrStickerInvalid
+	}
+	return nil
+}
+
+func validateMemoryUserStickerSetMutation(mutation domain.UserStickerSetMutation) error {
+	if mutation.OwnerUserID <= 0 {
+		return domain.ErrStickerInvalid
+	}
+	if mutation.Mutation == domain.UserStickerSetMutationReorder {
+		if !validMemoryInstalledStickerSetKind(mutation.Kind) || len(mutation.Order) == 0 || len(mutation.Order) > domain.MaxInstalledStickerSets {
+			return domain.ErrStickerInvalid
+		}
+		return validateMemoryUniqueStickerSetIDs(mutation.Order)
+	}
+	switch mutation.Mutation {
+	case domain.UserStickerSetMutationInstall, domain.UserStickerSetMutationUninstall,
+		domain.UserStickerSetMutationArchive, domain.UserStickerSetMutationUnarchive:
+	default:
+		return domain.ErrStickerInvalid
+	}
+	if len(mutation.Items) == 0 || len(mutation.Items) > domain.MaxInstalledStickerSets {
+		return domain.ErrStickerInvalid
+	}
+	ids := make([]int64, 0, len(mutation.Items))
+	for _, item := range mutation.Items {
+		if !validMemoryInstalledStickerSetKind(item.Kind) {
+			return domain.ErrStickerInvalid
+		}
+		ids = append(ids, item.StickerSetID)
+	}
+	return validateMemoryUniqueStickerSetIDs(ids)
+}
+
+func validMemoryStickerCollectionKind(kind domain.StickerCollectionKind) bool {
+	switch kind {
+	case domain.StickerCollectionFaved, domain.StickerCollectionRecent,
+		domain.StickerCollectionRecentAttached, domain.StickerCollectionGif:
+		return true
+	default:
+		return false
+	}
+}
+
+func validMemoryInstalledStickerSetKind(kind domain.StickerSetKind) bool {
+	switch kind {
+	case domain.StickerSetKindStickers, domain.StickerSetKindMasks, domain.StickerSetKindEmoji:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateMemoryUniqueStickerSetIDs(ids []int64) error {
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return domain.ErrStickerInvalid
+		}
+		if _, exists := seen[id]; exists {
+			return domain.ErrStickerInvalid
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
 }
 
 func (s *PasswordStore) ListNotifyExceptions(_ context.Context, ownerUserID int64) ([]domain.NotifyException, error) {

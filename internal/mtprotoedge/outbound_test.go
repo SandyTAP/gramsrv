@@ -66,6 +66,16 @@ func TestRPCResultReplayAttemptHooksArePhysicalConnectionLocal(t *testing.T) {
 	}
 	first.setAttemptDeliveryHook(func() { firstAttempt.Add(1) })
 	second.setAttemptDeliveryHook(func() { secondAttempt.Add(1) })
+	// Physical admission owns executor capacity before the socket actor writes.
+	// Exercise that same invariant here instead of calling markDelivered on an
+	// impossible, unreserved attempt.
+	executor := newRPCDeliveryHookExecutor(1, 2)
+	if err := first.prepareDeliveryHook(executor); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.prepareDeliveryHook(executor); err != nil {
+		t.Fatal(err)
+	}
 	first.markDelivered()
 	deadline := time.Now().Add(time.Second)
 	for (logical.Load() != 1 || firstAttempt.Load() != 1) && time.Now().Before(deadline) {
@@ -407,6 +417,16 @@ func (t *failAfterTransport) Send(_ context.Context, b *bin.Buffer) error {
 	t.mu.Unlock()
 	t.stored.Add(1)
 	return nil
+}
+
+func (t *failAfterTransport) SendDeadlineWithScratchGuarded(_ time.Time, b *bin.Buffer, _ *[]byte, guard func() error) error {
+	if guard == nil {
+		return errors.New("missing physical write guard")
+	}
+	if err := guard(); err != nil {
+		return err
+	}
+	return t.Send(context.Background(), b)
 }
 
 func (t *failAfterTransport) Recv(context.Context, *bin.Buffer) error { return io.EOF }
@@ -1115,26 +1135,32 @@ func TestOutboundResendAndAckState(t *testing.T) {
 	assertStateInfo(t, ackedStateBuf, ackedResendReqID, []byte{msgStateReceived})
 }
 
-func TestOutboundClientAckReportsOutboxDeliveryRef(t *testing.T) {
+func TestOutboundClientAckReportsExactDeliveryTracking(t *testing.T) {
 	budget := newOutboundTrackedBudget(64)
 	tr := &failAfterTransport{}
 	c := newOutboundTestConn(t, tr, budget)
 	defer c.Close()
 
-	ref := edgecontrol.OutboxDeliveryRef{OutboxID: 1234, TargetUserID: 42, Pts: 77, Attempt: 3}
+	ref := edgecontrol.DeliveryTracking{
+		BatchID: edgecontrol.BatchID{1}, CommandID: edgecontrol.CommandID{2}, SourceInstanceID: "egress-a",
+		Ref: edgecontrol.DeliveryRef{
+			Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42},
+			OutboxID: 1234, TargetUserID: 42, PTS: 77, LeaseFence: 9, Attempt: 3,
+		},
+	}
 	type ackEvent struct {
-		ref   edgecontrol.OutboxDeliveryRef
+		ref   edgecontrol.DeliveryTracking
 		msgID int64
 	}
 	acks := make(chan ackEvent, 1)
-	c.outboxClientAcked = func(_ *Conn, got edgecontrol.OutboxDeliveryRef, serverMsgID int64) {
+	c.deliveryClientAcked = func(_ *Conn, got edgecontrol.DeliveryTracking, serverMsgID int64) {
 		acks <- ackEvent{ref: got, msgID: serverMsgID}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	body := exactTestUpdatesEncoded(t, c, make([]byte, 12))
-	body.outboxDeliveryRef = ref
+	body.deliveryTracking = ref
 	if err := c.SendEncoded(ctx, proto.MessageFromServer, body); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -1147,14 +1173,74 @@ func TestOutboundClientAckReportsOutboxDeliveryRef(t *testing.T) {
 	select {
 	case got := <-acks:
 		if got.ref != ref {
-			t.Fatalf("outbox ack ref = %+v, want %+v", got.ref, ref)
+			t.Fatalf("delivery ack tracking = %+v, want %+v", got.ref, ref)
 		}
 		if got.msgID != data.MessageID {
-			t.Fatalf("outbox ack msg_id = %d, want %d", got.msgID, data.MessageID)
+			t.Fatalf("client delivery ack msg_id = %d, want %d", got.msgID, data.MessageID)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for outbox client ACK callback")
+		t.Fatal("timed out waiting for delivery client ACK callback")
 	}
+}
+
+type capturePhysicalWriteHook chan struct {
+	msgID      int64
+	observedAt time.Time
+}
+
+func (h capturePhysicalWriteHook) written(msgID int64, observedAt time.Time) {
+	select {
+	case h <- struct {
+		msgID      int64
+		observedAt time.Time
+	}{msgID: msgID, observedAt: observedAt}:
+	default:
+	}
+}
+
+func (h capturePhysicalWriteHook) failed(time.Time)                  {}
+func (h capturePhysicalWriteHook) allowPhysicalWrite(time.Time) bool { return true }
+
+func TestDurablePhysicalHookRunsOnlyAfterWriterSuccess(t *testing.T) {
+	tracking := edgecontrol.DeliveryTracking{
+		BatchID: edgecontrol.BatchID{1}, CommandID: edgecontrol.CommandID{2}, SourceInstanceID: "egress-a",
+		Ref: edgecontrol.DeliveryRef{
+			Domain:   edgecontrol.OrderingDomain{Kind: edgecontrol.QueueAccountPTS, StreamID: 42},
+			OutboxID: 55, TargetUserID: 42, PTS: 9, LeaseFence: 7, Attempt: 1,
+		},
+	}
+	t.Run("success", func(t *testing.T) {
+		tr := &failAfterTransport{}
+		c := newOutboundTestConn(t, tr, newOutboundTrackedBudget(1<<20))
+		hook := make(capturePhysicalWriteHook, 1)
+		encoded := exactTestUpdatesEncoded(t, c, make([]byte, 12))
+		if err := c.enqueueDurableEncoded(context.Background(), proto.MessageFromServer, encoded, tracking, hook); err != nil {
+			t.Fatalf("enqueue durable: %v", err)
+		}
+		select {
+		case got := <-hook:
+			if got.msgID <= 0 || got.observedAt.IsZero() {
+				t.Fatalf("hook=%+v", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("physical hook did not run")
+		}
+	})
+	t.Run("write_failure", func(t *testing.T) {
+		tr := &failAfterTransport{}
+		tr.failAt.Store(1)
+		c := newOutboundTestConn(t, tr, newOutboundTrackedBudget(1<<20))
+		hook := make(capturePhysicalWriteHook, 1)
+		encoded := exactTestUpdatesEncoded(t, c, make([]byte, 12))
+		if err := c.enqueueDurableEncoded(context.Background(), proto.MessageFromServer, encoded, tracking, hook); err != nil {
+			t.Fatalf("enqueue durable: %v", err)
+		}
+		select {
+		case got := <-hook:
+			t.Fatalf("hook ran after failed writer: %+v", got)
+		case <-time.After(50 * time.Millisecond):
+		}
+	})
 }
 
 func assertStateInfo(t *testing.T, b *bin.Buffer, reqMsgID int64, want []byte) {

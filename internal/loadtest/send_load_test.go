@@ -22,8 +22,9 @@ import (
 	messageapp "telesrv/internal/app/messages"
 	"telesrv/internal/domain"
 	"telesrv/internal/edgecontrol"
+	"telesrv/internal/edgecontrol/redisbus"
+	"telesrv/internal/edgecontrol/redisregistry"
 	"telesrv/internal/egress"
-	"telesrv/internal/mtprotoedge"
 	"telesrv/internal/store/postgres"
 	"telesrv/internal/store/redisstore"
 )
@@ -81,6 +82,11 @@ func TestMessageSendBaseline(t *testing.T) {
 		t.Fatalf("open postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	counterRecovery, err := postgres.OpenCounterRecovery(ctx, dsn, envInt("TELESRV_LOAD_COUNTER_RECOVERY_POOL_CONNS", 4))
+	if err != nil {
+		t.Fatalf("open postgres counter recovery: %v", err)
+	}
+	t.Cleanup(counterRecovery.Close)
 
 	rdb, err := redisstore.Open(ctx, redisAddr, os.Getenv("TELESRV_TEST_REDIS_PASSWORD"), 0)
 	if err != nil {
@@ -92,8 +98,10 @@ func TestMessageSendBaseline(t *testing.T) {
 	userStore := postgres.NewUserStore(pool)
 	updateEventStore := postgres.NewUpdateEventStore(pool)
 	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(leaseTimeout))
+	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool)
+	channelDeliveryStore := postgres.NewChannelDeliveryStore(pool)
 	dialogStore := postgres.NewDialogStore(pool)
-	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
+	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, counterRecovery.MessageBoxSource())
 	messageStore := postgres.NewMessageStore(pool, postgres.WithMessageAllocators(boxIDAllocator))
 	svc := messageapp.NewService(messageStore, dialogStore)
 
@@ -101,14 +109,21 @@ func TestMessageSendBaseline(t *testing.T) {
 	ids := seedUsers(t, ctx, userStore, users)
 	t.Cleanup(func() { cleanup(t, pool, rdb, ids) })
 
-	// 在线推送 binder 用真实 SessionManager（零连接），PushToUserExceptSession 返回 0，
-	// 让 Egress 走完整 claim→ListAfter→MarkDelivered 的 PG 往返，测排空而非网络 fanout。
-	binder := mtprotoedge.NewSessionManager(zap.NewNop())
+	// 使用生产同构的 v3 registry + command fabric。随机测试用户没有在线位置，
+	// 因而走权威空目标集完成路径，仍覆盖 claim→冻结目标→持久证据→finalize。
+	registry := redisregistry.New(rdb)
+	deliveryFabric := edgecontrol.NewDeliveryFabric(edgecontrol.DeliveryFabricConfig{
+		InstanceID:     "loadtest-egress",
+		Registry:       registry,
+		Bus:            redisbus.New(rdb),
+		CommandTimeout: 2 * time.Second,
+	})
+	t.Cleanup(deliveryFabric.Close)
 	metrics := &loadMetrics{}
 	updateBuilder := func(_ context.Context, requests []egress.OutboxUpdateRequest) ([][]byte, error) {
 		out := make([][]byte, len(requests))
 		for i := range out {
-			raw, err := edgecontrol.EncodeOutboxUpdate(&tg.Updates{})
+			raw, err := edgecontrol.EncodeDeliveryUpdate(&tg.Updates{})
 			if err != nil {
 				t.Fatalf("encode loadtest outbox update: %v", err)
 			}
@@ -116,10 +131,25 @@ func TestMessageSendBaseline(t *testing.T) {
 		}
 		return out, nil
 	}
-	egressService, err := egress.NewService(updateEventStore, dispatchOutboxStore, binder, updateBuilder, metrics, zap.NewNop(), egress.Config{
-		Workers: workers,
-		Batch:   outboxBatch,
-	})
+	channelBuilder := func(_ context.Context, requests []egress.ChannelUpdateRequest) ([][]byte, error) {
+		out := make([][]byte, len(requests))
+		for i := range out {
+			raw, err := edgecontrol.EncodeDeliveryUpdate(&tg.Updates{})
+			if err != nil {
+				t.Fatalf("encode loadtest channel update: %v", err)
+			}
+			out[i] = raw
+		}
+		return out, nil
+	}
+	egressService, err := egress.NewService(
+		updateEventStore, dispatchOutboxStore, deliveryOutboxStore, channelDeliveryStore,
+		deliveryFabric, updateBuilder, channelBuilder, metrics, zap.NewNop(), egress.Config{
+			InstanceID:    "loadtest-egress",
+			Workers:       workers,
+			Batch:         outboxBatch,
+			LeaseDuration: leaseTimeout,
+		})
 	if err != nil {
 		t.Fatalf("new egress service: %v", err)
 	}
@@ -127,6 +157,8 @@ func TestMessageSendBaseline(t *testing.T) {
 	egressDone := make(chan struct{})
 	listenerDone := make(chan struct{})
 	outboxWake := make(chan struct{}, 1)
+	deliveryWake := make(chan struct{}, 1)
+	channelWake := make(chan struct{}, 1)
 	wakeOutbox := func() {
 		select {
 		case outboxWake <- struct{}{}:
@@ -140,7 +172,9 @@ func TestMessageSendBaseline(t *testing.T) {
 			outboxReadyListener.Run(egressCtx, wakeOutbox)
 		}()
 		go func() {
-			egressService.RunWithWake(egressCtx, outboxWake)
+			egressService.RunWithWake(egressCtx, egress.WakeSources{
+				AccountPTS: outboxWake, AccountNonPTS: deliveryWake, ChannelPTS: channelWake,
+			})
 			close(egressDone)
 		}()
 	}

@@ -76,13 +76,13 @@ func TestConfiguredEmailLoginSharesAttemptsAcrossOfficialCodeCarriers(t *testing
 	if bad2 == bad1 {
 		bad2 = wrongCode(sender.code, '2')
 	}
-	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, "+15550009101", hash, bad1); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, "+15550009101", hash, bad1, testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("first bad WebK SignIn err = %v, want ErrCodeInvalid", err)
 	}
-	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{}, "+15550009101", hash, bad2); !errors.Is(err, ErrCodeInvalid) {
+	if _, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{}, "+15550009101", hash, bad2, testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 		t.Fatalf("second bad native SignInWithEmail err = %v, want ErrCodeInvalid", err)
 	}
-	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, "+15550009101", hash, sender.code); !errors.Is(err, ErrCodeExpired) {
+	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, "+15550009101", hash, sender.code, testAuthorizationDelivery); !errors.Is(err, ErrCodeExpired) {
 		t.Fatalf("WebK SignIn after shared max attempts err = %v, want ErrCodeExpired", err)
 	}
 }
@@ -119,7 +119,7 @@ func TestConfiguredEmailLoginAcceptsOfficialCodeCarriers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			users := memory.NewUserStore()
-			authz := memory.NewAuthorizationStore()
+			authz := newAuthorizationStoreWithDelivery()
 			u, err := users.Create(ctx, domain.User{Phone: tc.phone, FirstName: "Email"})
 			if err != nil {
 				t.Fatalf("create user: %v", err)
@@ -149,12 +149,12 @@ func TestConfiguredEmailLoginAcceptsOfficialCodeCarriers(t *testing.T) {
 			var got domain.User
 			var needSignUp bool
 			if tc.webK {
-				if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, "12345"); !errors.Is(err, ErrCodeInvalid) {
+				if _, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, "12345", testAuthorizationDelivery); !errors.Is(err, ErrCodeInvalid) {
 					t.Fatalf("WebK development code err=%v, want ErrCodeInvalid for random email channel", err)
 				}
-				got, _, needSignUp, err = svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, sender.code)
+				got, _, needSignUp, err = svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, sender.code, testAuthorizationDelivery)
 			} else {
-				got, _, needSignUp, err = svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, sender.code)
+				got, _, needSignUp, err = svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: key}, tc.phone, hash, sender.code, testAuthorizationDelivery)
 			}
 			if err != nil {
 				t.Fatalf("sign in: %v", err)
@@ -195,7 +195,7 @@ func TestConfiguredEmailLoginViaWebKStillHonorsTwoFactor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
-	got, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, u.Phone, hash, sender.code)
+	got, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: key}, u.Phone, hash, sender.code, testAuthorizationDelivery)
 	if !errors.Is(err, domain.ErrSessionPasswordNeeded) {
 		t.Fatalf("WebK email SignIn err=%v, want ErrSessionPasswordNeeded", err)
 	}
@@ -215,7 +215,7 @@ func TestConfiguredEmailLoginHasSingleConsumerAcrossOfficialCodeCarriers(t *test
 		t.Fatalf("create user: %v", err)
 	}
 	sender := &testMailSender{}
-	svc := NewService(users, memory.NewAuthorizationStore(), memory.NewCodeStore(), nil, nil, "12345",
+	svc := NewService(users, newAuthorizationStoreWithDelivery(), memory.NewCodeStore(), nil, nil, "12345",
 		WithLoginCodeDelivery(&captureLoginCodeDelivery{}),
 		WithLoginEmail(LoginEmailOptions{
 			Enabled:    true,
@@ -235,12 +235,12 @@ func TestConfiguredEmailLoginHasSingleConsumerAcrossOfficialCodeCarriers(t *test
 	nativeKey[0] = 0x96
 	go func() {
 		<-start
-		_, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: webKKey}, u.Phone, hash, sender.code)
+		_, _, _, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: webKKey}, u.Phone, hash, sender.code, testAuthorizationDelivery)
 		results <- err
 	}()
 	go func() {
 		<-start
-		_, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: nativeKey}, u.Phone, hash, sender.code)
+		_, _, _, err := svc.SignInWithEmail(ctx, domain.Authorization{AuthKeyID: nativeKey}, u.Phone, hash, sender.code, testAuthorizationDelivery)
 		results <- err
 	}()
 	close(start)

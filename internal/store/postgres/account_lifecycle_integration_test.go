@@ -54,7 +54,7 @@ func TestAccountLifecycleScheduleCancelAndTombstonePostgres(t *testing.T) {
 VALUES ($1, $2, 'stale-phone', 'Stale', 'Alias')`, peer.ID, deleted.ID); err != nil {
 		t.Fatalf("insert reverse contact: %v", err)
 	}
-	if _, err := NewMessageStore(pool).SendPrivateText(ctx, domain.SendPrivateTextRequest{
+	if _, err := newTestMessageStore(pool).SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID: deleted.ID, RecipientUserID: peer.ID, RandomID: nonce, Message: "keep shared history",
 	}); err != nil {
 		t.Fatalf("send shared message: %v", err)
@@ -75,7 +75,7 @@ VALUES ($1, 'standard', 'owned', $2, $3, 'XTR', 100, $3, $3)
 RETURNING id`, collectiblePhone, deleted.ID, time.Now().UTC()).Scan(&collectiblePhoneID); err != nil {
 		t.Fatalf("insert collectible phone: %v", err)
 	}
-	createdChannel, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	createdChannel, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: deleted.ID,
 		Title:         "Retained deletion membership",
 		Megagroup:     true,
@@ -99,7 +99,7 @@ SELECT COALESCE((SELECT version FROM read_model_versions
 		t.Fatal(err)
 	}
 
-	lifecycle := NewAccountLifecycleStore(pool)
+	lifecycle := NewAccountLifecycleStore(pool, testAllocatorsFor(pool).boxIDs)
 	now := time.Now().UTC().Truncate(time.Second)
 	digestOne := sha256.Sum256([]byte("confirm-one"))
 	pending, created, err := lifecycle.ScheduleAccountDeletion(ctx, domain.ScheduleAccountDeletion{
@@ -188,7 +188,7 @@ SELECT COALESCE((SELECT version FROM read_model_versions
 	if _, err := users.UpdateProfile(ctx, deleted.ID, "Resurrected", "", ""); err == nil {
 		t.Fatal("deleted account profile mutation unexpectedly succeeded")
 	}
-	history, err := NewMessageStore(pool).ListByUser(ctx, peer.ID, domain.MessageFilter{
+	history, err := newTestMessageStore(pool).ListByUser(ctx, peer.ID, domain.MessageFilter{
 		HasPeer: true,
 		Peer:    domain.Peer{Type: domain.PeerTypeUser, ID: deleted.ID},
 		Limit:   10,
@@ -275,7 +275,7 @@ VALUES ($1, true, 'abuse', 'test', 'freeze-test', $2, $3, 'https://example.test/
 VALUES ($1, 123, 'forgot', $2, $3, $4)`, pendingUser.ID, digest[:], now.Add(-8*24*time.Hour), now.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := NewAccountLifecycleStore(pool).DueAccountDeletions(ctx, now, 10)
+	candidates, err := NewAccountLifecycleStore(pool, testAllocatorsFor(pool).boxIDs).DueAccountDeletions(ctx, now, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ VALUES ($1, 123, 'forgot', $2, $3, $4)`, pendingUser.ID, digest[:], now.Add(-8*2
 	if err := users.UpdateLastSeen(ctx, ttlUser.ID, int(seen.Unix())); err != nil {
 		t.Fatal(err)
 	}
-	lifecycle := NewAccountLifecycleStore(pool)
+	lifecycle := NewAccountLifecycleStore(pool, testAllocatorsFor(pool).boxIDs)
 	if stale, err := lifecycle.ExecuteAccountDeletion(ctx, ttlUser.ID, domain.AccountDeletionAccountTTL, "", now); err != nil || stale.Changed {
 		t.Fatalf("stale TTL candidate changed=%v err=%v", stale.Changed, err)
 	}

@@ -348,6 +348,11 @@ type SendPrivateTextRequest struct {
 	GroupedID int64
 	// Effect 消息特效 id（私聊专属，0 表无特效；调用方已对 catalog 校验过合法性）。
 	Effect int64
+	// ClearDraft makes deletion of the sender's non-topic private-dialog draft
+	// part of this send aggregate. A successful first send commits the message,
+	// draft deletion, account PTS event and dispatch together; replays never run
+	// a second draft mutation.
+	ClearDraft bool
 	// BusinessAutomationKind is internal app-layer metadata used to suppress
 	// recursive greeting/away automation for server-generated replies.
 	BusinessAutomationKind BusinessAutomationKind
@@ -380,7 +385,10 @@ type SendPrivateTextResult struct {
 	RecipientMessage Message
 	SenderEvent      UpdateEvent
 	RecipientEvent   UpdateEvent
-	Duplicate        bool
+	// DraftEvent is non-zero only when ClearDraft deleted an existing draft in
+	// the first-send transaction. It is already durable and zero-exclusion.
+	DraftEvent UpdateEvent
+	Duplicate  bool
 	// ReplayDeleteEvent is the already-durable sender-side deletion that must
 	// follow the first-send snapshot in an exact random_id replay. It never
 	// represents a newly allocated event.
@@ -795,6 +803,14 @@ type ScheduledMessageList struct {
 	Hash     int64
 }
 
+// PrivateHistoryTTLResult is the authoritative two-owner dialog projection
+// committed by one private-history TTL mutation.
+type PrivateHistoryTTLResult struct {
+	OwnerUserID int64
+	Peer        Peer
+	Period      int
+}
+
 // ScheduleMessageRequest creates one scheduled message.
 type ScheduleMessageRequest struct {
 	OwnerUserID          int64
@@ -812,6 +828,9 @@ type ScheduleMessageRequest struct {
 	ScheduleDate         int
 	ScheduleRepeatPeriod int
 	Date                 int
+	// ClearDraft joins the draft deletion to scheduled-message creation. It is
+	// execution intent and is not retained on the scheduled row.
+	ClearDraft bool
 }
 
 // EditScheduledMessageRequest updates one pending scheduled message before it

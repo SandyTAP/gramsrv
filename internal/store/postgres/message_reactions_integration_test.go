@@ -20,7 +20,7 @@ func TestMessageStorePrivateMessageReactionsUseOwnerVisibleBoxIDs(t *testing.T) 
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
 		RecipientUserID: recipient.ID,
@@ -42,7 +42,8 @@ func TestMessageStorePrivateMessageReactionsUseOwnerVisibleBoxIDs(t *testing.T) 
 		},
 		Big:  true,
 		Date: 1700000950,
-	})
+	}, testPrivateReactionEffects)
+
 	if err != nil {
 		t.Fatalf("SetMessageReactions: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestDialogTopMessagesCarryPrivateMessageReactions(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	dialogs := NewDialogStore(pool)
 	sent, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    alice.ID,
@@ -166,7 +167,7 @@ func TestDialogTopMessagesCarryPrivateMessageReactions(t *testing.T) {
 			reaction,
 		},
 		Date: 1700001960,
-	}); err != nil {
+	}, testPrivateReactionEffects); err != nil {
 		t.Fatalf("SetMessageReactions: %v", err)
 	}
 

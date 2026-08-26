@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"strings"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *ChannelStore) CheckInvite(ctx context.Context, userID int64, hash string, date int) (domain.CheckChannelInviteResult, error) {
@@ -36,9 +37,12 @@ func (s *ChannelStore) CheckInvite(ctx context.Context, userID int64, hash strin
 	return domain.CheckChannelInviteResult{Channel: channel, Invite: invite, Already: already, Self: member}, nil
 }
 
-func (s *ChannelStore) ImportInvite(ctx context.Context, req domain.ImportChannelInviteRequest) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) ImportInvite(ctx context.Context, req domain.ImportChannelInviteRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if req.UserID == 0 || strings.TrimSpace(req.Hash) == "" {
 		return domain.CreateChannelResult{}, domain.ErrInviteHashEmpty
+	}
+	if effects == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = nowUnix()
@@ -68,6 +72,13 @@ func (s *ChannelStore) ImportInvite(ctx context.Context, req domain.ImportChanne
 		if err := s.recordPendingInviteImporterTx(ctx, tx, invite, req.UserID, req.Date); err != nil {
 			return domain.CreateChannelResult{}, err
 		}
+		snapshot, err := pendingJoinDeliverySnapshotTx(ctx, tx, channel)
+		if err != nil {
+			return domain.CreateChannelResult{}, err
+		}
+		if err := applyPendingJoinDeliveryTx(ctx, tx, snapshot, effects); err != nil {
+			return domain.CreateChannelResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.CreateChannelResult{}, fmt.Errorf("commit pending channel invite request: %w", err)
 		}
@@ -76,6 +87,9 @@ func (s *ChannelStore) ImportInvite(ctx context.Context, req domain.ImportChanne
 	}
 	result, err := s.approveInviteImporterTx(ctx, tx, channel, invite, req.UserID, 0, req.Date)
 	if err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	if err := applyPendingJoinDeliveryTx(ctx, tx, store.ChannelPendingJoinDeliverySnapshot{}, effects); err != nil {
 		return domain.CreateChannelResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -2,10 +2,14 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
+	"telesrv/internal/store/memory"
 )
 
 type captureMessages struct {
+	deliveryOutbox    store.DeliveryOutboxStore
 	list              domain.MessageList
 	filter            domain.MessageFilter
 	sendResult        domain.SendPrivateTextResult
@@ -45,6 +49,96 @@ type captureMessages struct {
 	mediaReq          domain.MediaSearchRequest
 }
 
+func (*captureMessages) ScheduleMessage(context.Context, int64, domain.ScheduleMessageRequest, store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
+	return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) EditScheduledMessage(context.Context, int64, domain.EditScheduledMessageRequest, store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
+	return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) ListScheduledMessages(context.Context, int64, domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error) {
+	return domain.ScheduledMessageList{}, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) GetScheduledMessages(context.Context, int64, domain.ScheduledMessageFilter) (domain.ScheduledMessageList, error) {
+	return domain.ScheduledMessageList{}, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) DeleteScheduledMessages(context.Context, int64, domain.ScheduledMessageFilter, int, store.DeliveryEffectsBuilder[[]domain.ScheduledMessage]) ([]domain.ScheduledMessage, error) {
+	return nil, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) ClaimScheduledMessages(context.Context, int64, domain.ScheduledMessageClaim) ([]domain.ScheduledMessage, error) {
+	return nil, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) ClaimDueScheduledMessages(context.Context, int, int, int) ([]domain.ScheduledMessage, error) {
+	return nil, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) MarkScheduledMessageSent(context.Context, int64, int, int, int, store.DeliveryEffectsBuilder[domain.ScheduledMessage]) error {
+	return store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) ReleaseScheduledMessage(context.Context, int64, int, string) error {
+	return store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) HasScheduledMessages(context.Context, int64, domain.Peer) (bool, error) {
+	return false, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) GetPrivateHistoryTTL(context.Context, int64, domain.Peer) (int, error) {
+	return 0, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) SetPrivateHistoryTTL(context.Context, int64, domain.Peer, int, store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult]) error {
+	return store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) DefaultHistoryTTL(context.Context, int64) (int, error) {
+	return 0, store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) SetDefaultHistoryTTL(context.Context, int64, int) error {
+	return store.ErrDeliveryOutboxRequired
+}
+
+func (*captureMessages) ClaimExpiredPrivateMessages(context.Context, int, int) ([]domain.DeleteMessagesRequest, error) {
+	return nil, store.ErrDeliveryOutboxRequired
+}
+
+func applyCaptureDeliveryEffects(ctx context.Context, outbox store.DeliveryOutboxStore, effects []store.DeliveryEffect) error {
+	for i := range effects {
+		if err := effects[i].Validate(); err != nil {
+			return fmt.Errorf("capture delivery effect %d: %w", i, err)
+		}
+	}
+	if len(effects) > 0 && outbox == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	for i, effect := range effects {
+		if effect.Kind != store.DeliveryEffectAbsolute {
+			return fmt.Errorf("capture delivery effect %d: unsupported kind %d", i, effect.Kind)
+		}
+		if _, err := outbox.Enqueue(ctx, store.DeliveryOutboxEnqueue{
+			TargetUserID: effect.TargetUserID, ExcludeAuthKeyID: effect.ExcludeAuthKeyID,
+			ExcludeSessionID: effect.ExcludeSessionID, Payload: effect.Payload,
+			RecoveryPolicy: effect.RecoveryPolicy,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func attachCaptureMessagesDeliveryOutbox(messages *captureMessages) *memory.DeliveryOutboxStore {
+	outbox := memory.NewDeliveryOutboxStore()
+	messages.deliveryOutbox = outbox
+	return outbox
+}
+
 type scheduledCaptureMessages struct {
 	*captureMessages
 	scheduled          []domain.ScheduledMessage
@@ -72,7 +166,17 @@ func (s *ttlCaptureMessages) GetPrivateHistoryTTL(_ context.Context, _ int64, _ 
 	return s.setTTLPeriod, nil
 }
 
-func (s *ttlCaptureMessages) SetPrivateHistoryTTL(_ context.Context, userID int64, peer domain.Peer, period int) error {
+func (s *ttlCaptureMessages) SetPrivateHistoryTTL(ctx context.Context, userID int64, peer domain.Peer, period int, effects store.DeliveryEffectsBuilder[domain.PrivateHistoryTTLResult]) error {
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(domain.PrivateHistoryTTLResult{OwnerUserID: userID, Peer: peer, Period: period})
+	if err != nil {
+		return err
+	}
+	if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+		return err
+	}
 	s.setTTLUserID = userID
 	s.setTTLPeer = peer
 	s.setTTLPeriod = period
@@ -94,7 +198,7 @@ func (s *ttlCaptureMessages) ClaimExpiredPrivateMessages(context.Context, int, i
 	return append([]domain.DeleteMessagesRequest(nil), s.expiredPrivateClaims...), nil
 }
 
-func (s *scheduledCaptureMessages) ScheduleMessage(_ context.Context, userID int64, req domain.ScheduleMessageRequest) (domain.ScheduledMessage, error) {
+func (s *scheduledCaptureMessages) ScheduleMessage(ctx context.Context, userID int64, req domain.ScheduleMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
 	s.scheduleReq = req
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
@@ -118,24 +222,46 @@ func (s *scheduledCaptureMessages) ScheduleMessage(_ context.Context, userID int
 		UpdatedAt:            req.Date,
 		State:                "pending",
 	}
+	if effects == nil {
+		return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(msg)
+	if err != nil {
+		return domain.ScheduledMessage{}, err
+	}
+	if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+		return domain.ScheduledMessage{}, err
+	}
 	s.scheduled = append(s.scheduled, msg)
 	return msg, nil
 }
 
-func (s *scheduledCaptureMessages) EditScheduledMessage(_ context.Context, userID int64, req domain.EditScheduledMessageRequest) (domain.ScheduledMessage, error) {
+func (s *scheduledCaptureMessages) EditScheduledMessage(ctx context.Context, userID int64, req domain.EditScheduledMessageRequest, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) (domain.ScheduledMessage, error) {
 	s.editScheduledReq = req
 	if req.OwnerUserID == 0 {
 		req.OwnerUserID = userID
 	}
 	for i := range s.scheduled {
 		if s.scheduled[i].OwnerUserID == req.OwnerUserID && s.scheduled[i].Peer == req.Peer && s.scheduled[i].ID == req.ID {
+			candidate := s.scheduled[i]
 			if req.SetMessage {
-				s.scheduled[i].Message = req.Message
-				s.scheduled[i].Entities = append([]domain.MessageEntity(nil), req.Entities...)
+				candidate.Message = req.Message
+				candidate.Entities = append([]domain.MessageEntity(nil), req.Entities...)
 			}
-			s.scheduled[i].ScheduleDate = req.ScheduleDate
-			s.scheduled[i].UpdatedAt = req.Date
-			return s.scheduled[i], nil
+			candidate.ScheduleDate = req.ScheduleDate
+			candidate.UpdatedAt = req.Date
+			if effects == nil {
+				return domain.ScheduledMessage{}, store.ErrDeliveryOutboxRequired
+			}
+			intents, err := effects(candidate)
+			if err != nil {
+				return domain.ScheduledMessage{}, err
+			}
+			if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+				return domain.ScheduledMessage{}, err
+			}
+			s.scheduled[i] = candidate
+			return candidate, nil
 		}
 	}
 	return domain.ScheduledMessage{}, domain.ErrMessageIDInvalid
@@ -157,12 +283,24 @@ func (s *scheduledCaptureMessages) GetScheduledMessages(_ context.Context, userI
 	return domain.ScheduledMessageList{Messages: items, Count: len(items)}, nil
 }
 
-func (s *scheduledCaptureMessages) DeleteScheduledMessages(_ context.Context, userID int64, filter domain.ScheduledMessageFilter, _ int) ([]domain.ScheduledMessage, error) {
+func (s *scheduledCaptureMessages) DeleteScheduledMessages(ctx context.Context, userID int64, filter domain.ScheduledMessageFilter, _ int, effects store.DeliveryEffectsBuilder[[]domain.ScheduledMessage]) ([]domain.ScheduledMessage, error) {
 	if filter.OwnerUserID == 0 {
 		filter.OwnerUserID = userID
 	}
 	s.deletedScheduled = filter
 	deleted := s.matchScheduled(filter)
+	if len(deleted) > 0 {
+		if effects == nil {
+			return nil, store.ErrDeliveryOutboxRequired
+		}
+		intents, err := effects(deleted)
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+			return nil, err
+		}
+	}
 	s.removeScheduled(filter)
 	return deleted, nil
 }
@@ -179,10 +317,28 @@ func (s *scheduledCaptureMessages) ClaimDueScheduledMessages(context.Context, in
 	return nil, nil
 }
 
-func (s *scheduledCaptureMessages) MarkScheduledMessageSent(_ context.Context, _ int64, id, sentMessageID, _ int) error {
+func (s *scheduledCaptureMessages) MarkScheduledMessageSent(ctx context.Context, ownerUserID int64, id, sentMessageID, date int, effects store.DeliveryEffectsBuilder[domain.ScheduledMessage]) error {
+	items := s.matchScheduled(domain.ScheduledMessageFilter{OwnerUserID: ownerUserID, IDs: []int{id}})
+	if len(items) == 0 {
+		return nil
+	}
+	item := items[0]
+	item.State = "sent"
+	item.SentMessageID = sentMessageID
+	item.UpdatedAt = date
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(item)
+	if err != nil {
+		return err
+	}
+	if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+		return err
+	}
 	s.markedScheduledID = id
 	s.markedSentID = sentMessageID
-	s.removeScheduled(domain.ScheduledMessageFilter{OwnerUserID: s.scheduleReq.OwnerUserID, Peer: s.scheduleReq.Peer, IDs: []int{id}})
+	s.removeScheduled(domain.ScheduledMessageFilter{OwnerUserID: ownerUserID, Peer: item.Peer, IDs: []int{id}})
 	return nil
 }
 
@@ -434,9 +590,9 @@ func (s *captureMessages) GetOutboxReadDate(_ context.Context, _ int64, req doma
 	return s.outboxReadDate, nil
 }
 
-func (s *captureMessages) SetMessageReactions(_ context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
-	s.setReactionReq = req
-	if len(s.setReactionRes.Messages) == 0 {
+func (s *captureMessages) SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
+	result := s.setReactionRes
+	if len(result.Messages) == 0 {
 		if len(req.Reactions) == 0 {
 			reactions := domain.ChannelMessageReactions{
 				CanSeeList: req.Peer.ID != userID,
@@ -444,7 +600,7 @@ func (s *captureMessages) SetMessageReactions(_ context.Context, userID int64, r
 				Results:    []domain.ChannelMessageReactionCount{},
 				Recent:     []domain.ChannelMessagePeerReaction{},
 			}
-			s.setReactionRes = domain.PrivateMessageReactionsResult{
+			result = domain.PrivateMessageReactionsResult{
 				Messages: []domain.Message{{
 					ID:          req.MessageID,
 					OwnerUserID: userID,
@@ -455,47 +611,59 @@ func (s *captureMessages) SetMessageReactions(_ context.Context, userID int64, r
 				}},
 				Reactions: reactions,
 			}
-			return s.setReactionRes, nil
-		}
-		reactions := domain.ChannelMessageReactions{
-			CanSeeList: req.Peer.ID != userID,
-			AsTags:     req.Peer.ID == userID,
-			Results: []domain.ChannelMessageReactionCount{{
-				Reaction:    req.Reactions[0],
-				Count:       1,
-				ChosenOrder: 1,
-			}},
-		}
-		if req.Peer.ID != userID {
-			reactions.Recent = []domain.ChannelMessagePeerReaction{{
-				UserID:      userID,
-				Reaction:    req.Reactions[0],
-				My:          true,
-				Big:         req.Big,
-				ChosenOrder: 1,
-				Date:        req.Date,
-			}}
-		}
-		s.setReactionRes = domain.PrivateMessageReactionsResult{
-			Messages: []domain.Message{{
-				ID:          req.MessageID,
-				OwnerUserID: userID,
-				Peer:        req.Peer,
-				From:        domain.Peer{Type: domain.PeerTypeUser, ID: req.Peer.ID},
-				Date:        req.Date,
-				Reactions:   &reactions,
-			}},
-			Reactions: reactions,
+		} else {
+			reactions := domain.ChannelMessageReactions{
+				CanSeeList: req.Peer.ID != userID,
+				AsTags:     req.Peer.ID == userID,
+				Results: []domain.ChannelMessageReactionCount{{
+					Reaction:    req.Reactions[0],
+					Count:       1,
+					ChosenOrder: 1,
+				}},
+			}
+			if req.Peer.ID != userID {
+				reactions.Recent = []domain.ChannelMessagePeerReaction{{
+					UserID:      userID,
+					Reaction:    req.Reactions[0],
+					My:          true,
+					Big:         req.Big,
+					ChosenOrder: 1,
+					Date:        req.Date,
+				}}
+			}
+			result = domain.PrivateMessageReactionsResult{
+				Messages: []domain.Message{{
+					ID:          req.MessageID,
+					OwnerUserID: userID,
+					Peer:        req.Peer,
+					From:        domain.Peer{Type: domain.PeerTypeUser, ID: req.Peer.ID},
+					Date:        req.Date,
+					Reactions:   &reactions,
+				}},
+				Reactions: reactions,
+			}
 		}
 	}
-	return s.setReactionRes, nil
+	if effects == nil {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(result)
+	if err != nil {
+		return domain.PrivateMessageReactionsResult{}, err
+	}
+	if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+		return domain.PrivateMessageReactionsResult{}, err
+	}
+	s.setReactionReq = req
+	s.setReactionRes = result
+	return result, nil
 }
 
-func (s *captureMessages) VoteMessagePoll(_ context.Context, _ int64, _ domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *captureMessages) VoteMessagePoll(_ context.Context, _ int64, _ domain.VotePrivateMessagePollRequest, _ store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 }
 
-func (s *captureMessages) CloseMessagePoll(_ context.Context, _ int64, _ domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error) {
+func (s *captureMessages) CloseMessagePoll(_ context.Context, _ int64, _ domain.ClosePrivateMessagePollRequest, _ store.DeliveryEffectsBuilder[domain.PrivateMessagePollResult]) (domain.PrivateMessagePollResult, error) {
 	return domain.PrivateMessagePollResult{}, domain.ErrMessageIDInvalid
 }
 
@@ -522,15 +690,28 @@ func (s *captureMessages) SavedReactionTags(_ context.Context, _ int64, savedPee
 	return append([]domain.SavedReactionTag(nil), s.savedTags...), s.savedTagErr
 }
 
-func (s *captureMessages) UpdateSavedReactionTag(_ context.Context, _ int64, tag domain.SavedReactionTag) error {
+func (s *captureMessages) UpdateSavedReactionTag(ctx context.Context, _ int64, tag domain.SavedReactionTag, effects store.DeliveryEffectsBuilder[domain.SavedReactionTag]) error {
+	if s.savedTagErr != nil {
+		return s.savedTagErr
+	}
+	if effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	intents, err := effects(tag)
+	if err != nil {
+		return err
+	}
+	if err := applyCaptureDeliveryEffects(ctx, s.deliveryOutbox, intents); err != nil {
+		return err
+	}
 	s.updatedSavedTag = tag
 	for i := range s.savedTags {
 		if s.savedTags[i].Reaction.Key() == tag.Reaction.Key() {
 			s.savedTags[i].Title = tag.Title
-			return s.savedTagErr
+			return nil
 		}
 	}
-	return s.savedTagErr
+	return nil
 }
 
 func (s *captureMessages) EditMessage(_ context.Context, userID int64, req domain.EditMessageRequest) (domain.EditMessageResult, error) {
@@ -587,12 +768,8 @@ func (s *captureMessages) GetSavedDialogsByPeers(_ context.Context, _ int64, _ [
 	return domain.SavedDialogList{}, nil
 }
 
-func (s *captureMessages) ToggleSavedDialogPin(_ context.Context, _ int64, _ domain.Peer, _ bool) (bool, error) {
-	return false, nil
-}
-
-func (s *captureMessages) ReorderPinnedSavedDialogs(_ context.Context, _ int64, _ []domain.Peer, _ bool) error {
-	return nil
+func (s *captureMessages) MutateSavedDialogs(_ context.Context, _ int64, _ store.SavedDialogMutation, _ store.DeliveryEffectsBuilder[store.SavedDialogMutationSnapshot]) (store.SavedDialogMutationSnapshot, error) {
+	return store.SavedDialogMutationSnapshot{}, nil
 }
 
 func (s *captureMessages) DeleteSavedHistory(_ context.Context, _ int64, _ domain.DeleteSavedHistoryRequest) (domain.DeleteSavedHistoryResult, error) {

@@ -390,7 +390,7 @@ func (r *GRPCRemote) DispatchAdmitted(ctx context.Context, authKeyID [8]byte, se
 	callCtx, cancel := r.withRequestTimeout(ctx)
 	defer cancel()
 	start := time.Now()
-	res, err := r.client.DispatchAdmitted(callCtx, grpcDispatchRequest(captured, authKeyID, sessionID, msgID, admissionSeq, profileEvidenceFresh(ctx), identityHintToPB(ctx)))
+	res, err := r.client.DispatchAdmitted(callCtx, grpcDispatchRequest(&captured, authKeyID, sessionID, msgID, admissionSeq, profileEvidenceFresh(ctx), identityHintToPB(ctx)))
 	if err != nil {
 		callErr := grpcRemoteCallError("dispatch_admitted", err)
 		observeCoreExecGRPCCall(r.metrics, "client", "dispatch_admitted", start, grpcRemoteCallOutcome(callErr))
@@ -420,15 +420,22 @@ func (r *GRPCRemote) DispatchAdmitted(ctx context.Context, authKeyID [8]byte, se
 			observeCoreExecGRPCCall(r.metrics, "client", "dispatch_admitted", start, grpcRemoteResponseErrorOutcome(controlErr))
 			return nil, res.GetMethod(), controlErr
 		}
-		if err := r.RunPostResponseActions(context.Background(), []postresponse.Action{action}); err != nil && r.log != nil {
-			r.log.Warn("commit coreexec post-response action without edge callback", zap.Error(err))
+		if err := r.RunPostResponseActions(context.Background(), []postresponse.Action{action}); err != nil {
+			controlErr := remoteControlError(err.Error())
+			observeCoreExecGRPCCall(r.metrics, "client", "dispatch_admitted", start, grpcRemoteResponseErrorOutcome(controlErr))
+			return nil, res.GetMethod(), controlErr
 		}
 	}
 	observeCoreExecGRPCCall(r.metrics, "client", "dispatch_admitted", start, "ok")
+	// grpc-go has completed unary response unmarshalling and will not reuse or
+	// mutate this message. Transfer its owned result slice directly into the
+	// request-bound result instead of cloning the complete TL payload.
+	resultWire := res.ResultWire
+	res.ResultWire = nil
 	return &encodedResult{
 		prepared:      request.Prepared(),
 		wireInvariant: res.GetWireInvariant(),
-		body:          append([]byte(nil), res.GetResultWire()...),
+		body:          resultWire,
 	}, res.GetMethod(), nil
 }
 
@@ -585,7 +592,7 @@ func (r *GRPCRemote) PrepareAdmittedReplay(ctx context.Context, authKeyID [8]byt
 	callCtx, cancel := r.withRequestTimeout(ctx)
 	defer cancel()
 	start := time.Now()
-	res, err := r.client.PrepareAdmittedReplay(callCtx, grpcDispatchRequest(captured, authKeyID, sessionID, msgID, admissionSeq, profileEvidenceFresh(ctx), identityHintToPB(ctx)))
+	res, err := r.client.PrepareAdmittedReplay(callCtx, grpcDispatchRequest(&captured, authKeyID, sessionID, msgID, admissionSeq, profileEvidenceFresh(ctx), identityHintToPB(ctx)))
 	if err != nil {
 		callErr := grpcRemoteCallError("prepare_admitted_replay", err)
 		observeCoreExecGRPCCall(r.metrics, "client", "prepare_admitted_replay", start, grpcRemoteCallOutcome(callErr))
@@ -705,6 +712,18 @@ func (r *GRPCRemote) take(identity tlprofile.PreparedIdentity) (capturedAdmissio
 	}
 	r.pendingCount--
 	return captured, true
+}
+
+// DiscardAdmitted releases wire bytes captured by the Edge codec shell when a
+// higher-level data-plane router takes ownership of the already-admitted call.
+// It is intentionally one-way: a discarded admission can never be dispatched
+// through CoreExec afterwards.
+func (r *GRPCRemote) DiscardAdmitted(identity tlprofile.PreparedIdentity) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.take(identity)
+	return ok
 }
 
 func (r *GRPCRemote) peek(identity tlprofile.PreparedIdentity) (capturedAdmission, bool) {
@@ -840,7 +859,9 @@ func (s *coreExecGRPCServer) DispatchAdmitted(ctx context.Context, req *coreexec
 			res.Error = err.Error()
 			return res, nil
 		}
-		res.ResultWire = encoded.Copy()
+		// encoded is local, uniquely owned and never reused after this transfer.
+		// grpc-go marshals the returned response before releasing it.
+		res.ResultWire = takeBufferRaw(&encoded)
 		res.WireInvariant = result.WireInvariant()
 	}
 	res.PostResponseActions, err = postResponseActionsToPB(postresponse.TakeActions(context.WithoutCancel(ctx)))
@@ -904,15 +925,11 @@ func (s *coreExecGRPCServer) CommitPostResponseActions(ctx context.Context, req 
 	if s == nil || s.handler == nil {
 		return nil, status.Error(codes.Internal, ErrNilHandler.Error())
 	}
-	executor, ok := s.handler.(postresponse.ActionExecutor)
-	if !ok {
-		return &coreexecpb.CommitPostResponseActionsResponse{Error: "coreexec grpc: postresponse action executor unavailable"}, nil
-	}
 	actions, err := postResponseActionsFromPB(req.GetActions())
 	if err != nil {
 		return &coreexecpb.CommitPostResponseActionsResponse{Error: err.Error()}, nil
 	}
-	if err := executor.RunPostResponseActions(ctx, actions); err != nil {
+	if err := s.handler.RunPostResponseActions(ctx, actions); err != nil {
 		return &coreexecpb.CommitPostResponseActionsResponse{Error: err.Error()}, nil
 	}
 	return &coreexecpb.CommitPostResponseActionsResponse{}, nil
@@ -1063,12 +1080,20 @@ func (s *coreExecGRPCServer) purgeExpiredReplayHooksLocked(now time.Time) {
 	}
 }
 
-func grpcDispatchRequest(captured capturedAdmission, authKeyID [8]byte, sessionID, msgID int64, admissionSeq uint64, fresh bool, identityHint *coreexecpb.IdentityHint) *coreexecpb.DispatchRequest {
+func grpcDispatchRequest(captured *capturedAdmission, authKeyID [8]byte, sessionID, msgID int64, admissionSeq uint64, fresh bool, identityHint *coreexecpb.IdentityHint) *coreexecpb.DispatchRequest {
+	if captured == nil {
+		return nil
+	}
+	// captured was removed from the pending-admission map and is now exclusively
+	// owned by this call. Move request_wire into the protobuf message; grpc-go
+	// synchronously finishes marshaling a unary request before Invoke returns.
+	requestWire := captured.Wire
+	captured.Wire = nil
 	return &coreexecpb.DispatchRequest{
 		Mode:                 admissionModeToPB(captured.Mode),
 		Profile:              int32(captured.Profile),
 		Limits:               limitsToPB(captured.Limits),
-		RequestWire:          append([]byte(nil), captured.Wire...),
+		RequestWire:          requestWire,
 		Proof:                proofToPB(captured.Proof),
 		AuthKeyId:            append([]byte(nil), authKeyID[:]...),
 		SessionId:            sessionID,

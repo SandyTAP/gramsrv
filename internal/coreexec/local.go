@@ -15,9 +15,9 @@ var ErrNilHandler = errors.New("coreexec: nil handler")
 
 // Handler is the Core RPC execution contract exposed by the CoreExec service.
 //
-// It intentionally includes the optional exact-layer capabilities that
-// mtprotoedge probes structurally. A wrapper that hid any of them would silently
-// downgrade replay, profile evidence, or destroy-auth-key cleanup.
+// Every capability in this contract is mandatory. A wrapper that hid any of
+// them would silently downgrade replay, profile evidence, destroy-auth-key
+// cleanup, or post-response durability.
 type Handler interface {
 	mtprotoedge.LayerRPCHandler
 	mtprotoedge.LayerRPCOptionsAdmitter
@@ -35,6 +35,7 @@ type Handler interface {
 	mtprotoedge.LayerRPCIdentityHintContext
 	mtprotoedge.LayerRPCAdmissionProfilePublisher
 	mtprotoedge.RPCInitConnectionObserver
+	postresponse.ActionExecutor
 }
 
 // Local adapts a Core router to the CoreExec server contract. Edge processes use
@@ -208,9 +209,5 @@ func (l *Local) RunPostResponseActions(ctx context.Context, actions []postrespon
 	if l == nil || l.handler == nil {
 		return ErrNilHandler
 	}
-	executor, ok := l.handler.(postresponse.ActionExecutor)
-	if !ok {
-		return nil
-	}
-	return executor.RunPostResponseActions(ctx, actions)
+	return l.handler.RunPostResponseActions(ctx, actions)
 }

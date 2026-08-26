@@ -28,7 +28,7 @@ func TestCreateStickerSetInvalidatesNegativeCacheAndLinksDocuments(t *testing.T)
 		t.Fatalf("resolve before create found set, want miss")
 	}
 
-	set, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	set, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Fresh Pack",
 		ShortName:     "fresh_pack",
@@ -82,7 +82,7 @@ func TestCreateStickerSetAcceptsUploadedStickerMaterial(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	set, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	set, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Uploads",
 		ShortName:     "uploads_pack",
@@ -122,7 +122,7 @@ func TestCreateStickerSetNormalizesUploadedTGSMime(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	_, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Uploads",
 		ShortName:     "tgs_uploads",
@@ -158,7 +158,7 @@ func TestCreateStickerSetClonesDocumentWhenReusedAcrossSets(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	emojiSet, emojiDocs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	emojiSet, emojiDocs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Emoji Pack",
 		ShortName:     "emoji_pack",
@@ -172,7 +172,7 @@ func TestCreateStickerSetClonesDocumentWhenReusedAcrossSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create emoji set: %v", err)
 	}
-	stickerSet, stickerDocs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	stickerSet, stickerDocs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Sticker Pack",
 		ShortName:     "sticker_pack",
@@ -223,7 +223,7 @@ func TestCreateStickerSetAcceptsWebPMaterialWithClientImageSize(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	_, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "WebP Uploads",
 		ShortName:     "webp_uploads",
@@ -272,7 +272,7 @@ func TestCreateStickerSetConvertsLottieJSONMaterialToTGS(t *testing.T) {
 	}
 	svc := NewService(media, blobs, 2)
 
-	_, docs, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, docs, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Lottie Uploads",
 		ShortName:     "lottie_uploads",
@@ -341,7 +341,7 @@ func TestCreateStickerSetRejectsInvalidLottieJSONMaterial(t *testing.T) {
 	}
 	svc := NewService(media, blobs, 2)
 
-	_, _, err = svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, _, err = createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Bad Lottie Uploads",
 		ShortName:     "bad_lottie_uploads",
@@ -366,7 +366,7 @@ func TestCreateStickerSetRejectsWebPMaterialWithoutShape(t *testing.T) {
 	}
 	svc := NewService(media, nil, 2)
 
-	_, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Bad WebP Uploads",
 		ShortName:     "bad_webp_uploads",
@@ -392,7 +392,7 @@ func TestCreateStickerSetRejectsDuplicateShortNameCaseInsensitive(t *testing.T) 
 		},
 	}
 	svc := NewService(media, nil, 2)
-	_, _, err := svc.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+	_, _, err := createStickerSetForTest(ctx, svc, domain.CreateStickerSetRequest{
 		CreatorUserID: 1000000001,
 		Title:         "Other",
 		ShortName:     "fresh_pack",

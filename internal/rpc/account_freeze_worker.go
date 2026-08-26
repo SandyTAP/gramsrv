@@ -12,7 +12,7 @@ import (
 
 type accountFreezeNotificationService interface {
 	ClaimAccountFreezeNotifications(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]domain.AccountFreezeNotification, error)
-	CompleteAccountFreezeNotification(ctx context.Context, id, version int64, now time.Time) error
+	CommitAccountFreezeNotificationDelivery(ctx context.Context, id, version int64, payload []byte, now time.Time) error
 }
 
 // RunAccountFreezeNotifications drains the crash-safe, coalesced non-pts
@@ -87,19 +87,24 @@ func (r *Router) dispatchAccountFreezeNotification(ctx context.Context, svc acco
 	if !found {
 		user = domain.User{ID: notification.FrozenUserID, Deleted: true}
 	}
-	pushCtx, pushCancel := context.WithTimeout(ctx, 10*time.Second)
-	r.pushUserUpdates(pushCtx, notification.TargetUserID, &tg.Updates{
+	payload, err := encodeDeliveryUpdate(&tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: notification.FrozenUserID}},
 		Users:   r.tgUsersForViewer(notification.TargetUserID, []domain.User{user}),
 		Date:    int(r.clock.Now().Unix()),
 	})
-	pushCancel()
-
-	completeCtx, completeCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = svc.CompleteAccountFreezeNotification(completeCtx, notification.ID, notification.Version, r.clock.Now().UTC())
-	completeCancel()
 	if err != nil {
-		r.log.Warn("complete account freeze notification failed",
+		r.log.Warn("encode account freeze notification failed",
+			zap.Int64("notification_id", notification.ID),
+			zap.Int64("version", notification.Version),
+			zap.Error(err))
+		return
+	}
+
+	commitCtx, commitCancel := context.WithTimeout(ctx, 10*time.Second)
+	err = svc.CommitAccountFreezeNotificationDelivery(commitCtx, notification.ID, notification.Version, payload, r.clock.Now().UTC())
+	commitCancel()
+	if err != nil {
+		r.log.Warn("commit account freeze notification delivery failed",
 			zap.Int64("notification_id", notification.ID),
 			zap.Int64("version", notification.Version),
 			zap.Error(err))

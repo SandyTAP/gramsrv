@@ -42,6 +42,9 @@ func TestCustomStickerPackLinkInstallAndSendSmoke(t *testing.T) {
 	pollStore := memory.NewPollStore()
 	messageStore.AttachPollStore(pollStore)
 	passwordStore := memory.NewPasswordStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
+	messageStore.AttachDeliveryOutbox(delivery)
 	files := &fakeFiles{
 		docs: map[int64]domain.Document{
 			101: {
@@ -55,13 +58,14 @@ func TestCustomStickerPackLinkInstallAndSendSmoke(t *testing.T) {
 		photos: map[int64]domain.Photo{},
 		sets:   map[domain.StickerSetKind][]domain.StickerSet{},
 	}
+	files.deliveryOutbox = delivery
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
 		Account:  appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore)),
 		Users:    appusers.NewService(userStore),
 		Messages: appmessages.NewService(messageStore, dialogStore),
 		Files:    files,
 		Polls:    apppolls.NewService(pollStore),
-		Sessions: &captureSessions{},
+		Sessions: &captureSessions{}, DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 
 	created, err := r.onStickersCreateStickerSet(WithUserID(ctx, alice.ID), &tg.StickersCreateStickerSetRequest{
@@ -169,6 +173,9 @@ func TestStickersBotCreatePackLinkInstallIsolationSmoke(t *testing.T) {
 	pollStore := memory.NewPollStore()
 	messageStore.AttachPollStore(pollStore)
 	passwordStore := memory.NewPasswordStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
+	messageStore.AttachDeliveryOutbox(delivery)
 	accountService := appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore))
 	botStore := memory.NewBotStore(userStore)
 	files := &fakeFiles{
@@ -185,19 +192,20 @@ func TestStickersBotCreatePackLinkInstallIsolationSmoke(t *testing.T) {
 		photos: map[int64]domain.Photo{},
 		sets:   map[domain.StickerSetKind][]domain.StickerSet{},
 	}
+	files.deliveryOutbox = delivery
 	botsService := botsapp.NewService(userStore, botStore, messageStore,
-		botsapp.WithStickerSetCreator(files),
-		botsapp.WithUserStickerSets(accountService))
+		botsapp.WithStickerSetCreator(files))
 	messagesService := appmessages.NewService(messageStore, dialogStore,
 		appmessages.WithBotResponder(botsService))
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Account:       accountService,
-		Users:         appusers.NewService(userStore),
-		Messages:      messagesService,
-		Files:         files,
-		Polls:         apppolls.NewService(pollStore),
-		Sessions:      &captureSessions{},
-		BotAPIUpdates: memory.NewBotAPIUpdateStore(),
+		Account:        accountService,
+		Users:          appusers.NewService(userStore),
+		Messages:       messagesService,
+		Files:          files,
+		Polls:          apppolls.NewService(pollStore),
+		Sessions:       &captureSessions{},
+		DeliveryOutbox: delivery,
+		BotAPIUpdates:  memory.NewBotAPIUpdateStore(),
 	}, zaptest.NewLogger(t), clock.System)
 	botsService.SetRouterHooks(r)
 	botsService.SetTextDraftPusher(r)
@@ -220,9 +228,6 @@ func TestStickersBotCreatePackLinkInstallIsolationSmoke(t *testing.T) {
 		t.Fatalf("created sets = %+v, want Alice alice_bot_pack", created)
 	}
 	setID := created[0].ID
-	if got := installedStickerSetIDs(t, passwordStore, ctx, alice.ID, domain.StickerSetKindStickers, nil); len(got) != 1 || got[0] != setID {
-		t.Fatalf("alice installed sets = %v, want [%d]", got, setID)
-	}
 	if got := installedStickerSetIDs(t, passwordStore, ctx, bob.ID, domain.StickerSetKindStickers, nil); len(got) != 0 {
 		t.Fatalf("bob installed sets before link = %v, want empty", got)
 	}
@@ -253,9 +258,6 @@ func TestStickersBotCreatePackLinkInstallIsolationSmoke(t *testing.T) {
 	}
 	if got := installedStickerSetIDs(t, passwordStore, ctx, bob.ID, domain.StickerSetKindStickers, nil); len(got) != 1 || got[0] != setID {
 		t.Fatalf("bob installed sets after link = %v, want [%d]", got, setID)
-	}
-	if got := allStickerSetIDs(t, r, WithUserID(ctx, alice.ID), domain.StickerSetKindStickers); len(got) != 1 || got[0] != setID {
-		t.Fatalf("alice getAllStickers = %v, want [%d]", got, setID)
 	}
 	if got := allStickerSetIDs(t, r, WithUserID(ctx, bob.ID), domain.StickerSetKindStickers); len(got) != 1 || got[0] != setID {
 		t.Fatalf("bob getAllStickers after install = %v, want [%d]", got, setID)

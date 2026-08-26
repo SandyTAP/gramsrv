@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // AIComposeStore 是 store.AIComposeStore 的内存实现。
@@ -15,6 +16,7 @@ type AIComposeStore struct {
 	bySlug map[string]int64
 	saves  map[int64]map[int64]int64 // userID -> toneID -> order
 	seq    int64
+	outbox *DeliveryOutboxStore
 }
 
 func NewAIComposeStore() *AIComposeStore {
@@ -22,10 +24,13 @@ func NewAIComposeStore() *AIComposeStore {
 		byID:   make(map[int64]domain.AIComposeTone),
 		bySlug: make(map[string]int64),
 		saves:  make(map[int64]map[int64]int64),
+		outbox: NewDeliveryOutboxStore(),
 	}
 }
 
-func (s *AIComposeStore) CreateAIComposeTone(_ context.Context, tone domain.AIComposeTone) error {
+func (s *AIComposeStore) DeliveryOutbox() *DeliveryOutboxStore { return s.outbox }
+
+func (s *AIComposeStore) CreateAIComposeTone(ctx context.Context, tone domain.AIComposeTone, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	if tone.ID == 0 || tone.AccessHash == 0 || tone.OwnerUserID == 0 || tone.Slug == "" {
 		return domain.ErrAIComposeToneInvalid
 	}
@@ -39,10 +44,15 @@ func (s *AIComposeStore) CreateAIComposeTone(_ context.Context, tone domain.AICo
 	}
 	s.byID[tone.ID] = tone.Clone()
 	s.bySlug[tone.Slug] = tone.ID
+	if err := s.applyToneEffectsLocked(ctx, tone, effects); err != nil {
+		delete(s.byID, tone.ID)
+		delete(s.bySlug, tone.Slug)
+		return err
+	}
 	return nil
 }
 
-func (s *AIComposeStore) UpdateAIComposeTone(_ context.Context, tone domain.AIComposeTone) error {
+func (s *AIComposeStore) UpdateAIComposeTone(ctx context.Context, tone domain.AIComposeTone, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, ok := s.byID[tone.ID]
@@ -60,10 +70,18 @@ func (s *AIComposeStore) UpdateAIComposeTone(_ context.Context, tone domain.AICo
 		s.bySlug[tone.Slug] = tone.ID
 	}
 	s.byID[tone.ID] = tone.Clone()
+	if err := s.applyToneEffectsLocked(ctx, tone, effects); err != nil {
+		s.byID[tone.ID] = prev
+		if tone.Slug != prev.Slug {
+			delete(s.bySlug, tone.Slug)
+			s.bySlug[prev.Slug] = tone.ID
+		}
+		return err
+	}
 	return nil
 }
 
-func (s *AIComposeStore) DeleteAIComposeTone(_ context.Context, ownerUserID, toneID int64) error {
+func (s *AIComposeStore) DeleteAIComposeTone(ctx context.Context, ownerUserID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tone, ok := s.byID[toneID]
@@ -75,8 +93,23 @@ func (s *AIComposeStore) DeleteAIComposeTone(_ context.Context, ownerUserID, ton
 	}
 	delete(s.byID, toneID)
 	delete(s.bySlug, tone.Slug)
+	removedSaves := make(map[int64]int64)
 	for userID := range s.saves {
-		delete(s.saves[userID], toneID)
+		if order, found := s.saves[userID][toneID]; found {
+			removedSaves[userID] = order
+			delete(s.saves[userID], toneID)
+		}
+	}
+	if err := s.applyToneEffectsLocked(ctx, tone, effects); err != nil {
+		s.byID[toneID] = tone
+		s.bySlug[tone.Slug] = toneID
+		for userID, order := range removedSaves {
+			if s.saves[userID] == nil {
+				s.saves[userID] = make(map[int64]int64)
+			}
+			s.saves[userID][toneID] = order
+		}
+		return err
 	}
 	return nil
 }
@@ -156,7 +189,7 @@ func (s *AIComposeStore) ListAIComposeTonesForUser(_ context.Context, userID int
 	return out, nil
 }
 
-func (s *AIComposeStore) SaveAIComposeTone(_ context.Context, userID, toneID int64) error {
+func (s *AIComposeStore) SaveAIComposeTone(ctx context.Context, userID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tone, ok := s.byID[toneID]
@@ -174,20 +207,60 @@ func (s *AIComposeStore) SaveAIComposeTone(_ context.Context, userID, toneID int
 	if _, ok := byUser[toneID]; ok {
 		return nil
 	}
+	previousSeq := s.seq
 	s.seq++
 	byUser[toneID] = s.seq
 	tone.InstallsCount++
 	s.byID[toneID] = tone
+	if err := s.applyToneEffectsLocked(ctx, tone, effects); err != nil {
+		delete(byUser, toneID)
+		if len(byUser) == 0 {
+			delete(s.saves, userID)
+		}
+		tone.InstallsCount--
+		s.byID[toneID] = tone
+		s.seq = previousSeq
+		return err
+	}
 	return nil
 }
 
-func (s *AIComposeStore) UnsaveAIComposeTone(_ context.Context, userID, toneID int64) error {
+func (s *AIComposeStore) UnsaveAIComposeTone(ctx context.Context, userID, toneID int64, effects store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if byUser := s.saves[userID]; byUser != nil {
-		delete(byUser, toneID)
+	tone, ok := s.byID[toneID]
+	if !ok {
+		return domain.ErrAIComposeToneNotFound
+	}
+	byUser := s.saves[userID]
+	if byUser == nil {
+		return nil
+	}
+	order, found := byUser[toneID]
+	if !found {
+		return nil
+	}
+	delete(byUser, toneID)
+	if err := s.applyToneEffectsLocked(ctx, tone, effects); err != nil {
+		byUser[toneID] = order
+		return err
 	}
 	return nil
+}
+
+func (s *AIComposeStore) applyToneEffectsLocked(ctx context.Context, tone domain.AIComposeTone, build store.DeliveryEffectsBuilder[domain.AIComposeTone]) error {
+	if build == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	effects, err := build(tone.Clone())
+	if err != nil {
+		return err
+	}
+	if len(effects) == 0 {
+		return store.ErrDeliveryOutboxRequired
+	}
+	_, err = applyDeliveryEffects(ctx, effects, s.outbox, nil)
+	return err
 }
 
 func (s *AIComposeStore) SavedAIComposeToneCount(_ context.Context, userID int64) (int, error) {

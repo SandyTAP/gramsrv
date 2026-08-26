@@ -15,7 +15,7 @@ func TestRetentionDownMigrationsRejectAdvancedFloorsPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	userID := createRevokeTestUser(t, ctx, pool, "retention-down-guard")
-	channel, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+	channel, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: userID,
 		Title:         "retention down guard",
 		Megagroup:     true,
@@ -99,8 +99,8 @@ func TestPerformanceMigrationIndexesPostgres(t *testing.T) {
 	var (
 		baseOutboxUnique, duplicateOutboxUnique bool
 		lastUsedAuthIndex, obsoleteAuthIndex    bool
-		pendingHeadIndex, staleHeadIndex        bool
-		poisonHeadIndex                         bool
+		readyLaneIndex, leaseLaneIndex          bool
+		failedLaneIndex                         bool
 		tempExpiryIndex                         bool
 	)
 	if err := pool.QueryRow(ctx, `
@@ -109,18 +109,18 @@ SELECT
   to_regclass('public.dispatch_outbox_target_id_uidx') IS NOT NULL,
   to_regclass('public.auth_keys_orphan_last_used_idx') IS NOT NULL,
   to_regclass('public.auth_keys_orphan_retention_idx') IS NOT NULL,
-  to_regclass('public.dispatch_outbox_user_heads_pending_shard_idx') IS NOT NULL,
-  to_regclass('public.dispatch_outbox_user_heads_dispatching_shard_idx') IS NOT NULL,
-  to_regclass('public.dispatch_outbox_user_heads_failed_cleanup_idx') IS NOT NULL,
+  to_regclass('public.dispatch_outbox_lanes_ready_shard_idx') IS NOT NULL,
+  to_regclass('public.dispatch_outbox_lanes_lease_shard_idx') IS NOT NULL,
+  to_regclass('public.dispatch_outbox_lanes_failed_cleanup_idx') IS NOT NULL,
   to_regclass('public.temp_auth_key_bindings_expiry_idx') IS NOT NULL
 `).Scan(
 		&baseOutboxUnique,
 		&duplicateOutboxUnique,
 		&lastUsedAuthIndex,
 		&obsoleteAuthIndex,
-		&pendingHeadIndex,
-		&staleHeadIndex,
-		&poisonHeadIndex,
+		&readyLaneIndex,
+		&leaseLaneIndex,
+		&failedLaneIndex,
 		&tempExpiryIndex,
 	); err != nil {
 		t.Fatalf("inspect performance migration indexes: %v", err)
@@ -131,7 +131,7 @@ SELECT
 	if !lastUsedAuthIndex || obsoleteAuthIndex {
 		t.Fatalf("auth orphan indexes last_used=%v created_at=%v, want true/false", lastUsedAuthIndex, obsoleteAuthIndex)
 	}
-	if !pendingHeadIndex || !staleHeadIndex || !poisonHeadIndex || !tempExpiryIndex {
-		t.Fatalf("ready/expiry indexes pending=%v stale=%v poison=%v temp_expiry=%v, want all true", pendingHeadIndex, staleHeadIndex, poisonHeadIndex, tempExpiryIndex)
+	if !readyLaneIndex || !leaseLaneIndex || !failedLaneIndex || !tempExpiryIndex {
+		t.Fatalf("ready/expiry indexes ready=%v lease=%v failed=%v temp_expiry=%v, want all true", readyLaneIndex, leaseLaneIndex, failedLaneIndex, tempExpiryIndex)
 	}
 }

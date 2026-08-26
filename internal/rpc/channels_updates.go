@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (r *Router) onUpdatesGetChannelDifference(ctx context.Context, req *tg.UpdatesGetChannelDifferenceRequest) (tg.UpdatesChannelDifferenceClass, error) {
@@ -206,7 +207,7 @@ func (r *Router) channelMessageUpdatesWithPeerCacheAndUsernames(ctx context.Cont
 	return r.channelMessagesUpdatesWithPeerCacheAndUsernames(ctx, viewerUserID, []domain.SendChannelMessageResult{res}, randomIDs, includeMessageIDs, nil, cache, usernames)
 }
 
-func (r *Router) pushChannelDiscussionUpdate(ctx context.Context, originUserID int64, discussion *domain.SendChannelDiscussionResult) error {
+func (r *Router) enqueueBotAPIChannelDiscussionUpdate(ctx context.Context, originUserID int64, discussion *domain.SendChannelDiscussionResult) error {
 	if discussion == nil || discussion.Channel.ID == 0 || discussion.Event.Pts == 0 {
 		return nil
 	}
@@ -217,10 +218,7 @@ func (r *Router) pushChannelDiscussionUpdate(ctx context.Context, originUserID i
 		Recipients:     discussion.Recipients,
 		MentionUserIDs: discussion.MentionUserIDs,
 	}
-	// 讨论组联动（broadcast↔linked megagroup）的第二轮 fan-out 也异步化 + 跨 viewer 投影预热
-	// （设计 Phase 0/Phase 1）。cache 仅被本 fan-out 闭包/预热使用、由单分片 worker 串行执行，
-	// 无跨 goroutine 竞态。
-	return r.enqueueChannelMessageFanout(ctx, originUserID, res, nil)
+	return r.enqueueBotAPIChannelMessageUpdate(ctx, originUserID, res)
 }
 
 func (r *Router) channelMessagesUpdatesWithPeerCache(ctx context.Context, viewerUserID int64, results []domain.SendChannelMessageResult, randomIDs []int64, includeMessageIDs bool, extraUserIDs []int64, cache *viewerPeerCache) *tg.Updates {
@@ -355,6 +353,10 @@ func (r *Router) channelDeleteMessagesUpdates(viewerUserID int64, channel domain
 }
 
 func (r *Router) channelAvailableMessagesUpdates(viewerUserID int64, channel domain.Channel, availableMinID int) *tg.Updates {
+	return r.channelAvailableMessagesUpdatesAt(viewerUserID, channel, availableMinID, int(r.clock.Now().Unix()))
+}
+
+func (r *Router) channelAvailableMessagesUpdatesAt(viewerUserID int64, channel domain.Channel, availableMinID, date int) *tg.Updates {
 	updates := make([]tg.UpdateClass, 0, 1)
 	if channel.ID != 0 && availableMinID > 0 {
 		updates = append(updates, &tg.UpdateChannelAvailableMessages{
@@ -365,8 +367,31 @@ func (r *Router) channelAvailableMessagesUpdates(viewerUserID int64, channel dom
 	return &tg.Updates{
 		Updates: updates,
 		Chats:   []tg.ChatClass{tgChannelChatMin(viewerUserID, channel)},
-		Date:    int(r.clock.Now().Unix()),
+		Date:    date,
 		Seq:     0,
+	}
+}
+
+func (r *Router) channelAvailableMinDeliveryEffects(ctx context.Context, requestUserID int64, date int) store.DeliveryEffectsBuilder[store.ChannelAvailableMinDeliverySnapshot] {
+	excludeAuthKeyID, excludeSessionID := deliveryExclusionFromContext(ctx)
+	return func(snapshot store.ChannelAvailableMinDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		if snapshot.TargetUserID == 0 {
+			return nil, nil
+		}
+		updates := r.channelAvailableMessagesUpdatesAt(snapshot.TargetUserID, snapshot.Channel, snapshot.AvailableMinID, date)
+		payload, err := encodeDeliveryUpdate(updates)
+		if err != nil {
+			return nil, err
+		}
+		authKeyID, sessionID := [8]byte{}, int64(0)
+		if snapshot.TargetUserID == requestUserID {
+			authKeyID, sessionID = excludeAuthKeyID, excludeSessionID
+		}
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.TargetUserID, ExcludeAuthKeyID: authKeyID,
+			ExcludeSessionID: sessionID, Payload: payload,
+			RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	}
 }
 
@@ -390,50 +415,27 @@ func projectChannelMentionForViewer(event domain.ChannelUpdateEvent, mentionUser
 	return event
 }
 
-type channelUpdatesBuilder func(viewerUserID int64) *tg.Updates
+type transientChannelUpdatesBuilder func(viewerUserID int64) *tg.Updates
 
-func (r *Router) pushChannelReadOutboxUpdates(ctx context.Context, channelID int64, updates []domain.ChannelReadOutboxUpdate) {
-	if r.deps.Sessions == nil || channelID == 0 || len(updates) == 0 {
-		return
-	}
-	seen := make(map[int64]int, len(updates))
-	for _, update := range updates {
-		if update.UserID == 0 || update.MaxID <= 0 {
-			continue
-		}
-		if seen[update.UserID] < update.MaxID {
-			seen[update.UserID] = update.MaxID
-		}
-	}
-	date := int(r.clock.Now().Unix())
-	for userID, maxID := range seen {
-		r.pushUserUpdates(ctx, userID, &tg.Updates{
-			Updates: []tg.UpdateClass{&tg.UpdateReadChannelOutbox{ChannelID: channelID, MaxID: maxID}},
-			Date:    date,
-			Seq:     0,
-		})
-	}
+func (r *Router) pushTransientChannelMemberUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build transientChannelUpdatesBuilder) {
+	r.pushTransientChannelUpdatesWithScope(ctx, channelTransientMembers, originUserID, channelID, recipients, build)
 }
 
-func (r *Router) pushChannelUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build channelUpdatesBuilder) {
-	r.pushChannelUpdatesWithScope(ctx, channelFanoutMembers, originUserID, channelID, recipients, build)
+func (r *Router) pushTransientChannelViewerUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build transientChannelUpdatesBuilder) {
+	r.pushTransientChannelUpdatesWithScope(ctx, channelTransientViewers, originUserID, channelID, recipients, build)
 }
 
-func (r *Router) pushChannelViewerUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build channelUpdatesBuilder) {
-	r.pushChannelUpdatesWithScope(ctx, channelFanoutViewers, originUserID, channelID, recipients, build)
+func (r *Router) pushTransientChannelExplicitUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build transientChannelUpdatesBuilder) {
+	r.pushTransientChannelUpdatesWithScope(ctx, channelTransientExplicit, originUserID, channelID, recipients, build)
 }
 
-func (r *Router) pushChannelExplicitUpdates(ctx context.Context, originUserID, channelID int64, recipients []int64, build channelUpdatesBuilder) {
-	r.pushChannelUpdatesWithScope(ctx, channelFanoutExplicit, originUserID, channelID, recipients, build)
-}
-
-func (r *Router) pushChannelUpdatesWithScope(ctx context.Context, scope channelFanoutScope, originUserID, channelID int64, recipients []int64, build channelUpdatesBuilder) {
+func (r *Router) pushTransientChannelUpdatesWithScope(ctx context.Context, scope channelTransientScope, originUserID, channelID int64, recipients []int64, build transientChannelUpdatesBuilder) {
 	if r.deps.Sessions == nil || build == nil {
 		return
 	}
 	explicit := recipients
-	recipients = r.channelFanoutRecipients(ctx, scope, channelID, recipients)
-	r.log.Debug("push channel updates fanout",
+	recipients = r.channelTransientRecipients(ctx, scope, channelID, recipients)
+	r.log.Debug("push transient channel updates",
 		zap.Int64("channel_id", channelID),
 		zap.Int("scope", int(scope)),
 		zap.Int64("origin_user_id", originUserID),
@@ -441,26 +443,12 @@ func (r *Router) pushChannelUpdatesWithScope(ctx context.Context, scope channelF
 		zap.Int64s("recipients", recipients),
 	)
 	excludeSessionID, _ := SessionIDFrom(ctx)
-	delivered, ok := r.pushChannelFanoutLocationBatches(ctx, recipients,
+	r.pushTransientChannelLocationBatches(ctx, recipients,
 		rawAuthKeyIDForOrigin(ctx), excludeSessionID, build,
-		zap.String("channel_fanout_kind", "sync_channel_push"),
+		zap.String("channel_delivery_kind", "transient_channel_push"),
 		zap.Int64("channel_id", channelID),
 		zap.Int("scope", int(scope)),
 	)
-	if !ok {
-		return
-	}
-	if len(delivered) == 0 && originUserID != 0 {
-		_, ok := r.pushChannelFanoutLocationBatches(ctx, []int64{originUserID},
-			rawAuthKeyIDForOrigin(ctx), excludeSessionID, build,
-			zap.String("channel_fanout_kind", "sync_origin_push"),
-			zap.Int64("channel_id", channelID),
-			zap.Int("scope", int(scope)),
-		)
-		if !ok {
-			return
-		}
-	}
 }
 
 func tgEmptyUpdates(date int) *tg.Updates {

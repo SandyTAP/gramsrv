@@ -10,6 +10,7 @@ import (
 	appchannels "telesrv/internal/app/channels"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 	"testing"
 	"time"
@@ -46,6 +47,8 @@ func newReactionPolicyFixture(t *testing.T, broadcast bool) reactionPolicyFixtur
 	channelStore := memory.NewChannelStore()
 	channelSvc := appchannels.NewService(channelStore)
 	passwordStore := memory.NewPasswordStore()
+	deliveryOutbox := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(deliveryOutbox)
 	accountSvc := appaccount.NewService(passwordStore, appaccount.WithReactionSettings(passwordStore))
 	created, err := channelSvc.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		Title:         "Reaction Policy",
@@ -68,10 +71,11 @@ func newReactionPolicyFixture(t *testing.T, broadcast bool) reactionPolicyFixtur
 	}
 	sessions := &captureSessions{}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Account:  accountSvc,
-		Channels: channelSvc,
-		Sessions: sessions,
+		Users:          appusers.NewService(userStore),
+		Account:        accountSvc,
+		Channels:       channelSvc,
+		Sessions:       sessions,
+		DeliveryOutbox: deliveryOutbox,
 	}, zaptest.NewLogger(t), clock.System)
 	return reactionPolicyFixture{
 		router:     r,
@@ -161,6 +165,7 @@ func TestSendPaidReactionUsesAtomicChannelSettlement(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("enable paid reactions: %v", err)
 	}
+	f.sessions.clearMessages()
 	f.sessions.channelViewers = map[int64][]int64{f.channel.ID: {f.member2ID}}
 	req := &tg.MessagesSendPaidReactionRequest{
 		Peer:     &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash},
@@ -302,6 +307,10 @@ func TestSendPaidReactionChannelSendAsAuthorizationAndProjection(t *testing.T) {
 	ownedPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: owned.Channel.ID}
 	if _, err := f.accountSvc.SetPaidReactionPrivacy(ctx, f.memberID, domain.PaidReactionPrivacy{
 		Kind: domain.PaidReactionPrivacyPeer, Peer: &ownedPeer,
+	}, func(domain.AccountReactionSettings) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: f.memberID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	}); err != nil {
 		t.Fatalf("save account-default paid reaction channel: %v", err)
 	}
@@ -380,6 +389,7 @@ func TestSendReactionAllowsCustomEmojiFromChannelPolicy(t *testing.T) {
 		t.Fatalf("off-whitelist emoji err = %v, want REACTION_INVALID", err)
 	}
 
+	f.sessions.clearMessages()
 	f.sessions.channelViewers = map[int64][]int64{f.channel.ID: {f.member2ID}}
 	sent, err := f.sendTLReactions(t, f.memberID, &tg.ReactionCustomEmoji{DocumentID: customDocumentID})
 	if err != nil {
@@ -394,16 +404,8 @@ func TestSendReactionAllowsCustomEmojiFromChannelPolicy(t *testing.T) {
 		t.Fatalf("custom reaction = %T %+v, want document %d", update.Reactions.Results[0].Reaction, update.Reactions.Results[0].Reaction, customDocumentID)
 	}
 
-	pushed := f.sessions.pushedUserIDs()
-	foundOtherViewer := false
-	for _, userID := range pushed {
-		if userID == f.member2ID {
-			foundOtherViewer = true
-			break
-		}
-	}
-	if !foundOtherViewer {
-		t.Fatalf("pushed users = %+v, want other online member %d", pushed, f.member2ID)
+	if pushed := f.sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("Core directly pushed reaction mutation to users %v", pushed)
 	}
 }
 
@@ -543,7 +545,7 @@ func TestBroadcastReactionsHideRecentReactors(t *testing.T) {
 	}
 }
 
-func TestChannelRealtimeFanoutPassesCapToProvider(t *testing.T) {
+func TestChannelReactionDoesNotEnumerateRealtimeFanout(t *testing.T) {
 	f := newReactionPolicyFixture(t, false)
 	f.sessions.channelViewers = map[int64][]int64{f.channel.ID: {f.memberID}}
 
@@ -553,7 +555,7 @@ func TestChannelRealtimeFanoutPassesCapToProvider(t *testing.T) {
 	f.sessions.mu.Lock()
 	gotLimit := f.sessions.channelViewersLimit
 	f.sessions.mu.Unlock()
-	if gotLimit != domain.MaxChannelRealtimeFanout {
-		t.Fatalf("online viewers limit = %d, want MaxChannelRealtimeFanout %d", gotLimit, domain.MaxChannelRealtimeFanout)
+	if gotLimit != 0 {
+		t.Fatalf("Core enumerated online channel viewers with limit %d", gotLimit)
 	}
 }

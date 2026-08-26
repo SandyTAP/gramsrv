@@ -7,13 +7,14 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 // makeBot 创建一个 owned bot，返回其 user。
 func makeBot(t *testing.T, svc *Service, owner domain.User, name, username string) domain.User {
 	t.Helper()
-	u, _, err := svc.CreateBot(context.Background(), owner.ID, name, username)
+	u, _, err := svc.CreateBotWithDelivery(context.Background(), owner.ID, name, username, appBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot %q: %v", username, err)
 	}
@@ -63,36 +64,54 @@ func TestSetBotCommandsAndBump(t *testing.T) {
 }
 
 func TestSetBotInfoFields(t *testing.T) {
-	svc, users, _, _ := newTestService(t)
+	svc, users, botStore, _ := newTestService(t)
 	owner := newOwner(t, users, "+2001")
 	bot := makeBot(t, svc, owner, "Info Bot", "info_test_bot")
 	ctx := context.Background()
 
-	if _, err := svc.SetBotInfo(ctx, bot.ID, domain.BotInfoUpdate{
+	if _, err := svc.SetBotInfoWithDelivery(ctx, bot.ID, domain.BotInfoUpdate{
 		SetName: true, Name: "Renamed Bot",
 		SetAbout: true, About: "about line",
 		SetDescription: true, Description: "what this bot does",
-	}); err != nil {
+	}, appBotInfoEffects); err != nil {
 		t.Fatalf("set bot info: %v", err)
 	}
-	name, about, description, err := svc.GetBotInfo(ctx, bot.ID)
+	info, err := svc.GetBotInfo(ctx, bot.ID, "")
 	if err != nil {
 		t.Fatalf("get bot info: %v", err)
 	}
-	if name != "Renamed Bot" || about != "about line" || description != "what this bot does" {
-		t.Fatalf("bot info = name=%q about=%q desc=%q", name, about, description)
+	if info.Name != "Renamed Bot" || info.About != "about line" || info.Description != "what this bot does" {
+		t.Fatalf("bot info = %+v", info)
 	}
 	// name 落到 users.first_name。
 	u, _, _ := users.ByID(ctx, bot.ID)
 	if u.FirstName != "Renamed Bot" || u.About != "about line" {
 		t.Fatalf("user row = first_name=%q about=%q, want name/about persisted", u.FirstName, u.About)
 	}
+	if _, err := svc.SetBotInfoWithDelivery(ctx, bot.ID, domain.BotInfoUpdate{LangCode: "zh-Hans", SetName: true, Name: "本地名称"}, appBotInfoEffects); err != nil {
+		t.Fatalf("set localized bot info: %v", err)
+	}
+	localized, err := svc.GetBotInfo(ctx, bot.ID, "zh-hans")
+	if err != nil || localized.Name != "本地名称" || localized.About != info.About || localized.Description != info.Description {
+		t.Fatalf("localized info = %+v err=%v", localized, err)
+	}
+	defaults, err := svc.GetBotInfo(ctx, bot.ID, "")
+	if err != nil || defaults.Name != info.Name {
+		t.Fatalf("localized write changed default = %+v err=%v", defaults, err)
+	}
+	rowsBeforeReplay := len(botStore.DeliveryOutbox().Snapshot())
+	if version, err := svc.SetBotInfoWithDelivery(ctx, bot.ID, domain.BotInfoUpdate{LangCode: "zh-hans", SetName: true, Name: "本地名称"}, appBotInfoEffects); err != nil || version != 0 {
+		t.Fatalf("localized replay = version:%d err:%v", version, err)
+	}
+	if len(botStore.DeliveryOutbox().Snapshot()) != rowsBeforeReplay {
+		t.Fatal("localized replay appended delivery")
+	}
 	// 空 name 非法。
-	if _, err := svc.SetBotInfo(ctx, bot.ID, domain.BotInfoUpdate{SetName: true, Name: "  "}); err != domain.ErrBotInfoInvalid {
+	if _, err := svc.SetBotInfoWithDelivery(ctx, bot.ID, domain.BotInfoUpdate{SetName: true, Name: "  "}, appBotInfoEffects); err != domain.ErrBotInfoInvalid {
 		t.Fatalf("empty name err = %v, want ErrBotInfoInvalid", err)
 	}
 	// 全空更新非法。
-	if _, err := svc.SetBotInfo(ctx, bot.ID, domain.BotInfoUpdate{}); err != domain.ErrBotInfoInvalid {
+	if _, err := svc.SetBotInfoWithDelivery(ctx, bot.ID, domain.BotInfoUpdate{}, appBotInfoEffects); err != domain.ErrBotInfoInvalid {
 		t.Fatalf("noop update err = %v, want ErrBotInfoInvalid", err)
 	}
 }
@@ -403,6 +422,7 @@ func TestRevokeBotTokenRevokesSessions(t *testing.T) {
 	users := memory.NewUserStore()
 	bots := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
+	bots.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
 	messages := memory.NewMessageStore(dialogs)
 	rev := &captureRevoker{}
 	svc := NewService(users, bots, messages)
@@ -421,8 +441,10 @@ func TestRevokeBotTokenRevokesSessions(t *testing.T) {
 
 func TestDeleteBotFailsClosedWhenSessionRevocationFails(t *testing.T) {
 	users := memory.NewUserStore()
-	botStore := &countingBotStore{BotStore: memory.NewBotStore(users)}
 	dialogs := memory.NewDialogStore()
+	memoryBots := memory.NewBotStore(users)
+	memoryBots.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())
+	botStore := &countingBotStore{BotStore: memoryBots}
 	messages := memory.NewMessageStore(dialogs)
 	revocationErr := errors.New("authorization store unavailable")
 	rev := &captureRevoker{err: revocationErr}
@@ -431,7 +453,7 @@ func TestDeleteBotFailsClosedWhenSessionRevocationFails(t *testing.T) {
 	owner := newOwner(t, users, "+2099")
 	bot := makeBot(t, svc, owner, "Delete Guard Bot", "delete_guard_bot")
 
-	if _, err := svc.DeleteBot(context.Background(), bot.ID); !errors.Is(err, domain.ErrBotSessionsNotRevoked) {
+	if _, err := svc.DeleteBotWithDelivery(context.Background(), bot.ID, appBotLifecycleEffects); !errors.Is(err, domain.ErrBotSessionsNotRevoked) {
 		t.Fatalf("DeleteBot error=%v, want ErrBotSessionsNotRevoked", err)
 	}
 	if botStore.deleteCalls != 0 {
@@ -442,7 +464,7 @@ func TestDeleteBotFailsClosedWhenSessionRevocationFails(t *testing.T) {
 	}
 
 	rev.err = nil
-	deleted, err := svc.DeleteBot(context.Background(), bot.ID)
+	deleted, err := svc.DeleteBotWithDelivery(context.Background(), bot.ID, appBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("DeleteBot after revocation recovery: %v", err)
 	}
@@ -476,10 +498,8 @@ func TestBotWriteAccessGrant(t *testing.T) {
 }
 
 type captureRevoker struct {
-	botUserID        int64
-	pushedCommandsTo int64
-	pushedCommands   []domain.BotCommand
-	err              error
+	botUserID int64
+	err       error
 }
 
 func (c *captureRevoker) RevokeBotSessions(_ context.Context, botUserID int64) error {
@@ -487,9 +507,48 @@ func (c *captureRevoker) RevokeBotSessions(_ context.Context, botUserID int64) e
 	return c.err
 }
 
-func (c *captureRevoker) PushBotCommandsChanged(_ context.Context, botUserID int64, commands []domain.BotCommand) {
-	c.pushedCommandsTo = botUserID
-	c.pushedCommands = append([]domain.BotCommand(nil), commands...)
+func appBotLifecycleEffects(snapshot store.BotLifecycleDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+		TargetUserID: snapshot.OwnerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+	})}, nil
 }
 
-func (c *captureRevoker) PushStickerSetsChanged(context.Context, int64, domain.StickerSetKind) {}
+func appBotInfoEffects(snapshot store.UserAudienceDeliverySnapshot) ([]store.DeliveryEffect, error) {
+	effects := make([]store.DeliveryEffect, len(snapshot.Audience))
+	for i, viewerID := range snapshot.Audience {
+		effects[i] = store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: viewerID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})
+	}
+	return effects, nil
+}
+
+func (c *captureRevoker) BotLifecycleDeliveryEffects(context.Context) store.DeliveryEffectsBuilder[store.BotLifecycleDeliverySnapshot] {
+	return appBotLifecycleEffects
+}
+
+func (c *captureRevoker) BotInfoDeliveryEffects(context.Context) store.DeliveryEffectsBuilder[store.UserAudienceDeliverySnapshot] {
+	return appBotInfoEffects
+}
+
+func (c *captureRevoker) BotCommandsDeliveryEffects(_ context.Context) store.DeliveryEffectsBuilder[store.BotCommandsDeliverySnapshot] {
+	return func(snapshot store.BotCommandsDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		effects := make([]store.DeliveryEffect, len(snapshot.Audience))
+		for i, viewerID := range snapshot.Audience {
+			effects[i] = store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+				TargetUserID: viewerID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+			})
+		}
+		return effects, nil
+	}
+}
+
+func (c *captureRevoker) StickerSetDeliveryEffects(_ context.Context, userID int64) store.DeliveryEffectsBuilder[store.StickerSetMutation] {
+	return func(store.StickerSetMutation) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}
+}
+
+func (c *captureRevoker) InvalidateStickerSetCatalog(domain.StickerSetKind) {}

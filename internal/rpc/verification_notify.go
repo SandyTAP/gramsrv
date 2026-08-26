@@ -61,29 +61,12 @@ func (r *Router) NotifyPeerVerified(ctx context.Context, peer domain.Peer) error
 	}
 }
 
-// notifyUserVerified covers ordinary accounts and bots alike: a verified bot is a
-// user#b1b8cc83 with verified:flags.17, so it takes the same audience-wide
-// updateUser fan-out the moderation flags use (owner plus every online account
-// that already sees the peer).
+// User-target delivery is committed by verificationPeerVerifier inside the
+// decision transaction. This post-commit hook is cache invalidation only; it may
+// never recreate a second delivery path.
 func (r *Router) notifyUserVerified(ctx context.Context, userID int64) error {
-	// Invalidate first and unconditionally: a decided application whose projection
-	// still says "not verified" would keep serving the stale badge state even if the
-	// push below cannot run.
 	r.invalidateRPCProjectionForUser(userID)
-	if r.deps.Users == nil {
-		return nil
-	}
-	user, found, err := r.verificationUser(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("notify peer verified: load user %d: %w", userID, err)
-	}
-	if !found || user.ID == 0 {
-		return fmt.Errorf("notify peer verified: user %d not found", userID)
-	}
-	// NotifyUserModerationFlagsChanged re-projects the peer per recipient, so the
-	// snapshot handed in only carries identity; the pushed tg.User is always built
-	// from a fresh read.
-	return r.NotifyUserModerationFlagsChanged(ctx, user)
+	return nil
 }
 
 func (r *Router) verificationUser(ctx context.Context, userID int64) (domain.User, bool, error) {

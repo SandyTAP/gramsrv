@@ -41,10 +41,6 @@ func (r *Router) onMessagesDeleteParticipantReaction(ctx context.Context, req *t
 		return nil, channelInvalidErr(err)
 	}
 	updates := r.channelMessageReactionsUpdates(ctx, userID, res)
-	moderationIDs := []int{res.Message.ID}
-	r.pushChannelViewerUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelReactionsViewerUpdates(ctx, userID, viewerUserID, res, moderationIDs)
-	})
 	return updates, nil
 }
 
@@ -67,7 +63,7 @@ func (r *Router) onMessagesDeleteParticipantReactions(ctx context.Context, req *
 	if !ok {
 		return false, channelInvalidErr(domain.ErrChannelInvalid)
 	}
-	res, err := moderator.DeleteParticipantReactions(ctx, userID, domain.DeleteChannelParticipantReactionsRequest{
+	_, err = moderator.DeleteParticipantReactions(ctx, userID, domain.DeleteChannelParticipantReactionsRequest{
 		UserID:            userID,
 		ChannelID:         peer.ID,
 		ParticipantUserID: participant.ID,
@@ -76,22 +72,6 @@ func (r *Router) onMessagesDeleteParticipantReactions(ctx context.Context, req *
 	})
 	if err != nil {
 		return false, channelInvalidErr(err)
-	}
-	if len(res.Messages) > 0 {
-		reactionRes := domain.ChannelMessageReactionsResult{
-			Channel:    res.Channel,
-			Messages:   res.Messages,
-			Recipients: res.Recipients,
-		}
-		ids := make([]int, 0, len(res.Messages))
-		for _, msg := range res.Messages {
-			if msg.ID > 0 {
-				ids = append(ids, msg.ID)
-			}
-		}
-		r.pushChannelViewerUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-			return r.channelReactionsViewerUpdates(ctx, userID, viewerUserID, reactionRes, ids)
-		})
 	}
 	return true, nil
 }

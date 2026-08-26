@@ -20,7 +20,7 @@ func TestBroadcastDeliveryPreservesAutoEntitiesInHistoryAndUpdates(t *testing.T)
 	recipient := createLoginCodeDeliveryTestUser(t, ctx, pool, "BroadcastEntities")
 
 	broadcasts := NewBroadcastStore(pool)
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	service := broadcastapp.NewService(broadcasts, messages, nil)
 	const text = "اعلان 🚀\n\n@matrixG"
 	want := []domain.MessageEntity{{Type: domain.MessageEntityMention, Offset: 10, Length: 8}}
@@ -143,7 +143,7 @@ func TestBroadcastSelectedClaimsAreDisjointAndDeliveryIsIncomingOnly(t *testing.
 	systemBoxesBefore := broadcastFactCount(t, ctx, pool, `SELECT count(*)::int FROM message_boxes WHERE owner_user_id = $1`, domain.OfficialSystemUserID)
 	systemEventsBefore := broadcastFactCount(t, ctx, pool, `SELECT count(*)::int FROM user_update_events WHERE user_id = $1`, domain.OfficialSystemUserID)
 	systemOutboxBefore := broadcastFactCount(t, ctx, pool, `SELECT count(*)::int FROM dispatch_outbox WHERE target_user_id = $1`, domain.OfficialSystemUserID)
-	msg, err := NewMessageStore(pool).DeliverBroadcastRecipient(ctx, firstClaims[0])
+	msg, err := newTestMessageStore(pool).DeliverBroadcastRecipient(ctx, firstClaims[0])
 	if err != nil {
 		t.Fatalf("DeliverBroadcastRecipient: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestBroadcastSelectedClaimsAreDisjointAndDeliveryIsIncomingOnly(t *testing.
 	}
 	assertBroadcastDeliveryFacts(t, ctx, pool, firstClaims[0], msg)
 
-	if _, err := NewMessageStore(pool).DeliverBroadcastRecipient(ctx, firstClaims[0]); !errors.Is(err, domain.ErrBroadcastLeaseLost) {
+	if _, err := newTestMessageStore(pool).DeliverBroadcastRecipient(ctx, firstClaims[0]); !errors.Is(err, domain.ErrBroadcastLeaseLost) {
 		t.Fatalf("replay delivery error = %v, want lease lost", err)
 	}
 	if got := broadcastWatermark(t, ctx, pool, firstClaims[0].UserID); got != msg.Pts {
@@ -184,10 +184,10 @@ func TestBroadcastSelectedClaimsAreDisjointAndDeliveryIsIncomingOnly(t *testing.
 	if len(reclaimed) != 1 || reclaimed[0].RecipientID != secondClaims[0].RecipientID || reclaimed[0].Attempts != 2 {
 		t.Fatalf("reclaimed claims = %+v, want second recipient attempt 2", reclaimed)
 	}
-	if _, err := NewMessageStore(pool).DeliverBroadcastRecipient(ctx, secondClaims[0]); !errors.Is(err, domain.ErrBroadcastLeaseLost) {
+	if _, err := newTestMessageStore(pool).DeliverBroadcastRecipient(ctx, secondClaims[0]); !errors.Is(err, domain.ErrBroadcastLeaseLost) {
 		t.Fatalf("stale claimant delivery error = %v, want lease lost", err)
 	}
-	if _, err := NewMessageStore(pool).DeliverBroadcastRecipient(ctx, reclaimed[0]); err != nil {
+	if _, err := newTestMessageStore(pool).DeliverBroadcastRecipient(ctx, reclaimed[0]); err != nil {
 		t.Fatalf("deliver second recipient: %v", err)
 	}
 	var sentCount int64

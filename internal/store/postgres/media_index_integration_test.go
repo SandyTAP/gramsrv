@@ -19,7 +19,7 @@ func TestChannelMediaIndexSearch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	var channelID int64
 	t.Cleanup(func() {
 		if channelID != 0 {
@@ -176,7 +176,7 @@ func TestPrivateMediaCategoryCountsMaterialized(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	docMedia := func(attrs ...domain.DocumentAttribute) *domain.MessageMedia {
 		return &domain.MessageMedia{Kind: domain.MessageMediaKindDocument, Document: &domain.Document{ID: 2, AccessHash: 2, Attributes: attrs}}
 	}

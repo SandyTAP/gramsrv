@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
 
 // TestUpdateEventAppendDiscussionTypes 回归迁移 0003：forum 话题已读的 durable 事件类型
@@ -27,35 +28,76 @@ func TestUpdateEventAppendDiscussionTypes(t *testing.T) {
 
 	store := NewUpdateEventStore(pool)
 	const channelID = int64(990077)
-	for _, et := range []domain.UpdateEventType{
-		domain.UpdateEventReadChannelDiscussionInbox,
-		domain.UpdateEventReadChannelDiscussionOutbox,
-	} {
+	type discussionWant struct {
+		eventType domain.UpdateEventType
+		topMsgID  int
+		maxID     int
+		pts       int
+	}
+	wants := []discussionWant{
+		{eventType: domain.UpdateEventReadChannelDiscussionInbox, topMsgID: 51, maxID: 100},
+		{eventType: domain.UpdateEventReadChannelDiscussionOutbox, topMsgID: 52, maxID: 101},
+	}
+	for i := range wants {
+		want := &wants[i]
+		et := want.eventType
 		ev, aerr := store.AppendAllocated(ctx, u.ID, domain.UpdateEvent{
 			Type:     et,
 			Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
-			TopMsgID: 51,
-			MaxID:    100,
+			TopMsgID: want.topMsgID,
+			MaxID:    want.maxID,
 			PtsCount: 1,
-			Date:     1700000900,
+			Date:     1700000900 + i,
 		})
 		if aerr != nil {
 			t.Fatalf("append %s 失败（迁移 0003 约束白名单是否缺该类型?）: %v", et, aerr)
 		}
-		if ev.Pts <= 0 {
-			t.Fatalf("append %s: pts=%d, want >0", et, ev.Pts)
+		if ev.Pts <= 0 || ev.PtsCount != 1 {
+			t.Fatalf("append %s: pts=%d pts_count=%d, want one allocated account PTS", et, ev.Pts, ev.PtsCount)
 		}
+		want.pts = ev.Pts
 	}
 
 	events, err := store.ListAfter(ctx, u.ID, 0, 50)
 	if err != nil {
 		t.Fatalf("list after: %v", err)
 	}
-	seen := map[domain.UpdateEventType]bool{}
-	for _, e := range events {
-		seen[e.Type] = true
+	seen := make(map[domain.UpdateEventType]domain.UpdateEvent, len(events))
+	for _, event := range events {
+		seen[event.Type] = event
 	}
-	if !seen[domain.UpdateEventReadChannelDiscussionInbox] || !seen[domain.UpdateEventReadChannelDiscussionOutbox] {
-		t.Fatalf("discussion 已读事件无法经 ListAfter 回放（多设备 getDifference 同步缺失）: seen=%v", seen)
+	for _, want := range wants {
+		got, ok := seen[want.eventType]
+		if !ok {
+			t.Fatalf("discussion event %s missing from ListAfter: seen=%v", want.eventType, seen)
+		}
+		if got.TopMsgID != want.topMsgID || got.MaxID != want.maxID || got.Pts != want.pts || got.PtsCount != 1 {
+			t.Fatalf("ListAfter %s = top_msg_id=%d max_id=%d pts=%d/%d, want %d/%d pts=%d/1",
+				want.eventType, got.TopMsgID, got.MaxID, got.Pts, got.PtsCount,
+				want.topMsgID, want.maxID, want.pts)
+		}
+	}
+
+	cursors := make([]storepkg.EventCursor, len(wants))
+	for i, want := range wants {
+		cursors[i] = storepkg.EventCursor{UserID: u.ID, Pts: want.pts}
+	}
+	batched, err := store.BatchByCursor(ctx, cursors)
+	if err != nil {
+		t.Fatalf("batch by cursor: %v", err)
+	}
+	batchedByType := make(map[domain.UpdateEventType]domain.UpdateEvent, len(batched))
+	for _, event := range batched {
+		batchedByType[event.Type] = event
+	}
+	for _, want := range wants {
+		got, ok := batchedByType[want.eventType]
+		if !ok || got.TopMsgID != want.topMsgID || got.MaxID != want.maxID || got.Pts != want.pts {
+			t.Fatalf("BatchByCursor %s = %+v, want top_msg_id=%d max_id=%d pts=%d",
+				want.eventType, got, want.topMsgID, want.maxID, want.pts)
+		}
+	}
+	if len(wants) != 2 || wants[1].pts != wants[0].pts+1 {
+		t.Fatalf("payload persistence changed PTS allocation: %+v", wants)
 	}
 }

@@ -391,24 +391,15 @@ func (s *Service) PublishNewMessage(ctx context.Context, userID int64, msg domai
 	}, true, 0, false)
 }
 
-// RecordMessagePoll records a durable marker for message poll state changes
-// (vote / close). updateMessagePoll has no pts fields in Layer 225 — same
-// historical bookkeeping shape pending its own audit.
-func (s *Service) RecordMessagePoll(ctx context.Context, authKeyID [8]byte, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error) {
-	if userID == 0 {
-		userID = msg.OwnerUserID
+// RecordReliableUserEvent is the narrow Core boundary for account events that
+// are produced outside the message transaction but still require durable
+// difference + dispatch semantics. Callers must supply a fully classified
+// domain event; this method never accepts TL payloads.
+func (s *Service) RecordReliableUserEvent(ctx context.Context, stateAuthKeyID [8]byte, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID <= 0 || event.Type == "" || event.Pts != 0 {
+		return domain.UpdateEvent{}, domain.UpdateState{}, fmt.Errorf("invalid reliable user event")
 	}
-	date := msg.Date
-	if date == 0 {
-		date = int(time.Now().Unix())
-	}
-	return s.recordEventWithoutState(ctx, userID, domain.UpdateEvent{
-		Type:     domain.UpdateEventMessagePoll,
-		Date:     date,
-		Message:  msg,
-		Peer:     msg.Peer,
-		PtsCount: 1,
-	})
+	return s.recordEventCore(ctx, stateAuthKeyID, excludeAuthKeyID, userID, event, true, excludeSessionID, stateAuthKeyID != ([8]byte{}))
 }
 
 // RecordStory records a story snapshot change for offline difference replay.
@@ -496,37 +487,6 @@ func (s *Service) RecordNewStoryReaction(ctx context.Context, stateAuthKeyID [8]
 	}, true, excludeSessionID, false)
 }
 
-// RecordQuickReplyMutation records account-local quick reply state changes for
-// multi-device sync. Quick-reply TL updates do not carry pts, so outbox appends
-// auxiliary pts bookkeeping just like other account settings events.
-func (s *Service) RecordQuickReplyMutation(ctx context.Context, stateAuthKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	if userID == 0 {
-		userID = mutation.List.OwnerUserID
-	}
-	event := domain.UpdateEvent{
-		Date:              mutation.Date,
-		PtsCount:          1,
-		QuickReplies:      append([]domain.QuickReply(nil), mutation.List.QuickReplies...),
-		QuickReply:        mutation.QuickReply,
-		QuickReplyMessage: mutation.Message,
-		MessageIDs:        append([]int(nil), mutation.MessageIDs...),
-		MaxID:             mutation.ShortcutID,
-	}
-	switch mutation.Kind {
-	case domain.QuickReplyMutationNew:
-		event.Type = domain.UpdateEventNewQuickReply
-	case domain.QuickReplyMutationDelete:
-		event.Type = domain.UpdateEventDeleteQuickReply
-	case domain.QuickReplyMutationMessage:
-		event.Type = domain.UpdateEventQuickReplyMessage
-	case domain.QuickReplyMutationIDs:
-		event.Type = domain.UpdateEventDeleteQuickReplyMessages
-	default:
-		event.Type = domain.UpdateEventQuickReplies
-	}
-	return s.recordEvent(ctx, stateAuthKeyID, excludeAuthKeyID, userID, event, true, excludeSessionID)
-}
-
 // RecordReadHistory 推进 update 状态并追加一条 read_history_inbox 事件。
 func (s *Service) RecordReadHistory(ctx context.Context, stateAuthKeyID [8]byte, userID int64, read domain.ReadHistoryResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	if userID == 0 {
@@ -544,35 +504,11 @@ func (s *Service) RecordReadHistory(ctx context.Context, stateAuthKeyID [8]byte,
 	}, true, excludeSessionID)
 }
 
-// RecordChannelState 记录当前账号与某频道成员关系变化（leave/kick），
-// 离线设备经 difference 收到 updateChannel 后重拉 channel 状态。
-func (s *Service) RecordChannelState(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	return s.recordEvent(ctx, stateAuthKeyID, excludeAuthKeyID, userID, domain.UpdateEvent{
-		Type:     domain.UpdateEventChannelState,
-		Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
-		PtsCount: 1,
-	}, true, excludeSessionID)
-}
-
 // RecordContactsReset 记录通讯录视角变化，供离线设备通过 updates.getDifference 触发重拉。
 func (s *Service) RecordContactsReset(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	return s.recordEvent(ctx, stateAuthKeyID, excludeAuthKeyID, userID, domain.UpdateEvent{
 		Type:     domain.UpdateEventContactsReset,
 		PtsCount: 1,
-	}, true, excludeSessionID)
-}
-
-// RecordUserEmojiStatus durably synchronizes an absolute emoji-status snapshot
-// to the account's other sessions and offline difference stream.
-func (s *Service) RecordUserEmojiStatus(ctx context.Context, stateAuthKeyID [8]byte, userID int64, status domain.UserEmojiStatus, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	if !status.Valid() {
-		return domain.UpdateEvent{}, domain.UpdateState{}, domain.ErrStarGiftCollectibleInvalid
-	}
-	return s.recordEvent(ctx, stateAuthKeyID, excludeAuthKeyID, userID, domain.UpdateEvent{
-		Type:        domain.UpdateEventUserEmojiStatus,
-		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: userID},
-		EmojiStatus: status,
-		PtsCount:    1,
 	}, true, excludeSessionID)
 }
 
@@ -635,16 +571,6 @@ func (s *Service) RecordDialogUnreadMark(ctx context.Context, stateAuthKeyID [8]
 		Type:     domain.UpdateEventDialogUnreadMark,
 		Peer:     peer,
 		Bool:     unread,
-		PtsCount: 1,
-	}, true, excludeSessionID)
-}
-
-// RecordChannelViewForumAsMessages records a per-account forum presentation state change.
-func (s *Service) RecordChannelViewForumAsMessages(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, enabled bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
-	return s.recordEvent(ctx, stateAuthKeyID, excludeAuthKeyID, userID, domain.UpdateEvent{
-		Type:     domain.UpdateEventChannelViewForum,
-		Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
-		Bool:     enabled,
 		PtsCount: 1,
 	}, true, excludeSessionID)
 }
@@ -724,10 +650,6 @@ func (s *Service) RecordFolderPeers(ctx context.Context, stateAuthKeyID [8]byte,
 
 func (s *Service) recordEvent(ctx context.Context, stateAuthKeyID, excludeAuthKeyID [8]byte, userID int64, event domain.UpdateEvent, dispatch bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	return s.recordEventCore(ctx, stateAuthKeyID, excludeAuthKeyID, userID, event, dispatch, excludeSessionID, true)
-}
-
-func (s *Service) recordEventWithoutState(ctx context.Context, userID int64, event domain.UpdateEvent) (domain.UpdateEvent, domain.UpdateState, error) {
-	return s.recordEventCore(ctx, [8]byte{}, [8]byte{}, userID, event, false, 0, false)
 }
 
 func (s *Service) recordEventCore(ctx context.Context, stateAuthKeyID, excludeAuthKeyID [8]byte, userID int64, event domain.UpdateEvent, dispatch bool, excludeSessionID int64, saveState bool) (domain.UpdateEvent, domain.UpdateState, error) {

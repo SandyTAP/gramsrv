@@ -823,11 +823,11 @@ func TestUsersGetFullUserProjectsOwnerScopedContactNoteAcrossCacheUpdates(t *tes
 	if !ok || !hasUserRefresh(pushed, friend.ID) {
 		t.Fatalf("add contact push = %T %+v, want other-session updateUser refresh", sessions.lastUserPush(), sessions.lastUserPush())
 	}
-	if _, err := contactsService.AddContact(ctx, altOwner.ID, domain.ContactInput{
+	if _, err := contactsService.AddContactWithDelivery(ctx, altOwner.ID, domain.ContactInput{
 		ContactUserID: friend.ID,
 		FirstName:     "Friend",
 		Note:          "alternate note",
-	}); err != nil {
+	}, 1700000400, rpcTestContactMutationEffects); err != nil {
 		t.Fatalf("add alternate owner contact: %v", err)
 	}
 	getNote := func(viewer domain.User) (tg.TextWithEntities, bool) {
@@ -1241,19 +1241,19 @@ func TestContactsAcceptContactReturnsSettingsAndReset(t *testing.T) {
 		t.Fatalf("create bob: %v", err)
 	}
 	contactsSvc := appcontacts.NewService(contactsStore, userStore)
-	if _, err := contactsSvc.AddContact(ctx, alice.ID, domain.ContactInput{
+	if _, err := contactsSvc.AddContactWithDelivery(ctx, alice.ID, domain.ContactInput{
 		ContactUserID: bob.ID,
 		Phone:         bob.Phone,
 		FirstName:     "Bobby",
 		LastName:      "Remark",
-	}); err != nil {
+	}, 1700000400, rpcTestContactMutationEffects); err != nil {
 		t.Fatalf("alice add bob: %v", err)
 	}
-	updatesSvc := &captureUpdates{state: domain.UpdateState{Pts: 10, Date: 1700000400}}
+	eventStore := memory.NewUpdateEventStore()
+	contactsStore.AttachUpdateEventStore(eventStore)
 	r := New(Config{}, Deps{
 		Contacts: contactsSvc,
 		Users:    appusers.NewService(userStore, appusers.WithContactStore(contactsStore)),
-		Updates:  updatesSvc,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000400, 0)})
 
 	out, err := r.onContactsAcceptContact(WithUserID(ctx, alice.ID), &tg.InputUser{UserID: bob.ID, AccessHash: bob.AccessHash})
@@ -1277,14 +1277,22 @@ func TestContactsAcceptContactReturnsSettingsAndReset(t *testing.T) {
 	if _, ok := got.Updates[1].(*tg.UpdateContactsReset); !ok {
 		t.Fatalf("update[1] = %T, want UpdateContactsReset", got.Updates[1])
 	}
-	if len(updatesSvc.events) != 4 {
-		t.Fatalf("recorded events = %+v, want current peer/reset and target peer/reset", updatesSvc.events)
+	aliceEvents, err := eventStore.ListAfter(ctx, alice.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("list alice events: %v", err)
 	}
-	if updatesSvc.events[0].UserID != alice.ID || updatesSvc.events[0].Settings.ShareContact {
-		t.Fatalf("current peer settings event = %+v, want alice share=false", updatesSvc.events[0])
+	bobEvents, err := eventStore.ListAfter(ctx, bob.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("list bob events: %v", err)
 	}
-	if updatesSvc.events[2].UserID != bob.ID || updatesSvc.events[2].Settings.ShareContact {
-		t.Fatalf("target peer settings event = %+v, want bob share=false", updatesSvc.events[2])
+	if len(aliceEvents) != 2 || len(bobEvents) != 2 {
+		t.Fatalf("durable events alice=%+v bob=%+v, want peer/reset for both", aliceEvents, bobEvents)
+	}
+	if aliceEvents[0].Type != domain.UpdateEventPeerSettings || aliceEvents[0].Settings.ShareContact || aliceEvents[1].Type != domain.UpdateEventContactsReset {
+		t.Fatalf("alice events = %+v, want peer settings share=false then reset", aliceEvents)
+	}
+	if bobEvents[0].Type != domain.UpdateEventPeerSettings || bobEvents[0].Settings.ShareContact || bobEvents[1].Type != domain.UpdateEventContactsReset {
+		t.Fatalf("bob events = %+v, want peer settings share=false then reset", bobEvents)
 	}
 	reverse, found, err := contactsStore.Get(ctx, bob.ID, alice.ID)
 	if err != nil || !found {
@@ -1299,7 +1307,10 @@ func TestContactsAddContactPhonePrivacyExceptionUpdatesPeerSettings(t *testing.T
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
 	contactsStore := memory.NewContactStore()
-	privacySvc := appprivacy.NewService(memory.NewPrivacyStore(), contactsStore)
+	privacyStore := memory.NewPrivacyStore()
+	contactsStore.AttachPrivacyStore(privacyStore)
+	contactsStore.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
+	privacySvc := appprivacy.NewService(privacyStore, contactsStore)
 	alice, err := userStore.Create(ctx, domain.User{AccessHash: 31, Phone: "2001", FirstName: "Alice", LastName: "A"})
 	if err != nil {
 		t.Fatalf("create alice: %v", err)

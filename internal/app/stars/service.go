@@ -5,6 +5,7 @@ package stars
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"telesrv/internal/domain"
@@ -72,6 +73,16 @@ func (s *Service) Credit(ctx context.Context, userID, amount int64, reason domai
 	return s.store.Credit(ctx, userID, amount, reason, peer, int(s.now().Unix()), title, desc)
 }
 
+func (s *Service) CreditWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, fmt.Errorf("stars delivery aggregate store is required: %w", store.ErrDeliveryOutboxRequired)
+	}
+	return s.store.CreditWithDelivery(ctx, userID, amount, reason, peer, int(s.now().Unix()), title, desc, effects)
+}
+
 // Debit 从账号扣款（amount>0），余额不足返回 domain.ErrStarsInsufficient。
 // 先确保起始授予已应用，避免新账号在尚未首读余额前借记被误判余额不足。
 func (s *Service) Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error) {
@@ -82,6 +93,16 @@ func (s *Service) Debit(ctx context.Context, userID, amount int64, reason domain
 		return domain.StarsBalance{}, err
 	}
 	return s.store.Debit(ctx, userID, amount, reason, peer, int(s.now().Unix()), title, desc)
+}
+
+func (s *Service) DebitWithDelivery(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string, effects store.DeliveryEffectsBuilder[domain.StarsBalance]) (domain.StarsBalance, error) {
+	if amount <= 0 {
+		return domain.StarsBalance{}, domain.ErrStarsInvalidAmount
+	}
+	if effects == nil {
+		return domain.StarsBalance{}, fmt.Errorf("stars delivery aggregate store is required: %w", store.ErrDeliveryOutboxRequired)
+	}
+	return s.store.DebitWithDelivery(ctx, userID, amount, s.grantAmount, reason, peer, int(s.now().Unix()), title, desc, effects)
 }
 
 // ListTransactions 按方向与顺序做 keyset 分页，首读时惰性授予。
@@ -107,21 +128,20 @@ func (s *Service) IssuePurchaseForm(ctx context.Context, form domain.StarsPurcha
 // Purchase settles one exact persisted form. Package validation remains at
 // the RPC boundary as well, while the store revalidates the persisted tuple
 // under lock before performing any write.
-func (s *Service) Purchase(ctx context.Context, req domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error) {
-	if s.purchaseStore == nil || req.FormID == 0 || req.Date <= 0 || !validPurchaseCommand(req.StarsPurchaseForm) {
+func (s *Service) PurchaseWithDelivery(ctx context.Context, req domain.StarsPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
+	if s.purchaseStore == nil || effects == nil || req.FormID == 0 || req.Date <= 0 || !validPurchaseCommand(req.StarsPurchaseForm) {
 		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
 	}
-	return s.purchaseStore.PurchaseStars(ctx, req)
+	return s.purchaseStore.PurchaseStarsWithDelivery(ctx, req, effects)
 }
 
 // GetGiveawayInfo resolves one launch card from the same aggregate that
 // persisted it. date is supplied by the RPC clock for deterministic tests.
 func (s *Service) GetGiveawayInfo(ctx context.Context, viewerUserID, channelID int64, messageID, date int) (domain.StarsGiveawayInfo, error) {
-	reader, ok := s.purchaseStore.(store.StarsGiveawayStore)
-	if !ok || viewerUserID <= 0 || channelID <= 0 || messageID <= 0 || date <= 0 {
+	if s.purchaseStore == nil || viewerUserID <= 0 || channelID <= 0 || messageID <= 0 || date <= 0 {
 		return domain.StarsGiveawayInfo{}, domain.ErrStarsPurchaseFormInvalid
 	}
-	return reader.GetStarsGiveawayInfo(ctx, viewerUserID, channelID, messageID, date)
+	return s.purchaseStore.GetStarsGiveawayInfo(ctx, viewerUserID, channelID, messageID, date)
 }
 
 func validPurchaseForm(form domain.StarsPurchaseForm) bool {

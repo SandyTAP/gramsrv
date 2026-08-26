@@ -32,7 +32,7 @@ func TestMessageStoreDeleteMessagesRecomputesRecipientUnreadAndTop(t *testing.T)
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	bodies := []string{"one", "two", "three"}
 	sent := make([]domain.SendPrivateTextResult, 0, len(bodies))
 	for i, body := range bodies {
@@ -134,7 +134,7 @@ func TestMessageStoreDeleteMiddleUnreadKeepsRecipientTop(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	recipientPeer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
 	first, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
@@ -252,7 +252,7 @@ func TestMessageStoreDeleteFirstUnreadEmitsSafeUnreadCorrection(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	recipientPeer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
 	first, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    sender.ID,
@@ -328,7 +328,7 @@ func TestMessageStoreDeleteHistoryRebuildsDialogAndEmitsDeleteUpdates(t *testing
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	for i := 0; i < 2; i++ {
 		if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 			SenderUserID:    sender.ID,
@@ -433,7 +433,7 @@ func TestMessageStoreDeleteHistoryJustClearPreservesHistoryClearMessage(t *testi
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, peerUser.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    owner.ID,
 		RecipientUserID: peerUser.ID,
@@ -498,7 +498,7 @@ WHERE target_user_id = $1
   AND pts = ANY($2::int[])
   AND exclude_auth_key_id = $3
   AND exclude_session_id = $4`,
-		owner.ID, []int32{int32(self.Pts - 1), int32(self.Pts)}, int64(7), int64(99)).Scan(&outboxRows); err != nil {
+		owner.ID, []int32{int32(self.Pts - 1), int32(self.Pts)}, []byte{7, 0, 0, 0, 0, 0, 0, 0}, int64(99)).Scan(&outboxRows); err != nil {
 		t.Fatalf("count clear outbox: %v", err)
 	}
 	if outboxRows != 2 {
@@ -526,7 +526,7 @@ func TestMessageStoreDeleteHistoryJustClearRevokeKeepsPerOwnerAnchors(t *testing
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	var last domain.SendPrivateTextResult
 	for i := 0; i < 2; i++ {
 		var err error
@@ -677,7 +677,7 @@ func TestMessageStoreDeleteHistoryJustClearKeepsAnchorAcrossBatches(t *testing.T
 		t.Fatalf("seed dialog: %v", err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: peerUser.ID}
 	first, err := messages.DeleteHistory(ctx, domain.DeleteHistoryRequest{
 		OwnerUserID: owner.ID,

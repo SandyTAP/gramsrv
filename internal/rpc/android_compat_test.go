@@ -197,13 +197,14 @@ func TestLegacyAndroidBotsExportBotTokenDispatch(t *testing.T) {
 	userStore := memory.NewUserStore()
 	botStore := memory.NewBotStore(userStore)
 	dialogStore := memory.NewDialogStore()
+	botStore.AttachDeliveryDependencies(dialogStore, memory.NewDeliveryOutboxStore())
 	messageStore := memory.NewMessageStore(dialogStore)
 	botService := botsapp.NewService(userStore, botStore, messageStore)
 	owner, err := userStore.Create(ctx, domain.User{AccessHash: 93, Phone: "15550001093", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	bot, token, err := botService.CreateBot(ctx, owner.ID, "Android Export", "android_export_bot")
+	bot, token, err := botService.CreateBotWithDelivery(ctx, owner.ID, "Android Export", "android_export_bot", rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}

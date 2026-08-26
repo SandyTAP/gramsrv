@@ -9,22 +9,8 @@ import (
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
-
-type moderationProjectionUsers struct {
-	UsersService
-	audience []int64
-	viewers  []int64
-}
-
-func (s *moderationProjectionUsers) ByIDs(_ context.Context, viewerUserID int64, ids []int64) ([]domain.User, error) {
-	s.viewers = append(s.viewers, viewerUserID)
-	return []domain.User{{ID: ids[0], FirstName: "Flagged", Scam: true}}, nil
-}
-
-func (s *moderationProjectionUsers) ModerationFlagAudience(_ context.Context, _ int64, _ int) ([]int64, error) {
-	return append([]int64(nil), s.audience...), nil
-}
 
 type moderationProjectionChannels struct {
 	ChannelsService
@@ -47,43 +33,35 @@ func (s *moderationProjectionChannels) FilterActiveMemberIDs(_ context.Context, 
 	return append([]int64(nil), userIDs...), nil
 }
 
-func TestUserModerationFlagsPushStandardNonPTSUpdate(t *testing.T) {
+func TestUserAudienceDeliveryEffectsBuildStandardNonPTSUpdate(t *testing.T) {
 	const (
 		targetID        = int64(2002)
 		onlineViewerID  = int64(1001)
 		offlineViewerID = int64(3003)
 	)
-	users := &moderationProjectionUsers{
-		audience: []int64{targetID, onlineViewerID, offlineViewerID},
+	r := New(Config{}, Deps{}, zap.NewNop(), clock.System)
+	effects, err := r.UserAudienceDeliveryEffects(store.UserAudienceDeliverySnapshot{
+		User:     domain.User{ID: targetID, FirstName: "Flagged", Scam: true},
+		Audience: []int64{targetID, onlineViewerID, offlineViewerID},
+	})
+	if err != nil {
+		t.Fatalf("build moderation effects: %v", err)
 	}
-	sessions := &captureSessions{onlineUserIDs: []int64{targetID, onlineViewerID}}
-	dialogs := &captureDialogs{}
-	r := New(Config{}, Deps{Users: users, Sessions: sessions, Dialogs: dialogs}, zap.NewNop(), clock.System)
-
-	if err := r.NotifyUserModerationFlagsChanged(context.Background(), domain.User{
-		ID: targetID, FirstName: "Flagged", Scam: true,
-	}); err != nil {
-		t.Fatalf("notify moderation flags: %v", err)
-	}
-	pushed := sessions.pushedUserIDs()
-	if len(pushed) != 2 || pushed[0] != targetID || pushed[1] != onlineViewerID {
-		t.Fatalf("pushed user ids = %v", pushed)
-	}
-	if len(users.viewers) != 2 || users.viewers[0] != targetID || users.viewers[1] != onlineViewerID {
-		t.Fatalf("projected viewers = %v", users.viewers)
-	}
-	if len(dialogs.invalidatedDialogs) != 3 {
-		t.Fatalf("dialog hash invalidations = %+v, want online and offline audience", dialogs.invalidatedDialogs)
+	if len(effects) != 3 {
+		t.Fatalf("effects = %d, want one durable row per frozen viewer", len(effects))
 	}
 	for i, viewerID := range []int64{targetID, onlineViewerID, offlineViewerID} {
-		got := dialogs.invalidatedDialogs[i]
-		if got.userID != viewerID || got.peer != (domain.Peer{Type: domain.PeerTypeUser, ID: targetID}) {
-			t.Fatalf("dialog hash invalidation[%d] = %+v", i, got)
+		if effects[i].Kind != store.DeliveryEffectAbsolute || effects[i].TargetUserID != viewerID {
+			t.Fatalf("effect[%d] = %+v, want absolute target %d", i, effects[i], viewerID)
 		}
 	}
-	updates, ok := sessions.lastUserPush().(*tg.Updates)
+	decoded, err := decodeDeliveryUpdate(effects[0].Payload)
+	if err != nil {
+		t.Fatalf("decode effect: %v", err)
+	}
+	updates, ok := decoded.(*tg.Updates)
 	if !ok || len(updates.Updates) != 1 {
-		t.Fatalf("updates = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
+		t.Fatalf("updates = %T %+v", decoded, decoded)
 	}
 	refresh, ok := updates.Updates[0].(*tg.UpdateUser)
 	if !ok || refresh.UserID != targetID {
@@ -94,11 +72,8 @@ func TestUserModerationFlagsPushStandardNonPTSUpdate(t *testing.T) {
 			t.Fatalf("synthetic delete bookkeeping leaked into moderation update: %+v", update)
 		}
 	}
-	if len(updates.Users) != 1 {
-		t.Fatalf("users = %+v", updates.Users)
-	}
-	if user, ok := updates.Users[0].(*tg.User); !ok || user.ID != targetID || !user.Scam || user.Fake {
-		t.Fatalf("user = %T %+v", updates.Users[0], updates.Users[0])
+	if len(updates.Users) != 0 {
+		t.Fatalf("audience refresh unexpectedly embedded viewer-specific users: %+v", updates.Users)
 	}
 }
 

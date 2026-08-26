@@ -226,9 +226,6 @@ func TestBotAPISendMessageToSupergroupChatID(t *testing.T) {
 		Channels: channelService,
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
-	cancelFanout := startChannelFanoutForTest(t, r)
-	defer cancelFanout()
-
 	chatID := -botAPIChannelChatIDBase - created.Channel.ID
 	replyKeyboard := &domain.MessageReplyMarkup{
 		Type:     domain.MessageReplyMarkupKeyboard,
@@ -258,8 +255,8 @@ func TestBotAPISendMessageToSupergroupChatID(t *testing.T) {
 		history.Messages[0].ReplyMarkup.Keyboard[0][0].Text != "Help" {
 		t.Fatalf("history messages = %+v, want bot channel message", history.Messages)
 	}
-	if pushed := waitForPushedUserIDs(t, sessions, 1); !fanoutHasID(pushed, owner.ID) {
-		t.Fatalf("fanout pushed = %v, want owner %d to receive online channel update", pushed, owner.ID)
+	if pushed := sessions.pushedUserIDs(); len(pushed) != 0 {
+		t.Fatalf("Core pushed durable channel update directly: %v", pushed)
 	}
 }
 
@@ -402,8 +399,8 @@ func TestBotAPIGetUpdatesReceivesVisibleSupergroupMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
-	if err := fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil); err != nil {
-		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	if err := fixture.router.enqueueBotAPIChannelMessageUpdate(fixture.ctx, fixture.owner.ID, res); err != nil {
+		t.Fatalf("enqueueBotAPIChannelMessageUpdate: %v", err)
 	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
@@ -449,8 +446,8 @@ func TestBotAPIGetUpdatesSkipsHiddenPrivacySupergroupMessage(t *testing.T) {
 	if len(res.SkipDeliveryUserIDs) == 0 {
 		t.Fatalf("SkipDeliveryUserIDs empty, want privacy bot excluded")
 	}
-	if err := fixture.router.enqueueChannelMessageFanout(fixture.ctx, fixture.owner.ID, res, nil); err != nil {
-		t.Fatalf("enqueueChannelMessageFanout: %v", err)
+	if err := fixture.router.enqueueBotAPIChannelMessageUpdate(fixture.ctx, fixture.owner.ID, res); err != nil {
+		t.Fatalf("enqueueBotAPIChannelMessageUpdate: %v", err)
 	}
 
 	events, err := fixture.router.BotAPIUpdates(fixture.ctx, fixture.bot.ID, 0)
@@ -653,11 +650,12 @@ func newBotAPIReceiveFixture(t *testing.T, botChatHistory bool) botAPIReceiveFix
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
 	botStore := memory.NewBotStore(userStore)
-	bot, _, err := botStore.CreateBotAccount(ctx, domain.User{AccessHash: 2001, FirstName: "TetrisBot", Username: "TetrisBot"}, domain.BotProfile{
+	botStore.AttachDeliveryDependencies(dialogStore, memory.NewDeliveryOutboxStore())
+	bot, _, err := botStore.CreateBotAccountWithDelivery(ctx, domain.User{AccessHash: 2001, FirstName: "TetrisBot", Username: "TetrisBot"}, domain.BotProfile{
 		OwnerUserID: owner.ID,
 		TokenSecret: "secret",
 		ChatHistory: botChatHistory,
-	})
+	}, rpcTestBotLifecycleEffects)
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}

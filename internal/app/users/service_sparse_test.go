@@ -57,13 +57,18 @@ func TestByIDsForViewerUserIDsLoadsUnionOnceAndPreservesViewerSemantics(t *testi
 	ownerA, _ := base.Create(ctx, domain.User{Phone: "15550101", FirstName: "Owner A"})
 	ownerB, _ := base.Create(ctx, domain.User{Phone: "15550102", FirstName: "Owner B"})
 	contacts := memory.NewContactStore()
+	contacts.AttachDeliveryOutbox(memory.NewDeliveryOutboxStore())
 	if _, err := contacts.Upsert(ctx, viewerA.ID, domain.ContactInput{ContactUserID: ownerA.ID, FirstName: "Alias A", Phone: "local-a"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := contacts.Upsert(ctx, viewerB.ID, domain.ContactInput{ContactUserID: ownerB.ID, FirstName: "Alias B"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := contacts.SetPersonalPhoto(ctx, viewerA.ID, ownerA.ID, 9901, 1); err != nil || !found {
+	if _, found, err := contacts.SetPersonalPhotoWithDelivery(ctx, viewerA.ID, ownerA.ID, 9901, 1, func(snapshot store.ContactPersonalPhotoDeliverySnapshot) ([]store.DeliveryEffect, error) {
+		return []store.DeliveryEffect{store.AbsoluteDeliveryEffect(store.DeliveryOutboxEnqueue{
+			TargetUserID: snapshot.ViewerUserID, Payload: []byte{1}, RecoveryPolicy: store.OutboxRecoveryAbsoluteReload,
+		})}, nil
+	}); err != nil || !found {
 		t.Fatalf("SetPersonalPhoto: found=%v err=%v", found, err)
 	}
 	rules := memory.NewPrivacyStore()

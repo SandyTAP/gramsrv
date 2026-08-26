@@ -40,7 +40,7 @@ func TestSendPrivateRichMessageSurvivesReadPaths(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	messages := newTestMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 
 	// Blocks 在 store 层是不透明字节（rpc 层 TL 编解码），含 0x00/0xFF/非 UTF-8 以验证
 	// JSONB base64 字节级 round-trip。

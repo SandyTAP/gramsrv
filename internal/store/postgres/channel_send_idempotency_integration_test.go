@@ -36,7 +36,7 @@ func TestChannelSendFingerprintReplayPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Channel replay " + suffix,
@@ -229,7 +229,7 @@ func TestChannelSendFingerprintConcurrentRacePostgres(t *testing.T) {
 	})
 	newChannel := func(title string) int64 {
 		t.Helper()
-		created, err := NewChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner.ID, Title: title + suffix, Megagroup: true, Date: 1700110000})
+		created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner.ID, Title: title + suffix, Megagroup: true, Date: 1700110000})
 		if err != nil {
 			t.Fatalf("create %s channel: %v", title, err)
 		}
@@ -248,7 +248,7 @@ func TestChannelSendFingerprintConcurrentRacePostgres(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				results[i], errs[i] = NewChannelStore(pool).SendChannelMessage(ctx, reqs[i])
+				results[i], errs[i] = newTestChannelStore(pool).SendChannelMessage(ctx, reqs[i])
 			}(i)
 		}
 		close(start)
@@ -319,7 +319,7 @@ func TestChannelSendFingerprintSingleConnectionConflictLookupPostgres(t *testing
 		_, _ = setupPool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, owner.ID)
 	})
 
-	setupChannels := NewChannelStore(setupPool)
+	setupChannels := newTestChannelStore(setupPool)
 	created, err := setupChannels.CreateChannel(setupCtx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "one connection " + suffix, Megagroup: true, Date: 1700120000,
 	})
@@ -369,7 +369,7 @@ func TestChannelSendFingerprintSingleConnectionConflictLookupPostgres(t *testing
 		msgIDs.current[id] = current
 	}
 	oneConnectionStore := func() *ChannelStore {
-		return NewChannelStore(pool, WithChannelAllocators(nil, msgIDs))
+		return newTestChannelStore(pool, WithChannelAllocators(nil, msgIDs))
 	}
 
 	var ordinaryResults [2]domain.SendChannelMessageResult

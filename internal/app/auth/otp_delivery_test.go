@@ -40,7 +40,7 @@ func TestWebhookPhoneLoginUsesRandomSMSCode(t *testing.T) {
 			t.Fatalf("provider called before durable App-code: requests=%d", len(appDelivery.requests))
 		}
 	}}
-	svc := NewService(users, memory.NewAuthorizationStore(), codes, nil, nil, "fixed-code-must-not-leak",
+	svc := NewService(users, newAuthorizationStoreWithDelivery(), codes, nil, nil, "fixed-code-must-not-leak",
 		WithLoginCodeDelivery(appDelivery),
 		WithPhoneCodeDelivery(sender, 6))
 
@@ -67,7 +67,7 @@ func TestWebhookPhoneLoginUsesRandomSMSCode(t *testing.T) {
 	if err != nil || !found || delivery.Kind != domain.AuthCodeDeliverySMS || delivery.Length != 6 {
 		t.Fatalf("delivery=%+v found=%v err=%v", delivery, found, err)
 	}
-	got, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: [8]byte{3}}, req.Recipient, hash, req.Code)
+	got, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: [8]byte{3}}, req.Recipient, hash, req.Code, testAuthorizationDelivery)
 	if err != nil || needSignUp || got.ID != user.ID {
 		t.Fatalf("SignIn user=%+v needSignUp=%v err=%v", got, needSignUp, err)
 	}
@@ -93,7 +93,7 @@ func TestWebhookPhoneLoginCanonicalizesNationalTrunkBeforeOTP(t *testing.T) {
 	if len(sender.requests) != 1 || sender.requests[0].Recipient != "989981679461" {
 		t.Fatalf("OTP requests = %+v, want canonical Iran recipient", sender.requests)
 	}
-	_, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, "989981679461", hash, sender.requests[0].Code)
+	_, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, "989981679461", hash, sender.requests[0].Code, testAuthorizationDelivery)
 	if err != nil || !needSignUp {
 		t.Fatalf("SignIn canonical variant needSignUp=%v err=%v", needSignUp, err)
 	}

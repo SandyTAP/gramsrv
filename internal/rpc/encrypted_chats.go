@@ -59,8 +59,10 @@ func businessAuthKeyIDFrom(ctx context.Context) (int64, bool) {
 	return businessAuthKeyInt64(id), true
 }
 
-// pushUpdateEncryption 把 updateEncryption 投给目标账号或精确绑定设备。targetAuthKeyID=0
-// 仅允许用于 accept 前邀请/撤回；accept 后必须非零，缺少定向 binder 时 fail-closed。
+// pushUpdateEncryption is only the online accelerator for the authoritative
+// encrypted_state_events fact committed with the secret-chat mutation. It
+// never enters an account PTS/non-PTS lane. targetAuthKeyID=0 is account-wide;
+// an accepted chat must use its exact bound device.
 func (r *Router) pushUpdateEncryption(ctx context.Context, targetUserID, targetAuthKeyID int64, chat domain.SecretChat, logMessage string) {
 	now := int(r.clock.Now().Unix())
 	upd := &tg.Updates{
@@ -74,11 +76,11 @@ func (r *Router) pushUpdateEncryption(ctx context.Context, targetUserID, targetA
 		Seq:   0,
 	}
 	if targetAuthKeyID == 0 {
-		r.pushUserMessage(ctx, targetUserID, logMessage, upd)
+		r.pushUserMessageTransient(ctx, targetUserID, logMessage, upd)
 		return
 	}
 	if targeted, ok := r.deps.Sessions.(AuthKeyTargetedSessionPusher); ok {
-		_, _ = targeted.PushToUserAuthKey(ctx, targetUserID, deviceAuthKeyBytes(targetAuthKeyID), proto.MessageFromServer, upd)
+		_, _ = targeted.PushToUserAuthKeyTransient(ctx, targetUserID, deviceAuthKeyBytes(targetAuthKeyID), proto.MessageFromServer, upd, r.cfg.OutboundPushTimeout)
 		return
 	}
 	r.log.Error("secret chat targeted session binder unavailable",

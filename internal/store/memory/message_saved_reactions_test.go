@@ -16,7 +16,7 @@ func TestSavedMessageTagsAssignmentCountsSearchAndDelete(t *testing.T) {
 	thumb := domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "👍"}
 	custom := domain.MessageReaction{Type: domain.MessageReactionCustomEmoji, DocumentID: 90001}
 
-	store := NewMessageStore()
+	store := newMessageStoreWithDelivery()
 	create := func(body string, savedPeer domain.Peer) domain.Message {
 		msg, err := store.Create(ctx, domain.Message{
 			OwnerUserID: userID,
@@ -43,7 +43,8 @@ func TestSavedMessageTagsAssignmentCountsSearchAndDelete(t *testing.T) {
 			MessageID:           msg.ID,
 			Reactions:           reactions,
 			ReactionsPerUserMax: 3,
-		})
+		}, testPrivateReactionEffects)
+
 		if err != nil {
 			t.Fatalf("set saved tags for %d: %v", msg.ID, err)
 		}
@@ -61,7 +62,7 @@ func TestSavedMessageTagsAssignmentCountsSearchAndDelete(t *testing.T) {
 
 	if err := store.UpsertSavedReactionTag(ctx, domain.SavedReactionTag{
 		UserID: userID, Reaction: thumb, Title: "Fav",
-	}); err != nil {
+	}, testSavedReactionTagEffects); err != nil {
 		t.Fatalf("rename saved tag: %v", err)
 	}
 	global, err := store.ListSavedReactionTags(ctx, domain.SavedReactionTagsRequest{UserID: userID, Limit: 100})
@@ -131,7 +132,7 @@ func TestSavedMessageTagsAssignmentCountsSearchAndDelete(t *testing.T) {
 	}
 	if err := store.UpsertSavedReactionTag(ctx, domain.SavedReactionTag{
 		UserID: userID, Reaction: thumb, Title: "ghost",
-	}); err != domain.ErrReactionInvalid {
+	}, testSavedReactionTagEffects); err != domain.ErrReactionInvalid {
 		t.Fatalf("rename unassigned tag err = %v, want ErrReactionInvalid", err)
 	}
 }

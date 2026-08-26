@@ -89,11 +89,15 @@ func (s *Service) SendChangePhoneCode(ctx context.Context, userID int64, authKey
 	return hash, domain.AuthCodeDelivery{Kind: domain.AuthCodeDeliverySMS, Length: len(rec.Code)}, nil
 }
 
-// ChangePhone 验证作用域和验证码后执行原子改号。返回事件用于当前 session 的
-// pts 簿记；其它 session 由 transactional outbox 投递 updateUserPhone。
-func (s *Service) ChangePhone(ctx context.Context, userID int64, authKeyID, originRawAuthKeyID [8]byte, sessionID int64, phone, phoneCodeHash, code string, date int) (domain.PhoneChangeResult, error) {
+// ChangePhoneWithDelivery verifies the scoped code and commits the phone row
+// together with the non-PTS delivery intent. Missing delivery capability fails
+// before the one-shot code is consumed.
+func (s *Service) ChangePhoneWithDelivery(ctx context.Context, userID int64, authKeyID, originRawAuthKeyID [8]byte, sessionID int64, phone, phoneCodeHash, code string, date int, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.PhoneChangeResult, error) {
 	if strings.TrimSpace(phoneCodeHash) == "" || strings.TrimSpace(code) == "" {
 		return domain.PhoneChangeResult{}, domain.ErrPhoneCodeEmpty
+	}
+	if effects == nil {
+		return domain.PhoneChangeResult{}, store.ErrDeliveryOutboxRequired
 	}
 	phone = domain.NormalizePhone(phone)
 	if !domain.ValidPhone(phone) {
@@ -137,7 +141,7 @@ func (s *Service) ChangePhone(ctx context.Context, userID int64, authKeyID, orig
 	if date == 0 {
 		date = int(time.Now().Unix())
 	}
-	result, err := s.phoneChanges.ChangePhone(ctx, domain.PhoneChangeRequest{
+	result, err := s.phoneChanges.ChangePhoneWithDelivery(ctx, domain.PhoneChangeRequest{
 		UserID: userID,
 		Phone:  phone,
 		Date:   date,
@@ -146,7 +150,7 @@ func (s *Service) ChangePhone(ctx context.Context, userID int64, authKeyID, orig
 		// echoes updateUserPhone back to the initiating device and suppresses the wrong session.
 		ExcludeAuthKeyID: originRawAuthKeyID,
 		ExcludeSessionID: sessionID,
-	})
+	}, effects)
 	if err != nil {
 		return domain.PhoneChangeResult{}, err
 	}

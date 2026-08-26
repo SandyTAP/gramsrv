@@ -6,7 +6,7 @@ Builds and restarts the local telesrv Edge process with explicit runtime logs.
 This helper is meant for Windows Edge development loops. It builds the current
 workspace into a staging executable, stops the repo-local Edge process currently
 listening on the configured MTProto port, promotes the new executable, starts it
-hidden, and verifies that the port is listening again. CoreExec and Egress ACK
+hidden, and verifies that the port is listening again. CoreExec and Egress Delivery
 gRPC targets are required because the Edge entrypoint does not run local Core or
 durable ACK writeback code.
 #>
@@ -16,8 +16,8 @@ param(
     [string]$AdvertiseIP,
     [string]$CoreExecGRPCTargets = $env:TELESRV_CORE_EXEC_GRPC_TARGETS,
     [string]$CoreExecToken = $env:TELESRV_CORE_EXEC_TOKEN,
-    [string]$EgressAckGRPCTargets = $env:TELESRV_EGRESS_ACK_GRPC_TARGETS,
-    [string]$EgressAckToken = $env:TELESRV_EGRESS_ACK_TOKEN,
+    [string]$EgressDeliveryGRPCTargets = $env:TELESRV_EGRESS_DELIVERY_GRPC_TARGETS,
+    [string]$EgressDeliveryToken = $env:TELESRV_EGRESS_DELIVERY_TOKEN,
     [string]$ExePath,
     [string]$LogDir,
     [int]$HealthTimeoutSeconds = 20,
@@ -308,14 +308,14 @@ try {
     }
     $env:TELESRV_CORE_EXEC_GRPC_TARGETS = $CoreExecGRPCTargets
     $env:TELESRV_CORE_EXEC_TOKEN = $CoreExecToken
-    if (-not $EgressAckGRPCTargets) {
-        throw "Egress ACK gRPC target is required: pass -EgressAckGRPCTargets or set TELESRV_EGRESS_ACK_GRPC_TARGETS"
+    if (-not $EgressDeliveryGRPCTargets) {
+        throw "Egress Delivery gRPC target is required: pass -EgressDeliveryGRPCTargets or set TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"
     }
-    if (-not $EgressAckToken) {
-        throw "Egress ACK token is required: pass -EgressAckToken or set TELESRV_EGRESS_ACK_TOKEN"
+    if (-not $EgressDeliveryToken) {
+        throw "Egress Delivery token is required: pass -EgressDeliveryToken or set TELESRV_EGRESS_DELIVERY_TOKEN"
     }
-    $env:TELESRV_EGRESS_ACK_GRPC_TARGETS = $EgressAckGRPCTargets
-    $env:TELESRV_EGRESS_ACK_TOKEN = $EgressAckToken
+    $env:TELESRV_EGRESS_DELIVERY_GRPC_TARGETS = $EgressDeliveryGRPCTargets
+    $env:TELESRV_EGRESS_DELIVERY_TOKEN = $EgressDeliveryToken
     if ($AdvertiseIP) {
         $env:TELESRV_ADVERTISE_IP = $AdvertiseIP
     }

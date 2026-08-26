@@ -11,6 +11,7 @@ import (
 
 	aiapp "telesrv/internal/app/ai"
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -84,6 +85,10 @@ func TestAIComposeStyleWebPagePreview(t *testing.T) {
 		EmojiID: 12345,
 		Title:   "Sharp",
 		Prompt:  "Make it crisp.",
+	}, func(domain.AIComposeTone) ([]storepkg.DeliveryEffect, error) {
+		return []storepkg.DeliveryEffect{storepkg.AbsoluteDeliveryEffect(storepkg.DeliveryOutboxEnqueue{
+			TargetUserID: userID, Payload: []byte{1}, RecoveryPolicy: storepkg.OutboxRecoveryAbsoluteReload,
+		})}, nil
 	})
 	if err != nil {
 		t.Fatalf("CreateTone: %v", err)

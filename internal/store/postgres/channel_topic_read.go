@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -89,9 +90,9 @@ func (s *ChannelStore) channelTopicReadBatch(ctx context.Context, channelID, use
 }
 
 // channelTopicTopMessageID 取某 topic 当前最新可见消息 id，作为 readDiscussion 推进上界。
-func (s *ChannelStore) channelTopicTopMessageID(ctx context.Context, channelID int64, topicID, availableMinID int) (int, error) {
+func (s *ChannelStore) channelTopicTopMessageID(ctx context.Context, db sqlcgen.DBTX, channelID int64, topicID, availableMinID int) (int, error) {
 	var v int
-	err := s.db.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 SELECT COALESCE(MAX(cm.id), 0)::int
 FROM channel_messages cm
 WHERE cm.channel_id = $1 AND `+channelTopicMessageCond(topicID, "$2")+` AND cm.id > $3 AND NOT cm.deleted`,
@@ -104,11 +105,55 @@ WHERE cm.channel_id = $1 AND `+channelTopicMessageCond(topicID, "$2")+` AND cm.i
 
 // ReadChannelTopicHistory 推进 viewer 在 forum 单话题的 per-topic 已读水位（messages.readDiscussion），
 // 不碰频道级 channel_members.read_inbox_max_id（消除话题间已读串扰），并返回需推进 outbox 的发送者。
-func (s *ChannelStore) ReadChannelTopicHistory(ctx context.Context, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error) {
+func (s *ChannelStore) ReadChannelTopicHistory(ctx context.Context, req domain.ReadChannelTopicHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelTopicHistoryResult]) (domain.ReadChannelTopicHistoryResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 || req.TopicID <= 0 {
 		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelInvalid
 	}
-	channel, member, err := s.getChannelForMemberOrLinkedGuest(ctx, s.db, req.UserID, req.ChannelID)
+	if effects == nil {
+		return domain.ReadChannelTopicHistoryResult{}, store.ErrDeliveryOutboxRequired
+	}
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("read channel topic history: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("begin read channel topic history: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := lockUsersForUpdate(ctx, tx, req.UserID); err != nil {
+		return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("lock channel topic reader: %w", err)
+	}
+	result, err := s.readChannelTopicHistoryTx(ctx, tx, req)
+	if err != nil {
+		return domain.ReadChannelTopicHistoryResult{}, err
+	}
+	if result.Changed {
+		intents, err := effects(result)
+		if err != nil {
+			return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("build channel topic read delivery effects: %w", err)
+		}
+		if len(intents) == 0 {
+			return domain.ReadChannelTopicHistoryResult{}, store.ErrDeliveryOutboxRequired
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("apply channel topic read delivery effects: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("commit channel topic read: %w", err)
+	}
+	committed = true
+	return result, nil
+}
+
+func (s *ChannelStore) readChannelTopicHistoryTx(ctx context.Context, tx pgx.Tx, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error) {
+	channel, member, err := s.getChannelForMemberOrLinkedGuest(ctx, tx, req.UserID, req.ChannelID)
 	if err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, err
 	}
@@ -118,7 +163,7 @@ func (s *ChannelStore) ReadChannelTopicHistory(ctx context.Context, req domain.R
 	if member.Guest {
 		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelPrivate
 	}
-	topMax, err := s.channelTopicTopMessageID(ctx, req.ChannelID, req.TopicID, member.AvailableMinID)
+	topMax, err := s.channelTopicTopMessageID(ctx, tx, req.ChannelID, req.TopicID, member.AvailableMinID)
 	if err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, err
 	}
@@ -126,14 +171,14 @@ func (s *ChannelStore) ReadChannelTopicHistory(ctx context.Context, req domain.R
 	if maxID <= 0 || maxID > topMax {
 		maxID = topMax
 	}
-	prev, err := s.channelTopicReadInbox(ctx, s.db, req.ChannelID, req.UserID, req.TopicID, member.AvailableMinID)
+	prev, err := s.channelTopicReadInbox(ctx, tx, req.ChannelID, req.UserID, req.TopicID, member.AvailableMinID)
 	if err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, err
 	}
 	if maxID <= prev {
 		return domain.ReadChannelTopicHistoryResult{Channel: channel, TopicID: req.TopicID, MaxID: prev, Changed: false, Pts: channel.Pts}, nil
 	}
-	if _, err := s.db.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 INSERT INTO channel_topic_read (channel_id, user_id, topic_id, read_inbox_max_id, read_inbox_date, updated_at)
 VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (channel_id, user_id, topic_id) DO UPDATE SET
@@ -143,7 +188,7 @@ ON CONFLICT (channel_id, user_id, topic_id) DO UPDATE SET
 		req.ChannelID, req.UserID, req.TopicID, maxID, req.Date); err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, fmt.Errorf("upsert channel topic read inbox: %w", err)
 	}
-	outbox, err := s.advanceChannelTopicReadOutbox(ctx, req.ChannelID, req.UserID, req.TopicID, prev, maxID)
+	outbox, err := s.advanceChannelTopicReadOutbox(ctx, tx, req.ChannelID, req.UserID, req.TopicID, prev, maxID)
 	if err != nil {
 		return domain.ReadChannelTopicHistoryResult{}, err
 	}
@@ -151,10 +196,10 @@ ON CONFLICT (channel_id, user_id, topic_id) DO UPDATE SET
 }
 
 // advanceChannelTopicReadOutbox 推进话题内被本次已读覆盖到的发送者的 per-topic read_outbox 水位，
-// 返回这些发送者用于在线下发 updateReadChannelDiscussionOutbox（已读回执 ✓✓）。回执 UPSERT 幂等，
-// 无需与 inbox 强原子。
-func (s *ChannelStore) advanceChannelTopicReadOutbox(ctx context.Context, channelID, readerUserID int64, topicID, prev, maxID int) ([]domain.ChannelReadOutboxUpdate, error) {
-	rows, err := s.db.Query(ctx, `
+// 返回这些发送者用于 durable updateReadChannelDiscussionOutbox。调用方必须
+// 传入同一事务，使 inbox/outbox 水位与所有 delivery effects 同原子边界。
+func (s *ChannelStore) advanceChannelTopicReadOutbox(ctx context.Context, db sqlcgen.DBTX, channelID, readerUserID int64, topicID, prev, maxID int) ([]domain.ChannelReadOutboxUpdate, error) {
+	rows, err := db.Query(ctx, `
 SELECT DISTINCT cm.sender_user_id
 FROM channel_messages cm
 WHERE cm.channel_id = $1 AND `+channelTopicMessageCond(topicID, "$2")+`
@@ -178,7 +223,7 @@ WHERE cm.channel_id = $1 AND `+channelTopicMessageCond(topicID, "$2")+`
 	}
 	updates := make([]domain.ChannelReadOutboxUpdate, 0, len(senders))
 	for _, sender := range senders {
-		if _, err := s.db.Exec(ctx, `
+		if _, err := db.Exec(ctx, `
 INSERT INTO channel_topic_read (channel_id, user_id, topic_id, read_outbox_max_id, updated_at)
 VALUES ($1, $2, $3, $4, now())
 ON CONFLICT (channel_id, user_id, topic_id) DO UPDATE SET

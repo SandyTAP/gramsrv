@@ -64,8 +64,8 @@ func NewStarGiftLifecycleStore(db sqlcgen.DBTX, messages *MessageStore, tonStart
 // state, collection membership, owner-scoped Stars balance and transaction log.
 // A channel conversion credits the channel ledger, never ActorUserID's personal
 // balance. No external payment or blockchain system participates.
-func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain.StarGiftConvertRequest) (domain.StarGiftConvertResult, error) {
-	if s == nil || s.db == nil || req.ActorUserID <= 0 || !req.Ref.Valid() || req.Date <= 0 {
+func (s *StarGiftLifecycleStore) ConvertStarGiftWithDelivery(ctx context.Context, req domain.StarGiftConvertRequest, effects store.DeliveryEffectsBuilder[domain.StarGiftConvertResult]) (domain.StarGiftConvertResult, error) {
+	if s == nil || s.db == nil || effects == nil || req.ActorUserID <= 0 || !req.Ref.Valid() || req.Date <= 0 {
 		return domain.StarGiftConvertResult{}, domain.ErrStarGiftNotFound
 	}
 	if req.Ref.Owner.Type == domain.PeerTypeUser && req.Ref.Owner.ID != req.ActorUserID {
@@ -190,6 +190,16 @@ func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain
 				return err
 			}
 			result.SourceEdits = edits
+		}
+		intents, err := effects(result)
+		if err != nil {
+			return fmt.Errorf("build star gift conversion delivery: %w", err)
+		}
+		if err := store.ValidateStarGiftConvertDeliveryEffects(result, intents); err != nil {
+			return err
+		}
+		if _, err := applyDeliveryEffectsTx(ctx, tx, intents); err != nil {
+			return fmt.Errorf("apply star gift conversion delivery: %w", err)
 		}
 		return nil
 	})
@@ -434,8 +444,9 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 		return domain.StarGiftTransferResult{}, err
 	}
 	var channelMutationUserIDs []int64
-	var expectedChannelSavedGiftID int64
-	if !transferReplay && req.Ref.Owner.Type == domain.PeerTypeChannel {
+	var sourceProjectionScope userStarGiftProjectionLockScope
+	var expectedSourceSavedGiftID int64
+	if !transferReplay {
 		saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref)
 		if err != nil {
 			return domain.StarGiftTransferResult{}, err
@@ -443,14 +454,22 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 		if !found {
 			return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
 		}
-		expectedChannelSavedGiftID = saved.ID
-		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, saved.ID, req.Ref.Owner.ID)
-		if err != nil {
-			return domain.StarGiftTransferResult{}, err
+		expectedSourceSavedGiftID = saved.ID
+		if saved.Owner.Type == domain.PeerTypeUser {
+			sourceProjectionScope, err = loadSavedUserStarGiftProjectionLockScope(ctx, s.db, saved)
+			if err != nil {
+				return domain.StarGiftTransferResult{}, err
+			}
+		} else {
+			channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, saved.ID, req.Ref.Owner.ID)
+			if err != nil {
+				return domain.StarGiftTransferResult{}, err
+			}
 		}
 	}
 	if req.To.Type != domain.PeerTypeUser {
-		return s.transferStarGiftWithoutPrivateMessage(ctx, req, expectedChannelSavedGiftID, channelMutationUserIDs)
+		return s.transferStarGiftWithoutPrivateMessage(ctx, req, expectedSourceSavedGiftID,
+			sourceProjectionScope, channelMutationUserIDs)
 	}
 	messageReq := domain.SendPrivateTextRequest{
 		SenderUserID: req.ActorUserID, RecipientUserID: req.To.ID,
@@ -463,17 +482,32 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 	var result domain.StarGiftTransferResult
 	var sourceSaved domain.SavedStarGift
 	var channelSourceRefs []starGiftViewerMessageRef
+	projectionUserIDs := make([]int64, 0, len(channelMutationUserIDs)+len(sourceProjectionScope.UserIDs))
+	projectionUserIDs = append(projectionUserIDs, channelMutationUserIDs...)
+	projectionUserIDs = append(projectionUserIDs, sourceProjectionScope.UserIDs...)
 	hooks := privateSendTxHooks{
-		lockUserIDs: channelMutationUserIDs,
+		lockUserIDs: projectionUserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
+			if len(sourceProjectionScope.UserIDs) > 0 {
+				if err := validateUserStarGiftProjectionLockScope(ctx, tx, sourceProjectionScope); err != nil {
+					if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+						return domain.ErrStarGiftTransferUnavailable
+					}
+					return err
+				}
+			}
 			saved, unique, err := lockTransferableStarGift(ctx, tx, req.ActorUserID, req.Ref, req.Date)
 			if err != nil {
 				return err
 			}
-			if expectedChannelSavedGiftID != 0 {
-				if saved.ID != expectedChannelSavedGiftID {
+			if expectedSourceSavedGiftID != 0 && saved.ID != expectedSourceSavedGiftID {
+				return domain.ErrStarGiftTransferUnavailable
+			}
+			if saved.Owner.Type == domain.PeerTypeUser {
+				if !sourceProjectionScope.matches(saved) {
 					return domain.ErrStarGiftTransferUnavailable
 				}
+			} else if expectedSourceSavedGiftID != 0 {
 				channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
 				if err != nil {
 					return err
@@ -531,7 +565,8 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 			result.Saved.FromUserID = req.ActorUserID
 			result.Saved.Unsaved = req.RecipientUnsaved
 			if sourceSaved.Owner.Type == domain.PeerTypeUser {
-				_, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, req.Date)
+				_, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique,
+					sourceProjectionScope, req.Date)
 				return err
 			}
 			if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, channelSourceRefs, req.Date); err != nil {
@@ -582,17 +617,34 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 	}
 	var channelMutationUserIDs []int64
-	var expectedChannelSavedGiftID int64
+	var sourceProjectionScope userStarGiftProjectionLockScope
+	var expectedSourceSavedGiftID int64
 	if !replaying && seller.Type == domain.PeerTypeChannel {
 		if err := s.db.QueryRow(ctx, `SELECT id FROM peer_star_gifts
 WHERE unique_gift_id=$1 AND owner_peer_type='channel' AND owner_peer_id=$2 AND lifecycle_status='active'`,
-			unique.ID, seller.ID).Scan(&expectedChannelSavedGiftID); err != nil {
+			unique.ID, seller.ID).Scan(&expectedSourceSavedGiftID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 			}
 			return domain.StarGiftTransferResult{}, err
 		}
-		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, expectedChannelSavedGiftID, seller.ID)
+		channelMutationUserIDs, err = listChannelStarGiftMutationUserIDs(ctx, s.db, expectedSourceSavedGiftID, seller.ID)
+		if err != nil {
+			return domain.StarGiftTransferResult{}, err
+		}
+	} else if !replaying && seller.Type == domain.PeerTypeUser {
+		saved, found, loadErr := NewStarGiftStore(s.db).GetByRef(ctx, domain.SavedStarGiftRef{
+			Owner: seller,
+			Slug:  unique.Slug,
+		})
+		if loadErr != nil {
+			return domain.StarGiftTransferResult{}, loadErr
+		}
+		if !found || saved.UniqueGiftID != unique.ID {
+			return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
+		}
+		expectedSourceSavedGiftID = saved.ID
+		sourceProjectionScope, err = loadSavedUserStarGiftProjectionLockScope(ctx, s.db, saved)
 		if err != nil {
 			return domain.StarGiftTransferResult{}, err
 		}
@@ -617,9 +669,20 @@ WHERE unique_gift_id=$1 AND owner_peer_type='channel' AND owner_peer_id=$2 AND l
 	var commissionAmount int64
 	var sourceSaved domain.SavedStarGift
 	var channelSourceRefs []starGiftViewerMessageRef
+	projectionUserIDs := make([]int64, 0, len(channelMutationUserIDs)+len(sourceProjectionScope.UserIDs))
+	projectionUserIDs = append(projectionUserIDs, channelMutationUserIDs...)
+	projectionUserIDs = append(projectionUserIDs, sourceProjectionScope.UserIDs...)
 	hooks := privateSendTxHooks{
-		lockUserIDs: channelMutationUserIDs,
+		lockUserIDs: projectionUserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
+			if len(sourceProjectionScope.UserIDs) > 0 {
+				if err := validateUserStarGiftProjectionLockScope(ctx, tx, sourceProjectionScope); err != nil {
+					if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+						return domain.ErrStarGiftResaleUnavailable
+					}
+					return err
+				}
+			}
 			var listingCurrency, sellerType string
 			var listingAmount, sellerID, uniqueID int64
 			if err := tx.QueryRow(ctx, `SELECT l.currency,l.amount,l.seller_peer_type,l.seller_peer_id,u.id
@@ -639,10 +702,14 @@ WHERE unique_gift_id=$1 AND owner_peer_type='channel' AND owner_peer_id=$2 AND l
 			if err != nil || !found || !saved.LifecycleStatus.Live() || saved.Owner != seller {
 				return domain.ErrStarGiftResaleUnavailable
 			}
-			if expectedChannelSavedGiftID != 0 {
-				if saved.ID != expectedChannelSavedGiftID {
+			if expectedSourceSavedGiftID != 0 && saved.ID != expectedSourceSavedGiftID {
+				return domain.ErrStarGiftResaleUnavailable
+			}
+			if saved.Owner.Type == domain.PeerTypeUser {
+				if !sourceProjectionScope.matches(saved) {
 					return domain.ErrStarGiftResaleUnavailable
 				}
+			} else if expectedSourceSavedGiftID != 0 {
 				channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
 				if err != nil {
 					return err
@@ -746,7 +813,8 @@ WHERE unique_gift_id=$1 AND owner_peer_type='channel' AND owner_peer_id=$2 AND l
 			result.Saved.MsgID, result.Saved.SavedID, result.Saved.UpgradeMsgID, result.Saved.Date = msgID, savedID, msgID, req.Date
 			result.Saved.FromUserID = messageSenderID
 			if sourceSaved.Owner.Type == domain.PeerTypeUser {
-				if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, req.Date); err != nil {
+				if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique,
+					sourceProjectionScope, req.Date); err != nil {
 					return err
 				}
 			} else if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, channelSourceRefs, req.Date); err != nil {
@@ -953,6 +1021,25 @@ func (s *StarGiftLifecycleStore) ResolveStarGiftOffer(ctx context.Context, req d
 		return domain.StarGiftOfferResult{}, domain.ErrStarGiftOfferInvalid
 	}
 	offer.Gift = gift
+	var sourceProjectionScope userStarGiftProjectionLockScope
+	var expectedSourceSavedGiftID int64
+	if !req.Decline {
+		saved, savedFound, loadErr := NewStarGiftStore(s.db).GetByRef(ctx, domain.SavedStarGiftRef{
+			Owner: offer.Owner,
+			Slug:  gift.Slug,
+		})
+		if loadErr != nil {
+			return domain.StarGiftOfferResult{}, loadErr
+		}
+		if !savedFound || saved.UniqueGiftID != offer.UniqueGiftID {
+			return domain.StarGiftOfferResult{}, domain.ErrStarGiftOfferInvalid
+		}
+		expectedSourceSavedGiftID = saved.ID
+		sourceProjectionScope, err = loadSavedUserStarGiftProjectionLockScope(ctx, s.db, saved)
+		if err != nil {
+			return domain.StarGiftOfferResult{}, err
+		}
+	}
 	actionKind := domain.MessageServiceActionStarGiftUnique
 	action := &domain.MessageServiceAction{Kind: actionKind, StarGiftUnique: &domain.MessageStarGiftUniqueAction{
 		Gift: gift, FromUserID: req.OwnerUserID,
@@ -970,7 +1057,16 @@ func (s *StarGiftLifecycleStore) ResolveStarGiftOffer(ctx context.Context, req d
 	var commissionAmount int64
 	var sourceSaved domain.SavedStarGift
 	hooks := privateSendTxHooks{
+		lockUserIDs: sourceProjectionScope.UserIDs,
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
+			if len(sourceProjectionScope.UserIDs) > 0 {
+				if err := validateUserStarGiftProjectionLockScope(ctx, tx, sourceProjectionScope); err != nil {
+					if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+						return domain.ErrStarGiftOfferInvalid
+					}
+					return err
+				}
+			}
 			locked, err := scanStarGiftOffer(tx.QueryRow(ctx, `SELECT id,buyer_user_id,owner_peer_type,owner_peer_id,unique_gift_id,
 			 currency,amount,random_id,offer_msg_id,buyer_msg_id,status,created_at,expires_at,resolved_at,balance_after
 			 FROM star_gift_offers WHERE id=$1 FOR UPDATE`, offer.ID))
@@ -992,6 +1088,9 @@ func (s *StarGiftLifecycleStore) ResolveStarGiftOffer(ctx context.Context, req d
 			}
 			saved, found, err := lockSavedStarGiftByUniqueID(ctx, tx, locked.UniqueGiftID)
 			if err != nil || !found || saved.Owner != locked.Owner || !saved.LifecycleStatus.Live() {
+				return domain.ErrStarGiftOfferInvalid
+			}
+			if saved.ID != expectedSourceSavedGiftID || !sourceProjectionScope.matches(saved) {
 				return domain.ErrStarGiftOfferInvalid
 			}
 			current, found, err := NewStarGiftStore(tx).UniqueByID(ctx, locked.UniqueGiftID)
@@ -1061,7 +1160,8 @@ func (s *StarGiftLifecycleStore) ResolveStarGiftOffer(ctx context.Context, req d
 				req.Date, fmt.Sprintf("offer:%d", result.Offer.ID)); err != nil {
 				return err
 			}
-			if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique, req.Date); err != nil {
+			if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, result.Unique,
+				sourceProjectionScope, req.Date); err != nil {
 				return err
 			}
 			return updateStarGiftResaleProjection(ctx, tx, result.Offer.Gift.GiftID)
@@ -1223,23 +1323,39 @@ func (s *StarGiftLifecycleStore) refundPendingStarGiftOffersExcept(ctx context.C
 func (s *StarGiftLifecycleStore) transferStarGiftWithoutPrivateMessage(
 	ctx context.Context,
 	req domain.StarGiftTransferRequest,
-	expectedChannelSavedGiftID int64,
+	expectedSourceSavedGiftID int64,
+	sourceProjectionScope userStarGiftProjectionLockScope,
 	channelMutationUserIDs []int64,
 ) (domain.StarGiftTransferResult, error) {
 	var result domain.StarGiftTransferResult
 	err := withTx(ctx, s.db, "transfer star gift to channel", func(tx pgx.Tx) error {
-		if err := lockUsersForUpdate(ctx, tx, channelMutationUserIDs...); err != nil {
+		projectionUserIDs := make([]int64, 0, len(channelMutationUserIDs)+len(sourceProjectionScope.UserIDs))
+		projectionUserIDs = append(projectionUserIDs, channelMutationUserIDs...)
+		projectionUserIDs = append(projectionUserIDs, sourceProjectionScope.UserIDs...)
+		if err := lockUsersForUpdate(ctx, tx, projectionUserIDs...); err != nil {
 			return err
+		}
+		if len(sourceProjectionScope.UserIDs) > 0 {
+			if err := validateUserStarGiftProjectionLockScope(ctx, tx, sourceProjectionScope); err != nil {
+				if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+					return domain.ErrStarGiftTransferUnavailable
+				}
+				return err
+			}
 		}
 		saved, unique, err := lockTransferableStarGift(ctx, tx, req.ActorUserID, req.Ref, req.Date)
 		if err != nil {
 			return err
 		}
 		var channelSourceRefs []starGiftViewerMessageRef
-		if expectedChannelSavedGiftID != 0 {
-			if saved.ID != expectedChannelSavedGiftID {
+		if expectedSourceSavedGiftID != 0 && saved.ID != expectedSourceSavedGiftID {
+			return domain.ErrStarGiftTransferUnavailable
+		}
+		if saved.Owner.Type == domain.PeerTypeUser {
+			if !sourceProjectionScope.matches(saved) {
 				return domain.ErrStarGiftTransferUnavailable
 			}
+		} else if expectedSourceSavedGiftID != 0 {
 			channelSourceRefs, err = listChannelStarGiftOwnershipMessageRefs(ctx, tx, saved.ID, saved.Owner.ID)
 			if err != nil {
 				return err
@@ -1285,7 +1401,8 @@ func (s *StarGiftLifecycleStore) transferStarGiftWithoutPrivateMessage(
 		}
 		result.Saved, result.Unique, result.Balance = saved, unique, balance
 		if sourceSaved.Owner.Type == domain.PeerTypeUser {
-			if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, unique, req.Date); err != nil {
+			if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, sourceSaved, unique,
+				sourceProjectionScope, req.Date); err != nil {
 				return err
 			}
 		} else if _, err := s.retireChannelStarGiftMessagesTx(ctx, tx, sourceSaved, unique, channelSourceRefs, req.Date); err != nil {
@@ -1647,13 +1764,57 @@ func (s *StarGiftLifecycleStore) resolveStarGiftWithdrawalByUniqueID(ctx context
 	return out, nil
 }
 
+type starGiftWithdrawalProjectionLockScope struct {
+	UniqueGiftID int64
+	Projection   userStarGiftProjectionLockScope
+}
+
+func loadStarGiftWithdrawalProjectionLockScope(
+	ctx context.Context,
+	db sqlcgen.DBTX,
+	providerRequestID string,
+) (starGiftWithdrawalProjectionLockScope, error) {
+	var scope starGiftWithdrawalProjectionLockScope
+	var ownerUserID, savedGiftID int64
+	var msgID, upgradeMsgID int
+	err := db.QueryRow(ctx, `SELECT w.unique_gift_id,w.owner_user_id,p.id,p.msg_id,p.upgrade_msg_id
+FROM star_gift_withdrawal_requests w
+JOIN peer_star_gifts p
+  ON p.unique_gift_id=w.unique_gift_id
+ AND p.owner_peer_type='user'
+ AND p.owner_peer_id=w.owner_user_id
+WHERE w.provider_request_id=$1`, providerRequestID).Scan(
+		&scope.UniqueGiftID, &ownerUserID, &savedGiftID, &msgID, &upgradeMsgID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return starGiftWithdrawalProjectionLockScope{}, domain.ErrStarGiftWithdrawalUnavailable
+	}
+	if err != nil {
+		return starGiftWithdrawalProjectionLockScope{}, err
+	}
+	scope.Projection, err = loadUserStarGiftProjectionLockScope(ctx, db, ownerUserID, savedGiftID, msgID, upgradeMsgID)
+	if err != nil {
+		return starGiftWithdrawalProjectionLockScope{}, err
+	}
+	return scope, nil
+}
+
 func (s *StarGiftLifecycleStore) CompleteStarGiftWithdrawal(ctx context.Context, providerRequestID string, date int) (domain.StarGiftWithdrawal, error) {
 	providerRequestID = strings.TrimSpace(providerRequestID)
 	if providerRequestID == "" || len(providerRequestID) > 256 || date <= 0 {
 		return domain.StarGiftWithdrawal{}, domain.ErrStarGiftWithdrawalUnavailable
 	}
+	lockScope, err := loadStarGiftWithdrawalProjectionLockScope(ctx, s.db, providerRequestID)
+	if err != nil {
+		return domain.StarGiftWithdrawal{}, err
+	}
 	expired := false
-	err := withTx(ctx, s.db, "complete star gift withdrawal", func(tx pgx.Tx) error {
+	err = withTx(ctx, s.db, "complete star gift withdrawal", func(tx pgx.Tx) error {
+		if err := lockUserStarGiftProjectionUsers(ctx, tx, lockScope.Projection); err != nil {
+			if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+				return domain.ErrStarGiftWithdrawalUnavailable
+			}
+			return err
+		}
 		var uniqueID, ownerUserID int64
 		var status string
 		var expiresAt int
@@ -1664,8 +1825,20 @@ WHERE provider_request_id=$1 FOR UPDATE`, providerRequestID).Scan(&uniqueID, &ow
 			}
 			return err
 		}
+		if uniqueID != lockScope.UniqueGiftID || ownerUserID != lockScope.Projection.OwnerUserID {
+			return domain.ErrStarGiftWithdrawalUnavailable
+		}
 		if status == "completed" {
 			return nil
+		}
+		// A concurrent successful completion deletes historical alias refs. Do
+		// not reject that idempotent replay: validate the preflight scope only
+		// after the fenced request row proves this transaction still mutates.
+		if err := validateUserStarGiftProjectionLockScope(ctx, tx, lockScope.Projection); err != nil {
+			if errors.Is(err, errUserStarGiftProjectionLockScopeChanged) {
+				return domain.ErrStarGiftWithdrawalUnavailable
+			}
+			return err
 		}
 		if status != "pending" || expiresAt <= date {
 			expired = true
@@ -1674,6 +1847,9 @@ WHERE provider_request_id=$1 FOR UPDATE`, providerRequestID).Scan(&uniqueID, &ow
 		}
 		saved, found, err := lockSavedStarGiftByUniqueID(ctx, tx, uniqueID)
 		if err != nil || !found || saved.Owner != (domain.Peer{Type: domain.PeerTypeUser, ID: ownerUserID}) || !saved.LifecycleStatus.Live() {
+			return domain.ErrStarGiftWithdrawalUnavailable
+		}
+		if !lockScope.Projection.matches(saved) {
 			return domain.ErrStarGiftWithdrawalUnavailable
 		}
 		unique, found, err := NewStarGiftStore(tx).UniqueByID(ctx, uniqueID)
@@ -1706,7 +1882,7 @@ owner_address=$2,gift_address=$3,craft_chance_permille=0,updated_at=now() WHERE 
 		unique.OwnerAddress = ownerAddress
 		unique.GiftAddress = giftAddress
 		unique.CraftChancePermille = 0
-		if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, saved, unique, date); err != nil {
+		if _, err := s.retireUserStarGiftMessagesTx(ctx, tx, saved, unique, lockScope.Projection, date); err != nil {
 			return err
 		}
 		return updateStarGiftResaleProjection(ctx, tx, unique.GiftID)

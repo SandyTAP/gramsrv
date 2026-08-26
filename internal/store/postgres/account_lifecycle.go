@@ -13,16 +13,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // AccountLifecycleStore is the PostgreSQL implementation of the unified
 // account tombstone and delayed deletion boundary.
 type AccountLifecycleStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	boxIDs store.BoxIDAllocator
 }
 
-func NewAccountLifecycleStore(pool *pgxpool.Pool) *AccountLifecycleStore {
-	return &AccountLifecycleStore{pool: pool}
+func NewAccountLifecycleStore(pool *pgxpool.Pool, boxIDs store.BoxIDAllocator) *AccountLifecycleStore {
+	return &AccountLifecycleStore{pool: pool, boxIDs: boxIDs}
 }
 
 func (s *AccountLifecycleStore) AccountDeletionSnapshot(ctx context.Context, userID int64) (domain.AccountDeletionSnapshot, bool, error) {
@@ -96,7 +98,10 @@ RETURNING id, user_id, requester_auth_key_id, state, reason, confirm_hash_digest
 	if randomID == 0 {
 		randomID = pending.ID
 	}
-	if _, err := NewMessageStore(tx).SendPrivateText(ctx, domain.SendPrivateTextRequest{
+	if s.boxIDs == nil {
+		return domain.AccountDeletionRequest{}, false, ErrBoxIDAllocatorMissing
+	}
+	if _, err := NewMessageStore(tx, WithMessageAllocators(s.boxIDs)).SendPrivateText(ctx, domain.SendPrivateTextRequest{
 		SenderUserID:    domain.OfficialSystemUserID,
 		RecipientUserID: req.UserID,
 		RandomID:        randomID,
@@ -463,8 +468,12 @@ func purgeDeletedBotPrivateState(ctx context.Context, tx pgx.Tx, userID int64, n
 		`DELETE FROM private_media_category_counts WHERE owner_user_id = $1`,
 		`DELETE FROM message_boxes WHERE owner_user_id = $1`,
 		`DELETE FROM dialogs WHERE user_id = $1`,
+		`DELETE FROM dispatch_outbox_attempts WHERE stream_id = $1`,
+		`DELETE FROM dispatch_outbox_lanes WHERE stream_id = $1`,
 		`DELETE FROM dispatch_outbox WHERE target_user_id = $1`,
-		`DELETE FROM dispatch_outbox_user_heads WHERE target_user_id = $1`,
+		`DELETE FROM edge_delivery_outbox_attempts WHERE stream_id = $1`,
+		`DELETE FROM edge_delivery_outbox_lanes WHERE stream_id = $1`,
+		`DELETE FROM edge_delivery_outbox WHERE target_user_id = $1`,
 		`DELETE FROM user_update_events WHERE user_id = $1`,
 		`DELETE FROM user_update_retention WHERE user_id = $1`,
 		`DELETE FROM user_update_watermarks WHERE user_id = $1`,

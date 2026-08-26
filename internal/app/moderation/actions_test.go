@@ -96,7 +96,7 @@ func TestActionWorkerAppliesFakeFlagAndResolvesCase(t *testing.T) {
 	adminActions := &captureModerationAdmin{}
 	worker := NewActionWorker(
 		reports,
-		NewActionExecutor(adminActions, nil, nil, nil),
+		NewActionExecutor(adminActions, nil, nil),
 		zap.NewNop(),
 	)
 	if err := worker.runOnce(ctx); err != nil {
@@ -165,7 +165,7 @@ func TestActionWorkerSupersedesOlderTargetSanction(t *testing.T) {
 	adminActions := &captureModerationAdmin{}
 	worker := NewActionWorker(
 		reports,
-		NewActionExecutor(adminActions, nil, nil, nil),
+		NewActionExecutor(adminActions, nil, nil),
 		zap.NewNop(),
 	)
 	if err := worker.runOnce(ctx); err != nil {
@@ -239,7 +239,7 @@ func TestAppealCannotClearSanctionOwnedByNewerCase(t *testing.T) {
 	}
 	oldCase := createCase(101, "old", "old", now)
 	adminActions := &captureModerationAdmin{}
-	worker := NewActionWorker(reports, NewActionExecutor(adminActions, nil, nil, nil), zap.NewNop())
+	worker := NewActionWorker(reports, NewActionExecutor(adminActions, nil, nil), zap.NewNop())
 	if err := worker.runOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestActionExecutorFreezeDefaultsAndBoundsAppealLink(t *testing.T) {
 	adminActions := &captureModerationAdmin{}
 	issuer := &captureAppealLinkIssuer{returnedToken: "token"}
 	executor := NewActionExecutor(
-		adminActions, nil, nil, nil,
+		adminActions, nil, nil,
 		WithActionClock(func() time.Time { return now }),
 		WithAppealLinks(issuer, "https://example.test/"),
 	)
@@ -352,7 +352,7 @@ func TestActionExecutorNotifiesCommittedAccountDeletion(t *testing.T) {
 	}
 	accounts := &captureModerationAccountDeleter{result: result}
 	notifier := &captureModerationAccountDeletionNotifier{}
-	executor := NewActionExecutor(nil, nil, nil, accounts, WithAccountDeletionNotifier(notifier))
+	executor := NewActionExecutor(nil, nil, accounts, WithAccountDeletionNotifier(notifier))
 	detail := domain.ModerationCaseDetail{
 		Case:      domain.ModerationCase{ID: 10, Target: domain.Peer{Type: domain.PeerTypeUser, ID: 20}},
 		Decisions: []domain.ModerationDecision{{ID: 30, Actor: "reviewer"}},
@@ -380,7 +380,7 @@ func TestActionExecutorNotifiesCommittedAccountDeletion(t *testing.T) {
 		t.Fatalf("notifications after unchanged deletion=%d, want 1", len(notifier.results))
 	}
 
-	withoutNotifier := NewActionExecutor(nil, nil, nil, accounts)
+	withoutNotifier := NewActionExecutor(nil, nil, accounts)
 	if err := withoutNotifier.Execute(context.Background(), detail, action); !errors.Is(err, domain.ErrModerationActionInvalid) {
 		t.Fatalf("delete without runtime notifier err=%v, want ErrModerationActionInvalid", err)
 	}

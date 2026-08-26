@@ -28,7 +28,7 @@ func TestDeleteChannelCascadesLinkedMonoforumPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", owner.ID)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Del Mono BC " + suffix, Broadcast: true, Date: 1700000900,
 	})

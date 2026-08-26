@@ -46,26 +46,6 @@ func (s *ChannelStore) SetForum(_ context.Context, userID, channelID int64, enab
 	return cloneChannel(channel), nil
 }
 
-func (s *ChannelStore) SetChannelViewForumAsMessages(_ context.Context, userID, channelID int64, enabled bool) (bool, error) {
-	if userID == 0 || channelID == 0 {
-		return false, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	channel, err := s.channelForMemberLocked(userID, channelID)
-	if err != nil {
-		return false, nil
-	}
-	dialog := s.dialogForUserLocked(userID, channel)
-	changed := dialog.ViewForumAsMessages != enabled
-	dialog.ViewForumAsMessages = enabled
-	if s.dialogs[userID] == nil {
-		s.dialogs[userID] = make(map[int64]domain.ChannelDialog)
-	}
-	s.dialogs[userID][channelID] = dialog
-	return changed, nil
-}
-
 func (s *ChannelStore) CreateForumTopic(ctx context.Context, req domain.CreateChannelForumTopicRequest) (domain.CreateChannelForumTopicResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 || req.RandomID == 0 {
 		return domain.CreateChannelForumTopicResult{}, domain.ErrChannelInvalid

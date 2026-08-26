@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"strings"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *ChannelStore) SetParticipantsHidden(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error) {
@@ -101,12 +102,7 @@ func (s *ChannelStore) recordPublicJoinRequestTx(ctx context.Context, tx pgx.Tx,
 	} else if !errors.Is(err, domain.ErrChannelPrivate) {
 		return err
 	}
-	if existing, err := s.getPendingInviteImporterTx(ctx, tx, channel.ID, userID, true); err == nil && existing.Requested {
-		return domain.ErrInviteRequestSent
-	} else if err != nil && !errors.Is(err, domain.ErrHideRequesterMissing) {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 INSERT INTO channel_invite_importers (channel_id, invite_id, user_id, date, requested)
 VALUES ($1, 0, $2, $3, true)
 ON CONFLICT (channel_id, user_id) DO UPDATE
@@ -114,15 +110,23 @@ SET invite_id = 0,
     date = EXCLUDED.date,
     requested = true,
     approved_by = 0,
-    updated_at = now()`, channel.ID, userID, date); err != nil {
+    updated_at = now()
+WHERE NOT channel_invite_importers.requested`, channel.ID, userID, date)
+	if err != nil {
 		return fmt.Errorf("insert public channel join request: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrInviteRequestSent
 	}
 	return nil
 }
 
-func (s *ChannelStore) HideChatJoinRequest(ctx context.Context, req domain.HideChannelJoinRequestRequest) (domain.CreateChannelResult, error) {
+func (s *ChannelStore) HideChatJoinRequest(ctx context.Context, req domain.HideChannelJoinRequestRequest, effects store.DeliveryEffectsBuilder[store.ChannelPendingJoinDeliverySnapshot]) (domain.CreateChannelResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 || req.TargetUserID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.CreateChannelResult{}, store.ErrDeliveryOutboxRequired
 	}
 	if req.Date == 0 {
 		req.Date = nowUnix()
@@ -169,6 +173,13 @@ func (s *ChannelStore) HideChatJoinRequest(ctx context.Context, req domain.HideC
 		return domain.CreateChannelResult{}, err
 	} else {
 		result = domain.CreateChannelResult{Channel: channel}
+	}
+	snapshot, err := pendingJoinDeliverySnapshotTx(ctx, tx, result.Channel)
+	if err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	if err := applyPendingJoinDeliveryTx(ctx, tx, snapshot, effects); err != nil {
+		return domain.CreateChannelResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.CreateChannelResult{}, fmt.Errorf("commit hide channel join request: %w", err)

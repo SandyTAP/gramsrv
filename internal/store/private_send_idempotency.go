@@ -9,9 +9,9 @@ import (
 	"telesrv/internal/domain"
 )
 
-const privateSendFingerprintVersion = 1
+const privateSendFingerprintVersion = 2
 
-const channelSendFingerprintVersion = 1
+const channelSendFingerprintVersion = 2
 
 const sendSnapshotVersion = 1
 
@@ -42,6 +42,7 @@ type privateSendFingerprintPayload struct {
 	ViaBotID        int64                      `json:"via_bot_id"`
 	GroupedID       int64                      `json:"grouped_id"`
 	Effect          int64                      `json:"effect"`
+	ClearDraft      bool                       `json:"clear_draft"`
 	ReplyMarkup     *domain.MessageReplyMarkup `json:"reply_markup"`
 	RichMessage     *domain.MessageRichMessage `json:"rich_message"`
 }
@@ -66,6 +67,7 @@ type channelSendFingerprintPayload struct {
 	SendAs      *domain.Peer                 `json:"send_as,omitempty"`
 	Action      *domain.ChannelMessageAction `json:"action,omitempty"`
 	TTLPeriod   int                          `json:"ttl_period"`
+	ClearDraft  bool                         `json:"clear_draft"`
 }
 
 type monoforumSendFingerprintPayload struct {
@@ -81,6 +83,7 @@ type monoforumSendFingerprintPayload struct {
 	NoForwards     bool                   `json:"noforwards"`
 	SuggestedPost  *domain.SuggestedPost  `json:"suggested_post,omitempty"`
 	AllowPaidStars int64                  `json:"allow_paid_stars"`
+	ClearDraft     bool                   `json:"clear_draft"`
 }
 
 // PrivateSendFingerprint returns a SHA-256 fingerprint of the original send
@@ -107,6 +110,7 @@ func PrivateSendFingerprint(req domain.SendPrivateTextRequest) ([]byte, error) {
 		ViaBotID:        req.ViaBotID,
 		GroupedID:       req.GroupedID,
 		Effect:          req.Effect,
+		ClearDraft:      req.ClearDraft,
 		ReplyMarkup:     req.ReplyMarkup,
 		RichMessage:     req.RichMessage,
 	})
@@ -143,6 +147,7 @@ func ChannelSendFingerprint(req domain.SendChannelMessageRequest) ([]byte, error
 		SendAs:      req.SendAs,
 		Action:      req.Action,
 		TTLPeriod:   req.TTLPeriod,
+		ClearDraft:  req.ClearDraft,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal channel send fingerprint: %w", err)
@@ -174,6 +179,7 @@ func MonoforumSendFingerprint(req domain.SendMonoforumMessageRequest) ([]byte, e
 		NoForwards:     req.NoForwards,
 		SuggestedPost:  req.SuggestedPost,
 		AllowPaidStars: req.AllowPaidStars,
+		ClearDraft:     req.ClearDraft,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal monoforum send fingerprint: %w", err)

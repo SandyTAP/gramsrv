@@ -96,16 +96,17 @@ func (r *Router) onChannelsDeleteChannel(ctx context.Context, input tg.InputChan
 		if err != nil {
 			return nil, err
 		}
-		view, _, err := r.deps.Communities.Delete(ctx, userID, community.Community.ID, int(r.clock.Now().Unix()))
+		date := int(r.clock.Now().Unix())
+		view, _, err := r.deps.Communities.Delete(ctx, userID, community.Community.ID, date, r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, communityErr(err)
 		}
 		for _, serviceMessage := range view.ServiceMessages {
-			if err := r.enqueueChannelMessageFanout(ctx, userID, serviceMessage, nil); err != nil {
+			if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, serviceMessage); err != nil {
 				return nil, internalErr()
 			}
 		}
-		return r.communityMutationUpdates(ctx, userID, view, true), nil
+		return r.communityUpdates(view), nil
 	}
 	if r.deps.Channels == nil {
 		return nil, channelInvalidErr(domain.ErrChannelInvalid)
@@ -130,7 +131,7 @@ func (r *Router) onChannelsDeleteChannel(ctx context.Context, input tg.InputChan
 		r.invalidateChannelFullBotInfoCacheForChannel(mono.ID)
 		appendChannelStateUpdates(updates, r.channelStateUpdates(userID, *mono))
 	}
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
+	r.pushTransientChannelMemberUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
 		upd := r.channelStateUpdates(viewerUserID, res.Channel)
 		if mono := res.LinkedMonoforum; mono != nil {
 			appendChannelStateUpdates(upd, r.channelStateUpdates(viewerUserID, *mono))
@@ -203,9 +204,6 @@ func (r *Router) onMessagesUnpinAllMessages(ctx context.Context, req *tg.Message
 		return nil, channelAdminErr(err)
 	}
 	r.invalidateRPCProjectionForChannel(res.Channel.ID)
-	r.enqueueChannelFanout(ctx, channelFanoutMessageBox, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
-		return r.channelPinnedUpdates(viewerUserID, res)
-	})
 	return &tg.MessagesAffectedHistory{
 		Pts:      res.Event.Pts,
 		PtsCount: res.Event.PtsCount,
@@ -290,53 +288,13 @@ func peerIDsExcept(ids []int64, skipIDs ...int64) []int64 {
 	return out
 }
 
-type channelFanoutScope int
+type channelTransientScope int
 
-func (r *Router) recordChannelReadInbox(ctx context.Context, userID int64, read domain.ReadChannelHistoryResult) (domain.UpdateEvent, error) {
-	if !read.Changed || read.ChannelID == 0 {
-		return domain.UpdateEvent{}, nil
-	}
-	date := int(r.clock.Now().Unix())
-	event := domain.UpdateEvent{
-		UserID:           userID,
-		Type:             domain.UpdateEventReadHistoryInbox,
-		Date:             date,
-		Peer:             domain.Peer{Type: domain.PeerTypeChannel, ID: read.ChannelID},
-		MaxID:            read.MaxID,
-		StillUnreadCount: read.StillUnreadCount,
-		ChannelPts:       read.Pts,
-		FolderID:         read.Dialog.FolderID,
-		PtsCount:         1,
-	}
-	// event.Pts 是账号 pts 槽位，只能来自真实 durable 记录；channel pts
-	// 永远只放 ChannelPts，混填会让 pts 簿记把 channel 序列当账号序列。
-	recordedEvent := event
-	if r.deps.Updates != nil {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		recorded, _, err := r.deps.Updates.RecordReadHistory(ctx, authKeyID, userID, domain.ReadHistoryResult{
-			OwnerUserID:      userID,
-			Peer:             event.Peer,
-			MaxID:            read.MaxID,
-			StillUnreadCount: read.StillUnreadCount,
-			ChannelPts:       read.Pts,
-			Changed:          read.Changed,
-		}, rawAuthKeyIDForOrigin(ctx), sessionID)
-		if err != nil {
-			return domain.UpdateEvent{}, internalErr()
-		}
-		recordedEvent = recorded
-	}
-	r.pushCurrentReadHistoryEvent(ctx, recordedEvent)
-	r.pushReadHistoryEvent(ctx, userID, recordedEvent)
-	return recordedEvent, nil
-}
-
-func (r *Router) channelFanoutRecipients(ctx context.Context, scope channelFanoutScope, channelID int64, explicit []int64) []int64 {
+func (r *Router) channelTransientRecipients(ctx context.Context, scope channelTransientScope, channelID int64, explicit []int64) []int64 {
 	if channelID == 0 || r.deps.Channels == nil || r.deps.Sessions == nil {
 		return uniqueRecipientIDs(explicit)
 	}
-	if scope == channelFanoutExplicit {
+	if scope == channelTransientExplicit {
 		return uniqueRecipientIDs(explicit)
 	}
 	provider, ok := r.deps.Sessions.(OnlineUserProvider)
@@ -347,15 +305,10 @@ func (r *Router) channelFanoutRecipients(ctx context.Context, scope channelFanou
 	// 并批量解析 users，放开会把高频操作（如 reaction）放大成 O(全部在线成员) 的逐条推送。
 	var online []int64
 	switch scope {
-	case channelFanoutMembers:
+	case channelTransientMembers:
 		online = provider.OnlineChannelMemberUserIDs(channelID, domain.MaxChannelRealtimeFanout)
-	case channelFanoutViewers:
+	case channelTransientViewers:
 		online = provider.OnlineChannelUserIDs(channelID, domain.MaxChannelRealtimeFanout)
-	case channelFanoutMessageBox:
-		online = provider.OnlineChannelMemberUserIDs(channelID, domain.MaxChannelRealtimeFanout)
-		if subscriptions, ok := r.deps.Sessions.(ChannelSubscriptionProvider); ok {
-			online = append(online, subscriptions.OnlineChannelSubscriberUserIDs(channelID, domain.MaxChannelRealtimeFanout)...)
-		}
 	}
 	if len(online) == 0 {
 		return uniqueRecipientIDs(explicit)
@@ -364,15 +317,14 @@ func (r *Router) channelFanoutRecipients(ctx context.Context, scope channelFanou
 		authorized []int64
 		err        error
 	)
-	if scope == channelFanoutMembers {
+	if scope == channelTransientMembers {
 		authorized, err = r.deps.Channels.FilterActiveMemberIDs(ctx, channelID, online)
-	} else if audience, ok := r.deps.Channels.(ChannelMessageAudienceService); ok {
-		authorized, err = audience.FilterMessageAudienceIDs(ctx, channelID, online)
 	} else {
-		// Test/minimal adapters without public-preview authorization retain the
-		// former member-only behavior; production channels.Service implements
-		// ChannelMessageAudienceService.
-		authorized, err = r.deps.Channels.FilterActiveMemberIDs(ctx, channelID, online)
+		audience, ok := r.deps.Channels.(ChannelMessageAudienceService)
+		if !ok {
+			return uniqueRecipientIDs(explicit)
+		}
+		authorized, err = audience.FilterMessageAudienceIDs(ctx, channelID, online)
 	}
 	if err != nil {
 		return uniqueRecipientIDs(explicit)
@@ -391,8 +343,8 @@ func (r *Router) channelFanoutRecipients(ctx context.Context, scope channelFanou
 		}
 		seen[userID] = struct{}{}
 	}
-	// Keep operation-specific recipients as a fallback: leave/kick/delete flows
-	// may need to notify a user who is no longer an active member after commit.
+	// Explicitly affected users remain part of the audience even when the
+	// mutation has already removed their active membership.
 	for _, userID := range explicit {
 		if userID == 0 {
 			continue
@@ -425,19 +377,19 @@ func uniqueRecipientIDs(ids []int64) []int64 {
 	return out
 }
 
-func (r *Router) pushChannelStateToMembers(ctx context.Context, originUserID int64, channel domain.Channel) {
+func (r *Router) pushTransientChannelStateInvalidation(ctx context.Context, originUserID int64, channel domain.Channel) {
 	// The third-party verification icon is resolved once here, outside the
 	// per-recipient builder: see channelStateUpdatesWithLinkedMonoforum.
 	icon := r.peerBotVerificationIcon(ctx, domain.Peer{Type: domain.PeerTypeChannel, ID: channel.ID})
 	usernames := r.channelStateUsernameRegistry(ctx, channel, domain.Channel{}, false)
-	r.pushChannelStateToMembersWithLinkedMonoforum(ctx, originUserID, channel, domain.Channel{}, false, icon, usernames)
+	r.pushTransientChannelStateInvalidationWithLinkedMonoforum(ctx, originUserID, channel, domain.Channel{}, false, icon, usernames)
 }
 
-func (r *Router) pushChannelStateToMembersWithLinkedMonoforum(ctx context.Context, originUserID int64, channel domain.Channel, mono domain.Channel, includeMono bool, botVerificationIcon int64, usernames map[domain.Peer][]domain.Username) {
+func (r *Router) pushTransientChannelStateInvalidationWithLinkedMonoforum(ctx context.Context, originUserID int64, channel domain.Channel, mono domain.Channel, includeMono bool, botVerificationIcon int64, usernames map[domain.Peer][]domain.Username) {
 	if r.deps.Channels == nil || channel.ID == 0 {
 		return
 	}
-	r.pushChannelUpdates(ctx, originUserID, channel.ID, []int64{originUserID}, func(viewerUserID int64) *tg.Updates {
+	r.pushTransientChannelMemberUpdates(ctx, originUserID, channel.ID, []int64{originUserID}, func(viewerUserID int64) *tg.Updates {
 		return r.channelStateUpdatesWithLinkedMonoforum(viewerUserID, channel, mono, includeMono, botVerificationIcon, usernames)
 	})
 }

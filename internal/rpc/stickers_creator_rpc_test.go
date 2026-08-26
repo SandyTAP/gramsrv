@@ -14,7 +14,7 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func stickerCreatorRouter(t *testing.T) (*Router, *fakeFiles, *memory.PasswordStore, *captureSessions) {
+func stickerCreatorRouter(t *testing.T) (*Router, *fakeFiles, *memory.DeliveryOutboxStore) {
 	t.Helper()
 	files := &fakeFiles{
 		docs: map[int64]domain.Document{
@@ -25,17 +25,18 @@ func stickerCreatorRouter(t *testing.T) (*Router, *fakeFiles, *memory.PasswordSt
 		sets: map[domain.StickerSetKind][]domain.StickerSet{},
 	}
 	passwordStore := memory.NewPasswordStore()
-	sessions := &captureSessions{}
+	delivery := memory.NewDeliveryOutboxStore()
+	passwordStore.AttachDeliveryOutbox(delivery)
+	files.deliveryOutbox = delivery
 	router := New(Config{}, Deps{
-		Account:  appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore)),
-		Files:    files,
-		Sessions: sessions,
+		Account: appaccount.NewService(passwordStore, appaccount.WithUserStickerSets(passwordStore)),
+		Files:   files, DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
-	return router, files, passwordStore, sessions
+	return router, files, delivery
 }
 
 func TestStickersCreateStickerSetInstallsAndInvalidatesCatalog(t *testing.T) {
-	r, _, store, sessions := stickerCreatorRouter(t)
+	r, _, delivery := stickerCreatorRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	before, err := r.onMessagesGetAllStickers(ctx, 0)
@@ -69,10 +70,7 @@ func TestStickersCreateStickerSetInstallsAndInvalidatesCatalog(t *testing.T) {
 	if len(full.Packs) != 1 || len(full.Keywords) != 1 || len(full.Documents) != 1 {
 		t.Fatalf("created payload packs=%d keywords=%d docs=%d, want 1/1/1", len(full.Packs), len(full.Keywords), len(full.Documents))
 	}
-	if got := installedStickerSetIDs(t, store, ctx, 1000000001, domain.StickerSetKindStickers, nil); len(got) != 1 || got[0] != full.Set.ID {
-		t.Fatalf("installed created set ids = %v, want [%d]", got, full.Set.ID)
-	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindStickers, nil)
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindStickers, nil)
 
 	owned, err := r.onMessagesGetMyStickers(ctx, &tg.MessagesGetMyStickersRequest{Limit: 10})
 	if err != nil {
@@ -80,18 +78,6 @@ func TestStickersCreateStickerSetInstallsAndInvalidatesCatalog(t *testing.T) {
 	}
 	if owned.Count != 1 || len(owned.Sets) != 1 {
 		t.Fatalf("my stickers = count %d sets %d, want one created set", owned.Count, len(owned.Sets))
-	}
-
-	after, err := r.onMessagesGetAllStickers(ctx, 0)
-	if err != nil {
-		t.Fatalf("get all after create: %v", err)
-	}
-	all, ok := after.(*tg.MessagesAllStickers)
-	if !ok {
-		t.Fatalf("all after create = %T, want *tg.MessagesAllStickers", after)
-	}
-	if len(all.Sets) != 1 || all.Sets[0].ID != full.Set.ID {
-		t.Fatalf("all after create = %+v, want created set", all.Sets)
 	}
 
 	available, err := r.onStickersCheckShortName(ctx, "fresh_pack")
@@ -104,7 +90,7 @@ func TestStickersCreateStickerSetInstallsAndInvalidatesCatalog(t *testing.T) {
 }
 
 func TestStickersCreateStickerSetRejectsBadDocumentAccessHash(t *testing.T) {
-	r, _, _, _ := stickerCreatorRouter(t)
+	r, _, _ := stickerCreatorRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	out, err := r.onStickersCreateStickerSet(ctx, &tg.StickersCreateStickerSetRequest{
@@ -121,8 +107,35 @@ func TestStickersCreateStickerSetRejectsBadDocumentAccessHash(t *testing.T) {
 	}
 }
 
+func TestStickersCreateStickerSetQueuesAtomicOriginExcludedDelivery(t *testing.T) {
+	r, _, delivery := stickerCreatorRouter(t)
+	rawAuthKeyID := [8]byte{1, 3, 5, 7, 9}
+	const sessionID = int64(5150)
+	ctx := WithSessionID(WithRawAuthKeyID(WithUserID(context.Background(), 1000000001), rawAuthKeyID), sessionID)
+	if _, err := r.onStickersCreateStickerSet(ctx, &tg.StickersCreateStickerSetRequest{
+		UserID: &tg.InputUserSelf{}, Title: "Atomic Pack", ShortName: "atomic_pack",
+		Stickers: []tg.InputStickerSetItem{{Document: &tg.InputDocument{ID: 101, AccessHash: 11}, Emoji: "🙂"}},
+	}); err != nil {
+		t.Fatalf("create sticker set: %v", err)
+	}
+	items := delivery.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("delivery items = %d, want 1", len(items))
+	}
+	if items[0].ExcludeAuthKeyID != rawAuthKeyID || items[0].ExcludeSessionID != sessionID {
+		t.Fatalf("delivery exclusion = %x/%d", items[0].ExcludeAuthKeyID, items[0].ExcludeSessionID)
+	}
+	updates := requireDeliveryUpdates(t, items[0])
+	if len(updates.Updates) != 1 {
+		t.Fatalf("delivery updates = %d, want 1", len(updates.Updates))
+	}
+	if _, ok := updates.Updates[0].(*tg.UpdateStickerSets); !ok {
+		t.Fatalf("delivery update = %T, want *tg.UpdateStickerSets", updates.Updates[0])
+	}
+}
+
 func TestStickersSuggestAndCheckShortNameValidation(t *testing.T) {
-	r, _, _, _ := stickerCreatorRouter(t)
+	r, _, _ := stickerCreatorRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	suggested, err := r.onStickersSuggestShortName(ctx, "Fresh Pack")
@@ -138,7 +151,7 @@ func TestStickersSuggestAndCheckShortNameValidation(t *testing.T) {
 }
 
 func TestStickersManageCreatedStickerSetRPCs(t *testing.T) {
-	r, files, _, sessions := stickerCreatorRouter(t)
+	r, files, delivery := stickerCreatorRouter(t)
 	ctx := WithUserID(context.Background(), 1000000001)
 
 	created, err := r.onStickersCreateStickerSet(ctx, &tg.StickersCreateStickerSetRequest{
@@ -171,7 +184,7 @@ func TestStickersManageCreatedStickerSetRPCs(t *testing.T) {
 	if addedFull.Set.Count != 2 || len(addedFull.Documents) != 2 || len(addedFull.Keywords) != 1 {
 		t.Fatalf("after add count=%d docs=%d keywords=%d, want 2/2/1", addedFull.Set.Count, len(addedFull.Documents), len(addedFull.Keywords))
 	}
-	assertStickerSetsUpdate(t, sessions.lastUserPush(), domain.StickerSetKindStickers, nil)
+	assertStickerSetsUpdate(t, lastQueuedDeliveryUpdates(t, delivery), domain.StickerSetKindStickers, nil)
 
 	moved, err := r.onStickersChangeStickerPosition(ctx, &tg.StickersChangeStickerPositionRequest{
 		Sticker:  &tg.InputDocument{ID: 102, AccessHash: 12},
@@ -216,7 +229,7 @@ func TestStickersManageCreatedStickerSetRPCs(t *testing.T) {
 }
 
 func TestStickersManageCreatedStickerSetRejectsNonCreator(t *testing.T) {
-	r, _, _, _ := stickerCreatorRouter(t)
+	r, _, _ := stickerCreatorRouter(t)
 	ownerCtx := WithUserID(context.Background(), 1000000001)
 
 	created, err := r.onStickersCreateStickerSet(ownerCtx, &tg.StickersCreateStickerSetRequest{

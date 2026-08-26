@@ -2,12 +2,14 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"telesrv/internal/domain"
+	storepkg "telesrv/internal/store"
 )
 
 // Default page sizes applied when an admin filter leaves the limit unset. The
@@ -55,7 +57,15 @@ type CollectibleUsernameStore struct {
 	transfers map[int64][]domain.CollectibleUsernameTransfer
 	// commands maps a provenance command key onto the asset it touched.
 	commands map[string]int64
+
+	users          *UserStore
+	deliveryOutbox *DeliveryOutboxStore
 }
+
+var (
+	_ storepkg.UsernameRegistryDeliveryStore    = (*CollectibleUsernameStore)(nil)
+	_ storepkg.CollectibleUsernameDeliveryStore = (*CollectibleUsernameStore)(nil)
+)
 
 // collectibleRegistryRow is one peer_usernames row: the owning peer plus the
 // projected username shape.
@@ -77,6 +87,99 @@ func NewCollectibleUsernameStore() *CollectibleUsernameStore {
 		transfers:      make(map[int64][]domain.CollectibleUsernameTransfer),
 		commands:       make(map[string]int64),
 	}
+}
+
+func (s *CollectibleUsernameStore) AttachDelivery(users *UserStore, outbox *DeliveryOutboxStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.users = users
+	s.deliveryOutbox = outbox
+}
+
+func (s *CollectibleUsernameStore) cloneLocked() *CollectibleUsernameStore {
+	clone := &CollectibleUsernameStore{
+		nextAssetID: s.nextAssetID, nextTransferID: s.nextTransferID,
+		assets:       make(map[int64]domain.CollectibleUsername, len(s.assets)),
+		assetsByName: make(map[string]int64, len(s.assetsByName)),
+		registry:     make(map[string]collectibleRegistryRow, len(s.registry)),
+		transfers:    make(map[int64][]domain.CollectibleUsernameTransfer, len(s.transfers)),
+		commands:     make(map[string]int64, len(s.commands)),
+	}
+	for id, asset := range s.assets {
+		clone.assets[id] = asset
+	}
+	for name, id := range s.assetsByName {
+		clone.assetsByName[name] = id
+	}
+	for name, row := range s.registry {
+		clone.registry[name] = row
+	}
+	for id, entries := range s.transfers {
+		clone.transfers[id] = append([]domain.CollectibleUsernameTransfer(nil), entries...)
+	}
+	for key, id := range s.commands {
+		clone.commands[key] = id
+	}
+	return clone
+}
+
+func (s *CollectibleUsernameStore) commitCloneLocked(clone *CollectibleUsernameStore) {
+	s.nextAssetID, s.nextTransferID = clone.nextAssetID, clone.nextTransferID
+	s.assets, s.assetsByName, s.registry = clone.assets, clone.assetsByName, clone.registry
+	s.transfers, s.commands = clone.transfers, clone.commands
+}
+
+func (s *CollectibleUsernameStore) applyUsernameDeliveryLocked(
+	ctx context.Context,
+	peers []domain.Peer,
+	build storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot],
+) error {
+	if build == nil {
+		return storepkg.ErrDeliveryOutboxRequired
+	}
+	ids := make([]int64, 0, len(peers))
+	seen := make(map[int64]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.Type != domain.PeerTypeUser || peer.ID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[peer.ID]; duplicate {
+			continue
+		}
+		seen[peer.ID] = struct{}{}
+		ids = append(ids, peer.ID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	snapshot := storepkg.UsernameAudienceDeliverySnapshot{Users: make([]storepkg.UserAudienceDeliverySnapshot, 0, len(ids))}
+	if len(ids) > 0 {
+		if s.users == nil || s.deliveryOutbox == nil {
+			return storepkg.ErrDeliveryOutboxRequired
+		}
+		for _, id := range ids {
+			user, ok := s.users.byID[id]
+			if !ok || user.Deleted {
+				return domain.ErrUserNotFound
+			}
+			snapshot.Users = append(snapshot.Users, storepkg.UserAudienceDeliverySnapshot{
+				User: user, Audience: []int64{id},
+			})
+		}
+	}
+	effects, err := build(snapshot)
+	if err != nil {
+		return fmt.Errorf("build username audience delivery: %w", err)
+	}
+	if err := storepkg.ValidateUsernameAudienceDeliveryEffects(snapshot, effects); err != nil {
+		return err
+	}
+	if len(effects) == 0 {
+		return nil
+	}
+	_, err = applyDeliveryEffects(ctx, effects, s.deliveryOutbox, nil)
+	return err
 }
 
 // SetEditableUsername writes the peer's editable slot, mirroring the
@@ -519,6 +622,172 @@ func (s *CollectibleUsernameStore) DeleteCollectibleUsername(_ context.Context, 
 		}
 	}
 	s.rebindAssetNameLocked(key)
+	return true, nil
+}
+
+func (s *CollectibleUsernameStore) SetUsernameActiveWithDelivery(ctx context.Context, peer domain.Peer, username string, active bool, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if s == nil || effects == nil {
+		return false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.cloneLocked()
+	changed, err := candidate.SetUsernameActive(ctx, peer, username, active)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{peer}, effects); err != nil {
+		return false, err
+	}
+	s.commitCloneLocked(candidate)
+	return true, nil
+}
+
+func (s *CollectibleUsernameStore) ReorderUsernamesWithDelivery(ctx context.Context, peer domain.Peer, order []string, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if s == nil || effects == nil {
+		return false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.cloneLocked()
+	changed, err := candidate.ReorderUsernames(ctx, peer, order)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{peer}, effects); err != nil {
+		return false, err
+	}
+	s.commitCloneLocked(candidate)
+	return true, nil
+}
+
+func (s *CollectibleUsernameStore) DeactivateAllUsernamesWithDelivery(ctx context.Context, peer domain.Peer, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if s == nil || effects == nil {
+		return false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.cloneLocked()
+	changed, err := candidate.DeactivateAllUsernames(ctx, peer)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{peer}, effects); err != nil {
+		return false, err
+	}
+	s.commitCloneLocked(candidate)
+	return true, nil
+}
+
+func (s *CollectibleUsernameStore) MintCollectibleUsernameWithDelivery(ctx context.Context, req domain.MintCollectibleUsernameRequest, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if s == nil || effects == nil {
+		return domain.CollectibleUsername{}, false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.cloneLocked()
+	asset, created, err := candidate.MintCollectibleUsername(ctx, req)
+	if err != nil || !created {
+		return asset, created, err
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{asset.Owner}, effects); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	s.commitCloneLocked(candidate)
+	return asset, true, nil
+}
+
+func (s *CollectibleUsernameStore) TransferCollectibleUsernameWithDelivery(ctx context.Context, req domain.TransferCollectibleUsernameRequest, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if s == nil || effects == nil {
+		return domain.CollectibleUsername{}, false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, previousErr := s.assetByNameLocked(domain.NormalizeUsername(req.Username))
+	candidate := s.cloneLocked()
+	asset, changed, err := candidate.TransferCollectibleUsername(ctx, req)
+	if err != nil || !changed {
+		return asset, changed, err
+	}
+	if previousErr != nil {
+		return domain.CollectibleUsername{}, false, previousErr
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{previous.Owner, asset.Owner}, effects); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	s.commitCloneLocked(candidate)
+	return asset, true, nil
+}
+
+func (s *CollectibleUsernameStore) RevokeCollectibleUsernameWithDelivery(ctx context.Context, req domain.RevokeCollectibleUsernameRequest, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (domain.CollectibleUsername, bool, error) {
+	if s == nil || effects == nil {
+		return domain.CollectibleUsername{}, false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, previousErr := s.assetByNameLocked(domain.NormalizeUsername(req.Username))
+	candidate := s.cloneLocked()
+	asset, changed, err := candidate.RevokeCollectibleUsername(ctx, req)
+	if err != nil || !changed {
+		return asset, changed, err
+	}
+	if previousErr != nil {
+		return domain.CollectibleUsername{}, false, previousErr
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{previous.Owner}, effects); err != nil {
+		return domain.CollectibleUsername{}, false, err
+	}
+	s.commitCloneLocked(candidate)
+	return asset, true, nil
+}
+
+func (s *CollectibleUsernameStore) DeleteCollectibleUsernameWithDelivery(ctx context.Context, req domain.DeleteCollectibleUsernameRequest, effects storepkg.DeliveryEffectsBuilder[storepkg.UsernameAudienceDeliverySnapshot]) (bool, error) {
+	if s == nil || effects == nil {
+		return false, storepkg.ErrDeliveryOutboxRequired
+	}
+	if s.users != nil {
+		s.users.mu.Lock()
+		defer s.users.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, previousErr := s.assetByNameLocked(domain.NormalizeUsername(req.Username))
+	candidate := s.cloneLocked()
+	deleted, err := candidate.DeleteCollectibleUsername(ctx, req)
+	if err != nil || !deleted {
+		return deleted, err
+	}
+	if previousErr != nil {
+		return false, previousErr
+	}
+	if err := s.applyUsernameDeliveryLocked(ctx, []domain.Peer{previous.Owner}, effects); err != nil {
+		return false, err
+	}
+	s.commitCloneLocked(candidate)
 	return true, nil
 }
 

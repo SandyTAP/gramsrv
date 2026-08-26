@@ -45,7 +45,7 @@ file_data:
   token: ${TEST_FILE_TOKEN}
   timeout: 11s
 egress:
-  ack:
+  delivery:
     resolver: static
     targets:
       - 127.0.0.1:2510
@@ -85,6 +85,27 @@ edge:
 	t.Setenv("TELESRV_CONFIG", path)
 	if _, err := LoadEdge(); err == nil || !strings.Contains(err.Error(), "typo_field") {
 		t.Fatalf("LoadEdge err = %v, want unknown field rejection", err)
+	}
+}
+
+func TestLoadCoreReadsCounterRecoveryPoolSizeFromYAML(t *testing.T) {
+	path := writeRoleYAML(t, "core-postgres.yaml", `
+version: 1
+postgres:
+  dsn: postgres://core-test
+  max_conns: 11
+  min_conns: 3
+  counter_recovery_max_conns: 2
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+	t.Setenv("TELESRV_POSTGRES_COUNTER_RECOVERY_MAX_CONNS", "99")
+
+	cfg, err := LoadCore()
+	if err != nil {
+		t.Fatalf("LoadCore: %v", err)
+	}
+	if cfg.PostgresDSN != "postgres://core-test" || cfg.PostgresMaxConns != 11 || cfg.PostgresMinConns != 3 || cfg.PostgresCounterRecoveryMaxConns != 2 {
+		t.Fatalf("postgres config = dsn:%q max:%d min:%d recovery:%d", cfg.PostgresDSN, cfg.PostgresMaxConns, cfg.PostgresMinConns, cfg.PostgresCounterRecoveryMaxConns)
 	}
 }
 
@@ -364,7 +385,7 @@ media:
 func TestLoadExampleRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "core-secret")
 	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
-	t.Setenv("TELESRV_EGRESS_ACK_TOKEN", "egress-secret")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_TOKEN", "egress-secret")
 	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "groupcall-secret")
 	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
 	t.Setenv("TELESRV_POSTGRES_DSN", "postgres://telesrv:telesrv@127.0.0.1:5432/telesrv?sslmode=disable")
@@ -424,7 +445,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_REDIS_PASSWORD", "redis-secret")
 	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "core-secret")
 	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
-	t.Setenv("TELESRV_EGRESS_ACK_TOKEN", "egress-secret")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_TOKEN", "egress-secret")
 	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "group-call-secret")
 	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
 	t.Setenv("TELESRV_DEV_AUTH_CODE", "918274")
@@ -454,7 +475,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	}{
 		{name: "edge", file: "edge.yaml", load: func() error {
 			cfg, err := LoadEdge()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCTargets != "core:2440" || cfg.CoreExecGRPCResolver != "dns" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.EgressAckGRPCTargets != "egress:2510" || cfg.EgressAckGRPCResolver != "dns") {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCTargets != "core:2440" || cfg.CoreExecGRPCResolver != "dns" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.EgressDeliveryGRPCTargets != "egress:2510" || cfg.EgressDeliveryGRPCResolver != "dns") {
 				return fmt.Errorf("unexpected Docker edge identity or service targets")
 			}
 			return err
@@ -468,7 +489,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 		}},
 		{name: "egress", file: "egress.yaml", load: func() error {
 			cfg, err := LoadEgress()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.EgressAckGRPCAddr != "0.0.0.0:2510" || cfg.DefaultCountryCode != "CN" || cfg.PublicBaseURL != "https://example.test" || cfg.PublicAppScheme != "telesrv") {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.EgressDeliveryGRPCAddr != "0.0.0.0:2510" || cfg.DefaultCountryCode != "CN" || cfg.PublicBaseURL != "https://example.test" || cfg.PublicAppScheme != "telesrv" || cfg.DeliveryAttemptTimeout != 2*time.Second || cfg.DeliveryClockSkewAllowance != time.Second) {
 				return fmt.Errorf("unexpected Docker egress identity or listener")
 			}
 			return err

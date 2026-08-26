@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type staticUsersService struct {
@@ -53,6 +54,21 @@ func (s staticUsersService) ByIDs(_ context.Context, _ int64, userIDs []int64) (
 	return out, nil
 }
 
+func (s staticUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	if userID != s.user.ID {
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrUserNotFound
+	}
+	u := testUserWithEmojiStatus(s.user, status)
+	return u, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s staticUsersService) UpdatePersonalChannelWithDelivery(_ context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	if userID != s.user.ID {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	return testUserPersonalChannelMutation(s.user, channelID, effects)
+}
+
 func (s mapUsersService) Self(_ context.Context, userID int64) (domain.User, error) {
 	return s.users[userID], nil
 }
@@ -90,6 +106,29 @@ func (s mapUsersService) ByIDsForViewers(ctx context.Context, viewerUserIDs []in
 		out[viewerID] = append([]domain.User(nil), users...)
 	}
 	return out, nil
+}
+
+func (s mapUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	u, ok := s.users[userID]
+	if !ok {
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrUserNotFound
+	}
+	u = testUserWithEmojiStatus(u, status)
+	s.users[userID] = u
+	return u, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s mapUsersService) UpdatePersonalChannelWithDelivery(_ context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	u, ok := s.users[userID]
+	if !ok {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	u, err := testUserPersonalChannelMutation(u, channelID, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.users[userID] = u
+	return u, nil
 }
 
 func (s *countingMapUsersService) ByID(ctx context.Context, currentUserID, userID int64) (domain.User, bool, error) {
@@ -136,4 +175,61 @@ func (s *captureUsersService) ByIDs(_ context.Context, currentUserID int64, user
 		}
 	}
 	return out, nil
+}
+
+func (s *captureUsersService) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	s.userID = userID
+	if userID != s.user.ID {
+		return domain.User{}, domain.UpdateEvent{}, domain.ErrUserNotFound
+	}
+	s.user = testUserWithEmojiStatus(s.user, status)
+	return s.user, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+
+func (s *captureUsersService) UpdatePersonalChannelWithDelivery(_ context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	s.userID = userID
+	if userID != s.user.ID {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	u, err := testUserPersonalChannelMutation(s.user, channelID, effects)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.user = u
+	return u, nil
+}
+
+func testUserWithEmojiStatus(user domain.User, status domain.UserEmojiStatus) domain.User {
+	user.EmojiStatusDocumentID = status.DocumentID
+	user.EmojiStatusUntil = status.Until
+	user.EmojiStatusCollectible = status.Collectible
+	return user
+}
+
+func testEmojiStatusUpdateEvent(userID int64, status domain.UserEmojiStatus, date int) domain.UpdateEvent {
+	return domain.UpdateEvent{
+		UserID:      userID,
+		Type:        domain.UpdateEventUserEmojiStatus,
+		Pts:         1,
+		PtsCount:    1,
+		Date:        date,
+		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: userID},
+		EmojiStatus: status,
+	}
+}
+
+func testUserPersonalChannelMutation(user domain.User, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	if effects == nil {
+		return domain.User{}, store.ErrDeliveryOutboxRequired
+	}
+	user.PersonalChannelID = channelID
+	snapshot := store.UserDeliverySnapshot{User: user}
+	intents, err := effects(snapshot)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if err := store.ValidateUserSelfDeliveryEffects(snapshot, intents); err != nil {
+		return domain.User{}, err
+	}
+	return user, nil
 }

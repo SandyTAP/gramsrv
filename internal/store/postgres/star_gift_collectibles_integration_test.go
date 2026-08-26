@@ -104,7 +104,7 @@ func TestStarGiftCollectibleUpgradeAggregatePostgres(t *testing.T) {
 		t.Fatalf("issued after rejected manual update = %d err %v, want 0", guardedIssued, err)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	saved := createCollectibleSavedGift(t, ctx, messages, gifts, entry.Gift, domain.SavedStarGift{
 		Owner: ownerPeer, FromUserID: sender.ID, GiftID: entry.Gift.ID, RevisionID: entry.Gift.RevisionID,
 		Date: 1700001000, ConvertStars: 25, Message: "original",
@@ -115,6 +115,7 @@ func TestStarGiftCollectibleUpgradeAggregatePostgres(t *testing.T) {
 		t.Fatalf("grant upgrade stars: %v", err)
 	}
 	upgrades := NewStarGiftUpgradeStore(pool, messages)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 0)
 	req := domain.StarGiftUpgradeRequest{
 		UserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: saved.MsgID},
 		KeepOriginalDetails: true, ChargeStars: 100, FormID: 991,
@@ -430,8 +431,12 @@ WHERE owner_user_id=$1 AND msg_id=$2`, sender.ID, ownerMessage.ID).Scan(&senderA
 	if err != nil {
 		t.Fatalf("create ordinary collection: %v", err)
 	}
-	converted, err := gifts.MarkConverted(ctx, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: insufficientSaved.MsgID})
-	if err != nil || !converted.Converted || converted.PinnedOrder != 0 || len(converted.CollectionIDs) != 0 {
+	converted, err := lifecycle.ConvertStarGiftWithDelivery(ctx, domain.StarGiftConvertRequest{
+		ActorUserID: owner.ID,
+		Ref:         domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: insufficientSaved.MsgID},
+		Date:        1700001025,
+	}, starGiftConvertTestEffects)
+	if err != nil || !converted.Saved.Converted || converted.Saved.PinnedOrder != 0 || len(converted.Saved.CollectionIDs) != 0 {
 		t.Fatalf("convert collection member = %+v err %v", converted, err)
 	}
 	collections, err := gifts.ListCollections(ctx, ownerPeer)
@@ -566,7 +571,7 @@ func TestStarGiftUpgradeWithoutCraftedModelDoesNotAdvertiseCraft(t *testing.T) {
 		t.Fatalf("no-craft pool models = %+v", revision.Models)
 	}
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	saved := createCollectibleSavedGift(t, ctx, messages, gifts, entry.Gift, domain.SavedStarGift{
 		Owner: ownerPeer, FromUserID: sender.ID, GiftID: entry.Gift.ID, RevisionID: entry.Gift.RevisionID,
 		Date: now, ConvertStars: 25,
@@ -659,7 +664,7 @@ func TestAdminUniqueStarGiftGrantIsAtomicAndReplayable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish admin grant collectible pool: %v", err)
 	}
-	upgrades := NewStarGiftUpgradeStore(pool, NewMessageStore(pool))
+	upgrades := NewStarGiftUpgradeStore(pool, newTestMessageStore(pool))
 	invalid := domain.AdminStarGiftGrant{
 		SenderID: domain.OfficialSystemUserID, Recipient: domain.Peer{Type: domain.PeerTypeUser, ID: recipient.ID},
 		GiftID: entry.Gift.ID, Upgrade: true, CommandKey: "admin-invalid-" + suffix, Date: now,

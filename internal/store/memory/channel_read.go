@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func (s *ChannelStore) SetChannelDialogUnreadMark(_ context.Context, userID, channelID int64, unread bool) (bool, error) {
@@ -49,9 +50,12 @@ func (s *ChannelStore) ListChannelUnreadMarked(_ context.Context, userID int64) 
 	return out, nil
 }
 
-func (s *ChannelStore) ReadChannelMessageContents(_ context.Context, req domain.ReadChannelMessageContentsRequest) (domain.ReadChannelMessageContentsResult, error) {
+func (s *ChannelStore) ReadChannelMessageContents(ctx context.Context, req domain.ReadChannelMessageContentsRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelMessageContentsResult]) (domain.ReadChannelMessageContentsResult, error) {
 	if req.UserID == 0 || req.ChannelID == 0 {
 		return domain.ReadChannelMessageContentsResult{}, domain.ErrChannelInvalid
+	}
+	if effects == nil {
+		return domain.ReadChannelMessageContentsResult{}, store.ErrDeliveryOutboxRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -60,7 +64,15 @@ func (s *ChannelStore) ReadChannelMessageContents(_ context.Context, req domain.
 		return domain.ReadChannelMessageContentsResult{}, err
 	}
 	if len(req.IDs) == 0 {
-		return domain.ReadChannelMessageContentsResult{Channel: channel}, nil
+		result := domain.ReadChannelMessageContentsResult{Channel: channel}
+		intents, err := effects(result)
+		if err != nil {
+			return domain.ReadChannelMessageContentsResult{}, err
+		}
+		if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+			return domain.ReadChannelMessageContentsResult{}, err
+		}
+		return result, nil
 	}
 	if len(req.IDs) > domain.MaxGetMessageIDs {
 		return domain.ReadChannelMessageContentsResult{}, domain.ErrChannelInvalid
@@ -83,6 +95,28 @@ func (s *ChannelStore) ReadChannelMessageContents(_ context.Context, req domain.
 		messages = append(messages, cloneChannelMessage(msg))
 	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].ID > messages[j].ID })
+	reactionsBefore := cloneChannelReadReactions(s.reactions[req.ChannelID])
+	mentionsBefore, mentionsExisted := cloneChannelReadMentions(s.mentions[req.UserID][req.ChannelID])
+	dialogBefore, dialogExisted := s.dialogs[req.UserID][req.ChannelID]
+	rollback := func() {
+		s.reactions[req.ChannelID] = reactionsBefore
+		if mentionsExisted {
+			if s.mentions[req.UserID] == nil {
+				s.mentions[req.UserID] = make(map[int64]map[int]memoryMention)
+			}
+			s.mentions[req.UserID][req.ChannelID] = mentionsBefore
+		} else if s.mentions[req.UserID] != nil {
+			delete(s.mentions[req.UserID], req.ChannelID)
+		}
+		if dialogExisted {
+			if s.dialogs[req.UserID] == nil {
+				s.dialogs[req.UserID] = make(map[int64]domain.ChannelDialog)
+			}
+			s.dialogs[req.UserID][req.ChannelID] = dialogBefore
+		} else if s.dialogs[req.UserID] != nil {
+			delete(s.dialogs[req.UserID], req.ChannelID)
+		}
+	}
 	clearedSet := make(map[int]struct{})
 	for _, msg := range messages {
 		byUser := s.reactions[req.ChannelID][msg.ID]
@@ -137,12 +171,48 @@ func (s *ChannelStore) ReadChannelMessageContents(_ context.Context, req domain.
 	}
 	s.populateChannelMessageRepliesLocked(req.UserID, req.ChannelID, messages)
 	s.populateChannelMessageReactionsLocked(req.UserID, channel, messages)
-	return domain.ReadChannelMessageContentsResult{
+	result := domain.ReadChannelMessageContentsResult{
 		Channel:                         channel,
 		Messages:                        messages,
 		ClearedUnreadReactionMessageIDs: cleared,
 		ClearedUnreadMentionMessageIDs:  clearedMentions,
-	}, nil
+	}
+	intents, err := effects(result)
+	if err != nil {
+		rollback()
+		return domain.ReadChannelMessageContentsResult{}, err
+	}
+	if _, err := applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil); err != nil {
+		rollback()
+		return domain.ReadChannelMessageContentsResult{}, err
+	}
+	return result, nil
+}
+
+func cloneChannelReadReactions(in map[int]map[int64][]domain.ChannelMessagePeerReaction) map[int]map[int64][]domain.ChannelMessagePeerReaction {
+	if in == nil {
+		return nil
+	}
+	out := make(map[int]map[int64][]domain.ChannelMessagePeerReaction, len(in))
+	for messageID, byUser := range in {
+		clonedByUser := make(map[int64][]domain.ChannelMessagePeerReaction, len(byUser))
+		for userID, rows := range byUser {
+			clonedByUser[userID] = append([]domain.ChannelMessagePeerReaction(nil), rows...)
+		}
+		out[messageID] = clonedByUser
+	}
+	return out
+}
+
+func cloneChannelReadMentions(in map[int]memoryMention) (map[int]memoryMention, bool) {
+	if in == nil {
+		return nil, false
+	}
+	out := make(map[int]memoryMention, len(in))
+	for messageID, mention := range in {
+		out[messageID] = mention
+	}
+	return out, true
 }
 
 func (s *ChannelStore) ListChannelUnreadMentions(_ context.Context, viewerUserID int64, filter domain.ChannelUnreadMentionsFilter) (domain.ChannelHistory, error) {
@@ -249,7 +319,10 @@ func (s *ChannelStore) ReadChannelMentions(_ context.Context, req domain.ReadCha
 	}, nil
 }
 
-func (s *ChannelStore) ReadChannelHistory(_ context.Context, req domain.ReadChannelHistoryRequest) (domain.ReadChannelHistoryResult, error) {
+func (s *ChannelStore) ReadChannelHistory(ctx context.Context, req domain.ReadChannelHistoryRequest, effects store.DeliveryEffectsBuilder[domain.ReadChannelHistoryResult]) (domain.ReadChannelHistoryResult, error) {
+	if effects == nil {
+		return domain.ReadChannelHistoryResult{}, store.ErrDeliveryOutboxRequired
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	channel, _, readOnly, err := s.channelForViewerLocked(req.UserID, req.ChannelID)
@@ -269,18 +342,19 @@ func (s *ChannelStore) ReadChannelHistory(_ context.Context, req domain.ReadChan
 			Forum:     channel.Forum,
 		}, nil
 	}
+	snapshot := s.snapshotChannelReadStateLocked(req.ChannelID)
 	member := s.members[req.ChannelID][req.UserID]
 	previous := member.ReadInboxMaxID
-	changed := maxID > member.ReadInboxMaxID
+	changed := maxID > member.ReadInboxMaxID || member.UnreadMark
 	var outboxUpdates []domain.ChannelReadOutboxUpdate
-	if changed {
+	if maxID > member.ReadInboxMaxID {
 		member.ReadInboxMaxID = maxID
 		member.ReadInboxDate = req.Date
-		member.UnreadMark = false
-		s.members[req.ChannelID][req.UserID] = member
 		s.readMarks[req.ChannelID] = s.readMarks[req.ChannelID].advance(req.UserID, maxID)
 		outboxUpdates = s.advanceChannelReadOutboxLocked(req.ChannelID, req.UserID, previous, maxID)
 	}
+	member.UnreadMark = false
+	s.members[req.ChannelID][req.UserID] = member
 	dialog := s.dialogForUserLocked(req.UserID, channel)
 	dialog.ReadInboxMaxID = member.ReadInboxMaxID
 	dialog.UnreadCount = s.channelUnreadCountLocked(req.UserID, channel.ID, member.ReadInboxMaxID, dialog.TopMessageID)
@@ -289,7 +363,7 @@ func (s *ChannelStore) ReadChannelHistory(_ context.Context, req domain.ReadChan
 		s.dialogs[req.UserID] = make(map[int64]domain.ChannelDialog)
 	}
 	s.dialogs[req.UserID][req.ChannelID] = dialog
-	return domain.ReadChannelHistoryResult{
+	result := domain.ReadChannelHistoryResult{
 		ChannelID:        req.ChannelID,
 		MaxID:            maxID,
 		StillUnreadCount: dialog.UnreadCount,
@@ -298,7 +372,77 @@ func (s *ChannelStore) ReadChannelHistory(_ context.Context, req domain.ReadChan
 		Forum:            channel.Forum,
 		Dialog:           dialog,
 		OutboxUpdates:    outboxUpdates,
-	}, nil
+	}
+	if channel.Forum && maxID > 0 {
+		general, err := s.readChannelTopicHistoryLocked(domain.ReadChannelTopicHistoryRequest{
+			UserID: req.UserID, ChannelID: req.ChannelID, TopicID: domain.ForumGeneralTopicID,
+			MaxID: maxID, Date: req.Date,
+		})
+		if err != nil {
+			s.restoreChannelReadStateLocked(req.ChannelID, snapshot)
+			return domain.ReadChannelHistoryResult{}, err
+		}
+		if general.Changed {
+			result.GeneralTopic = &general
+		}
+	}
+	if !result.Changed && result.GeneralTopic == nil {
+		return result, nil
+	}
+	intents, err := effects(result)
+	if err == nil && len(intents) == 0 {
+		err = store.ErrDeliveryOutboxRequired
+	}
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	}
+	if err != nil {
+		s.restoreChannelReadStateLocked(req.ChannelID, snapshot)
+		return domain.ReadChannelHistoryResult{}, err
+	}
+	return result, nil
+}
+
+type memoryChannelReadSnapshot struct {
+	members    map[int64]domain.ChannelMember
+	dialogs    map[int64]map[int64]domain.ChannelDialog
+	readMark   channelReadWatermark
+	topicReads map[int64]map[int]memoryTopicRead
+}
+
+func (s *ChannelStore) snapshotChannelReadStateLocked(channelID int64) memoryChannelReadSnapshot {
+	members := make(map[int64]domain.ChannelMember, len(s.members[channelID]))
+	for userID, member := range s.members[channelID] {
+		members[userID] = member
+	}
+	dialogs := make(map[int64]map[int64]domain.ChannelDialog, len(s.dialogs))
+	for userID, byChannel := range s.dialogs {
+		copyByChannel := make(map[int64]domain.ChannelDialog, len(byChannel))
+		for id, dialog := range byChannel {
+			copyByChannel[id] = dialog
+		}
+		dialogs[userID] = copyByChannel
+	}
+	topicReads := make(map[int64]map[int]memoryTopicRead, len(s.topicReads[channelID]))
+	for userID, byTopic := range s.topicReads[channelID] {
+		copyByTopic := make(map[int]memoryTopicRead, len(byTopic))
+		for topicID, water := range byTopic {
+			copyByTopic[topicID] = water
+		}
+		topicReads[userID] = copyByTopic
+	}
+	return memoryChannelReadSnapshot{members: members, dialogs: dialogs, readMark: s.readMarks[channelID], topicReads: topicReads}
+}
+
+func (s *ChannelStore) restoreChannelReadStateLocked(channelID int64, snapshot memoryChannelReadSnapshot) {
+	s.members[channelID] = snapshot.members
+	s.dialogs = snapshot.dialogs
+	s.readMarks[channelID] = snapshot.readMark
+	if snapshot.topicReads == nil {
+		delete(s.topicReads, channelID)
+	} else {
+		s.topicReads[channelID] = snapshot.topicReads
+	}
 }
 
 func (s *ChannelStore) advanceChannelReadOutboxLocked(channelID, readerUserID int64, previous, maxID int) []domain.ChannelReadOutboxUpdate {

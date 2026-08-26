@@ -32,7 +32,7 @@ func TestMessageStoreListByUserSupportsForwardAndAroundHistoryOffsets(t *testing
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	for i := 1; i <= 6; i++ {
 		if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 			SenderUserID:    alice.ID,
@@ -109,7 +109,7 @@ func TestMessageStoreSearchPagesUseHasMoreHintWithoutTotalCount(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{alice.ID, bob.ID})
 	})
 
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	for i := 1; i <= 5; i++ {
 		if _, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
 			SenderUserID:    alice.ID,

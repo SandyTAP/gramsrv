@@ -15,9 +15,11 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-func TestAccountChangePhoneRPCReturnsSelfAndPushesNonPTSUpdate(t *testing.T) {
+func TestAccountChangePhoneRPCReturnsSelfAndCommitsNonPTSDelivery(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	users.AttachDeliveryOutbox(outbox)
 	auths := memory.NewAuthorizationStore()
 	codes := memory.NewCodeStore()
 	events := memory.NewUpdateEventStore()
@@ -32,15 +34,14 @@ func TestAccountChangePhoneRPCReturnsSelfAndPushesNonPTSUpdate(t *testing.T) {
 	accountSvc := appaccount.NewService(
 		memory.NewPasswordStore(),
 		appaccount.WithUsers(users),
-		appaccount.WithPhoneChange(memory.NewPhoneChangeStore(users, events), auths, codes, nil, "12345", time.Minute, 5),
+		appaccount.WithPhoneChange(memory.NewPhoneChangeStore(users), auths, codes, nil, "12345", time.Minute, 5),
 	)
 	registry := newFakeUsernameRegistry()
 	registry.byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}] = []domain.Username{
 		{Username: "Alice", Editable: true, Active: true, SortOrder: 0},
 		{Username: "aliceCollect0728b", Active: true, SortOrder: 1, CollectibleID: 2},
 	}
-	sessions := &captureSessions{onlineUserIDs: []int64{user.ID}}
-	r := New(Config{}, Deps{Account: accountSvc, Sessions: sessions, Usernames: registry}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{}, Deps{Account: accountSvc, DeliveryOutbox: outbox, Usernames: registry}, zaptest.NewLogger(t), clock.System)
 	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, user.ID), authKeyID), 77)
 
 	sentClass, err := r.onAccountSendChangePhoneCode(reqCtx, &tg.AccountSendChangePhoneCodeRequest{PhoneNumber: "+1 555 001 3002"})
@@ -69,11 +70,16 @@ func TestAccountChangePhoneRPCReturnsSelfAndPushesNonPTSUpdate(t *testing.T) {
 	}
 	assertVectorOnlyUsernames(t, "account.changePhone", self, []string{"Alice", "aliceCollect0728b"})
 
-	otherPush, ok := sessions.lastUserPush().(*tg.Updates)
-	if !ok || len(otherPush.Updates) != 1 {
-		t.Fatalf("other-session push = %T %+v", sessions.lastUserPush(), sessions.lastUserPush())
+	items := outbox.Snapshot()
+	if len(items) != 1 {
+		t.Fatalf("delivery items = %+v", items)
 	}
-	userUpdate, ok := otherPush.Updates[0].(*tg.UpdateUser)
+	decoded, err := decodeDeliveryUpdate(items[0].Payload)
+	otherPush, ok := decoded.(*tg.Updates)
+	if err != nil || !ok || len(otherPush.Updates) != 1 {
+		t.Fatalf("decode delivery = %T %+v err=%v", decoded, decoded, err)
+	}
+	userUpdate, ok := otherPush.Updates[0].(*tg.UpdateUserPhone)
 	if !ok || userUpdate.UserID != user.ID {
 		t.Fatalf("user update = %T %+v", otherPush.Updates[0], otherPush.Updates[0])
 	}
@@ -84,9 +90,8 @@ func TestAccountChangePhoneRPCReturnsSelfAndPushesNonPTSUpdate(t *testing.T) {
 	if !ok || pushedSelf.Phone != "15550013002" {
 		t.Fatalf("pushed self = %T %+v", otherPush.Users[0], otherPush.Users[0])
 	}
-	snapshot := sessions.snapshot()
-	if sessions.rawAuthKeyID != authKeyID || snapshot.sessionID != 77 {
-		t.Fatalf("push exclusion = %x/%d", sessions.rawAuthKeyID, snapshot.sessionID)
+	if items[0].ExcludeAuthKeyID != authKeyID || items[0].ExcludeSessionID != 77 {
+		t.Fatalf("delivery exclusion = %x/%d", items[0].ExcludeAuthKeyID, items[0].ExcludeSessionID)
 	}
 
 	updateSvc := appupdates.NewService(memory.NewUpdateStateStore(), events)
@@ -102,9 +107,10 @@ func TestAccountChangePhoneRPCReturnsSelfAndPushesNonPTSUpdate(t *testing.T) {
 func TestAccountChangePhoneRPCMapsCodeAndOccupiedErrors(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	users.AttachDeliveryOutbox(outbox)
 	auths := memory.NewAuthorizationStore()
 	codes := memory.NewCodeStore()
-	events := memory.NewUpdateEventStore()
 	user, _ := users.Create(ctx, domain.User{AccessHash: 411, Phone: "15550013101", FirstName: "Alice"})
 	occupied, _ := users.Create(ctx, domain.User{AccessHash: 412, Phone: "15550013102", FirstName: "Bob"})
 	authKeyID := [8]byte{5, 4, 3, 2}
@@ -113,8 +119,8 @@ func TestAccountChangePhoneRPCMapsCodeAndOccupiedErrors(t *testing.T) {
 	}
 	accountSvc := appaccount.NewService(memory.NewPasswordStore(),
 		appaccount.WithUsers(users),
-		appaccount.WithPhoneChange(memory.NewPhoneChangeStore(users, events), auths, codes, nil, "12345", time.Minute, 5))
-	r := New(Config{}, Deps{Account: accountSvc}, zaptest.NewLogger(t), clock.System)
+		appaccount.WithPhoneChange(memory.NewPhoneChangeStore(users), auths, codes, nil, "12345", time.Minute, 5))
+	r := New(Config{}, Deps{Account: accountSvc, DeliveryOutbox: outbox}, zaptest.NewLogger(t), clock.System)
 	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, user.ID), authKeyID), 88)
 
 	if _, err := r.onAccountSendChangePhoneCode(reqCtx, &tg.AccountSendChangePhoneCodeRequest{PhoneNumber: occupied.Phone}); err == nil {

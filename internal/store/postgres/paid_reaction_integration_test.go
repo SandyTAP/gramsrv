@@ -145,7 +145,7 @@ func TestChannelPaidReactionPostgresOwnerSendAsAndOrderedCrossSettlement(t *test
 		t.Fatalf("create cross admin: %v", err)
 	}
 	userIDs := []int64{owner.ID, admin.ID}
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	channelIDs := make([]int64, 0, 3)
 	t.Cleanup(func() {
 		if len(channelIDs) > 0 {
@@ -287,7 +287,7 @@ func TestChannelPaidReactionPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", userIDs)
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Paid Reaction " + suffix,

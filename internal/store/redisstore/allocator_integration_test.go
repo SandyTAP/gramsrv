@@ -16,6 +16,28 @@ func (s staticCounterSource) Current(context.Context, int64) (int, error) {
 	return s.value, nil
 }
 
+func (s staticCounterSource) CurrentBatch(_ context.Context, userIDs []int64) (map[int64]int, error) {
+	out := make(map[int64]int, len(userIDs))
+	for _, userID := range userIDs {
+		out[userID] = s.value
+	}
+	return out, nil
+}
+
+func TestRedisAllocatorsRejectNegativeOwnerBeforeBackendAccess(t *testing.T) {
+	boxes := NewBoxIDAllocator(nil, staticCounterSource{})
+	if _, err := boxes.NextBoxID(context.Background(), -1); err == nil {
+		t.Fatal("NextBoxID accepted a negative owner")
+	}
+	if _, err := boxes.CurrentBoxID(context.Background(), -1); err == nil {
+		t.Fatal("CurrentBoxID accepted a negative owner")
+	}
+	channelMessages := NewChannelMessageIDAllocator(nil, staticCounterSource{})
+	if _, err := channelMessages.NextChannelMessageID(context.Background(), -1); err == nil {
+		t.Fatal("NextChannelMessageID accepted a negative channel")
+	}
+}
+
 func TestRedisBoxAllocatorRecoverFromCounterSource(t *testing.T) {
 	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
 	if addr == "" {
@@ -108,6 +130,122 @@ func TestRedisBoxAllocatorConcurrentFirstUse(t *testing.T) {
 	}
 	if current != 1000+workers {
 		t.Fatalf("current box id = %d, want %d", current, 1000+workers)
+	}
+}
+
+func TestRedisBoxAllocatorBatchAllocatesDistinctUsersOnce(t *testing.T) {
+	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
+	}
+	ctx := context.Background()
+	c, err := Open(ctx, addr, "", 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	firstUser := time.Now().UnixNano()
+	secondUser := firstUser + 1
+	keys := []string{boxIDKey(firstUser), boxIDKey(secondUser)}
+	t.Cleanup(func() { _ = c.Del(ctx, keys...).Err() })
+	if err := c.MSet(ctx, keys[0], 40, keys[1], 90).Err(); err != nil {
+		t.Fatalf("seed counters: %v", err)
+	}
+
+	boxes := NewBoxIDAllocator(c, staticCounterSource{value: 1000})
+	got, err := boxes.NextBoxIDs(ctx, []int64{firstUser, secondUser, firstUser})
+	if err != nil {
+		t.Fatalf("NextBoxIDs: %v", err)
+	}
+	if len(got) != 2 || got[firstUser] != 41 || got[secondUser] != 91 {
+		t.Fatalf("NextBoxIDs = %+v, want first=41 second=91", got)
+	}
+	if current, err := c.MGet(ctx, keys...).Result(); err != nil {
+		t.Fatalf("MGet: %v", err)
+	} else if current[0] != "41" || current[1] != "91" {
+		t.Fatalf("counters = %#v, want each incremented exactly once", current)
+	}
+}
+
+func TestRedisBoxAllocatorBatchRecoversMissingCounters(t *testing.T) {
+	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
+	}
+	ctx := context.Background()
+	c, err := Open(ctx, addr, "", 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	firstUser := time.Now().UnixNano()
+	secondUser := firstUser + 1
+	keys := []string{boxIDKey(firstUser), boxIDKey(secondUser)}
+	t.Cleanup(func() { _ = c.Del(ctx, keys...).Err() })
+
+	got, err := NewBoxIDAllocator(c, staticCounterSource{value: 700}).NextBoxIDs(ctx, []int64{firstUser, secondUser})
+	if err != nil {
+		t.Fatalf("NextBoxIDs: %v", err)
+	}
+	if got[firstUser] != 701 || got[secondUser] != 701 {
+		t.Fatalf("NextBoxIDs = %+v, want both recovered to 701", got)
+	}
+}
+
+func TestRedisBoxAllocatorBatchRejectsInvalidUserBeforeAllocation(t *testing.T) {
+	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
+	}
+	ctx := context.Background()
+	c, err := Open(ctx, addr, "", 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	userID := time.Now().UnixNano()
+	key := boxIDKey(userID)
+	t.Cleanup(func() { _ = c.Del(ctx, key).Err() })
+	if err := c.Set(ctx, key, 10, 0).Err(); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	if _, err := NewBoxIDAllocator(c, nil).NextBoxIDs(ctx, []int64{userID, 0}); err == nil {
+		t.Fatal("NextBoxIDs accepted zero user id")
+	}
+	if got, err := c.Get(ctx, key).Int64(); err != nil || got != 10 {
+		t.Fatalf("counter after rejected batch = %d err=%v, want unchanged 10", got, err)
+	}
+}
+
+func TestRedisBoxAllocatorRejectsMissingDurableSourceBeforeAllocation(t *testing.T) {
+	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
+	}
+	ctx := context.Background()
+	c, err := Open(ctx, addr, "", 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	userID := time.Now().UnixNano()
+	key := boxIDKey(userID)
+	t.Cleanup(func() { _ = c.Del(ctx, key).Err() })
+	if err := c.Set(ctx, key, 10, 0).Err(); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	if _, err := NewBoxIDAllocator(c, nil).NextBoxID(ctx, userID); err == nil {
+		t.Fatal("NextBoxID accepted a missing durable source")
+	}
+	if _, err := NewBoxIDAllocator(c, nil).NextBoxIDs(ctx, []int64{userID}); err == nil {
+		t.Fatal("NextBoxIDs accepted a missing durable source")
+	}
+	if got, err := c.Get(ctx, key).Int64(); err != nil || got != 10 {
+		t.Fatalf("counter after rejected allocation = %d err=%v, want unchanged 10", got, err)
 	}
 }
 

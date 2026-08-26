@@ -186,11 +186,11 @@ func (s *MessageStore) DeliverLoginCodeMessage(ctx context.Context, req domain.L
 	if err := appendNewMessageEvent(ctx, qtx, msg); err != nil {
 		return domain.LoginCodeDeliveryResult{}, err
 	}
-	if err := enqueueDispatch(ctx, qtx, sqlcgen.EnqueueDispatchParams{
+	if err := enqueueDispatch(ctx, qtx, dispatchEnqueue{
 		TargetUserID:     req.UserID,
 		Pts:              int32(msg.Pts),
 		EventType:        string(domain.UpdateEventNewMessage),
-		ExcludeAuthKeyID: 0,
+		ExcludeAuthKeyID: [8]byte{},
 		ExcludeSessionID: 0,
 	}); err != nil {
 		return domain.LoginCodeDeliveryResult{}, fmt.Errorf("enqueue login code dispatch: %w", err)
@@ -325,18 +325,5 @@ WHERE delivery_key = $1`, deliveryKey[:]).Scan(
 }
 
 func (s *MessageStore) nextIncomingSystemBoxID(ctx context.Context, qtx *sqlcgen.Queries, userID int64) (int, error) {
-	// The default allocator queries PostgreSQL. Run that query on the active
-	// transaction connection: querying s.q while holding the transaction can
-	// deadlock a MaxConns=1 pool. External allocators (Redis/counters) retain
-	// their normal semantics.
-	switch s.boxIDs.(type) {
-	case pgBoxIDAllocator, *pgBoxIDAllocator:
-		current, err := qtx.MaxMessageBoxID(ctx, userID)
-		if err != nil {
-			return 0, err
-		}
-		return int(current) + 1, nil
-	default:
-		return s.boxIDs.NextBoxID(ctx, userID)
-	}
+	return s.boxIDs.NextBoxID(ctx, userID)
 }

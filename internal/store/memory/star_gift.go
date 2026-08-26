@@ -564,42 +564,6 @@ func (s *StarGiftStore) SetUnsaved(_ context.Context, ref domain.SavedStarGiftRe
 	return false, nil
 }
 
-func (s *StarGiftStore) MarkConverted(_ context.Context, ref domain.SavedStarGiftRef) (domain.SavedStarGift, error) {
-	if !ref.Valid() {
-		return domain.SavedStarGift{}, domain.ErrStarGiftNotFound
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.gifts {
-		if s.savedStarGiftMatchesRef(s.gifts[i], ref) {
-			if s.gifts[i].UniqueGiftID != 0 {
-				return domain.SavedStarGift{}, domain.ErrStarGiftAlreadyUpgraded
-			}
-			if s.gifts[i].Converted {
-				return domain.SavedStarGift{}, domain.ErrStarGiftAlreadyConverted
-			}
-			s.gifts[i].Converted = true
-			s.gifts[i].LifecycleStatus = domain.StarGiftLifecycleConverted
-			s.gifts[i].Unsaved = true
-			s.gifts[i].PinnedOrder = 0
-			for collectionIndex := range s.collections[ref.Owner] {
-				collection := &s.collections[ref.Owner][collectionIndex]
-				next := collection.GiftIDs[:0]
-				for _, giftID := range collection.GiftIDs {
-					if giftID != s.gifts[i].ID {
-						next = append(next, giftID)
-					}
-				}
-				collection.GiftIDs = next
-				collection.Hash = domain.StarGiftCollectionHash(collection.Title, collection.GiftIDs)
-			}
-			s.refreshCollectionMembershipsLocked(ref.Owner)
-			return s.gifts[i], nil
-		}
-	}
-	return domain.SavedStarGift{}, domain.ErrStarGiftNotFound
-}
-
 func (s *StarGiftStore) ListCollections(_ context.Context, owner domain.Peer) ([]domain.StarGiftCollection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -43,9 +43,6 @@ func (r *Router) onChannelsCreateChannel(ctx context.Context, req *tg.ChannelsCr
 	if err != nil {
 		return nil, err
 	}
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelOperationUpdates(ctx, viewerUserID, res)
-	})
 	return updates, nil
 }
 

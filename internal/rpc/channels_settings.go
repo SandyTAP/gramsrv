@@ -49,7 +49,7 @@ func (r *Router) onChannelsUpdateUsername(ctx context.Context, req *tg.ChannelsU
 		return false, channelUsernameErr(err)
 	}
 	r.invalidateRPCProjectionForChannel(channel.ID)
-	r.pushChannelStateToMembers(ctx, userID, channel)
+	r.pushTransientChannelStateInvalidation(ctx, userID, channel)
 	return true, nil
 }
 
@@ -214,7 +214,7 @@ func (r *Router) onChannelsSetDiscussionGroup(ctx context.Context, req *tg.Chann
 	}
 	for _, channel := range res.Channels {
 		r.invalidateRPCProjectionForChannel(channel.ID)
-		r.pushChannelStateToMembers(ctx, userID, channel)
+		r.pushTransientChannelStateInvalidation(ctx, userID, channel)
 	}
 	return true, nil
 }
@@ -374,11 +374,12 @@ func (r *Router) onChannelsEditTitle(ctx context.Context, req *tg.ChannelsEditTi
 		if err != nil {
 			return nil, err
 		}
-		view, changed, err := r.deps.Communities.EditTitle(ctx, userID, community.Community.ID, req.Title)
+		date := int(r.clock.Now().Unix())
+		view, _, err := r.deps.Communities.EditTitle(ctx, userID, community.Community.ID, req.Title, r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, communityErr(err)
 		}
-		return r.communityMutationUpdates(ctx, userID, view, changed), nil
+		return r.communityUpdates(view), nil
 	}
 	if r.deps.Channels == nil {
 		return nil, channelInvalidErr(domain.ErrChannelInvalid)
@@ -398,21 +399,15 @@ func (r *Router) onChannelsEditTitle(ctx context.Context, req *tg.ChannelsEditTi
 	}
 	r.invalidateRPCProjectionForChannel(res.Channel.ID)
 	updates := r.channelTitleUpdates(ctx, userID, res)
-	// 混合容器拆分（设计 fan-out epic）：channelTitleUpdates 同时含①无 pts UpdateChannel（频道元数据
-	// 刷新，无 channel difference 恢复面）②带 pts 改名服务消息（broadcast+megagroup 均产 pts，有
-	// difference 恢复面）。①必须同步发（不能进可丢弃队列，否则永久漏人数/元数据刷新），但它无 Users
-	// 投影、廉价；②走异步 fan-out（含 owner 预热 + >cap nudge，丢弃由 getChannelDifference 兜底），把
-	// per-viewer 服务消息投影移出改名者 RPC 路径。操作者本设备仍由上面的 RPC result 即时回显完整容器。
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelStateUpdates(viewerUserID, res.Channel)
-	})
+	// The mixed response is caller-only. The committed service event is signalled
+	// exactly once through the channel_pts lane; Core does no second fan-out.
 	if res.Event.Pts != 0 {
-		if err := r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, domain.SendChannelMessageResult{
 			Channel:    res.Channel,
 			Message:    res.Message,
 			Event:      res.Event,
 			Recipients: res.Recipients,
-		}, nil); err != nil {
+		}); err != nil {
 			return nil, internalErr()
 		}
 	}
@@ -438,11 +433,12 @@ func (r *Router) onChannelsEditPhoto(ctx context.Context, req *tg.ChannelsEditPh
 		if err != nil {
 			return nil, err
 		}
-		view, changed, err := r.deps.Communities.SetPhoto(ctx, userID, community.Community.ID, photo, int(r.clock.Now().Unix()))
+		date := int(r.clock.Now().Unix())
+		view, _, err := r.deps.Communities.SetPhoto(ctx, userID, community.Community.ID, photo, date, r.communityDeliveryEffects(ctx, userID, date))
 		if err != nil {
 			return nil, communityErr(err)
 		}
-		return r.communityMutationUpdates(ctx, userID, view, changed), nil
+		return r.communityUpdates(view), nil
 	}
 	if r.deps.Channels == nil {
 		return nil, channelInvalidErr(domain.ErrChannelInvalid)
@@ -457,16 +453,13 @@ func (r *Router) onChannelsEditPhoto(ctx context.Context, req *tg.ChannelsEditPh
 	}
 	r.invalidateRPCProjectionForChannel(res.Channel.ID)
 	updates := r.channelPhotoUpdates(ctx, userID, res)
-	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-		return r.channelStateUpdates(viewerUserID, res.Channel)
-	})
 	if res.Event.Pts != 0 {
-		if err := r.enqueueChannelMessageFanout(ctx, userID, domain.SendChannelMessageResult{
+		if err := r.enqueueBotAPIChannelMessageUpdate(ctx, userID, domain.SendChannelMessageResult{
 			Channel:    res.Channel,
 			Message:    res.Message,
 			Event:      res.Event,
 			Recipients: res.Recipients,
-		}, nil); err != nil {
+		}); err != nil {
 			return nil, internalErr()
 		}
 	}

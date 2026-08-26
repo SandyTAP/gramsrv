@@ -432,6 +432,8 @@ func TestStoriesReadStoriesRecordsDifferenceUpdate(t *testing.T) {
 	authKeyID := [8]byte{1, 2, 3}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
+	storyStore.AttachUpdateEventStore(updateStore)
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001}
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
 		Owner:      owner,
@@ -538,7 +540,7 @@ func TestStoriesReadAndReactionEventsExcludeCurrentSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	storyStore := memory.NewStoryStore()
+	storyStore := memory.NewStoryStore(channelStore)
 	userPeer := domain.Peer{Type: domain.PeerTypeUser, ID: ownerUser.ID}
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
 		Owner:      userPeer,
@@ -563,7 +565,7 @@ func TestStoriesReadAndReactionEventsExcludeCurrentSession(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:    appusers.NewService(userStore),
 		Channels: channelService,
-		Stories:  appstories.NewService(storyStore),
+		Stories:  appstories.NewService(&rpcStoryDeliveryCaptureStore{StoryStore: storyStore, capture: updates}),
 		Updates:  updates,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000220, 0)})
 	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, viewer.ID), authKeyID), sessionID)
@@ -624,7 +626,7 @@ func TestStoriesReadStoriesClampsFutureMaxID(t *testing.T) {
 			1000000002: {ID: 1000000002, FirstName: "Viewer"},
 		}},
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 
 	readCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, 1000000002), authKeyID), 88)
@@ -680,6 +682,7 @@ func TestStoriesReadStoriesInvisiblePeerDoesNotWriteDifference(t *testing.T) {
 	authKeyID := [8]byte{4, 5, 7}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001}
 	viewerID := int64(1000000002)
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
@@ -774,13 +777,13 @@ func TestStoriesGetAllReadPeerStoriesReturnsStoredReadUpdates(t *testing.T) {
 	storyStore := memory.NewStoryStore()
 	userPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1000000002}
 	channelPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: 1000000003}
-	if _, err := storyStore.MarkRead(ctx, viewerID, userPeer, 2, 1700000001); err != nil {
+	if _, err := rpcTestMarkStoryRead(ctx, storyStore, viewerID, userPeer, 2, 1700000001); err != nil {
 		t.Fatalf("mark user read: %v", err)
 	}
-	if _, err := storyStore.MarkRead(ctx, viewerID, channelPeer, 5, 1700000002); err != nil {
+	if _, err := rpcTestMarkStoryRead(ctx, storyStore, viewerID, channelPeer, 5, 1700000002); err != nil {
 		t.Fatalf("mark channel read: %v", err)
 	}
-	if _, err := storyStore.MarkRead(ctx, 1000000099, userPeer, 9, 1700000003); err != nil {
+	if _, err := rpcTestMarkStoryRead(ctx, storyStore, 1000000099, userPeer, 9, 1700000003); err != nil {
 		t.Fatalf("mark other viewer read: %v", err)
 	}
 	r := New(Config{}, Deps{
@@ -2588,7 +2591,7 @@ func TestStoriesSendReactionRecordsOwnerNewReactionDifference(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 	viewerCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, viewer.ID), viewerAuthKeyID), 7102)
 
@@ -2707,7 +2710,7 @@ func TestStoriesViewsAndReactionsListReturnViewerUsers(t *testing.T) {
 		t.Fatalf("increment view: %v", err)
 	}
 	fire := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "🔥"}
-	if _, err := storyStore.SetReaction(ctx, viewerTwo.ID, owner, 1, fire, 1700000002); err != nil {
+	if _, err := rpcTestSetStoryReaction(ctx, storyStore, viewerTwo.ID, owner, 1, fire, 1700000002); err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
 	r := New(Config{}, Deps{
@@ -3085,11 +3088,11 @@ func TestStoriesGetStoryReactionsListReturnsChannelAdminReactions(t *testing.T) 
 		t.Fatalf("upsert channel story: %v", err)
 	}
 	fire := &domain.MessageReaction{Type: domain.MessageReactionEmoji, Emoticon: "🔥"}
-	if _, err := storyStore.SetReaction(ctx, reactor.ID, owner, 1, fire, 1700000003); err != nil {
+	if _, err := rpcTestSetStoryReaction(ctx, storyStore, reactor.ID, owner, 1, fire, 1700000003); err != nil {
 		t.Fatalf("set reaction: %v", err)
 	}
 	custom := &domain.MessageReaction{Type: domain.MessageReactionCustomEmoji, DocumentID: 12345}
-	if _, err := storyStore.SetReaction(ctx, member.ID, owner, 1, custom, 1700000004); err != nil {
+	if _, err := rpcTestSetStoryReaction(ctx, storyStore, member.ID, owner, 1, custom, 1700000004); err != nil {
 		t.Fatalf("set custom reaction: %v", err)
 	}
 	r := New(Config{}, Deps{
@@ -3240,7 +3243,7 @@ func TestStoriesGetStoryReactionsListReturnsPublicRepost(t *testing.T) {
 		t.Fatalf("upsert channel story: %v", err)
 	}
 	repostOwner := domain.Peer{Type: domain.PeerTypeUser, ID: reposter.ID}
-	repost, err := storyStore.CreateStory(ctx, domain.StoryCreateRequest{
+	repost, err := rpcTestCreateStory(ctx, storyStore, reposter.ID, domain.StoryCreateRequest{
 		Owner:    repostOwner,
 		RandomID: 9140201,
 		Date:     1700000202,
@@ -3300,7 +3303,7 @@ func TestStoriesGetStoryReactionsListReturnsPublicRepost(t *testing.T) {
 	if filtered.Count != 0 || len(filtered.Reactions) != 0 {
 		t.Fatalf("filtered reactions list = %+v, want no repost rows", filtered)
 	}
-	if _, err := storyStore.DeleteStories(ctx, repostOwner, []int{repost.Story.ID}, 1700000203); err != nil {
+	if _, err := rpcTestDeleteStories(ctx, storyStore, repostOwner.ID, repostOwner, []int{repost.Story.ID}, 1700000203); err != nil {
 		t.Fatalf("delete repost: %v", err)
 	}
 	empty, err := r.onStoriesGetStoryReactionsList(WithUserID(ctx, creator.ID), req)
@@ -3750,7 +3753,7 @@ func TestStatsGetStoryPublicForwardsReturnsStoryAndMessageForwards(t *testing.T)
 		t.Fatalf("public forwards after message delete row = %T, want *tg.PublicForwardStory", afterMessageDelete.Forwards[0])
 	}
 
-	if _, err := storyStore.DeleteStories(ctx, repostPeer, []int{repost.ID}, 1700000410); err != nil {
+	if _, err := rpcTestDeleteStories(ctx, storyStore, repostPeer.ID, repostPeer, []int{repost.ID}, 1700000410); err != nil {
 		t.Fatalf("delete public repost: %v", err)
 	}
 	empty, err := r.onStatsGetStoryPublicForwards(WithUserID(ctx, creator.ID), &tg.StatsGetStoryPublicForwardsRequest{
@@ -3909,7 +3912,7 @@ func TestStoriesSendReactionDoesNotFakeChannelAdminNewReactionNotification(t *te
 		Users:    appusers.NewService(userStore),
 		Channels: channelService,
 		Stories:  appstories.NewService(storyStore),
-		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates:  rpcTestStoryUpdates(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000100, 0)})
 	updates, err := r.onStoriesSendReaction(
 		WithSessionID(WithAuthKeyID(WithUserID(ctx, reactor.ID), reactorAuthKeyID), 8123),
@@ -4077,9 +4080,10 @@ func TestStoriesChannelAdminCanSendEditDeleteStory(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("promote story admin: %v", err)
 	}
-	storyStore := memory.NewStoryStore()
+	storyStore := memory.NewStoryStore(channelStore)
 	stateStore := memory.NewUpdateStateStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	r := New(Config{}, Deps{
 		Users:    appusers.NewService(userStore),
 		Channels: channelService,
@@ -4761,6 +4765,7 @@ func TestStoryDifferenceProjectsCompanionStoriesMaxID(t *testing.T) {
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	now := time.Unix(1700000500, 0)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
@@ -4808,6 +4813,7 @@ func TestStoriesSendStoryRepostRecordsForwardHeaderAndDifference(t *testing.T) {
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	now := time.Unix(1700000501, 0)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
@@ -5014,6 +5020,7 @@ func TestStoriesSendStoryRepostRespectsForwardPrivacyFromName(t *testing.T) {
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	now := time.Unix(1700000521, 0)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
@@ -5186,6 +5193,7 @@ func TestStoriesSendEditDeleteRecordsStoryUpdates(t *testing.T) {
 	userID := user.ID
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	now := time.Unix(1700000500, 0)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
@@ -5331,7 +5339,7 @@ func TestStoriesWriteEventsExcludeCurrentSession(t *testing.T) {
 	updates := &captureUpdates{}
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
-		Stories: appstories.NewService(storyStore),
+		Stories: appstories.NewService(&rpcStoryDeliveryCaptureStore{StoryStore: storyStore, capture: updates}),
 		Updates: updates,
 		Files:   &fakeFiles{photos: map[int64]domain.Photo{}},
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000510, 0)})
@@ -5410,6 +5418,7 @@ func TestStoriesDeleteStoriesFanoutsDeletedUserStoryToVisibleViewer(t *testing.T
 	storyStore := memory.NewStoryStore()
 	stateStore := memory.NewUpdateStateStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
@@ -5485,6 +5494,7 @@ func TestStoriesDeleteStoriesFanoutsDeletedUserStoryToAllStoriesCachedViewer(t *
 	storyStore := memory.NewStoryStore()
 	stateStore := memory.NewUpdateStateStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
@@ -5590,7 +5600,7 @@ func TestStoriesDeleteStoriesFanoutsExpiredPinnedUserStory(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: now})
 	ownerCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, owner.ID), ownerAuthKey), 92)
 
@@ -5655,7 +5665,7 @@ func TestStoriesTogglePinnedFanoutsExpiredPinnedUserStoryRemoval(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 	}, zaptest.NewLogger(t), fixedClock{now: now})
 	ownerCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, owner.ID), ownerAuthKey), 93)
 
@@ -5699,6 +5709,7 @@ func TestStoriesSendStoryRandomIDRetryReturnsOriginalWithoutNewUpdate(t *testing
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	now := time.Unix(1700000510, 0)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
@@ -6251,6 +6262,7 @@ func TestStoriesMediaAreasRoundTripSendEditClearAndDifference(t *testing.T) {
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
@@ -7508,6 +7520,7 @@ func TestStoriesEditStoryHandlesAndroidEmptyMusicAndRejectsUnsupportedFlags(t *t
 	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
@@ -7713,7 +7726,7 @@ func TestStoriesSendEditPrivacyRulesDriveVisibility(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 		Files:   &fakeFiles{photos: map[int64]domain.Photo{}},
 	}, zaptest.NewLogger(t), fixedClock{now: now})
 	reqCtx := WithSessionID(WithAuthKeyID(WithUserID(ctx, author.ID), authKeyID), 991)
@@ -7824,7 +7837,7 @@ func TestStoriesPrivacyRulesRejectNilInputsBeforeMutation(t *testing.T) {
 	r := New(Config{}, Deps{
 		Users:   appusers.NewService(userStore),
 		Stories: appstories.NewService(storyStore),
-		Updates: appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates: rpcTestStoryUpdates(storyStore),
 		Files:   &fakeFiles{photos: map[int64]domain.Photo{}},
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000920, 0)})
 	reqCtx := WithUserID(ctx, author.ID)
@@ -8278,6 +8291,7 @@ func TestStoriesEditPrivacyFanoutsKnownViewerDifferences(t *testing.T) {
 	storyStore := memory.NewStoryStore()
 	stateStore := memory.NewUpdateStateStore()
 	updateStore := memory.NewUpdateEventStore()
+	storyStore.AttachUpdateEventStore(updateStore)
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: author.ID}
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
 		Owner:      ownerPeer,

@@ -252,13 +252,11 @@ func (r *Router) onPhoneCreateGroupCall(ctx context.Context, req *tg.PhoneCreate
 		channel.ActiveCallID = call.ID
 		channel.ActiveCallAccessHash = call.AccessHash
 	}
-	// 扇出：banner flag 刷新 + updateGroupCall + 服务消息。
-	r.pushChannelStateToMembers(ctx, userID, channel)
+	// Core 只直推无 PTS 的 banner cache hint 与 updateGroupCall；服务消息由
+	// durable channel lane 投递。
+	r.pushTransientChannelStateInvalidation(ctx, userID, channel)
 	r.pushGroupCallUpdate(ctx, channel, call)
-	if serviceRes.Event.Pts != 0 {
-		r.pushGroupCallServiceMessage(ctx, userID, serviceRes)
-	}
-	// 响应：updateGroupCall + 服务消息（发起设备视角）。TDesktop 创建后自行 joinGroupCall。
+	// 当前 RPC 响应仍携带同一 service event（发起设备视角）。TDesktop 创建后自行 joinGroupCall。
 	update := &tg.UpdateGroupCall{Call: tgGroupCall(call, userID, true, r.cfg.PublicBaseURL)}
 	update.SetPeer(&tg.PeerChannel{ChannelID: channel.ID})
 	out := r.groupCallUpdateContainer(ctx, userID, channel, update, []int64{userID})
@@ -470,11 +468,8 @@ func (r *Router) onPhoneDiscardGroupCall(ctx context.Context, in tg.InputGroupCa
 	} else {
 		r.log.Warn("group call ended service message", zap.Int64("channel_id", channel.ID), zap.Error(err))
 	}
-	r.pushChannelStateToMembers(ctx, scope.userID, channel)
+	r.pushTransientChannelStateInvalidation(ctx, scope.userID, channel)
 	r.pushGroupCallUpdate(ctx, channel, call)
-	if serviceRes.Event.Pts != 0 {
-		r.pushGroupCallServiceMessage(ctx, scope.userID, serviceRes)
-	}
 	out := r.groupCallUpdateContainer(ctx, scope.userID, channel,
 		groupCallUpdateFor(channel, call, scope.userID, true, r.cfg.PublicBaseURL), nil)
 	if serviceRes.Event.Pts != 0 {

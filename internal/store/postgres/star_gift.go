@@ -896,61 +896,6 @@ WHERE export_id=$1`, exportID, unsaved); err != nil {
 	return changed, nil
 }
 
-func (s *StarGiftStore) MarkConverted(ctx context.Context, ref domain.SavedStarGiftRef) (domain.SavedStarGift, error) {
-	if !ref.Valid() {
-		return domain.SavedStarGift{}, domain.ErrStarGiftNotFound
-	}
-	out := domain.SavedStarGift{}
-	err := withTx(ctx, s.db, "convert star gift", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, starGiftCollectionLockKey(ref.Owner)); err != nil {
-			return fmt.Errorf("lock star gift owner collections: %w", err)
-		}
-		where, args := savedStarGiftRefWhere(ref)
-		row := tx.QueryRow(ctx, `
-SELECT p.id, p.owner_peer_type, p.owner_peer_id, p.from_user_id, p.gift_id, p.catalog_revision_id,
-       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, p.unsaved, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
-	   p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
-	   p.drop_original_details_stars, p.can_craft_at,
-	       p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, p.pinned_order,
-       COALESCE((SELECT array_agg(i.collection_id ORDER BY c.sort_order, i.collection_id)
-                 FROM star_gift_collection_items i
-                 JOIN star_gift_collections c ON c.collection_id=i.collection_id
-                 WHERE i.saved_gift_id=p.id), ARRAY[]::integer[])
-FROM peer_star_gifts p
-WHERE `+where+` FOR UPDATE`, args...)
-		g, err := scanSavedStarGift(row)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrStarGiftNotFound
-			}
-			return err
-		}
-		if g.Converted {
-			return domain.ErrStarGiftAlreadyConverted
-		}
-		if g.UniqueGiftID != 0 {
-			return domain.ErrStarGiftAlreadyUpgraded
-		}
-		if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET converted = true, lifecycle_status='converted', unsaved = true, pinned_order = 0 WHERE id = $1`, g.ID); err != nil {
-			return fmt.Errorf("mark star gift converted: %w", err)
-		}
-		if err := removeSavedGiftFromCollections(ctx, tx, g.Owner, g.ID); err != nil {
-			return err
-		}
-		g.Converted = true
-		g.LifecycleStatus = domain.StarGiftLifecycleConverted
-		g.Unsaved = true
-		g.PinnedOrder = 0
-		g.CollectionIDs = nil
-		out = g
-		return nil
-	})
-	if err != nil {
-		return domain.SavedStarGift{}, err
-	}
-	return out, nil
-}
-
 func scanSavedStarGift(row rowScanner) (domain.SavedStarGift, error) {
 	var g domain.SavedStarGift
 	var ownerType string

@@ -130,7 +130,7 @@ func (s *S3FS) PutReader(ctx context.Context, r io.Reader) (string, int64, []byt
 		if info.Size != size {
 			return "", 0, nil, fmt.Errorf("existing s3 blob %q size %d does not match content size %d", key, info.Size, size)
 		}
-		return key, size, append([]byte(nil), sum...), nil
+		return key, size, sum, nil
 	} else if !isS3NotFound(err) {
 		return "", 0, nil, fmt.Errorf("stat s3 blob %q: %w", key, err)
 	}
@@ -147,7 +147,7 @@ func (s *S3FS) PutReader(ctx context.Context, r io.Reader) (string, int64, []byt
 	if uploaded.Size != size {
 		return "", 0, nil, fmt.Errorf("put s3 blob %q reported size %d, want %d", key, uploaded.Size, size)
 	}
-	return key, size, append([]byte(nil), sum...), nil
+	return key, size, sum, nil
 }
 
 func (s *S3FS) Get(ctx context.Context, objectKey string) ([]byte, error) {

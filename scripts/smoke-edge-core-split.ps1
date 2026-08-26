@@ -5,10 +5,10 @@ Builds and smoke-tests telesrv core/edge split mode.
 .DESCRIPTION
 This script builds the dedicated cmd/telesrv-core binary for Core, the
 cmd/telesrv-egress binary for Durable Egress, and the cmd/telesrv-edge binary for
-Edge. It verifies the selected CoreExec transport, the Egress ACK boundary, each
+Edge. It verifies the selected CoreExec transport, the Egress Delivery boundary, each
 edge MTProto listener, and writes separate logs for every role. By default it
 starts one Core, one Egress, and one Edge; with -MultiInstance it starts two
-CoreExec gRPC listeners, two Egress ACK gRPC listeners, and two Edge listeners.
+CoreExec gRPC listeners, two Egress Delivery gRPC listeners, and two Edge listeners.
 Optional CoreExec gRPC TLS/mTLS parameters are passed to the
 core and edge roles through the same TELESRV_CORE_EXEC_GRPC_TLS_* variables used
 in production. -GenerateCoreExecGRPCTestCerts creates a temporary CA, server
@@ -45,8 +45,8 @@ requested number of distinct Core instance IDs through the configured resolver.
 Use -CoreExecProcessProbeDuration and -CoreExecProcessProbeInterval to keep
 dispatching over a sustained observation window instead of accepting one short
 burst.
--RunEgressAckProcessProbeGate runs a real Egress ACK gRPC probe after role
-startup; with -EgressAckProcessProbeExpectInstances it fails unless GetInfo
+-RunEgressDeliveryProcessProbeGate runs a real Egress Delivery gRPC probe after role
+startup; with -EgressDeliveryProcessProbeExpectInstances it fails unless GetInfo
 observes the requested number of distinct Egress instance IDs through the
 configured resolver.
 -RunEgressOutboxCrashRecoveryGate runs a real PostgreSQL durable outbox gate
@@ -56,12 +56,12 @@ late client ACK attempts are fenced without timer-dependent sleeps.
 after role startup. It creates probe users, registers a fake online Edge in
 Redis, appends transactional durable outbox events, requires multiple real
 telesrv-egress SourceInstanceID values to push through Redis fabric, reports
-client ACKs through Egress ACK gRPC, and verifies dispatch_outbox drains.
+client ACKs through Egress Delivery gRPC, and verifies dispatch_outbox drains.
 -RunEgressOutboxProcessCrashGate runs a real Durable Egress crash/reclaim gate
 after role startup. It withholds the first Redis fabric service ACK, waits until
 the row remains dispatching, stops the source
 telesrv-egress process, then requires another Egress process to reclaim the same
-outbox row with attempt+1 and drain it through a service-level delivered ACK.
+outbox row with attempt+1 and drain it through a strict physical-write receipt.
 -RunCoreExecPendingMetricsGate scrapes each Edge /metrics endpoint and verifies
 the CoreExec pending admission gauges are exported with fixed transport-only
 labels.
@@ -138,16 +138,16 @@ param(
     [string]$CoreExecGRPCTLSClientCertFile,
     [string]$CoreExecGRPCTLSClientKeyFile,
     [switch]$GenerateCoreExecGRPCTestCerts,
-    [string]$EgressAckGRPCAddr = "127.0.0.1:2510",
+    [string]$EgressDeliveryGRPCAddr = "127.0.0.1:2510",
     [ValidateSet("static", "dns")]
-    [string]$EgressAckGRPCResolver = "static",
-    [string]$EgressAckGRPCTargets,
-    [string[]]$EgressAckGRPCAddrs,
-    [switch]$RunEgressAckProcessProbeGate,
-    [int]$EgressAckProcessProbeExpectInstances = 0,
-    [string]$EgressAckProcessProbeDuration = "0s",
-    [string]$EgressAckProcessProbeInterval = "0s",
-    [switch]$RunEgressAckRollingRestartGate,
+    [string]$EgressDeliveryGRPCResolver = "static",
+    [string]$EgressDeliveryGRPCTargets,
+    [string[]]$EgressDeliveryGRPCAddrs,
+    [switch]$RunEgressDeliveryProcessProbeGate,
+    [int]$EgressDeliveryProcessProbeExpectInstances = 0,
+    [string]$EgressDeliveryProcessProbeDuration = "0s",
+    [string]$EgressDeliveryProcessProbeInterval = "0s",
+    [switch]$RunEgressDeliveryRollingRestartGate,
     [switch]$RunEgressOutboxCrashRecoveryGate,
     [string]$EgressOutboxCrashRecoveryLeaseTimeout = "1s",
     [string]$EgressOutboxCrashRecoveryStaleAge = "2s",
@@ -155,15 +155,15 @@ param(
     [int]$EgressOutboxMultiProcessUsers = 16,
     [int]$EgressOutboxMultiProcessEventsPerUser = 2,
     [int]$EgressOutboxMultiProcessExpectInstances = 0,
-    [string]$EgressOutboxMultiProcessCommandAckDelay = "50ms",
+    [string]$EgressOutboxMultiProcessAdmissionDelay = "50ms",
     [string]$EgressOutboxMultiProcessClientAckDelay = "25ms",
     [string]$EgressOutboxMultiProcessTimeout = "30s",
     [switch]$RunEgressOutboxProcessCrashGate,
     [string]$EgressOutboxProcessCrashLeaseTimeout = "1s",
-    [string]$EgressOutboxProcessCrashCommandAckDelay = "0s",
+    [string]$EgressOutboxProcessCrashAdmissionDelay = "0s",
     [string]$EgressOutboxProcessCrashClientAckDelay = "25ms",
     [string]$EgressOutboxProcessCrashTimeout = "45s",
-    [string]$EgressAckToken = "edge-core-smoke-egress",
+    [string]$EgressDeliveryToken = "edge-core-smoke-egress",
     [string]$CoreListen = "127.0.0.1:2397",
     [string]$EdgeListen = "127.0.0.1:2398",
     [string[]]$EdgeListens,
@@ -249,17 +249,17 @@ if ($null -eq $EdgeListens -or $EdgeListens.Count -eq 0) {
         $EdgeListens = @($EdgeListen)
     }
 }
-if ($null -eq $EgressAckGRPCAddrs -or $EgressAckGRPCAddrs.Count -eq 0) {
+if ($null -eq $EgressDeliveryGRPCAddrs -or $EgressDeliveryGRPCAddrs.Count -eq 0) {
     if ($MultiInstance) {
-        $EgressAckGRPCAddrs = @("127.0.0.1:2510", "127.0.0.1:2511")
+        $EgressDeliveryGRPCAddrs = @("127.0.0.1:2510", "127.0.0.1:2511")
     } else {
-        $EgressAckGRPCAddrs = @($EgressAckGRPCAddr)
+        $EgressDeliveryGRPCAddrs = @($EgressDeliveryGRPCAddr)
     }
 }
 if ($MultiInstance) {
     $CoreExecGRPCAddr = $CoreExecGRPCAddrs[0]
     $EdgeListen = $EdgeListens[0]
-    $EgressAckGRPCAddr = $EgressAckGRPCAddrs[0]
+    $EgressDeliveryGRPCAddr = $EgressDeliveryGRPCAddrs[0]
 }
 if ($RunCoreExecDNSMultiAProcessGate) {
     if ($CoreExecGRPCAddrs.Count -lt 2) {
@@ -292,8 +292,8 @@ if ($RunCoreExecDNSMultiAProcessGate) {
 if (-not $CoreExecGRPCTargets) {
     $CoreExecGRPCTargets = ($CoreExecGRPCAddrs -join ",")
 }
-if (-not $EgressAckGRPCTargets) {
-    $EgressAckGRPCTargets = ($EgressAckGRPCAddrs -join ",")
+if (-not $EgressDeliveryGRPCTargets) {
+    $EgressDeliveryGRPCTargets = ($EgressDeliveryGRPCAddrs -join ",")
 }
 if ($InjectBadCoreExecTarget) {
     $badTarget = $BadCoreExecGRPCAddr.Trim()
@@ -313,10 +313,10 @@ if ($CoreExecGRPCResolver -eq "dns" -and -not $RunCoreExecDNSMultiAProcessGate) 
         throw "-CoreExecGRPCResolver dns requires exactly one -CoreExecGRPCTargets value; use static for comma-separated endpoints"
     }
 }
-if ($EgressAckGRPCResolver -eq "dns") {
-    $dnsTargets = @($EgressAckGRPCTargets.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+if ($EgressDeliveryGRPCResolver -eq "dns") {
+    $dnsTargets = @($EgressDeliveryGRPCTargets.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
     if ($dnsTargets.Count -ne 1) {
-        throw "-EgressAckGRPCResolver dns requires exactly one -EgressAckGRPCTargets value; use static for comma-separated endpoints"
+        throw "-EgressDeliveryGRPCResolver dns requires exactly one -EgressDeliveryGRPCTargets value; use static for comma-separated endpoints"
     }
 }
 if ($GenerateCoreExecGRPCTestCerts) {
@@ -382,11 +382,11 @@ if ($RunCoreExecPendingMetricsGate -and $BuildOnly) {
 if ($RunCoreExecRollingRestartGate -and $BuildOnly) {
     throw "-RunCoreExecRollingRestartGate cannot be combined with -BuildOnly"
 }
-if ($RunEgressAckProcessProbeGate -and $BuildOnly) {
-    throw "-RunEgressAckProcessProbeGate cannot be combined with -BuildOnly"
+if ($RunEgressDeliveryProcessProbeGate -and $BuildOnly) {
+    throw "-RunEgressDeliveryProcessProbeGate cannot be combined with -BuildOnly"
 }
-if ($RunEgressAckRollingRestartGate -and $BuildOnly) {
-    throw "-RunEgressAckRollingRestartGate cannot be combined with -BuildOnly"
+if ($RunEgressDeliveryRollingRestartGate -and $BuildOnly) {
+    throw "-RunEgressDeliveryRollingRestartGate cannot be combined with -BuildOnly"
 }
 if ($RunEgressOutboxCrashRecoveryGate -and $BuildOnly) {
     throw "-RunEgressOutboxCrashRecoveryGate cannot be combined with -BuildOnly"
@@ -414,8 +414,8 @@ if ($PreflightOnly -and ($RunCoreExecUnavailableGate -or
         $RunCoreExecProcessProbeGate -or
         $RunCoreExecPendingMetricsGate -or
         $RunCoreExecRollingRestartGate -or
-        $RunEgressAckProcessProbeGate -or
-        $RunEgressAckRollingRestartGate -or
+        $RunEgressDeliveryProcessProbeGate -or
+        $RunEgressDeliveryRollingRestartGate -or
         $RunEgressOutboxMultiProcessGate -or
         $RunEgressOutboxProcessCrashGate -or
         $RunMTProtoEdgeProbeGate -or
@@ -444,29 +444,29 @@ if ($RunMTProtoEdgeAuthProbeGate -and -not $MTProtoEdgeAuthCode) {
 if ($MTProtoEdgeAuthProbeRuns -le 0) {
     throw "-MTProtoEdgeAuthProbeRuns must be positive"
 }
-if ($EgressAckProcessProbeExpectInstances -lt 0) {
-    throw "-EgressAckProcessProbeExpectInstances must be non-negative"
+if ($EgressDeliveryProcessProbeExpectInstances -lt 0) {
+    throw "-EgressDeliveryProcessProbeExpectInstances must be non-negative"
 }
-if ([string]::IsNullOrWhiteSpace($EgressAckProcessProbeDuration)) {
-    throw "-EgressAckProcessProbeDuration must not be empty"
+if ([string]::IsNullOrWhiteSpace($EgressDeliveryProcessProbeDuration)) {
+    throw "-EgressDeliveryProcessProbeDuration must not be empty"
 }
-if ([string]::IsNullOrWhiteSpace($EgressAckProcessProbeInterval)) {
-    throw "-EgressAckProcessProbeInterval must not be empty"
+if ([string]::IsNullOrWhiteSpace($EgressDeliveryProcessProbeInterval)) {
+    throw "-EgressDeliveryProcessProbeInterval must not be empty"
 }
-if ($RunEgressAckRollingRestartGate -and -not $MultiInstance) {
-    throw "-RunEgressAckRollingRestartGate requires -MultiInstance"
+if ($RunEgressDeliveryRollingRestartGate -and -not $MultiInstance) {
+    throw "-RunEgressDeliveryRollingRestartGate requires -MultiInstance"
 }
-if ($RunEgressAckRollingRestartGate -and $EgressAckGRPCAddrs.Count -lt 2) {
-    throw "-RunEgressAckRollingRestartGate requires at least two -EgressAckGRPCAddrs"
+if ($RunEgressDeliveryRollingRestartGate -and $EgressDeliveryGRPCAddrs.Count -lt 2) {
+    throw "-RunEgressDeliveryRollingRestartGate requires at least two -EgressDeliveryGRPCAddrs"
 }
-if ($RunEgressAckRollingRestartGate -and $EgressAckGRPCResolver -ne "static") {
-    throw "-RunEgressAckRollingRestartGate currently requires -EgressAckGRPCResolver static"
+if ($RunEgressDeliveryRollingRestartGate -and $EgressDeliveryGRPCResolver -ne "static") {
+    throw "-RunEgressDeliveryRollingRestartGate currently requires -EgressDeliveryGRPCResolver static"
 }
-if ($RunEgressAckRollingRestartGate) {
-    $RunEgressAckProcessProbeGate = $true
+if ($RunEgressDeliveryRollingRestartGate) {
+    $RunEgressDeliveryProcessProbeGate = $true
 }
-if ($RunEgressAckProcessProbeGate -and $MultiInstance -and $EgressAckProcessProbeExpectInstances -eq 0) {
-    $EgressAckProcessProbeExpectInstances = $EgressAckGRPCAddrs.Count
+if ($RunEgressDeliveryProcessProbeGate -and $MultiInstance -and $EgressDeliveryProcessProbeExpectInstances -eq 0) {
+    $EgressDeliveryProcessProbeExpectInstances = $EgressDeliveryGRPCAddrs.Count
 }
 if ([string]::IsNullOrWhiteSpace($EgressOutboxCrashRecoveryLeaseTimeout)) {
     throw "-EgressOutboxCrashRecoveryLeaseTimeout must not be empty"
@@ -477,8 +477,8 @@ if ([string]::IsNullOrWhiteSpace($EgressOutboxCrashRecoveryStaleAge)) {
 if ($RunEgressOutboxMultiProcessGate -and -not $MultiInstance) {
     throw "-RunEgressOutboxMultiProcessGate requires -MultiInstance"
 }
-if ($RunEgressOutboxMultiProcessGate -and $EgressAckGRPCAddrs.Count -lt 2) {
-    throw "-RunEgressOutboxMultiProcessGate requires at least two -EgressAckGRPCAddrs"
+if ($RunEgressOutboxMultiProcessGate -and $EgressDeliveryGRPCAddrs.Count -lt 2) {
+    throw "-RunEgressOutboxMultiProcessGate requires at least two -EgressDeliveryGRPCAddrs"
 }
 if ($EgressOutboxMultiProcessUsers -le 0) {
     throw "-EgressOutboxMultiProcessUsers must be positive"
@@ -489,8 +489,8 @@ if ($EgressOutboxMultiProcessEventsPerUser -le 0) {
 if ($EgressOutboxMultiProcessExpectInstances -lt 0) {
     throw "-EgressOutboxMultiProcessExpectInstances must be non-negative"
 }
-if ([string]::IsNullOrWhiteSpace($EgressOutboxMultiProcessCommandAckDelay)) {
-    throw "-EgressOutboxMultiProcessCommandAckDelay must not be empty"
+if ([string]::IsNullOrWhiteSpace($EgressOutboxMultiProcessAdmissionDelay)) {
+    throw "-EgressOutboxMultiProcessAdmissionDelay must not be empty"
 }
 if ([string]::IsNullOrWhiteSpace($EgressOutboxMultiProcessClientAckDelay)) {
     throw "-EgressOutboxMultiProcessClientAckDelay must not be empty"
@@ -499,12 +499,12 @@ if ([string]::IsNullOrWhiteSpace($EgressOutboxMultiProcessTimeout)) {
     throw "-EgressOutboxMultiProcessTimeout must not be empty"
 }
 if ($RunEgressOutboxMultiProcessGate) {
-    $RunEgressAckProcessProbeGate = $true
-    if ($EgressAckProcessProbeExpectInstances -eq 0) {
-        $EgressAckProcessProbeExpectInstances = $EgressAckGRPCAddrs.Count
+    $RunEgressDeliveryProcessProbeGate = $true
+    if ($EgressDeliveryProcessProbeExpectInstances -eq 0) {
+        $EgressDeliveryProcessProbeExpectInstances = $EgressDeliveryGRPCAddrs.Count
     }
     if ($EgressOutboxMultiProcessExpectInstances -eq 0) {
-        $EgressOutboxMultiProcessExpectInstances = $EgressAckGRPCAddrs.Count
+        $EgressOutboxMultiProcessExpectInstances = $EgressDeliveryGRPCAddrs.Count
     }
     if ($EgressOutboxMultiProcessUsers -lt $EgressOutboxMultiProcessExpectInstances) {
         throw "-EgressOutboxMultiProcessUsers must be >= expected Egress instances"
@@ -513,14 +513,14 @@ if ($RunEgressOutboxMultiProcessGate) {
 if ($RunEgressOutboxProcessCrashGate -and -not $MultiInstance) {
     throw "-RunEgressOutboxProcessCrashGate requires -MultiInstance"
 }
-if ($RunEgressOutboxProcessCrashGate -and $EgressAckGRPCAddrs.Count -lt 2) {
-    throw "-RunEgressOutboxProcessCrashGate requires at least two -EgressAckGRPCAddrs"
+if ($RunEgressOutboxProcessCrashGate -and $EgressDeliveryGRPCAddrs.Count -lt 2) {
+    throw "-RunEgressOutboxProcessCrashGate requires at least two -EgressDeliveryGRPCAddrs"
 }
 if ([string]::IsNullOrWhiteSpace($EgressOutboxProcessCrashLeaseTimeout)) {
     throw "-EgressOutboxProcessCrashLeaseTimeout must not be empty"
 }
-if ([string]::IsNullOrWhiteSpace($EgressOutboxProcessCrashCommandAckDelay)) {
-    throw "-EgressOutboxProcessCrashCommandAckDelay must not be empty"
+if ([string]::IsNullOrWhiteSpace($EgressOutboxProcessCrashAdmissionDelay)) {
+    throw "-EgressOutboxProcessCrashAdmissionDelay must not be empty"
 }
 if ([string]::IsNullOrWhiteSpace($EgressOutboxProcessCrashClientAckDelay)) {
     throw "-EgressOutboxProcessCrashClientAckDelay must not be empty"
@@ -529,13 +529,13 @@ if ([string]::IsNullOrWhiteSpace($EgressOutboxProcessCrashTimeout)) {
     throw "-EgressOutboxProcessCrashTimeout must not be empty"
 }
 if ($RunEgressOutboxProcessCrashGate) {
-    $RunEgressAckProcessProbeGate = $true
-    if ($EgressAckProcessProbeExpectInstances -eq 0) {
-        $EgressAckProcessProbeExpectInstances = $EgressAckGRPCAddrs.Count
+    $RunEgressDeliveryProcessProbeGate = $true
+    if ($EgressDeliveryProcessProbeExpectInstances -eq 0) {
+        $EgressDeliveryProcessProbeExpectInstances = $EgressDeliveryGRPCAddrs.Count
     }
 }
-if ([string]::IsNullOrWhiteSpace($EgressAckToken)) {
-    throw "-EgressAckToken must not be empty"
+if ([string]::IsNullOrWhiteSpace($EgressDeliveryToken)) {
+    throw "-EgressDeliveryToken must not be empty"
 }
 if ($KeepRunning -and ($RunLogSafetyGate -or $RunPortCleanupGate)) {
     throw "-RunLogSafetyGate and -RunPortCleanupGate require the smoke helper to clean up processes; remove -KeepRunning"
@@ -800,7 +800,7 @@ function Invoke-CoreExecSmokeProbe {
     }
 }
 
-function Invoke-EgressAckSmokeProbe {
+function Invoke-EgressDeliverySmokeProbe {
     param(
         [string]$Name,
         [int]$Count = 8,
@@ -808,19 +808,19 @@ function Invoke-EgressAckSmokeProbe {
     )
     $args = @(
         "run",
-        ".\scripts\egress-ack-smoke-probe",
+        ".\scripts\egress-delivery-smoke-probe",
         "-targets",
-        $EgressAckGRPCTargets,
+        $EgressDeliveryGRPCTargets,
         "-resolver",
-        $EgressAckGRPCResolver,
+        $EgressDeliveryGRPCResolver,
         "-token",
-        $EgressAckToken,
+        $EgressDeliveryToken,
         "-count",
         [string]$Count,
         "-duration",
-        $EgressAckProcessProbeDuration,
+        $EgressDeliveryProcessProbeDuration,
         "-interval",
-        $EgressAckProcessProbeInterval,
+        $EgressDeliveryProcessProbeInterval,
         "-timeout",
         "${StartupTimeoutSeconds}s"
     )
@@ -830,9 +830,9 @@ function Invoke-EgressAckSmokeProbe {
     $result = Invoke-External "go" $args
     $output = $result.Output.Trim()
     if ($output.Length -gt 0) {
-        Write-Host "[ok] Egress ACK probe ${Name}: $output"
+        Write-Host "[ok] Egress Delivery probe ${Name}: $output"
     } else {
-        Write-Host "[ok] Egress ACK probe $Name passed"
+        Write-Host "[ok] Egress Delivery probe $Name passed"
     }
 }
 
@@ -840,20 +840,20 @@ function Invoke-EgressOutboxMultiProcessGate {
     $args = @(
         "run",
         ".\scripts\egress-outbox-multi-process-probe",
-        "-egress-ack-targets",
-        $EgressAckGRPCTargets,
-        "-egress-ack-resolver",
-        $EgressAckGRPCResolver,
-        "-egress-ack-token",
-        $EgressAckToken,
+        "-egress-delivery-targets",
+        $EgressDeliveryGRPCTargets,
+        "-egress-delivery-resolver",
+        $EgressDeliveryGRPCResolver,
+        "-egress-delivery-token",
+        $EgressDeliveryToken,
         "-users",
         [string]$EgressOutboxMultiProcessUsers,
         "-events-per-user",
         [string]$EgressOutboxMultiProcessEventsPerUser,
         "-expect-source-instances",
         [string]$EgressOutboxMultiProcessExpectInstances,
-        "-command-ack-delay",
-        $EgressOutboxMultiProcessCommandAckDelay,
+        "-admission-delay",
+        $EgressOutboxMultiProcessAdmissionDelay,
         "-client-ack-delay",
         $EgressOutboxMultiProcessClientAckDelay,
         "-timeout",
@@ -886,20 +886,20 @@ function Start-EgressOutboxProcessCrashProbe {
         "-crash-recovery",
         "-crash-signal-file",
         $SignalFile,
-        "-egress-ack-targets",
-        $EgressAckGRPCTargets,
-        "-egress-ack-resolver",
-        $EgressAckGRPCResolver,
-        "-egress-ack-token",
-        $EgressAckToken,
+        "-egress-delivery-targets",
+        $EgressDeliveryGRPCTargets,
+        "-egress-delivery-resolver",
+        $EgressDeliveryGRPCResolver,
+        "-egress-delivery-token",
+        $EgressDeliveryToken,
         "-users",
         "1",
         "-events-per-user",
         "1",
         "-expect-source-instances",
         "2",
-        "-command-ack-delay",
-        $EgressOutboxProcessCrashCommandAckDelay,
+        "-admission-delay",
+        $EgressOutboxProcessCrashAdmissionDelay,
         "-client-ack-delay",
         $EgressOutboxProcessCrashClientAckDelay,
         "-timeout",
@@ -1014,7 +1014,7 @@ function Invoke-EgressOutboxProcessCrashGate {
         Write-Host "[ok] Egress outbox process crash gate passed"
     }
     $restarted = Start-EgressSmokeRole $index $EgressAddresses[$index] $CommonEnv $Stamp "crash-restart"
-    Invoke-EgressAckSmokeProbe "after outbox crash recovery restart" 8 $EgressAckGRPCAddrs.Count
+    Invoke-EgressDeliverySmokeProbe "after outbox crash recovery restart" 8 $EgressDeliveryGRPCAddrs.Count
     [pscustomobject]@{
         Index = $index
         SourceInstanceID = $source
@@ -1628,9 +1628,9 @@ function Invoke-CoreExecUnavailableGate {
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_ADDR"] = ""
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_TARGETS"] = $BadCoreExecGRPCAddr
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_RESOLVER"] = $CoreExecGRPCResolver
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_ADDR"] = ""
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_TARGETS"] = $EgressAckGRPCTargets
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_RESOLVER"] = $EgressAckGRPCResolver
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_ADDR"] = ""
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"] = $EgressDeliveryGRPCTargets
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER"] = $EgressDeliveryGRPCResolver
     $edgeEnv["TELESRV_INSTANCE_ID"] = "smoke-edge-unavailable-$PID"
     Add-CoreExecGRPCClientTLSEnv $edgeEnv
     $proc = Start-TelesrvRole "edge-unavailable" $edgeEnv $stdout $stderr
@@ -1713,8 +1713,8 @@ function Start-EgressSmokeRole {
     $egressEnv["TELESRV_LISTEN"] = $CoreListen
     $egressEnv["TELESRV_CORE_EXEC_GRPC_ADDR"] = ""
     $egressEnv["TELESRV_CORE_EXEC_GRPC_TARGETS"] = ""
-    $egressEnv["TELESRV_EGRESS_ACK_GRPC_ADDR"] = $Address
-    $egressEnv["TELESRV_EGRESS_ACK_GRPC_TARGETS"] = ""
+    $egressEnv["TELESRV_EGRESS_DELIVERY_GRPC_ADDR"] = $Address
+    $egressEnv["TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"] = ""
     $instanceID = "smoke-egress-$PID-$Index"
     if ($Suffix) {
         $instanceID = "smoke-egress-$PID-$Index-$Suffix"
@@ -1722,7 +1722,7 @@ function Start-EgressSmokeRole {
     $egressEnv["TELESRV_INSTANCE_ID"] = $instanceID
     $proc = Start-TelesrvRole $name $egressEnv $egressStdout $egressStderr $EgressExePath
     $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
-    Wait-PortForProcess $proc (Get-ListenPort $Address) "egress ack grpc $Index" $egressStderr $deadline
+    Wait-PortForProcess $proc (Get-ListenPort $Address) "egress delivery grpc $Index" $egressStderr $deadline
     Wait-LogContains $proc $egressStderr "telesrv egress ready" $name $deadline
     Write-Host "[ok] $name ready: $Address"
     [pscustomobject]@{
@@ -1787,12 +1787,12 @@ $CoreExecGRPCMTLSEnabled = [bool]($CoreExecGRPCTLSClientCAFile)
 $SelectedCoreExecGRPCAddr = $CoreExecGRPCAddr
 $CoreExecPort = Get-ListenPort $SelectedCoreExecGRPCAddr
 $EdgePort = Get-ListenPort $EdgeListen
-$EgressAckPort = Get-ListenPort $EgressAckGRPCAddr
+$EgressDeliveryPort = Get-ListenPort $EgressDeliveryGRPCAddr
 if ($CoreExecPort -eq $EdgePort) {
     throw "Selected CoreExec address and EdgeListen must use different ports"
 }
-if ($EgressAckPort -eq $CoreExecPort -or $EgressAckPort -eq $EdgePort) {
-    throw "Selected Egress ACK address must use a port distinct from CoreExec and Edge"
+if ($EgressDeliveryPort -eq $CoreExecPort -or $EgressDeliveryPort -eq $EdgePort) {
+    throw "Selected Egress Delivery address must use a port distinct from CoreExec and Edge"
 }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
@@ -1871,16 +1871,16 @@ try {
             Add-SmokeCleanupPort (Get-ListenPort $addr)
             Write-Host "[ok] CoreExec grpc listen address is free ($addr)"
         }
-        foreach ($addr in $EgressAckGRPCAddrs) {
+        foreach ($addr in $EgressDeliveryGRPCAddrs) {
             foreach ($seen in $seenAddresses) {
                 if (Test-ListenEndpointConflict $addr $seen) {
                     throw "Duplicate or conflicting smoke listen endpoint $addr overlaps $seen"
                 }
             }
             $seenAddresses += $addr
-            Assert-ListenAddressFree $addr "Egress ACK grpc $addr"
+            Assert-ListenAddressFree $addr "Egress Delivery grpc $addr"
             Add-SmokeCleanupPort (Get-ListenPort $addr)
-            Write-Host "[ok] Egress ACK grpc listen address is free ($addr)"
+            Write-Host "[ok] Egress Delivery grpc listen address is free ($addr)"
         }
         foreach ($addr in $EdgeListens) {
             foreach ($seen in $seenAddresses) {
@@ -1929,7 +1929,7 @@ try {
             TELESRV_SFU_CONTROL_TOKEN = "edge-core-smoke-sfu"
             TELESRV_TURN_ENABLE = "false"
             TELESRV_CORE_EXEC_TOKEN = $CoreExecToken
-            TELESRV_EGRESS_ACK_TOKEN = $EgressAckToken
+            TELESRV_EGRESS_DELIVERY_TOKEN = $EgressDeliveryToken
         }
         if ($RunEgressOutboxMultiProcessGate -or $RunEgressOutboxProcessCrashGate) {
             $commonEnv["TELESRV_POSTGRES_MAX_CONNS"] = "8"
@@ -1968,8 +1968,8 @@ try {
         $egressProcs = @()
         $egressLogs = @()
         $egressInstanceIDs = @()
-        for ($i = 0; $i -lt $EgressAckGRPCAddrs.Count; $i++) {
-            $addr = $EgressAckGRPCAddrs[$i]
+        for ($i = 0; $i -lt $EgressDeliveryGRPCAddrs.Count; $i++) {
+            $addr = $EgressDeliveryGRPCAddrs[$i]
             $startedEgress = Start-EgressSmokeRole $i $addr $commonEnv $stamp
             $egressProcs += $startedEgress.Process
             $egressLogs += $startedEgress.Log
@@ -1992,9 +1992,9 @@ try {
             $edgeEnv["TELESRV_CORE_EXEC_GRPC_ADDR"] = ""
             $edgeEnv["TELESRV_CORE_EXEC_GRPC_TARGETS"] = $CoreExecGRPCTargets
             $edgeEnv["TELESRV_CORE_EXEC_GRPC_RESOLVER"] = $CoreExecGRPCResolver
-            $edgeEnv["TELESRV_EGRESS_ACK_GRPC_ADDR"] = ""
-            $edgeEnv["TELESRV_EGRESS_ACK_GRPC_TARGETS"] = $EgressAckGRPCTargets
-            $edgeEnv["TELESRV_EGRESS_ACK_GRPC_RESOLVER"] = $EgressAckGRPCResolver
+            $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_ADDR"] = ""
+            $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"] = $EgressDeliveryGRPCTargets
+            $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER"] = $EgressDeliveryGRPCResolver
             $edgeEnv["TELESRV_INSTANCE_ID"] = "smoke-edge-$PID-$i"
             Add-CoreExecGRPCClientTLSEnv $edgeEnv
             $proc = Start-TelesrvRole "edge$i" $edgeEnv $edgeStdout $edgeStderr
@@ -2019,9 +2019,9 @@ try {
             Write-Step "CoreExec process probe gate"
             Invoke-CoreExecSmokeProbe "after startup" 8 $CoreExecProcessProbeExpectInstances
         }
-        if ($RunEgressAckProcessProbeGate) {
-            Write-Step "Egress ACK process probe gate"
-            Invoke-EgressAckSmokeProbe "after startup" 8 $EgressAckProcessProbeExpectInstances
+        if ($RunEgressDeliveryProcessProbeGate) {
+            Write-Step "Egress Delivery process probe gate"
+            Invoke-EgressDeliverySmokeProbe "after startup" 8 $EgressDeliveryProcessProbeExpectInstances
         }
         if ($RunEgressOutboxMultiProcessGate) {
             Write-Step "Egress outbox multi-process gate"
@@ -2030,7 +2030,7 @@ try {
         $egressOutboxProcessCrashSourceInstanceID = ""
         if ($RunEgressOutboxProcessCrashGate) {
             Write-Step "Egress outbox process crash recovery gate"
-            $crashResult = Invoke-EgressOutboxProcessCrashGate -EgressProcesses $egressProcs -EgressInstanceIDs $egressInstanceIDs -EgressAddresses $EgressAckGRPCAddrs -CommonEnv $commonEnv -Stamp $stamp
+            $crashResult = Invoke-EgressOutboxProcessCrashGate -EgressProcesses $egressProcs -EgressInstanceIDs $egressInstanceIDs -EgressAddresses $EgressDeliveryGRPCAddrs -CommonEnv $commonEnv -Stamp $stamp
             $egressProcs[$crashResult.Index] = $crashResult.Restarted.Process
             $egressLogs[$crashResult.Index] = $crashResult.Restarted.Log
             $egressInstanceIDs[$crashResult.Index] = $crashResult.Restarted.InstanceID
@@ -2081,39 +2081,39 @@ try {
             Write-Host "[ok] CoreExec rolling restart gate passed"
         }
 
-        if ($RunEgressAckRollingRestartGate) {
-            if ($EgressAckGRPCAddrs.Count -lt 2) {
-                throw "-RunEgressAckRollingRestartGate requires at least two Egress ACK gRPC addrs"
+        if ($RunEgressDeliveryRollingRestartGate) {
+            if ($EgressDeliveryGRPCAddrs.Count -lt 2) {
+                throw "-RunEgressDeliveryRollingRestartGate requires at least two Egress Delivery gRPC addrs"
             }
-            Write-Step "Egress ACK rolling restart gate"
-            Invoke-EgressAckSmokeProbe "before restart" 8 $EgressAckProcessProbeExpectInstances
+            Write-Step "Egress Delivery rolling restart gate"
+            Invoke-EgressDeliverySmokeProbe "before restart" 8 $EgressDeliveryProcessProbeExpectInstances
 
             Stop-CoreSmokeRole $egressProcs[0] "egress0 rolling gate"
-            Wait-PortFree (Get-ListenPort $EgressAckGRPCAddrs[0]) "egress0 rolling gate" (Get-Date).AddSeconds($StartupTimeoutSeconds)
-            Invoke-EgressAckSmokeProbe "after egress0 stopped" 8
+            Wait-PortFree (Get-ListenPort $EgressDeliveryGRPCAddrs[0]) "egress0 rolling gate" (Get-Date).AddSeconds($StartupTimeoutSeconds)
+            Invoke-EgressDeliverySmokeProbe "after egress0 stopped" 8
 
-            $restartedEgress0 = Start-EgressSmokeRole 0 $EgressAckGRPCAddrs[0] $commonEnv $stamp "restart"
+            $restartedEgress0 = Start-EgressSmokeRole 0 $EgressDeliveryGRPCAddrs[0] $commonEnv $stamp "restart"
             $egressProcs[0] = $restartedEgress0.Process
             $egressLogs[0] = $restartedEgress0.Log
             $egressInstanceIDs[0] = $restartedEgress0.InstanceID
 
             Stop-CoreSmokeRole $egressProcs[1] "egress1 rolling gate"
-            Wait-PortFree (Get-ListenPort $EgressAckGRPCAddrs[1]) "egress1 rolling gate" (Get-Date).AddSeconds($StartupTimeoutSeconds)
-            Invoke-EgressAckSmokeProbe "after egress1 stopped and egress0 restarted" 8
+            Wait-PortFree (Get-ListenPort $EgressDeliveryGRPCAddrs[1]) "egress1 rolling gate" (Get-Date).AddSeconds($StartupTimeoutSeconds)
+            Invoke-EgressDeliverySmokeProbe "after egress1 stopped and egress0 restarted" 8
 
-            $restartedEgress1 = Start-EgressSmokeRole 1 $EgressAckGRPCAddrs[1] $commonEnv $stamp "restart"
+            $restartedEgress1 = Start-EgressSmokeRole 1 $EgressDeliveryGRPCAddrs[1] $commonEnv $stamp "restart"
             $egressProcs[1] = $restartedEgress1.Process
             $egressLogs[1] = $restartedEgress1.Log
             $egressInstanceIDs[1] = $restartedEgress1.InstanceID
-            Write-Host "[ok] Egress ACK rolling restart gate passed"
+            Write-Host "[ok] Egress Delivery rolling restart gate passed"
         }
 
         Write-Step "Smoke result"
-        Write-Host "[ok] multi-instance split smoke passed over CoreExec grpc and Egress ACK grpc"
+        Write-Host "[ok] multi-instance split smoke passed over CoreExec grpc and Egress Delivery grpc"
         Write-Host "[ok] CoreExec targets: $CoreExecGRPCTargets"
         Write-Host "[ok] CoreExec resolver: $CoreExecGRPCResolver"
-        Write-Host "[ok] Egress ACK targets: $EgressAckGRPCTargets"
-        Write-Host "[ok] Egress ACK resolver: $EgressAckGRPCResolver"
+        Write-Host "[ok] Egress Delivery targets: $EgressDeliveryGRPCTargets"
+        Write-Host "[ok] Egress Delivery resolver: $EgressDeliveryGRPCResolver"
         Write-Host "[ok] Egress outbox multi-process gate run: $RunEgressOutboxMultiProcessGate"
         Write-Host "[ok] CoreExec unavailable gate run: $RunCoreExecUnavailableGate"
         Write-Host "[ok] CoreExec readiness flap gate run: $RunCoreExecReadinessFlapGate"
@@ -2123,10 +2123,10 @@ try {
         Write-Host "[ok] CoreExec no implicit retry gate run: $RunCoreExecNoImplicitRetryGate"
         Write-Host "[ok] CoreExec failure classification gate run: $RunCoreExecFailureClassificationGate"
         Write-Host "[ok] CoreExec process probe gate run: $RunCoreExecProcessProbeGate expect_instances: $CoreExecProcessProbeExpectInstances duration: $CoreExecProcessProbeDuration interval: $CoreExecProcessProbeInterval"
-        Write-Host "[ok] Egress ACK process probe gate run: $RunEgressAckProcessProbeGate expect_instances: $EgressAckProcessProbeExpectInstances duration: $EgressAckProcessProbeDuration interval: $EgressAckProcessProbeInterval"
+        Write-Host "[ok] Egress Delivery process probe gate run: $RunEgressDeliveryProcessProbeGate expect_instances: $EgressDeliveryProcessProbeExpectInstances duration: $EgressDeliveryProcessProbeDuration interval: $EgressDeliveryProcessProbeInterval"
         Write-Host "[ok] CoreExec pending metrics gate run: $RunCoreExecPendingMetricsGate debug_addrs: $($edgeDebugAddrs -join ',')"
         Write-Host "[ok] CoreExec rolling restart gate run: $RunCoreExecRollingRestartGate"
-        Write-Host "[ok] Egress ACK rolling restart gate run: $RunEgressAckRollingRestartGate"
+        Write-Host "[ok] Egress Delivery rolling restart gate run: $RunEgressDeliveryRollingRestartGate"
         Write-Host "[ok] Egress outbox crash recovery gate run: $RunEgressOutboxCrashRecoveryGate lease_timeout: $EgressOutboxCrashRecoveryLeaseTimeout stale_age: $EgressOutboxCrashRecoveryStaleAge"
         Write-Host "[ok] Egress outbox process crash gate run: $RunEgressOutboxProcessCrashGate source: $egressOutboxProcessCrashSourceInstanceID lease_timeout: $EgressOutboxProcessCrashLeaseTimeout"
         Write-Host "[ok] MTProto Edge probe gate run: $RunMTProtoEdgeProbeGate count: $MTProtoEdgeProbeCount obfuscated: $MTProtoEdgeProbeObfuscated"
@@ -2155,8 +2155,8 @@ try {
             CoreExecTransport = "grpc"
             CoreExecGRPCTargets = $CoreExecGRPCTargets
             CoreExecGRPCResolver = $CoreExecGRPCResolver
-            EgressAckGRPCTargets = $EgressAckGRPCTargets
-            EgressAckGRPCResolver = $EgressAckGRPCResolver
+            EgressDeliveryGRPCTargets = $EgressDeliveryGRPCTargets
+            EgressDeliveryGRPCResolver = $EgressDeliveryGRPCResolver
             CoreExecUnavailableGateRun = [bool]$RunCoreExecUnavailableGate
             CoreExecReadinessFlapGateRun = [bool]$RunCoreExecReadinessFlapGate
             CoreExecDNSResolverGateRun = [bool]$RunCoreExecDNSResolverGate
@@ -2172,13 +2172,13 @@ try {
             CoreExecProcessProbeExpectInstances = $CoreExecProcessProbeExpectInstances
             CoreExecProcessProbeDuration = $CoreExecProcessProbeDuration
             CoreExecProcessProbeInterval = $CoreExecProcessProbeInterval
-            EgressAckProcessProbeGateRun = [bool]$RunEgressAckProcessProbeGate
-            EgressAckProcessProbeExpectInstances = $EgressAckProcessProbeExpectInstances
-            EgressAckProcessProbeDuration = $EgressAckProcessProbeDuration
-            EgressAckProcessProbeInterval = $EgressAckProcessProbeInterval
+            EgressDeliveryProcessProbeGateRun = [bool]$RunEgressDeliveryProcessProbeGate
+            EgressDeliveryProcessProbeExpectInstances = $EgressDeliveryProcessProbeExpectInstances
+            EgressDeliveryProcessProbeDuration = $EgressDeliveryProcessProbeDuration
+            EgressDeliveryProcessProbeInterval = $EgressDeliveryProcessProbeInterval
             CoreExecPendingMetricsGateRun = [bool]$RunCoreExecPendingMetricsGate
             CoreExecRollingRestartGateRun = [bool]$RunCoreExecRollingRestartGate
-            EgressAckRollingRestartGateRun = [bool]$RunEgressAckRollingRestartGate
+            EgressDeliveryRollingRestartGateRun = [bool]$RunEgressDeliveryRollingRestartGate
             EgressOutboxCrashRecoveryGateRun = [bool]$RunEgressOutboxCrashRecoveryGate
             EgressOutboxCrashRecoveryLeaseTimeout = $EgressOutboxCrashRecoveryLeaseTimeout
             EgressOutboxCrashRecoveryStaleAge = $EgressOutboxCrashRecoveryStaleAge
@@ -2217,21 +2217,21 @@ try {
         Write-Host "[ok] CoreExec grpc TLS enabled; mTLS=$CoreExecGRPCMTLSEnabled"
     }
     Assert-PortFree $CoreExecPort "CoreExec grpc"
-    Assert-PortFree $EgressAckPort "Egress ACK grpc"
+    Assert-PortFree $EgressDeliveryPort "Egress Delivery grpc"
     Assert-PortFree $EdgePort "Edge"
     Add-SmokeCleanupPort $CoreExecPort
-    Add-SmokeCleanupPort $EgressAckPort
+    Add-SmokeCleanupPort $EgressDeliveryPort
     Add-SmokeCleanupPort $EdgePort
     if ($InjectBadCoreExecTarget) {
         $badPort = Get-ListenPort $BadCoreExecGRPCAddr
-        if ($badPort -eq $CoreExecPort -or $badPort -eq $EgressAckPort -or $badPort -eq $EdgePort) {
-            throw "Bad CoreExec target port $badPort must not overlap CoreExec, Egress ACK, or Edge listen ports"
+        if ($badPort -eq $CoreExecPort -or $badPort -eq $EgressDeliveryPort -or $badPort -eq $EdgePort) {
+            throw "Bad CoreExec target port $badPort must not overlap CoreExec, Egress Delivery, or Edge listen ports"
         }
         Assert-PortFree $badPort "Bad CoreExec grpc target $BadCoreExecGRPCAddr"
         Write-Host "[ok] bad CoreExec grpc target will remain unstarted: $BadCoreExecGRPCAddr"
     }
     Write-Host "[ok] CoreExec grpc port $CoreExecPort is free"
-    Write-Host "[ok] Egress ACK grpc port $EgressAckPort is free"
+    Write-Host "[ok] Egress Delivery grpc port $EgressDeliveryPort is free"
     Write-Host "[ok] Edge port $EdgePort is free"
 
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -2258,7 +2258,7 @@ try {
         TELESRV_SFU_CONTROL_TOKEN = "edge-core-smoke-sfu"
         TELESRV_TURN_ENABLE = "false"
         TELESRV_CORE_EXEC_TOKEN = $CoreExecToken
-        TELESRV_EGRESS_ACK_TOKEN = $EgressAckToken
+        TELESRV_EGRESS_DELIVERY_TOKEN = $EgressDeliveryToken
     }
     if ($PostgresDSN) {
         $commonEnv["TELESRV_POSTGRES_DSN"] = $PostgresDSN
@@ -2287,10 +2287,10 @@ try {
     Write-Host "[ok] coreexec grpc listening: $CoreExecGRPCAddr"
 
     Write-Step "Start egress role"
-    $startedEgress = Start-EgressSmokeRole 0 $EgressAckGRPCAddr $commonEnv $stamp
+    $startedEgress = Start-EgressSmokeRole 0 $EgressDeliveryGRPCAddr $commonEnv $stamp
     $egressProc = $startedEgress.Process
     $egressStderr = $startedEgress.Log
-    Write-Host "[ok] egress ack grpc listening: $EgressAckGRPCAddr"
+    Write-Host "[ok] egress delivery grpc listening: $EgressDeliveryGRPCAddr"
 
     Write-Step "Start edge role"
     $edgeEnv = Copy-Hashtable $commonEnv
@@ -2299,9 +2299,9 @@ try {
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_ADDR"] = ""
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_TARGETS"] = $CoreExecGRPCTargets
     $edgeEnv["TELESRV_CORE_EXEC_GRPC_RESOLVER"] = $CoreExecGRPCResolver
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_ADDR"] = ""
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_TARGETS"] = $EgressAckGRPCTargets
-    $edgeEnv["TELESRV_EGRESS_ACK_GRPC_RESOLVER"] = $EgressAckGRPCResolver
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_ADDR"] = ""
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_TARGETS"] = $EgressDeliveryGRPCTargets
+    $edgeEnv["TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER"] = $EgressDeliveryGRPCResolver
     Add-CoreExecGRPCClientTLSEnv $edgeEnv
     $edgeEnv["TELESRV_INSTANCE_ID"] = "smoke-edge-$PID"
     $edgeProc = Start-TelesrvRole "edge" $edgeEnv $edgeStdout $edgeStderr
@@ -2322,9 +2322,9 @@ try {
         Write-Step "CoreExec process probe gate"
         Invoke-CoreExecSmokeProbe "after startup" 8 $CoreExecProcessProbeExpectInstances
     }
-    if ($RunEgressAckProcessProbeGate) {
-        Write-Step "Egress ACK process probe gate"
-        Invoke-EgressAckSmokeProbe "after startup" 8 $EgressAckProcessProbeExpectInstances
+    if ($RunEgressDeliveryProcessProbeGate) {
+        Write-Step "Egress Delivery process probe gate"
+        Invoke-EgressDeliverySmokeProbe "after startup" 8 $EgressDeliveryProcessProbeExpectInstances
     }
     if ($RunCoreExecPendingMetricsGate) {
         Write-Step "CoreExec pending metrics gate"
@@ -2332,11 +2332,11 @@ try {
     }
 
     Write-Step "Smoke result"
-    Write-Host "[ok] core + egress + edge split smoke passed over CoreExec grpc and Egress ACK grpc"
+    Write-Host "[ok] core + egress + edge split smoke passed over CoreExec grpc and Egress Delivery grpc"
     Write-Host "[ok] CoreExec targets: $CoreExecGRPCTargets"
     Write-Host "[ok] CoreExec resolver: $CoreExecGRPCResolver"
-    Write-Host "[ok] Egress ACK targets: $EgressAckGRPCTargets"
-    Write-Host "[ok] Egress ACK resolver: $EgressAckGRPCResolver"
+    Write-Host "[ok] Egress Delivery targets: $EgressDeliveryGRPCTargets"
+    Write-Host "[ok] Egress Delivery resolver: $EgressDeliveryGRPCResolver"
     Write-Host "[ok] CoreExec unavailable gate run: $RunCoreExecUnavailableGate"
     Write-Host "[ok] CoreExec readiness flap gate run: $RunCoreExecReadinessFlapGate"
     Write-Host "[ok] CoreExec DNS resolver gate run: $RunCoreExecDNSResolverGate"
@@ -2344,7 +2344,7 @@ try {
     Write-Host "[ok] CoreExec no implicit retry gate run: $RunCoreExecNoImplicitRetryGate"
     Write-Host "[ok] CoreExec failure classification gate run: $RunCoreExecFailureClassificationGate"
     Write-Host "[ok] CoreExec process probe gate run: $RunCoreExecProcessProbeGate expect_instances: $CoreExecProcessProbeExpectInstances duration: $CoreExecProcessProbeDuration interval: $CoreExecProcessProbeInterval"
-    Write-Host "[ok] Egress ACK process probe gate run: $RunEgressAckProcessProbeGate expect_instances: $EgressAckProcessProbeExpectInstances duration: $EgressAckProcessProbeDuration interval: $EgressAckProcessProbeInterval"
+    Write-Host "[ok] Egress Delivery process probe gate run: $RunEgressDeliveryProcessProbeGate expect_instances: $EgressDeliveryProcessProbeExpectInstances duration: $EgressDeliveryProcessProbeDuration interval: $EgressDeliveryProcessProbeInterval"
     Write-Host "[ok] CoreExec pending metrics gate run: $RunCoreExecPendingMetricsGate debug_addrs: $edgeDebugAddr"
     Write-Host "[ok] Egress outbox crash recovery gate run: $RunEgressOutboxCrashRecoveryGate lease_timeout: $EgressOutboxCrashRecoveryLeaseTimeout stale_age: $EgressOutboxCrashRecoveryStaleAge"
     Write-Host "[ok] MTProto Edge probe gate run: $RunMTProtoEdgeProbeGate count: $MTProtoEdgeProbeCount obfuscated: $MTProtoEdgeProbeObfuscated"
@@ -2374,9 +2374,9 @@ try {
         CoreExecGRPCAddr = $CoreExecGRPCAddr
         CoreExecGRPCTargets = $CoreExecGRPCTargets
         CoreExecGRPCResolver = $CoreExecGRPCResolver
-        EgressAckGRPCAddr = $EgressAckGRPCAddr
-        EgressAckGRPCTargets = $EgressAckGRPCTargets
-        EgressAckGRPCResolver = $EgressAckGRPCResolver
+        EgressDeliveryGRPCAddr = $EgressDeliveryGRPCAddr
+        EgressDeliveryGRPCTargets = $EgressDeliveryGRPCTargets
+        EgressDeliveryGRPCResolver = $EgressDeliveryGRPCResolver
         CoreExecUnavailableGateRun = [bool]$RunCoreExecUnavailableGate
         CoreExecReadinessFlapGateRun = [bool]$RunCoreExecReadinessFlapGate
         CoreExecDNSResolverGateRun = [bool]$RunCoreExecDNSResolverGate
@@ -2387,10 +2387,10 @@ try {
         CoreExecProcessProbeExpectInstances = $CoreExecProcessProbeExpectInstances
         CoreExecProcessProbeDuration = $CoreExecProcessProbeDuration
         CoreExecProcessProbeInterval = $CoreExecProcessProbeInterval
-        EgressAckProcessProbeGateRun = [bool]$RunEgressAckProcessProbeGate
-        EgressAckProcessProbeExpectInstances = $EgressAckProcessProbeExpectInstances
-        EgressAckProcessProbeDuration = $EgressAckProcessProbeDuration
-        EgressAckProcessProbeInterval = $EgressAckProcessProbeInterval
+        EgressDeliveryProcessProbeGateRun = [bool]$RunEgressDeliveryProcessProbeGate
+        EgressDeliveryProcessProbeExpectInstances = $EgressDeliveryProcessProbeExpectInstances
+        EgressDeliveryProcessProbeDuration = $EgressDeliveryProcessProbeDuration
+        EgressDeliveryProcessProbeInterval = $EgressDeliveryProcessProbeInterval
         EgressOutboxCrashRecoveryGateRun = [bool]$RunEgressOutboxCrashRecoveryGate
         EgressOutboxCrashRecoveryLeaseTimeout = $EgressOutboxCrashRecoveryLeaseTimeout
         EgressOutboxCrashRecoveryStaleAge = $EgressOutboxCrashRecoveryStaleAge

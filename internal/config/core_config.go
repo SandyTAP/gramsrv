@@ -173,8 +173,6 @@ type OutboxYAML struct {
 	OrphanAuthKeyRetention string `yaml:"orphan_auth_key_retention"`
 	RetentionInterval      string `yaml:"retention_interval"`
 	RetentionBatch         *int   `yaml:"retention_batch"`
-	PoisonRetention        string `yaml:"poison_retention"`
-	PoisonCleanupInterval  string `yaml:"poison_cleanup_interval"`
 }
 
 type CoreCacheYAML struct {
@@ -290,6 +288,7 @@ type CoreConfig struct {
 	PostgresDSN                        string
 	PostgresMaxConns                   int
 	PostgresMinConns                   int
+	PostgresCounterRecoveryMaxConns    int
 	RedisAddr                          string
 	RedisPassword                      string
 	RedisDB                            int
@@ -353,8 +352,6 @@ type CoreConfig struct {
 	ChannelBoostCacheMaxEntries        int
 	ChannelBoostCacheTTL               time.Duration
 	OutboxLeaseTimeout                 time.Duration
-	OutboxPoisonRetention              time.Duration
-	OutboxPoisonCleanupInterval        time.Duration
 	OutboundPushTimeout                time.Duration
 	SendRateLimit                      int
 	SendRateWindow                     time.Duration
@@ -552,6 +549,7 @@ func coreConfigFromConfig(c Config) CoreConfig {
 		PostgresDSN:                        c.PostgresDSN,
 		PostgresMaxConns:                   c.PostgresMaxConns,
 		PostgresMinConns:                   c.PostgresMinConns,
+		PostgresCounterRecoveryMaxConns:    c.PostgresCounterRecoveryMaxConns,
 		RedisAddr:                          c.RedisAddr,
 		RedisPassword:                      c.RedisPassword,
 		RedisDB:                            c.RedisDB,
@@ -615,8 +613,6 @@ func coreConfigFromConfig(c Config) CoreConfig {
 		ChannelBoostCacheMaxEntries:        c.ChannelBoostCacheMaxEntries,
 		ChannelBoostCacheTTL:               c.ChannelBoostCacheTTL,
 		OutboxLeaseTimeout:                 c.OutboxLeaseTimeout,
-		OutboxPoisonRetention:              c.OutboxPoisonRetention,
-		OutboxPoisonCleanupInterval:        c.OutboxPoisonCleanupInterval,
 		OutboundPushTimeout:                c.OutboundPushTimeout,
 		SendRateLimit:                      c.SendRateLimit,
 		SendRateWindow:                     c.SendRateWindow,
@@ -988,10 +984,7 @@ func applyOutboxYAML(b *envBuilder, y OutboxYAML) error {
 		return err
 	}
 	b.setInt("TELESRV_RETENTION_BATCH", y.RetentionBatch)
-	if err := b.setDuration("TELESRV_OUTBOX_POISON_RETENTION", y.PoisonRetention); err != nil {
-		return err
-	}
-	return b.setDuration("TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL", y.PoisonCleanupInterval)
+	return nil
 }
 
 func applyCoreCacheYAML(b *envBuilder, y CoreCacheYAML) error {

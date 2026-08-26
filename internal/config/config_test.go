@@ -10,6 +10,7 @@ import (
 func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	t.Setenv("TELESRV_ADVERTISE_IP", "")
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "")
+	t.Setenv("TELESRV_SEND_RATE_LIMIT", "")
 
 	cfg, err := loadProcessEnvConfig()
 	if err != nil {
@@ -55,6 +56,9 @@ func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	}
 	if !cfg.StorageLowSpaceGuardEnable || cfg.StorageMinFreeBytes != 1<<30 || cfg.StorageMaxTotalBytes != 0 || cfg.StorageUsageRefreshInterval != time.Minute {
 		t.Fatalf("unexpected storage capacity defaults: enabled=%v min=%d max=%d interval=%v", cfg.StorageLowSpaceGuardEnable, cfg.StorageMinFreeBytes, cfg.StorageMaxTotalBytes, cfg.StorageUsageRefreshInterval)
+	}
+	if cfg.SendRateLimit != 0 {
+		t.Fatalf("SendRateLimit = %d, want disabled by default", cfg.SendRateLimit)
 	}
 }
 
@@ -513,18 +517,18 @@ func TestLoadEdgeLocationConfig(t *testing.T) {
 	t.Setenv("TELESRV_FILE_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
 	t.Setenv("TELESRV_FILE_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
 	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_ADDR", "127.0.0.1:2450")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "static")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TARGETS", "127.0.0.1:2450,127.0.0.1:2451")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", "8s")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE", `D:\certs\egress.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_KEY_FILE", `D:\certs\egress-key.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\edge-ca.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CA_FILE", `D:\certs\egress-ca.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_SERVER_NAME", "egress.internal")
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
-	t.Setenv("TELESRV_EGRESS_ACK_TOKEN", "egress-secret")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_ADDR", "127.0.0.1:2450")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER", "static")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TARGETS", "127.0.0.1:2450,127.0.0.1:2451")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT", "8s")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE", `D:\certs\egress.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_KEY_FILE", `D:\certs\egress-key.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE", `D:\certs\edge-ca.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CA_FILE", `D:\certs\egress-ca.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_SERVER_NAME", "egress.internal")
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE", `D:\certs\edge.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_KEY_FILE", `D:\certs\edge-key.pem`)
+	t.Setenv("TELESRV_EGRESS_DELIVERY_TOKEN", "egress-secret")
 
 	cfg, err := loadProcessEnvConfig()
 	if err != nil {
@@ -631,33 +635,33 @@ func TestLoadEdgeLocationConfig(t *testing.T) {
 			cfg.FileGRPCTLSClientCertFile,
 			cfg.FileGRPCTLSClientKeyFile)
 	}
-	if cfg.EgressAckToken != "egress-secret" {
-		t.Fatalf("EgressAckToken = %q, want egress-secret", cfg.EgressAckToken)
+	if cfg.EgressDeliveryToken != "egress-secret" {
+		t.Fatalf("EgressDeliveryToken = %q, want egress-secret", cfg.EgressDeliveryToken)
 	}
-	if cfg.EgressAckGRPCAddr != "127.0.0.1:2450" || cfg.EgressAckGRPCTargets != "127.0.0.1:2450,127.0.0.1:2451" {
-		t.Fatalf("egress ack grpc config = %q/%q", cfg.EgressAckGRPCAddr, cfg.EgressAckGRPCTargets)
+	if cfg.EgressDeliveryGRPCAddr != "127.0.0.1:2450" || cfg.EgressDeliveryGRPCTargets != "127.0.0.1:2450,127.0.0.1:2451" {
+		t.Fatalf("egress delivery grpc config = %q/%q", cfg.EgressDeliveryGRPCAddr, cfg.EgressDeliveryGRPCTargets)
 	}
-	if cfg.EgressAckGRPCResolver != "static" {
-		t.Fatalf("EgressAckGRPCResolver = %q, want static", cfg.EgressAckGRPCResolver)
+	if cfg.EgressDeliveryGRPCResolver != "static" {
+		t.Fatalf("EgressDeliveryGRPCResolver = %q, want static", cfg.EgressDeliveryGRPCResolver)
 	}
-	if cfg.EgressAckGRPCRequestTimeout != 8*time.Second {
-		t.Fatalf("EgressAckGRPCRequestTimeout = %v, want 8s", cfg.EgressAckGRPCRequestTimeout)
+	if cfg.EgressDeliveryGRPCRequestTimeout != 8*time.Second {
+		t.Fatalf("EgressDeliveryGRPCRequestTimeout = %v, want 8s", cfg.EgressDeliveryGRPCRequestTimeout)
 	}
-	if cfg.EgressAckGRPCTLSCertFile != `D:\certs\egress.pem` ||
-		cfg.EgressAckGRPCTLSKeyFile != `D:\certs\egress-key.pem` ||
-		cfg.EgressAckGRPCTLSClientCAFile != `D:\certs\edge-ca.pem` ||
-		cfg.EgressAckGRPCTLSCAFile != `D:\certs\egress-ca.pem` ||
-		cfg.EgressAckGRPCTLSServerName != "egress.internal" ||
-		cfg.EgressAckGRPCTLSClientCertFile != `D:\certs\edge.pem` ||
-		cfg.EgressAckGRPCTLSClientKeyFile != `D:\certs\edge-key.pem` {
-		t.Fatalf("egress ack grpc tls config = server:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q",
-			cfg.EgressAckGRPCTLSCertFile,
-			cfg.EgressAckGRPCTLSKeyFile,
-			cfg.EgressAckGRPCTLSClientCAFile,
-			cfg.EgressAckGRPCTLSCAFile,
-			cfg.EgressAckGRPCTLSServerName,
-			cfg.EgressAckGRPCTLSClientCertFile,
-			cfg.EgressAckGRPCTLSClientKeyFile)
+	if cfg.EgressDeliveryGRPCTLSCertFile != `D:\certs\egress.pem` ||
+		cfg.EgressDeliveryGRPCTLSKeyFile != `D:\certs\egress-key.pem` ||
+		cfg.EgressDeliveryGRPCTLSClientCAFile != `D:\certs\edge-ca.pem` ||
+		cfg.EgressDeliveryGRPCTLSCAFile != `D:\certs\egress-ca.pem` ||
+		cfg.EgressDeliveryGRPCTLSServerName != "egress.internal" ||
+		cfg.EgressDeliveryGRPCTLSClientCertFile != `D:\certs\edge.pem` ||
+		cfg.EgressDeliveryGRPCTLSClientKeyFile != `D:\certs\edge-key.pem` {
+		t.Fatalf("egress delivery grpc tls config = server:%q/%q client_ca:%q ca:%q server_name:%q client:%q/%q",
+			cfg.EgressDeliveryGRPCTLSCertFile,
+			cfg.EgressDeliveryGRPCTLSKeyFile,
+			cfg.EgressDeliveryGRPCTLSClientCAFile,
+			cfg.EgressDeliveryGRPCTLSCAFile,
+			cfg.EgressDeliveryGRPCTLSServerName,
+			cfg.EgressDeliveryGRPCTLSClientCertFile,
+			cfg.EgressDeliveryGRPCTLSClientKeyFile)
 	}
 }
 
@@ -665,6 +669,15 @@ func TestLoadRejectsInvalidCoreExecGRPCResolver(t *testing.T) {
 	t.Setenv("TELESRV_CORE_EXEC_GRPC_RESOLVER", "consul")
 	if _, err := loadProcessEnvConfig(); err == nil {
 		t.Fatal("Load accepted invalid TELESRV_CORE_EXEC_GRPC_RESOLVER")
+	}
+}
+
+func TestLoadRejectsOverlappingDurableDeliveryDeadlineWindow(t *testing.T) {
+	t.Setenv("TELESRV_OUTBOX_LEASE_TIMEOUT", "3s")
+	t.Setenv("TELESRV_DELIVERY_ATTEMPT_TIMEOUT", "2s")
+	t.Setenv("TELESRV_DELIVERY_CLOCK_SKEW_ALLOWANCE", "1s")
+	if _, err := loadProcessEnvConfig(); err == nil {
+		t.Fatal("Load accepted delivery attempt + skew window without lease safety tail")
 	}
 }
 
@@ -683,23 +696,23 @@ func TestLoadRejectsInvalidCoreExecGRPCRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidEgressAckGRPCResolver(t *testing.T) {
-	t.Setenv("TELESRV_EGRESS_ACK_GRPC_RESOLVER", "consul")
+func TestLoadRejectsInvalidEgressDeliveryGRPCResolver(t *testing.T) {
+	t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER", "consul")
 	if _, err := loadProcessEnvConfig(); err == nil {
-		t.Fatal("Load accepted invalid TELESRV_EGRESS_ACK_GRPC_RESOLVER")
+		t.Fatal("Load accepted invalid TELESRV_EGRESS_DELIVERY_GRPC_RESOLVER")
 	}
 }
 
-func TestLoadRejectsInvalidEgressAckGRPCRequestTimeout(t *testing.T) {
+func TestLoadRejectsInvalidEgressDeliveryGRPCRequestTimeout(t *testing.T) {
 	for _, item := range []struct{ name, value string }{
 		{name: "zero", value: "0s"},
 		{name: "negative", value: "-1s"},
 		{name: "too large", value: "61s"},
 	} {
 		t.Run(item.name, func(t *testing.T) {
-			t.Setenv("TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT", item.value)
+			t.Setenv("TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT", item.value)
 			if _, err := loadProcessEnvConfig(); err == nil {
-				t.Fatalf("Load accepted TELESRV_EGRESS_ACK_GRPC_REQUEST_TIMEOUT=%s", item.value)
+				t.Fatalf("Load accepted TELESRV_EGRESS_DELIVERY_GRPC_REQUEST_TIMEOUT=%s", item.value)
 			}
 		})
 	}
@@ -732,19 +745,19 @@ func TestLoadRejectsInvalidCoreExecGRPCTLSConfig(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidEgressAckGRPCTLSConfig(t *testing.T) {
+func TestLoadRejectsInvalidEgressDeliveryGRPCTLSConfig(t *testing.T) {
 	tests := []struct {
 		name string
 		env  map[string]string
 	}{
 		{name: "server cert without key", env: map[string]string{
-			"TELESRV_EGRESS_ACK_GRPC_TLS_CERT_FILE": "egress.pem",
+			"TELESRV_EGRESS_DELIVERY_GRPC_TLS_CERT_FILE": "egress.pem",
 		}},
 		{name: "server client ca without server cert", env: map[string]string{
-			"TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CA_FILE": "edge-ca.pem",
+			"TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CA_FILE": "edge-ca.pem",
 		}},
 		{name: "client cert without key", env: map[string]string{
-			"TELESRV_EGRESS_ACK_GRPC_TLS_CLIENT_CERT_FILE": "edge.pem",
+			"TELESRV_EGRESS_DELIVERY_GRPC_TLS_CLIENT_CERT_FILE": "edge.pem",
 		}},
 	}
 	for _, tt := range tests {
@@ -753,7 +766,7 @@ func TestLoadRejectsInvalidEgressAckGRPCTLSConfig(t *testing.T) {
 				t.Setenv(key, value)
 			}
 			if _, err := loadProcessEnvConfig(); err == nil {
-				t.Fatal("Load accepted invalid Egress ACK gRPC TLS config")
+				t.Fatal("Load accepted invalid Egress Delivery gRPC TLS config")
 			}
 		})
 	}
@@ -871,7 +884,7 @@ func TestLoadRejectsInvalidSFUOwnerConfig(t *testing.T) {
 		{name: "token newline", env: map[string]string{"TELESRV_SFU_CONTROL_TOKEN": "bad\nsecret"}},
 		{name: "groupcall token newline", env: map[string]string{"TELESRV_GROUPCALL_CONTROL_TOKEN": "bad\nsecret"}},
 		{name: "coreexec token newline", env: map[string]string{"TELESRV_CORE_EXEC_TOKEN": "bad\nsecret"}},
-		{name: "egress ack token newline", env: map[string]string{"TELESRV_EGRESS_ACK_TOKEN": "bad\nsecret"}},
+		{name: "egress delivery token newline", env: map[string]string{"TELESRV_EGRESS_DELIVERY_TOKEN": "bad\nsecret"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -938,19 +951,6 @@ func TestLoadRejectsMalformedMTProtoCapacity(t *testing.T) {
 				t.Fatalf("Load accepted %s=%q", test.key, test.value)
 			}
 		})
-	}
-}
-
-func TestLoadOutboxPoisonPolicy(t *testing.T) {
-	t.Setenv("TELESRV_OUTBOX_POISON_RETENTION", "2m")
-	t.Setenv("TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL", "7s")
-
-	cfg, err := loadProcessEnvConfig()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.OutboxPoisonRetention != 2*time.Minute || cfg.OutboxPoisonCleanupInterval != 7*time.Second {
-		t.Fatalf("outbox poison policy = %v/%v, want 2m/7s", cfg.OutboxPoisonRetention, cfg.OutboxPoisonCleanupInterval)
 	}
 }
 

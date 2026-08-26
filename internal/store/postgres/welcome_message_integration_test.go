@@ -20,7 +20,7 @@ func TestWelcomeMessageStoreDurabilityIdempotencyConcurrencyAndNoPTS(t *testing.
 	suffix := randomSuffix(t)
 	users := NewUserStore(pool)
 	owner := createTestUser(t, ctx, users, "+1779"+suffix+"01", "WelcomeOwner", "")
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	createdChannel, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Welcome " + suffix, Megagroup: true, Date: 1700000000,
 	})
@@ -158,7 +158,7 @@ func TestWelcomeMessageJoinDeliveryIsTransactionalLeasedAndTTLBounded(t *testing
 	owner := createTestUser(t, ctx, users, "+1778"+suffix+"01", "WelcomeOwner", "")
 	member := createTestUser(t, ctx, users, "+1778"+suffix+"02", "WelcomeMember", "")
 	secondMember := createTestUser(t, ctx, users, "+1778"+suffix+"03", "WelcomeSecond", "")
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID, Title: "Welcome Delivery " + suffix, Megagroup: true, Date: 1700000100,
 	})

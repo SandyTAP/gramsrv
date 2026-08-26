@@ -216,13 +216,45 @@ type encodedOutboundMessage struct {
 	layer             *outboundLayerBinding
 	compressed        bool
 	uncompressedBytes int
-	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
+	deliveryTracking  edgecontrol.DeliveryTracking
+	physicalHook      physicalWriteReceiptHook
+	physicalGuard     durablePhysicalWriteGuard
 	// replayMsgID/replaySeqNo identify an existing logical-session frame. They
 	// are populated only by the receipt ledger's outbox lookup, never by a newly
 	// encoded result. A replay writes that exact frame instead of allocating a
 	// second payload owner or a new MTProto message identity.
 	replayMsgID int64
 	replaySeqNo int32
+}
+
+// physicalWriteReceiptHook runs inline on the sole Conn outbound actor only
+// after the transport writer returns nil. Implementations must be O(1) and
+// non-blocking; durable delivery reserves their downstream slot before command
+// admission.
+type physicalWriteReceiptHook interface {
+	written(serverMsgID int64, observedAt time.Time)
+	failed(observedAt time.Time)
+}
+
+type durablePhysicalWriteGuard interface {
+	allowPhysicalWrite(time.Time) bool
+}
+
+type oneShotPhysicalWriteReceiptHook struct {
+	done atomic.Bool
+	next physicalWriteReceiptHook
+}
+
+func (h *oneShotPhysicalWriteReceiptHook) written(serverMsgID int64, observedAt time.Time) {
+	if h != nil && h.next != nil && h.done.CompareAndSwap(false, true) {
+		h.next.written(serverMsgID, observedAt)
+	}
+}
+
+func (h *oneShotPhysicalWriteReceiptHook) failed(observedAt time.Time) {
+	if h != nil && h.next != nil && h.done.CompareAndSwap(false, true) {
+		h.next.failed(observedAt)
+	}
 }
 
 type rpcResultDeliveryState uint32
@@ -618,11 +650,6 @@ func (m *encodedOutboundMessage) markDelivered() {
 		return
 	}
 	if ticket == nil {
-		// Production write paths reserve before admission. This fallback preserves
-		// old direct-test callers without ever waiting in the socket writer.
-		ticket, _ = defaultRPCDeliveryHookExecutor.reserve()
-	}
-	if ticket == nil {
 		logicalClaim.abandon()
 		log.Printf("mtprotoedge: delivered rpc_result without reserved delivery-hook capacity")
 		return
@@ -742,7 +769,9 @@ func cloneRPCResultForRequest(encoded *encodedOutboundMessage, reqMsgID int64, s
 		priority: encoded.priority, delivery: delivery, compressed: encoded.compressed,
 		layer: encoded.layer, layerInvariant: encoded.layerInvariant,
 		uncompressedBytes: encoded.uncompressedBytes,
-		outboxDeliveryRef: encoded.outboxDeliveryRef,
+		deliveryTracking:  encoded.deliveryTracking,
+		physicalHook:      encoded.physicalHook,
+		physicalGuard:     encoded.physicalGuard,
 		replayMsgID:       replayMsgID, replaySeqNo: replaySeqNo,
 	}, nil
 }
@@ -797,7 +826,9 @@ type outboundFrame struct {
 	delivery          *rpcResultDelivery
 	compressed        bool
 	uncompressedBytes int
-	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
+	deliveryTracking  edgecontrol.DeliveryTracking
+	physicalHook      physicalWriteReceiptHook
+	physicalGuard     durablePhysicalWriteGuard
 	// layer is retained only for proactive session-bound frames so a later
 	// msg_resend_req cannot replay bytes from an obsolete profile epoch.
 	layer          *outboundLayerBinding
@@ -1311,6 +1342,30 @@ func (c *Conn) SendEncoded(ctx context.Context, t proto.MessageType, encoded *en
 		encoded.markReplayable()
 	}
 	return err
+}
+
+// enqueueDurableEncoded admits an immutable durable update to the Conn actor.
+// Success is queue admission only; the supplied hook is the sole physical-write
+// receipt and fires after a real writer success, including a later resend.
+func (c *Conn) enqueueDurableEncoded(
+	ctx context.Context,
+	t proto.MessageType,
+	encoded *encodedOutboundMessage,
+	tracking edgecontrol.DeliveryTracking,
+	hook physicalWriteReceiptHook,
+) error {
+	if encoded == nil || !tracking.Valid() || hook == nil {
+		return errors.New("mtprotoedge: invalid durable outbound delivery")
+	}
+	durable := *encoded
+	durable.deliveryTracking = tracking
+	durable.physicalHook = &oneShotPhysicalWriteReceiptHook{next: hook}
+	guard, ok := hook.(durablePhysicalWriteGuard)
+	if !ok || !guard.allowPhysicalWrite(time.Now()) {
+		return errors.New("mtprotoedge: durable delivery physical guard rejected")
+	}
+	durable.physicalGuard = guard
+	return c.enqueueEncodedDelivery(ctx, t, &durable, outboundPriorityNormal, nil)
 }
 
 // enqueueEncodedDelivery transfers an immutable body to the bounded egress actor
@@ -1868,8 +1923,8 @@ func (c *Conn) handleOutboundOp(state *outboundState, op outboundOp) {
 		if ack.reqMsgID != 0 && c.rpcResultAcked != nil {
 			c.rpcResultAcked(c, ack.reqMsgID)
 		}
-		if !ack.outboxDeliveryRef.Empty() && c.outboxClientAcked != nil {
-			c.outboxClientAcked(c, ack.outboxDeliveryRef, ack.msgID)
+		if !ack.deliveryTracking.Empty() && c.deliveryClientAcked != nil {
+			c.deliveryClientAcked(c, ack.deliveryTracking, ack.msgID)
 		}
 	}
 	op.finish(result)
@@ -1976,6 +2031,12 @@ func (c *Conn) handleOutboundSend(state *outboundState, op outboundOp) error {
 	if err == nil {
 		err = c.writeFrame(op.ctx, frame)
 	}
+	if errors.Is(err, errDurableDeliveryFenced) && state != nil && frame != nil {
+		state.removePending(frame.msgID)
+	}
+	if err != nil && frame != nil && frame.physicalHook != nil {
+		frame.physicalHook.failed(time.Now())
+	}
 	queueWait := time.Since(op.enqueuedAt)
 	bytes := 0
 	typeID := uint32(0)
@@ -2011,8 +2072,14 @@ func (c *Conn) handleOutboundResend(state *outboundState, ctx context.Context, i
 			return info, err
 		}
 		if err := c.writeFrame(ctx, frame); err != nil {
+			if frame.physicalHook != nil {
+				frame.physicalHook.failed(time.Now())
+			}
 			if lockedLayer {
 				c.layerProfileMu.RUnlock()
+			}
+			if errors.Is(err, errDurableDeliveryFenced) {
+				state.removePending(id)
 			}
 			c.metrics.OutboundResend(resent, err)
 			return info, err
@@ -2038,6 +2105,12 @@ func (c *Conn) handleOutboundResendByRequest(state *outboundState, ctx context.C
 		return false, nil
 	}
 	if err := c.writeFrame(ctx, frame); err != nil {
+		if frame.physicalHook != nil {
+			frame.physicalHook.failed(time.Now())
+		}
+		if errors.Is(err, errDurableDeliveryFenced) {
+			state.removePending(msgID)
+		}
 		c.metrics.OutboundResend(0, err)
 		return false, err
 	}
@@ -2258,7 +2331,9 @@ func (c *Conn) buildFrameWithState(
 		delivery:          encoded.delivery,
 		compressed:        encoded.compressed,
 		uncompressedBytes: encoded.uncompressedBytes,
-		outboxDeliveryRef: encoded.outboxDeliveryRef,
+		deliveryTracking:  encoded.deliveryTracking,
+		physicalHook:      encoded.physicalHook,
+		physicalGuard:     encoded.physicalGuard,
 	}, nil
 }
 
@@ -2374,12 +2449,16 @@ type deadlineOutboundGuardedScratchWriter interface {
 var (
 	errAuthKeyUnavailableAtPhysicalWrite = errors.New("auth key unavailable at physical write admission")
 	errConnRetiredAtPhysicalWrite        = errors.New("connection retired at physical write admission")
+	errDurableDeliveryFenced             = errors.New("durable delivery deadline/fence rejected before physical write")
 )
 
 func (c *Conn) writeFrame(ctx context.Context, frame *outboundFrame) error {
 	if c.authKeyProtocolUnavailableNow() {
 		c.fenceUnavailableAuthKey()
 		return ErrConnClosed
+	}
+	if frame.physicalGuard != nil && !frame.physicalGuard.allowPhysicalWrite(time.Now()) {
+		return errDurableDeliveryFenced
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -2411,12 +2490,32 @@ func (c *Conn) writeFrame(ctx context.Context, frame *outboundFrame) error {
 		c.fenceUnavailableAuthKey()
 		return ErrConnClosed
 	}
+	if frame.physicalGuard != nil && !frame.physicalGuard.allowPhysicalWrite(time.Now()) {
+		return errDurableDeliveryFenced
+	}
 
 	writer := c.writer
 	if writer == nil {
 		writer = c.transport
 	}
-	if guarded, ok := writer.(deadlineOutboundGuardedScratchWriter); ok {
+	if frame.physicalGuard != nil {
+		guarded, ok := writer.(deadlineOutboundGuardedScratchWriter)
+		if !ok {
+			return errDurableDeliveryFenced
+		}
+		err = guarded.SendDeadlineWithScratchGuarded(deadline, out, &scratch.codec, func() error {
+			if c.isRetired() {
+				return errConnRetiredAtPhysicalWrite
+			}
+			if c.authKeyProtocolUnavailableNow() {
+				return errAuthKeyUnavailableAtPhysicalWrite
+			}
+			if !frame.physicalGuard.allowPhysicalWrite(time.Now()) {
+				return errDurableDeliveryFenced
+			}
+			return nil
+		})
+	} else if guarded, ok := writer.(deadlineOutboundGuardedScratchWriter); ok {
 		err = guarded.SendDeadlineWithScratchGuarded(deadline, out, &scratch.codec, func() error {
 			if c.isRetired() {
 				return errConnRetiredAtPhysicalWrite
@@ -2452,14 +2551,21 @@ func (c *Conn) writeFrame(ctx context.Context, frame *outboundFrame) error {
 		// drain and must retain the lease long enough to write the final bare -404.
 		return ErrConnClosed
 	}
+	if errors.Is(err, errDurableDeliveryFenced) {
+		return errDurableDeliveryFenced
+	}
 	if err != nil {
 		// 任一 partial write / timeout 都可能破坏 MTProto 帧边界；该 socket
 		// 不可继续复用。这里只发 terminal 信号，不在 actor 内等待自身退出。
 		c.failTransport()
 		return fmt.Errorf("send: %w", err)
 	}
+	observedAt := time.Now()
+	if frame.physicalHook != nil {
+		frame.physicalHook.written(frame.msgID, observedAt)
+	}
 	if frame.sentAt.IsZero() {
-		frame.sentAt = time.Now()
+		frame.sentAt = observedAt
 		frame.sends = 1
 	}
 	return nil
@@ -2681,11 +2787,11 @@ func (s *outboundState) addReserved(frame *outboundFrame) int {
 }
 
 type outboundAcknowledgement struct {
-	msgID             int64
-	reqMsgID          int64
-	bytes             int
-	sentAt            time.Time
-	outboxDeliveryRef edgecontrol.OutboxDeliveryRef
+	msgID            int64
+	reqMsgID         int64
+	bytes            int
+	sentAt           time.Time
+	deliveryTracking edgecontrol.DeliveryTracking
 }
 
 func (s *outboundState) ack(ids []int64) []int64 {
@@ -2707,11 +2813,11 @@ func (s *outboundState) ackWithDetails(ids []int64) []outboundAcknowledgement {
 			continue
 		}
 		detail := outboundAcknowledgement{
-			msgID:             id,
-			reqMsgID:          frame.reqMsgID,
-			bytes:             len(frame.body),
-			sentAt:            frame.sentAt,
-			outboxDeliveryRef: frame.outboxDeliveryRef,
+			msgID:            id,
+			reqMsgID:         frame.reqMsgID,
+			bytes:            len(frame.body),
+			sentAt:           frame.sentAt,
+			deliveryTracking: frame.deliveryTracking,
 		}
 		if !s.removePending(id) {
 			continue

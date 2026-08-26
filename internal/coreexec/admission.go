@@ -39,9 +39,12 @@ const (
 )
 
 type capturedAdmission struct {
-	Mode      AdmissionMode
-	Profile   tlprofile.Profile
-	Limits    tlprofile.Limits
+	Mode    AdmissionMode
+	Profile tlprofile.Profile
+	Limits  tlprofile.Limits
+	// Wire is the one owned, immutable copy detached from the reusable Edge
+	// inbound frame. Ownership moves to the protobuf request when the admission
+	// lease is consumed; no later CoreExec stage may clone or mutate it.
 	Wire      []byte
 	Proof     wireProof
 	CreatedAt time.Time
@@ -73,7 +76,10 @@ type replayHookEntry struct {
 type encodedResult struct {
 	prepared      tlprofile.PreparedCall
 	wireInvariant bool
-	body          []byte
+	// body owns the immutable protobuf response bytes returned by grpc-go. The
+	// response message transfers this slice to encodedResult before becoming
+	// unreachable; Encode only appends it to the caller's outbound buffer.
+	body []byte
 }
 
 func (r *encodedResult) Prepared() tlprofile.PreparedCall { return r.prepared }
@@ -92,6 +98,9 @@ func copyBufferRaw(b *bin.Buffer) []byte {
 	if b == nil {
 		return nil
 	}
+	// This is the sole mandatory request-wire copy: Edge admission consumes a
+	// view into a reusable decrypted MTProto frame whose backing array may be
+	// overwritten as soon as the inbound request leaves the connection actor.
 	return append([]byte(nil), b.Raw()...)
 }
 
@@ -99,7 +108,12 @@ func admitCaptured(handler Handler, mode AdmissionMode, profile int, limits tlpr
 	if handler == nil {
 		return tlprofile.Admission{}, ErrNilHandler
 	}
-	body := bin.Buffer{Buf: append([]byte(nil), wire...)}
+	// request_wire belongs to the inbound protobuf request for the complete
+	// unary-handler lifetime. Generated admission advances only this local slice
+	// header; TL decoders do not mutate the backing wire and materialized bytes
+	// fields own their data. The admitted request is dispatched before the gRPC
+	// handler returns, so borrowing here is both bounded and race-free.
+	body := bin.Buffer{Buf: wire}
 	options := tlprofile.AdmissionOptions{
 		Limits:     limits,
 		ExpandGZIP: coreExecGZIPExpander,
@@ -114,6 +128,18 @@ func admitCaptured(handler Handler, mode AdmissionMode, profile int, limits tlpr
 	default:
 		return tlprofile.Admission{}, fmt.Errorf("coreexec: invalid admission mode %q", mode)
 	}
+}
+
+// takeBufferRaw transfers the buffer's owned backing array to its caller and
+// clears the source header so an accidental later Reset/Put cannot mutate the
+// transferred protobuf payload.
+func takeBufferRaw(b *bin.Buffer) []byte {
+	if b == nil {
+		return nil
+	}
+	raw := b.Raw()
+	b.ResetTo(nil)
+	return raw
 }
 
 func proofFromAdmission(admitted tlprofile.Admission) wireProof {

@@ -6,15 +6,19 @@ import (
 	"hash"
 	"sort"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"time"
 )
 
-func (s *MessageStore) SetMessageReactions(_ context.Context, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
+func (s *MessageStore) SetMessageReactions(ctx context.Context, req domain.SetPrivateMessageReactionsRequest, effects store.DeliveryEffectsBuilder[domain.PrivateMessageReactionsResult]) (domain.PrivateMessageReactionsResult, error) {
 	if req.UserID == 0 || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 || req.MessageID <= 0 || req.MessageID > domain.MaxMessageBoxID {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
 	}
 	if len(req.Reactions) > domain.MaxChannelMessageReactionsPerUser {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
+	}
+	if effects == nil {
+		return domain.PrivateMessageReactionsResult{}, store.ErrDeliveryOutboxRequired
 	}
 	req.Reactions = domain.TrimMessageReactionsToUserMax(req.Reactions, req.ReactionsPerUserMax)
 	if req.Date == 0 {
@@ -23,7 +27,7 @@ func (s *MessageStore) SetMessageReactions(_ context.Context, req domain.SetPriv
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Peer.ID == req.UserID {
-		return s.setSavedMessageTagsLocked(req)
+		return s.setSavedMessageTagsLocked(ctx, req, effects)
 	}
 	var target domain.Message
 	for _, msg := range s.m[req.UserID] {
@@ -35,9 +39,13 @@ func (s *MessageStore) SetMessageReactions(_ context.Context, req domain.SetPriv
 	if target.ID == 0 || target.UID == 0 {
 		return domain.PrivateMessageReactionsResult{}, domain.ErrMessageIDInvalid
 	}
-	if _, ok := s.privateReactions[target.UID]; !ok {
+	byUser, hadMessageReactions := s.privateReactions[target.UID]
+	if !hadMessageReactions {
 		s.privateReactions[target.UID] = make(map[int64][]domain.ChannelMessagePeerReaction)
+		byUser = s.privateReactions[target.UID]
 	}
+	previousRows, hadUserReactions := byUser[req.UserID]
+	previousRows = append([]domain.ChannelMessagePeerReaction(nil), previousRows...)
 	rows := make([]domain.ChannelMessagePeerReaction, 0, len(req.Reactions))
 	for i, reaction := range req.Reactions {
 		if !reaction.Valid() {
@@ -57,17 +65,43 @@ func (s *MessageStore) SetMessageReactions(_ context.Context, req domain.SetPriv
 	} else {
 		s.privateReactions[target.UID][req.UserID] = rows
 	}
+	var unreadOwnerIndex = -1
+	var previousUnread bool
 	if target.From.ID != 0 && target.From.ID != req.UserID {
 		for i := range s.m[target.From.ID] {
 			if s.m[target.From.ID][i].UID != target.UID {
 				continue
 			}
+			unreadOwnerIndex = i
+			previousUnread = s.m[target.From.ID][i].ReactionUnread
 			s.m[target.From.ID][i].ReactionUnread = len(rows) > 0
 			break
 		}
 	}
+	res := s.privateReactionResultLocked(target.UID)
+	intents, err := effects(res)
+	if err == nil && len(intents) == 0 && len(res.Messages) > 0 {
+		err = store.ErrDeliveryOutboxRequired
+	}
+	if err == nil {
+		_, err = applyDeliveryEffects(ctx, intents, s.deliveryOutbox, nil)
+	}
+	if err != nil {
+		if hadUserReactions {
+			byUser[req.UserID] = previousRows
+		} else {
+			delete(byUser, req.UserID)
+		}
+		if !hadMessageReactions && len(byUser) == 0 {
+			delete(s.privateReactions, target.UID)
+		}
+		if unreadOwnerIndex >= 0 {
+			s.m[target.From.ID][unreadOwnerIndex].ReactionUnread = previousUnread
+		}
+		return domain.PrivateMessageReactionsResult{}, err
+	}
 	s.refreshPrivateReactionDialogSnapshotsLocked(target.UID)
-	return s.privateReactionResultLocked(target.UID), nil
+	return res, nil
 }
 
 func (s *MessageStore) GetMessageReactions(_ context.Context, req domain.PrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error) {
@@ -201,6 +235,17 @@ func (s *MessageStore) refreshPrivateReactionDialogSnapshotsLocked(uid int64) {
 	}
 	s.dialogs.mu.Lock()
 	defer s.dialogs.mu.Unlock()
+	s.refreshPrivateReactionDialogSnapshotsWithDialogLocked(uid)
+}
+
+// refreshPrivateReactionDialogSnapshotsWithDialogLocked mirrors the helper
+// above when an aggregate already owns both MessageStore.mu and DialogStore.mu.
+// Keeping a single lock order (message -> dialog -> event) prevents the memory
+// model from hiding deadlocks that the PostgreSQL aggregate is designed to avoid.
+func (s *MessageStore) refreshPrivateReactionDialogSnapshotsWithDialogLocked(uid int64) {
+	if s.dialogs == nil || uid == 0 {
+		return
+	}
 	for ownerID, messages := range s.m {
 		list := s.dialogs.m[ownerID]
 		changed := false

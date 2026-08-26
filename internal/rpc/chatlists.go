@@ -173,10 +173,7 @@ func (r *Router) onChatlistsCheckChatlistInvite(ctx context.Context, slug string
 		if preview.Membership != nil {
 			filterID = preview.Membership.LocalFilterID
 		}
-		users, chats, channels := r.tgChatlistPeerEnvelopeWithChannels(ctx, userID, append(preview.Missing, preview.Already...))
-		if preview.Membership != nil {
-			r.pushChatlistJoinedChannelNudges(ctx, userID, channels)
-		}
+		users, chats, _ := r.tgChatlistPeerEnvelopeWithChannels(ctx, userID, append(preview.Missing, preview.Already...))
 		return &tg.ChatlistsChatlistInviteAlready{
 			FilterID:     filterID,
 			MissingPeers: tgChatlistPeers(preview.Missing),
@@ -406,13 +403,11 @@ func (r *Router) recordChatlistFilterUpdate(ctx context.Context, userID int64, f
 	var err error
 	if r.deps.Updates != nil {
 		authKeyID, _ := AuthKeyIDFrom(ctx)
-		sessionID, _ := SessionIDFrom(ctx)
-		event, _, err = r.deps.Updates.RecordDialogFilter(ctx, authKeyID, userID, filterID, folder, rawAuthKeyIDForOrigin(ctx), sessionID)
+		event, _, err = r.deps.Updates.RecordDialogFilter(ctx, authKeyID, userID, filterID, folder, [8]byte{}, 0)
 		if err != nil {
 			return internalErr()
 		}
 	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
 	r.requireReliableDispatchForUserUpdate(ctx, userID, tgUpdateForOutboxEvent(event))
 	return nil
 }
@@ -433,7 +428,6 @@ func (r *Router) chatlistFilterUpdates(ctx context.Context, userID int64, filter
 			return nil, internalErr()
 		}
 	}
-	r.bookkeepAuxPtsForCurrentSession(ctx, event)
 	out := tgUpdateForOutboxEvent(event)
 	if out == nil {
 		out = &tg.Updates{Date: event.Date}
@@ -461,7 +455,6 @@ func (r *Router) chatlistOperationUpdates(ctx context.Context, userID int64, fil
 		r.invalidateChannelFullBotInfoCacheForChannel(res.Channel.ID)
 		if leaving {
 			r.removeOnlineChannelMemberships(res.Channel.ID, userID)
-			r.recordChannelStateForUser(ctx, userID, res.Channel.ID, true)
 		} else {
 			r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
 		}
@@ -472,9 +465,6 @@ func (r *Router) chatlistOperationUpdates(ctx context.Context, userID int64, fil
 				out.Updates = append(out.Updates, nudge)
 			}
 		}
-		r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-			return r.channelOperationUpdates(ctx, viewerUserID, res)
-		})
 	}
 	return out, nil
 }
@@ -486,33 +476,6 @@ func chatlistJoinedChannelNudge(channel domain.Channel) tg.UpdateClass {
 	update := &tg.UpdateChannelTooLong{ChannelID: channel.ID}
 	update.SetPts(channel.Pts)
 	return update
-}
-
-func (r *Router) pushChatlistJoinedChannelNudges(ctx context.Context, userID int64, channels []domain.Channel) {
-	if userID == 0 || len(channels) == 0 {
-		return
-	}
-	updates := make([]tg.UpdateClass, 0, len(channels))
-	for _, channel := range channels {
-		if nudge := chatlistJoinedChannelNudge(channel); nudge != nil {
-			updates = append(updates, nudge)
-		}
-	}
-	if len(updates) == 0 {
-		return
-	}
-	out := &tg.Updates{
-		Updates: updates,
-		Users:   []tg.UserClass{},
-		Chats:   []tg.ChatClass{},
-		Date:    int(r.clock.Now().Unix()),
-		Seq:     0,
-	}
-	if _, ok := SessionIDFrom(ctx); ok {
-		r.pushCurrentSessionMessage(ctx, "push chatlist joined channel nudges", out)
-		return
-	}
-	r.pushUserUpdates(ctx, userID, out)
 }
 
 func chatlistErr(err error) error {

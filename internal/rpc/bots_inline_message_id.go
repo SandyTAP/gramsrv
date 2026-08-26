@@ -184,7 +184,7 @@ func (r *Router) pushInlineBotSendFeedback(ctx context.Context, userID int64, re
 			update.SetMsgID(msgID)
 		}
 	}
-	r.pushUserMessage(ctx, results.BotUserID, "push bot inline send", &tg.Updates{
+	r.pushUserMessageTransient(ctx, results.BotUserID, "push bot inline send", &tg.Updates{
 		Updates: []tg.UpdateClass{update},
 		Date:    int(r.clock.Now().Unix()),
 	})

@@ -25,7 +25,7 @@ func TestAuthSignUpWritesOfficialLoginMessagePostgres(t *testing.T) {
 
 	users := NewUserStore(pool)
 	dialogs := NewDialogStore(pool)
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	svc := appauth.NewService(
 		users,
 		NewAuthorizationStore(pool),
@@ -55,7 +55,7 @@ func TestAuthSignUpWritesOfficialLoginMessagePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
-	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345"); err != nil || !needSignUp {
+	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345", postgresAuthorizationDelivery); err != nil || !needSignUp {
 		t.Fatalf("SignIn needSignUp = %v err = %v, want need sign-up", needSignUp, err)
 	}
 
@@ -97,7 +97,7 @@ func TestAuthSendCodeOfficialLoginMessagePreservesReadWatermarkBeforeSignInPostg
 
 	users := NewUserStore(pool)
 	dialogs := NewDialogStore(pool)
-	messages := NewMessageStore(pool)
+	messages := newTestMessageStore(pool)
 	svc := appauth.NewService(
 		users,
 		NewAuthorizationStore(pool),
@@ -128,7 +128,7 @@ func TestAuthSendCodeOfficialLoginMessagePreservesReadWatermarkBeforeSignInPostg
 	if err != nil {
 		t.Fatalf("SendCode signup: %v", err)
 	}
-	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345"); err != nil || !needSignUp {
+	if _, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345", postgresAuthorizationDelivery); err != nil || !needSignUp {
 		t.Fatalf("SignIn before signup needSignUp=%v err=%v, want true/nil", needSignUp, err)
 	}
 	u, first, err := svc.SignUp(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "PgLogin", "Read")
@@ -187,7 +187,7 @@ FROM target`, u.ID, domain.OfficialSystemUserID).Scan(&top, &readMax, &unread, &
 	}
 	secondID := first.ID + 1
 	assertOfficialDialog(secondID, first.ID, 1)
-	_, lateSecond, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345")
+	_, lateSecond, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345", postgresAuthorizationDelivery)
 	if err != nil || needSignUp {
 		t.Fatalf("SignIn second needSignUp=%v err=%v", needSignUp, err)
 	}
@@ -202,7 +202,7 @@ FROM target`, u.ID, domain.OfficialSystemUserID).Scan(&top, &readMax, &unread, &
 	}
 	thirdID := first.ID + 2
 	assertOfficialDialog(thirdID, first.ID, 2)
-	_, lateThird, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345")
+	_, lateThird, needSignUp, err := svc.SignIn(ctx, domain.Authorization{AuthKeyID: authKeyID}, phone, hash, "12345", postgresAuthorizationDelivery)
 	if err != nil || needSignUp {
 		t.Fatalf("SignIn third needSignUp=%v err=%v", needSignUp, err)
 	}

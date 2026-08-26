@@ -447,11 +447,11 @@ func (r *Router) onBotsUpdateUserEmojiStatus(ctx context.Context, req *tg.BotsUp
 	if err != nil {
 		return false, err
 	}
-	svc, ok := r.deps.Users.(UserPremiumService)
-	if !ok {
-		return false, userPermissionDeniedErr()
+	if r.deps.Users == nil {
+		return false, internalErr()
 	}
-	u, err := svc.UpdateEmojiStatus(ctx, target.ID, domain.UserEmojiStatus{DocumentID: documentID, Until: until})
+	value := domain.UserEmojiStatus{DocumentID: documentID, Until: until}
+	u, _, err := r.deps.Users.UpdateEmojiStatusWithEvent(ctx, target.ID, value, int(r.clock.Now().Unix()))
 	if err != nil {
 		if errors.Is(err, domain.ErrPremiumRequired) {
 			return false, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
@@ -459,14 +459,6 @@ func (r *Router) onBotsUpdateUserEmojiStatus(ctx context.Context, req *tg.BotsUp
 		return false, internalErr()
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateUserEmojiStatus{
-			UserID:      u.ID,
-			EmojiStatus: tgUserEmojiStatus(u, r.clock.Now().Unix()),
-		}},
-		Users: []tg.UserClass{r.tgSelfUserWithUsernames(ctx, u)},
-		Date:  int(r.clock.Now().Unix()),
-	})
 	return true, nil
 }
 

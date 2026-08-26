@@ -26,8 +26,24 @@ func (s *ChannelStore) SendChannelMessage(_ context.Context, req domain.SendChan
 		}
 		req.IdempotencyFingerprint = fingerprint
 	}
+	var aggregateDialogs *DialogStore
+	var aggregateEvents *UpdateEventStore
+	if req.ClearDraft {
+		s.dialogAggregateMu.RLock()
+		aggregateDialogs, aggregateEvents = s.dialogAggregate, s.accountEvents
+		s.dialogAggregateMu.RUnlock()
+		if aggregateDialogs == nil || aggregateEvents == nil {
+			return domain.SendChannelMessageResult{}, store.ErrDeliveryOutboxRequired
+		}
+		aggregateDialogs.mu.Lock()
+		defer aggregateDialogs.mu.Unlock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if req.ClearDraft {
+		aggregateEvents.mu.Lock()
+		defer aggregateEvents.mu.Unlock()
+	}
 	if req.RandomID != 0 {
 		if replay, found, replayErr := s.lookupChannelSendReplayLocked(domain.ChannelSendReplayRequest{
 			ChannelID:              req.ChannelID,
@@ -86,6 +102,27 @@ func (s *ChannelStore) SendChannelMessage(_ context.Context, req domain.SendChan
 	if req.SendAs != nil {
 		p := *req.SendAs
 		sendAs = &p
+	}
+	var draftSnapshot store.DialogAccountMutationSnapshot
+	var draftEffects []store.DeliveryEffect
+	if req.ClearDraft {
+		topMessageID := 0
+		if replyTo != nil && replyTo.TopMessageID > 0 {
+			topMessageID = replyTo.TopMessageID
+		}
+		mutation := store.DialogAccountMutation{
+			Kind: store.DialogAccountDeleteDraft, UserID: req.UserID, Date: req.Date,
+			Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: req.ChannelID}, TopMessageID: topMessageID,
+		}
+		_, changed := aggregateDialogs.drafts[mutation.UserID][draftKey(mutation.Peer, mutation.TopMessageID)]
+		draftSnapshot = store.DialogAccountMutationSnapshot{Mutation: mutation, Changed: changed}
+		draftEffects, err = sendDraftClearEffects(draftSnapshot)
+		if err != nil {
+			return domain.SendChannelMessageResult{}, err
+		}
+		if err := store.ValidateDialogAccountEffects(draftSnapshot, draftEffects); err != nil {
+			return domain.SendChannelMessageResult{}, fmt.Errorf("validate memory channel-send draft effects: %w", err)
+		}
 	}
 	pts := s.nextChannelPtsLocked(req.ChannelID)
 	msgID := s.nextChannelMessageIDLocked(req.ChannelID)
@@ -235,6 +272,12 @@ func (s *ChannelStore) SendChannelMessage(_ context.Context, req domain.SendChan
 	}
 	recipients := s.activeMemberIDsLocked(req.ChannelID, 0, 0)
 	recipients = filterSkippedChannelRecipients(recipients, skipDelivery)
+	var draftEvent domain.UpdateEvent
+	if len(draftEffects) == 1 {
+		delete(aggregateDialogs.drafts[req.UserID], draftKey(draftSnapshot.Mutation.Peer, draftSnapshot.Mutation.TopMessageID))
+		draftEvent = aggregateEvents.appendLocked(req.UserID, draftEffects[0].Event, true)
+		aggregateEvents.dispatches[req.UserID] = append(aggregateEvents.dispatches[req.UserID], memoryUpdateDispatch{Pts: draftEvent.Pts})
+	}
 	return domain.SendChannelMessageResult{
 		Channel:             channel,
 		Message:             cloneChannelMessage(msg),
@@ -243,6 +286,7 @@ func (s *ChannelStore) SendChannelMessage(_ context.Context, req domain.SendChan
 		Discussion:          discussion,
 		MentionUserIDs:      append([]int64(nil), req.MentionUserIDs...),
 		SkipDeliveryUserIDs: append([]int64(nil), req.SkipDeliveryUserIDs...),
+		DraftEvent:          draftEvent,
 	}, nil
 }
 

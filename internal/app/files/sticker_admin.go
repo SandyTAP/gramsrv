@@ -178,7 +178,7 @@ func (s *Service) AdminAddStickerToSet(ctx context.Context, setID int64, item do
 	}
 	set.Hash = stickerSetHash(set)
 	docs = append(docs, doc)
-	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{doc})
+	return s.persistAdminStickerSetMutation(ctx, set, docs, []domain.Document{doc})
 }
 
 // AdminRemoveStickerFromSet detaches one document from any pack, with no
@@ -223,5 +223,5 @@ func (s *Service) AdminRemoveStickerFromSet(ctx context.Context, setID int64, do
 		}
 	}
 	set.Hash = stickerSetHash(set)
-	return s.persistStickerSetMutation(ctx, set, docs, []domain.Document{removedDoc})
+	return s.persistAdminStickerSetMutation(ctx, set, docs, []domain.Document{removedDoc})
 }

@@ -75,6 +75,13 @@ func (p *OutboxProjector) BuildOutboxUpdateBytes(ctx context.Context, requests [
 	return p.router.BuildOutboxUpdateBytes(ctx, requests)
 }
 
+func (p *OutboxProjector) BuildChannelUpdateBytes(ctx context.Context, requests []egress.ChannelUpdateRequest) ([][]byte, error) {
+	if p == nil || p.router == nil {
+		return nil, ErrOutboxProjectorUnavailable
+	}
+	return p.router.BuildChannelUpdateBytes(ctx, requests)
+}
+
 // NewWelcomeDeliveryDispatcher wires the projection-only Egress router to the
 // remote Edge control boundary. It does not expose Core RPC dispatch or local
 // session ownership to the Egress process.

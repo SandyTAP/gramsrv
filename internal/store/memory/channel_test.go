@@ -12,7 +12,7 @@ import (
 
 func TestChannelCreateInitialPtsBaseline(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "initial pts",
@@ -52,7 +52,7 @@ func TestChannelCreateInitialPtsBaseline(t *testing.T) {
 
 func TestChannelCreateCreatesPermanentInviteAndHasLink(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "private group with main link",
@@ -91,7 +91,7 @@ func TestChannelCreateCreatesPermanentInviteAndHasLink(t *testing.T) {
 
 func TestChannelViewExportedInviteIsAdminOnly(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "private group with regular member",
@@ -119,7 +119,7 @@ func TestChannelViewExportedInviteIsAdminOnly(t *testing.T) {
 }
 
 func TestChannelRealtimeRecipientsAreCapped(t *testing.T) {
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	memberIDs := make([]int64, domain.MaxChannelRealtimeFanout+25)
 	for i := range memberIDs {
 		memberIDs[i] = int64(10_000 + i)
@@ -150,7 +150,7 @@ func TestChannelRealtimeRecipientsAreCapped(t *testing.T) {
 
 func TestChannelCreatorLeaveTransfersOwner(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "creator transfer",
@@ -201,7 +201,7 @@ func TestChannelCreatorLeaveTransfersOwner(t *testing.T) {
 	if oldOwner.Status != domain.ChannelMemberLeft || oldOwner.Role == domain.ChannelRoleCreator {
 		t.Fatalf("old owner = %+v, want left non-creator", oldOwner)
 	}
-	if _, err := store.JoinChannel(ctx, created.Channel.ID, 1, 1_700_000_113); err != nil {
+	if _, err := store.JoinChannel(ctx, created.Channel.ID, 1, 1_700_000_113, testPendingJoinEffects); err != nil {
 		t.Fatalf("old owner rejoin: %v", err)
 	}
 	rejoined, err := store.GetParticipant(ctx, 3, created.Channel.ID, 1)
@@ -215,7 +215,7 @@ func TestChannelCreatorLeaveTransfersOwner(t *testing.T) {
 
 func TestChannelCreatorCanEditOwnAdminRights(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "creator self admin",
@@ -277,7 +277,7 @@ func TestChannelCreatorCanEditOwnAdminRights(t *testing.T) {
 
 func TestChannelAdminAndBanDoNotAdvanceChannelPts(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "participant state no pts",
@@ -365,7 +365,7 @@ func TestChannelAdminAndBanDoNotAdvanceChannelPts(t *testing.T) {
 
 func TestChannelStoreGetMessagesNonMemberPublicPreview(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	const owner, outsider int64 = 1, 99
 
 	// 公开广播频道：非成员可读取消息（查看他人资料里的公开「个人频道」时，DrKLO 经
@@ -405,7 +405,7 @@ func TestChannelStoreGetMessagesNonMemberPublicPreview(t *testing.T) {
 
 func TestChannelStoreStoryMessageForwardsPublicOnlyAndDeleteRollback(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	source := domain.Peer{Type: domain.PeerTypeUser, ID: 42}
 	media := &domain.MessageMedia{
 		Kind: domain.MessageMediaKindStory,
@@ -502,7 +502,7 @@ func TestChannelStoreStoryMessageForwardsPublicOnlyAndDeleteRollback(t *testing.
 
 func TestPendingJoinRequestsSummaryAndInviteAdmins(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "pending join requests",
@@ -551,7 +551,7 @@ func TestPendingJoinRequestsSummaryAndInviteAdmins(t *testing.T) {
 			UserID: int64(10 + i),
 			Hash:   invite.Invite.Hash,
 			Date:   1_700_000_160 + i,
-		})
+		}, testPendingJoinEffects)
 		if !errors.Is(err, domain.ErrInviteRequestSent) {
 			t.Fatalf("import pending %d err = %v, want ErrInviteRequestSent", i, err)
 		}
@@ -578,7 +578,7 @@ func TestPendingJoinRequestsSummaryAndInviteAdmins(t *testing.T) {
 
 func TestCommonChannelsOnlySharedMegagroups(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	first, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "common one",
@@ -671,7 +671,7 @@ func TestCommonChannelsOnlySharedMegagroups(t *testing.T) {
 
 func TestLeftChannelsReturnsPagedLeftMemberships(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	older, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "older left",
@@ -736,7 +736,7 @@ func TestLeftChannelsReturnsPagedLeftMemberships(t *testing.T) {
 
 func TestDiscussionGroupLinksAreBidirectionalAndReplaceOldLinks(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	broadcast, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "broadcast",
@@ -843,7 +843,7 @@ func TestDiscussionGroupLinksAreBidirectionalAndReplaceOldLinks(t *testing.T) {
 
 func TestChannelDeleteHistoryCapsHugeMaxID(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "bounded delete history",
@@ -873,7 +873,7 @@ func TestChannelDeleteHistoryCapsHugeMaxID(t *testing.T) {
 		MaxID:       int(^uint(0) >> 1),
 		ForEveryone: true,
 		Date:        1_700_001_300,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("delete first batch: %v", err)
 	}
@@ -887,7 +887,7 @@ func TestChannelDeleteHistoryCapsHugeMaxID(t *testing.T) {
 		MaxID:       int(^uint(0) >> 1),
 		ForEveryone: true,
 		Date:        1_700_001_301,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("delete second batch: %v", err)
 	}
@@ -908,7 +908,7 @@ func TestChannelDeleteHistoryCapsHugeMaxID(t *testing.T) {
 
 func TestChannelDeleteHistoryLocalClearReturnsMonotonicAvailableMinID(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "monotonic local clear",
@@ -945,7 +945,7 @@ func TestChannelDeleteHistoryLocalClearReturnsMonotonicAvailableMinID(t *testing
 		ChannelID: created.Channel.ID,
 		MaxID:     second.Message.ID,
 		Date:      1_700_000_253,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("clear high watermark: %v", err)
 	}
@@ -972,7 +972,7 @@ func TestChannelDeleteHistoryLocalClearReturnsMonotonicAvailableMinID(t *testing
 		ChannelID: created.Channel.ID,
 		MaxID:     first.Message.ID,
 		Date:      1_700_000_254,
-	})
+	}, testAvailableMinEffects)
 	if err != nil {
 		t.Fatalf("clear stale low watermark: %v", err)
 	}
@@ -1050,7 +1050,7 @@ func TestChannelDeleteHistoryLocalClearKeepsMegagroupAndBroadcastDialogs(t *test
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			store := NewChannelStore()
+			store := newChannelStoreWithDelivery()
 			created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 				CreatorUserID: 11,
 				Title:         tc.name + " local clear",
@@ -1077,7 +1077,7 @@ func TestChannelDeleteHistoryLocalClearKeepsMegagroupAndBroadcastDialogs(t *test
 				ChannelID: created.Channel.ID,
 				MaxID:     sent.Message.ID,
 				Date:      1_700_000_272,
-			})
+			}, testAvailableMinEffects)
 			if err != nil {
 				t.Fatalf("clear local history: %v", err)
 			}
@@ -1100,7 +1100,7 @@ func TestChannelDeleteHistoryLocalClearKeepsMegagroupAndBroadcastDialogs(t *test
 
 func TestChannelPrehistoryBoundaryDoesNotCreateHistoryClearAnchor(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 21,
 		Title:         "hidden prehistory",
@@ -1158,7 +1158,7 @@ func TestChannelPrehistoryBoundaryDoesNotCreateHistoryClearAnchor(t *testing.T) 
 
 func TestChannelListDialogsDerivesRecipientTopWithoutWriteFanout(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "single copy dialog top",
@@ -1174,7 +1174,7 @@ func TestChannelListDialogsDerivesRecipientTopWithoutWriteFanout(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     created.Message.ID,
 		Date:      1_700_000_301,
-	}); err != nil {
+	}, testChannelReadEffects); err != nil {
 		t.Fatalf("read initial service message: %v", err)
 	}
 
@@ -1206,7 +1206,7 @@ func TestChannelListDialogsDerivesRecipientTopWithoutWriteFanout(t *testing.T) {
 
 func TestChannelUnreadExcludesOwnOutgoing(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "own outgoing unread",
@@ -1249,7 +1249,8 @@ func TestChannelUnreadExcludesOwnOutgoing(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		MaxID:     sent.Message.ID,
 		Date:      1_700_000_362,
-	})
+	}, testChannelReadEffects)
+
 	if err != nil {
 		t.Fatalf("read channel history: %v", err)
 	}
@@ -1260,7 +1261,7 @@ func TestChannelUnreadExcludesOwnOutgoing(t *testing.T) {
 
 func TestChannelMessageReplyMarkupSurvivesReadPaths(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "channel reply markup",
@@ -1360,7 +1361,7 @@ func TestChannelMessageReplyMarkupSurvivesReadPaths(t *testing.T) {
 
 func TestChannelMessageViaBotEditUpdatesReplyMarkup(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "channel via bot edit",
@@ -1427,7 +1428,7 @@ func TestChannelMessageViaBotEditUpdatesReplyMarkup(t *testing.T) {
 
 func TestBroadcastChannelReactionsAreAnonymousAndSkipUnread(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "broadcast reaction",
@@ -1488,7 +1489,7 @@ func TestBroadcastChannelReactionsAreAnonymousAndSkipUnread(t *testing.T) {
 
 func TestChannelReadMessageContentsClearsVisibleUnreadReactions(t *testing.T) {
 	ctx := context.Background()
-	store := NewChannelStore()
+	store := newChannelStoreWithDelivery()
 	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: 1,
 		Title:         "visible unread reaction",
@@ -1546,7 +1547,7 @@ func TestChannelReadMessageContentsClearsVisibleUnreadReactions(t *testing.T) {
 		UserID:    1,
 		ChannelID: created.Channel.ID,
 		IDs:       []int{sent.Message.ID},
-	})
+	}, testChannelMessageContentsEffects)
 	if err != nil {
 		t.Fatalf("read channel message contents: %v", err)
 	}

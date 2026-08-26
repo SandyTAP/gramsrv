@@ -408,12 +408,6 @@ func (r *Router) sendMonoforumMessage(ctx context.Context, userID int64, peer do
 	if err != nil {
 		return nil, messageSendErr(err)
 	}
-	if req.ClearDraft {
-		r.clearDraftAfterSend(ctx, userID, peer, req.ReplyTo)
-	}
-	if !res.Duplicate {
-		r.enqueueMonoforumMessageFanout(ctx, userID, mono, req.SavedPeer, res)
-	}
 	return r.monoforumSendUpdatesStrict(ctx, userID, mono, req.SavedPeer, res)
 }
 

@@ -60,12 +60,11 @@ func TestCachedRawTemporarySessionReResolvesDurableBinding(t *testing.T) {
 	}
 	r := New(Config{TempKeyResolveCacheTTL: time.Minute}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	var in bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 19, FilePart: 0, Bytes: []byte{1}}).Encode(&in); err != nil {
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&in); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 554, &in); err != nil {
@@ -95,12 +94,11 @@ func TestCachedRawSessionWithoutMetadataFailsClosedToDurableResolver(t *testing.
 	}
 	r := New(Config{TempKeyResolveCacheTTL: time.Minute}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	var in bin.Buffer
-	if err := (&tg.UploadSaveFilePartRequest{FileID: 18, FilePart: 0, Bytes: []byte{1}}).Encode(&in); err != nil {
+	if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&in); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 553, &in); err != nil {
@@ -128,13 +126,12 @@ func TestTempKeyResolveCacheHitsWithinTTL(t *testing.T) {
 	}
 	r := New(Config{TempKeyResolveCacheTTL: time.Minute}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	for i := 0; i < 8; i++ {
 		var in bin.Buffer
-		if err := (&tg.UploadSaveFilePartRequest{FileID: 20, FilePart: i, Bytes: []byte{1}}).Encode(&in); err != nil {
+		if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&in); err != nil {
 			t.Fatalf("encode %d: %v", i, err)
 		}
 		if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 555, &in); err != nil {
@@ -163,13 +160,12 @@ func TestTempKeyResolveCacheExpires(t *testing.T) {
 	}
 	r := New(Config{TempKeyResolveCacheTTL: time.Millisecond}, Deps{
 		Auth:     auth,
-		Files:    &fakeFiles{},
 		Sessions: sessions,
 	}, zaptest.NewLogger(t), clock.System)
 
 	dispatch := func() {
 		var in bin.Buffer
-		if err := (&tg.UploadSaveFilePartRequest{FileID: 21, FilePart: 0, Bytes: []byte{1}}).Encode(&in); err != nil {
+		if err := (&tg.AccountGetAuthorizationsRequest{}).Encode(&in); err != nil {
 			t.Fatalf("encode: %v", err)
 		}
 		if _, err := r.Dispatch(context.Background(), tempAuthKeyID, 556, &in); err != nil {

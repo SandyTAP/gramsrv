@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/iamxvbaba/td/clock"
@@ -12,28 +14,48 @@ import (
 	appstars "telesrv/internal/app/stars"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 type starsFriendGiftRPCStore struct {
 	*memory.StarsStore
+	mu        sync.Mutex
 	issued    domain.StarsPurchaseForm
 	purchased domain.StarsPurchaseRequest
 	purchases int
+	settled   domain.StarsPurchaseResult
+	outbox    *memory.DeliveryOutboxStore
 }
 
 func (s *starsFriendGiftRPCStore) IssueStarsPurchaseForm(_ context.Context, form domain.StarsPurchaseForm) (domain.StarsPurchaseForm, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	form.FormID = 70001
 	s.issued = form
 	return form, nil
 }
 
-func (s *starsFriendGiftRPCStore) PurchaseStars(_ context.Context, req domain.StarsPurchaseRequest) (domain.StarsPurchaseResult, error) {
-	s.purchased = req
-	s.purchases++
+func (s *starsFriendGiftRPCStore) PurchaseStarsWithDelivery(ctx context.Context, req domain.StarsPurchaseRequest, effects store.DeliveryEffectsBuilder[domain.StarsPurchaseResult]) (domain.StarsPurchaseResult, error) {
+	if effects == nil {
+		return domain.StarsPurchaseResult{}, store.ErrDeliveryOutboxRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if req.FormID != s.issued.FormID || req.Kind != s.issued.Kind || req.BuyerUserID != s.issued.BuyerUserID ||
+		req.RecipientUserID != s.issued.RecipientUserID || req.Stars != s.issued.Stars || req.Currency != s.issued.Currency ||
+		req.Amount != s.issued.Amount || !reflect.DeepEqual(req.Giveaway, s.issued.Giveaway) {
+		return domain.StarsPurchaseResult{}, domain.ErrStarsPurchaseFormInvalid
+	}
+	if s.settled.TransactionID != "" {
+		replay := s.settled
+		replay.Duplicate = true
+		return replay, nil
+	}
+	var result domain.StarsPurchaseResult
 	action := &domain.MessageServiceAction{Kind: domain.MessageServiceActionGiftStars, GiftStars: &domain.MessageGiftStarsAction{
 		Currency: req.Currency, Amount: req.Amount, Stars: req.Stars,
-		TransactionID: "stars-gift-test", BalanceAfter: 4321,
+		TransactionID: "stars-gift-test",
 	}}
 	sender := domain.Message{ID: 11, OwnerUserID: req.BuyerUserID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: req.RecipientUserID},
 		From: domain.Peer{Type: domain.PeerTypeUser, ID: req.BuyerUserID}, Out: true, Date: req.Date,
@@ -41,15 +63,32 @@ func (s *starsFriendGiftRPCStore) PurchaseStars(_ context.Context, req domain.St
 	recipient := sender
 	recipient.ID, recipient.OwnerUserID, recipient.Peer, recipient.Out = 12, req.RecipientUserID,
 		domain.Peer{Type: domain.PeerTypeUser, ID: req.BuyerUserID}, false
-	return domain.StarsPurchaseResult{
-		Balance:       domain.StarsBalance{UserID: req.RecipientUserID, Balance: 4321},
-		TransactionID: "stars-gift-test",
-		Send: domain.SendPrivateTextResult{
-			SenderMessage: sender, RecipientMessage: recipient,
-			SenderEvent:    domain.UpdateEvent{UserID: req.BuyerUserID, Type: domain.UpdateEventNewMessage, Pts: 5, PtsCount: 1, Date: req.Date, Message: sender},
-			RecipientEvent: domain.UpdateEvent{UserID: req.RecipientUserID, Type: domain.UpdateEventNewMessage, Pts: 9, PtsCount: 1, Date: req.Date, Message: recipient},
-		},
-	}, nil
+	balance, err := s.StarsStore.CreditWithDelivery(ctx, req.RecipientUserID, req.Stars, domain.StarsReasonGift,
+		domain.Peer{Type: domain.PeerTypeUser, ID: req.BuyerUserID}, req.Date, "Stars gift", "test purchase",
+		func(balance domain.StarsBalance) ([]store.DeliveryEffect, error) {
+			action.GiftStars.BalanceAfter = balance.Balance
+			result = domain.StarsPurchaseResult{
+				Balance: balance, TransactionID: "stars-gift-test",
+				Send: domain.SendPrivateTextResult{
+					SenderMessage: sender, RecipientMessage: recipient,
+					SenderEvent:    domain.UpdateEvent{UserID: req.BuyerUserID, Type: domain.UpdateEventNewMessage, Pts: 5, PtsCount: 1, Date: req.Date, Message: sender},
+					RecipientEvent: domain.UpdateEvent{UserID: req.RecipientUserID, Type: domain.UpdateEventNewMessage, Pts: 9, PtsCount: 1, Date: req.Date, Message: recipient},
+				},
+			}
+			return effects(result)
+		})
+	if err != nil {
+		return domain.StarsPurchaseResult{}, err
+	}
+	result.Balance = balance
+	s.purchased = req
+	s.purchases++
+	s.settled = result
+	return result, nil
+}
+
+func (*starsFriendGiftRPCStore) GetStarsGiveawayInfo(context.Context, int64, int64, int, int) (domain.StarsGiveawayInfo, error) {
+	return domain.StarsGiveawayInfo{}, domain.ErrMessageIDInvalid
 }
 
 func starsFriendGiftTestRouter(t *testing.T) (*Router, *starsFriendGiftRPCStore, domain.User, domain.User) {
@@ -64,7 +103,10 @@ func starsFriendGiftTestRouter(t *testing.T) (*Router, *starsFriendGiftRPCStore,
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := &starsFriendGiftRPCStore{StarsStore: memory.NewStarsStore()}
+	starsStore := memory.NewStarsStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	starsStore.AttachDeliveryOutbox(outbox)
+	st := &starsFriendGiftRPCStore{StarsStore: starsStore, outbox: outbox}
 	r := New(Config{DC: 2, PublicBaseURL: "https://links.example.test"}, Deps{
 		Users: appusers.NewService(users),
 		Stars: appstars.NewService(st, appstars.WithStartingGrant(0), appstars.WithPurchaseStore(st)),
@@ -74,7 +116,8 @@ func starsFriendGiftTestRouter(t *testing.T) (*Router, *starsFriendGiftRPCStore,
 
 func TestStarsFriendGiftOptionsFormAndFiatSettlement(t *testing.T) {
 	r, st, buyer, recipient := starsFriendGiftTestRouter(t)
-	ctx := WithUserID(context.Background(), buyer.ID)
+	originAuthKeyID := [8]byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	ctx := WithRawAuthKeyID(WithSessionID(WithUserID(context.Background(), buyer.ID), 31001), originAuthKeyID)
 
 	generic, err := r.onPaymentsGetStarsGiftOptions(ctx, &tg.PaymentsGetStarsGiftOptionsRequest{})
 	if err != nil || len(generic) != 3 || generic[0].Stars != 1000 || generic[0].Currency != "USD" || generic[0].Amount != 99 {
@@ -139,6 +182,16 @@ func TestStarsFriendGiftOptionsFormAndFiatSettlement(t *testing.T) {
 
 	if st.purchases != 1 {
 		t.Fatalf("settlement count = %d, want one fiat submit", st.purchases)
+	}
+	if _, err := r.onPaymentsSendPaymentForm(ctx, &tg.PaymentsSendPaymentFormRequest{
+		FormID: form.FormID, Invoice: invoice, Credentials: devStarsCredentials(form.FormID),
+	}); err != nil {
+		t.Fatalf("exact friend-gift replay: %v", err)
+	}
+	items := st.outbox.Snapshot()
+	if st.purchases != 1 || len(items) != 1 || items[0].TargetUserID != recipient.ID ||
+		items[0].ExcludeAuthKeyID != ([8]byte{}) || items[0].ExcludeSessionID != 0 {
+		t.Fatalf("friend-gift delivery = %+v purchases=%d, want one zero-exclusion recipient update", items, st.purchases)
 	}
 }
 

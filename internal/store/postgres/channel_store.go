@@ -1,12 +1,40 @@
 package postgres
 
 import (
+	"context"
+	"errors"
+
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
+
+var (
+	ErrChannelIDAllocatorMissing        = errors.New("postgres channel store: Redis channel id allocator is required")
+	ErrChannelMessageIDAllocatorMissing = errors.New("postgres channel store: Redis channel message id allocator is required")
+)
+
+type missingChannelIDAllocator struct{}
+
+func (missingChannelIDAllocator) NextChannelID(context.Context) (int64, error) {
+	return 0, ErrChannelIDAllocatorMissing
+}
+
+func (missingChannelIDAllocator) CurrentChannelID(context.Context) (int64, error) {
+	return 0, ErrChannelIDAllocatorMissing
+}
+
+type missingChannelMessageIDAllocator struct{}
+
+func (missingChannelMessageIDAllocator) NextChannelMessageID(context.Context, int64) (int, error) {
+	return 0, ErrChannelMessageIDAllocatorMissing
+}
+
+func (missingChannelMessageIDAllocator) CurrentChannelMessageID(context.Context, int64) (int, error) {
+	return 0, ErrChannelMessageIDAllocatorMissing
+}
 
 const channelDialogQueryLimit = 500
 
@@ -121,10 +149,10 @@ func NewChannelStore(db sqlcgen.DBTX, opts ...ChannelStoreOption) *ChannelStore 
 		s.log = zap.NewNop()
 	}
 	if s.ids == nil {
-		s.ids = pgChannelIDAllocator{db: db}
+		s.ids = missingChannelIDAllocator{}
 	}
 	if s.msgIDs == nil {
-		s.msgIDs = pgChannelMessageIDAllocator{db: db}
+		s.msgIDs = missingChannelMessageIDAllocator{}
 	}
 	return s
 }

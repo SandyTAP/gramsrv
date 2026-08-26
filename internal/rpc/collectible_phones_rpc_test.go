@@ -10,6 +10,7 @@ import (
 	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 type collectiblePhoneRPCStore struct{ asset domain.CollectiblePhone }
@@ -35,6 +36,13 @@ func (s collectiblePhoneRPCUsers) ByID(_ context.Context, _, id int64) (domain.U
 }
 func (s collectiblePhoneRPCUsers) ByIDs(context.Context, int64, []int64) ([]domain.User, error) {
 	return nil, nil
+}
+func (s collectiblePhoneRPCUsers) UpdateEmojiStatusWithEvent(_ context.Context, userID int64, status domain.UserEmojiStatus, date int) (domain.User, domain.UpdateEvent, error) {
+	u := testUserWithEmojiStatus(domain.User{ID: userID}, status)
+	return u, testEmojiStatusUpdateEvent(userID, status, date), nil
+}
+func (s collectiblePhoneRPCUsers) UpdatePersonalChannelWithDelivery(_ context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error) {
+	return testUserPersonalChannelMutation(domain.User{ID: userID}, channelID, effects)
 }
 
 func TestFragmentCollectiblePhoneInfoHonorsProjectedVisibility(t *testing.T) {

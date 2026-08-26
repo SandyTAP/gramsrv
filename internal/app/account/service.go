@@ -1122,12 +1122,19 @@ func (s *Service) GetReactionSettings(ctx context.Context, userID int64) (domain
 
 // SetReactionsNotifySettings stores reaction notification preferences.
 func (s *Service) SetReactionsNotifySettings(ctx context.Context, userID int64, notify domain.ReactionsNotifySettings) (domain.AccountReactionSettings, error) {
+	if s == nil || s.reactions == nil || userID == 0 {
+		return domain.AccountReactionSettings{}, store.ErrDeliveryOutboxRequired
+	}
 	settings, err := s.GetReactionSettings(ctx, userID)
 	if err != nil {
 		return domain.AccountReactionSettings{}, err
 	}
 	settings.Notify = normalizeNotifySettings(notify)
-	return s.saveReactionSettings(ctx, userID, settings)
+	settings = normalizeReactionSettings(settings)
+	if err := s.reactions.SaveReactionsNotifySettings(ctx, userID, settings); err != nil {
+		return domain.AccountReactionSettings{}, err
+	}
+	return settings, nil
 }
 
 // SetDefaultReaction stores the account default quick reaction.
@@ -1140,25 +1147,27 @@ func (s *Service) SetDefaultReaction(ctx context.Context, userID int64, reaction
 		reaction = domain.DefaultAccountReactionSettings().DefaultReaction
 	}
 	settings.DefaultReaction = reaction
-	return s.saveReactionSettings(ctx, userID, settings)
+	return s.saveReactionSettings(ctx, userID, settings, func(domain.AccountReactionSettings) ([]store.DeliveryEffect, error) {
+		return nil, nil
+	})
 }
 
 // SetPaidReactionPrivacy stores the account default paid reaction privacy.
-func (s *Service) SetPaidReactionPrivacy(ctx context.Context, userID int64, privacy domain.PaidReactionPrivacy) (domain.AccountReactionSettings, error) {
+func (s *Service) SetPaidReactionPrivacy(ctx context.Context, userID int64, privacy domain.PaidReactionPrivacy, effects store.DeliveryEffectsBuilder[domain.AccountReactionSettings]) (domain.AccountReactionSettings, error) {
 	settings, err := s.GetReactionSettings(ctx, userID)
 	if err != nil {
 		return domain.AccountReactionSettings{}, err
 	}
 	settings.PaidPrivacy = normalizePaidPrivacy(privacy)
-	return s.saveReactionSettings(ctx, userID, settings)
+	return s.saveReactionSettings(ctx, userID, settings, effects)
 }
 
-func (s *Service) saveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings) (domain.AccountReactionSettings, error) {
+func (s *Service) saveReactionSettings(ctx context.Context, userID int64, settings domain.AccountReactionSettings, effects store.DeliveryEffectsBuilder[domain.AccountReactionSettings]) (domain.AccountReactionSettings, error) {
 	settings = normalizeReactionSettings(settings)
-	if s == nil || s.reactions == nil || userID == 0 {
-		return settings, nil
+	if s == nil || s.reactions == nil || userID == 0 || effects == nil {
+		return domain.AccountReactionSettings{}, store.ErrDeliveryOutboxRequired
 	}
-	return settings, s.reactions.SaveReactionSettings(ctx, userID, settings)
+	return settings, s.reactions.SaveReactionSettings(ctx, userID, settings, effects)
 }
 
 // GetAccountSettings 返回账号级单例设置（未持久化时回落默认）。
@@ -1287,12 +1296,23 @@ func (s *Service) SaveNotifySettings(ctx context.Context, ownerUserID int64, sco
 	return s.notify.SaveNotifySettings(ctx, ownerUserID, scope, settings)
 }
 
-// ResetNotifySettings 清空该用户全部作用域的通知设置（恢复默认）。
-func (s *Service) ResetNotifySettings(ctx context.Context, ownerUserID int64) error {
+// SaveNotifySettingsWithDelivery atomically persists a notify preference and
+// its non-PTS absolute delivery fact. A store without this transaction boundary
+// is rejected; there is deliberately no post-commit enqueue fallback.
+func (s *Service) SaveNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings, delivery store.DeliveryOutboxEnqueue) error {
 	if s == nil || s.notify == nil || ownerUserID == 0 {
-		return nil
+		return store.ErrDeliveryOutboxRequired
 	}
-	return s.notify.ResetNotifySettings(ctx, ownerUserID)
+	return s.notify.SaveNotifySettingsWithDelivery(ctx, ownerUserID, scope, settings, delivery)
+}
+
+// ResetNotifySettingsWithDelivery atomically clears all scopes and appends the
+// absolute default-scope reload built from the frozen pre-delete snapshot.
+func (s *Service) ResetNotifySettingsWithDelivery(ctx context.Context, ownerUserID int64, effects store.DeliveryEffectsBuilder[store.NotifySettingsResetSnapshot]) error {
+	if s == nil || s.notify == nil || ownerUserID == 0 || effects == nil {
+		return store.ErrDeliveryOutboxRequired
+	}
+	return s.notify.ResetNotifySettingsWithDelivery(ctx, ownerUserID, effects)
 }
 
 // PeerNotifySettings 批量取一组 peer 的整-peer 通知设置（dialog 列表投影）。
@@ -1319,62 +1339,36 @@ func (s *Service) ListNotifyExceptions(ctx context.Context, ownerUserID int64) (
 	return s.notify.ListNotifyExceptions(ctx, ownerUserID)
 }
 
-// SaveStickerCollectionItem 收藏/最近/GIF 集合的加入或移除（最新置顶、按类别上界截断）。
-func (s *Service) SaveStickerCollectionItem(ctx context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now int) error {
-	if s == nil || s.stickers == nil || userID == 0 {
-		return nil
+// MutateStickerCollection commits the account-local collection transition and
+// its durable non-PTS delivery fact in one store transaction.
+func (s *Service) MutateStickerCollection(ctx context.Context, mutation domain.StickerCollectionMutation, effects store.DeliveryEffectsBuilder[domain.StickerCollectionMutation]) error {
+	if s == nil || s.stickers == nil || mutation.OwnerUserID <= 0 || effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	return s.stickers.SaveStickerCollectionItem(ctx, userID, kind, documentID, unsave, now, domain.MaxStickerCollectionItems(kind))
+	return s.stickers.MutateStickerCollection(ctx, mutation, effects)
 }
 
 // ListStickerCollection 取某类个人贴纸集合（最新在前）。
 func (s *Service) ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error) {
-	if s == nil || s.stickers == nil || userID == 0 {
-		return nil, nil
+	if s == nil || s.stickers == nil || userID <= 0 {
+		return nil, domain.ErrStickerInvalid
 	}
 	return s.stickers.ListStickerCollection(ctx, userID, kind, limit)
 }
 
-// ClearStickerCollection 清空某类个人贴纸集合。
-func (s *Service) ClearStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind) error {
-	if s == nil || s.stickers == nil || userID == 0 {
-		return nil
+// MutateUserStickerSets commits one scalar or vector installed-set transition
+// together with its durable delivery facts. The vector form is the only write
+// boundary used by toggleStickerSets, avoiding N independent transactions.
+func (s *Service) MutateUserStickerSets(ctx context.Context, mutation domain.UserStickerSetMutation, effects store.DeliveryEffectsBuilder[domain.UserStickerSetMutation]) error {
+	if s == nil || s.stickerSets == nil || mutation.OwnerUserID <= 0 || effects == nil {
+		return store.ErrDeliveryOutboxRequired
 	}
-	return s.stickers.ClearStickerCollection(ctx, userID, kind)
-}
-
-// InstallUserStickerSet 安装或重新激活一个贴纸集，安装态是 per-user 事实。
-func (s *Service) InstallUserStickerSet(ctx context.Context, userID int64, setID int64, kind domain.StickerSetKind, archived bool, installedDate int) error {
-	if s == nil || s.stickerSets == nil || userID == 0 || setID == 0 {
-		return nil
-	}
-	return s.stickerSets.InstallUserStickerSet(ctx, userID, setID, kind, archived, installedDate)
-}
-
-func (s *Service) UninstallUserStickerSet(ctx context.Context, userID int64, setID int64) error {
-	if s == nil || s.stickerSets == nil || userID == 0 || setID == 0 {
-		return nil
-	}
-	return s.stickerSets.UninstallUserStickerSet(ctx, userID, setID)
-}
-
-func (s *Service) SetUserStickerSetArchived(ctx context.Context, userID int64, setID int64, archived bool, now int) error {
-	if s == nil || s.stickerSets == nil || userID == 0 || setID == 0 {
-		return nil
-	}
-	return s.stickerSets.SetUserStickerSetArchived(ctx, userID, setID, archived, now)
-}
-
-func (s *Service) ReorderUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, order []int64, now int) error {
-	if s == nil || s.stickerSets == nil || userID == 0 || len(order) == 0 {
-		return nil
-	}
-	return s.stickerSets.ReorderUserStickerSets(ctx, userID, kind, order, now)
+	return s.stickerSets.MutateUserStickerSets(ctx, mutation, effects)
 }
 
 func (s *Service) ListUserStickerSets(ctx context.Context, userID int64, kind domain.StickerSetKind, archived *bool, offsetID int64, limit int) ([]domain.UserStickerSet, int, error) {
-	if s == nil || s.stickerSets == nil || userID == 0 {
-		return nil, 0, nil
+	if s == nil || s.stickerSets == nil || userID <= 0 {
+		return nil, 0, domain.ErrStickerInvalid
 	}
 	return s.stickerSets.ListUserStickerSets(ctx, userID, kind, archived, offsetID, limit)
 }

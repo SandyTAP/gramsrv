@@ -31,7 +31,7 @@ func TestChannelStoreEditMemberRank(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{owner.ID, member.ID})
 	})
 
-	channels := NewChannelStore(pool)
+	channels := newTestChannelStore(pool)
 	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
 		CreatorUserID: owner.ID,
 		Title:         "Rank Integration",
@@ -168,7 +168,7 @@ func TestChannelStoreEditMemberRank(t *testing.T) {
 	if _, err := channels.LeaveChannel(ctx, channelID, member.ID, 1700009008); err != nil {
 		t.Fatalf("member leaves: %v", err)
 	}
-	if _, err := channels.JoinChannel(ctx, channelID, member.ID, 1700009009); err != nil {
+	if _, err := channels.JoinChannel(ctx, channelID, member.ID, 1700009009, testPendingJoinEffects); err != nil {
 		t.Fatalf("member rejoins: %v", err)
 	}
 	rejoined, err := channels.GetParticipant(ctx, owner.ID, channelID, member.ID)
@@ -206,7 +206,7 @@ func TestChannelStoreEditMemberRank(t *testing.T) {
 	if newCreator.Role != domain.ChannelRoleCreator {
 		t.Fatalf("future creator = %+v, want creator role", newCreator)
 	}
-	if _, err := channels.JoinChannel(ctx, channelID, owner.ID, 1700009012); err != nil {
+	if _, err := channels.JoinChannel(ctx, channelID, owner.ID, 1700009012, testPendingJoinEffects); err != nil {
 		t.Fatalf("creator rejoins: %v", err)
 	}
 	creatorBack, err := channels.GetParticipant(ctx, member.ID, channelID, owner.ID)
