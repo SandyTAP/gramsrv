@@ -49,6 +49,9 @@ type RunConfig struct {
 	RampDuration        time.Duration
 	RPCInterval         time.Duration
 	MessageInterval     time.Duration
+	MessageRate         float64
+	MessageQueueDepth   int
+	DeliverySettle      time.Duration
 	FileInterval        time.Duration
 	FileSizeBytes       int
 	FileChunkBytes      int
@@ -68,6 +71,15 @@ func (c RunConfig) validate() error {
 	}
 	if c.Duration <= 0 || c.RecoveryDuration < 0 || c.RampDuration < 0 || c.RPCInterval <= 0 || c.OperationTimeout <= 0 || c.SampleInterval <= 0 {
 		return errors.New("run durations and intervals are invalid")
+	}
+	if c.MessageRate < 0 || c.MessageRate > 100000 || c.MessageQueueDepth < 0 || c.MessageQueueDepth > 1024 || c.DeliverySettle < 0 {
+		return errors.New("message rate, queue depth or delivery settle is invalid")
+	}
+	if c.MessageRate > 0 && c.MessageInterval > 0 {
+		return errors.New("message-rate and message-interval workloads are mutually exclusive")
+	}
+	if c.MessageRate > 0 && (c.MessageQueueDepth == 0 || c.RampDuration >= c.Duration) {
+		return errors.New("fixed-rate workload requires a queue depth and load duration beyond the connection ramp")
 	}
 	if c.FileSizeBytes < 0 || c.FileChunkBytes < 0 || c.FileChunkBytes > 1<<20 || c.FileSizeBytes > 64<<20 {
 		return errors.New("file size must be <=64MiB and chunk size must be <=1MiB")
@@ -113,6 +125,11 @@ type harnessCounters struct {
 	updates            atomic.Uint64
 	fatalErrors        atomic.Uint64
 	downloadBytes      atomic.Uint64
+	messageScheduled   atomic.Uint64
+	messageEnqueued    atomic.Uint64
+	messageCompleted   atomic.Uint64
+	messageQueueFull   atomic.Uint64
+	messageNotReady    atomic.Uint64
 }
 
 var debugConnectionErrors atomic.Uint64
@@ -159,21 +176,26 @@ type loadWorker struct {
 	fileInterval     time.Duration
 	operationTimeout time.Duration
 	fileFixture      *downloadFixture
+	delivery         *deliveryTracker
 
-	desired    atomic.Bool
-	state      atomic.Int32
-	everReady  atomic.Bool
-	signal     chan struct{}
-	lastUpdate updateState
-	messageSeq atomic.Uint64
+	desired       atomic.Bool
+	state         atomic.Int32
+	everReady     atomic.Bool
+	signal        chan struct{}
+	lastUpdate    updateState
+	deliveryState updateState
+	messageSeq    atomic.Uint64
+	sendQueue     chan struct{}
+	reconcile     chan chan struct{}
 }
 
-func newLoadWorker(record, target SessionRecord, endpoint Endpoint, publicKey *rsa.PublicKey, storage *EncryptedFileStorage, metrics *metricSet, counters *harnessCounters, events *eventWriter, rpcInterval, messageInterval, fileInterval, operationTimeout time.Duration, fixture *downloadFixture) *loadWorker {
+func newLoadWorker(record, target SessionRecord, endpoint Endpoint, publicKey *rsa.PublicKey, storage *EncryptedFileStorage, metrics *metricSet, counters *harnessCounters, events *eventWriter, rpcInterval, messageInterval, fileInterval, operationTimeout time.Duration, fixture *downloadFixture, delivery *deliveryTracker, messageQueueDepth int) *loadWorker {
 	w := &loadWorker{
 		record: record, target: target, endpoint: endpoint, publicKey: publicKey, storage: storage,
 		metrics: metrics, counters: counters, events: events, rpcInterval: rpcInterval,
 		msgInterval: messageInterval, fileInterval: fileInterval, operationTimeout: operationTimeout, fileFixture: fixture,
-		signal: make(chan struct{}, 1),
+		delivery: delivery, signal: make(chan struct{}, 1), sendQueue: make(chan struct{}, messageQueueDepth),
+		reconcile: make(chan chan struct{}),
 	}
 	w.state.Store(workerStopped)
 	return w
@@ -260,8 +282,9 @@ func (w *loadWorker) supervise(ctx context.Context, wg *sync.WaitGroup) {
 func (w *loadWorker) runClient(ctx context.Context) error {
 	reconnectSignal := make(chan struct{}, 1)
 	client, err := newClient(w.endpoint, w.publicKey, w.storage, clientHooks{
-		Update: telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error {
+		Update: telegram.UpdateHandlerFunc(func(_ context.Context, updates tg.UpdatesClass) error {
 			w.counters.updates.Add(1)
+			observeUpdatesClass(w.delivery, w.record.UserID, updates, deliveryLive)
 			return nil
 		}),
 		ConnectionState: func(state telegram.ConnectionState) {
@@ -316,6 +339,9 @@ func (w *loadWorker) runClient(ctx context.Context) error {
 		} else {
 			w.refreshUpdateState(ctx, raw)
 		}
+		if _, valid := w.deliveryState.load(); !valid {
+			w.refreshDeliveryState(ctx, raw)
+		}
 
 		rpcTicker := time.NewTicker(w.rpcInterval)
 		defer rpcTicker.Stop()
@@ -345,6 +371,11 @@ func (w *loadWorker) runClient(ctx context.Context) error {
 				cycle++
 			case <-messageC:
 				w.sendMessage(ctx, raw)
+			case <-w.sendQueue:
+				w.sendMessage(ctx, raw)
+			case done := <-w.reconcile:
+				w.catchUpDelivery(ctx, raw)
+				close(done)
 			case <-fileC:
 				w.downloadFileChunk(ctx, raw)
 			}
@@ -385,6 +416,20 @@ func (w *loadWorker) refreshUpdateState(ctx context.Context, raw *tg.Client) {
 	w.metrics.observe("updates.getState", start, err)
 	if err == nil {
 		w.lastUpdate.store(*state)
+		if _, valid := w.deliveryState.load(); !valid {
+			w.deliveryState.store(*state)
+		}
+	}
+}
+
+func (w *loadWorker) refreshDeliveryState(ctx context.Context, raw *tg.Client) {
+	start := time.Now()
+	operationCtx, cancel := w.operationContext(ctx)
+	state, err := raw.UpdatesGetState(operationCtx)
+	cancel()
+	w.metrics.observe("updates.getState.delivery", start, err)
+	if err == nil {
+		w.deliveryState.store(*state)
 	}
 }
 
@@ -427,7 +472,49 @@ func (w *loadWorker) catchUp(ctx context.Context, raw *tg.Client) {
 	}
 }
 
+func (w *loadWorker) catchUpDelivery(ctx context.Context, raw *tg.Client) {
+	state, valid := w.deliveryState.load()
+	if !valid {
+		w.refreshDeliveryState(ctx, raw)
+		return
+	}
+	for page := 0; page < 256; page++ {
+		start := time.Now()
+		operationCtx, cancel := w.operationContext(ctx)
+		difference, err := raw.UpdatesGetDifference(operationCtx, &tg.UpdatesGetDifferenceRequest{Pts: state.Pts, Date: state.Date, Qts: state.Qts})
+		cancel()
+		w.metrics.observe("updates.getDifference.delivery", start, err)
+		if err != nil {
+			return
+		}
+		switch value := difference.(type) {
+		case *tg.UpdatesDifferenceEmpty:
+			state.Date, state.Seq = value.Date, value.Seq
+			w.deliveryState.store(state)
+			return
+		case *tg.UpdatesDifference:
+			observeMessageClasses(w.delivery, w.record.UserID, value.NewMessages, deliveryDifference)
+			observeUpdateClasses(w.delivery, w.record.UserID, value.OtherUpdates, deliveryDifference)
+			state = value.State
+			w.deliveryState.store(state)
+			return
+		case *tg.UpdatesDifferenceSlice:
+			observeMessageClasses(w.delivery, w.record.UserID, value.NewMessages, deliveryDifference)
+			observeUpdateClasses(w.delivery, w.record.UserID, value.OtherUpdates, deliveryDifference)
+			state = value.IntermediateState
+			w.deliveryState.store(state)
+		case *tg.UpdatesDifferenceTooLong:
+			state.Pts = value.Pts
+			w.deliveryState.store(state)
+			return
+		default:
+			return
+		}
+	}
+}
+
 func (w *loadWorker) sendMessage(ctx context.Context, raw *tg.Client) {
+	defer w.counters.messageCompleted.Add(1)
 	sequence := w.messageSeq.Add(1)
 	var randomBytes [8]byte
 	if _, err := cryptorand.Read(randomBytes[:]); err != nil {
@@ -438,13 +525,16 @@ func (w *loadWorker) sendMessage(ctx context.Context, raw *tg.Client) {
 		randomID = int64(sequence)
 	}
 	start := time.Now()
+	marker := w.delivery.marker(w.record.Index, sequence)
+	w.delivery.begin(marker, w.record.UserID, w.target.UserID, start)
 	operationCtx, cancel := w.operationContext(ctx)
 	_, err := raw.MessagesSendMessage(operationCtx, &tg.MessagesSendMessageRequest{
 		Peer:    &tg.InputPeerUser{UserID: w.target.UserID, AccessHash: w.target.AccessHash},
-		Message: fmt.Sprintf("load/%d/%d", w.record.Index, sequence), RandomID: randomID,
+		Message: marker, RandomID: randomID,
 	})
 	cancel()
 	w.metrics.observe("messages.sendMessage", start, err)
+	w.delivery.finish(marker, err == nil)
 }
 
 func (w *loadWorker) downloadFileChunk(ctx context.Context, raw *tg.Client) {
@@ -654,8 +744,13 @@ func Run(ctx context.Context, cfg RunConfig) (*RunReport, error) {
 		return nil, err
 	}
 	defer events.close()
-	metrics := newMetricSet("auth.status", "connection.dead", "ping", "updates.getState", "updates.getDifference", "messages.getDialogs", "help.getConfig", "messages.sendMessage", "upload.saveFilePart", "messages.uploadMedia", "upload.getFile")
+	metrics := newMetricSet("auth.status", "connection.dead", "ping", "updates.getState", "updates.getDifference", "updates.getState.delivery", "updates.getDifference.delivery", "messages.getDialogs", "help.getConfig", "messages.sendMessage", "upload.saveFilePart", "messages.uploadMedia", "upload.getFile")
 	counters := &harnessCounters{}
+	runID, err := newLoadRunID()
+	if err != nil {
+		return nil, fmt.Errorf("create load run id: %w", err)
+	}
+	delivery := newDeliveryTracker(runID)
 	serverMetrics := newServerMetricsClient(cfg.ServerMetricsURL)
 	var baselineServerMetrics map[string]float64
 	if serverMetrics != nil {
@@ -681,8 +776,10 @@ func Run(ctx context.Context, cfg RunConfig) (*RunReport, error) {
 			record, target, manifest.Endpoint, publicKey,
 			&EncryptedFileStorage{Path: resolveSessionPath(cfg.ManifestPath, record), Key: key},
 			metrics, counters, events, cfg.RPCInterval, cfg.MessageInterval, cfg.FileInterval, cfg.OperationTimeout, fixture,
+			delivery, cfg.MessageQueueDepth,
 		))
 	}
+	messageWorkers := primaryWorkers(workers)
 
 	startedAt := time.Now().UTC()
 	loadCtx, stopLoad := context.WithCancel(ctx)
@@ -709,6 +806,13 @@ func Run(ctx context.Context, cfg RunConfig) (*RunReport, error) {
 
 	if cfg.OfflineFraction > 0 {
 		go runOfflineWindow(loadCtx, workers, cfg.OfflineFraction, cfg.OfflineAt, cfg.OfflineFor, events)
+	}
+	messageCtx, stopMessages := context.WithCancel(loadCtx)
+	defer stopMessages()
+	var messageWG sync.WaitGroup
+	if cfg.MessageRate > 0 {
+		messageWG.Add(1)
+		go runFixedMessageSchedule(messageCtx, &messageWG, cfg.RampDuration, cfg.MessageRate, messageWorkers, counters, events)
 	}
 	loadTimer := time.NewTimer(cfg.Duration)
 	sampleTicker := time.NewTicker(cfg.SampleInterval)
@@ -741,11 +845,48 @@ func Run(ctx context.Context, cfg RunConfig) (*RunReport, error) {
 
 loadFinished:
 	sampleTicker.Stop()
+	stopMessages()
+	messageWG.Wait()
+	loadEndedAt := time.Now().UTC()
+	if cfg.MessageRate > 0 {
+		drainCtx, cancelDrain := context.WithTimeout(ctx, cfg.OperationTimeout+time.Duration(cfg.MessageQueueDepth)*cfg.OperationTimeout)
+		waitMessageDrain(drainCtx, counters)
+		cancelDrain()
+	}
+	if cfg.DeliverySettle > 0 && delivery.report().Expected > delivery.report().Delivered {
+		settleTimer := time.NewTimer(cfg.DeliverySettle)
+		settleTicker := time.NewTicker(min(cfg.SampleInterval, time.Second))
+	settling:
+		for {
+			select {
+			case <-ctx.Done():
+				settleTimer.Stop()
+				settleTicker.Stop()
+				stopLoad()
+				workerWG.Wait()
+				return nil, ctx.Err()
+			case <-settleTicker.C:
+				if current := delivery.report(); current.Missing == 0 {
+					settleTimer.Stop()
+					settleTicker.Stop()
+					break settling
+				}
+			case <-settleTimer.C:
+				settleTicker.Stop()
+				break settling
+			}
+		}
+	}
+	if delivery.report().Missing > 0 {
+		reconcileCtx, cancelReconcile := context.WithTimeout(ctx, cfg.OperationTimeout*2)
+		reconcileDeliveries(reconcileCtx, workers)
+		cancelReconcile()
+	}
+	finalReady := countWorkerState(workers, workerReady)
 	stopLoad()
 	workerWG.Wait()
-	loadEndedAt := time.Now().UTC()
-	if ready := countWorkerState(workers, workerReady); ready > peakReady {
-		peakReady = ready
+	if finalReady > peakReady {
+		peakReady = finalReady
 	}
 
 	if cfg.RecoveryDuration > 0 {
@@ -779,15 +920,18 @@ recoveryFinished:
 		steadyRatio = float64(steadyReadySum) / float64(steadySamples*len(workers))
 	}
 	report := &RunReport{
-		Version: 2, StartedAt: startedAt, LoadEndedAt: loadEndedAt, FinishedAt: time.Now().UTC(),
+		Version: 3, StartedAt: startedAt, LoadEndedAt: loadEndedAt, FinishedAt: time.Now().UTC(),
 		RequestedDuration: cfg.Duration.String(), RecoveryDuration: cfg.RecoveryDuration.String(),
-		ExpectedSessions: len(workers), PeakReadySessions: peakReady, FinalReadySessions: countWorkerState(workers, workerReady),
+		ExpectedSessions: len(workers), PeakReadySessions: peakReady, FinalReadySessions: finalReady,
 		ConnectionAttempts: counters.connectionAttempts.Load(), Reconnects: counters.reconnects.Load(),
 		Disconnects: counters.disconnects.Load(), UpdatesReceived: counters.updates.Load(), DownloadedBytes: counters.downloadBytes.Load(),
 		WorkerFatalErrors: counters.fatalErrors.Load(), Operations: metrics.report(),
 		BaselineServerMetrics: baselineServerMetrics, FinalServerMetrics: finalServerMetrics,
 		ServerMetricsScrapes: serverMetrics.successes(), ServerMetricsErrors: serverMetrics.failures(),
 		SteadySamples: steadySamples, SteadyReadyRatio: steadyRatio, MinSteadyReadySessions: steadyReadyMinimum,
+		MessageRatePerSecond: cfg.MessageRate, MessageScheduled: counters.messageScheduled.Load(),
+		MessageEnqueued: counters.messageEnqueued.Load(), MessageCompleted: counters.messageCompleted.Load(), MessageQueueFull: counters.messageQueueFull.Load(),
+		MessageNotReady: counters.messageNotReady.Load(), Delivery: delivery.report(),
 	}
 	evaluateReport(report, cfg)
 	if err := WriteReport(cfg.ReportPath, report); err != nil {
@@ -812,6 +956,119 @@ func primaryTargets(records []SessionRecord) []SessionRecord {
 		targets[account] = record
 	}
 	return targets
+}
+
+func newLoadRunID() (string, error) {
+	var value [8]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func primaryWorkers(workers []*loadWorker) []*loadWorker {
+	primary := make([]*loadWorker, 0, len(workers))
+	for _, worker := range workers {
+		if worker.record.DeviceIndex == 0 && worker.target.UserID > 0 {
+			primary = append(primary, worker)
+		}
+	}
+	return primary
+}
+
+func runFixedMessageSchedule(ctx context.Context, wg *sync.WaitGroup, startDelay time.Duration, rate float64, workers []*loadWorker, counters *harnessCounters, events *eventWriter) {
+	defer wg.Done()
+	if rate <= 0 || len(workers) == 0 {
+		return
+	}
+	startTimer := time.NewTimer(startDelay)
+	defer startTimer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-startTimer.C:
+	}
+	readyTicker := time.NewTicker(10 * time.Millisecond)
+	for countWorkerState(workers, workerReady) != len(workers) {
+		select {
+		case <-ctx.Done():
+			readyTicker.Stop()
+			return
+		case <-readyTicker.C:
+		}
+	}
+	readyTicker.Stop()
+	interval := time.Duration(float64(time.Second) / rate)
+	if interval < time.Microsecond {
+		interval = time.Microsecond
+	}
+	events.write(map[string]any{"type": "fixed_message_rate_start", "at": time.Now().UTC(), "rate_per_second": rate, "senders": len(workers)})
+	next := time.Now()
+	workerIndex := 0
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			events.write(map[string]any{
+				"type": "fixed_message_rate_stop", "at": time.Now().UTC(),
+				"scheduled": counters.messageScheduled.Load(), "enqueued": counters.messageEnqueued.Load(),
+				"queue_full": counters.messageQueueFull.Load(), "not_ready": counters.messageNotReady.Load(),
+			})
+			return
+		case <-timer.C:
+			worker := workers[workerIndex]
+			workerIndex = (workerIndex + 1) % len(workers)
+			counters.messageScheduled.Add(1)
+			if worker.state.Load() != workerReady {
+				counters.messageNotReady.Add(1)
+			} else {
+				select {
+				case worker.sendQueue <- struct{}{}:
+					counters.messageEnqueued.Add(1)
+				default:
+					counters.messageQueueFull.Add(1)
+				}
+			}
+			next = next.Add(interval)
+			timer.Reset(max(time.Until(next), time.Duration(0)))
+		}
+	}
+}
+
+func reconcileDeliveries(ctx context.Context, workers []*loadWorker) {
+	waits := make([]chan struct{}, 0, len(workers))
+	for _, worker := range workers {
+		if worker.state.Load() != workerReady {
+			continue
+		}
+		done := make(chan struct{})
+		select {
+		case <-ctx.Done():
+			return
+		case worker.reconcile <- done:
+			waits = append(waits, done)
+		}
+	}
+	for _, done := range waits {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+		}
+	}
+}
+
+func waitMessageDrain(ctx context.Context, counters *harnessCounters) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for counters.messageCompleted.Load() < counters.messageEnqueued.Load() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func minimumOpenFiles(sessions int) int {
@@ -900,6 +1157,46 @@ func evaluateReport(report *RunReport, cfg RunConfig) {
 	}
 	if report.WorkerFatalErrors > 0 {
 		report.Failures = append(report.Failures, fmt.Sprintf("worker fatal errors: %d", report.WorkerFatalErrors))
+	}
+	if cfg.MessageRate > 0 {
+		if report.MessageScheduled == 0 {
+			report.Failures = append(report.Failures, "fixed-rate message scheduler produced no arrivals")
+		}
+		if report.MessageNotReady > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("fixed-rate arrivals rejected because sender was not ready: %d", report.MessageNotReady))
+		}
+		if report.MessageQueueFull > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("fixed-rate arrivals rejected by bounded sender queues: %d", report.MessageQueueFull))
+		}
+		if report.MessageEnqueued != report.MessageScheduled {
+			report.Failures = append(report.Failures, fmt.Sprintf("fixed-rate scheduler enqueued %d of %d arrivals", report.MessageEnqueued, report.MessageScheduled))
+		}
+		if report.MessageCompleted != report.MessageEnqueued {
+			report.Failures = append(report.Failures, fmt.Sprintf("message workers completed %d of %d enqueued sends", report.MessageCompleted, report.MessageEnqueued))
+		}
+		sendOperation := report.Operations["messages.sendMessage"]
+		if sendOperation.Count != report.MessageCompleted {
+			report.Failures = append(report.Failures, fmt.Sprintf("messages.sendMessage recorded %d of %d completed jobs", sendOperation.Count, report.MessageCompleted))
+		}
+		successfulSends := sendOperation.Count - min(sendOperation.Count, sendOperation.Errors+sendOperation.Canceled)
+		if report.Delivery.Expected != successfulSends {
+			report.Failures = append(report.Failures, fmt.Sprintf("delivery tracker committed %d of %d successful send RPCs", report.Delivery.Expected, successfulSends))
+		}
+		if report.Delivery.Missing > 0 || report.Delivery.Delivered != report.Delivery.Expected {
+			report.Failures = append(report.Failures, fmt.Sprintf("recipient delivery incomplete: delivered %d of %d, missing %d", report.Delivery.Delivered, report.Delivery.Expected, report.Delivery.Missing))
+		}
+		if cfg.OfflineFraction == 0 && report.Delivery.DifferenceRecovered > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("online recipients recovered %d messages only through updates.getDifference", report.Delivery.DifferenceRecovered))
+		}
+		if report.Delivery.DuplicateObservations > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("recipient observed %d duplicate message updates", report.Delivery.DuplicateObservations))
+		}
+		if report.Delivery.WrongAccountObserved > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("load markers appeared on %d wrong recipient accounts", report.Delivery.WrongAccountObserved))
+		}
+		if report.Delivery.UnmatchedMarkers > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("observed %d load markers without a successful send RPC", report.Delivery.UnmatchedMarkers))
+		}
 	}
 	for name, operation := range report.Operations {
 		if operation.FloodWaits > 0 {

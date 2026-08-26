@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultOutboxBatch    = 100
+	defaultOutboxBatch    = 10
 	defaultOutboxInterval = 200 * time.Millisecond
 	defaultOutboxWorkers  = 4
 	// outboxLogicalShards 是稳定 user→lane 哈希空间。它不随运行时 worker 数变化，

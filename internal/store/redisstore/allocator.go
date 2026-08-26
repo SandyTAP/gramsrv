@@ -15,6 +15,12 @@ type BoxIDAllocator struct {
 	counter counterAllocator
 }
 
+var _ store.DistributedBoxIDAllocator = (*BoxIDAllocator)(nil)
+
+// DistributedBoxIDAllocation marks Redis INCR reservations as safe for the
+// cross-process private-send microbatch path.
+func (*BoxIDAllocator) DistributedBoxIDAllocation() {}
+
 // ChannelIDAllocator 用 Redis INCR 分配全局 channel/supergroup id。
 type ChannelIDAllocator struct {
 	counter counterAllocator
@@ -123,6 +129,91 @@ func channelMessageIDKey(channelID int64) string {
 func (a *BoxIDAllocator) NextBoxID(ctx context.Context, userID int64) (int, error) {
 	v, err := a.counter.next(ctx, userID)
 	return int(v), err
+}
+
+// NextBoxIDs allocates every distinct owner in one Redis pipeline. Cold
+// counters use one durable batch read and one recovery pipeline; the batch API
+// never degrades into per-user network calls.
+func (a *BoxIDAllocator) NextBoxIDs(ctx context.Context, userIDs []int64) (map[int64]int, error) {
+	if a == nil || a.counter.c == nil {
+		return nil, fmt.Errorf("redis box_id counter: nil client")
+	}
+	unique := make([]int64, 0, len(userIDs))
+	keys := make([]string, 0, len(userIDs))
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			return nil, fmt.Errorf("redis box_id counter: invalid user id %d", userID)
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		key, err := a.counter.validatedKey(userID)
+		if err != nil {
+			return nil, err
+		}
+		unique = append(unique, userID)
+		keys = append(keys, key)
+	}
+	if len(unique) == 0 {
+		return map[int64]int{}, nil
+	}
+
+	commands := make([]*redis.Cmd, len(unique))
+	if _, err := a.counter.c.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, key := range keys {
+			commands[i] = counterNextScript.Eval(ctx, pipe, []string{key})
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("redis batch next box_id counters: %w", err)
+	}
+
+	out := make(map[int64]int, len(unique))
+	missingUsers := make([]int64, 0, len(unique))
+	missingKeys := make([]string, 0, len(unique))
+	for i, command := range commands {
+		value, err := command.Int64()
+		if err != nil {
+			return nil, fmt.Errorf("redis batch next box_id counter for %d: %w", unique[i], err)
+		}
+		if value == missingCounterSentinel {
+			missingUsers = append(missingUsers, unique[i])
+			missingKeys = append(missingKeys, keys[i])
+			continue
+		}
+		out[unique[i]] = int(value)
+	}
+	if len(missingUsers) == 0 {
+		return out, nil
+	}
+
+	recovered, err := a.counter.recoveredBatch(ctx, missingUsers)
+	if err != nil {
+		return nil, err
+	}
+	recoveryCommands := make([]*redis.Cmd, len(missingUsers))
+	if _, err := a.counter.c.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, key := range missingKeys {
+			floor, ok := recovered[missingUsers[i]]
+			if !ok {
+				return fmt.Errorf("durable source omitted user %d", missingUsers[i])
+			}
+			recoveryCommands[i] = counterRecoverNextScript.Eval(ctx, pipe, []string{key}, floor)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("redis batch recover-next box_id counters: %w", err)
+	}
+	for i, command := range recoveryCommands {
+		value, err := command.Int64()
+		if err != nil {
+			return nil, fmt.Errorf("redis batch recover-next box_id counter for %d: %w", missingUsers[i], err)
+		}
+		out[missingUsers[i]] = int(value)
+	}
+	return out, nil
 }
 
 func (a *BoxIDAllocator) CurrentBoxID(ctx context.Context, userID int64) (int, error) {
@@ -239,6 +330,17 @@ func (a counterAllocator) recovered(ctx context.Context, userID int64) (int, err
 		if err != nil {
 			return 0, fmt.Errorf("recover %s counter: %w", a.name, err)
 		}
+	}
+	return recovered, nil
+}
+
+func (a counterAllocator) recoveredBatch(ctx context.Context, userIDs []int64) (map[int64]int, error) {
+	if a.source == nil {
+		return nil, fmt.Errorf("recover %s counters: missing durable source", a.name)
+	}
+	recovered, err := a.source.CurrentBatch(ctx, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("recover %s counters: %w", a.name, err)
 	}
 	return recovered, nil
 }

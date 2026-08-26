@@ -173,6 +173,13 @@ type RunReport struct {
 	UpdatesReceived        uint64                     `json:"updates_received"`
 	DownloadedBytes        uint64                     `json:"downloaded_bytes"`
 	WorkerFatalErrors      uint64                     `json:"worker_fatal_errors"`
+	MessageRatePerSecond   float64                    `json:"message_rate_per_second"`
+	MessageScheduled       uint64                     `json:"message_scheduled"`
+	MessageEnqueued        uint64                     `json:"message_enqueued"`
+	MessageCompleted       uint64                     `json:"message_completed"`
+	MessageQueueFull       uint64                     `json:"message_queue_full"`
+	MessageNotReady        uint64                     `json:"message_not_ready"`
+	Delivery               DeliveryReport             `json:"delivery"`
 	Operations             map[string]OperationReport `json:"operations"`
 	BaselineServerMetrics  map[string]float64         `json:"baseline_server_metrics,omitempty"`
 	FinalServerMetrics     map[string]float64         `json:"final_server_metrics,omitempty"`

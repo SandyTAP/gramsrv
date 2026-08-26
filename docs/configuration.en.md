@@ -569,7 +569,7 @@ The following fallback keys are accepted from the **process environment only**. 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
 | `TELESRV_OUTBOX_WORKERS` | int / `4` | Concurrent outbox workers. Stable logical sharding preserves per-user pts order. |
-| `TELESRV_OUTBOX_BATCH` | int / `100` | Maximum rows claimed per poll. Larger batches improve throughput but increase DB/push bursts. |
+| `TELESRV_OUTBOX_BATCH` | int / `10` | Maximum rows claimed per poll. The default bounds simultaneous user-lane fences during completion and avoids cross-user lock convoys. |
 | `TELESRV_OUTBOX_INTERVAL` | duration / `200ms` | Delay between outbox claims. |
 | `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | Time before a `dispatching` row can be reclaimed. Must exceed worst-case batch delivery time. |
 | `TELESRV_OUTBOX_POISON_RETENTION` | duration / `1m` | Diagnostic retention for terminal failed delivery heads; durable update events remain recoverable through difference. |

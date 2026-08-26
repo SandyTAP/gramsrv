@@ -497,6 +497,7 @@ WITH doomed AS MATERIALIZED (
   FROM dispatch_outbox_user_heads h
   WHERE h.status = 'failed'
     AND h.updated_at < now() - make_interval(secs => sqlc.arg(older_than_seconds)::int)
+    AND h.target_user_id = ANY(sqlc.arg(target_user_ids)::bigint[])
   ORDER BY h.updated_at ASC, h.target_user_id ASC, h.head_id ASC
   LIMIT sqlc.arg(limit_count)
   FOR UPDATE OF h SKIP LOCKED

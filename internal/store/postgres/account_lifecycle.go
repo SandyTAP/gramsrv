@@ -443,6 +443,12 @@ func purgeDeletedBotPrivateState(ctx context.Context, tx pgx.Tx, userID int64, n
 	// Leave shared private_messages/channel_messages and immutable transaction
 	// ledgers intact. Only the deleted user's private projections and settings are
 	// removed; other users continue to reference the tombstone sender.
+	// The purge can empty the durable delivery lane. Fence concurrent appends
+	// before deleting its outbox/head/event facts so no committed task becomes
+	// undiscoverable during the account lifecycle transition.
+	if err := lockDispatchOutboxLanesExclusive(ctx, tx, []int64{userID}); err != nil {
+		return fmt.Errorf("lock deleted bot dispatch lane: %w", err)
+	}
 	statements := []string{
 		`DELETE FROM account_privacy_rules WHERE owner_user_id = $1`,
 		`DELETE FROM account_reaction_settings WHERE user_id = $1`,
