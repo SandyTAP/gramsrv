@@ -292,6 +292,18 @@
 .gift-import-modal-body { gap: 14px; }
 .gift-source-tabs { display: flex; gap: 8px; }
 
+/* Auction / scheduled-drop authoring block inside the import modal. */
+.gift-lifecycle {
+  display: flex; flex-direction: column; gap: 10px; padding: 12px 13px;
+  background: var(--panel-subtle); border: 1px solid var(--line-strong); border-radius: 12px;
+}
+.gift-lifecycle .gift-source-tabs button { flex: 1 1 0; justify-content: center; }
+
+/* Auctions tab: two-line table cells (headline value + secondary detail). */
+.auction-cell { display: grid; gap: 3px; min-width: 92px; }
+.auction-cell small { font-size: 11px; color: var(--muted); }
+.auction-cell .mono { font-size: 11px; }
+
 /* Give-gift flow */
 .give-gift-summary {
   display: flex; align-items: center; gap: 11px; padding: 11px 13px;

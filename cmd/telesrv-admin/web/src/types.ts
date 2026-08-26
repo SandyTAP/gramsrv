@@ -250,6 +250,41 @@ export type StarGiftRow = {
 
 export type StarGiftListResponse = { Gifts: StarGiftRow[] };
 
+// One auction or scheduled drop in the operator monitor. The Auction* live-state
+// fields are only meaningful once Materialized is true: the engine creates the
+// star_gift_auctions row lazily, on the first client request or sweeper pass.
+export type StarGiftAuctionRow = {
+  GiftID: string;
+  Title: string;
+  Stars: string;
+  Enabled: boolean;
+  IsAuction: boolean;
+  Slug: string;
+  AvailabilityTotal: number;
+  AvailabilityRemains: number;
+  GiftsPerRound: number;
+  AuctionStartDate: number;
+  AuctionRoundDuration: number;
+  LockedUntilDate: number;
+  Materialized: boolean;
+  Status: "" | "pending" | "active" | "completed" | "cancelled";
+  StartDate: number;
+  EndDate: number;
+  RoundDuration: number;
+  TotalRounds: number;
+  CurrentRound: number;
+  NextRoundAt: number;
+  GiftsLeft: number;
+  LastGiftNum: number;
+  MinBidAmount: string;
+  ActiveBids: number;
+  TopBid: string;
+  BidTotal: string;
+  UpdatedAt: string;
+};
+
+export type StarGiftAuctionListResponse = { Auctions: StarGiftAuctionRow[] };
+
 export type OfficialStarGiftRow = {
   source_gift_id: string;
   title: string;

@@ -127,6 +127,9 @@ WHERE f.buyer_user_id=stale.buyer_user_id AND f.form_id=stale.form_id`, now, for
 		}
 	}
 
+	// 单个拍卖异常不得中断整轮 lifecycle 清算：否则一条坏数据会让所有到期拍卖、
+	// 未交付奖励和频道礼物通知被无限期跳过。记录首个错误，其余条目照常推进。
+	var sweepErr error
 	auctionLimit := remaining
 	if auctionLimit > 100 {
 		auctionLimit = 100
@@ -155,10 +158,13 @@ ORDER BY next_round_at,gift_id LIMIT $2`, now, auctionLimit)
 		rows.Close()
 		for _, giftID := range giftIDs {
 			if err := s.settleStarGiftAuction(ctx, giftID, now); err != nil {
-				return err
+				if sweepErr == nil {
+					sweepErr = err
+				}
+				continue
 			}
-			if err := s.dispatchStarGiftAuctionAwards(ctx, giftID); err != nil {
-				return err
+			if err := s.dispatchStarGiftAuctionAwards(ctx, giftID); err != nil && sweepErr == nil {
+				sweepErr = err
 			}
 		}
 		remaining -= len(giftIDs)
@@ -187,13 +193,15 @@ WHERE saved_gift_id IS NULL ORDER BY gift_id LIMIT $1`, minAuctionInt(remaining,
 		}
 		rows.Close()
 		for _, giftID := range giftIDs {
-			if err := s.dispatchStarGiftAuctionAwards(ctx, giftID); err != nil {
-				return err
+			if err := s.dispatchStarGiftAuctionAwards(ctx, giftID); err != nil && sweepErr == nil {
+				sweepErr = err
 			}
 		}
 	}
-	_, err := s.dispatchChannelStarGiftNotifications(ctx, now, minAuctionInt(limit, 100), 0)
-	return err
+	if _, err := s.dispatchChannelStarGiftNotifications(ctx, now, minAuctionInt(limit, 100), 0); err != nil {
+		return err
+	}
+	return sweepErr
 }
 
 func (s *StarGiftLifecycleStore) ListCraftStarGifts(ctx context.Context, userID, giftID int64, offset string, limit int) (domain.SavedStarGiftPage, error) {
@@ -219,7 +227,7 @@ func (s *StarGiftLifecycleStore) ListCraftStarGifts(ctx context.Context, userID,
 	}
 	args = append(args, limit+1)
 	rows, err := s.db.Query(ctx, `SELECT p.id,p.owner_peer_type,p.owner_peer_id,p.from_user_id,p.gift_id,p.catalog_revision_id,
-p.msg_id,p.saved_id,p.gift_date,p.name_hidden,p.unsaved,p.converted,p.convert_stars,p.prepaid_upgrade_stars,p.prepaid_upgrade_hash,p.gift_num,
+p.msg_id,p.saved_id,p.gift_date,p.name_hidden,p.unsaved,p.converted,p.convert_stars,p.prepaid_upgrade_stars,p.prepaid_upgrade_hash,p.gift_num,p.paid_stars,
 p.lifecycle_status,p.transfer_stars,p.can_export_at,p.can_transfer_at,p.can_resell_at,p.drop_original_details_stars,p.can_craft_at,
 p.message,p.message_entities::text,COALESCE(p.unique_gift_id,0),p.upgrade_msg_id,p.pinned_order,
 COALESCE((SELECT array_agg(i.collection_id ORDER BY c.sort_order,i.collection_id) FROM star_gift_collection_items i
@@ -792,7 +800,8 @@ func (s *StarGiftLifecycleStore) dispatchStarGiftAuctionAwards(ctx context.Conte
 	if s.messages == nil {
 		return domain.ErrStarGiftAuctionUnavailable
 	}
-	gift, found, err := NewStarGiftStore(s.db).CatalogGift(ctx, giftID)
+	// 交付欠付的中标奖励不看 c.enabled：运营下架该礼物后，已中标的用户仍必须收到礼物。
+	gift, found, err := NewStarGiftStore(s.db).CatalogGiftAnyState(ctx, giftID)
 	if err != nil || !found {
 		return domain.ErrStarGiftAuctionUnavailable
 	}
@@ -836,6 +845,13 @@ WHERE gift_id=$1 AND saved_gift_id IS NULL ORDER BY id LIMIT 100`, giftID)
 		}
 		for _, item := range items {
 			owner := domain.Peer{Type: domain.PeerType(item.recipientType), ID: item.recipientID}
+			// 拍卖奖励必须按中标价（star_gift_auction_acquired.bid_amount）投影，而不是目录起拍价。
+			// ensureStarGiftAuction 用 gift.Stars 作为 min_bid_amount，若沿用目录价，客户端会把
+			// 每一次中标都渲染成起拍价（"You won the auction with a bid of 50 Stars"）。
+			paid := item.amount
+			if paid <= 0 {
+				paid = gift.Stars
+			}
 			var msgID int
 			if owner.Type == domain.PeerTypeUser {
 				sticker := gift.Sticker
@@ -843,7 +859,7 @@ WHERE gift_id=$1 AND saved_gift_id IS NULL ORDER BY id LIMIT 100`, giftID)
 					RecipientUserID: owner.ID, RandomID: lifecycleCommandRandomID("auction-award", giftID, item.round, item.pos),
 					Date: item.date, Media: &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{
 						Kind: domain.MessageServiceActionStarGift, StarGift: &domain.MessageStarGiftAction{GiftID: gift.ID,
-							Stars: gift.Stars, ConvertStars: 0, Title: gift.Title, Sticker: &sticker, Message: item.message,
+							Stars: paid, ConvertStars: 0, Title: gift.Title, Sticker: &sticker, Message: item.message,
 							FromUserID: item.bidder, PeerUserID: owner.ID, To: owner, NameHidden: item.hide, Saved: true,
 							AuctionAcquired: true, GiftNum: item.giftNum}}}})
 				if err != nil {
@@ -864,14 +880,14 @@ WHERE gift_id=$1 AND saved_gift_id IS NULL ORDER BY id LIMIT 100`, giftID)
 				}
 				id, err := NewStarGiftStore(tx).Create(ctx, domain.SavedStarGift{Owner: owner, FromUserID: item.bidder,
 					GiftID: gift.ID, RevisionID: gift.RevisionID, MsgID: msgID, Date: item.date, NameHidden: item.hide,
-					ConvertStars: 0, Message: item.message, GiftNum: item.giftNum})
+					ConvertStars: 0, Message: item.message, GiftNum: item.giftNum, PaidStars: paid})
 				if err != nil {
 					return err
 				}
 				if owner.Type == domain.PeerTypeChannel {
 					sticker := gift.Sticker
 					action := domain.ChannelMessageAction{Type: domain.ChannelActionStarGift, StarGift: &domain.MessageStarGiftAction{
-						GiftID: gift.ID, Stars: gift.Stars, ConvertStars: 0, Title: gift.Title, Sticker: &sticker,
+						GiftID: gift.ID, Stars: paid, ConvertStars: 0, Title: gift.Title, Sticker: &sticker,
 						Message: item.message, FromUserID: item.bidder, PeerChannelID: owner.ID, SavedID: id,
 						NameHidden: item.hide, Saved: true, AuctionAcquired: true, GiftNum: item.giftNum,
 					}}
@@ -1079,8 +1095,12 @@ func (s *StarGiftLifecycleStore) ensureStarGiftAuction(ctx context.Context, gift
 	if start <= 0 {
 		start = now
 	}
+	dur := gift.AuctionRoundDuration
+	if dur <= 0 {
+		dur = starGiftAuctionRoundDuration
+	}
 	totalRounds := (supply + gift.GiftsPerRound - 1) / gift.GiftsPerRound
-	end := start + totalRounds*starGiftAuctionRoundDuration
+	end := start + totalRounds*dur
 	status := "pending"
 	currentRound := 0
 	if now >= start {
@@ -1089,8 +1109,8 @@ func (s *StarGiftLifecycleStore) ensureStarGiftAuction(ctx context.Context, gift
 	_, err = s.db.Exec(ctx, `INSERT INTO star_gift_auctions(gift_id,slug,start_date,end_date,round_duration,gifts_per_round,
 total_rounds,current_round,next_round_at,gifts_left,min_bid_amount,status)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(gift_id) DO NOTHING`, gift.ID, gift.AuctionSlug,
-		start, end, starGiftAuctionRoundDuration, gift.GiftsPerRound, totalRounds, currentRound,
-		start+starGiftAuctionRoundDuration, supply, maxInt64(1, gift.Stars), status)
+		start, end, dur, gift.GiftsPerRound, totalRounds, currentRound,
+		start+dur, supply, maxInt64(1, gift.Stars), status)
 	if err != nil {
 		return 0, err
 	}

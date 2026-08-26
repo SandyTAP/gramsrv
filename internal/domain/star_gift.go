@@ -29,28 +29,29 @@ type StarGift struct {
 	// Layer 228 regular-gift shape. Static release facts live in the immutable
 	// catalog revision; AvailabilityRemains/AvailabilityResale are the current
 	// inventory projection maintained on the catalog aggregate.
-	Limited             bool
-	SoldOut             bool
-	Birthday            bool
-	RequirePremium      bool
-	LimitedPerUser      bool
-	PeerColorAvailable  bool
-	Auction             bool
-	AvailabilityRemains int
-	AvailabilityTotal   int
-	AvailabilityResale  int64
-	FirstSaleDate       int
-	LastSaleDate        int
-	ResellMinStars      int64
-	ReleasedBy          Peer
-	PerUserTotal        int
-	PerUserRemains      int
-	LockedUntilDate     int
-	AuctionSlug         string
-	GiftsPerRound       int
-	AuctionStartDate    int
-	UpgradeVariants     int
-	Background          *StarGiftBackground
+	Limited              bool
+	SoldOut              bool
+	Birthday             bool
+	RequirePremium       bool
+	LimitedPerUser       bool
+	PeerColorAvailable   bool
+	Auction              bool
+	AvailabilityRemains  int
+	AvailabilityTotal    int
+	AvailabilityResale   int64
+	FirstSaleDate        int
+	LastSaleDate         int
+	ResellMinStars       int64
+	ReleasedBy           Peer
+	PerUserTotal         int
+	PerUserRemains       int
+	LockedUntilDate      int
+	AuctionSlug          string
+	GiftsPerRound        int
+	AuctionStartDate     int
+	AuctionRoundDuration int
+	UpgradeVariants      int
+	Background           *StarGiftBackground
 }
 
 // StarGiftBackground is the release-level palette used by auction cards and
@@ -79,6 +80,7 @@ type SavedStarGift struct {
 	PrepaidUpgradeStars      int64  // 送礼人随礼物预付的唯一礼物升级额
 	PrepaidUpgradeHash       string // 第三方单独代付升级的一次性 entitlement
 	GiftNum                  int    // auction-acquired release number for regular gifts
+	PaidStars                int64  // 实际成交价（拍卖中标价）；0 表示按目录 revision 价投影
 	Message                  string // 附言（可选）
 	MessageEntities          []MessageEntity
 	UniqueGiftID             int64 // 非 0 表示已升级为唯一礼物；与 Converted 互斥
@@ -271,6 +273,16 @@ const (
 	StarGiftCurrencyStars StarGiftCurrency = "XTR"
 	StarGiftCurrencyTON   StarGiftCurrency = "TON"
 )
+
+// MaxStarGiftAuctionBidStars caps a single auction bid so the bid ladder stays
+// inside the range official clients can represent. Telegram Desktop derives its
+// bid-slider maximum from the current top bid in 32-bit arithmetic — int(top * 1.2)
+// in payments_reaction_box.cpp — and asserts that the result is at least 2. A top
+// bid above roughly 1.79e9 overflows that int, the assertion fails, and the client
+// dies for everyone who opens the auction, not just the bidder who set the price.
+// Since every bid must clear the one before it, an uncapped auction escalates into
+// that range on its own.
+const MaxStarGiftAuctionBidStars int64 = 10_000_000
 
 type StarGiftAmount struct {
 	Currency StarGiftCurrency
@@ -890,8 +902,86 @@ type StarGiftCatalogWrite struct {
 	AuctionSlug          string
 	GiftsPerRound        int
 	AuctionStartDate     int
+	AuctionRoundDuration int
 	UpgradeVariants      int
 	Background           *StarGiftBackground
+}
+
+// ValidateLifecycleAuthoring validates the optional auction and scheduled-release
+// parameters an operator may attach when authoring a catalog revision through the
+// admin panel. Zero values describe an ordinary gift and always pass; this is the
+// authoring boundary for the auction panel and the scheduled-release surfaces. now
+// is the current time in Unix seconds. The official-gift import path builds its
+// bundle directly from Telegram's snapshot and does not go through this check, so
+// the rules here may be stricter than the official model.
+func (w StarGiftCatalogWrite) ValidateLifecycleAuthoring(now int) error {
+	if w.GiftsPerRound < 0 || w.AvailabilityTotal < 0 || w.AuctionStartDate < 0 ||
+		w.LockedUntilDate < 0 || w.AuctionRoundDuration < 0 {
+		return fmt.Errorf("%w: negative field", ErrStarGiftLifecycleInvalid)
+	}
+	if w.Auction {
+		if strings.TrimSpace(w.AuctionSlug) == "" {
+			return fmt.Errorf("%w: auction requires a slug", ErrStarGiftLifecycleInvalid)
+		}
+		if w.GiftsPerRound <= 0 {
+			return fmt.Errorf("%w: auction requires gifts_per_round > 0", ErrStarGiftLifecycleInvalid)
+		}
+		if w.AvailabilityTotal <= 0 {
+			return fmt.Errorf("%w: auction requires availability_total > 0", ErrStarGiftLifecycleInvalid)
+		}
+		if w.GiftsPerRound > w.AvailabilityTotal {
+			return fmt.Errorf("%w: gifts_per_round exceeds availability_total", ErrStarGiftLifecycleInvalid)
+		}
+		if w.AuctionStartDate != 0 && w.AuctionStartDate < now {
+			return fmt.Errorf("%w: auction start date is in the past", ErrStarGiftLifecycleInvalid)
+		}
+		if w.LockedUntilDate != 0 {
+			return fmt.Errorf("%w: auctions do not use a scheduled-release time", ErrStarGiftLifecycleInvalid)
+		}
+		// The gift price is the auction's opening bid (ensureStarGiftAuction seeds
+		// min_bid_amount from it), so it is bound by the same ceiling as a bid.
+		// Rejecting it here means an auction cannot be authored into a state where
+		// no legal bid exists.
+		if w.Stars > MaxStarGiftAuctionBidStars {
+			return fmt.Errorf("%w: auction opening bid exceeds %d stars", ErrStarGiftLifecycleInvalid, MaxStarGiftAuctionBidStars)
+		}
+		return nil
+	}
+	// Non-auction gift: reject stray auction-only parameters, but allow
+	// LockedUntilDate, which is exactly the scheduled-release gate.
+	if strings.TrimSpace(w.AuctionSlug) != "" || w.GiftsPerRound != 0 ||
+		w.AuctionStartDate != 0 || w.AuctionRoundDuration != 0 {
+		return fmt.Errorf("%w: auction parameters set on a non-auction gift", ErrStarGiftLifecycleInvalid)
+	}
+	if w.LockedUntilDate != 0 && w.LockedUntilDate <= now {
+		return fmt.Errorf("%w: scheduled-release time must be in the future", ErrStarGiftLifecycleInvalid)
+	}
+	return nil
+}
+
+// NormalizeLifecycleAuthoring derives the revision fields that the catalog's own
+// CHECK constraints require but that an operator never states directly. Call it
+// after ValidateLifecycleAuthoring, on the same write.
+//
+// star_gift_catalog_revision_auction_check demands that an auction be limited,
+// carry a non-empty slug, and have gifts_per_round > 0 and auction_start_date > 0;
+// the supply check separately demands "limited AND availability_total > 0". So an
+// auction is by definition a limited gift, and a zero start date — which the
+// validator accepts as "start now", and which ensureStarGiftAuction resolves the
+// same way — has to become a concrete timestamp or the INSERT is rejected.
+// AvailabilityRemains seeds the client's "N left" projection; auction settlement
+// keeps it in step with gifts_left afterwards.
+func (w *StarGiftCatalogWrite) NormalizeLifecycleAuthoring(now int) {
+	if !w.Auction {
+		return
+	}
+	w.Limited = true
+	if w.AuctionStartDate <= 0 {
+		w.AuctionStartDate = now
+	}
+	if w.AvailabilityRemains <= 0 {
+		w.AvailabilityRemains = w.AvailabilityTotal
+	}
 }
 
 // StarGiftCatalogBundleWrite atomically publishes one catalog revision and its optional
@@ -1019,6 +1109,7 @@ var (
 	ErrStarGiftAlreadyConverted            = errors.New("stargift: already converted")
 	ErrStarGiftFileInvalid                 = errors.New("stargift: invalid animation file")
 	ErrStarGiftCatalogFull                 = errors.New("stargift: catalog full")
+	ErrStarGiftLifecycleInvalid            = errors.New("stargift: invalid auction or scheduled-release parameters")
 	ErrStarGiftCollectibleUnavailable      = errors.New("stargift: collectible upgrade unavailable")
 	ErrStarGiftAlreadyUpgraded             = errors.New("stargift: already upgraded")
 	ErrStarGiftCollectibleSoldOut          = errors.New("stargift: collectible supply exhausted")

@@ -37,6 +37,7 @@ export function routeTitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/messages")) return t("route.messages");
 	if (pathname.startsWith("/give-gifts")) return t("route.giveGifts");
 	if (pathname.startsWith("/gifts")) return t("route.gifts");
+	if (pathname.startsWith("/auctions")) return t("route.auctions");
   return t("route.dashboard");
 }
 
@@ -59,5 +60,6 @@ export function routeSubtitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/messages")) return t("route.messagesSubtitle");
 	if (pathname.startsWith("/give-gifts")) return t("route.giveGiftsSubtitle");
 	if (pathname.startsWith("/gifts")) return t("route.giftsSubtitle");
+	if (pathname.startsWith("/auctions")) return t("route.auctionsSubtitle");
   return t("route.dashboardSubtitle");
 }

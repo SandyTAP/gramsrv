@@ -6,11 +6,17 @@ import { api, errorMessage } from "../api";
 import { ActionButton } from "../components/ActionButton";
 import { Alert, Badge, EmptyRow, Metric, PageFrame, QueryPanel } from "../components/ui";
 import { useI18n } from "../i18n";
-import { formatDate } from "../lib/format";
+import { formatDate, localInputValue, toUnixSeconds } from "../lib/format";
 import type { CommandResult, OfficialStarGiftRow, StarGiftRow } from "../types";
 import { GiftCollectiblesModal } from "./GiftCollectiblesModal";
 
 type OfficialGiftCategory = "all" | "upgrade" | "craft" | "basic";
+
+// "auction" runs the gift through the timed-round bidding engine; "drop" keeps it
+// locked behind a countdown until locked_until_date passes. An auction needs an
+// animation of its own, so it is authored on the upload path only; a drop is just a
+// release time and applies to a snapshot import as well.
+type LifecycleMode = "regular" | "auction" | "drop";
 
 function officialGiftAttributeCount(gift: OfficialStarGiftRow) {
   return gift.model_count + gift.pattern_count + gift.backdrop_count;
@@ -101,6 +107,17 @@ export function GiftsPage() {
   const [stars, setStars] = useState("50");
   const [convertStars, setConvertStars] = useState("50");
   const [sortOrder, setSortOrder] = useState("0");
+  const [lifecycleMode, setLifecycleMode] = useState<LifecycleMode>("regular");
+  const [auctionSlug, setAuctionSlug] = useState("");
+  const [auctionSupply, setAuctionSupply] = useState("10");
+  const [giftsPerRound, setGiftsPerRound] = useState("1");
+  const [roundDuration, setRoundDuration] = useState("3600");
+  const [auctionStartAt, setAuctionStartAt] = useState("");
+  const [unlockAt, setUnlockAt] = useState("");
+  // The snapshot path carries its own scheduling state: the mode selector above
+  // belongs to the upload form, and an official gift cannot be auctioned here.
+  const [officialScheduled, setOfficialScheduled] = useState(false);
+  const [officialUnlockAt, setOfficialUnlockAt] = useState(() => localInputValue(3600));
   const [enabled, setEnabled] = useState(true);
   const [reason, setReason] = useState("");
   const [preview, setPreview] = useState<CommandResult | null>(null);
@@ -142,6 +159,13 @@ export function GiftsPage() {
     });
   }, [officialGifts, officialQuery, officialCategory]);
 
+  const auctionRounds = useMemo(() => {
+    const supply = Number(auctionSupply);
+    const perRound = Number(giftsPerRound);
+    if (!(supply > 0) || !(perRound > 0)) return 0;
+    return Math.ceil(supply / perRound);
+  }, [auctionSupply, giftsPerRound]);
+
   const visibleGifts = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     if (!normalized) return gifts;
@@ -151,6 +175,39 @@ export function GiftsPage() {
       gift.SourceFormat.toLowerCase().includes(normalized)
     );
   }, [gifts, query]);
+
+  // Mirrors domain.StarGiftCatalogWrite.ValidateLifecycleAuthoring so the operator
+  // sees the problem before the upload round-trip. Only the keys belonging to the
+  // selected mode are sent — the server rejects auction fields on a plain gift.
+  function lifecyclePayload() {
+    const now = Math.floor(Date.now() / 1000);
+    if (lifecycleMode === "auction") {
+      const supply = Number(auctionSupply);
+      const perRound = Number(giftsPerRound);
+      const duration = Number(roundDuration);
+      const startDate = toUnixSeconds(auctionStartAt);
+      if (!auctionSlug.trim()) throw new Error(t("gifts.lifecycle.slugRequired"));
+      if (!(supply > 0)) throw new Error(t("gifts.lifecycle.supplyRequired"));
+      if (!(perRound > 0)) throw new Error(t("gifts.lifecycle.perRoundRequired"));
+      if (perRound > supply) throw new Error(t("gifts.lifecycle.perRoundTooLarge"));
+      if (!(duration > 0)) throw new Error(t("gifts.lifecycle.roundDurationRequired"));
+      if (startDate !== 0 && startDate < now) throw new Error(t("gifts.lifecycle.startPast"));
+      return {
+        auction: true,
+        auction_slug: auctionSlug.trim().toLowerCase(),
+        availability_total: supply,
+        gifts_per_round: perRound,
+        auction_round_duration: duration,
+        auction_start_date: startDate
+      };
+    }
+    if (lifecycleMode === "drop") {
+      const unlock = toUnixSeconds(unlockAt);
+      if (unlock <= now) throw new Error(t("gifts.lifecycle.unlockRequired"));
+      return { locked_until_date: unlock };
+    }
+    return {};
+  }
 
   function uploadForm(confirm: boolean, commandID = "") {
     if (!file) throw new Error(t("gifts.fileRequired"));
@@ -165,7 +222,8 @@ export function GiftsPage() {
 			stars,
 			convert_stars: convertStars,
       enabled,
-      sort_order: Number(sortOrder)
+      sort_order: Number(sortOrder),
+      ...lifecyclePayload()
     }));
     form.set("file", file, file.name);
     return form;
@@ -174,12 +232,21 @@ export function GiftsPage() {
   function officialPayload(confirm: boolean, commandID = "") {
     if (!sourceGiftID) throw new Error(t("gifts.officialRequired"));
     if (!reason.trim()) throw new Error(t("action.reasonRequired"));
+    // A snapshot import can be scheduled but not auctioned: an auction needs its own
+    // supply and animation, which is the upload path. Sending 0 keeps whatever
+    // release time the snapshot itself carries.
+    let lockedUntil = 0;
+    if (officialScheduled) {
+      lockedUntil = toUnixSeconds(officialUnlockAt);
+      if (lockedUntil <= Math.floor(Date.now() / 1000)) throw new Error(t("gifts.lifecycle.unlockRequired"));
+    }
     return {
       command_id: commandID, reason: reason.trim(), confirm,
 		source_gift_id: sourceGiftID, gift_id: giftID, title: title.trim(),
 		stars, convert_stars: convertStars, enabled, sort_order: Number(sortOrder),
 		include_collectible: includeCollectible, upgrade_stars: upgradeStars,
-      supply_total: Number(supplyTotal), slug_prefix: slugPrefix.trim().toLowerCase()
+      supply_total: Number(supplyTotal), slug_prefix: slugPrefix.trim().toLowerCase(),
+      locked_until_date: lockedUntil
     };
   }
 
@@ -350,6 +417,41 @@ export function GiftsPage() {
                 <label><span>{t("gifts.convertStars")}</span><input type="number" min="0" value={convertStars} onChange={(e) => { setConvertStars(e.target.value); setPreview(null); }} /></label>
                 <label><span>{t("gifts.sortOrder")}</span><input type="number" value={sortOrder} onChange={(e) => { setSortOrder(e.target.value); setPreview(null); }} /></label>
               </div>
+              {importSource === "file" ? <section className="gift-lifecycle">
+                <span className="gift-field-label">{t("gifts.lifecycle.label")}</span>
+                <div className="gift-source-tabs" role="group" aria-label={t("gifts.lifecycle.label")}>
+                  {(["regular", "auction", "drop"] as const).map((mode) => (
+                    <button key={mode} className={`btn ${lifecycleMode === mode ? "primary" : ""}`} type="button"
+                      aria-pressed={lifecycleMode === mode} onClick={() => { setLifecycleMode(mode); setPreview(null); }}>
+                      {t(`gifts.lifecycle.${mode}`)}
+                    </button>
+                  ))}
+                </div>
+                <div className="gift-import-note"><span>{lifecycleMode === "auction" ? t("gifts.lifecycle.hintAuction") : lifecycleMode === "drop" ? t("gifts.lifecycle.hintDrop") : t("gifts.lifecycle.hintRegular")}</span></div>
+                {lifecycleMode === "auction" && <>
+                  <div className="gift-fields-grid">
+                    <label><span>{t("gifts.auction.slug")}</span><input value={auctionSlug} maxLength={48} placeholder={t("gifts.auction.slugPlaceholder")} onChange={(e) => { setAuctionSlug(e.target.value.toLowerCase()); setPreview(null); }} /></label>
+                    <label><span>{t("gifts.auction.supply")}</span><input type="number" min="1" value={auctionSupply} onChange={(e) => { setAuctionSupply(e.target.value); setPreview(null); }} /></label>
+                    <label><span>{t("gifts.auction.perRound")}</span><input type="number" min="1" value={giftsPerRound} onChange={(e) => { setGiftsPerRound(e.target.value); setPreview(null); }} /></label>
+                    <label><span>{t("gifts.auction.roundDuration")}</span><input type="number" min="1" value={roundDuration} onChange={(e) => { setRoundDuration(e.target.value); setPreview(null); }} /></label>
+                    <label><span>{t("gifts.auction.startAt")}</span><input type="datetime-local" value={auctionStartAt} onChange={(e) => { setAuctionStartAt(e.target.value); setPreview(null); }} /></label>
+                  </div>
+                  {auctionRounds > 0 && <div className="gift-import-note"><span>{t("gifts.auction.plan", { rounds: auctionRounds, perRound: Number(giftsPerRound), minutes: Math.max(1, Math.round(Number(roundDuration) / 60)) })}</span></div>}
+                </>}
+                {lifecycleMode === "drop" && <div className="gift-fields-grid">
+                  <label><span>{t("gifts.drop.unlockAt")}</span><input type="datetime-local" value={unlockAt} onChange={(e) => { setUnlockAt(e.target.value); setPreview(null); }} /></label>
+                </div>}
+              </section> : <section className="gift-lifecycle">
+                <span className="gift-field-label">{t("gifts.lifecycle.label")}</span>
+                <div className="gift-import-note"><span>{t("gifts.lifecycle.auctionFileOnly")}</span></div>
+                <label className="gift-switch"><input type="checkbox" checked={officialScheduled} onChange={(e) => { setOfficialScheduled(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.drop.schedule")}</span></label>
+                {officialScheduled && <>
+                  <div className="gift-import-note"><span>{t("gifts.lifecycle.hintDrop")}</span></div>
+                  <div className="gift-fields-grid">
+                    <label><span>{t("gifts.drop.unlockAt")}</span><input type="datetime-local" value={officialUnlockAt} onChange={(e) => { setOfficialUnlockAt(e.target.value); setPreview(null); }} /></label>
+                  </div>
+                </>}
+              </section>}
               <label className="gift-reason-field"><span>{t("gifts.reason")}</span><input value={reason} placeholder={t("gifts.reasonPlaceholder")} onChange={(e) => setReason(e.target.value)} /></label>
               <label className="gift-switch"><input type="checkbox" checked={enabled} onChange={(e) => { setEnabled(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.enableAfterImport")}</span></label>
               {importError && <Alert>{importError}</Alert>}

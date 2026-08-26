@@ -78,6 +78,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/messages/groups", s.requireAuthAPI(http.HandlerFunc(s.handleGroupMessagesAPI)))
 	mux.Handle("GET /api/messages/groups/detail", s.requireAuthAPI(http.HandlerFunc(s.handleGroupMessageDetailAPI)))
 	mux.Handle("GET /api/gifts", s.requireAuthAPI(http.HandlerFunc(s.handleStarGiftsAPI)))
+	mux.Handle("GET /api/auctions", s.requireAuthAPI(http.HandlerFunc(s.handleStarGiftAuctionsAPI)))
 	mux.Handle("GET /api/official-gifts", s.requireAuthAPI(http.HandlerFunc(s.handleOfficialStarGiftsAPI)))
 	mux.Handle("GET /api/official-gifts/{id}/animation", s.requireAuthAPI(http.HandlerFunc(s.handleOfficialStarGiftAnimationAPI)))
 	mux.Handle("GET /api/gifts/{id}/animation", s.requireAuthAPI(http.HandlerFunc(s.handleStarGiftAnimationAPI)))
@@ -344,6 +345,21 @@ func (s *server) handleStarGiftsAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"Gifts": rows})
+}
+
+// handleStarGiftAuctionsAPI backs the auctions tab: the live state of every
+// operator-authored auction and scheduled drop.
+func (s *server) handleStarGiftAuctionsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	rows, err := s.read.ListStarGiftAuctions(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"Auctions": rows})
 }
 
 func (s *server) handleEmojiAPI(w http.ResponseWriter, r *http.Request) {
@@ -2039,6 +2055,17 @@ type importStarGiftAPIRequest struct {
 	ConvertStars int64  `json:"convert_stars,string"`
 	Enabled      bool   `json:"enabled"`
 	SortOrder    int    `json:"sort_order"`
+
+	// Optional lifecycle authoring for the auction panel and the scheduled
+	// release ("отложенный дроп"). Zero values describe an ordinary gift; the
+	// admin service validates the combination before writing a revision.
+	Auction              bool   `json:"auction"`
+	AuctionSlug          string `json:"auction_slug"`
+	GiftsPerRound        int    `json:"gifts_per_round"`
+	AuctionStartDate     int    `json:"auction_start_date"`
+	AuctionRoundDuration int    `json:"auction_round_duration"`
+	AvailabilityTotal    int    `json:"availability_total"`
+	LockedUntilDate      int    `json:"locked_until_date"`
 }
 
 func (s *server) handleImportStarGiftAPI(w http.ResponseWriter, r *http.Request) {
@@ -2078,6 +2105,14 @@ func (s *server) handleImportStarGiftAPI(w http.ResponseWriter, r *http.Request)
 		Enabled:      body.Enabled,
 		SortOrder:    body.SortOrder,
 		FileName:     header.Filename,
+
+		Auction:              body.Auction,
+		AuctionSlug:          body.AuctionSlug,
+		GiftsPerRound:        body.GiftsPerRound,
+		AuctionStartDate:     body.AuctionStartDate,
+		AuctionRoundDuration: body.AuctionRoundDuration,
+		AvailabilityTotal:    body.AvailabilityTotal,
+		LockedUntilDate:      body.LockedUntilDate,
 	}
 	result, err := s.callAdminMultipart(r.Context(), "/v1/gifts/import", req, header.Filename, data)
 	writeCommandResultAPI(w, result, err)
@@ -2098,6 +2133,9 @@ type importOfficialStarGiftAPIRequest struct {
 	UpgradeStars       int64  `json:"upgrade_stars,string"`
 	SupplyTotal        int    `json:"supply_total"`
 	SlugPrefix         string `json:"slug_prefix"`
+	// Unix seconds at which the imported gift becomes purchasable. Zero keeps the
+	// snapshot's own release time.
+	LockedUntilDate int `json:"locked_until_date"`
 }
 
 func (s *server) handleImportOfficialStarGiftAPI(w http.ResponseWriter, r *http.Request) {
@@ -2115,6 +2153,7 @@ func (s *server) handleImportOfficialStarGiftAPI(w http.ResponseWriter, r *http.
 		Stars: body.Stars, ConvertStars: body.ConvertStars, Enabled: body.Enabled, SortOrder: body.SortOrder,
 		IncludeCollectible: body.IncludeCollectible, UpgradeStars: body.UpgradeStars,
 		SupplyTotal: body.SupplyTotal, SlugPrefix: body.SlugPrefix,
+		LockedUntilDate: body.LockedUntilDate,
 	}
 	result, err := s.callAdminAPI(r.Context(), "/v1/official-gifts/import", req)
 	writeCommandResultAPI(w, result, err)
