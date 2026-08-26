@@ -20,10 +20,12 @@ redis:
   db: 0
 
 egress:
-  ack_server:
+  delivery_server:
     addr: 127.0.0.1:2510
-    token: ${TELESRV_EGRESS_ACK_TOKEN}
+    token: ${TELESRV_EGRESS_DELIVERY_TOKEN}
   workers: 4
   batch: 100
   lease_timeout: 30s
   outbound_push_timeout: 200ms
+  delivery_attempt_timeout: 2s
+  delivery_clock_skew_allowance: 1s

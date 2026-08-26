@@ -272,7 +272,7 @@ services:
       TELESRV_LOG_LEVEL: ${TELESRV_LOG_LEVEL:-info}
       TELESRV_POSTGRES_DSN: ${TELESRV_POSTGRES_DSN:?set TELESRV_POSTGRES_DSN in deploy/docker/.env}
       TELESRV_REDIS_PASSWORD: ${TELESRV_REDIS_PASSWORD:?set TELESRV_REDIS_PASSWORD in deploy/docker/.env}
-      TELESRV_EGRESS_ACK_TOKEN: ${TELESRV_EGRESS_ACK_TOKEN:?set TELESRV_EGRESS_ACK_TOKEN in deploy/docker/.env}
+      TELESRV_EGRESS_DELIVERY_TOKEN: ${TELESRV_EGRESS_DELIVERY_TOKEN:?set TELESRV_EGRESS_DELIVERY_TOKEN in deploy/docker/.env}
       TELESRV_ADVERTISE_IP: ${TELESRV_ADVERTISE_IP:?set TELESRV_ADVERTISE_IP in deploy/docker/.env}
       TELESRV_ADVERTISE_PORT: ${TELESRV_ADVERTISE_PORT:-2398}
       TELESRV_DEFAULT_COUNTRY_CODE: ${TELESRV_DEFAULT_COUNTRY_CODE:-CN}
@@ -294,7 +294,7 @@ services:
         - telesrv-healthcheck
         - all
         - --grpc
-        - 127.0.0.1:2510,telesrv.egress.v1.EgressAckService,TELESRV_EGRESS_ACK_TOKEN
+        - 127.0.0.1:2510,telesrv.egress.v3.EgressDeliveryService,TELESRV_EGRESS_DELIVERY_TOKEN
         - --postgres-dsn-env
         - TELESRV_POSTGRES_DSN
         - --redis
@@ -375,7 +375,7 @@ services:
       TELESRV_REDIS_PASSWORD: ${TELESRV_REDIS_PASSWORD:?set TELESRV_REDIS_PASSWORD in deploy/docker/.env}
       TELESRV_CORE_EXEC_TOKEN: ${TELESRV_CORE_EXEC_TOKEN:?set TELESRV_CORE_EXEC_TOKEN in deploy/docker/.env}
       TELESRV_FILE_TOKEN: ${TELESRV_FILE_TOKEN:?set TELESRV_FILE_TOKEN in deploy/docker/.env}
-      TELESRV_EGRESS_ACK_TOKEN: ${TELESRV_EGRESS_ACK_TOKEN:?set TELESRV_EGRESS_ACK_TOKEN in deploy/docker/.env}
+      TELESRV_EGRESS_DELIVERY_TOKEN: ${TELESRV_EGRESS_DELIVERY_TOKEN:?set TELESRV_EGRESS_DELIVERY_TOKEN in deploy/docker/.env}
       TELESRV_ADVERTISE_IP: ${TELESRV_ADVERTISE_IP:?set TELESRV_ADVERTISE_IP in deploy/docker/.env}
       TELESRV_ADVERTISE_PORT: ${TELESRV_ADVERTISE_PORT:-2398}
       TELESRV_DEFAULT_COUNTRY_CODE: ${TELESRV_DEFAULT_COUNTRY_CODE:-CN}
@@ -413,7 +413,7 @@ services:
         - --grpc
         - file:2520,telesrv.filedata.v1.FileDataService,TELESRV_FILE_TOKEN
         - --grpc
-        - egress:2510,telesrv.egress.v1.EgressAckService,TELESRV_EGRESS_ACK_TOKEN
+        - egress:2510,telesrv.egress.v3.EgressDeliveryService,TELESRV_EGRESS_DELIVERY_TOKEN
         - --redis
         - redis:6379,TELESRV_REDIS_PASSWORD,0
         - --timeout

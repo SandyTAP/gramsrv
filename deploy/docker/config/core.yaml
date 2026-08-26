@@ -20,6 +20,7 @@ postgres:
   dsn: ${TELESRV_POSTGRES_DSN}
   max_conns: 32
   min_conns: 8
+  counter_recovery_max_conns: 4
 
 redis:
   addr: redis:6379

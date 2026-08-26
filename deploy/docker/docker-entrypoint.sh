@@ -148,7 +148,7 @@ case "$command_name" in
     require_secret TELESRV_REDIS_PASSWORD
     require_secret TELESRV_CORE_EXEC_TOKEN
     require_secret TELESRV_FILE_TOKEN
-    require_secret TELESRV_EGRESS_ACK_TOKEN
+    require_secret TELESRV_EGRESS_DELIVERY_TOKEN
     initialize_edge_key
     ;;
   telesrv-core)
@@ -222,7 +222,7 @@ case "$command_name" in
     require_value TELESRV_PUBLIC_BASE_URL
     require_dsn
     require_secret TELESRV_REDIS_PASSWORD
-    require_secret TELESRV_EGRESS_ACK_TOKEN
+    require_secret TELESRV_EGRESS_DELIVERY_TOKEN
     ;;
   telesrv-file)
     require_dsn

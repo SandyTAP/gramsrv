@@ -55,10 +55,10 @@ file_data:
   timeout: 10s
 
 egress:
-  ack:
+  delivery:
     resolver: static
     targets:
       - 127.0.0.1:2510
       - 127.0.0.1:2511
-    token: ${TELESRV_EGRESS_ACK_TOKEN}
+    token: ${TELESRV_EGRESS_DELIVERY_TOKEN}
     timeout: 5s
