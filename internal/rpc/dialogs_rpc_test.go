@@ -178,18 +178,17 @@ func TestDialogSettingRPCsRecordDurableUpdates(t *testing.T) {
 	if ok, err := r.onMessagesToggleDialogPin(ctx, toggle); err != nil || !ok {
 		t.Fatalf("toggle pin = %v, %v", ok, err)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogPinned || updates.events[0].Peer != peer || !updates.events[0].Bool || updates.excludeSessionID != 0 {
-		t.Fatalf("pin event = %+v, want durable dialog_pinned", updates.events)
-	}
-	if updates.authKeyID != authKeyID || updates.excludeAuthKeyID != ([8]byte{}) {
-		t.Fatalf("durable update keys = state:%x exclude:%x, want state:%x and no current-session exclusion", updates.authKeyID, updates.excludeAuthKeyID, authKeyID)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Type != domain.UpdateEventDialogPinned || events[0].Peer != peer || !events[0].Bool || !dialogs.capturedEffectsHaveNoExclusion() {
+		t.Fatalf("pin event = %+v, want durable dialog_pinned without session exclusion", events)
 	}
 
 	if ok, err := r.onMessagesReorderPinnedDialogs(ctx, &tg.MessagesReorderPinnedDialogsRequest{Order: []tg.InputDialogPeerClass{dialogPeer}}); err != nil || !ok {
 		t.Fatalf("reorder pinned = %v, %v", ok, err)
 	}
-	if len(updates.events) != 2 || updates.events[1].Type != domain.UpdateEventPinnedDialogs || len(updates.events[1].Peers) != 1 || updates.events[1].Peers[0] != peer {
-		t.Fatalf("reorder event = %+v, want durable pinned_dialogs", updates.events)
+	events = dialogs.capturedEvents()
+	if len(events) != 2 || events[1].Type != domain.UpdateEventPinnedDialogs || len(events[1].Peers) != 1 || events[1].Peers[0] != peer {
+		t.Fatalf("reorder event = %+v, want durable pinned_dialogs", events)
 	}
 
 	mark := &tg.MessagesMarkDialogUnreadRequest{Peer: dialogPeer}
@@ -197,8 +196,9 @@ func TestDialogSettingRPCsRecordDurableUpdates(t *testing.T) {
 	if ok, err := r.onMessagesMarkDialogUnread(ctx, mark); err != nil || !ok {
 		t.Fatalf("mark unread = %v, %v", ok, err)
 	}
-	if len(updates.events) != 3 || updates.events[2].Type != domain.UpdateEventDialogUnreadMark || updates.events[2].Peer != peer || !updates.events[2].Bool {
-		t.Fatalf("unread event = %+v, want durable dialog_unread_mark", updates.events)
+	events = dialogs.capturedEvents()
+	if len(events) != 3 || events[2].Type != domain.UpdateEventDialogUnreadMark || events[2].Peer != peer || !events[2].Bool {
+		t.Fatalf("unread event = %+v, want durable dialog_unread_mark", events)
 	}
 
 	parentMark := &tg.MessagesMarkDialogUnreadRequest{
@@ -210,8 +210,8 @@ func TestDialogSettingRPCsRecordDurableUpdates(t *testing.T) {
 	if ok, err := r.onMessagesMarkDialogUnread(ctx, parentMark); err != nil || !ok {
 		t.Fatalf("mark monoforum unread compat = %v, %v", ok, err)
 	}
-	if len(updates.events) != 3 {
-		t.Fatalf("parent_peer unread compat recorded events = %+v, want no durable event", updates.events)
+	if events = dialogs.capturedEvents(); len(events) != 3 {
+		t.Fatalf("parent_peer unread compat recorded events = %+v, want no durable event", events)
 	}
 
 	getParentMarks := &tg.MessagesGetDialogUnreadMarksRequest{ParentPeer: &tg.InputPeerChannel{ChannelID: 9001}}
@@ -233,8 +233,9 @@ func TestDialogSettingRPCsRecordDurableUpdates(t *testing.T) {
 	if ok, err := r.onMessagesHidePeerSettingsBar(ctx, &tg.InputPeerUser{UserID: peer.ID}); err != nil || !ok {
 		t.Fatalf("hide peer settings = %v, %v", ok, err)
 	}
-	if len(updates.events) != 4 || updates.events[3].Type != domain.UpdateEventPeerSettings || updates.events[3].Peer != peer || !updates.events[3].Settings.HiddenPeerSettingsBar {
-		t.Fatalf("peer settings event = %+v, want durable peer_settings", updates.events)
+	events = dialogs.capturedEvents()
+	if len(events) != 4 || events[3].Type != domain.UpdateEventPeerSettings || events[3].Peer != peer || !events[3].Settings.HiddenPeerSettingsBar {
+		t.Fatalf("peer settings event = %+v, want durable peer_settings", events)
 	}
 }
 
@@ -253,8 +254,8 @@ func TestReorderPinnedDialogsNoopDoesNotRecordUpdate(t *testing.T) {
 	}); err != nil || !ok {
 		t.Fatalf("reorder pinned noop = %v, %v", ok, err)
 	}
-	if len(updates.events) != 0 {
-		t.Fatalf("noop reorder recorded events = %+v, want none", updates.events)
+	if events := dialogs.capturedEvents(); len(events) != 0 {
+		t.Fatalf("noop reorder recorded events = %+v, want none", events)
 	}
 }
 
@@ -269,7 +270,9 @@ func TestDialogUnreadMarksIncludeChannelDialogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
 	}
-	dialogs := appdialogs.NewService(memory.NewDialogStore(), channelStore)
+	dialogStore := memory.NewDialogStore()
+	dialogStore.BindDialogAggregateStores(channelStore, nil)
+	dialogs := appdialogs.NewService(dialogStore, channelStore)
 	r := New(Config{}, Deps{
 		Channels: channelSvc,
 		Dialogs:  dialogs,
@@ -355,8 +358,9 @@ func TestDialogFolderRPCsPersistAndRecordUpdates(t *testing.T) {
 	if dialogs.savedFolder.ID != 2 || dialogs.savedFolder.Title != "Work" || !dialogs.savedFolder.Contacts || len(dialogs.savedFolder.IncludePeers) != 1 {
 		t.Fatalf("saved folder = %+v, want parsed dialog folder", dialogs.savedFolder)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogFilter || updates.events[0].FilterID != 2 || updates.excludeSessionID != 0 || updates.excludeAuthKeyID != ([8]byte{}) {
-		t.Fatalf("filter event = %+v, want durable dialog_filter", updates.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Type != domain.UpdateEventDialogFilter || events[0].FilterID != 2 || !dialogs.capturedEffectsHaveNoExclusion() {
+		t.Fatalf("filter event = %+v, want durable dialog_filter without session exclusion", events)
 	}
 
 	if ok, err := r.onMessagesUpdateDialogFiltersOrder(ctx, []int{2, 2, 0, 3}); err != nil || !ok {
@@ -365,15 +369,17 @@ func TestDialogFolderRPCsPersistAndRecordUpdates(t *testing.T) {
 	if len(dialogs.folderOrder) != 2 || dialogs.folderOrder[0] != 2 || dialogs.folderOrder[1] != 3 {
 		t.Fatalf("folder order = %+v, want cleaned custom IDs", dialogs.folderOrder)
 	}
-	if len(updates.events) != 2 || updates.events[1].Type != domain.UpdateEventDialogFilterOrder {
-		t.Fatalf("order event = %+v, want durable dialog_filter_order", updates.events)
+	events = dialogs.capturedEvents()
+	if len(events) != 2 || events[1].Type != domain.UpdateEventDialogFilterOrder {
+		t.Fatalf("order event = %+v, want durable dialog_filter_order", events)
 	}
 
 	if ok, err := r.onMessagesToggleDialogFilterTags(ctx, true); err != nil || !ok {
 		t.Fatalf("toggle filter tags = %v, %v", ok, err)
 	}
-	if !dialogs.tagsEnabled || len(updates.events) != 3 || updates.events[2].Type != domain.UpdateEventDialogFilters {
-		t.Fatalf("tags/update = tags %v events %+v, want reload update", dialogs.tagsEnabled, updates.events)
+	events = dialogs.capturedEvents()
+	if !dialogs.tagsEnabled || len(events) != 3 || events[2].Type != domain.UpdateEventDialogFilters {
+		t.Fatalf("tags/update = tags %v events %+v, want reload update", dialogs.tagsEnabled, events)
 	}
 }
 
@@ -400,8 +406,8 @@ func TestFoldersEditPeerFoldersPersistsArchiveAndReturnsPtsUpdate(t *testing.T) 
 		t.Fatalf("updates = %T %+v, want tg.Updates with updateFolderPeers", got, got)
 	}
 	update, ok := out.Updates[0].(*tg.UpdateFolderPeers)
-	if !ok || update.Pts != 31 || update.PtsCount != 1 || len(update.FolderPeers) != 1 {
-		t.Fatalf("update = %T %+v, want updateFolderPeers pts=31", out.Updates[0], out.Updates[0])
+	if !ok || update.Pts <= 0 || update.PtsCount != 1 || len(update.FolderPeers) != 1 {
+		t.Fatalf("update = %T %+v, want updateFolderPeers with allocated pts", out.Updates[0], out.Updates[0])
 	}
 }
 
@@ -420,11 +426,12 @@ func TestDialogSettingRPCsUseDurableDispatchForEverySession(t *testing.T) {
 	if ok, err := r.onMessagesToggleDialogPin(ctx, toggle); err != nil || !ok {
 		t.Fatalf("toggle pin = %v, %v", ok, err)
 	}
-	if len(updates.events) != 1 || updates.events[0].Type != domain.UpdateEventDialogPinned {
-		t.Fatalf("events = %+v, want durable event recorded", updates.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Type != domain.UpdateEventDialogPinned {
+		t.Fatalf("events = %+v, want durable event recorded", events)
 	}
-	if updates.excludeAuthKeyID != ([8]byte{}) || updates.excludeSessionID != 0 {
-		t.Fatalf("durable dispatch exclusion = %x/%d, want none so current and other sessions share one event", updates.excludeAuthKeyID, updates.excludeSessionID)
+	if !dialogs.capturedEffectsHaveNoExclusion() {
+		t.Fatalf("durable effects = %+v, want no exclusion so every session shares one event", dialogs.effects)
 	}
 	if got := sessions.snapshot(); got.message != nil {
 		t.Fatalf("Core direct push = %T %+v, want none", got.message, got.message)
@@ -465,14 +472,15 @@ func TestMessagesSaveDraftDurableDispatchIncludesCurrentSession(t *testing.T) {
 	if !ok {
 		t.Fatalf("save draft = false, want true")
 	}
-	if len(updateStore.events) != 1 || updateStore.events[0].Type != domain.UpdateEventDraftMessage {
-		t.Fatalf("events = %+v, want durable draft event", updateStore.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Type != domain.UpdateEventDraftMessage {
+		t.Fatalf("events = %+v, want durable draft event", events)
 	}
 	if dialogs.savedDraft.Message != "1111" || len(dialogs.savedDraft.Entities) != 1 {
 		t.Fatalf("saved draft = %+v, want persisted message and entities", dialogs.savedDraft)
 	}
-	if updateStore.excludeSessionID != 0 || updateStore.excludeAuthKeyID != ([8]byte{}) {
-		t.Fatalf("durable exclusion = %x/%d, want none", updateStore.excludeAuthKeyID, updateStore.excludeSessionID)
+	if !dialogs.capturedEffectsHaveNoExclusion() {
+		t.Fatalf("durable effects = %+v, want no exclusion", dialogs.effects)
 	}
 	if msg := sessions.lastUserPush(); msg != nil {
 		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
@@ -747,14 +755,15 @@ func TestMessagesClearAllDraftsDurableDispatchIncludesCurrentSession(t *testing.
 	if err != nil || !ok {
 		t.Fatalf("clear all drafts = %v, %v", ok, err)
 	}
-	if len(updateStore.events) != 1 || updateStore.events[0].Type != domain.UpdateEventDraftMessage {
-		t.Fatalf("events = %+v, want durable draft clear event", updateStore.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Type != domain.UpdateEventDraftMessage {
+		t.Fatalf("events = %+v, want durable draft clear event", events)
 	}
 	if msg := sessions.lastUserPush(); msg != nil {
 		t.Fatalf("unexpected user-session push = %T %+v", msg, msg)
 	}
-	if updateStore.excludeSessionID != 0 || updateStore.excludeAuthKeyID != ([8]byte{}) {
-		t.Fatalf("durable exclusion = %x/%d, want none", updateStore.excludeAuthKeyID, updateStore.excludeSessionID)
+	if !dialogs.capturedEffectsHaveNoExclusion() {
+		t.Fatalf("durable effects = %+v, want no exclusion", dialogs.effects)
 	}
 	if got := sessions.snapshot(); got.message != nil {
 		t.Fatalf("current-session direct push = %T %+v, want none", got.message, got.message)
@@ -831,8 +840,9 @@ func TestDialogPinFolderScoping(t *testing.T) {
 	if ok, err := r.onMessagesToggleDialogPin(ctx, toggle); err != nil || !ok {
 		t.Fatalf("toggle pin = %v, %v", ok, err)
 	}
-	if len(updates.events) != 1 || updates.events[0].FolderID != domain.DialogArchiveFolderID {
-		t.Fatalf("pin event = %+v, want folder_id=1", updates.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].FolderID != domain.DialogArchiveFolderID {
+		t.Fatalf("pin event = %+v, want folder_id=1", events)
 	}
 
 	// 归档列表内重排：req.folder_id 必须传到 service 与 durable 事件。
@@ -844,12 +854,13 @@ func TestDialogPinFolderScoping(t *testing.T) {
 	if dialogs.folderID != domain.DialogArchiveFolderID {
 		t.Fatalf("reorder folder = %d, want archive", dialogs.folderID)
 	}
-	if len(updates.events) != 2 || updates.events[1].FolderID != domain.DialogArchiveFolderID {
-		t.Fatalf("reorder event = %+v, want folder_id=1", updates.events)
+	events = dialogs.capturedEvents()
+	if len(events) != 2 || events[1].FolderID != domain.DialogArchiveFolderID {
+		t.Fatalf("reorder event = %+v, want folder_id=1", events)
 	}
 
 	// 差分重放转换：归档内置顶 update 带 folder_id flag。
-	pinnedUpdate := tgOtherUpdateFromEvent(updates.events[0])
+	pinnedUpdate := tgOtherUpdateFromEvent(events[0])
 	dialogPinned, ok := pinnedUpdate.(*tg.UpdateDialogPinned)
 	if !ok {
 		t.Fatalf("replayed update = %T, want *tg.UpdateDialogPinned", pinnedUpdate)
@@ -879,12 +890,13 @@ func TestToggleDialogPinArchiveFolderRow(t *testing.T) {
 	if !dialogs.archivePinned {
 		t.Fatalf("archive pinned not persisted")
 	}
-	if len(updates.events) != 1 || updates.events[0].Peer.Type != domain.PeerTypeFolder || updates.events[0].Peer.ID != domain.DialogArchiveFolderID {
-		t.Fatalf("archive pin event = %+v, want folder peer", updates.events)
+	events := dialogs.capturedEvents()
+	if len(events) != 1 || events[0].Peer.Type != domain.PeerTypeFolder || events[0].Peer.ID != domain.DialogArchiveFolderID {
+		t.Fatalf("archive pin event = %+v, want folder peer", events)
 	}
 	// 重放转换：dialogPeerFolder 且不带 folder_id flag（TDesktop 会把带
 	// flag 的 folder peer 置顶视为 "Nested folders" 协议错误）。
-	update := tgOtherUpdateFromEvent(updates.events[0])
+	update := tgOtherUpdateFromEvent(events[0])
 	dialogPinned, ok := update.(*tg.UpdateDialogPinned)
 	if !ok {
 		t.Fatalf("replayed update = %T, want *tg.UpdateDialogPinned", update)

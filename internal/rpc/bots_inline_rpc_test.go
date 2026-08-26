@@ -45,6 +45,7 @@ func (s builtinGifCatalogRPCSource) GetDocuments(context.Context, []int64) ([]do
 func TestBuiltinGifInlineQueryAcceptsGlobalEmptyPeerAndRegistersQuery(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
+	users.AttachUpdateEventStore(memory.NewUpdateEventStore())
 	botStore := memory.NewBotStore(users)
 	owner, err := users.Create(ctx, domain.User{AccessHash: 7001, Phone: "15550007001", FirstName: "Owner"})
 	if err != nil {
@@ -79,6 +80,7 @@ func newInlineBotRPCTestFixture(t *testing.T) inlineBotRPCTestFixture {
 	t.Helper()
 	ctx := context.Background()
 	users := memory.NewUserStore()
+	users.AttachUpdateEventStore(memory.NewUpdateEventStore())
 	botStore := memory.NewBotStore(users)
 	dialogs := memory.NewDialogStore()
 	botStore.AttachDeliveryDependencies(dialogs, memory.NewDeliveryOutboxStore())

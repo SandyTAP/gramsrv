@@ -256,8 +256,8 @@ func TestDispatchPersistsPreLoginClientMetadataOnInitConnection(t *testing.T) {
 	if !ok {
 		t.Fatalf("auth key client metadata was not persisted")
 	}
-	if got.Layer != currentClientLayer {
-		t.Fatalf("persisted layer = %d, want %d", got.Layer, currentClientLayer)
+	if got.Layer != 0 {
+		t.Fatalf("client metadata persisted protocol layer = %d, want separate durable authority", got.Layer)
 	}
 	if got.Platform != string(ClientTypeAndroid) {
 		t.Fatalf("persisted platform = %q, want android", got.Platform)
@@ -362,7 +362,7 @@ func TestSendCodeAPIIDDoesNotOverwriteStrongTWebIdentity(t *testing.T) {
 	}
 }
 
-func TestDispatchRestoresPreLoginAndroidDescriptionWithoutLayer(t *testing.T) {
+func TestDispatchRestoresPreLoginAndroidDescriptionWithoutProtocolLayer(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	authKeyID := [8]byte{0x22, 0xdb, 0xcf, 0xc8, 0x0d, 0x4c, 0x77, 0x97}
 	auth := &captureAuthService{
@@ -395,8 +395,8 @@ func TestDispatchRestoresPreLoginAndroidDescriptionWithoutLayer(t *testing.T) {
 		t.Fatalf("RPC inner handled log missing")
 	}
 	fields := entries[len(entries)-1].ContextMap()
-	if got := intLogField(fields["layer"]); got != currentClientLayer {
-		t.Fatalf("logged layer = %d fields=%v, want restored %d", got, fields, currentClientLayer)
+	if got := intLogField(fields["layer"]); got != 0 {
+		t.Fatalf("logged layer = %d fields=%v, want separate protocol authority", got, fields)
 	}
 	if got := fields["client_type"]; got != string(ClientTypeAndroid) {
 		t.Fatalf("logged client_type = %v, want %s", got, ClientTypeAndroid)
@@ -405,7 +405,7 @@ func TestDispatchRestoresPreLoginAndroidDescriptionWithoutLayer(t *testing.T) {
 		t.Fatalf("logged app_version = %v, want 12.8.1 (69169) pbeta", got)
 	}
 	if got, ok := r.NegotiatedLayer(authKeyID, sessionID); ok || got != currentClientLayer {
-		t.Fatalf("metadata-only negotiated layer = (%d,%v), want (%d,false)", got, ok, currentClientLayer)
+		t.Fatalf("legacy negotiated fallback = (%d,%v), want (%d,false)", got, ok, currentClientLayer)
 	}
 }
 
@@ -505,47 +505,6 @@ func TestObservedClientLayerNeverLeaksAcrossAuthKeySessions(t *testing.T) {
 	}
 	if got, ok := r.NegotiatedLayer(effectiveAuthKey, 101); ok || got != currentClientLayer {
 		t.Fatalf("effective auth metadata layer = (%d,%v), want (%d,false)", got, ok, currentClientLayer)
-	}
-}
-
-func TestInvokeWithLayerPersistsClientLayerUpgrade(t *testing.T) {
-	authKeyID := [8]byte{0x68, 0x25, 0x7a, 0x02}
-	userID := int64(1780269504)
-	auth := &captureAuthService{
-		userID: userID,
-		authorizations: []domain.Authorization{{
-			AuthKeyID: authKeyID,
-			UserID:    userID,
-			Layer:     225,
-		}},
-	}
-	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
-		Auth: auth,
-	}, zaptest.NewLogger(t), clock.System)
-	req := &tg.InvokeWithLayerRequest{
-		Layer: currentClientLayer,
-		Query: &tg.HelpGetConfigRequest{},
-	}
-	var in bin.Buffer
-	if err := req.Encode(&in); err != nil {
-		t.Fatalf("encode invokeWithLayer: %v", err)
-	}
-
-	if _, err := r.Dispatch(context.Background(), authKeyID, 100, &in); err != nil {
-		t.Fatalf("dispatch invokeWithLayer: %v", err)
-	}
-
-	if got := auth.authKeyClientInfos[authKeyID].Layer; got != currentClientLayer {
-		t.Fatalf("persisted auth-key layer = %d, want %d", got, currentClientLayer)
-	}
-	if got := auth.authorizations[0].Layer; got != 225 {
-		t.Fatalf("unordered authorization mirror changed to %d, want 225", got)
-	}
-	if got, ok := r.NegotiatedLayer(authKeyID, 100); !ok || got != currentClientLayer {
-		t.Fatalf("same session negotiated layer = (%d,%v), want (%d,true)", got, ok, currentClientLayer)
-	}
-	if got, ok := r.NegotiatedLayer(authKeyID, 101); ok || got != currentClientLayer {
-		t.Fatalf("new session negotiated layer = (%d,%v), want (%d,false)", got, ok, currentClientLayer)
 	}
 }
 
@@ -1225,8 +1184,10 @@ func TestDispatchPushesOnlinePeerStatusesToRestoredSession(t *testing.T) {
 	}
 }
 
-// TestTDesktopStartupRPCsEncode 验证第一阶段 TDesktop 启动 RPC 均能被路由并编码回包。
-func TestTDesktopStartupRPCsEncode(t *testing.T) {
+// TestTDesktopStartupReadRPCsEncode verifies stateless/read-side startup RPC
+// routing and response encoding. Stateful methods keep production-shaped
+// aggregate fixtures in their focused tests instead of sharing this empty one.
+func TestTDesktopStartupReadRPCsEncode(t *testing.T) {
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
 		Users: staticUsersService{user: domain.User{
 			ID:         1000000001,
@@ -1243,7 +1204,6 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		name string
 		req  bin.Object
 	}{
-		{name: "auth.bindTempAuthKey", req: &tg.AuthBindTempAuthKeyRequest{PermAuthKeyID: 1, Nonce: 2, ExpiresAt: 3, EncryptedMessage: []byte("binding")}},
 		{name: "auth.exportLoginToken", req: &tg.AuthExportLoginTokenRequest{APIID: 1, APIHash: "hash"}},
 		{name: "help.getAppConfig", req: &tg.HelpGetAppConfigRequest{}},
 		{name: "help.getCountriesList", req: &tg.HelpGetCountriesListRequest{LangCode: "en"}},
@@ -1258,7 +1218,6 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		{name: "auth.initPasskeyLogin", req: &tg.AuthInitPasskeyLoginRequest{APIID: 4, APIHash: "test"}},
 		{name: "account.getPassword", req: &tg.AccountGetPasswordRequest{}},
 		{name: "account.getNotifySettings", req: &tg.AccountGetNotifySettingsRequest{Peer: &tg.InputNotifyUsers{}}},
-		{name: "account.resetNotifySettings", req: &tg.AccountResetNotifySettingsRequest{}},
 		{name: "account.getPrivacy", req: &tg.AccountGetPrivacyRequest{Key: &tg.InputPrivacyKeyStatusTimestamp{}}},
 		{name: "account.getAuthorizations", req: &tg.AccountGetAuthorizationsRequest{}},
 		{name: "account.getWebAuthorizations", req: &tg.AccountGetWebAuthorizationsRequest{}},
@@ -1284,9 +1243,6 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		{name: "account.getAutoDownloadSettings", req: &tg.AccountGetAutoDownloadSettingsRequest{}},
 		{name: "account.getSavedMusicIds", req: &tg.AccountGetSavedMusicIDsRequest{}},
 		{name: "account.getSavedRingtones", req: &tg.AccountGetSavedRingtonesRequest{}},
-		{name: "account.resetPassword", req: &tg.AccountResetPasswordRequest{}},
-		{name: "account.updateStatus", req: &tg.AccountUpdateStatusRequest{Offline: true}},
-		{name: "account.updateDeviceLocked", req: &tg.AccountUpdateDeviceLockedRequest{Period: 60}},
 		{name: "payments.canPurchaseStore", req: &tg.PaymentsCanPurchaseStoreRequest{Purpose: &tg.InputStorePaymentStarsTopup{Stars: 1000, Currency: "USD", Amount: 99}}},
 		{name: "payments.getStarsTopupOptions", req: &tg.PaymentsGetStarsTopupOptionsRequest{}},
 		{name: "payments.getStarsGiftOptions", req: &tg.PaymentsGetStarsGiftOptionsRequest{}},
@@ -1310,17 +1266,12 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		{name: "messages.getQuickReplies", req: &tg.MessagesGetQuickRepliesRequest{}},
 		{name: "messages.getQuickReplyMessages", req: &tg.MessagesGetQuickReplyMessagesRequest{ShortcutID: 1}},
 		{name: "messages.getSavedHistory", req: &tg.MessagesGetSavedHistoryRequest{Peer: &tg.InputPeerSelf{}, Limit: 20}},
-		{name: "messages.readSavedHistory", req: &tg.MessagesReadSavedHistoryRequest{ParentPeer: &tg.InputPeerChannel{ChannelID: 1, AccessHash: 1}, Peer: &tg.InputPeerSelf{}}},
-		{name: "messages.deleteSavedHistory", req: &tg.MessagesDeleteSavedHistoryRequest{Peer: &tg.InputPeerSelf{}}},
 		{name: "messages.getPeerSettings", req: &tg.MessagesGetPeerSettingsRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}}},
-		{name: "messages.setChatWallPaper", req: &tg.MessagesSetChatWallPaperRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}, Wallpaper: &tg.InputWallPaperNoFile{ID: 930000000000000000}}},
 		{name: "messages.getHistory", req: &tg.MessagesGetHistoryRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}, Limit: 20}},
 		{name: "messages.getRecentLocations", req: &tg.MessagesGetRecentLocationsRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}, Limit: 20}},
-		{name: "messages.readHistory", req: &tg.MessagesReadHistoryRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}}},
 		{name: "messages.search", req: &tg.MessagesSearchRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}, Filter: &tg.InputMessagesFilterEmpty{}, Limit: 20}},
 		{name: "messages.searchGlobal", req: &tg.MessagesSearchGlobalRequest{Q: "login", Filter: &tg.InputMessagesFilterEmpty{}, OffsetPeer: &tg.InputPeerEmpty{}, Limit: 20}},
 		{name: "messages.getWebPage", req: &tg.MessagesGetWebPageRequest{URL: "https://example.invalid"}},
-		{name: "messages.getScheduledHistory", req: &tg.MessagesGetScheduledHistoryRequest{Peer: &tg.InputPeerUser{UserID: domain.OfficialSystemUserID, AccessHash: domain.OfficialSystemUser().AccessHash}}},
 		{name: "contacts.getContacts", req: &tg.ContactsGetContactsRequest{}},
 		{name: "contacts.search", req: &tg.ContactsSearchRequest{Q: "Test", Limit: 20}},
 		{name: "contacts.getBlocked", req: &tg.ContactsGetBlockedRequest{Limit: 20}},
@@ -1332,13 +1283,9 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		{name: "stories.getPinnedStories", req: &tg.StoriesGetPinnedStoriesRequest{Peer: &tg.InputPeerSelf{}, Limit: 20}},
 		{name: "stories.exportStoryLink", req: &tg.StoriesExportStoryLinkRequest{Peer: &tg.InputPeerSelf{}, ID: 1}},
 		{name: "stories.report", req: &tg.StoriesReportRequest{Peer: &tg.InputPeerSelf{}, ID: []int{1}}},
-		{name: "stories.activateStealthMode", req: &tg.StoriesActivateStealthModeRequest{Past: true, Future: true}},
 		{name: "stories.searchPosts", req: &tg.StoriesSearchPostsRequest{Hashtag: "storytag", Limit: 20}},
 		{name: "stories.getAlbums", req: &tg.StoriesGetAlbumsRequest{Peer: &tg.InputPeerSelf{}}},
 		{name: "stories.getAlbumStories", req: &tg.StoriesGetAlbumStoriesRequest{Peer: &tg.InputPeerSelf{}, AlbumID: 1, Limit: 20}},
-		{name: "stories.toggleAllStoriesHidden", req: &tg.StoriesToggleAllStoriesHiddenRequest{Hidden: true}},
-		{name: "stories.reorderAlbums", req: &tg.StoriesReorderAlbumsRequest{Peer: &tg.InputPeerSelf{}, Order: []int{1}}},
-		{name: "stories.deleteAlbum", req: &tg.StoriesDeleteAlbumRequest{Peer: &tg.InputPeerSelf{}, AlbumID: 1}},
 		{name: "stories.getAllReadPeerStories", req: &tg.StoriesGetAllReadPeerStoriesRequest{}},
 		{name: "stories.getPeerMaxIDs", req: &tg.StoriesGetPeerMaxIDsRequest{ID: []tg.InputPeerClass{&tg.InputPeerSelf{}}}},
 		{name: "stories.getStoriesViews", req: &tg.StoriesGetStoriesViewsRequest{Peer: &tg.InputPeerSelf{}, ID: []int{1}}},

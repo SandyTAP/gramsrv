@@ -144,7 +144,7 @@ func run() error {
 		TargetUserID: firstTarget.TargetUserID, BatchID: firstTarget.BatchID, CommandID: firstTarget.CommandID,
 		EligibleSessions: 1, WrittenSessions: 1, ServerMsgID: 9001, ObservedAt: time.Now(),
 	}})
-	if err != nil || len(stale) != 1 || (stale[0].Outcome != store.OutboxEvidenceAlreadyFinalized && stale[0].Outcome != store.OutboxEvidenceFenced) {
+	if err != nil || len(stale) != 1 || stale[0].Outcome != store.OutboxEvidenceFenced {
 		return fmt.Errorf("stale physical evidence outcome=%+v err=%v", stale, err)
 	}
 	current, err := queue.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{

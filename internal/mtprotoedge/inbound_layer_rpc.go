@@ -11,6 +11,8 @@ import (
 	"github.com/iamxvbaba/td/tgerr"
 	"github.com/iamxvbaba/td/tlprofile"
 	"go.uber.org/zap"
+
+	"telesrv/internal/store"
 )
 
 var inboundLayerDecodeLimits = tlprofile.Limits{
@@ -1115,6 +1117,9 @@ func (s *Server) commitLayerProfileEvidence(ctx context.Context, c *Conn, profil
 		ctx, c.authKeyID, c.sessionID, int(profile), msgID,
 	)
 	if err != nil {
+		if errors.Is(err, store.ErrAuthKeySessionLayerConflict) {
+			return false, fmt.Errorf("%w: %v", ErrLayerProfileConflict, err)
+		}
 		return false, fmt.Errorf("advance durable exact session Layer evidence: %w", err)
 	}
 	if layer <= 0 || authoritativeMsgID <= 0 {

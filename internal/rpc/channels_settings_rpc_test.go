@@ -643,9 +643,12 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	moderationStore := memory.NewModerationReportStore()
 	userService := appusers.NewService(userStore)
 	channelService := appchannels.NewService(channelStore)
+	dialogStore := memory.NewDialogStore()
+	dialogStore.BindDialogAggregateStores(channelStore, nil)
 	r := New(Config{}, Deps{
 		Users:          userService,
 		Channels:       channelService,
+		Dialogs:        appdialogs.NewService(dialogStore, channelStore),
 		DeliveryOutbox: deliveryOutbox,
 		Moderation: appmoderation.NewService(
 			moderationStore,
@@ -957,7 +960,8 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if page := hiddenMembers.(*tg.ChannelsChannelParticipants); len(page.Participants) != 0 || page.Count == 0 {
 		t.Fatalf("hidden participants page = %+v, want empty page with aggregate count", page)
 	}
-	viewAsMessagesUpdates, err := r.onChannelsToggleViewForumAsMessages(WithUserID(ctx, owner.ID), &tg.ChannelsToggleViewForumAsMessagesRequest{Channel: input, Enabled: true})
+	forumViewCtx := WithSessionID(WithRawAuthKeyID(WithUserID(ctx, owner.ID), [8]byte{0x61}), 61)
+	viewAsMessagesUpdates, err := r.onChannelsToggleViewForumAsMessages(forumViewCtx, &tg.ChannelsToggleViewForumAsMessagesRequest{Channel: input, Enabled: true})
 	if err != nil {
 		t.Fatalf("toggle forum as messages: %v", err)
 	}

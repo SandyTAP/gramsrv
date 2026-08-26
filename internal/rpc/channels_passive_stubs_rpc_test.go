@@ -307,16 +307,15 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("messages.deleteScheduledMessages: %v", err)
 	}
-	if got := deletedScheduled.(*tg.Updates).Updates; len(got) != 1 {
-		t.Fatalf("messages.deleteScheduledMessages updates = %+v, want one update", got)
-	} else if update, ok := got[0].(*tg.UpdateDeleteScheduledMessages); !ok || len(update.Messages) != 2 || update.Messages[0] != 7 {
-		t.Fatalf("messages.deleteScheduledMessages update = %#v, want requested ids", got[0])
+	if got := deletedScheduled.(*tg.Updates).Updates; len(got) != 0 {
+		t.Fatalf("messages.deleteScheduledMessages updates = %+v, want no update for missing scheduled messages", got)
 	}
-	if _, err := r.onMessagesSendScheduledMessages(ownerCtx, &tg.MessagesSendScheduledMessagesRequest{
+	missingScheduled, err := r.onMessagesSendScheduledMessages(ownerCtx, &tg.MessagesSendScheduledMessagesRequest{
 		Peer: inputPeerChannel(channel),
 		ID:   []int{7},
-	}); err == nil || !strings.Contains(err.Error(), "MESSAGE_ID_INVALID") {
-		t.Fatalf("messages.sendScheduledMessages err = %v, want MESSAGE_ID_INVALID", err)
+	})
+	if err != nil || len(missingScheduled.(*tg.Updates).Updates) != 0 {
+		t.Fatalf("messages.sendScheduledMessages missing result = %+v err %v, want idempotent empty updates", missingScheduled, err)
 	}
 	if _, err := r.onMessagesCreateForumTopic(ownerCtx, &tg.MessagesCreateForumTopicRequest{
 		Peer:     inputPeerChannel(channel),

@@ -185,6 +185,11 @@ type LayerRPCDurableSessionProfileDeleter interface {
 	) (deleted bool, err error)
 }
 
+type layerRPCProfileResolver interface {
+	LayerRPCDurableSessionProfileResolver
+	LayerRPCInheritedAuthKeyProfileResolver
+}
+
 // LayerRPCReplayPreparer reapplies connection-local wrapper state for an
 // already-executed exact request without consuming its one-shot business
 // dispatch lease. The returned callback is safe to run only after a successful
@@ -362,6 +367,9 @@ type Options struct {
 	// It is deliberately unexported so production callers cannot bypass
 	// generated Layer admission by configuring the canonical-only route.
 	legacyRPC legacyRPCHandler
+	// layerProfileRPC is an internal test hook which supplies the production
+	// durable profile interfaces without enabling exact business dispatch.
+	layerProfileRPC layerRPCProfileResolver
 	// LayerRPC is the generated exact-profile production path. When configured,
 	// every API request must complete admission before execution-ledger scheduling.
 	LayerRPC LayerRPCHandler
@@ -520,6 +528,7 @@ type Server struct {
 	conns               *SessionManager
 	rpc                 legacyRPCHandler
 	layerRPC            LayerRPCHandler
+	layerProfileRPC     layerRPCProfileResolver
 	metrics             Metrics
 	onServing           func(net.Addr)
 	cipher              crypto.Cipher
@@ -573,6 +582,7 @@ func New(opts Options) *Server {
 		conns:                    conns,
 		rpc:                      opts.legacyRPC,
 		layerRPC:                 opts.LayerRPC,
+		layerProfileRPC:          opts.layerProfileRPC,
 		metrics:                  opts.Metrics,
 		onServing:                opts.OnServing,
 		deliveryClientAcked:      opts.DeliveryClientAcked,
@@ -590,6 +600,9 @@ func New(opts Options) *Server {
 		}),
 		rpcRewrap: newRPCRewrapRegistry(opts.RPCGlobalMaxTasks),
 		admission: newAdmissionController(opts.MaxConnections, opts.MaxConnectionsPerIP, opts.MaxConcurrentHandshakes),
+	}
+	if server.layerProfileRPC == nil {
+		server.layerProfileRPC, _ = opts.LayerRPC.(layerRPCProfileResolver)
 	}
 	conns.setLogicalSessionReleaseHook(func(key sessionKey) {
 		server.rpcResults.forgetSession(key.authKeyID, key.sessionID)

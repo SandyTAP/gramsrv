@@ -330,12 +330,17 @@ func TestMonoforumSendMessageWritePath(t *testing.T) {
 	}
 
 	channelStore := memory.NewChannelStore()
+	outbox := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(outbox)
+	dialogStore := memory.NewDialogStore()
+	dialogStore.BindDialogAggregateStores(channelStore, nil)
 	channelSvc := appchannels.NewService(channelStore)
-	dialogSvc := appdialogs.NewService(memory.NewDialogStore(), channelStore)
+	dialogSvc := appdialogs.NewService(dialogStore, channelStore)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: channelSvc,
-		Dialogs:  dialogSvc,
+		Users:          appusers.NewService(userStore),
+		Channels:       channelSvc,
+		Dialogs:        dialogSvc,
+		DeliveryOutbox: outbox,
 	}, zaptest.NewLogger(t), clock.System)
 
 	created, err := channelSvc.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{Title: "DM Broadcast", Broadcast: true, Date: 1000})

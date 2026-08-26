@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +19,126 @@ import (
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
 	"github.com/iamxvbaba/td/transport"
+
+	"telesrv/internal/rpc"
+	"telesrv/internal/store"
 )
+
+type testLayerSessionKey struct {
+	authKeyID [8]byte
+	sessionID int64
+}
+
+type testAuthKeySessionLayerStore struct {
+	mu       sync.Mutex
+	now      func() time.Time
+	next     int64
+	sessions map[testLayerSessionKey]store.AuthKeySessionLayer
+	defaults map[[8]byte]store.AuthKeyLayerDefault
+}
+
+func newTestAuthKeySessionLayerStore() *testAuthKeySessionLayerStore {
+	return newTestAuthKeySessionLayerStoreAt(time.Now)
+}
+
+func newTestAuthKeySessionLayerStoreAt(now func() time.Time) *testAuthKeySessionLayerStore {
+	return &testAuthKeySessionLayerStore{
+		now:      now,
+		sessions: make(map[testLayerSessionKey]store.AuthKeySessionLayer),
+		defaults: make(map[[8]byte]store.AuthKeyLayerDefault),
+	}
+}
+
+func testLayerRPCDeps() rpc.Deps {
+	return rpc.Deps{AuthKeySessionLayers: newTestAuthKeySessionLayerStore()}
+}
+
+func testLayerRPCDepsAt(now func() time.Time) rpc.Deps {
+	return rpc.Deps{AuthKeySessionLayers: newTestAuthKeySessionLayerStoreAt(now)}
+}
+
+func (s *testAuthKeySessionLayerStore) GetSessionLayer(_ context.Context, authKeyID [8]byte, sessionID int64) (store.AuthKeySessionLayer, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := testLayerSessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	value, found := s.sessions[key]
+	if found && !s.now().Before(value.ExpiresAt) {
+		delete(s.sessions, key)
+		return store.AuthKeySessionLayer{}, false, nil
+	}
+	if found {
+		def := s.defaults[authKeyID]
+		value.SharedDefault = def.Layer == value.Layer && def.ObservationID == value.ObservationID
+	}
+	return value, found, nil
+}
+
+func (s *testAuthKeySessionLayerStore) AdvanceSessionLayer(_ context.Context, authKeyID [8]byte, sessionID int64, layer int, msgID int64) (store.AuthKeySessionLayer, bool, error) {
+	if authKeyID == ([8]byte{}) || sessionID == 0 || layer <= 0 || msgID <= 0 {
+		return store.AuthKeySessionLayer{}, false, store.ErrAuthKeySessionLayerInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := testLayerSessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	if current, found := s.sessions[key]; found {
+		if s.now().Before(current.ExpiresAt) {
+			if msgID < current.MessageID {
+				return current, false, nil
+			}
+			if msgID == current.MessageID {
+				if layer != current.Layer {
+					return current, false, store.ErrAuthKeySessionLayerConflict
+				}
+				return current, false, nil
+			}
+		}
+		delete(s.sessions, key)
+	}
+	s.next++
+	expiresAt, fresh := store.AuthKeySessionLayerEvidenceFresh(s.now(), msgID)
+	if !fresh {
+		// Focused protocol tests use small synthetic msg_ids. Keep those fixtures
+		// bounded without pretending they are valid production timestamps.
+		expiresAt = s.now().Add(time.Hour)
+	}
+	current := store.AuthKeySessionLayer{
+		Layer: layer, MessageID: msgID, ObservationID: s.next,
+		ExpiresAt: expiresAt, SharedDefault: true,
+	}
+	s.sessions[key] = current
+	s.defaults[authKeyID] = store.AuthKeyLayerDefault{Layer: layer, ObservationID: current.ObservationID}
+	return current, true, nil
+}
+
+func (s *testAuthKeySessionLayerStore) GetAuthKeyLayerDefault(_ context.Context, authKeyID [8]byte) (store.AuthKeyLayerDefault, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, found := s.defaults[authKeyID]
+	return value, found, nil
+}
+
+func (s *testAuthKeySessionLayerStore) DeleteSessionLayer(_ context.Context, authKeyID [8]byte, sessionID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := testLayerSessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	_, found := s.sessions[key]
+	delete(s.sessions, key)
+	return found, nil
+}
+
+func (*testAuthKeySessionLayerStore) DeleteExpiredSessionLayers(context.Context, int) (int, error) {
+	return 0, nil
+}
+
+type emptyDurableLayerResolver struct{}
+
+func (emptyDurableLayerResolver) ResolveNegotiatedSessionLayerEvidence(context.Context, [8]byte, int64) (int, int64, bool, error) {
+	return 0, 0, false, nil
+}
+
+func (emptyDurableLayerResolver) ResolveInheritedAuthKeyLayer(context.Context, [8]byte) (int, bool, error) {
+	return 0, false, nil
+}
 
 // legacyCanonicalTestConn explicitly declares the canonical-only profile used
 // by old connection-state tests. Production exact-path tests must instead call
@@ -115,6 +235,9 @@ func startTestServer(t *testing.T, opts Options) (addr string, pub exchange.Publ
 	}
 	if opts.DC == 0 {
 		opts.DC = 2
+	}
+	if _, productionResolver := opts.LayerRPC.(layerRPCProfileResolver); !productionResolver && opts.layerProfileRPC == nil {
+		opts.layerProfileRPC = emptyDurableLayerResolver{}
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

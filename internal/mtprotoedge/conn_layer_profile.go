@@ -313,11 +313,14 @@ func (s *Server) seedInitialLayerProfile(
 	}
 	_ = fetchedLayer
 	_ = previous
-	durableResolver, ok := s.layerRPC.(LayerRPCDurableSessionProfileResolver)
-	if !ok {
+	resolver := s.layerProfileRPC
+	if resolver == nil {
+		resolver, _ = s.layerRPC.(layerRPCProfileResolver)
+	}
+	if resolver == nil {
 		return fmt.Errorf("durable exact session Layer resolver is required")
 	}
-	layer, msgID, found, err := durableResolver.ResolveNegotiatedSessionLayerEvidence(ctx, c.authKeyID, c.sessionID)
+	layer, msgID, found, err := resolver.ResolveNegotiatedSessionLayerEvidence(ctx, c.authKeyID, c.sessionID)
 	if err != nil {
 		return fmt.Errorf("resolve durable exact session Layer during connection seed: %w", err)
 	}
@@ -327,11 +330,7 @@ func (s *Server) seedInitialLayerProfile(
 		}
 		return c.seedRawLayerEvidence(layer, msgID)
 	}
-	inherited, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver)
-	if !ok {
-		return fmt.Errorf("Redis inherited auth-key Layer resolver is required")
-	}
-	layer, found, err = inherited.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
+	layer, found, err = resolver.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)
 	if err != nil {
 		return fmt.Errorf("resolve inherited auth-key Layer: %w", err)
 	}
@@ -355,8 +354,11 @@ func (s *Server) refreshActivatedInheritedLayerProfile(ctx context.Context, c *C
 		return nil
 	}
 	_ = fetchedLayer
-	resolver, ok := s.layerRPC.(LayerRPCInheritedAuthKeyProfileResolver)
-	if !ok {
+	resolver := s.layerProfileRPC
+	if resolver == nil {
+		resolver, _ = s.layerRPC.(layerRPCProfileResolver)
+	}
+	if resolver == nil {
 		return fmt.Errorf("Redis inherited auth-key Layer resolver is required")
 	}
 	layer, found, err := resolver.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID)

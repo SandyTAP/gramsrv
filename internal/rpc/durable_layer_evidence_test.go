@@ -10,7 +10,6 @@ import (
 	"github.com/iamxvbaba/td/proto"
 	"go.uber.org/zap/zaptest"
 
-	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
@@ -198,22 +197,24 @@ func TestDurableInheritedLayerRevalidatesEachNewSession(t *testing.T) {
 	if err := keys.Save(ctx, store.AuthKeyData{ID: authKeyID}); err != nil {
 		t.Fatal(err)
 	}
-	auth := &captureAuthService{authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
-		authKeyID: {Layer: 225, LayerObservationID: 1},
-	}}
-	r := New(Config{}, Deps{Auth: auth, AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	msgIDs := proto.NewMessageIDGen(time.Now).New
+	if _, applied, err := keys.AdvanceSessionLayer(ctx, authKeyID, 51, 225, msgIDs(proto.MessageFromClient)); err != nil || !applied {
+		t.Fatalf("seed initial default = applied %v err %v", applied, err)
+	}
+	r := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, authKeyID); err != nil || !found || layer != 225 {
 		t.Fatalf("initial default = (%d,%v,%v)", layer, found, err)
 	}
-	auth.authKeyClientInfos[authKeyID] = domain.AuthKeyClientInfo{Layer: 230, LayerObservationID: 2}
+	if _, applied, err := keys.AdvanceSessionLayer(ctx, authKeyID, 52, 230, msgIDs(proto.MessageFromClient)); err != nil || !applied {
+		t.Fatalf("seed future default = applied %v err %v", applied, err)
+	}
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, authKeyID); err != nil || !found || layer != 0 {
 		t.Fatalf("future authoritative default = (%d,%v,%v)", layer, found, err)
 	}
-	auth.authKeyClientInfos[authKeyID] = domain.AuthKeyClientInfo{Layer: 228, LayerObservationID: 3}
+	if _, applied, err := keys.AdvanceSessionLayer(ctx, authKeyID, 53, 228, msgIDs(proto.MessageFromClient)); err != nil || !applied {
+		t.Fatalf("seed corrected default = applied %v err %v", applied, err)
+	}
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, authKeyID); err != nil || !found || layer != 228 {
 		t.Fatalf("corrected default = (%d,%v,%v)", layer, found, err)
-	}
-	if auth.authKeyInfoLookups != 3 {
-		t.Fatalf("auth_keys lookups = %d, want one per new session resolution", auth.authKeyInfoLookups)
 	}
 }

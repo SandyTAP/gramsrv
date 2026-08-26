@@ -94,12 +94,13 @@ func TestLoginEmailEndToEnd(t *testing.T) {
 		}))
 
 	deps := rpc.Deps{
-		Auth:           authService,
-		Account:        accountService,
-		Help:           help.NewService(helpStore, helpStore),
-		Users:          users.NewService(userStore),
-		Updates:        updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
-		DeliveryOutbox: deliveryOutbox,
+		Auth:                 authService,
+		Account:              accountService,
+		Help:                 help.NewService(helpStore, helpStore),
+		Users:                users.NewService(userStore),
+		Updates:              updates.NewService(memory.NewUpdateStateStore(), updateEventStore),
+		DeliveryOutbox:       deliveryOutbox,
+		AuthKeySessionLayers: authKeyStore,
 
 		Contacts: contacts.NewService(memory.NewContactStore()),
 		Dialogs:  dialogs.NewService(dialogStore),

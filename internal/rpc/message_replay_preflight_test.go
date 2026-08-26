@@ -229,13 +229,11 @@ func TestSendMultiMediaMixedReplayChargesAndResolvesOnlyAbsentItems(t *testing.T
 	messages := newReplayPreflightMessages()
 	messages.replays[7201] = privateReplayFixture(userID, userID, 7201, 91, messages.reservedGroupedID)
 	limiter := &captureRateLimiter{}
-	dialogs := &replayCountingDialogs{captureDialogs: &captureDialogs{}}
 	files := &replaySelectiveFiles{fakeFiles: &fakeFiles{photos: map[int64]domain.Photo{
 		222: {ID: 222, AccessHash: 2220, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 100, H: 100}}},
 	}}}
 	r := New(Config{SendRateLimit: 10, SendRateWindow: time.Minute}, Deps{
 		Messages: messages,
-		Dialogs:  dialogs,
 		Files:    files,
 		Limiter:  limiter,
 	}, zaptest.NewLogger(t), clock.System)
@@ -263,8 +261,8 @@ func TestSendMultiMediaMixedReplayChargesAndResolvesOnlyAbsentItems(t *testing.T
 	if len(messages.reserveRequests) != 1 {
 		t.Fatalf("album reservations = %d, want 1", len(messages.reserveRequests))
 	}
-	if dialogs.deleteDraftCalls != 1 {
-		t.Fatalf("draft deletes = %d, want exactly one from first genuinely-new item", dialogs.deleteDraftCalls)
+	if !messages.sendRequests[0].ClearDraft {
+		t.Fatal("first genuinely-new item did not carry atomic clear_draft intent")
 	}
 
 	limiterCalls := len(limiter.calls)
@@ -282,8 +280,8 @@ func TestSendMultiMediaMixedReplayChargesAndResolvesOnlyAbsentItems(t *testing.T
 	if len(messages.reserveRequests) != reservations {
 		t.Fatalf("full duplicate reservations: before=%d after=%d", reservations, len(messages.reserveRequests))
 	}
-	if dialogs.deleteDraftCalls != 1 {
-		t.Fatalf("full duplicate cleared draft again: calls=%d", dialogs.deleteDraftCalls)
+	if len(messages.sendRequests) != 1 {
+		t.Fatalf("full duplicate issued another atomic send/clear: calls=%d", len(messages.sendRequests))
 	}
 }
 

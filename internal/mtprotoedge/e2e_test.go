@@ -48,10 +48,11 @@ func TestTelegramClientEndToEnd(t *testing.T) {
 	authzStore.AttachDeliveryOutbox(deliveryOutbox)
 	authKeyStore := memory.NewAuthKeyStore()
 	deps := rpc.Deps{
-		Auth:           auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
-		Users:          users.NewService(userStore),
-		Updates:        updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
-		DeliveryOutbox: deliveryOutbox,
+		Auth:                 auth.NewService(userStore, authzStore, memory.NewCodeStore(), authKeyStore, memory.NewTempAuthKeyBindingStore(authKeyStore), "12345"),
+		Users:                users.NewService(userStore),
+		Updates:              updates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		DeliveryOutbox:       deliveryOutbox,
+		AuthKeySessionLayers: authKeyStore,
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
 	srv := New(Options{Logger: zaptest.NewLogger(t), DC: dc, RSAKey: rsaKey, AuthKeys: authKeyStore, LayerRPC: router})

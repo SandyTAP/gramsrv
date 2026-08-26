@@ -597,6 +597,9 @@ func TestAccountProfileMutationResponsesKeepVectorOnlyUsernames(t *testing.T) {
 		{Username: "renamed_slot", Editable: true, Active: true, SortOrder: 0},
 		{Username: "owner_collectible", Active: true, SortOrder: 1, CollectibleID: 21},
 	}
+	if err := f.router.NotifyPeerUsernamesChanged(ctx, peer); err != nil {
+		t.Fatalf("invalidate username projection before aggregate mutation: %v", err)
+	}
 	updated, err = f.router.onAccountUpdateUsername(ctx, "renamed_slot")
 	if err != nil {
 		t.Fatalf("account.updateUsername: %v", err)
@@ -1106,9 +1109,13 @@ func TestChannelsGetChannelsProjectsCollectibleUsernames(t *testing.T) {
 	registry := newFakeUsernameRegistry()
 	r, owner, channel := newCollectibleChannelFixture(t, registry)
 	ctx := WithUserID(context.Background(), owner.ID)
-	registry.byPeer[domain.Peer{Type: domain.PeerTypeChannel, ID: channel.ID}] = []domain.Username{
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: channel.ID}
+	registry.byPeer[peer] = []domain.Username{
 		{Username: "chan_slot", Editable: true, Active: true, SortOrder: 1},
 		{Username: "chan_nft", Active: true, SortOrder: 0, CollectibleID: 44},
+	}
+	if err := r.NotifyPeerUsernamesChanged(ctx, peer); err != nil {
+		t.Fatalf("invalidate username projection: %v", err)
 	}
 
 	chats, err := r.onChannelsGetChannels(ctx, []tg.InputChannelClass{

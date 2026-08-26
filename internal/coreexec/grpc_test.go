@@ -727,14 +727,19 @@ func TestGRPCRemoteAppliesRequestTimeoutToProfileRPC(t *testing.T) {
 }
 
 func TestGRPCRemoteDurableLayerEvidenceRoundTrip(t *testing.T) {
-	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
-	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	layers := memory.NewAuthKeyStore()
+	deps := rpc.Deps{AuthKeySessionLayers: layers}
+	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, deps, zaptest.NewLogger(t), clock.System)
+	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, deps, zaptest.NewLogger(t), clock.System)
 	remote, cleanup := newBufGRPCRemote(t, coreRouter, edgeRouter, "secret", "secret")
 	defer cleanup()
 
 	authKeyID := [8]byte{9, 8, 7}
 	const sessionID = int64(44)
-	const msgID = int64(10_000)
+	msgID := int64((uint64(time.Now().UTC().Unix()) << 32) | 4)
+	if err := layers.Save(context.Background(), store.AuthKeyData{ID: authKeyID}); err != nil {
+		t.Fatal(err)
+	}
 
 	layer, currentMsgID, publish, err := remote.AdvanceNegotiatedSessionLayerEvidence(context.Background(), authKeyID, sessionID, 225, msgID)
 	if err != nil {

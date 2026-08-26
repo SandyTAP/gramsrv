@@ -142,7 +142,7 @@ func TestLayerRPCAdmissionCapacityRejectsBeforeDecoder(t *testing.T) {
 		{name: "global_task", fillGlobal: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+			router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 			counting := &countingLayerRPCAdmission{LayerRPCHandler: router}
 			s := New(Options{DC: 2, LayerRPC: counting})
 			scheduler := newInboundRPCScheduler(1, 1, 1<<30)
@@ -178,7 +178,7 @@ func TestLayerRPCAdmissionCapacityRejectsBeforeDecoder(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionExpandsTDLibNestedGZIPUnderTransferredBudget(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 	c := &Conn{authKeyID: [8]byte{8, 21}, sessionID: 821, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -263,7 +263,7 @@ func TestLayerRPCAdmissionAdmitsTDLibUploadParts(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+			router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 			s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 			c := &Conn{authKeyID: [8]byte{8, 31}, sessionID: 831, metrics: NopMetrics{}}
 			c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -340,7 +340,7 @@ func TestLayerRPCAdmissionRejectionLogsBoundedMetadataWithoutUploadBody(t *testi
 	body = body[:len(body)-1]
 
 	core, logs := observer.New(zap.DebugLevel)
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zap.New(core), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zap.New(core), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zap.New(core)})
 	c := &Conn{
 		authKeyID:  [8]byte{8, 34},
@@ -407,7 +407,7 @@ func TestLayerRPCAdmissionRejectionLogsBoundedMetadataWithoutUploadBody(t *testi
 }
 
 func TestLayerRPCAdmissionAdmitsTDLibFirstUploadContainer(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 	c := &Conn{authKeyID: [8]byte{8, 32}, sessionID: 832, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 8, time.Second)
@@ -451,7 +451,7 @@ func TestLayerRPCAdmissionAdmitsTDLibFirstUploadContainer(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionTDLibFirstUploadContainerRequiresFlatBytesCapability(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	// The wrapper deliberately exposes exact admission but not the optional
 	// flat-bytes sizing capability. The edge must therefore retain the generic
 	// worst-case charge and reject the whole oversized batch atomically.
@@ -515,7 +515,7 @@ func tdlibFirstUploadPlan(t *testing.T) (*inboundPlan, int64) {
 }
 
 func TestLayerRPCAdmissionAdmitsTDLibWrappedBindTempAuthKey(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 	c := &Conn{authKeyID: [8]byte{8, 41}, sessionID: -7940676790771565328, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -560,7 +560,7 @@ func TestLayerRPCAdmissionAdmitsTDLibWrappedBindTempAuthKey(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionNestedGZIPGrowFailureRejectsWholeBatch(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 	first, _ := tdlibNestedGZIPBody(t, tlprofile.Profile228, &tg.HelpGetConfigRequest{})
 	second, _ := tdlibNestedGZIPBody(t, tlprofile.Profile228, &tg.HelpGetNearestDCRequest{})
@@ -601,7 +601,7 @@ func TestLayerRPCAdmissionNestedGZIPGrowFailureRejectsWholeBatch(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionNestedGZIPSiblingsShareFrameExpansionLimit(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router, Logger: zaptest.NewLogger(t)})
 	c := &Conn{authKeyID: [8]byte{8, 23}, sessionID: 823, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -729,7 +729,7 @@ func TestLayerRPCAdmissionNestedGZIPReDecodeReusesMaterializationCharge(t *testi
 }
 
 func TestLayerRPCAdmissionTransfersOriginalReservationToFreshOwner(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 3}, sessionID: 83, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -802,7 +802,7 @@ func tdlibWrappedBody(t *testing.T, profile tlprofile.Profile, terminal bin.Obje
 }
 
 func TestLayerRPCAdmissionPendingReplayReleasesProvisionalEntry(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 4}, sessionID: 84, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 4, time.Second)
@@ -844,7 +844,7 @@ func TestLayerRPCAdmissionPendingReplayReleasesProvisionalEntry(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionCompletedReplayReleasesWholeProvisionalBatch(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 8}, sessionID: 88, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 2, time.Second)
@@ -886,7 +886,7 @@ func TestLayerRPCAdmissionCompletedReplayReleasesWholeProvisionalBatch(t *testin
 }
 
 func TestLayerRPCAdmissionTransferredBatchClosesWithoutLeak(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 5}, sessionID: 85, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 2, time.Second)
@@ -921,7 +921,7 @@ func TestLayerRPCAdmissionTransferredBatchClosesWithoutLeak(t *testing.T) {
 }
 
 func TestLayerRPCAdmissionTransferredBatchCommitsConservativeCharge(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 6}, sessionID: 86, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 2, time.Second)
@@ -961,7 +961,7 @@ func TestLayerRPCAdmissionTransferredBatchCommitsConservativeCharge(t *testing.T
 }
 
 func TestLayerRPCAdmissionLocalDuplicateConsumesNoProvisionalEntry(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{8, 7}, sessionID: 87, metrics: NopMetrics{}}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 2, time.Second)

@@ -25,10 +25,12 @@ func newDraftDifferenceTestRouter(t *testing.T) (*Router, domain.User, domain.Us
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 21, Phone: "15550008801", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 22, Phone: "15550008802", FirstName: "Friend"})
 	dialogStore := memory.NewDialogStore()
+	events := memory.NewUpdateEventStore()
+	dialogStore.AttachUpdateEventStore(events)
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{
 		Users:    appusers.NewService(userStore),
 		Dialogs:  appdialogs.NewService(dialogStore, memory.NewChannelStore()),
-		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
+		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), events),
 		Sessions: &captureSessions{},
 	}, zaptest.NewLogger(t), clock.System)
 	return r, owner, friend

@@ -10,6 +10,8 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	appchannels "telesrv/internal/app/channels"
+	appdialogs "telesrv/internal/app/dialogs"
+	appmessages "telesrv/internal/app/messages"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
@@ -32,6 +34,7 @@ type rpcChannelFixture struct {
 	ctx      context.Context
 	users    *memory.UserStore
 	channels *memory.ChannelStore
+	delivery *memory.DeliveryOutboxStore
 	router   *Router
 }
 
@@ -40,14 +43,24 @@ func newRPCChannelFixture(t *testing.T) *rpcChannelFixture {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
 	channelStore := memory.NewChannelStore()
+	dialogStore := memory.NewDialogStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
+	dialogStore.BindDialogAggregateStores(channelStore, nil)
+	messageStore := memory.NewMessageStore(dialogStore)
+	messageStore.AttachDeliveryOutbox(delivery)
 	return &rpcChannelFixture{
 		t:        t,
 		ctx:      ctx,
 		users:    userStore,
 		channels: channelStore,
+		delivery: delivery,
 		router: New(Config{}, Deps{
-			Users:    appusers.NewService(userStore),
-			Channels: appchannels.NewService(channelStore),
+			Users:          appusers.NewService(userStore),
+			Channels:       appchannels.NewService(channelStore),
+			Dialogs:        appdialogs.NewService(dialogStore, channelStore),
+			Messages:       appmessages.NewService(messageStore, dialogStore),
+			DeliveryOutbox: delivery,
 		}, zaptest.NewLogger(t), clock.System),
 	}
 }

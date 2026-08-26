@@ -36,9 +36,13 @@ func TestLinkedDiscussionGuestCanCommentWithoutMembership(t *testing.T) {
 	owner, _ := users.Create(ctx, domain.User{AccessHash: 301, Phone: "15550003001", FirstName: "Owner"})
 	subscriber, _ := users.Create(ctx, domain.User{AccessHash: 302, Phone: "15550003002", FirstName: "Subscriber"})
 	channelStore := memory.NewChannelStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
 	channels := appchannels.NewService(channelStore, appchannels.WithBotProfileResolver(emptyDiscussionBotProfiles{}))
-	dialogs := appdialogs.NewService(memory.NewDialogStore(), channelStore)
-	r := New(Config{}, Deps{Users: appusers.NewService(users), Channels: channels, Dialogs: dialogs}, zaptest.NewLogger(t), clock.System)
+	dialogStore := memory.NewDialogStore()
+	dialogStore.BindDialogAggregateStores(channelStore, nil)
+	dialogs := appdialogs.NewService(dialogStore, channelStore)
+	r := New(Config{}, Deps{Users: appusers.NewService(users), Channels: channels, Dialogs: dialogs, DeliveryOutbox: delivery}, zaptest.NewLogger(t), clock.System)
 
 	broadcast, err := channels.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{Title: "Private channel", Broadcast: true, Date: 1700003001})
 	if err != nil {
@@ -181,8 +185,11 @@ func TestPublicChannelAndMegagroupPreviewStayReadableForNonMember(t *testing.T) 
 	users := memory.NewUserStore()
 	owner, _ := users.Create(ctx, domain.User{AccessHash: 401, Phone: "15550004001", FirstName: "Owner"})
 	viewer, _ := users.Create(ctx, domain.User{AccessHash: 402, Phone: "15550004002", FirstName: "Viewer"})
-	channels := appchannels.NewService(memory.NewChannelStore())
-	r := New(Config{}, Deps{Users: appusers.NewService(users), Channels: channels}, zaptest.NewLogger(t), clock.System)
+	channelStore := memory.NewChannelStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
+	channels := appchannels.NewService(channelStore)
+	r := New(Config{}, Deps{Users: appusers.NewService(users), Channels: channels, DeliveryOutbox: delivery}, zaptest.NewLogger(t), clock.System)
 
 	tests := []struct {
 		name      string
@@ -571,6 +578,8 @@ func TestChannelsGetLeftChannelsRPCReturnsLeftFlagAndSafePaging(t *testing.T) {
 		memberID int64 = 1000000902
 	)
 	channelStore := memory.NewChannelStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
 	channelService := appchannels.NewService(channelStore)
 	r := New(Config{}, Deps{Channels: channelService}, zaptest.NewLogger(t), clock.System)
 	older, err := channelService.CreateMegagroupFromCreateChat(ctx, ownerID, domain.CreateChannelRequest{
@@ -729,11 +738,14 @@ func TestChannelDiscussionRepliesRPCUsesLinkedMegagroup(t *testing.T) {
 	member, _ := userStore.Create(ctx, domain.User{AccessHash: 92, Phone: "15550002912", FirstName: "Member"})
 	subscriber, _ := userStore.Create(ctx, domain.User{AccessHash: 93, Phone: "15550002913", FirstName: "Subscriber"})
 	channelStore := memory.NewChannelStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
 	channelService := appchannels.NewService(channelStore)
 	trackedChannels := &countingDiscussionReadChannels{ChannelsService: channelService, delegate: channelService}
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: trackedChannels,
+		Users:          appusers.NewService(userStore),
+		Channels:       trackedChannels,
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 	broadcast, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
 		Title:     "Discussion Source",

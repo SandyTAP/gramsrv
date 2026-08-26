@@ -19,6 +19,7 @@ import (
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/rpc"
+	"telesrv/internal/store/memory"
 )
 
 // TestRPCGetConfig 验证 M3：握手后 client 加密 help.getConfig，
@@ -77,8 +78,9 @@ func TestLayerRPCGetConfigUsesExactAdmittedProfile(t *testing.T) {
 		advIP   = "127.0.0.1"
 		advPort = 12345
 	)
-	router := rpc.New(rpc.Config{DC: dc, IP: advIP, Port: advPort}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
-	addr, pub, _ := startTestServer(t, Options{DC: dc, LayerRPC: router})
+	keys := memory.NewAuthKeyStore()
+	router := rpc.New(rpc.Config{DC: dc, IP: advIP, Port: advPort}, rpc.Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	addr, pub, _ := startTestServer(t, Options{DC: dc, AuthKeys: keys, LayerRPC: router})
 	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
 
 	clientMsgID := proto.NewMessageIDGen(time.Now)

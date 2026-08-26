@@ -215,9 +215,11 @@ func TestBindTempAuthKeyClearsUnauthenticatedSessionUser(t *testing.T) {
 	var permAuthKeyID = [8]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}
 	sessions := newAuthBindingCaptureSessions()
 	auth := &captureAuthService{}
+	layers := newLayerEvidenceTestStore()
 	r := New(Config{}, Deps{
-		Auth:     auth,
-		Sessions: sessions,
+		Auth:                 auth,
+		Sessions:             sessions,
+		AuthKeySessionLayers: layers,
 	}, zaptest.NewLogger(t), clock.System)
 	req := &tg.AuthBindTempAuthKeyRequest{
 		PermAuthKeyID: int64(binary.LittleEndian.Uint64(permAuthKeyID[:])),

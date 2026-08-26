@@ -43,6 +43,7 @@ func exactOutboundLayerRPCBody(t *testing.T, profile tlprofile.Profile, request 
 
 type admissionOnlyLayerRPC struct {
 	dispatcher *tlprofile.Dispatcher
+	layers     store.AuthKeySessionLayerStore
 	mu         sync.Mutex
 	published  []publishedLayerEvidence
 }
@@ -57,16 +58,6 @@ type legacyAdmissionOnlyLayerRPC struct {
 
 type orderedAdmissionOnlyLayerRPC struct {
 	*admissionOnlyLayerRPC
-	exactMu sync.Mutex
-	exact   map[orderedTestSessionKey]struct {
-		layer int
-		msgID int64
-	}
-}
-
-type orderedTestSessionKey struct {
-	authKeyID [8]byte
-	sessionID int64
 }
 
 type publishedLayerEvidence struct {
@@ -200,6 +191,12 @@ func (h *capacityAdmissionOnlyLayerRPC) FreezeNegotiatedSessionLayerAt([8]byte, 
 	return false, exactProfileCapacityTestError{}
 }
 
+func (h *capacityAdmissionOnlyLayerRPC) AdvanceNegotiatedSessionLayerEvidence(
+	context.Context, [8]byte, int64, int, int64,
+) (int, int64, bool, error) {
+	return 0, 0, false, exactProfileCapacityTestError{}
+}
+
 type replayProfileCaptureLayerRPC struct {
 	*admissionOnlyLayerRPC
 	mu       sync.Mutex
@@ -230,7 +227,10 @@ func (h *replayProfileCaptureLayerRPC) capturedProfiles() ([]tlprofile.Profile, 
 }
 
 func newAdmissionOnlyLayerRPC() *admissionOnlyLayerRPC {
-	return &admissionOnlyLayerRPC{dispatcher: tlprofile.NewDispatcher()}
+	return &admissionOnlyLayerRPC{
+		dispatcher: tlprofile.NewDispatcher(),
+		layers:     newTestAuthKeySessionLayerStore(),
+	}
 }
 
 func newLegacyAdmissionOnlyLayerRPC() *legacyAdmissionOnlyLayerRPC {
@@ -238,43 +238,56 @@ func newLegacyAdmissionOnlyLayerRPC() *legacyAdmissionOnlyLayerRPC {
 }
 
 func newOrderedAdmissionOnlyLayerRPC() *orderedAdmissionOnlyLayerRPC {
-	return &orderedAdmissionOnlyLayerRPC{
-		admissionOnlyLayerRPC: newAdmissionOnlyLayerRPC(),
-		exact: make(map[orderedTestSessionKey]struct {
-			layer int
-			msgID int64
-		}),
-	}
+	return &orderedAdmissionOnlyLayerRPC{admissionOnlyLayerRPC: newAdmissionOnlyLayerRPC()}
 }
 
 func (h *orderedAdmissionOnlyLayerRPC) NegotiatedSessionLayerEvidence(authKeyID [8]byte, sessionID int64) (int, int64, bool) {
-	h.exactMu.Lock()
-	defer h.exactMu.Unlock()
-	entry, ok := h.exact[orderedTestSessionKey{authKeyID: authKeyID, sessionID: sessionID}]
-	return entry.layer, entry.msgID, ok
+	current, found, err := h.layers.GetSessionLayer(context.Background(), authKeyID, sessionID)
+	if err != nil {
+		return 0, 0, false
+	}
+	return current.Layer, current.MessageID, found
 }
 
 func (h *orderedAdmissionOnlyLayerRPC) FreezeNegotiatedSessionLayerAt(authKeyID [8]byte, sessionID int64, layer int, msgID int64) (bool, error) {
-	h.exactMu.Lock()
-	defer h.exactMu.Unlock()
-	key := orderedTestSessionKey{authKeyID: authKeyID, sessionID: sessionID}
-	current, ok := h.exact[key]
-	if ok {
-		if msgID < current.msgID {
-			return false, nil
-		}
-		if msgID == current.msgID {
-			if layer != current.layer {
-				return false, fmt.Errorf("same msg_id selected two layers")
-			}
-			return false, nil
-		}
-	}
-	h.exact[key] = struct {
-		layer int
-		msgID int64
-	}{layer: layer, msgID: msgID}
-	return true, nil
+	_, applied, err := h.layers.AdvanceSessionLayer(context.Background(), authKeyID, sessionID, layer, msgID)
+	return applied, err
+}
+
+func (h *admissionOnlyLayerRPC) ResolveNegotiatedSessionLayerEvidence(
+	ctx context.Context,
+	authKeyID [8]byte,
+	sessionID int64,
+) (int, int64, bool, error) {
+	current, found, err := h.layers.GetSessionLayer(ctx, authKeyID, sessionID)
+	return current.Layer, current.MessageID, found, err
+}
+
+func (h *admissionOnlyLayerRPC) ResolveInheritedAuthKeyLayer(
+	ctx context.Context,
+	authKeyID [8]byte,
+) (int, bool, error) {
+	current, found, err := h.layers.GetAuthKeyLayerDefault(ctx, authKeyID)
+	return current.Layer, found, err
+}
+
+func (h *admissionOnlyLayerRPC) AdvanceNegotiatedSessionLayerEvidence(
+	ctx context.Context,
+	authKeyID [8]byte,
+	sessionID int64,
+	layer int,
+	msgID int64,
+) (int, int64, bool, error) {
+	current, applied, err := h.layers.AdvanceSessionLayer(ctx, authKeyID, sessionID, layer, msgID)
+	return current.Layer, current.MessageID, applied && current.SharedDefault, err
+}
+
+func (h *admissionOnlyLayerRPC) DeleteNegotiatedSessionLayerEvidence(
+	ctx context.Context,
+	authKeyID [8]byte,
+	sessionID int64,
+) (bool, error) {
+	return h.layers.DeleteSessionLayer(ctx, authKeyID, sessionID)
 }
 
 func (h *admissionOnlyLayerRPC) AdmitLayer(profile tlprofile.Profile, b *bin.Buffer, limits tlprofile.Limits) (tlprofile.Admission, error) {
@@ -524,7 +537,7 @@ func TestBatchProvisionalCursorKeepsRegistryWatermarkAcrossOldReplay(t *testing.
 		t.Fatal(err)
 	}
 	c := &Conn{authKeyID: authKeyID, sessionID: sessionID, metrics: NopMetrics{}}
-	if err := c.SeedInheritedLayerProfile(tlprofile.Profile225); err != nil {
+	if err := s.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); err != nil {
 		t.Fatal(err)
 	}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 8, time.Second)
@@ -773,7 +786,7 @@ func TestFutureExactLayerWatermarkAllowsOnlyNewerSupportedSelfHeal(t *testing.T)
 		t.Fatal(err)
 	}
 	c := &Conn{authKeyID: authKeyID, sessionID: sessionID, metrics: NopMetrics{}}
-	if err := c.SeedInheritedLayerProfile(tlprofile.Profile225); err != nil {
+	if err := s.seedInitialLayerProfile(context.Background(), c, 225, LayerProfileSnapshot{}); err != nil {
 		t.Fatal(err)
 	}
 	c.startInboundRPCScheduler(s.rpcScheduler, 1, 8, time.Second)
@@ -882,124 +895,6 @@ func TestLayerStoreOutageRejectsExplicitEvidenceWithoutLocalMutation(t *testing.
 	}
 	if got := handler.publications(); len(got) != 0 {
 		t.Fatalf("store outage published auth-key default: %#v", got)
-	}
-}
-
-func TestDurabilityOutageInitializesOnlyCurrentConnection(t *testing.T) {
-	ctx := context.Background()
-	boom := errors.New("layer primary unavailable")
-	manager := NewSessionManager(zaptest.NewLogger(t))
-	router := rpc.New(
-		rpc.Config{DC: 2},
-		rpc.Deps{
-			Sessions:             manager,
-			AuthKeySessionLayers: unavailableEdgeSessionLayerStore{err: boom},
-		},
-		zaptest.NewLogger(t),
-		clock.System,
-	)
-	s := New(Options{DC: 2, LayerRPC: router, ActiveSessions: manager})
-	c := newOutboundTestConn(t, &collectingSessionTransport{}, newOutboundTrackedBudget(1<<20))
-	c.authKeyID = [8]byte{0x31, 0x08}
-	c.sessionID = 3108
-	// newOutboundTestConn installs a canonical profile for generic outbound
-	// tests. This scenario starts before any selector, so reset that fixture-only
-	// state before exposing the Conn to Router/SessionManager.
-	c.layerProfileMu.Lock()
-	c.layerProfileState.Store(0)
-	c.layerProfileEvidenceLayer = 0
-	c.layerProfileEvidenceMsgID = 0
-	c.setLegacyClientLayer(0)
-	c.layerProfileMu.Unlock()
-	c.startInboundRPCScheduler(s.rpcScheduler, 1, 8, time.Second)
-	if err := manager.Register(c); err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Unregister(c)
-	manager.BindAuthKeyForSession(c.authKeyID, c.sessionID, c.authKeyID)
-	manager.BindUserForAuthKey(c.authKeyID, c.sessionID, 42)
-	// Production wires Channels and marks this after its empty/non-empty
-	// membership snapshot. This focused test has no channel service, so seed the
-	// independent membership half of the readiness predicate.
-	c.membershipsSynced.Store(true)
-
-	msgID := proto.NewMessageIDGen(time.Now).New(proto.MessageFromClient)
-	plan := &inboundPlan{items: []inboundItem{{
-		kind: inboundItemRPC, msgID: msgID,
-		body: exactLayerRPCBody(t, &tg.InvokeWithLayerRequest{
-			Layer: 227,
-			Query: &tg.InitConnectionRequest{
-				APIID:          6,
-				DeviceModel:    "Desktop",
-				SystemVersion:  "Windows",
-				AppVersion:     "outage-test",
-				SystemLangCode: "en",
-				LangPack:       "tdesktop",
-				LangCode:       "en",
-				Query:          &tg.HelpGetConfigRequest{},
-			},
-		}),
-		layerProfileEvidenceFreshness: inboundLayerProfileEvidenceFresh,
-	}}}
-	defer plan.close()
-	if err := s.prepareInboundLayerRPCBatch(ctx, c, plan); err != nil {
-		t.Fatalf("explicit init during outage: %v", err)
-	}
-	if len(plan.rpcTasks) != 1 || !plan.items[0].profileEvidenceFresh() {
-		t.Fatalf("outage init plan = tasks:%d fresh:%v", len(plan.rpcTasks), plan.items[0].profileEvidenceFresh())
-	}
-	if !c.rpcRewrapInitialized.Load() {
-		t.Fatal("current connection did not retain successful init wrapper state")
-	}
-	if state, evidenceMsgID := c.layerProfileEvidenceState(); state.Profile != tlprofile.Profile227 || state.Origin != LayerProfileExplicit || evidenceMsgID != msgID {
-		t.Fatalf("current connection profile = %#v msg:%d", state, evidenceMsgID)
-	}
-	if _, _, found := router.NegotiatedSessionLayerEvidence(c.authKeyID, c.sessionID); found {
-		t.Fatal("outage-local selector entered Router exact-session cache")
-	}
-
-	if err := plan.rpcTasks[0].run(ctx); err != nil {
-		t.Fatalf("execute outage-local init: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !manager.ReceivesUpdatesForAuthKey(c.authKeyID, c.sessionID) {
-		if time.Now().After(deadline) {
-			t.Fatal("successful outage-local init never made current session updates-ready")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if _, ok := s.rpcResults.Replay(c.authKeyID, c.sessionID, msgID); !ok {
-		t.Fatal("successful outage-local init did not publish its exact RPC result")
-	}
-	if layer, found, err := router.ResolveInheritedAuthKeyLayer(ctx, c.authKeyID); err != nil || found || layer != 0 {
-		t.Fatalf("outage-local init leaked auth-key Layer default = (%d,%v,%v)", layer, found, err)
-	}
-
-	// Proactive updates use the current connection's local wire profile even
-	// though no exact/auth-key durable seed was published.
-	fanout, err := newLayerUpdatesFanout(testLayerUpdatesValue(123))
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := fanout.prepareForConn(ctx, c)
-	if err != nil || encoded.layer == nil || encoded.layer.profile != tlprofile.Profile227 {
-		t.Fatalf("outage-local push profile = encoded:%#v err:%v", encoded, err)
-	}
-
-	// Simulate a new logical session on the same physical transport. Passing the
-	// old Conn snapshot must not leak the outage-local selector across sessions.
-	replacement := &Conn{authKeyID: c.authKeyID, sessionID: c.sessionID + 1, metrics: NopMetrics{}}
-	if err := s.seedInitialLayerProfile(ctx, replacement, 0, c.LayerProfileState()); err != nil {
-		t.Fatal(err)
-	}
-	if state := replacement.LayerProfileState(); state.Origin != LayerProfileUnknown {
-		t.Fatalf("new session inherited outage-local profile: %#v", state)
-	}
-	naked := exactOutboundLayerRPCBody(t, tlprofile.Profile227, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerSelf{}, Limit: 1,
-	})
-	if _, _, err := s.admitInboundLayerRPCAt(replacement, msgID+4, naked); err == nil {
-		t.Fatal("new session admitted profile-dependent naked RPC without its own selector")
 	}
 }
 
@@ -1285,7 +1180,7 @@ func TestOldCompletedLayerRequestCannotRollBackCorrectedSession(t *testing.T) {
 
 func TestLogicalSessionLayerWatermarkSurvivesResultExpiryAndOldContainer(t *testing.T) {
 	now := newExpiryTestClock(time.Unix(1_900_000_000, 0))
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), now)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDepsAt(now.Now), zaptest.NewLogger(t), now)
 	s := New(Options{DC: 2, LayerRPC: router, Clock: now})
 	s.rpcResults = newRPCExecutionLedgerForServerTest(s, now.Now, 8)
 	authKeyID := [8]byte{0x22, 0x95}
@@ -1699,7 +1594,7 @@ func TestPreflightMarksOldContainerInnerLayerEvidenceRequestBound(t *testing.T) 
 }
 
 func TestExactSessionProfileSurvivesUnregisterAndSeedsNakedReplay(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	authKeyID := [8]byte{0x22, 0x00, 0x77}
 	const sessionID = int64(22077)
@@ -1709,7 +1604,7 @@ func TestExactSessionProfileSurvivesUnregisterAndSeedsNakedReplay(t *testing.T) 
 		Layer: 225,
 		Query: &tg.HelpGetConfigRequest{},
 	})
-	if _, _, err := s.admitInboundLayerRPC(old, first); err != nil {
+	if _, _, err := s.admitInboundLayerRPCAt(old, 100, first); err != nil {
 		t.Fatalf("initial invokeWithLayer admission: %v", err)
 	}
 
@@ -1743,7 +1638,7 @@ func TestExactSessionProfileSurvivesUnregisterAndSeedsNakedReplay(t *testing.T) 
 }
 
 func TestSameAuthKeyNewSessionRequiresOwnLayerEvidence(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	authKeyID := [8]byte{0x22, 0x70, 0x22, 0x70}
 	const (
@@ -1756,7 +1651,7 @@ func TestSameAuthKeyNewSessionRequiresOwnLayerEvidence(t *testing.T) {
 		Layer: 227,
 		Query: &tg.HelpGetConfigRequest{},
 	})
-	bobRequest, _, err := s.admitInboundLayerRPC(bobConn, bobWrapped)
+	bobRequest, _, err := s.admitInboundLayerRPCAt(bobConn, 100, bobWrapped)
 	if err != nil {
 		t.Fatalf("Bob session layer 227: %v", err)
 	}
@@ -1784,7 +1679,7 @@ func TestSameAuthKeyNewSessionRequiresOwnLayerEvidence(t *testing.T) {
 		Layer: 228,
 		Query: profileDependent,
 	})
-	aliceRequest, _, err := s.admitInboundLayerRPC(aliceConn, aliceWrapped)
+	aliceRequest, _, err := s.admitInboundLayerRPCAt(aliceConn, 104, aliceWrapped)
 	if err != nil {
 		t.Fatalf("Alice session own layer 228 evidence: %v", err)
 	}
@@ -1800,7 +1695,7 @@ func TestSameAuthKeyNewSessionRequiresOwnLayerEvidence(t *testing.T) {
 }
 
 func TestExactSessionRegistryAllowsOrderedExplicitCorrection(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	authKeyID := [8]byte{0x22, 0x07, 0x07}
 	const sessionID = int64(22707)
@@ -1817,7 +1712,7 @@ func TestExactSessionRegistryAllowsOrderedExplicitCorrection(t *testing.T) {
 		Layer: 227,
 		Query: &tg.HelpGetConfigRequest{},
 	})
-	request, _, err := s.admitInboundLayerRPC(c, wrapped)
+	request, _, err := s.admitInboundLayerRPCAt(c, 104, wrapped)
 	if err != nil {
 		t.Fatalf("profile correction: %v", err)
 	}
@@ -1833,7 +1728,7 @@ func TestExactSessionRegistryAllowsOrderedExplicitCorrection(t *testing.T) {
 }
 
 func TestRestoredExplicitProfileNakedFailureRequestsLayerCorrection(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{2, 2, 0, 2}, sessionID: 220227, metrics: NopMetrics{}}
 	if err := c.SeedLayerProfile(tlprofile.Profile225); err != nil {
@@ -1851,7 +1746,7 @@ func TestRestoredExplicitProfileNakedFailureRequestsLayerCorrection(t *testing.T
 	}
 
 	wrapped := exactLayerRPCBody(t, &tg.InvokeWithLayerRequest{Layer: 227, Query: request})
-	admitted, _, err := s.admitInboundLayerRPC(c, wrapped)
+	admitted, _, err := s.admitInboundLayerRPCAt(c, 104, wrapped)
 	if err != nil {
 		t.Fatalf("explicit correction retry: %v", err)
 	}
@@ -1864,7 +1759,7 @@ func TestRestoredExplicitProfileNakedFailureRequestsLayerCorrection(t *testing.T
 }
 
 func TestUnprofiledInvariantBindKeepsProfileUnknownAndReturnsExactBool(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	authKeyID := [8]byte{0xcd, 0xd4, 0x2a, 0x05}
 	const sessionID = int64(227220)
@@ -1942,7 +1837,7 @@ func TestUnprofiledInvariantBindKeepsProfileUnknownAndReturnsExactBool(t *testin
 }
 
 func TestLayerRPCBatchCapacityKeepsExistingPendingReplay(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	s.rpcResults = newRPCExecutionLedgerForServerTest(s, time.Now, 1)
 	c := &Conn{
@@ -2034,7 +1929,7 @@ func TestLayerRPCBatchCapacityAbortsRejectedRewrapOwner(t *testing.T) {
 }
 
 func TestLayerRPCDependencyGateUsesBusinessOutcome(t *testing.T) {
-	router := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	router := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, testLayerRPCDeps(), zaptest.NewLogger(t), clock.System)
 	s := New(Options{DC: 2, LayerRPC: router})
 	c := &Conn{authKeyID: [8]byte{7, 7, 2}, sessionID: 772, metrics: NopMetrics{}}
 

@@ -32,6 +32,123 @@ type unavailableAuthKeyInfoService struct {
 	err error
 }
 
+// layerEvidenceTestStore is the Router-level fake for tests which exercise
+// publication ordering rather than the store's MTProto freshness validation.
+// Store packages cover msg_id validation separately; Router tests explicitly
+// inject this production-shaped authority and never rely on a local fallback.
+type layerEvidenceTestStore struct {
+	mu       sync.Mutex
+	next     int64
+	sessions map[clientInfoSessionKey]store.AuthKeySessionLayer
+	defaults map[[8]byte]store.AuthKeyLayerDefault
+	aliases  map[[8]byte][8]byte
+	reads    int
+}
+
+func newLayerEvidenceTestStore() *layerEvidenceTestStore {
+	return &layerEvidenceTestStore{
+		sessions: make(map[clientInfoSessionKey]store.AuthKeySessionLayer),
+		defaults: make(map[[8]byte]store.AuthKeyLayerDefault),
+		aliases:  make(map[[8]byte][8]byte),
+	}
+}
+
+func (s *layerEvidenceTestStore) canonicalLocked(authKeyID [8]byte) [8]byte {
+	if canonical, ok := s.aliases[authKeyID]; ok {
+		return canonical
+	}
+	return authKeyID
+}
+
+func (s *layerEvidenceTestStore) bind(rawAuthKeyID, permAuthKeyID [8]byte) {
+	s.mu.Lock()
+	rawDefault := s.defaults[s.canonicalLocked(rawAuthKeyID)]
+	permDefault := s.defaults[s.canonicalLocked(permAuthKeyID)]
+	if rawDefault.ObservationID > permDefault.ObservationID {
+		permDefault = rawDefault
+	}
+	s.defaults[permAuthKeyID] = permDefault
+	delete(s.defaults, rawAuthKeyID)
+	s.aliases[rawAuthKeyID] = permAuthKeyID
+	s.mu.Unlock()
+}
+
+func (s *layerEvidenceTestStore) seedDefault(authKeyID [8]byte, layer int, observationID int64) {
+	s.mu.Lock()
+	if observationID <= 0 {
+		s.next++
+		observationID = s.next
+	} else if observationID > s.next {
+		s.next = observationID
+	}
+	s.defaults[s.canonicalLocked(authKeyID)] = store.AuthKeyLayerDefault{Layer: layer, ObservationID: observationID}
+	s.mu.Unlock()
+}
+
+func (s *layerEvidenceTestStore) GetSessionLayer(_ context.Context, rawAuthKeyID [8]byte, sessionID int64) (store.AuthKeySessionLayer, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, found := s.sessions[clientInfoSessionKey{rawAuthKeyID: rawAuthKeyID, sessionID: sessionID}]
+	if found {
+		def := s.defaults[s.canonicalLocked(rawAuthKeyID)]
+		value.SharedDefault = def.Layer == value.Layer && def.ObservationID == value.ObservationID
+	}
+	return value, found, nil
+}
+
+func (s *layerEvidenceTestStore) AdvanceSessionLayer(_ context.Context, rawAuthKeyID [8]byte, sessionID int64, layer int, msgID int64) (store.AuthKeySessionLayer, bool, error) {
+	if layer <= 0 || msgID <= 0 {
+		return store.AuthKeySessionLayer{}, false, store.ErrAuthKeySessionLayerInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := clientInfoSessionKey{rawAuthKeyID: rawAuthKeyID, sessionID: sessionID}
+	if current, found := s.sessions[key]; found {
+		if msgID < current.MessageID {
+			def := s.defaults[s.canonicalLocked(rawAuthKeyID)]
+			current.SharedDefault = def.Layer == current.Layer && def.ObservationID == current.ObservationID
+			return current, false, nil
+		}
+		if msgID == current.MessageID {
+			if layer != current.Layer {
+				return current, false, store.ErrAuthKeySessionLayerConflict
+			}
+			def := s.defaults[s.canonicalLocked(rawAuthKeyID)]
+			current.SharedDefault = def.Layer == current.Layer && def.ObservationID == current.ObservationID
+			return current, false, nil
+		}
+	}
+	s.next++
+	current := store.AuthKeySessionLayer{
+		Layer: layer, MessageID: msgID, ObservationID: s.next,
+		ExpiresAt: time.Now().Add(time.Hour), SharedDefault: true,
+	}
+	s.sessions[key] = current
+	s.defaults[s.canonicalLocked(rawAuthKeyID)] = store.AuthKeyLayerDefault{Layer: layer, ObservationID: current.ObservationID}
+	return current, true, nil
+}
+
+func (s *layerEvidenceTestStore) GetAuthKeyLayerDefault(_ context.Context, authKeyID [8]byte) (store.AuthKeyLayerDefault, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reads++
+	value, found := s.defaults[s.canonicalLocked(authKeyID)]
+	return value, found, nil
+}
+
+func (s *layerEvidenceTestStore) DeleteSessionLayer(_ context.Context, rawAuthKeyID [8]byte, sessionID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := clientInfoSessionKey{rawAuthKeyID: rawAuthKeyID, sessionID: sessionID}
+	_, found := s.sessions[key]
+	delete(s.sessions, key)
+	return found, nil
+}
+
+func (s *layerEvidenceTestStore) DeleteExpiredSessionLayers(context.Context, int) (int, error) {
+	return 0, nil
+}
+
 func (s *unavailableAuthKeyInfoService) AuthKeyClientInfo(context.Context, [8]byte) (domain.AuthKeyClientInfo, bool, error) {
 	return domain.AuthKeyClientInfo{}, false, s.err
 }
@@ -57,7 +174,11 @@ func TestResolveInheritedAuthKeyLayerUsesAuthKeyAuthorityOnly(t *testing.T) {
 				},
 				authorizations: []domain.Authorization{{AuthKeyID: authKeyID, UserID: 10, Layer: tt.authorization}},
 			}
-			r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+			layers := newLayerEvidenceTestStore()
+			if tt.keyLayer > 0 {
+				layers.seedDefault(authKeyID, tt.keyLayer, 1)
+			}
+			r := New(Config{DC: 2}, Deps{Auth: auth, AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 			got, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
 			if err != nil {
 				t.Fatal(err)
@@ -69,8 +190,8 @@ func TestResolveInheritedAuthKeyLayerUsesAuthKeyAuthorityOnly(t *testing.T) {
 			if err != nil || got != tt.want || found != tt.found {
 				t.Fatalf("cached resolved layer = (%d,%v,%v), want (%d,%v,nil)", got, found, err, tt.want, tt.found)
 			}
-			if auth.authKeyInfoLookups != 1 {
-				t.Fatalf("auth key info lookups = %d, want 1 after repeated resolve", auth.authKeyInfoLookups)
+			if layers.reads != 2 {
+				t.Fatalf("durable default reads = %d, want one per new-session resolve", layers.reads)
 			}
 			if auth.authorizationLookups != 0 {
 				t.Fatalf("authorization Layer mirror lookups = %d, want 0", auth.authorizationLookups)
@@ -82,15 +203,22 @@ func TestResolveInheritedAuthKeyLayerUsesAuthKeyAuthorityOnly(t *testing.T) {
 func TestResolveInheritedAuthKeyLayerNormalizesBoundTempToPermanent(t *testing.T) {
 	rawAuthKeyID := [8]byte{0x31}
 	permAuthKeyID := [8]byte{0x32}
-	auth := &captureAuthService{
-		resolvedAuthKeyID: permAuthKeyID,
-		hasResolved:       true,
-		authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
-			rawAuthKeyID:  {Layer: 225}, // stale shadow
-			permAuthKeyID: {Layer: 227}, // canonical shared default
-		},
+	keys := memory.NewAuthKeyStore()
+	if err := keys.Save(context.Background(), store.AuthKeyData{ID: rawAuthKeyID, ExpiresAt: 2_000_000_000, Layer: 225, LayerObservationID: 1}); err != nil {
+		t.Fatal(err)
 	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	if err := keys.Save(context.Background(), store.AuthKeyData{ID: permAuthKeyID, Layer: 227, LayerObservationID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	bindings := memory.NewTempAuthKeyBindingStore(keys)
+	if err := bindings.Save(context.Background(), domain.TempAuthKeyBinding{
+		TempAuthKeyID: rawAuthKeyID,
+		PermAuthKeyID: businessAuthKeyInt64(permAuthKeyID),
+		ExpiresAt:     2_000_000_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
 
 	layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), rawAuthKeyID)
 	if err != nil {
@@ -107,34 +235,22 @@ func TestResolveInheritedAuthKeyLayerNormalizesBoundTempToPermanent(t *testing.T
 func TestResolveInheritedAuthKeyLayerFailsClosedWithoutAvailabilityMarker(t *testing.T) {
 	boom := errors.New("Redis temporarily unavailable")
 	for _, tt := range []struct {
-		name  string
-		auth  AuthService
-		store store.AuthKeySessionLayerStore
-		want  error
+		name   string
+		layers store.AuthKeySessionLayerStore
+		want   error
 	}{
 		{
-			name: "temporary binding lookup outage",
-			auth: &unavailableResolveAuthService{
-				captureAuthService: &captureAuthService{}, err: boom,
-			},
-			store: memory.NewAuthKeyStore(), want: boom,
+			name: "missing durable authority",
+			want: store.ErrAuthKeySessionLayerStoreRequired,
 		},
 		{
-			name:  "Redis default lookup outage",
-			auth:  &captureAuthService{},
-			store: unavailableSessionLayerStore{err: boom},
-			want:  boom,
-		},
-		{
-			name: "structural binding failure",
-			auth: &unavailableResolveAuthService{
-				captureAuthService: &captureAuthService{}, err: store.ErrAuthKeyBindingInvalid,
-			},
-			store: memory.NewAuthKeyStore(), want: store.ErrAuthKeyBindingInvalid,
+			name:   "Redis default lookup outage",
+			layers: unavailableSessionLayerStore{err: boom},
+			want:   boom,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			r := New(Config{DC: 2}, Deps{Auth: tt.auth, AuthKeySessionLayers: tt.store}, zaptest.NewLogger(t), clock.System)
+			r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: tt.layers}, zaptest.NewLogger(t), clock.System)
 			layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), [8]byte{0x33})
 			if layer != 0 || found || !errors.Is(err, tt.want) {
 				t.Fatalf("resolution = (%d,%v,%v), want (0,false,%v)", layer, found, err, tt.want)
@@ -159,30 +275,29 @@ func TestResolveInheritedDurableAuthKeyLayerIgnoresAuthorizationMirror(t *testin
 			Layer:     227,
 		}},
 	}
-	r := New(Config{DC: 2}, Deps{
-		Auth: auth, AuthKeySessionLayers: memory.NewAuthKeyStore(),
-	}, zaptest.NewLogger(t), clock.System)
+	keys := memory.NewAuthKeyStore()
+	if err := keys.Save(context.Background(), store.AuthKeyData{ID: authKeyID}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(Config{DC: 2}, Deps{Auth: auth, AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
 
 	layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
 	if err != nil || found || layer != 0 {
 		t.Fatalf("durable zero primary = (%d,%v,%v), want (0,false,nil)", layer, found, err)
 	}
-	if auth.authKeyInfoLookups != 1 || auth.authorizationLookups != 0 {
-		t.Fatalf("durable lookups = auth_key:%d authorization:%d, want 1/0",
+	if auth.authKeyInfoLookups != 0 || auth.authorizationLookups != 0 {
+		t.Fatalf("legacy auth metadata was consulted: auth_key:%d authorization:%d",
 			auth.authKeyInfoLookups, auth.authorizationLookups)
 	}
 }
 
 func TestExplicitLayerCorrectionUpdatesDefaultWithoutChangingSibling(t *testing.T) {
 	authKeyID := [8]byte{0x41}
-	auth := &captureAuthService{authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo)}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
-
-	ctx1 := WithAuthKeyID(WithSessionID(WithRawAuthKeyID(context.Background(), authKeyID), 1), authKeyID)
-	ctx2 := WithAuthKeyID(WithSessionID(WithRawAuthKeyID(context.Background(), authKeyID), 2), authKeyID)
-	r.rememberClientLayer(ctx1, 225)
-	r.rememberClientLayer(ctx2, 225)
-	r.rememberClientLayer(ctx1, 227)
+	layers := newLayerEvidenceTestStore()
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
+	freezeAndPublishLayer(t, r, authKeyID, 1, 10, 1, 225)
+	freezeAndPublishLayer(t, r, authKeyID, 2, 11, 2, 225)
+	freezeAndPublishLayer(t, r, authKeyID, 1, 20, 3, 227)
 
 	if layer, ok := r.NegotiatedSessionLayer(authKeyID, 1); !ok || layer != 227 {
 		t.Fatalf("corrected session = (%d,%v), want (227,true)", layer, ok)
@@ -190,8 +305,8 @@ func TestExplicitLayerCorrectionUpdatesDefaultWithoutChangingSibling(t *testing.
 	if layer, ok := r.NegotiatedSessionLayer(authKeyID, 2); !ok || layer != 225 {
 		t.Fatalf("sibling session = (%d,%v), want unchanged (225,true)", layer, ok)
 	}
-	if got := auth.authKeyClientInfos[authKeyID].Layer; got != 227 {
-		t.Fatalf("durable shared default = %d, want 227", got)
+	if got, found, err := layers.GetAuthKeyLayerDefault(context.Background(), authKeyID); err != nil || !found || got.Layer != 227 {
+		t.Fatalf("durable shared default = (%+v,%v,%v), want 227", got, found, err)
 	}
 	layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
 	if err != nil || !found || layer != 227 {
@@ -250,6 +365,8 @@ func TestBindTempAuthKeyLayerPrecedenceAndRawShadow(t *testing.T) {
 			rawAuthKeyID := [8]byte{0x51, byte(tt.want)}
 			permAuthKeyID := [8]byte{0x52, byte(tt.want)}
 			const sessionID = int64(99)
+			layers := newLayerEvidenceTestStore()
+			layers.seedDefault(permAuthKeyID, 225, 1)
 			auth := &captureAuthService{authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
 				permAuthKeyID: {Layer: 225},
 			}}
@@ -257,12 +374,14 @@ func TestBindTempAuthKeyLayerPrecedenceAndRawShadow(t *testing.T) {
 			// this merged permanent primary; it must not derive or persist a winner
 			// from its process-local exact-session registry after Bind returns.
 			auth.bindTempHook = func(domain.TempAuthKeyBinding) error {
-				auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: tt.want, LayerObservationID: 42}
-				auth.authKeyClientInfos[permAuthKeyID] = domain.AuthKeyClientInfo{Layer: tt.want, LayerObservationID: 42}
+				layers.bind(rawAuthKeyID, permAuthKeyID)
+				merged, _, _ := layers.GetAuthKeyLayerDefault(context.Background(), permAuthKeyID)
+				auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: merged.Layer, LayerObservationID: merged.ObservationID}
+				auth.authKeyClientInfos[permAuthKeyID] = domain.AuthKeyClientInfo{Layer: merged.Layer, LayerObservationID: merged.ObservationID}
 				return nil
 			}
 			sessions := &inheritedLayerCaptureSessions{}
-			r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+			r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions, AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 			if tt.explicitLayer != 0 {
 				freezeAndPublishLayer(t, r, rawAuthKeyID, sessionID, 10, 1, tt.explicitLayer)
 				sessions.seeds = nil
@@ -291,18 +410,18 @@ func TestBindTempAuthKeyLayerPrecedenceAndRawShadow(t *testing.T) {
 			rawCached := r.authInfo[rawAuthKeyID]
 			permCached := r.authInfo[permAuthKeyID]
 			r.clientInfoMu.RUnlock()
-			if rawCached.layerObservationID != 42 || rawCached.layerObservationID != permCached.layerObservationID {
-				t.Fatalf("bound observation shadow = raw:%d perm:%d, want 42/42",
+			if rawCached.layerObservationID <= 0 || rawCached.layerObservationID != permCached.layerObservationID {
+				t.Fatalf("bound observation shadow = raw:%d perm:%d, want one positive shared observation",
 					rawCached.layerObservationID, permCached.layerObservationID)
 			}
 		})
 	}
 }
 
-func TestResolveInheritedAuthKeyLayerCachesTerminalMissingRows(t *testing.T) {
+func TestResolveInheritedAuthKeyLayerRevalidatesTerminalMissingRows(t *testing.T) {
 	authKeyID := [8]byte{0x61}
-	auth := &captureAuthService{authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo)}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	layers := newLayerEvidenceTestStore()
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 
 	for i := 0; i < 2; i++ {
 		layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
@@ -310,30 +429,23 @@ func TestResolveInheritedAuthKeyLayerCachesTerminalMissingRows(t *testing.T) {
 			t.Fatalf("resolve %d = (%d,%v,%v), want (0,false,nil)", i, layer, found, err)
 		}
 	}
-	if auth.authKeyInfoLookups != 1 || auth.authorizationLookups != 0 {
-		t.Fatalf("terminal missing lookups = auth_key:%d authorization:%d, want 1/0", auth.authKeyInfoLookups, auth.authorizationLookups)
+	if layers.reads != 2 {
+		t.Fatalf("terminal missing durable reads = %d, want one per new-session resolve", layers.reads)
 	}
 }
 
 func TestResolveInheritedBoundTempUnsupportedPermanentBlocksRawShadow(t *testing.T) {
 	rawAuthKeyID := [8]byte{0x62}
 	permAuthKeyID := [8]byte{0x63}
-	auth := &captureAuthService{
-		resolvedAuthKeyID: permAuthKeyID,
-		hasResolved:       true,
-		authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
-			rawAuthKeyID:  {Layer: 225},
-			permAuthKeyID: {Layer: 230},
-		},
-	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(rawAuthKeyID, 225, 1)
+	layers.seedDefault(permAuthKeyID, 230, 2)
+	layers.bind(rawAuthKeyID, permAuthKeyID)
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 
 	layer, authoritative, err := r.ResolveInheritedAuthKeyLayer(context.Background(), rawAuthKeyID)
 	if err != nil || !authoritative || layer != 0 {
 		t.Fatalf("bound future default = (%d,%v,%v), want (0,true,nil)", layer, authoritative, err)
-	}
-	if auth.authKeyInfoLookups != 1 {
-		t.Fatalf("canonical auth-key lookups = %d, want 1", auth.authKeyInfoLookups)
 	}
 }
 
@@ -341,6 +453,9 @@ func TestBindTempAuthKeyFuturePermanentClearsInheritedUntilFreshExplicit(t *test
 	rawAuthKeyID := [8]byte{0x62, 1}
 	permAuthKeyID := [8]byte{0x62, 2}
 	const sessionID = int64(621)
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(rawAuthKeyID, 225, 1)
+	layers.seedDefault(permAuthKeyID, 230, 44)
 	auth := &captureAuthService{
 		resolvedAuthKeyID: permAuthKeyID,
 		hasResolved:       true,
@@ -350,11 +465,12 @@ func TestBindTempAuthKeyFuturePermanentClearsInheritedUntilFreshExplicit(t *test
 		},
 	}
 	auth.bindTempHook = func(domain.TempAuthKeyBinding) error {
+		layers.bind(rawAuthKeyID, permAuthKeyID)
 		auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: 230, LayerObservationID: 44}
 		return nil
 	}
 	sessions := &inheritedLayerCaptureSessions{}
-	r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions, AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 	r.clientInfoMu.Lock()
 	r.rememberAuthClientLayerLocked(rawAuthKeyID, 225)
 	r.clientInfoMu.Unlock()
@@ -372,15 +488,15 @@ func TestBindTempAuthKeyFuturePermanentClearsInheritedUntilFreshExplicit(t *test
 	r.clientInfoMu.RLock()
 	blocked := r.authInfo[rawAuthKeyID]
 	r.clientInfoMu.RUnlock()
-	if blocked.layer != 0 || blocked.layerObservationID != 44 || !blocked.layerBlocked || !blocked.layerBlockedByAuthKey {
+	if blocked.layer != 230 || blocked.layerObservationID != 44 || !blocked.layerBlocked || !blocked.layerBlockedByAuthKey {
 		t.Fatalf("raw blocked shadow = %+v", blocked)
 	}
 
 	// A later in-window explicit selector is new wire evidence and may correct
 	// both the session and the permanent shared default.
 	freezeAndPublishLayer(t, r, rawAuthKeyID, sessionID, 20, 1, 225)
-	if got := auth.authKeyClientInfos[permAuthKeyID].Layer; got != 225 {
-		t.Fatalf("fresh explicit did not self-heal future default: %d", got)
+	if got, found, err := layers.GetAuthKeyLayerDefault(context.Background(), permAuthKeyID); err != nil || !found || got.Layer != 225 {
+		t.Fatalf("fresh explicit did not self-heal future default: (%+v,%v,%v)", got, found, err)
 	}
 	if got, found := r.cachedAuthKeyLayerDefault(rawAuthKeyID); !found || got != 225 {
 		t.Fatalf("raw default after self-heal = (%d,%v)", got, found)
@@ -389,10 +505,9 @@ func TestBindTempAuthKeyFuturePermanentClearsInheritedUntilFreshExplicit(t *test
 
 func TestSupportedExplicitEvidenceClearsUnsupportedCacheState(t *testing.T) {
 	authKeyID := [8]byte{0x63, 1}
-	auth := &captureAuthService{authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
-		authKeyID: {Layer: 230},
-	}}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(authKeyID, 230, 1)
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 	if layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID); err != nil || !found || layer != 0 {
 		t.Fatalf("future default = (%d,%v,%v), want (0,true,nil)", layer, found, err)
 	}
@@ -411,47 +526,80 @@ type inheritedLayerResolution struct {
 	err   error
 }
 
-type blockingLayerReadAuthService struct {
-	*captureAuthService
+type blockingLayerReadStore struct {
+	store.AuthKeySessionLayerStore
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
-	stale   domain.AuthKeyClientInfo
+	stale   store.AuthKeyLayerDefault
 }
 
-func (s *blockingLayerReadAuthService) AuthKeyClientInfo(ctx context.Context, _ [8]byte) (domain.AuthKeyClientInfo, bool, error) {
-	s.authKeyInfoLookups++
+func (s *blockingLayerReadStore) GetAuthKeyLayerDefault(ctx context.Context, _ [8]byte) (store.AuthKeyLayerDefault, bool, error) {
 	s.once.Do(func() { close(s.started) })
 	select {
 	case <-s.release:
 		return s.stale, true, nil
 	case <-ctx.Done():
-		return domain.AuthKeyClientInfo{}, false, ctx.Err()
+		return store.AuthKeyLayerDefault{}, false, ctx.Err()
 	}
 }
 
 func TestResolveInheritedLayerDoesNotReturnStaleSingleflightRead(t *testing.T) {
 	authKeyID := [8]byte{0x64}
 	const sessionID = int64(640)
-	auth := &blockingLayerReadAuthService{
-		captureAuthService: &captureAuthService{authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo)},
-		started:            make(chan struct{}),
-		release:            make(chan struct{}),
-		stale:              domain.AuthKeyClientInfo{Layer: 225},
+	primary := newLayerEvidenceTestStore()
+	primary.seedDefault(authKeyID, 225, 1)
+	layers := &blockingLayerReadStore{
+		AuthKeySessionLayerStore: primary,
+		started:                  make(chan struct{}),
+		release:                  make(chan struct{}),
+		stale:                    store.AuthKeyLayerDefault{Layer: 225, ObservationID: 1},
 	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 	resolved := make(chan inheritedLayerResolution, 1)
 	go func() {
 		layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
 		resolved <- inheritedLayerResolution{layer: layer, found: found, err: err}
 	}()
-	<-auth.started
+	<-layers.started
 
 	freezeAndPublishLayer(t, r, authKeyID, sessionID, 100, 2, 227)
-	close(auth.release)
+	close(layers.release)
 	got := <-resolved
 	if got.err != nil || !got.found || got.layer != 227 {
 		t.Fatalf("resolver returned stale DB value = (%d,%v,%v), want (227,true,nil)", got.layer, got.found, got.err)
+	}
+}
+
+func TestResolveInheritedLayerDoesNotUnblockNewerFutureObservation(t *testing.T) {
+	authKeyID := [8]byte{0x64, 3}
+	primary := newLayerEvidenceTestStore()
+	primary.seedDefault(authKeyID, 225, 1)
+	layers := &blockingLayerReadStore{
+		AuthKeySessionLayerStore: primary,
+		started:                  make(chan struct{}),
+		release:                  make(chan struct{}),
+		stale:                    store.AuthKeyLayerDefault{Layer: 225, ObservationID: 1},
+	}
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
+	resolved := make(chan inheritedLayerResolution, 1)
+	go func() {
+		layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), authKeyID)
+		resolved <- inheritedLayerResolution{layer: layer, found: found, err: err}
+	}()
+	<-layers.started
+
+	r.cacheAuthKeyClientInfo(authKeyID, clientSessionInfo{
+		layer:                 230,
+		layerObservationID:    2,
+		layerBlocked:          true,
+		layerBlockedByAuthKey: true,
+		authKeyInfoChecked:    true,
+	})
+	close(layers.release)
+	got := <-resolved
+	if got.err != nil || !got.found || got.layer != 0 {
+		t.Fatalf("resolver unblocked stale Layer over future observation = (%d,%v,%v)", got.layer, got.found, got.err)
 	}
 }
 
@@ -480,25 +628,26 @@ func TestBoundDurableResolveCannotProjectStalePermanentLayerOverNewObservation(t
 	}); err != nil {
 		t.Fatal(err)
 	}
-	auth := &blockingLayerReadAuthService{
-		captureAuthService: &captureAuthService{
-			resolvedAuthKeyID: permAuthKeyID,
-			hasResolved:       true,
-		},
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-		stale:   domain.AuthKeyClientInfo{Layer: 225, LayerObservationID: 1},
+	auth := &captureAuthService{
+		resolvedAuthKeyID: permAuthKeyID,
+		hasResolved:       true,
+	}
+	layers := &blockingLayerReadStore{
+		AuthKeySessionLayerStore: keys,
+		started:                  make(chan struct{}),
+		release:                  make(chan struct{}),
+		stale:                    store.AuthKeyLayerDefault{Layer: 225, ObservationID: 1},
 	}
 	sessions := &inheritedLayerCaptureSessions{}
 	r := New(Config{DC: 2}, Deps{
-		Auth: auth, Sessions: sessions, AuthKeySessionLayers: keys,
+		Auth: auth, Sessions: sessions, AuthKeySessionLayers: layers,
 	}, zaptest.NewLogger(t), clock.System)
 	resolved := make(chan inheritedLayerResolution, 1)
 	go func() {
 		layer, found, err := r.ResolveInheritedAuthKeyLayer(ctx, rawAuthKeyID)
 		resolved <- inheritedLayerResolution{layer: layer, found: found, err: err}
 	}()
-	<-auth.started
+	<-layers.started
 
 	msgID := int64((uint64(time.Now().UTC().Unix()) << 32) | 4)
 	if layer, gotMsgID, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(
@@ -509,7 +658,7 @@ func TestBoundDurableResolveCannotProjectStalePermanentLayerOverNewObservation(t
 	if err := r.PublishAdmittedLayerProfileEvidence(ctx, rawAuthKeyID, sessionID, msgID, 2, 1, 227); err != nil {
 		t.Fatal(err)
 	}
-	close(auth.release)
+	close(layers.release)
 	got := <-resolved
 	if got.err != nil || !got.found || got.layer != 227 {
 		t.Fatalf("bound resolver returned stale permanent read = (%d,%v,%v)", got.layer, got.found, got.err)
@@ -521,49 +670,10 @@ func TestBoundDurableResolveCannotProjectStalePermanentLayerOverNewObservation(t
 	}
 	r.clientInfoMu.RLock()
 	rawInfo := r.authInfo[rawAuthKeyID]
-	permInfo := r.authInfo[permAuthKeyID]
 	r.clientInfoMu.RUnlock()
-	for id, info := range map[[8]byte]clientSessionInfo{
-		rawAuthKeyID: rawInfo, permAuthKeyID: permInfo,
-	} {
-		if info.layer != permanent.Layer || info.layerObservationID != permanent.LayerObservationID {
-			t.Fatalf("cache %x = layer/obs %d/%d, durable %d/%d",
-				id, info.layer, info.layerObservationID, permanent.Layer, permanent.LayerObservationID)
-		}
-	}
-}
-
-func TestAdmittedLayerSequenceOrdersSharedDefaultAcrossSessions(t *testing.T) {
-	rawOld := [8]byte{0x65, 1}
-	rawNew := [8]byte{0x65, 2}
-	permAuthKeyID := [8]byte{0x65, 3}
-	auth := &captureAuthService{
-		resolvedAuthKeyID:  permAuthKeyID,
-		hasResolved:        true,
-		authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo),
-	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
-	if _, err := r.FreezeNegotiatedSessionLayerAt(rawOld, 1, 225, 10); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.FreezeNegotiatedSessionLayerAt(rawNew, 2, 227, 20); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := r.PublishAdmittedLayerProfileEvidence(context.Background(), rawNew, 2, 20, 2, 1, 227); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.PublishAdmittedLayerProfileEvidence(context.Background(), rawOld, 1, 10, 1, 1, 225); err != nil {
-		t.Fatal(err)
-	}
-	if got := auth.authKeyClientInfos[permAuthKeyID].Layer; got != 227 {
-		t.Fatalf("durable shared default rolled back = %d, want 227", got)
-	}
-	if got, ok := r.cachedAuthKeyLayerDefault(permAuthKeyID); !ok || got != 227 {
-		t.Fatalf("memory shared default = (%d,%v), want (227,true)", got, ok)
-	}
-	if got, ok := r.NegotiatedSessionLayer(rawOld, 1); !ok || got != 225 {
-		t.Fatalf("old live session changed = (%d,%v), want (225,true)", got, ok)
+	if rawInfo.layer != permanent.Layer || rawInfo.layerObservationID != permanent.LayerObservationID {
+		t.Fatalf("raw cache = layer/obs %d/%d, canonical durable %d/%d",
+			rawInfo.layer, rawInfo.layerObservationID, permanent.Layer, permanent.LayerObservationID)
 	}
 }
 
@@ -635,89 +745,20 @@ func TestDurableObservationOrdersLocalDefaultWhenAdmissionCommitsInReverse(t *te
 		t.Fatalf("durable permanent default = (%+v,%v,%v)", permanent, found, err)
 	}
 	r.clientInfoMu.RLock()
-	local := r.authInfo[permAuthKeyID]
+	local := r.authInfo[rawEarlierAdmission]
 	r.clientInfoMu.RUnlock()
 	if local.layer != permanent.Layer || local.layerObservationID != permanent.LayerObservationID {
-		t.Fatalf("local default = layer/obs %d/%d, durable %d/%d",
+		t.Fatalf("raw local default = layer/obs %d/%d, canonical durable %d/%d",
 			local.layer, local.layerObservationID, permanent.Layer, permanent.LayerObservationID)
 	}
 	lastSeed := 0
 	for _, seed := range sessions.seeds {
-		if seed.rawAuthKeyID == permAuthKeyID {
+		if seed.rawAuthKeyID == rawEarlierAdmission {
 			lastSeed = seed.layer
 		}
 	}
 	if lastSeed != 225 {
-		t.Fatalf("SessionManager permanent seed = %d, want 225", lastSeed)
-	}
-}
-
-type blockingLayerWriteAuthService struct {
-	*captureAuthService
-	mu         sync.Mutex
-	started    chan struct{}
-	release    chan struct{}
-	updates    int
-	blockFirst sync.Once
-}
-
-func (s *blockingLayerWriteAuthService) UpdateAuthKeyClientInfo(ctx context.Context, authKeyID [8]byte, info domain.AuthKeyClientInfo) error {
-	s.mu.Lock()
-	s.updates++
-	first := s.updates == 1
-	s.mu.Unlock()
-	if first {
-		s.blockFirst.Do(func() { close(s.started) })
-		select {
-		case <-s.release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.captureAuthService.UpdateAuthKeyClientInfo(ctx, authKeyID, info)
-}
-
-func (s *blockingLayerWriteAuthService) layer(authKeyID [8]byte) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.authKeyClientInfos[authKeyID].Layer
-}
-
-func TestAdmittedLayerPersistentWritesFollowAdmissionSequence(t *testing.T) {
-	rawOld := [8]byte{0x66, 1}
-	rawNew := [8]byte{0x66, 2}
-	permAuthKeyID := [8]byte{0x66, 3}
-	auth := &blockingLayerWriteAuthService{
-		captureAuthService: &captureAuthService{
-			resolvedAuthKeyID:  permAuthKeyID,
-			hasResolved:        true,
-			authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo),
-		},
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
-	if _, err := r.FreezeNegotiatedSessionLayerAt(rawOld, 1, 225, 10); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.FreezeNegotiatedSessionLayerAt(rawNew, 2, 227, 20); err != nil {
-		t.Fatal(err)
-	}
-
-	errs := make(chan error, 2)
-	go func() { errs <- r.PublishAdmittedLayerProfileEvidence(context.Background(), rawOld, 1, 10, 1, 1, 225) }()
-	<-auth.started
-	go func() { errs <- r.PublishAdmittedLayerProfileEvidence(context.Background(), rawNew, 2, 20, 2, 1, 227) }()
-	close(auth.release)
-	for i := 0; i < 2; i++ {
-		if err := <-errs; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := auth.layer(permAuthKeyID); got != 227 {
-		t.Fatalf("ordered durable default = %d, want 227", got)
+		t.Fatalf("SessionManager raw seed = %d, want 225", lastSeed)
 	}
 }
 
@@ -762,13 +803,20 @@ func TestAuthLayerEvidenceCapacityUsesExactSafeFloor(t *testing.T) {
 }
 
 func TestAdmittedLayerSafeFloorIsMonotonic(t *testing.T) {
-	r := New(Config{DC: 2}, Deps{}, zaptest.NewLogger(t), clock.System)
+	layers := newLayerEvidenceTestStore()
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
 	first := [8]byte{0x67, 1}
 	second := [8]byte{0x67, 2}
+	if _, _, _, err := r.AdvanceNegotiatedSessionLayerEvidence(context.Background(), first, 1, 225, 10); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.FreezeNegotiatedSessionLayerAt(first, 1, 225, 10); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.PublishAdmittedLayerProfileEvidence(context.Background(), first, 1, 10, 2, 2, 225); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := r.AdvanceNegotiatedSessionLayerEvidence(context.Background(), second, 2, 227, 20); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.FreezeNegotiatedSessionLayerAt(second, 2, 227, 20); err != nil {
@@ -786,27 +834,36 @@ func TestAdmittedLayerSafeFloorIsMonotonic(t *testing.T) {
 }
 
 func TestInvalidateAuthUserCachePreservesLayerEvidenceWatermark(t *testing.T) {
-	rawOld := [8]byte{0x68, 1}
 	permAuthKeyID := [8]byte{0x68, 2}
-	auth := &captureAuthService{
-		resolvedAuthKeyID:  permAuthKeyID,
-		hasResolved:        true,
-		authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo),
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(permAuthKeyID, 227, 2)
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
+	if layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), permAuthKeyID); err != nil || !found || layer != 227 {
+		t.Fatalf("seed resolve = (%d,%v,%v)", layer, found, err)
 	}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
-	freezeAndPublishLayer(t, r, permAuthKeyID, 2, 20, 2, 227)
 	r.invalidateAuthUserCache(permAuthKeyID)
-	freezeAndPublishLayer(t, r, rawOld, 1, 10, 1, 225)
-	if got := auth.authKeyClientInfos[permAuthKeyID].Layer; got != 227 {
-		t.Fatalf("authorization invalidation erased protocol order = %d, want 227", got)
+	r.clientInfoMu.Lock()
+	applied, err := r.claimAuthLayerDefaultEvidenceLocked(225, 1, true, permAuthKeyID)
+	r.clientInfoMu.Unlock()
+	if err != nil || applied {
+		t.Fatalf("older observation claim after invalidation = (%v,%v), want (false,nil)", applied, err)
+	}
+	if got, found := r.cachedAuthKeyLayerDefault(permAuthKeyID); !found || got != 227 {
+		t.Fatalf("authorization invalidation erased protocol order = (%d,%v)", got, found)
 	}
 }
 
 func TestStaleExactCorrectionSkipsSharedPublicationWithoutFailingRPC(t *testing.T) {
 	authKeyID := [8]byte{0x69}
-	auth := &captureAuthService{authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo)}
-	r := New(Config{DC: 2}, Deps{Auth: auth}, zaptest.NewLogger(t), clock.System)
+	layers := newLayerEvidenceTestStore()
+	r := New(Config{DC: 2}, Deps{AuthKeySessionLayers: layers}, zaptest.NewLogger(t), clock.System)
+	if _, _, _, err := r.AdvanceNegotiatedSessionLayerEvidence(context.Background(), authKeyID, 1, 225, 10); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.FreezeNegotiatedSessionLayerAt(authKeyID, 1, 225, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := r.AdvanceNegotiatedSessionLayerEvidence(context.Background(), authKeyID, 1, 227, 20); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.FreezeNegotiatedSessionLayerAt(authKeyID, 1, 227, 20); err != nil {
@@ -815,79 +872,14 @@ func TestStaleExactCorrectionSkipsSharedPublicationWithoutFailingRPC(t *testing.
 	if err := r.PublishAdmittedLayerProfileEvidence(context.Background(), authKeyID, 1, 10, 1, 1, 225); err != nil {
 		t.Fatalf("stale publication rejected immutable old RPC: %v", err)
 	}
-	if _, exists := auth.authKeyClientInfos[authKeyID]; exists {
-		t.Fatal("stale exact observation published durable default")
+	if _, found := r.cachedAuthKeyLayerDefault(authKeyID); found {
+		t.Fatal("stale exact observation published process-local default")
 	}
 	if err := r.PublishAdmittedLayerProfileEvidence(context.Background(), authKeyID, 1, 20, 2, 2, 227); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestBindTempAuthKeyUsesLiveExplicitLayerAfterExactTTL(t *testing.T) {
-	clk := &exactProfileTestClock{now: time.Unix(1_700_000_000, 0)}
-	rawAuthKeyID := [8]byte{0x6a, 1}
-	permAuthKeyID := [8]byte{0x6a, 2}
-	const sessionID = int64(106)
-	auth := &captureAuthService{authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
-		permAuthKeyID: {Layer: 225},
-	}}
-	auth.bindTempHook = func(domain.TempAuthKeyBinding) error {
-		// The durable raw observation was published before the in-process exact
-		// registry expired. Bind merges that observation into the permanent row.
-		auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: 227}
-		auth.authKeyClientInfos[permAuthKeyID] = domain.AuthKeyClientInfo{Layer: 227}
-		return nil
-	}
-	sessions := &inheritedLayerCaptureSessions{explicitLayer: 227, explicitMsgID: 100}
-	r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions}, zaptest.NewLogger(t), clk)
-	freezeAndPublishLayer(t, r, rawAuthKeyID, sessionID, 100, 5, 227)
-	sessions.seeds = nil
-	clk.advance(exactSessionProfileTTL + time.Second)
-	if _, ok := r.NegotiatedSessionLayer(rawAuthKeyID, sessionID); ok {
-		t.Fatal("test setup retained expired exact registry entry")
-	}
-
-	ctx := WithAuthKeyID(WithSessionID(WithRawAuthKeyID(context.Background(), rawAuthKeyID), sessionID), rawAuthKeyID)
-	ok, err := r.onAuthBindTempAuthKey(ctx, &tg.AuthBindTempAuthKeyRequest{PermAuthKeyID: businessAuthKeyInt64(permAuthKeyID)})
-	if err != nil || !ok {
-		t.Fatalf("bind after exact TTL = (%v,%v)", ok, err)
-	}
-	if got := auth.authKeyClientInfos[permAuthKeyID].Layer; got != 227 {
-		t.Fatalf("live explicit Layer was lost at bind = %d, want 227", got)
-	}
-	if len(sessions.refreshes) != 1 || sessions.refreshes[0].layer != 227 {
-		t.Fatalf("bind refresh calls = %+v", sessions.refreshes)
-	}
-}
-
-func TestNakedBindDoesNotRedateOlderExplicitEvidence(t *testing.T) {
-	rawAuthKeyID := [8]byte{0x6b, 1}
-	permAuthKeyID := [8]byte{0x6b, 2}
-	const sessionID = int64(107)
-	auth := &captureAuthService{authKeyClientInfos: make(map[[8]byte]domain.AuthKeyClientInfo)}
-	auth.bindTempHook = func(domain.TempAuthKeyBinding) error {
-		// The permanent observation is globally newer than the raw observation.
-		// Model the transaction's observation_id merge before the router reloads.
-		auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: 227}
-		auth.authKeyClientInfos[permAuthKeyID] = domain.AuthKeyClientInfo{Layer: 227}
-		return nil
-	}
-	sessions := &inheritedLayerCaptureSessions{explicitLayer: 225, explicitMsgID: 10}
-	r := New(Config{DC: 2}, Deps{Auth: auth, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
-	freezeAndPublishLayer(t, r, rawAuthKeyID, sessionID, 10, 1, 225)
-	freezeAndPublishLayer(t, r, permAuthKeyID, 2, 20, 2, 227)
-
-	ctx := WithAuthKeyID(WithSessionID(WithRawAuthKeyID(context.Background(), rawAuthKeyID), sessionID), rawAuthKeyID)
-	ctx = withLayerAdmissionSequence(ctx, 99) // naked bind order is not Layer evidence order.
-	ok, err := r.onAuthBindTempAuthKey(ctx, &tg.AuthBindTempAuthKeyRequest{PermAuthKeyID: businessAuthKeyInt64(permAuthKeyID)})
-	if err != nil || !ok {
-		t.Fatalf("naked bind = (%v,%v)", ok, err)
-	}
-	if got := auth.authKeyClientInfos[permAuthKeyID].Layer; got != 227 {
-		t.Fatalf("naked bind re-dated old explicit Layer = %d, want 227", got)
-	}
-	if got := auth.authKeyClientInfos[rawAuthKeyID].Layer; got != 227 {
-		t.Fatalf("raw inherited shadow did not normalize to permanent default = %d", got)
+	if got, found := r.cachedAuthKeyLayerDefault(authKeyID); !found || got != 227 {
+		t.Fatalf("fresh exact publication = (%d,%v)", got, found)
 	}
 }
 
@@ -971,6 +963,14 @@ func TestRequestBoundBindHasNoStoreCacheOrSessionSideEffects(t *testing.T) {
 
 func freezeAndPublishLayer(t *testing.T, r *Router, rawAuthKeyID [8]byte, sessionID, msgID int64, admissionSeq uint64, layer int) {
 	t.Helper()
+	if r.deps.AuthKeySessionLayers == nil {
+		r.deps.AuthKeySessionLayers = newLayerEvidenceTestStore()
+	}
+	if gotLayer, gotMsgID, _, err := r.AdvanceNegotiatedSessionLayerEvidence(
+		context.Background(), rawAuthKeyID, sessionID, layer, msgID,
+	); err != nil || gotLayer != layer || gotMsgID != msgID {
+		t.Fatalf("advance durable layer evidence = (%d,%d,%v), want (%d,%d,nil)", gotLayer, gotMsgID, err, layer, msgID)
+	}
 	if _, err := r.FreezeNegotiatedSessionLayerAt(rawAuthKeyID, sessionID, layer, msgID); err != nil {
 		t.Fatal(err)
 	}

@@ -50,6 +50,8 @@ func (s *captureDialogs) MutateAccountDialogs(_ context.Context, mutation store.
 		intents[i].Event.Pts = i + 1
 	}
 	snapshot.Effects = intents
+	s.mutations = append(s.mutations, mutation)
+	s.effects = append(s.effects, intents...)
 	return snapshot, nil
 }
 
@@ -85,6 +87,25 @@ type captureDialogs struct {
 		peer   domain.Peer
 	}
 	reorderNoChange bool
+	mutations       []store.DialogAccountMutation
+	effects         []store.DeliveryEffect
+}
+
+func (s *captureDialogs) capturedEvents() []domain.UpdateEvent {
+	events := make([]domain.UpdateEvent, 0, len(s.effects))
+	for _, effect := range s.effects {
+		events = append(events, effect.Event)
+	}
+	return events
+}
+
+func (s *captureDialogs) capturedEffectsHaveNoExclusion() bool {
+	for _, effect := range s.effects {
+		if effect.ExcludeAuthKeyID != ([8]byte{}) || effect.ExcludeSessionID != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *captureDialogs) InvalidateDialog(userID int64, peer domain.Peer) {

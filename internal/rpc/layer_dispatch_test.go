@@ -288,10 +288,12 @@ func TestLayerDispatchUnprofiledInvariantDoesNotPublishRepresentativeLayer(t *te
 			rawAuthKeyID: {Layer: 225, DeviceModel: "stale-device"},
 		},
 	}
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(rawAuthKeyID, 225, 1)
 	sessions := &layerCaptureSessions{}
 	r := New(
 		Config{DC: 2, IP: "127.0.0.1", Port: 2398},
-		Deps{Auth: auth, Sessions: sessions},
+		Deps{Auth: auth, Sessions: sessions, AuthKeySessionLayers: layers},
 		zaptest.NewLogger(t),
 		clock.System,
 	)
@@ -362,9 +364,11 @@ func TestLayerDispatchInheritedDefaultIsEffectiveWithoutBecomingExplicitEvidence
 	rawAuthKeyID := [8]byte{0x73}
 	const sessionID = int64(73)
 	auth := &captureAuthService{}
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(rawAuthKeyID, 225, 1)
 	r := New(
 		Config{DC: 2, IP: "127.0.0.1", Port: 2398},
-		Deps{Auth: auth},
+		Deps{Auth: auth, AuthKeySessionLayers: layers},
 		zaptest.NewLogger(t),
 		clock.System,
 	)
@@ -403,10 +407,12 @@ func TestLayerDispatchProfiledBareIgnoresStaleMetadataLayer(t *testing.T) {
 			rawAuthKeyID: {Layer: 227, DeviceModel: "newer-device-metadata"},
 		},
 	}
+	layers := newLayerEvidenceTestStore()
+	layers.seedDefault(authKeyIDFromInt64(1), 227, 1)
 	sessions := &layerCaptureSessions{}
 	r := New(
 		Config{DC: 2, IP: "127.0.0.1", Port: 2398},
-		Deps{Auth: auth, Sessions: sessions},
+		Deps{Auth: auth, Sessions: sessions, AuthKeySessionLayers: layers},
 		zaptest.NewLogger(t),
 		clock.System,
 	)
@@ -856,8 +862,8 @@ func TestPrepareAdmittedReplayDoesNotRollBackNewerExplicitLayerOrClientInfo(t *t
 	if layer, ok := r.NegotiatedSessionLayer(authKeyID, sessionID); !ok || layer != 227 {
 		t.Fatalf("exact session rolled back = (%d,%v), want (227,true)", layer, ok)
 	}
-	if got := auth.authKeyClientInfos[authKeyID].Layer; got != 227 {
-		t.Fatalf("durable default rolled back = %d, want 227", got)
+	if got, found, err := r.deps.AuthKeySessionLayers.GetAuthKeyLayerDefault(context.Background(), authKeyID); err != nil || !found || got.Layer != 227 {
+		t.Fatalf("durable default rolled back = (%+v,%v,%v), want Layer 227", got, found, err)
 	}
 	if calls := sessions.layerCallsSnapshot(); len(calls) != 0 {
 		t.Fatalf("Router replay touched edge-owned exact binder: %+v", calls)
@@ -913,8 +919,11 @@ func TestDelayedExplicitDispatchCannotRollBackAdmissionTimeLayerOrInitMetadata(t
 	if layer, msgID, ok := r.NegotiatedSessionLayerEvidence(authKeyID, sessionID); !ok || layer != 227 || msgID != 20 {
 		t.Fatalf("exact evidence after delayed dispatch = (%d,%d,%v), want (227,20,true)", layer, msgID, ok)
 	}
-	if got := auth.authKeyClientInfos[authKeyID]; got.Layer != 227 || got.DeviceModel != "New Desktop" || got.AppVersion != "new" {
+	if got := auth.authKeyClientInfos[authKeyID]; got.Layer != 0 || got.DeviceModel != "New Desktop" || got.AppVersion != "new" {
 		t.Fatalf("durable protocol metadata rolled back: %+v", got)
+	}
+	if got, found, err := r.deps.AuthKeySessionLayers.GetAuthKeyLayerDefault(context.Background(), authKeyID); err != nil || !found || got.Layer != 227 {
+		t.Fatalf("durable layer authority = (%+v,%v,%v), want Layer 227", got, found, err)
 	}
 	if calls := sessions.layerCallsSnapshot(); len(calls) != 0 {
 		t.Fatalf("handler dispatch duplicated/rolled back edge profile binding: %+v", calls)

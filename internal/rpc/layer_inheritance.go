@@ -298,6 +298,25 @@ func (r *Router) ResolveInheritedAuthKeyLayer(ctx context.Context, rawAuthKeyID 
 	if err != nil {
 		return 0, false, wrapLayerEvidenceStoreAvailability(err)
 	}
+	if !found {
+		return 0, false, nil
+	}
+	// A Redis read can start before a newer same-process explicit observation
+	// commits and return after it. resolveDurableAuthKeyLayerDefault merges the
+	// read by observation ID, so recheck that merged tuple before returning; the
+	// older read must not select a stale codec for the new connection.
+	r.clientInfoMu.RLock()
+	current := r.authInfo[rawAuthKeyID]
+	r.clientInfoMu.RUnlock()
+	if current.layerObservationID > 0 {
+		switch {
+		case isSupportedLayer(current.layer):
+			layer = current.layer
+		case current.layerBlocked:
+			layer = 0
+			found = true
+		}
+	}
 	return layer, found, nil
 }
 

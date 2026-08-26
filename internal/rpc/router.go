@@ -1732,7 +1732,10 @@ func mergeClientSessionInfo(base, fallback clientSessionInfo) clientSessionInfo 
 	if fallback.layerBlockedByAuthKey && base.layer == 0 {
 		base.layerBlockedByAuthKey = true
 	}
-	if base.layer != 0 {
+	// A future durable Layer retains its numeric value for observation ordering
+	// and diagnostics, but remains an authoritative blocked default. Only a
+	// generated/supported Layer clears that state.
+	if isSupportedLayer(base.layer) {
 		base.layerBlocked = false
 		base.layerBlockedByAuthKey = false
 	}

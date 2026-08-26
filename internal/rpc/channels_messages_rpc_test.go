@@ -377,9 +377,12 @@ func TestChannelDeleteRejectsInvalidMessageIDsRPC(t *testing.T) {
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 43, Phone: "15550002143", FirstName: "Owner"})
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 44, Phone: "15550002144", FirstName: "Friend"})
 	channelStore := memory.NewChannelStore()
+	delivery := memory.NewDeliveryOutboxStore()
+	channelStore.AttachDeliveryOutbox(delivery)
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(userStore),
-		Channels: appchannels.NewService(channelStore),
+		Users:          appusers.NewService(userStore),
+		Channels:       appchannels.NewService(channelStore),
+		DeliveryOutbox: delivery,
 	}, zaptest.NewLogger(t), clock.System)
 	created, err := r.onMessagesCreateChat(WithUserID(ctx, owner.ID), &tg.MessagesCreateChatRequest{
 		Users: []tg.InputUserClass{&tg.InputUser{UserID: friend.ID, AccessHash: friend.AccessHash}},

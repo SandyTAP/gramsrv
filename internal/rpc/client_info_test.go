@@ -45,7 +45,7 @@ func TestNormalizeClientInfoUsesRuneLimitsAndProducesValidUTF8(t *testing.T) {
 	}
 }
 
-func TestNormalizedClientInfoIsSharedByAuthPersistencePaths(t *testing.T) {
+func TestNormalizedClientInfoIsSharedWhileProtocolLayerUsesSeparateAuthority(t *testing.T) {
 	authKeyID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 	ctx := WithLayer(context.Background(), 227)
 	ctx = WithAuthKeyID(ctx, authKeyID)
@@ -71,9 +71,11 @@ func TestNormalizedClientInfoIsSharedByAuthPersistencePaths(t *testing.T) {
 		authz.SystemVersion != authKeyInfo.SystemVersion ||
 		authz.AppVersion != authKeyInfo.AppVersion ||
 		authz.Platform != authKeyInfo.Platform ||
-		authz.APIID != authKeyInfo.APIID ||
-		authz.Layer != authKeyInfo.Layer {
+		authz.APIID != authKeyInfo.APIID {
 		t.Fatalf("authorization metadata %+v differs from auth-key metadata %+v", authz, authKeyInfo)
+	}
+	if authz.Layer != 227 || authKeyInfo.Layer != 0 {
+		t.Fatalf("layer ownership = authorization:%d auth-key-client-info:%d, want 227/0 with durable session layer authority", authz.Layer, authKeyInfo.Layer)
 	}
 }
 

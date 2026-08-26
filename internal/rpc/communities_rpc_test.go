@@ -125,10 +125,13 @@ func TestCommunityDialogsSharePinnedLimit(t *testing.T) {
 	}
 	channels := memory.NewChannelStore()
 	channelService := appchannels.NewService(channels)
-	communityService := appcommunities.NewService(memory.NewCommunityStore(users, channels, nil, nil, memory.NewDeliveryOutboxStore()))
+	communityStore := memory.NewCommunityStore(users, channels, nil, nil, memory.NewDeliveryOutboxStore())
+	communityService := appcommunities.NewService(communityStore)
+	dialogStore := memory.NewDialogStore()
+	dialogStore.BindDialogAggregateStores(channels, communityStore)
 	r := New(Config{}, Deps{
 		Users: appusers.NewService(users), Channels: channelService,
-		Communities: communityService, Dialogs: appdialogs.NewService(memory.NewDialogStore(), channels),
+		Communities: communityService, Dialogs: appdialogs.NewService(dialogStore, channels),
 	}, zaptest.NewLogger(t), clock.System)
 
 	inputs := make([]*tg.InputChannel, 0, domain.MaxPinnedDialogsMainFolder)
