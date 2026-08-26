@@ -549,7 +549,7 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
 | `TELESRV_OUTBOX_WORKERS` | int / `4` | 并发 outbox worker 数；稳定逻辑分片保持单用户 pts 顺序。 |
-| `TELESRV_OUTBOX_BATCH` | int / `100` | 每次 poll 最大 claim 行数；增大提高吞吐，也增加 DB/推送突发。 |
+| `TELESRV_OUTBOX_BATCH` | int / `10` | 每次 poll 最大 claim 行数；默认限制 completion 同时持有的用户 lane fence 数，避免大批次跨用户锁车队。 |
 | `TELESRV_OUTBOX_INTERVAL` | duration / `200ms` | 两次 outbox claim 之间的等待。 |
 | `TELESRV_OUTBOX_LEASE_TIMEOUT` | duration / `30s` | `dispatching` 行可被重新 claim 的超时；必须大于最坏单批投递耗时。 |
 | `TELESRV_OUTBOX_POISON_RETENTION` | duration / `1m` | terminal failed 投递头的排障保留窗口；durable update 仍可经 difference 恢复。 |

@@ -706,8 +706,9 @@ WITH doomed AS MATERIALIZED (
   FROM dispatch_outbox_user_heads h
   WHERE h.status = 'failed'
     AND h.updated_at < now() - make_interval(secs => $1::int)
+    AND h.target_user_id = ANY($2::bigint[])
   ORDER BY h.updated_at ASC, h.target_user_id ASC, h.head_id ASC
-  LIMIT $2
+  LIMIT $3
   FOR UPDATE OF h SKIP LOCKED
 ),
 deleted AS (
@@ -723,6 +724,7 @@ FROM deleted
 
 type DeleteFailedDispatchOutboxParams struct {
 	OlderThanSeconds int32
+	TargetUserIds    []int64
 	LimitCount       int32
 }
 
@@ -730,7 +732,7 @@ type DeleteFailedDispatchOutboxParams struct {
 // claim/completion 保持同一 user_heads→outbox 锁序。删除的只是在线任务，durable
 // user_update_events 不动，故客户端仍可经 difference 恢复。
 func (q *Queries) DeleteFailedDispatchOutbox(ctx context.Context, arg DeleteFailedDispatchOutboxParams) (int32, error) {
-	row := q.db.QueryRow(ctx, deleteFailedDispatchOutbox, arg.OlderThanSeconds, arg.LimitCount)
+	row := q.db.QueryRow(ctx, deleteFailedDispatchOutbox, arg.OlderThanSeconds, arg.TargetUserIds, arg.LimitCount)
 	var deleted_count int32
 	err := row.Scan(&deleted_count)
 	return deleted_count, err

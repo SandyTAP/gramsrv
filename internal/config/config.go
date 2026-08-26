@@ -853,7 +853,7 @@ func Load() (Config, error) {
 		ChannelBoostCacheTTL:          envDurationOr("TELESRV_CHANNEL_BOOST_CACHE_TTL", 10*time.Second),
 
 		OutboxWorkers:         envIntOr("TELESRV_OUTBOX_WORKERS", 4),
-		OutboxBatch:           envIntOr("TELESRV_OUTBOX_BATCH", 100),
+		OutboxBatch:           envIntOr("TELESRV_OUTBOX_BATCH", 10),
 		OutboxInterval:        envDurationOr("TELESRV_OUTBOX_INTERVAL", 200*time.Millisecond),
 		OutboxLeaseTimeout:    envDurationOr("TELESRV_OUTBOX_LEASE_TIMEOUT", 30*time.Second),
 		OutboxPoisonRetention: envDurationOr("TELESRV_OUTBOX_POISON_RETENTION", time.Minute),

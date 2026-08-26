@@ -46,11 +46,14 @@ func TestStarGiftLifecycleMigrationsApply(t *testing.T) {
 	if dsn == "" {
 		t.Skip("set TELESRV_TEST_POSTGRES_DSN to run postgres integration test")
 	}
+
 	head := headMigrationVersion(t)
+
 	status, err := MigrateAndStatus(dsn)
 	if err != nil {
 		t.Fatalf("migrate star gift lifecycle schema: %v", err)
 	}
+
 	if status.Dirty || status.Empty || status.Version != head {
 		t.Fatalf("migration status = %+v, want clean version %d", status, head)
 	}

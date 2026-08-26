@@ -470,6 +470,14 @@ func (a loginCodeFixedBoxAllocator) NextBoxID(context.Context, int64) (int, erro
 	return a.boxID, nil
 }
 
+func (a loginCodeFixedBoxAllocator) NextBoxIDs(_ context.Context, userIDs []int64) (map[int64]int, error) {
+	out := make(map[int64]int, len(userIDs))
+	for _, userID := range userIDs {
+		out[userID] = a.boxID
+	}
+	return out, nil
+}
+
 func (a loginCodeFixedBoxAllocator) CurrentBoxID(context.Context, int64) (int, error) {
 	return a.boxID, nil
 }
