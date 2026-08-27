@@ -710,6 +710,14 @@ type StarGiftAuctionUserState struct {
 	MinBidAmount  int64
 	BidPeer       Peer
 	AcquiredCount int
+	// BidVersion is this bidder's own generation counter for this auction. It is
+	// bumped by every write to their bid row — placing it, raising it, winning a
+	// round, being refunded — and by nothing anyone else does. Payment forms are
+	// bound to it so a bid placed after the previous one was settled can never
+	// reuse the settled bid's durable payment receipt. It is deliberately kept
+	// after the bid goes inactive, because that is exactly the case the binding
+	// has to separate. Not projected to clients.
+	BidVersion int64
 }
 
 type StarGiftAuctionBidRequest struct {

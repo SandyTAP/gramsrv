@@ -1057,12 +1057,26 @@ VALUES($1,$2,$3,$4,$5,$6)`, req.UserID, req.FormID, req.GiftID, req.BidAmount, b
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
-			if replayBalance, found, replayErr := s.loadAuctionBidReplay(ctx, req.UserID, req.FormID, req.GiftID); replayErr != nil || found {
+			replayBalance, found, replayErr := s.loadAuctionBidReplay(ctx, req.UserID, req.FormID, req.GiftID)
+			if replayErr != nil {
+				return domain.StarGiftAuction{}, domain.StarsBalance{}, replayErr
+			}
+			if found {
 				state, stateErr := s.loadStarGiftAuction(ctx, req.UserID, req.GiftID)
-				if replayErr != nil {
-					return domain.StarGiftAuction{}, domain.StarsBalance{}, replayErr
-				}
 				return state, replayBalance, stateErr
+			}
+			// The form was spent on a bid that has since been settled. Its receipt is
+			// still there — it is the durable proof the stars were taken — so the
+			// payment insert could never land and the whole bid rolled back. Report an
+			// unavailable bid instead of leaking a constraint violation: the bidder has
+			// to open a fresh form, which is what binding the form to their bid
+			// generation makes them do.
+			spent, spentErr := s.auctionBidFormSpent(ctx, req.UserID, req.FormID)
+			if spentErr != nil {
+				return domain.StarGiftAuction{}, domain.StarsBalance{}, spentErr
+			}
+			if spent {
+				return domain.StarGiftAuction{}, domain.StarsBalance{}, domain.ErrStarGiftAuctionUnavailable
 			}
 		}
 		return domain.StarGiftAuction{}, domain.StarsBalance{}, err
@@ -1172,14 +1186,22 @@ ORDER BY amount DESC,bid_date,bidder_user_id LIMIT 3`, giftID)
 	topRows.Close()
 	var peerType string
 	var active bool
-	err = s.db.QueryRow(ctx, `SELECT returned,active,amount,bid_date,recipient_peer_type,recipient_peer_id,acquired_count
+	err = s.db.QueryRow(ctx, `SELECT returned,active,amount,bid_date,recipient_peer_type,recipient_peer_id,acquired_count,version
 FROM star_gift_auction_bids WHERE gift_id=$1 AND bidder_user_id=$2`, giftID, userID).Scan(&out.UserState.Returned,
-		&active, &out.UserState.BidAmount, &out.UserState.BidDate, &peerType, &out.UserState.BidPeer.ID, &out.UserState.AcquiredCount)
+		&active, &out.UserState.BidAmount, &out.UserState.BidDate, &peerType, &out.UserState.BidPeer.ID,
+		&out.UserState.AcquiredCount, &out.UserState.BidVersion)
 	if err == nil {
-		if active || out.UserState.Returned {
+		if active {
 			out.UserState.BidPeer.Type = domain.PeerType(peerType)
 			out.UserState.MinBidAmount = out.UserState.BidAmount + 1
 		} else {
+			// An inactive row is a settled round: the bidder either won and was
+			// charged or was refunded. Either way they hold no reservation, so the
+			// bid group must not be reported as live — `returned` (its own TL flag)
+			// still tells the client their stars came back. Reporting the settled
+			// amount here also locked refunded bidders out of the auction: the RPC
+			// gate rejects a fresh bid while a bid amount is present, and the store
+			// rejects an update while the row is inactive, leaving no accepted call.
 			out.UserState.BidAmount, out.UserState.BidDate, out.UserState.BidPeer = 0, 0, domain.Peer{}
 		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1189,9 +1211,9 @@ FROM star_gift_auction_bids WHERE gift_id=$1 AND bidder_user_id=$2`, giftID, use
 }
 
 func (s *StarGiftLifecycleStore) loadAuctionBidReplay(ctx context.Context, userID, formID, giftID int64) (domain.StarsBalance, bool, error) {
-	var storedGiftID, balance int64
-	err := s.db.QueryRow(ctx, `SELECT gift_id,balance_after FROM star_gift_auction_bid_payments WHERE user_id=$1 AND form_id=$2`, userID, formID).
-		Scan(&storedGiftID, &balance)
+	var storedGiftID, storedAmount, balance int64
+	err := s.db.QueryRow(ctx, `SELECT gift_id,bid_amount,balance_after FROM star_gift_auction_bid_payments WHERE user_id=$1 AND form_id=$2`, userID, formID).
+		Scan(&storedGiftID, &storedAmount, &balance)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.StarsBalance{}, false, nil
 	}
@@ -1201,7 +1223,43 @@ func (s *StarGiftLifecycleStore) loadAuctionBidReplay(ctx context.Context, userI
 	if storedGiftID != giftID {
 		return domain.StarsBalance{}, false, domain.ErrStarGiftAuctionUnavailable
 	}
+	// A receipt only answers for a bid the bidder still holds. Round settlement
+	// clears `active` — the reservation was either spent on an award or refunded —
+	// so a receipt whose bid is gone describes a finished round, not the bid being
+	// submitted now. Answering it as a replay reported success while
+	// star_gift_auction_bids.active stayed false, leaving the bidder out of the
+	// auction with their stars untouched. Form ids are bound to the bidder's own bid
+	// generation (rpc.starGiftAuctionBidFormID), so a live path never presents a
+	// settled form; this is the second gate, and it is what keeps a stale form from
+	// being mistaken for the new bid.
+	var active bool
+	var liveAmount int64
+	err = s.db.QueryRow(ctx, `SELECT active,amount FROM star_gift_auction_bids WHERE gift_id=$1 AND bidder_user_id=$2`,
+		giftID, userID).Scan(&active, &liveAmount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StarsBalance{}, false, nil
+	}
+	if err != nil {
+		return domain.StarsBalance{}, false, err
+	}
+	if !active || liveAmount != storedAmount {
+		return domain.StarsBalance{}, false, nil
+	}
 	return domain.StarsBalance{UserID: userID, Balance: balance}, true, nil
+}
+
+// auctionBidFormSpent reports whether this bidder already paid against this form,
+// regardless of what became of the bid it bought.
+func (s *StarGiftLifecycleStore) auctionBidFormSpent(ctx context.Context, userID, formID int64) (bool, error) {
+	var one int
+	err := s.db.QueryRow(ctx, `SELECT 1 FROM star_gift_auction_bid_payments WHERE user_id=$1 AND form_id=$2`, userID, formID).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func maxInt64(a, b int64) int64 {
