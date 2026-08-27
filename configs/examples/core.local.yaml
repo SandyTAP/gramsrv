@@ -16,6 +16,18 @@ public:
   app_scheme: telesrv
   web_base_url: https://weba.telesrv.net
 
+branding:
+  product_name: Telesrv
+  product_username: telesrv
+  desktop_app_name: Telesrv Desktop
+  android_app_name: Telesrv Android
+  ios_app_name: Telesrv iOS
+  macos_app_name: Telesrv macOS
+  web_a_app_name: Telesrv Web A
+  web_k_app_name: Telesrv Web K
+  premium_name: Telesrv Premium
+  stars_name: Telesrv Stars
+
 postgres:
   dsn: ${TELESRV_POSTGRES_DSN}
 
@@ -73,7 +85,3 @@ star_gifts:
   # local preserves the existing same-origin export flow; ton is opt-in.
   export:
     mode: local
-
-storage:
-  blob_backend: localfs
-  blob_dir: data/blobs

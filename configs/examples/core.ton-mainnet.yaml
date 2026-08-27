@@ -16,6 +16,18 @@ public:
   app_scheme: telesrv
   web_base_url: https://${TELESRV_WEB_HOST}
 
+branding:
+  product_name: Telesrv
+  product_username: telesrv
+  desktop_app_name: Telesrv Desktop
+  android_app_name: Telesrv Android
+  ios_app_name: Telesrv iOS
+  macos_app_name: Telesrv macOS
+  web_a_app_name: Telesrv Web A
+  web_k_app_name: Telesrv Web K
+  premium_name: Telesrv Premium
+  stars_name: Telesrv Stars
+
 postgres:
   dsn: ${TELESRV_POSTGRES_DSN}
 
@@ -96,7 +108,3 @@ star_gifts:
         enabled: true
         bot_token_file: ${TELESRV_TON_CLAIM_BOT_TOKEN_FILE}
         init_data_ttl: 15m
-
-storage:
-  blob_backend: localfs
-  blob_dir: data/blobs
