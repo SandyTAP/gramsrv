@@ -26,6 +26,9 @@ type EgressYAML struct {
 // LoadEgress reads the Egress role YAML config and returns the runtime snapshot used by the Egress process.
 func LoadEgress() (EgressConfig, error) {
 	cfg, err := loadRoleYAML(roleEgress, func(b *envBuilder, y EgressConfigYAML) error {
+		if err := requireYAMLVersion(y.Version); err != nil {
+			return err
+		}
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}

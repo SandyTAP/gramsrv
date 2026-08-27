@@ -68,6 +68,9 @@ type EdgeEgressYAML struct {
 // LoadEdge reads the Edge role YAML config and returns the runtime snapshot used by the Edge process.
 func LoadEdge() (EdgeConfig, error) {
 	cfg, err := loadRoleYAML(roleEdge, func(b *envBuilder, y EdgeConfigYAML) error {
+		if err := requireYAMLVersion(y.Version); err != nil {
+			return err
+		}
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}

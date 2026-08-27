@@ -12,6 +12,7 @@ import (
 type CoreConfigYAML struct {
 	Version       int `yaml:"version"`
 	CommonYAML    `yaml:",inline"`
+	Branding      BrandingYAML      `yaml:"branding"`
 	CoreExec      GRPCServerYAML    `yaml:"core_exec"`
 	FileData      GRPCClientYAML    `yaml:"file_data"`
 	GroupCall     GroupCallYAML     `yaml:"group_call"`
@@ -28,7 +29,6 @@ type CoreConfigYAML struct {
 	AI            AIYAML            `yaml:"ai"`
 	Translation   TranslationYAML   `yaml:"translation"`
 	StarGifts     StarGiftsYAML     `yaml:"star_gifts"`
-	Storage       StorageYAML       `yaml:"storage"`
 }
 
 type GroupCallYAML struct {
@@ -740,9 +740,13 @@ func coreConfigFromConfig(c Config) CoreConfig {
 func LoadCore() (CoreConfig, error) {
 	var starGiftTONAllowUserIDs []int64
 	cfg, err := loadRoleYAML(roleCore, func(b *envBuilder, y CoreConfigYAML) error {
+		if err := requireYAMLVersion(y.Version); err != nil {
+			return err
+		}
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}
+		applyBrandingYAML(b, y.Branding)
 		applyCoreExecServerYAML(b, y.CoreExec)
 		if err := applyFileClientYAML(b, y.FileData); err != nil {
 			return err
@@ -797,7 +801,7 @@ func LoadCore() (CoreConfig, error) {
 		if err != nil {
 			return err
 		}
-		return applyStorageYAML(b, y.Storage)
+		return nil
 	})
 	if err != nil {
 		return CoreConfig{}, err

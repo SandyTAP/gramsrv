@@ -61,6 +61,9 @@ func LoadAdmin() (AdminConfig, error) {
 }
 
 func adminConfigFromYAML(y AdminConfigYAML) (AdminConfig, error) {
+	if err := requireYAMLVersion(y.Version); err != nil {
+		return AdminConfig{}, err
+	}
 	permissions := trimStringList(y.Admin.UI.Permissions)
 	if len(permissions) == 0 {
 		permissions = []string{adminPermissionAll}

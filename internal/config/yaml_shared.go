@@ -28,7 +28,6 @@ type CommonYAML struct {
 	Instance InstanceYAML `yaml:"instance"`
 	Debug    DebugYAML    `yaml:"debug"`
 	Public   PublicYAML   `yaml:"public"`
-	Branding BrandingYAML `yaml:"branding"`
 	Postgres PostgresYAML `yaml:"postgres"`
 	Redis    RedisYAML    `yaml:"redis"`
 }
@@ -120,6 +119,13 @@ func newEnvBuilder() *envBuilder {
 	return &envBuilder{values: map[string]string{}}
 }
 
+func requireYAMLVersion(version int) error {
+	if version != 1 {
+		return fmt.Errorf("version must be 1")
+	}
+	return nil
+}
+
 func (b *envBuilder) source() envSource {
 	return newEnvSource(b.values, false)
 }
@@ -200,17 +206,6 @@ func applyCommonYAML(b *envBuilder, y CommonYAML) error {
 	b.setString("TELESRV_PUBLIC_WEB_BASE_URL", y.Public.WebBaseURL)
 	b.setString("TELESRV_PUBLIC_APP_NAME", y.Public.AppName)
 
-	b.setString("TELESRV_BRAND_PRODUCT_NAME", y.Branding.ProductName)
-	b.setString("TELESRV_BRAND_PRODUCT_USERNAME", y.Branding.ProductUsername)
-	b.setString("TELESRV_BRAND_DESKTOP_APP_NAME", y.Branding.DesktopAppName)
-	b.setString("TELESRV_BRAND_ANDROID_APP_NAME", y.Branding.AndroidAppName)
-	b.setString("TELESRV_BRAND_IOS_APP_NAME", y.Branding.IOSAppName)
-	b.setString("TELESRV_BRAND_MACOS_APP_NAME", y.Branding.MacOSAppName)
-	b.setString("TELESRV_BRAND_WEB_A_APP_NAME", y.Branding.WebAAppName)
-	b.setString("TELESRV_BRAND_WEB_K_APP_NAME", y.Branding.WebKAppName)
-	b.setString("TELESRV_BRAND_PREMIUM_NAME", y.Branding.PremiumName)
-	b.setString("TELESRV_BRAND_STARS_NAME", y.Branding.StarsName)
-
 	b.setString("TELESRV_POSTGRES_DSN", y.Postgres.DSN)
 	b.setInt("TELESRV_POSTGRES_MAX_CONNS", y.Postgres.MaxConns)
 	b.setInt("TELESRV_POSTGRES_MIN_CONNS", y.Postgres.MinConns)
@@ -219,6 +214,19 @@ func applyCommonYAML(b *envBuilder, y CommonYAML) error {
 	b.setString("TELESRV_REDIS_PASSWORD", y.Redis.Password)
 	b.setInt("TELESRV_REDIS_DB", y.Redis.DB)
 	return nil
+}
+
+func applyBrandingYAML(b *envBuilder, y BrandingYAML) {
+	b.setString("TELESRV_BRAND_PRODUCT_NAME", y.ProductName)
+	b.setString("TELESRV_BRAND_PRODUCT_USERNAME", y.ProductUsername)
+	b.setString("TELESRV_BRAND_DESKTOP_APP_NAME", y.DesktopAppName)
+	b.setString("TELESRV_BRAND_ANDROID_APP_NAME", y.AndroidAppName)
+	b.setString("TELESRV_BRAND_IOS_APP_NAME", y.IOSAppName)
+	b.setString("TELESRV_BRAND_MACOS_APP_NAME", y.MacOSAppName)
+	b.setString("TELESRV_BRAND_WEB_A_APP_NAME", y.WebAAppName)
+	b.setString("TELESRV_BRAND_WEB_K_APP_NAME", y.WebKAppName)
+	b.setString("TELESRV_BRAND_PREMIUM_NAME", y.PremiumName)
+	b.setString("TELESRV_BRAND_STARS_NAME", y.StarsName)
 }
 
 func applyCoreExecServerYAML(b *envBuilder, y GRPCServerYAML) {

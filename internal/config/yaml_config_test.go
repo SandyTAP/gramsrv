@@ -5,9 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 func TestLoadEdgeReadsRoleYAMLWithoutProcessEnvOverride(t *testing.T) {
@@ -85,6 +88,91 @@ edge:
 	t.Setenv("TELESRV_CONFIG", path)
 	if _, err := LoadEdge(); err == nil || !strings.Contains(err.Error(), "typo_field") {
 		t.Fatalf("LoadEdge err = %v, want unknown field rejection", err)
+	}
+}
+
+func TestEveryRoleRequiresYAMLVersionOne(t *testing.T) {
+	tests := []struct {
+		name string
+		load func() error
+	}{
+		{name: "edge", load: func() error { _, err := LoadEdge(); return err }},
+		{name: "core", load: func() error { _, err := LoadCore(); return err }},
+		{name: "egress", load: func() error { _, err := LoadEgress(); return err }},
+		{name: "file", load: func() error { _, err := LoadFile(); return err }},
+		{name: "sfu", load: func() error { _, err := LoadSFU(); return err }},
+		{name: "admin", load: func() error { _, err := LoadAdmin(); return err }},
+		{name: "ton", load: func() error { _, err := LoadTON(); return err }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeRoleYAML(t, tt.name+".yaml", "version: 2")
+			t.Setenv("TELESRV_CONFIG", path)
+			if err := tt.load(); err == nil || !strings.Contains(err.Error(), "version must be 1") {
+				t.Fatalf("load err = %v, want version rejection", err)
+			}
+		})
+	}
+}
+
+func TestLoadCoreRejectsFileStorageConfiguration(t *testing.T) {
+	path := writeRoleYAML(t, "core-with-file-storage.yaml", `
+version: 1
+storage:
+  blob_backend: s3
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+	if _, err := LoadCore(); err == nil || !strings.Contains(err.Error(), "field storage not found") {
+		t.Fatalf("LoadCore err = %v, want strict rejection of File-owned storage config", err)
+	}
+}
+
+func TestLoadNonCoreRejectsBrandingConfiguration(t *testing.T) {
+	path := writeRoleYAML(t, "file-with-core-branding.yaml", `
+version: 1
+branding:
+  product_name: Wrong Owner
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+	if _, err := LoadFile(); err == nil || !strings.Contains(err.Error(), "field branding not found") {
+		t.Fatalf("LoadFile err = %v, want strict rejection of Core-owned branding config", err)
+	}
+}
+
+func TestLoadCoreReadsBrandingYAML(t *testing.T) {
+	path := writeRoleYAML(t, "core-branding.yaml", `
+version: 1
+public:
+  base_url: https://chat.example.test
+branding:
+  product_name: Example Chat
+  product_username: example_chat
+  desktop_app_name: Example Desktop
+  android_app_name: Example Android
+  ios_app_name: Example iOS
+  macos_app_name: Example macOS
+  web_a_app_name: Example Web A
+  web_k_app_name: Example Web K
+  premium_name: Example Plus
+  stars_name: Example Credits
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+
+	cfg, err := LoadCore()
+	if err != nil {
+		t.Fatalf("LoadCore: %v", err)
+	}
+	brand := cfg.Branding
+	if brand.ProductName != "Example Chat" || brand.ProductUsername != "example_chat" ||
+		brand.DesktopAppName != "Example Desktop" || brand.AndroidAppName != "Example Android" ||
+		brand.IOSAppName != "Example iOS" || brand.MacOSAppName != "Example macOS" ||
+		brand.WebAAppName != "Example Web A" || brand.WebKAppName != "Example Web K" ||
+		brand.PremiumName != "Example Plus" || brand.StarsName != "Example Credits" ||
+		brand.PublicBaseURL != "https://chat.example.test" {
+		t.Fatalf("Branding = %+v", brand)
+	}
+	if cfg.PublicAppName != brand.ProductName || cfg.SMTPFromName != brand.ProductName {
+		t.Fatalf("brand-derived defaults = public app %q smtp from %q", cfg.PublicAppName, cfg.SMTPFromName)
 	}
 }
 
@@ -382,6 +470,43 @@ media:
 	}
 }
 
+func TestLoadFileReadsCompleteS3YAML(t *testing.T) {
+	path := writeRoleYAML(t, "file-s3.yaml", `
+version: 1
+storage:
+  blob_backend: s3
+  blob_staging_dir: data/blob-staging
+  s3:
+    endpoint: minio.example.test:9000
+    region: eu-west-1
+    bucket: telesrv-media
+    access_key_id: access
+    secret_access_key: secret
+    use_ssl: false
+    path_style: true
+    create_bucket: true
+  low_space_guard_enabled: true
+  min_free_bytes: 4096
+  max_total_bytes: 8192
+  usage_refresh_interval: 17s
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+
+	cfg, err := LoadFile()
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if cfg.BlobBackendKind != "s3" || cfg.BlobStagingDir != "data/blob-staging" ||
+		cfg.S3Endpoint != "minio.example.test:9000" || cfg.S3Region != "eu-west-1" ||
+		cfg.S3Bucket != "telesrv-media" || cfg.S3AccessKeyID != "access" || cfg.S3SecretAccessKey != "secret" ||
+		cfg.S3UseSSL || !cfg.S3PathStyle || !cfg.S3CreateBucket {
+		t.Fatal("S3 config was not preserved")
+	}
+	if !cfg.StorageLowSpaceGuardEnable || cfg.StorageMinFreeBytes != 4096 || cfg.StorageMaxTotalBytes != 8192 || cfg.StorageUsageRefreshInterval != 17*time.Second {
+		t.Fatalf("S3 capacity config = enabled:%v min:%d max:%d interval:%s", cfg.StorageLowSpaceGuardEnable, cfg.StorageMinFreeBytes, cfg.StorageMaxTotalBytes, cfg.StorageUsageRefreshInterval)
+	}
+}
+
 func TestLoadExampleRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "core-secret")
 	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
@@ -460,12 +585,27 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://example.test")
 	t.Setenv("TELESRV_PUBLIC_APP_SCHEME", "telesrv")
 	t.Setenv("TELESRV_PUBLIC_WEB_BASE_URL", "https://web.example.test")
-	t.Setenv("TELESRV_BLOB_BACKEND", "localfs")
+	t.Setenv("TELESRV_BLOB_BACKEND", "s3")
 	t.Setenv("TELESRV_EXTERNAL_MEDIA_ENABLE", "true")
 	t.Setenv("TELESRV_WEBPAGE_PREVIEW_ENABLE", "true")
-	t.Setenv("TELESRV_S3_USE_SSL", "true")
-	t.Setenv("TELESRV_S3_PATH_STYLE", "false")
-	t.Setenv("TELESRV_S3_CREATE_BUCKET", "false")
+	t.Setenv("TELESRV_S3_ENDPOINT", "minio.example.test:9000")
+	t.Setenv("TELESRV_S3_REGION", "eu-central-1")
+	t.Setenv("TELESRV_S3_BUCKET", "docker-media")
+	t.Setenv("TELESRV_S3_ACCESS_KEY_ID", "docker-access")
+	t.Setenv("TELESRV_S3_SECRET_ACCESS_KEY", "docker-secret")
+	t.Setenv("TELESRV_S3_USE_SSL", "false")
+	t.Setenv("TELESRV_S3_PATH_STYLE", "true")
+	t.Setenv("TELESRV_S3_CREATE_BUCKET", "true")
+	t.Setenv("TELESRV_BRAND_PRODUCT_NAME", "Docker Chat")
+	t.Setenv("TELESRV_BRAND_PRODUCT_USERNAME", "docker_chat")
+	t.Setenv("TELESRV_BRAND_DESKTOP_APP_NAME", "Docker Desktop")
+	t.Setenv("TELESRV_BRAND_ANDROID_APP_NAME", "Docker Android")
+	t.Setenv("TELESRV_BRAND_IOS_APP_NAME", "Docker iOS")
+	t.Setenv("TELESRV_BRAND_MACOS_APP_NAME", "Docker macOS")
+	t.Setenv("TELESRV_BRAND_WEB_A_APP_NAME", "Docker Web A")
+	t.Setenv("TELESRV_BRAND_WEB_K_APP_NAME", "Docker Web K")
+	t.Setenv("TELESRV_BRAND_PREMIUM_NAME", "Docker Plus")
+	t.Setenv("TELESRV_BRAND_STARS_NAME", "Docker Credits")
 
 	dockerConfigDir := filepath.Join("..", "..", "deploy", "docker", "config")
 	tests := []struct {
@@ -482,7 +622,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 		}},
 		{name: "core", file: "core.yaml", load: func() error {
 			cfg, err := LoadCore()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCAddr != "0.0.0.0:2440" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.LangPackSeedDir != "/usr/share/telesrv/langpack" || cfg.OTPWebhookURL != "https://otp.example.test/v1/deliveries" || cfg.OTPWebhookSecret != "otp-secret" || cfg.OTPWebhookTimeout != 4*time.Second) {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCAddr != "0.0.0.0:2440" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.LangPackSeedDir != "/usr/share/telesrv/langpack" || cfg.OTPWebhookURL != "https://otp.example.test/v1/deliveries" || cfg.OTPWebhookSecret != "otp-secret" || cfg.OTPWebhookTimeout != 4*time.Second || cfg.Branding.ProductName != "Docker Chat" || cfg.Branding.StarsName != "Docker Credits") {
 				return fmt.Errorf("unexpected Docker core identity, listeners, or seed path")
 			}
 			return err
@@ -496,7 +636,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 		}},
 		{name: "file", file: "file.yaml", load: func() error {
 			cfg, err := LoadFile()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.FileGRPCAddr != "0.0.0.0:2520" || cfg.BlobDir != "/var/lib/telesrv-file/blobs") {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.FileGRPCAddr != "0.0.0.0:2520" || cfg.BlobBackendKind != "s3" || cfg.BlobStagingDir != "/var/lib/telesrv-file/blob-staging" || cfg.S3Endpoint != "minio.example.test:9000" || cfg.S3Region != "eu-central-1" || cfg.S3Bucket != "docker-media" || cfg.S3AccessKeyID != "docker-access" || cfg.S3SecretAccessKey != "docker-secret" || cfg.S3UseSSL || !cfg.S3PathStyle || !cfg.S3CreateBucket) {
 				return fmt.Errorf("unexpected Docker file identity, listener, or blob path")
 			}
 			return err
@@ -516,6 +656,80 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 				t.Fatalf("load Docker %s: %v", tt.file, err)
 			}
 		})
+	}
+}
+
+func TestDockerRoleConfigVariablesAreInjectedByMatchingService(t *testing.T) {
+	dockerDir := filepath.Join("..", "..", "deploy", "docker")
+	composeData, err := os.ReadFile(filepath.Join(dockerDir, "compose.yaml"))
+	if err != nil {
+		t.Fatalf("read compose.yaml: %v", err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]any `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(composeData, &compose); err != nil {
+		t.Fatalf("parse compose.yaml: %v", err)
+	}
+
+	variablePattern := regexp.MustCompile(`\$\{([A-Z][A-Z0-9_]*)\}`)
+	referencedByRole := make(map[string]map[string]struct{})
+	for _, role := range []string{"edge", "core", "egress", "file", "sfu"} {
+		configData, err := os.ReadFile(filepath.Join(dockerDir, "config", role+".yaml"))
+		if err != nil {
+			t.Fatalf("read %s config: %v", role, err)
+		}
+		service, ok := compose.Services[role]
+		if !ok {
+			t.Fatalf("compose service %q is missing", role)
+		}
+		referencedByRole[role] = make(map[string]struct{})
+		for _, match := range variablePattern.FindAllSubmatch(configData, -1) {
+			name := string(match[1])
+			referencedByRole[role][name] = struct{}{}
+			if _, ok := service.Environment[name]; !ok {
+				t.Errorf("%s config expands %s but the matching Compose service does not inject it", role, name)
+			}
+		}
+	}
+
+	processOnly := map[string]map[string]struct{}{
+		"edge": {
+			"TELESRV_EDGE_STATE_DIR":    {},
+			"TELESRV_LOG_LEVEL":         {},
+			"TELESRV_RSA_IDENTITY_MODE": {},
+		},
+		"core": {
+			"TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH": {},
+			"TELESRV_LOG_LEVEL":                       {},
+		},
+		"egress": {"TELESRV_LOG_LEVEL": {}},
+		"file":   {"TELESRV_LOG_LEVEL": {}},
+		"sfu":    {"TELESRV_LOG_LEVEL": {}},
+	}
+	for role, referenced := range referencedByRole {
+		for name := range compose.Services[role].Environment {
+			if !strings.HasPrefix(name, "TELESRV_") {
+				continue
+			}
+			if _, ok := referenced[name]; ok {
+				continue
+			}
+			if _, ok := processOnly[role][name]; !ok {
+				t.Errorf("Compose service %s injects unused setting %s", role, name)
+			}
+		}
+	}
+
+	for serviceName, service := range compose.Services {
+		for name := range service.Environment {
+			fileOwned := name == "TELESRV_BLOB_BACKEND" || strings.HasPrefix(name, "TELESRV_BLOB_") || strings.HasPrefix(name, "TELESRV_S3_") || strings.HasPrefix(name, "TELESRV_STORAGE_")
+			if fileOwned && serviceName != "file" {
+				t.Errorf("File-owned setting %s is injected into Compose service %s", name, serviceName)
+			}
+		}
 	}
 }
 

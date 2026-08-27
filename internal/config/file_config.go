@@ -49,6 +49,9 @@ type UploadYAML struct {
 // LoadFile reads the FileData role YAML config and returns the runtime snapshot used by the File process.
 func LoadFile() (FileConfig, error) {
 	cfg, err := loadRoleYAML(roleFile, func(b *envBuilder, y FileConfigYAML) error {
+		if err := requireYAMLVersion(y.Version); err != nil {
+			return err
+		}
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}

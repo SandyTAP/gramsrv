@@ -135,8 +135,8 @@ func LoadTON() (TONConfig, error) {
 func (c TONConfig) DebugAddress() string { return c.DebugAddr }
 
 func tonConfigFromYAML(y TONConfigYAML) (TONConfig, error) {
-	if y.Version != 1 {
-		return TONConfig{}, fmt.Errorf("version must be 1")
+	if err := requireYAMLVersion(y.Version); err != nil {
+		return TONConfig{}, err
 	}
 	cfg := TONConfig{
 		InstanceID:           strings.TrimSpace(y.Instance.ID),

@@ -25,6 +25,9 @@ type SFUYAML struct {
 // LoadSFU reads the SFU role YAML config and returns the runtime snapshot used by the SFU process.
 func LoadSFU() (SFUConfig, error) {
 	cfg, err := loadRoleYAML(roleSFU, func(b *envBuilder, y SFUConfigYAML) error {
+		if err := requireYAMLVersion(y.Version); err != nil {
+			return err
+		}
 		if err := applyCommonYAML(b, y.CommonYAML); err != nil {
 			return err
 		}

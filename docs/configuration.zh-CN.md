@@ -11,7 +11,8 @@
 
 - `cmd/telesrv-edge|core|egress|file|sfu|admin|ton` 默认分别读取 `configs/<role>.yaml`；也可用
   `--config <path>` 或进程环境变量 `TELESRV_CONFIG=<path>` 指向自己的 YAML 文件。
-- YAML 使用严格解析：未知字段、非法结构、非法时长都会阻止启动。环境变量不再作为普通字段覆盖
+- 每个角色文件都必须声明 `version: 1`。YAML 使用严格解析：缺失/不支持的版本、未知字段、非法结构、
+  非法时长都会阻止启动。环境变量不再作为普通字段覆盖
   YAML；只在 YAML 字符串中通过 `${NAME}` 展开 secret、DSN 或部署平台注入值。
 - `TELESRV_CONFIG` 只选择当前进程的配置文件。不要把它写进 YAML 内部；每个服务的 systemd unit、
   Docker/Kubernetes 配置或本地启动脚本应分别传入自己的 config path。
@@ -22,6 +23,12 @@
 代码边界同样按角色拆分：`internal/config/edge_config.go`、`core_config.go`、`egress_config.go`、
 `file_config.go`、`sfu_config.go`、`admin_config.go`、`ton_config.go` 分别定义对应 YAML schema、`Load<Role>()` 和 runtime config
 类型。生产入口和 `internal/node/<role>` 不应再接收全局 `config.Config`；仓库不再提供对外的旧 env 文件入口。
+
+下表继续使用 `TELESRV_*` 名称，是因为它们既是代码内部经校验的 setting 名，也是 Docker
+`.env` 的展开键；它们不是进程级覆盖。角色 YAML 中，客户端可见品牌只属于 Core 的
+`branding.*`，完整的 blob/S3 backend 配置只属于 File 的 `storage.*`。`core.yaml` 会严格
+拒绝 `storage`，其它角色会严格拒绝 `branding`，不会接受不使用的副本。Admin 有一个独立且
+刻意受限的 `storage` 块，只选择宿主机磁盘看板采样的本地路径，不会配置或初始化对象存储 backend。
 
 ## 2. MTProto 监听、传输与资源预算
 
@@ -456,6 +463,11 @@ go run ./cmd/telegramloginkeygen -mode rotate-code -dir data/telegram-login
 active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别生成不一致的 key ring。
 
 ## 4. PostgreSQL、Redis、文件与 seed
+
+本节永久对象存储参数只属于 File 角色。它们只能写在 `file.yaml` 的
+`storage.blob_backend`、`storage.blob_dir`、`storage.blob_staging_dir` 与
+`storage.s3.*`。Docker 会把下列 `TELESRV_BLOB_*`、`TELESRV_S3_*` 和容量参数展开到
+File YAML。Core 只拥有媒体 metadata 与权限，不持有对象存储配置，也不初始化 backend。
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|

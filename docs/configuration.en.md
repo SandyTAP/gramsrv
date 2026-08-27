@@ -11,7 +11,8 @@ This document describes settings loaded by `internal/config`. Service entrypoint
 
 - `cmd/telesrv-edge|core|egress|file|sfu|admin|ton` read `configs/<role>.yaml` by default. Use
   `--config <path>` or process environment `TELESRV_CONFIG=<path>` to point a process at its own YAML file.
-- YAML is parsed strictly: unknown fields, invalid structure, and invalid duration values fail startup. Environment
+- Every role file must declare `version: 1`. YAML is parsed strictly: missing/unsupported versions, unknown fields,
+  invalid structure, and invalid duration values fail startup. Environment
   variables are no longer generic field overrides for service entrypoints; they are only expanded from YAML strings
   such as `${POSTGRES_DSN}` or `${CORE_EXEC_TOKEN}` for secret/platform injection.
 - `TELESRV_CONFIG` only selects the current process config file. Do not put it inside YAML; systemd units,
@@ -23,6 +24,15 @@ This document describes settings loaded by `internal/config`. Service entrypoint
 The Go configuration boundary is role-scoped too: `internal/config/edge_config.go`, `core_config.go`,
 `egress_config.go`, `file_config.go`, `sfu_config.go`, `admin_config.go`, and `ton_config.go` define the matching YAML schema, `Load<Role>()`, and runtime
 config type. Production entrypoints and `internal/node/<role>` should not accept the global `config.Config`; the repository no longer exposes the old env-file entrypoint.
+
+The tables below keep `TELESRV_*` names because those are the validated internal
+setting names and the Docker `.env` expansion keys. They are not process-level
+overrides. In role YAML, client-visible branding belongs to Core under
+`branding.*`; the complete blob/S3 backend configuration belongs to File under
+`storage.*`. Non-Core role files reject `branding`, and `core.yaml` rejects
+`storage`, instead of accepting unused copies. Admin has a separate, deliberately
+limited `storage` block only for selecting the local path sampled by its host-disk
+dashboard; it does not configure or initialize the object-store backend.
 
 ## 2. MTProto listener, transport, and resource budgets
 
@@ -475,6 +485,13 @@ adds a new active key. Do not edit manifests or PEM files manually, and never ge
 key rings independently on different instances.
 
 ## 4. PostgreSQL, Redis, files, and seed data
+
+Permanent object-storage settings in this section are File-role settings. Put
+them only in `file.yaml` as `storage.blob_backend`, `storage.blob_dir`,
+`storage.blob_staging_dir`, and `storage.s3.*`. Docker maps the listed
+`TELESRV_BLOB_*`, `TELESRV_S3_*`, and capacity keys into that File YAML. Core
+owns media metadata and permissions but has no object-storage configuration or
+backend initialization path.
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
