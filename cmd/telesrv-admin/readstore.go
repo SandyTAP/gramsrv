@@ -473,6 +473,99 @@ LIMIT $1`, domain.MaxStarGiftCatalogSize)
 	return out, rows.Err()
 }
 
+// StarGiftAuctionRow is one row of the operator auction/scheduled-drop monitor.
+// It is driven from the catalog, not from star_gift_auctions: the engine
+// materializes an auction row lazily (ensureStarGiftAuction), so a freshly
+// authored auction has a catalog revision but no auction row yet. Materialized
+// reports whether that has happened; the Auction* fields are zero until it has.
+type StarGiftAuctionRow struct {
+	GiftID  int64 `json:"GiftID,string"`
+	Title   string
+	Stars   int64 `json:"Stars,string"`
+	Enabled bool
+	// Authoring parameters, as stored on the active catalog revision.
+	IsAuction            bool
+	Slug                 string
+	AvailabilityTotal    int
+	AvailabilityRemains  int
+	GiftsPerRound        int
+	AuctionStartDate     int
+	AuctionRoundDuration int
+	LockedUntilDate      int
+	// Live engine state, valid only when Materialized.
+	Materialized  bool
+	Status        string
+	StartDate     int
+	EndDate       int
+	RoundDuration int
+	TotalRounds   int
+	CurrentRound  int
+	NextRoundAt   int
+	GiftsLeft     int
+	LastGiftNum   int
+	MinBidAmount  int64 `json:"MinBidAmount,string"`
+	// Bid aggregates over the still-active, non-refunded bids.
+	ActiveBids int
+	TopBid     int64 `json:"TopBid,string"`
+	BidTotal   int64 `json:"BidTotal,string"`
+	UpdatedAt  time.Time
+}
+
+// ListStarGiftAuctions returns every catalog gift that is either an auction or a
+// scheduled drop (locked_until_date set), plus any gift that already has an
+// auction row, so an auction whose revision was later replaced stays visible.
+func (s *readStore) ListStarGiftAuctions(ctx context.Context) ([]StarGiftAuctionRow, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT c.gift_id, r.title, r.stars, c.enabled,
+       r.auction, COALESCE(NULLIF(r.auction_slug, ''), a.slug, ''),
+       r.availability_total, c.availability_remains, r.gifts_per_round,
+       r.auction_start_date, r.auction_round_duration, r.locked_until_date,
+       a.gift_id IS NOT NULL,
+       COALESCE(a.status, ''), COALESCE(a.start_date, 0), COALESCE(a.end_date, 0),
+       COALESCE(a.round_duration, 0), COALESCE(a.total_rounds, 0), COALESCE(a.current_round, 0),
+       COALESCE(a.next_round_at, 0), COALESCE(a.gifts_left, 0), COALESCE(a.last_gift_num, 0),
+       COALESCE(a.min_bid_amount, 0),
+       COALESCE(b.active_bids, 0), COALESCE(b.top_bid, 0), COALESCE(b.bid_total, 0),
+       c.updated_at
+FROM star_gift_catalog c
+JOIN star_gift_catalog_revisions r ON r.id = c.active_revision_id
+LEFT JOIN star_gift_auctions a ON a.gift_id = c.gift_id
+LEFT JOIN (
+	SELECT gift_id, COUNT(*)::int AS active_bids, MAX(amount) AS top_bid, SUM(amount) AS bid_total
+	FROM star_gift_auction_bids
+	WHERE active AND NOT returned
+	GROUP BY gift_id
+) b ON b.gift_id = c.gift_id
+WHERE r.auction OR r.locked_until_date > 0 OR a.gift_id IS NOT NULL
+ORDER BY r.auction DESC, r.auction_start_date DESC, r.locked_until_date DESC, c.gift_id
+LIMIT $1`, domain.MaxStarGiftCatalogSize)
+	if err != nil {
+		return nil, fmt.Errorf("list star gift auctions: %w", err)
+	}
+	defer rows.Close()
+	out := make([]StarGiftAuctionRow, 0)
+	for rows.Next() {
+		var row StarGiftAuctionRow
+		if err := rows.Scan(
+			&row.GiftID, &row.Title, &row.Stars, &row.Enabled,
+			&row.IsAuction, &row.Slug,
+			&row.AvailabilityTotal, &row.AvailabilityRemains, &row.GiftsPerRound,
+			&row.AuctionStartDate, &row.AuctionRoundDuration, &row.LockedUntilDate,
+			&row.Materialized,
+			&row.Status, &row.StartDate, &row.EndDate,
+			&row.RoundDuration, &row.TotalRounds, &row.CurrentRound,
+			&row.NextRoundAt, &row.GiftsLeft, &row.LastGiftNum,
+			&row.MinBidAmount,
+			&row.ActiveBids, &row.TopBid, &row.BidTotal,
+			&row.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 func (s *readStore) SearchAccounts(ctx context.Context, q string) ([]AccountRow, error) {
 	q = strings.TrimSpace(q)
 	if q == "" {

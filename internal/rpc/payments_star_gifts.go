@@ -1776,6 +1776,10 @@ func tgSavedStarGiftGift(g domain.SavedStarGift, catalog map[int64]domain.StarGi
 		}
 		out := tgStarGift(gift)
 		out.ConvertStars = g.ConvertStars
+		// 拍卖中标的礼物必须显示成交价（中标出价），目录 revision 里存的是起拍价。
+		if g.PaidStars > 0 {
+			out.Stars = g.PaidStars
+		}
 		return out
 	}
 	// resolveStarGiftCatalog 在进入投影前保证每个 revision 都存在；该分支仅保留类型完备性。

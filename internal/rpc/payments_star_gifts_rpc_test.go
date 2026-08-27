@@ -665,6 +665,58 @@ func TestSavedStarGiftProjectionCombinesHistoricalCatalogWithCurrentCollectibleA
 	}
 }
 
+// An auction-acquired gift must be priced at the winning bid, both on the
+// profile card and inside the award service message. The catalog revision only
+// holds the auction's starting price (which is also min_bid_amount), so
+// projecting it made every win render as "won with a bid of <starting price>".
+func TestAuctionAcquiredStarGiftProjectsWinningBid(t *testing.T) {
+	catalog := domain.StarGift{
+		ID: 8101, RevisionID: 9101, Stars: 50, Title: "Auction Cake",
+		Sticker: domain.Document{ID: 710, AccessHash: 7, DCID: 2, MimeType: "application/x-tgsticker"},
+	}
+	revisions := map[int64]domain.StarGift{catalog.RevisionID: catalog}
+	saved := domain.SavedStarGift{GiftID: catalog.ID, RevisionID: catalog.RevisionID, MsgID: 51, Date: 100,
+		GiftNum: 3, PaidStars: 1275}
+
+	projected := tgSavedStarGifts(0, []domain.SavedStarGift{saved}, revisions, nil)
+	if len(projected) != 1 {
+		t.Fatalf("projected = %#v, want one saved gift", projected)
+	}
+	gift, ok := projected[0].Gift.(*tg.StarGift)
+	if !ok {
+		t.Fatalf("saved gift inner = %T, want *tg.StarGift", projected[0].Gift)
+	}
+	if gift.Stars != saved.PaidStars {
+		t.Fatalf("auction gift stars = %d, want winning bid %d", gift.Stars, saved.PaidStars)
+	}
+	if num, ok := projected[0].GetGiftNum(); !ok || num != 3 {
+		t.Fatalf("gift_num = %d ok=%v, want release number 3", num, ok)
+	}
+
+	// Ordinary gifts keep projecting the immutable historical catalog price.
+	saved.PaidStars = 0
+	plain := tgSavedStarGifts(0, []domain.SavedStarGift{saved}, revisions, nil)[0]
+	inner, ok := plain.Gift.(*tg.StarGift)
+	if !ok || inner.Stars != catalog.Stars {
+		t.Fatalf("non-auction gift = %#v, want catalog price %d", plain.Gift, catalog.Stars)
+	}
+
+	action, ok := tgMessageActionStarGift(&domain.MessageStarGiftAction{
+		GiftID: catalog.ID, Stars: 1275, Title: catalog.Title, Sticker: &catalog.Sticker,
+		AuctionAcquired: true, GiftNum: 3, Saved: true,
+	}).(*tg.MessageActionStarGift)
+	if !ok {
+		t.Fatal("award action is not messageActionStarGift")
+	}
+	if !action.AuctionAcquired {
+		t.Fatal("award action must set auction_acquired")
+	}
+	awarded, ok := action.Gift.(*tg.StarGift)
+	if !ok || awarded.Stars != 1275 {
+		t.Fatalf("award action gift = %#v, want winning bid 1275", action.Gift)
+	}
+}
+
 func TestSavedStarGiftProjectionPreservesCollectibleLifecycle(t *testing.T) {
 	const (
 		giftID     = int64(8001)
