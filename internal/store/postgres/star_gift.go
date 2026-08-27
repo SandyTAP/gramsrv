@@ -30,7 +30,7 @@ SELECT c.gift_id, r.id, r.stars, r.convert_stars, r.title,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
        COALESCE(r.released_by_peer_type, ''), COALESCE(r.released_by_peer_id, 0),
        r.per_user_total, r.locked_until_date, r.auction_slug, r.gifts_per_round,
-       r.auction_start_date, r.upgrade_variants,
+       r.auction_start_date, r.auction_round_duration, r.upgrade_variants,
        r.background_center_color IS NOT NULL,
        COALESCE(r.background_center_color, 0), COALESCE(r.background_edge_color, 0),
        COALESCE(r.background_text_color, 0),
@@ -79,6 +79,24 @@ WHERE c.enabled AND c.gift_id = $1`, giftID))
 	return gift, true, nil
 }
 
+// CatalogGiftAnyState 忽略 c.enabled 读取目录礼物。已经产生的义务（拍卖中标交付、
+// 历史投影）必须与"当前是否可购买"解耦：运营在管理端下架礼物后，欠付的中标奖励
+// 仍要按原礼物定义交付，否则整轮 lifecycle 清算会被这一条卡死。
+func (s *StarGiftStore) CatalogGiftAnyState(ctx context.Context, giftID int64) (domain.StarGift, bool, error) {
+	if giftID <= 0 {
+		return domain.StarGift{}, false, nil
+	}
+	gift, err := scanCatalogGift(s.db.QueryRow(ctx, starGiftCatalogSelect+`
+WHERE c.gift_id = $1`, giftID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StarGift{}, false, nil
+	}
+	if err != nil {
+		return domain.StarGift{}, false, err
+	}
+	return gift, true, nil
+}
+
 func (s *StarGiftStore) CatalogRevision(ctx context.Context, revisionID int64) (domain.StarGift, bool, error) {
 	if revisionID <= 0 {
 		return domain.StarGift{}, false, nil
@@ -91,7 +109,7 @@ SELECT r.gift_id, r.id, r.stars, r.convert_stars, r.title,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
        COALESCE(r.released_by_peer_type, ''), COALESCE(r.released_by_peer_id, 0),
        r.per_user_total, r.locked_until_date, r.auction_slug, r.gifts_per_round,
-       r.auction_start_date, r.upgrade_variants,
+       r.auction_start_date, r.auction_round_duration, r.upgrade_variants,
        r.background_center_color IS NOT NULL,
        COALESCE(r.background_center_color, 0), COALESCE(r.background_edge_color, 0),
        COALESCE(r.background_text_color, 0),
@@ -126,7 +144,7 @@ func scanCatalogGift(row rowScanner) (domain.StarGift, error) {
 		&gift.AvailabilityRemains, &gift.AvailabilityTotal, &gift.AvailabilityResale,
 		&gift.FirstSaleDate, &gift.LastSaleDate, &gift.ResellMinStars,
 		&releasedByType, &releasedByID, &gift.PerUserTotal, &gift.LockedUntilDate,
-		&gift.AuctionSlug, &gift.GiftsPerRound, &gift.AuctionStartDate, &gift.UpgradeVariants,
+		&gift.AuctionSlug, &gift.GiftsPerRound, &gift.AuctionStartDate, &gift.AuctionRoundDuration, &gift.UpgradeVariants,
 		&hasBackground, &background.CenterColor, &background.EdgeColor, &background.TextColor,
 		&gift.UpgradeStars, &gift.UpgradeTotal, &gift.UpgradeIssued,
 		&gift.Sticker.ID, &gift.Sticker.AccessHash, &gift.Sticker.FileReference, &gift.Sticker.Date,
@@ -230,11 +248,12 @@ INSERT INTO star_gift_catalog_revisions (
     peer_color_available, auction, availability_total,
     released_by_peer_type, released_by_peer_id, per_user_total, locked_until_date,
     auction_slug, gifts_per_round, auction_start_date, upgrade_variants,
-    background_center_color, background_edge_color, background_text_color
+    background_center_color, background_edge_color, background_text_color,
+    auction_round_duration
 ) VALUES (
     $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 	NULLIF($19::bigint,0),$20,$21::jsonb,$22,$23,$24,$25,$26,$27,$28,$29,
-	$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40
+	$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41
 )`,
 			revisionID, giftID, revision, write.Title, write.Stars, write.ConvertStars, write.Document.ID,
 			string(write.Animation.JSON), write.Animation.SHA256, write.Animation.SourceName, string(write.Animation.SourceFormat),
@@ -246,6 +265,7 @@ INSERT INTO star_gift_catalog_revisions (
 			write.LockedUntilDate, write.AuctionSlug, write.GiftsPerRound, write.AuctionStartDate,
 			write.UpgradeVariants, nullableBackgroundColor(write.Background, "center"),
 			nullableBackgroundColor(write.Background, "edge"), nullableBackgroundColor(write.Background, "text"),
+			write.AuctionRoundDuration,
 		); err != nil {
 			return fmt.Errorf("insert star gift revision: %w", err)
 		}
@@ -391,7 +411,7 @@ SELECT c.gift_id, r.id, r.stars, r.convert_stars, r.title,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
        COALESCE(r.released_by_peer_type, ''), COALESCE(r.released_by_peer_id, 0),
        r.per_user_total, r.locked_until_date, r.auction_slug, r.gifts_per_round,
-       r.auction_start_date, r.upgrade_variants,
+       r.auction_start_date, r.auction_round_duration, r.upgrade_variants,
        r.background_center_color IS NOT NULL,
        COALESCE(r.background_center_color, 0), COALESCE(r.background_edge_color, 0),
        COALESCE(r.background_text_color, 0),
@@ -420,7 +440,7 @@ WHERE c.gift_id=$1`, giftID)
 		&entry.Gift.FirstSaleDate, &entry.Gift.LastSaleDate, &entry.Gift.ResellMinStars,
 		&releasedByType, &releasedByID, &entry.Gift.PerUserTotal, &entry.Gift.LockedUntilDate,
 		&entry.Gift.AuctionSlug, &entry.Gift.GiftsPerRound, &entry.Gift.AuctionStartDate,
-		&entry.Gift.UpgradeVariants, &hasBackground, &background.CenterColor, &background.EdgeColor,
+		&entry.Gift.AuctionRoundDuration, &entry.Gift.UpgradeVariants, &hasBackground, &background.CenterColor, &background.EdgeColor,
 		&background.TextColor,
 		&entry.Gift.UpgradeStars, &entry.Gift.UpgradeTotal, &entry.Gift.UpgradeIssued,
 		&entry.Gift.Sticker.ID, &entry.Gift.Sticker.AccessHash, &entry.Gift.Sticker.FileReference, &entry.Gift.Sticker.Date,
@@ -468,14 +488,15 @@ func (s *StarGiftStore) Create(ctx context.Context, gift domain.SavedStarGift) (
 WITH next_id AS (
     SELECT nextval(pg_get_serial_sequence('public.peer_star_gifts', 'id'))::bigint AS id
 )
-INSERT INTO peer_star_gifts (id, owner_peer_type, owner_peer_id, from_user_id, gift_id, catalog_revision_id, msg_id, saved_id, gift_date, name_hidden, unsaved, converted, convert_stars, prepaid_upgrade_stars, prepaid_upgrade_hash, gift_num, message, message_entities)
+INSERT INTO peer_star_gifts (id, owner_peer_type, owner_peer_id, from_user_id, gift_id, catalog_revision_id, msg_id, saved_id, gift_date, name_hidden, unsaved, converted, convert_stars, prepaid_upgrade_stars, prepaid_upgrade_hash, gift_num, message, message_entities, paid_stars)
 SELECT next_id.id, $1,$2,$3,$4,$5,$6,
        CASE WHEN $1 = 'channel' AND $7::bigint = 0 THEN next_id.id ELSE $7::bigint END,
-       $8,$9,$10,false,$11,$12,$13,$14,$15,$16
+       $8,$9,$10,false,$11,$12,$13,$14,$15,$16,$17
 FROM next_id
 RETURNING id`,
 		string(gift.Owner.Type), gift.Owner.ID, gift.FromUserID, gift.GiftID, gift.RevisionID, gift.MsgID, gift.SavedID, gift.Date,
-		gift.NameHidden, gift.Unsaved, gift.ConvertStars, gift.PrepaidUpgradeStars, gift.PrepaidUpgradeHash, gift.GiftNum, gift.Message, entitiesJSON).Scan(&id)
+		gift.NameHidden, gift.Unsaved, gift.ConvertStars, gift.PrepaidUpgradeStars, gift.PrepaidUpgradeHash, gift.GiftNum, gift.Message, entitiesJSON,
+		maxInt64(0, gift.PaidStars)).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("create star gift: %w", err)
 	}
@@ -576,7 +597,7 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 SELECT p.id, CASE WHEN p.lifecycle_status='exported' THEN 'user' ELSE p.owner_peer_type END,
        CASE WHEN p.lifecycle_status='exported' THEN hp.host_user_id ELSE p.owner_peer_id END,
        p.from_user_id, p.gift_id, p.catalog_revision_id,
-       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, `+effectiveUnsaved+`, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
+       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, `+effectiveUnsaved+`, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num, p.paid_stars,
        p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
        p.drop_original_details_stars, p.can_craft_at,
 	   p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, `+effectivePinned+`,
@@ -737,7 +758,7 @@ SELECT p.id, CASE WHEN p.lifecycle_status='exported' THEN 'user' ELSE p.owner_pe
        p.from_user_id, p.gift_id, p.catalog_revision_id,
 	   p.msg_id, p.saved_id, p.gift_date, p.name_hidden,
        CASE WHEN p.lifecycle_status='exported' THEN hp.unsaved ELSE p.unsaved END,
-       p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
+       p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num, p.paid_stars,
 	   p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
 	   p.drop_original_details_stars, p.can_craft_at,
 	       p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id,
@@ -901,7 +922,7 @@ func scanSavedStarGift(row rowScanner) (domain.SavedStarGift, error) {
 	var ownerType string
 	var entitiesJSON string
 	if err := row.Scan(&g.ID, &ownerType, &g.Owner.ID, &g.FromUserID, &g.GiftID, &g.RevisionID, &g.MsgID, &g.SavedID, &g.Date,
-		&g.NameHidden, &g.Unsaved, &g.Converted, &g.ConvertStars, &g.PrepaidUpgradeStars, &g.PrepaidUpgradeHash, &g.GiftNum,
+		&g.NameHidden, &g.Unsaved, &g.Converted, &g.ConvertStars, &g.PrepaidUpgradeStars, &g.PrepaidUpgradeHash, &g.GiftNum, &g.PaidStars,
 		&g.LifecycleStatus, &g.TransferStars, &g.CanExportAt, &g.CanTransferAt, &g.CanResellAt,
 		&g.DropOriginalDetailsStars, &g.CanCraftAt, &g.Message, &entitiesJSON, &g.UniqueGiftID,
 		&g.UpgradeMsgID, &g.PinnedOrder, &g.CollectionIDs); err != nil {

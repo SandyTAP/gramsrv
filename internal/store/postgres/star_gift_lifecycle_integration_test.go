@@ -949,6 +949,24 @@ can_resell_at,drop_original_details_stars,can_craft_at FROM peer_star_gifts WHER
 		Scan(&auctionSavedCount); err != nil || auctionSavedCount != 1 {
 		t.Fatalf("auction saved award count = %d err %v", auctionSavedCount, err)
 	}
+	// The award must be priced at the winning bid (200), not at the catalog
+	// starting price (100) that ensureStarGiftAuction reuses as min_bid_amount.
+	var auctionPaidStars int64
+	if err := pool.QueryRow(ctx, `SELECT paid_stars FROM peer_star_gifts WHERE gift_id=$1 AND gift_num=1`,
+		auctionEntry.Gift.ID).Scan(&auctionPaidStars); err != nil || auctionPaidStars != 200 {
+		t.Fatalf("auction award paid_stars = %d want 200 err %v", auctionPaidStars, err)
+	}
+	// The service message carries its own immutable gift snapshot, which is what
+	// the client renders as "won the auction with a bid of N Stars".
+	var awardSnapshotStars int64
+	if err := pool.QueryRow(ctx, `SELECT (media->'service_action'->'star_gift'->>'stars')::bigint
+FROM message_boxes
+WHERE owner_user_id=$1
+  AND (media->'service_action'->'star_gift'->>'gift_id')::bigint=$2
+  AND (media->'service_action'->'star_gift'->>'auction_acquired')='true'`,
+		owner.ID, auctionEntry.Gift.ID).Scan(&awardSnapshotStars); err != nil || awardSnapshotStars != 200 {
+		t.Fatalf("auction award message stars = %d want 200 err %v", awardSnapshotStars, err)
+	}
 
 }
 
@@ -1686,7 +1704,7 @@ WHERE channel_id=$1 AND message #>> '{Action,StarGiftUnique,saved_id}'=$2`,
 		t.Fatalf("create channel auction: %v", err)
 	}
 	if _, _, err := lifecycle.BidStarGiftAuction(ctx, domain.StarGiftAuctionBidRequest{UserID: actor.ID,
-		GiftID: auctionEntry.Gift.ID, Peer: channelPeer, BidAmount: 100, FormID: 22001, Date: now + 3,
+		GiftID: auctionEntry.Gift.ID, Peer: channelPeer, BidAmount: 250, FormID: 22001, Date: now + 3,
 	}); err != nil {
 		t.Fatalf("bid channel auction: %v", err)
 	}
@@ -1704,6 +1722,25 @@ WHERE channel_id=$1 AND message #>> '{Action,StarGiftUnique,saved_id}'=$2`,
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
 WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%'`, created.Channel.ID).Scan(&awardLogs); err != nil || awardLogs != 1 {
 		t.Fatalf("channel auction admin logs = %d err %v", awardLogs, err)
+	}
+	// Channel awards are priced at the winning bid (250) as well; the catalog
+	// starting price is 100.
+	var channelPaidStars int64
+	if err := pool.QueryRow(ctx, `SELECT paid_stars FROM peer_star_gifts WHERE id=$1`, awardSavedID).
+		Scan(&channelPaidStars); err != nil || channelPaidStars != 250 {
+		t.Fatalf("channel auction paid_stars = %d want 250 err %v", channelPaidStars, err)
+	}
+	// jsonb re-serializes with a space after the colon, so match on the shape
+	// rather than on a literal substring.
+	var channelAwardStarsLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%' AND message::text ~ '"stars":[[:space:]]*250'`,
+		created.Channel.ID).Scan(&channelAwardStarsLogs); err != nil || channelAwardStarsLogs != 1 {
+		var raw string
+		_ = pool.QueryRow(ctx, `SELECT message::text FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%' ORDER BY id DESC LIMIT 1`,
+			created.Channel.ID).Scan(&raw)
+		t.Fatalf("channel auction award log stars = %d want 1 err %v log=%s", channelAwardStarsLogs, err, raw)
 	}
 }
 

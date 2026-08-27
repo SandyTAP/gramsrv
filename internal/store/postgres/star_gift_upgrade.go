@@ -169,7 +169,10 @@ WHERE collectible_revision_id=$1 AND crafted
 			}
 			saved.ID = savedID
 
-			num := revision.Issued + 1
+			num, err := allocateCollectibleGiftNum(ctx, tx, gift.ID, 0, revision)
+			if err != nil {
+				return err
+			}
 			var uniqueID int64
 			if err := tx.QueryRow(ctx, `SELECT nextval('unique_star_gift_id_seq')`).Scan(&uniqueID); err != nil {
 				return fmt.Errorf("allocate admin unique star gift id: %w", err)
@@ -432,6 +435,10 @@ WHERE collectible_revision_id=$1 AND crafted
 					canCraftAt = starGiftCraftReadyAt(req.Date, s.lifecycle.CraftDelaySeconds)
 				}
 			}
+			// issued 恒等于已铸造的藏品数量（每次铸造占用 [1..supply_total] 中一个
+			// 互不相同的号码，触发器又强制 issued 只能 +1），所以只要还有中标礼物等着
+			// 领号，issued 必然 < supply_total——这道闸门不会拦住中标者。真正判定中标号
+			// 是否越界或被占用的是 allocateCollectibleGiftNum。
 			if revision.Issued >= revision.SupplyTotal {
 				return domain.ErrStarGiftCollectibleSoldOut
 			}
@@ -463,7 +470,10 @@ WHERE collectible_revision_id=$1 AND crafted
 				return err
 			}
 
-			num := revision.Issued + 1
+			num, err := allocateCollectibleGiftNum(ctx, tx, locked.GiftID, locked.GiftNum, revision)
+			if err != nil {
+				return err
+			}
 			var uniqueID int64
 			if err := tx.QueryRow(ctx, `SELECT nextval('unique_star_gift_id_seq')`).Scan(&uniqueID); err != nil {
 				return fmt.Errorf("allocate unique star gift id: %w", err)
@@ -926,7 +936,7 @@ func lockSavedStarGiftByID(ctx context.Context, tx pgx.Tx, savedID int64) (domai
 func lockSavedStarGiftWhere(ctx context.Context, tx pgx.Tx, where string, args ...any) (domain.SavedStarGift, error) {
 	row := tx.QueryRow(ctx, `
 SELECT p.id, p.owner_peer_type, p.owner_peer_id, p.from_user_id, p.gift_id, p.catalog_revision_id,
-       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, p.unsaved, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num,
+       p.msg_id, p.saved_id, p.gift_date, p.name_hidden, p.unsaved, p.converted, p.convert_stars, p.prepaid_upgrade_stars, p.prepaid_upgrade_hash, p.gift_num, p.paid_stars,
 	   p.lifecycle_status, p.transfer_stars, p.can_export_at, p.can_transfer_at, p.can_resell_at,
 	   p.drop_original_details_stars, p.can_craft_at,
 	       p.message, p.message_entities::text, COALESCE(p.unique_gift_id, 0), p.upgrade_msg_id, p.pinned_order,
@@ -962,6 +972,53 @@ WHERE c.gift_id=$1 FOR UPDATE OF r`, giftID).Scan(
 		return domain.StarGiftCollectibleRevision{}, domain.ErrStarGiftCollectibleUnavailable
 	}
 	return revision, nil
+}
+
+// allocateCollectibleGiftNum 决定新藏品的编号。
+//
+// 拍卖中标的礼物在结算时就拿到了发行号（peer_star_gifts.gift_num，等于
+// star_gift_auction_acquired.gift_num）——那才是用户真正赢到的号码，升级成藏品
+// 时必须沿用，不能按"谁先点升级"重新编号。其余路径（普通购买、管理员发放）仍沿
+// 发行计数器递增，但必须跳过已发行的号码以及被尚未升级的中标礼物预留的号码，否
+// 则会撞上 unique_star_gift_number_uniq，或抢走中标者应得的号码。
+func allocateCollectibleGiftNum(ctx context.Context, tx pgx.Tx, giftID int64, wonNum int, revision domain.StarGiftCollectibleRevision) (int, error) {
+	if wonNum > 0 {
+		if wonNum > revision.SupplyTotal {
+			return 0, domain.ErrStarGiftCollectibleUnavailable
+		}
+		var taken bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM unique_star_gifts WHERE gift_id=$1 AND num=$2)`,
+			giftID, wonNum).Scan(&taken); err != nil {
+			return 0, fmt.Errorf("check auction collectible number: %w", err)
+		}
+		if taken {
+			// 中标号被别的藏品占用属于数据损坏。宁可让升级失败并暴露出来，也不能
+			// 悄悄发一个错号——那正是本次修复要消灭的行为。
+			return 0, domain.ErrStarGiftCollectibleUnavailable
+		}
+		return wonNum, nil
+	}
+	start := revision.Issued + 1
+	if start < 1 {
+		start = 1
+	}
+	var num int
+	err := tx.QueryRow(ctx, `
+WITH reserved AS (
+    SELECT num FROM unique_star_gifts WHERE gift_id=$1
+    UNION
+    SELECT gift_num FROM peer_star_gifts WHERE gift_id=$1 AND gift_num>0 AND unique_gift_id IS NULL
+)
+SELECT n FROM generate_series($2::int, $3::int) AS n
+WHERE NOT EXISTS (SELECT 1 FROM reserved r WHERE r.num=n)
+ORDER BY n LIMIT 1`, giftID, start, revision.SupplyTotal).Scan(&num)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, domain.ErrStarGiftCollectibleSoldOut
+	}
+	if err != nil {
+		return 0, fmt.Errorf("allocate collectible number: %w", err)
+	}
+	return num, nil
 }
 
 func debitStarGiftUpgrade(ctx context.Context, tx pgx.Tx, userID, amount int64, peer domain.Peer, date int) (domain.StarsBalance, error) {

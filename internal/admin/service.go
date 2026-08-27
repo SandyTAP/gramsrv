@@ -813,23 +813,40 @@ type ImportStarGiftRequest struct {
 	FileName     string `json:"file_name"`
 	ContentSHA   string `json:"content_sha256"`
 	Data         []byte `json:"-"`
+
+	// Optional lifecycle authoring for the auction panel and scheduled-release
+	// ("отложенный дроп") surfaces. Zero values describe an ordinary gift.
+	// Validated by domain.StarGiftCatalogWrite.ValidateLifecycleAuthoring.
+	// For auctions Stars is the starting/minimum bid and AvailabilityTotal is
+	// the supply; AuctionRoundDuration is seconds (0 => engine default).
+	Auction              bool   `json:"auction,omitempty"`
+	AuctionSlug          string `json:"auction_slug,omitempty"`
+	GiftsPerRound        int    `json:"gifts_per_round,omitempty"`
+	AuctionStartDate     int    `json:"auction_start_date,omitempty"`
+	AuctionRoundDuration int    `json:"auction_round_duration,omitempty"`
+	AvailabilityTotal    int    `json:"availability_total,omitempty"`
+	LockedUntilDate      int    `json:"locked_until_date,omitempty"`
 }
 
 type ImportOfficialStarGiftRequest struct {
 	CommandMeta
-	SourceGiftID       string   `json:"source_gift_id"`
-	GiftID             int64    `json:"gift_id,omitempty"`
-	Title              string   `json:"title"`
-	Stars              int64    `json:"stars"`
-	ConvertStars       int64    `json:"convert_stars"`
-	Enabled            bool     `json:"enabled"`
-	SortOrder          int      `json:"sort_order"`
-	IncludeCollectible bool     `json:"include_collectible"`
-	UpgradeStars       int64    `json:"upgrade_stars,omitempty"`
-	SupplyTotal        int      `json:"supply_total,omitempty"`
-	SlugPrefix         string   `json:"slug_prefix,omitempty"`
-	ManifestSHA256     string   `json:"manifest_sha256,omitempty"`
-	AssetSHA256        []string `json:"asset_sha256,omitempty"`
+	SourceGiftID       string `json:"source_gift_id"`
+	GiftID             int64  `json:"gift_id,omitempty"`
+	Title              string `json:"title"`
+	Stars              int64  `json:"stars"`
+	ConvertStars       int64  `json:"convert_stars"`
+	Enabled            bool   `json:"enabled"`
+	SortOrder          int    `json:"sort_order"`
+	IncludeCollectible bool   `json:"include_collectible"`
+	UpgradeStars       int64  `json:"upgrade_stars,omitempty"`
+	SupplyTotal        int    `json:"supply_total,omitempty"`
+	SlugPrefix         string `json:"slug_prefix,omitempty"`
+	// LockedUntilDate schedules the local release of an imported official gift.
+	// Zero keeps whatever release time the snapshot carries. Validated in
+	// ImportOfficialStarGift, which requires a future timestamp.
+	LockedUntilDate int      `json:"locked_until_date,omitempty"`
+	ManifestSHA256  string   `json:"manifest_sha256,omitempty"`
+	AssetSHA256     []string `json:"asset_sha256,omitempty"`
 }
 
 type SetStarGiftEnabledRequest struct {
@@ -3586,6 +3603,21 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 		len([]rune(strings.TrimSpace(req.Title))) > domain.MaxStarGiftTitleRunes {
 		return CommandResult{}, domain.ErrStarGiftInvalid
 	}
+	lifecycle := domain.StarGiftCatalogWrite{
+		Auction: req.Auction, AuctionSlug: strings.TrimSpace(req.AuctionSlug), GiftsPerRound: req.GiftsPerRound,
+		AuctionStartDate: req.AuctionStartDate, AuctionRoundDuration: req.AuctionRoundDuration,
+		AvailabilityTotal: req.AvailabilityTotal, LockedUntilDate: req.LockedUntilDate,
+		// The price is the auction's opening bid, so the validator needs it to bound
+		// the bid ladder; see domain.MaxStarGiftAuctionBidStars.
+		Stars: req.Stars,
+	}
+	now := int(s.now().Unix())
+	if err := lifecycle.ValidateLifecycleAuthoring(now); err != nil {
+		return CommandResult{}, err
+	}
+	// Fills in limited / availability_remains / a concrete auction_start_date,
+	// which the revision's CHECK constraints require for an auction.
+	lifecycle.NormalizeLifecycleAuthoring(now)
 	animation, err := s.gifts.PrepareAnimation(req.FileName, req.Data)
 	if err != nil {
 		return CommandResult{}, err
@@ -3600,6 +3632,19 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 			"sha256": req.ContentSHA, "width": animation.Width, "height": animation.Height,
 			"frame_rate": animation.FrameRate, "compressed_bytes": len(animation.TGS), "json_bytes": len(animation.JSON),
 		}
+		if lifecycle.Auction {
+			details["auction"] = true
+			details["auction_slug"] = lifecycle.AuctionSlug
+			details["gifts_per_round"] = lifecycle.GiftsPerRound
+			details["auction_start_date"] = lifecycle.AuctionStartDate
+			details["auction_round_duration"] = lifecycle.AuctionRoundDuration
+			details["availability_total"] = lifecycle.AvailabilityTotal
+			details["limited"] = lifecycle.Limited
+			details["availability_remains"] = lifecycle.AvailabilityRemains
+		}
+		if lifecycle.LockedUntilDate > 0 {
+			details["locked_until_date"] = lifecycle.LockedUntilDate
+		}
 		if req.DryRun {
 			return CommandResult{Message: "star gift import validated", Details: details}, nil
 		}
@@ -3607,6 +3652,10 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 			GiftID: req.GiftID, Title: req.Title, Stars: req.Stars, ConvertStars: req.ConvertStars,
 			Enabled: req.Enabled, SortOrder: req.SortOrder, Animation: animation,
 			Actor: req.Actor, CommandID: req.CommandID,
+			Auction: lifecycle.Auction, AuctionSlug: lifecycle.AuctionSlug, GiftsPerRound: lifecycle.GiftsPerRound,
+			AuctionStartDate: lifecycle.AuctionStartDate, AuctionRoundDuration: lifecycle.AuctionRoundDuration,
+			AvailabilityTotal: lifecycle.AvailabilityTotal, LockedUntilDate: lifecycle.LockedUntilDate,
+			Limited: lifecycle.Limited, AvailabilityRemains: lifecycle.AvailabilityRemains,
 		})
 		if err != nil {
 			return CommandResult{Details: details}, err
@@ -3687,6 +3736,34 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 	}
 	if req.SlugPrefix = strings.ToLower(strings.TrimSpace(req.SlugPrefix)); req.SlugPrefix == "" {
 		req.SlugPrefix = "official-" + req.SourceGiftID
+	}
+
+	// Scheduled release ("отложенный дроп") for a snapshot gift. The snapshot's own
+	// locked_until_date records Telegram's release window, which is normally long
+	// past by the time the gift is mirrored here, so it cannot serve as a local
+	// schedule. An operator-supplied time therefore wins, and must be in the future
+	// — a past one would publish the gift immediately while reading as scheduled.
+	lockedUntilDate := bundle.Gift.LockedUntilDate
+	if req.LockedUntilDate != 0 {
+		if req.LockedUntilDate < 0 || req.LockedUntilDate <= int(s.now().Unix()) {
+			return CommandResult{}, fmt.Errorf("%w: scheduled-release time must be in the future",
+				domain.ErrStarGiftLifecycleInvalid)
+		}
+		lockedUntilDate = req.LockedUntilDate
+	}
+
+	// Supply for an auction import. The rule below — publish a snapshot as a fresh
+	// local entry with no inventory — cannot hold for an auction, because
+	// star_gift_catalog_revision_auction_check requires an auction to be limited and
+	// the supply check then requires availability_total > 0. Leaving both zero made
+	// every official auction import fail on the INSERT. Carry the snapshot's supply
+	// for that case only, and let the shared normalizer derive the rest.
+	auctionLimited, auctionTotal := false, 0
+	if bundle.Gift.Auction {
+		auctionLimited, auctionTotal = true, bundle.Gift.AvailabilityTotal
+		if auctionTotal <= 0 {
+			auctionTotal = req.SupplyTotal
+		}
 	}
 
 	baseAnimation, err := s.gifts.PrepareOfficialAnimation(bundle.BaseDocument.FileName, bundle.BaseDocument.Data)
@@ -3776,17 +3853,24 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		// inventory. Keep the complete source JSON as provenance, while publishing
 		// regular official imports as a fresh, locally purchasable catalog entry.
 		// Local resale counters and sale dates are derived by lifecycle writes.
-		Limited: false, SoldOut: false, Birthday: bundle.Gift.Birthday,
+		// Auctions are the one exception; see auctionLimited above.
+		Limited: auctionLimited, SoldOut: false, Birthday: bundle.Gift.Birthday,
 		RequirePremium: bundle.Gift.RequirePremium, LimitedPerUser: bundle.Gift.LimitedPerUser,
 		PeerColorAvailable: bundle.Gift.PeerColorAvailable, Auction: bundle.Gift.Auction,
-		AvailabilityRemains: 0, AvailabilityTotal: 0,
+		AvailabilityRemains: 0, AvailabilityTotal: auctionTotal,
 		AvailabilityResale: 0, FirstSaleDate: 0,
 		LastSaleDate: 0, ResellMinStars: 0,
-		PerUserTotal: bundle.Gift.PerUserTotal, LockedUntilDate: bundle.Gift.LockedUntilDate,
+		PerUserTotal: bundle.Gift.PerUserTotal, LockedUntilDate: lockedUntilDate,
 		AuctionSlug: bundle.Gift.AuctionSlug, GiftsPerRound: bundle.Gift.GiftsPerRound,
 		AuctionStartDate: bundle.Gift.AuctionStartDate, UpgradeVariants: bundle.Gift.UpgradeVariants,
 		Background: background,
 	}, Collectible: collectible}
+	// Only auctions are touched: a snapshot auction_start_date may be zero or in the
+	// past, and the revision's CHECK requires it to be positive. The full
+	// ValidateLifecycleAuthoring is deliberately not run here — it is the authoring
+	// contract for operator input, and a snapshot legitimately carries a
+	// locked_until_date that has already elapsed.
+	write.Catalog.NormalizeLifecycleAuthoring(int(s.now().Unix()))
 	return s.runCommand(ctx, req.CommandMeta, ActionImportOfficialStarGift, 0, domain.Peer{}, req, func() (CommandResult, error) {
 		details := map[string]any{"source_gift_id": req.SourceGiftID, "gift_id": strconv.FormatInt(req.GiftID, 10),
 			"manifest_sha256": req.ManifestSHA256, "title": req.Title, "stars": strconv.FormatInt(req.Stars, 10),
@@ -3798,6 +3882,14 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 			"official_availability_remains": bundle.Gift.AvailabilityRemains,
 			"official_availability_total":   bundle.Gift.AvailabilityTotal,
 			"official_availability_resale":  bundle.Gift.AvailabilityResale,
+		}
+		if lockedUntilDate > 0 {
+			details["locked_until_date"] = lockedUntilDate
+			details["locked_until_scheduled_by_operator"] = req.LockedUntilDate > 0
+		}
+		if write.Catalog.Auction {
+			details["auction_availability_total"] = write.Catalog.AvailabilityTotal
+			details["auction_start_date"] = write.Catalog.AuctionStartDate
 		}
 		if bundle.Collectible != nil {
 			details["models"] = len(bundle.Collectible.Models)

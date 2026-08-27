@@ -156,11 +156,36 @@ func (r *Router) starGiftAuctionBidPaymentForm(ctx context.Context, userID int64
 	if err != nil {
 		return nil, err
 	}
-	return &tg.PaymentsPaymentFormStars{FormID: starGiftLifecycleFormID("auction", userID,
-		state.Gift.ID, peer.Type, peer.ID, inv.BidAmount, state.Version),
-		BotID: domain.OfficialSystemUserID, Title: state.Gift.Title, Description: "Collectible gift auction bid",
-		Invoice: tg.Invoice{Currency: "XTR", Prices: []tg.LabeledPrice{{Label: "Auction bid", Amount: delta}}},
-		Users:   r.tgUsersForViewer(userID, []domain.User{domain.OfficialSystemUser()})}, nil
+	// paymentFormStarGift is the gift form — the same one transfer, resale, purchase
+	// and prepaid upgrade return. paymentFormStars is the bot/top-up Stars form, and a
+	// client that asked for a gift invoice cannot open a payment sheet from it.
+	return &tg.PaymentsPaymentFormStarGift{FormID: starGiftAuctionBidFormID(userID, state.Gift.ID, peer, inv.BidAmount, state.UserState.BidVersion),
+		Invoice: tg.Invoice{Currency: "XTR", Prices: []tg.LabeledPrice{{Label: "Auction bid", Amount: delta}}}}, nil
+}
+
+// starGiftAuctionBidFormID binds a bid form to what the bidder is committing to:
+// themselves, the gift, the recipient, the amount and their own bid generation.
+//
+// The generation is the bidder's own star_gift_auction_bids.version — bumped by every
+// write to their row (placing a bid, raising it, winning a round, being refunded) and
+// by nothing anyone else does. Without it the id was a pure function of the bid, so a
+// bidder who had won or been refunded and then bid the same amount for the same
+// recipient again got the settled bid's id back. BidStarGiftAuction answers a known
+// star_gift_auction_bid_payments(user_id, form_id) receipt with the stored payment, so
+// that bid was reported as a successful replay and never became active.
+//
+// The auction's own version counter cannot serve here: every other bidder and every
+// round settlement bumps it, so a form would be invalidated by strangers and confirm
+// as STARS_FORM_AMOUNT_MISMATCH. Safety does not rest on it either — sendStarGiftAuctionBidForm
+// re-reads the live auction through starGiftAuctionBidTarget and re-checks the bid
+// against the current minimum, so a form that has fallen below it is still rejected.
+//
+// Binding the generation costs no replay tolerance: starGiftAuctionBidTarget already
+// rejects a confirm replayed after its bid landed — a fresh bid requires no live bid
+// and a raise requires a strictly higher amount — so the durable receipt only ever
+// answers two confirms racing on one form inside the store.
+func starGiftAuctionBidFormID(userID, giftID int64, peer domain.Peer, bidAmount, bidGeneration int64) int64 {
+	return starGiftLifecycleFormID("auction", userID, giftID, peer.Type, peer.ID, bidAmount, bidGeneration)
 }
 
 func (r *Router) sendStarGiftAuctionBidForm(ctx context.Context, userID, formID int64, inv *tg.InputInvoiceStarGiftAuctionBid) (tg.PaymentsPaymentResultClass, error) {
@@ -168,8 +193,7 @@ func (r *Router) sendStarGiftAuctionBidForm(ctx context.Context, userID, formID 
 	if err != nil {
 		return nil, err
 	}
-	wantFormID := starGiftLifecycleFormID("auction", userID,
-		state.Gift.ID, peer.Type, peer.ID, inv.BidAmount, state.Version)
+	wantFormID := starGiftAuctionBidFormID(userID, state.Gift.ID, peer, inv.BidAmount, state.UserState.BidVersion)
 	if formID == 0 || formID != wantFormID {
 		return nil, starsFormAmountMismatchErr()
 	}
@@ -238,6 +262,13 @@ func (r *Router) starGiftAuctionBidTarget(ctx context.Context, userID int64, inv
 		minimum = state.UserState.MinBidAmount
 	}
 	if inv.BidAmount < minimum || inv.BidAmount <= oldAmount {
+		return domain.StarGiftAuction{}, domain.Peer{}, 0, starGiftInvalidErr()
+	}
+	// The upper bound is rejected the same way as a bid below the minimum: it is an
+	// out-of-range amount, and clients already handle STARGIFT_INVALID here. Without
+	// it the bid ladder can climb past what official clients can represent — see
+	// domain.MaxStarGiftAuctionBidStars.
+	if inv.BidAmount > domain.MaxStarGiftAuctionBidStars {
 		return domain.StarGiftAuction{}, domain.Peer{}, 0, starGiftInvalidErr()
 	}
 	return state, peer, inv.BidAmount - oldAmount, nil
@@ -909,11 +940,13 @@ func tgStarGiftAuctionUserState(state domain.StarGiftAuctionUserState) tg.StarGi
 	if state.Returned {
 		out.SetReturned(true)
 	}
-	if state.BidAmount > 0 {
+	// bid_amount/bid_date/min_bid_amount/bid_peer 共用 flags.0：整组要么全给要么全省，
+	// 只置位而留下 nil 的 bid_peer 会让整条 user state 无法编码。
+	if bidPeer := tgPeer(state.BidPeer); state.BidAmount > 0 && bidPeer != nil {
 		out.SetBidAmount(state.BidAmount)
 		out.SetBidDate(state.BidDate)
 		out.SetMinBidAmount(state.MinBidAmount)
-		out.SetBidPeer(tgPeer(state.BidPeer))
+		out.SetBidPeer(bidPeer)
 	}
 	return out
 }
