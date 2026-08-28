@@ -67,6 +67,7 @@ import (
 	verificationapp "telesrv/internal/app/verification"
 	welcomemessagesapp "telesrv/internal/app/welcomemessages"
 	"telesrv/internal/botapi"
+	"telesrv/internal/app/files/botavatars"
 	"telesrv/internal/branding"
 	"telesrv/internal/config"
 	"telesrv/internal/domain"
@@ -1173,6 +1174,8 @@ func run(logger *zap.Logger) error {
 			logger.Warn("sync bot branding", zap.Int64("bot", botID), zap.Error(err))
 		}
 	}
+	// Assign embedded avatars to the built-in system account and bots (idempotent).
+	botavatars.Seed(ctx, filesService, logger, time.Now().Unix())
 	groupCallStore := postgres.NewGroupCallStore(pool)
 	groupCallsService := groupcallsapp.NewService(groupCallStore, groupcallsapp.WithPublicBaseURL(cfg.PublicBaseURL))
 	// 群通话媒体面：内嵌 pion SFU（M1+）。SFU 的 liveness reporter 把媒体面存活
