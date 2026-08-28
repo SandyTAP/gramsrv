@@ -172,6 +172,19 @@ func (s *Service) AdminUser(ctx context.Context, userID int64) (domain.User, boo
 	return s.loadBaseUserByID(ctx, userID)
 }
 
+// BotStatus returns only the immutable viewer-independent bot fact. Presence
+// classification must not pay for contact/privacy/photo projection.
+func (s *Service) BotStatus(ctx context.Context, userID int64) (bool, bool, error) {
+	if userID == 0 {
+		return false, false, nil
+	}
+	u, found, err := s.loadBaseUserByID(ctx, userID)
+	if err != nil || !found {
+		return false, found, err
+	}
+	return u.Bot, true, nil
+}
+
 // PrivacyBaseUsers returns viewer-independent bot/premium facts through the
 // shared base-user read model. Privacy uses this as a batched cold loader behind
 // its bounded process cache; no viewer projection is performed, avoiding a

@@ -284,6 +284,13 @@ type UsersService interface {
 	ByIDs(ctx context.Context, currentUserID int64, userIDs []int64) ([]domain.User, error)
 }
 
+// BaseUserBotStatusProvider exposes the immutable, viewer-independent bot bit
+// without constructing a full user projection. Production users.Service
+// implements it through the shared base-user Redis read model.
+type BaseUserBotStatusProvider interface {
+	BotStatus(ctx context.Context, userID int64) (bot bool, found bool, err error)
+}
+
 type CollectiblePhoneService interface {
 	CollectiblePhone(ctx context.Context, phone string) (domain.CollectiblePhone, error)
 }

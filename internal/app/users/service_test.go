@@ -134,6 +134,23 @@ func TestByIDsRejectsOwnerSetAboveBoundInsteadOfTruncating(t *testing.T) {
 	}
 }
 
+func TestBotStatusReadsViewerIndependentBaseFact(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewUserStore()
+	bot, err := base.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000077", FirstName: "Bot", Bot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(base)
+	got, found, err := svc.BotStatus(ctx, bot.ID)
+	if err != nil || !found || !got {
+		t.Fatalf("BotStatus = %v, found=%v, err=%v", got, found, err)
+	}
+	if got, found, err := svc.BotStatus(ctx, bot.ID+1000); err != nil || found || got {
+		t.Fatalf("missing BotStatus = %v, found=%v, err=%v", got, found, err)
+	}
+}
+
 func TestPrivacyBaseUsersRejectsViewerSetAboveBoundInsteadOfNegativeCachingTruncation(t *testing.T) {
 	svc := NewService(memory.NewUserStore())
 	ids := make([]int64, maxBatchUsers+1)
