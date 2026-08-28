@@ -9,9 +9,10 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/gotd/ige v0.3.0
 	github.com/gotd/log/logzap v0.1.1
-	github.com/iamxvbaba/td v1.3.1
+	github.com/iamxvbaba/td v1.3.2
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
 	github.com/jackc/pgx/v5 v5.9.2
+	github.com/klauspost/compress v1.19.1
 	github.com/lestrrat-go/jwx/v3 v3.1.1
 	github.com/minio/minio-go/v7 v7.2.1
 	github.com/nyaruka/phonenumbers v1.8.1
@@ -63,7 +64,6 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/lestrrat-go/blackmagic v1.0.4 // indirect

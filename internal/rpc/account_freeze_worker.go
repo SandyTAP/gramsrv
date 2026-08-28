@@ -39,8 +39,8 @@ func (r *Router) RunAccountFreezeNotifications(ctx context.Context, interval tim
 }
 
 func (r *Router) drainAccountFreezeNotifications(ctx context.Context, batch int) {
-	svc, ok := r.deps.AccountFreeze.(accountFreezeNotificationService)
-	if !ok || r.deps.Users == nil {
+	svc := r.deps.AccountFreezeNotifications
+	if svc == nil || r.deps.Users == nil {
 		return
 	}
 	for {
@@ -61,7 +61,7 @@ func (r *Router) drainAccountFreezeNotifications(ctx context.Context, batch int)
 	}
 }
 
-func (r *Router) dispatchAccountFreezeNotification(ctx context.Context, svc accountFreezeNotificationService, notification domain.AccountFreezeNotification) {
+func (r *Router) dispatchAccountFreezeNotification(ctx context.Context, svc AccountFreezeNotificationService, notification domain.AccountFreezeNotification) {
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: notification.FrozenUserID}
 	if contacts, ok := r.deps.Contacts.(interface{ InvalidateViewers(...int64) }); ok {
 		contacts.InvalidateViewers(notification.TargetUserID)

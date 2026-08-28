@@ -15,12 +15,13 @@ import (
 
 // ErrNotAuthorized 表示当前 auth_key 尚未登录。
 var (
-	ErrNotAuthorized       = errors.New("not authorized")
-	ErrSystemUserImmutable = errors.New("system user identity is immutable")
-	ErrDeliveryRequired    = errors.New("user delivery aggregate store is required")
-	ErrBatchUsersLimit     = errors.New("batch users limit exceeded")
-	ErrBatchViewerCells    = errors.New("batch viewer projection cell limit exceeded")
-	ErrBatchUserMissing    = errors.New("batch user projection source is incomplete")
+	ErrNotAuthorized            = errors.New("not authorized")
+	ErrSystemUserImmutable      = errors.New("system user identity is immutable")
+	ErrDeliveryRequired         = errors.New("user delivery aggregate store is required")
+	ErrBatchUsersLimit          = errors.New("batch users limit exceeded")
+	ErrBatchViewerCells         = errors.New("batch viewer projection cell limit exceeded")
+	ErrBatchUserMissing         = errors.New("batch user projection source is incomplete")
+	ErrLastSeenBatchUnsupported = errors.New("last seen batch store unsupported")
 )
 
 // ProfilePhotoProvider 批量返回用户当前头像（用于把 PhotoID/DCID/Stripped 富化到 domain.User）。
@@ -28,14 +29,15 @@ type ProfilePhotoProvider = userprojection.ProfilePhotoProvider
 
 // Service 提供用户查询。
 type Service struct {
-	users     store.UserStore
-	cache     store.UserCache
-	contacts  store.ContactStore
-	photos    ProfilePhotoProvider
-	privacy   userprojection.PrivacyEvaluator
-	freezes   userprojection.AccountFreezeProvider
-	phones    store.CollectiblePhoneStore
-	projector *userprojection.Projector
+	users           store.UserStore
+	cache           store.UserCache
+	contacts        store.ContactStore
+	photos          ProfilePhotoProvider
+	privacy         userprojection.PrivacyEvaluator
+	freezes         userprojection.AccountFreezeProvider
+	phones          store.CollectiblePhoneStore
+	phoneProjection userprojection.CollectiblePhoneProvider
+	projector       *userprojection.Projector
 }
 
 type usernameAvailabilityStore interface {
@@ -73,7 +75,14 @@ func WithAccountFreezeProvider(p userprojection.AccountFreezeProvider) Option {
 // their viewer-specific projection. Independent +888 login identities live in
 // users.phone and take lookup precedence over this optional alias registry.
 func WithCollectiblePhoneStore(p store.CollectiblePhoneStore) Option {
-	return func(s *Service) { s.phones = p }
+	return func(s *Service) {
+		s.phones = p
+		s.phoneProjection = p
+	}
+}
+
+func WithCollectiblePhoneProvider(p userprojection.CollectiblePhoneProvider) Option {
+	return func(s *Service) { s.phoneProjection = p }
 }
 
 const (
@@ -103,7 +112,7 @@ func NewService(users store.UserStore, opts ...Option) *Service {
 		userprojection.WithPhotoProvider(s.photos),
 		userprojection.WithPrivacyEvaluator(s.privacy),
 		userprojection.WithAccountFreezeProvider(s.freezes),
-		userprojection.WithCollectiblePhoneProvider(s.phones),
+		userprojection.WithCollectiblePhoneProvider(s.phoneProjection),
 	)
 	return s
 }
@@ -604,6 +613,37 @@ func (s *Service) UpdateLastSeen(ctx context.Context, userID int64, lastSeenAt i
 		return err
 	}
 	s.dropCachedUsers(ctx, userID)
+	return nil
+}
+
+func (s *Service) UpdateLastSeenBatch(ctx context.Context, updates []store.UserLastSeenUpdate) error {
+	batch, ok := s.users.(store.UserLastSeenBatchStore)
+	if !ok {
+		return ErrLastSeenBatchUnsupported
+	}
+	latest := make(map[int64]int, len(updates))
+	for _, update := range updates {
+		if update.UserID != 0 && update.LastSeenAt > latest[update.UserID] {
+			latest[update.UserID] = update.LastSeenAt
+		}
+	}
+	if len(latest) == 0 {
+		return nil
+	}
+	merged := make([]store.UserLastSeenUpdate, 0, len(latest))
+	userIDs := make([]int64, 0, len(latest))
+	for userID, lastSeenAt := range latest {
+		merged = append(merged, store.UserLastSeenUpdate{UserID: userID, LastSeenAt: lastSeenAt})
+		userIDs = append(userIDs, userID)
+	}
+	if err := batch.UpdateLastSeenBatch(ctx, merged); err != nil {
+		return err
+	}
+	if s.cache != nil {
+		if err := s.cache.Delete(ctx, userIDs); err != nil {
+			return fmt.Errorf("invalidate last seen batch user cache: %w", err)
+		}
+	}
 	return nil
 }
 

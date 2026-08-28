@@ -22,6 +22,7 @@ type blockingFirstListContactStore struct {
 
 	mu        sync.Mutex
 	firstUsed bool
+	listCalls int
 }
 
 type blockingFirstPersonalPhotoStore struct {
@@ -116,6 +117,7 @@ func (s *stalePersonalPhotoWritebackStore) staleReads() int {
 
 func (s *blockingFirstListContactStore) ListByUser(ctx context.Context, userID int64) (domain.ContactList, error) {
 	s.mu.Lock()
+	s.listCalls++
 	if !s.firstUsed {
 		s.firstUsed = true
 		s.mu.Unlock()
@@ -129,6 +131,12 @@ func (s *blockingFirstListContactStore) ListByUser(ctx context.Context, userID i
 	}
 	s.mu.Unlock()
 	return s.ContactStore.ListByUser(ctx, userID)
+}
+
+func (s *blockingFirstListContactStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
 }
 
 func (s *blockingFirstPersonalPhotoStore) PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error) {
@@ -248,6 +256,173 @@ func TestCachedContactStoreCachesProjectionReads(t *testing.T) {
 	}
 	if counting.reverseCalls != 0 {
 		t.Fatalf("GetReverseContacts calls = %d, want 0 from shared contact cache", counting.reverseCalls)
+	}
+}
+
+func TestCachedContactStoreContactSnapshotLRUEvictsOnlyOldestViewer(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	for viewerID := int64(1); viewerID <= 3; viewerID++ {
+		if _, err := base.Upsert(ctx, viewerID, domain.ContactInput{
+			ContactUserID: 100 + viewerID,
+			FirstName:     fmt.Sprintf("viewer-%d", viewerID),
+		}); err != nil {
+			t.Fatalf("seed viewer %d: %v", viewerID, err)
+		}
+	}
+	counting := &countingContactStore{ContactStore: base}
+	cached := NewCachedContactStoreWithMaxViewers(counting, time.Hour, 2)
+
+	for _, viewerID := range []int64{1, 2, 1, 3} {
+		if _, err := cached.ListByUser(ctx, viewerID); err != nil {
+			t.Fatalf("list viewer %d: %v", viewerID, err)
+		}
+	}
+	if counting.listCalls != 3 {
+		t.Fatalf("ListByUser calls = %d, want 3 before evicted viewer is read", counting.listCalls)
+	}
+	cached.mu.RLock()
+	_, hasOne := cached.contacts[1]
+	_, hasTwo := cached.contacts[2]
+	_, hasThree := cached.contacts[3]
+	contactEntries := cached.contactLRU.Len()
+	cached.mu.RUnlock()
+	if !hasOne || hasTwo || !hasThree || contactEntries != 2 {
+		t.Fatalf("contact LRU state = one:%v two:%v three:%v len:%d, want one+three only", hasOne, hasTwo, hasThree, contactEntries)
+	}
+
+	if _, err := cached.ListByUser(ctx, 1); err != nil {
+		t.Fatalf("list retained viewer 1: %v", err)
+	}
+	if counting.listCalls != 3 {
+		t.Fatalf("retained viewer caused cold load: calls=%d, want 3", counting.listCalls)
+	}
+	if _, err := cached.ListByUser(ctx, 2); err != nil {
+		t.Fatalf("list evicted viewer 2: %v", err)
+	}
+	if counting.listCalls != 4 {
+		t.Fatalf("evicted viewer did not cold load exactly once: calls=%d, want 4", counting.listCalls)
+	}
+}
+
+func TestCachedContactStoreContactAndPersonalPhotoLRUsAreIndependent(t *testing.T) {
+	cached := NewCachedContactStoreWithMaxViewers(memory.NewContactStore(), time.Hour, 2)
+	expireAt := time.Now().Add(time.Hour)
+	contactSnap := func(userID int64) contactAccountSnapshot {
+		return buildContactAccountSnapshot(domain.ContactList{Contacts: []domain.Contact{{
+			User: domain.User{ID: 100 + userID},
+		}}}, expireAt)
+	}
+	photoSnap := func(userID int64) personalPhotoSnapshot {
+		return personalPhotoSnapshot{
+			refs:     map[int64]domain.ProfilePhotoRef{100 + userID: {PhotoID: 9000 + userID}},
+			expireAt: expireAt,
+		}
+	}
+
+	cached.mu.Lock()
+	cached.storeContactSnapshotLocked(1, contactSnap(1))
+	cached.storeContactSnapshotLocked(2, contactSnap(2))
+	cached.storePersonalPhotoSnapshotLocked(1, photoSnap(1))
+	cached.storePersonalPhotoSnapshotLocked(2, photoSnap(2))
+	cached.mu.Unlock()
+	if _, ok := cached.lookupContactSnapshot(1, time.Now()); !ok {
+		t.Fatal("contact viewer 1 missing before LRU touch")
+	}
+	cached.mu.Lock()
+	cached.storeContactSnapshotLocked(3, contactSnap(3))
+	cached.mu.Unlock()
+
+	cached.mu.RLock()
+	_, contactOne := cached.contacts[1]
+	_, contactTwo := cached.contacts[2]
+	_, contactThree := cached.contacts[3]
+	_, photoOne := cached.personalPhotos[1]
+	_, photoTwo := cached.personalPhotos[2]
+	cached.mu.RUnlock()
+	if !contactOne || contactTwo || !contactThree {
+		t.Fatalf("contact LRU = one:%v two:%v three:%v, want one+three", contactOne, contactTwo, contactThree)
+	}
+	if !photoOne || !photoTwo {
+		t.Fatalf("contact eviction crossed into personal-photo LRU: one:%v two:%v", photoOne, photoTwo)
+	}
+
+	if _, ok := cached.lookupPersonalPhotoSnapshot(2, time.Now()); !ok {
+		t.Fatal("personal-photo viewer 2 missing before LRU touch")
+	}
+	cached.mu.Lock()
+	cached.storePersonalPhotoSnapshotLocked(3, photoSnap(3))
+	cached.mu.Unlock()
+	cached.mu.RLock()
+	_, photoOne = cached.personalPhotos[1]
+	_, photoTwo = cached.personalPhotos[2]
+	_, photoThree := cached.personalPhotos[3]
+	_, contactOne = cached.contacts[1]
+	_, contactThree = cached.contacts[3]
+	cached.mu.RUnlock()
+	if photoOne || !photoTwo || !photoThree {
+		t.Fatalf("personal-photo LRU = one:%v two:%v three:%v, want two+three", photoOne, photoTwo, photoThree)
+	}
+	if !contactOne || !contactThree {
+		t.Fatalf("personal-photo eviction crossed into contact LRU: one:%v three:%v", contactOne, contactThree)
+	}
+
+	cached.InvalidateViewers(3)
+	cached.mu.RLock()
+	_, contactThree = cached.contacts[3]
+	_, photoThree = cached.personalPhotos[3]
+	_, contactElement := cached.contactElements[3]
+	_, photoElement := cached.personalElements[3]
+	cached.mu.RUnlock()
+	if contactThree || photoThree || contactElement || photoElement {
+		t.Fatalf("viewer invalidation left LRU state: contact=%v photo=%v contactElement=%v photoElement=%v",
+			contactThree, photoThree, contactElement, photoElement)
+	}
+}
+
+func TestCachedContactStoreUnrelatedViewerInvalidationDoesNotRejectRefill(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	if _, err := base.Upsert(ctx, 2, domain.ContactInput{ContactUserID: 20, FirstName: "current"}); err != nil {
+		t.Fatalf("seed current contact: %v", err)
+	}
+	blocking := &blockingFirstListContactStore{
+		ContactStore: base,
+		started:      make(chan struct{}),
+		release:      make(chan struct{}),
+		first: domain.ContactList{Contacts: []domain.Contact{{
+			User:      domain.User{ID: 20},
+			FirstName: "captured",
+		}}},
+	}
+	cached := NewCachedContactStore(blocking, time.Hour)
+
+	type readResult struct {
+		contacts map[int64]domain.Contact
+		err      error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		contacts, err := cached.GetMany(ctx, 2, []int64{20})
+		resultCh <- readResult{contacts: contacts, err: err}
+	}()
+	waitForCacheTestSignal(t, blocking.started)
+	cached.InvalidateViewers(1)
+	close(blocking.release)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("contact read: %v", result.err)
+		}
+		if got := result.contacts[20].FirstName; got != "captured" {
+			t.Fatalf("unrelated invalidation rejected captured refill: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for contact read")
+	}
+	if calls := blocking.callCount(); calls != 1 {
+		t.Fatalf("ListByUser calls = %d, want 1 after unrelated invalidation", calls)
 	}
 }
 
@@ -805,6 +980,59 @@ func TestCachedContactStoreDoesNotRefillStaleSnapshotAfterInvalidation(t *testin
 	}
 	if cachedHit[2].FirstName != "Alicia" {
 		t.Fatalf("cached value after stale load retry = %+v, want Alicia", cachedHit[2])
+	}
+	if calls := blocking.callCount(); calls != 2 {
+		t.Fatalf("ListByUser calls = %d, want stale load plus exact-viewer retry", calls)
+	}
+}
+
+func TestCachedContactStoreFlushRejectsEveryInFlightRefill(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alice"}); err != nil {
+		t.Fatalf("seed contact: %v", err)
+	}
+	first, err := base.ListByUser(ctx, 1)
+	if err != nil {
+		t.Fatalf("snapshot first contact list: %v", err)
+	}
+	blocking := &blockingFirstListContactStore{
+		ContactStore: base,
+		started:      make(chan struct{}),
+		release:      make(chan struct{}),
+		first:        first,
+	}
+	cached := NewCachedContactStore(blocking, time.Hour)
+
+	type readResult struct {
+		contacts map[int64]domain.Contact
+		err      error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		contacts, err := cached.GetMany(ctx, 1, []int64{2})
+		resultCh <- readResult{contacts: contacts, err: err}
+	}()
+	waitForCacheTestSignal(t, blocking.started)
+	if _, err := base.Upsert(ctx, 1, domain.ContactInput{ContactUserID: 2, FirstName: "Alicia"}); err != nil {
+		t.Fatalf("update contact while first load is blocked: %v", err)
+	}
+	cached.FlushReadModelCache()
+	close(blocking.release)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("contact read: %v", result.err)
+		}
+		if got := result.contacts[2].FirstName; got != "Alicia" {
+			t.Fatalf("flush allowed stale refill: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for contact read")
+	}
+	if calls := blocking.callCount(); calls != 2 {
+		t.Fatalf("ListByUser calls = %d, want stale load plus post-flush retry", calls)
 	}
 }
 

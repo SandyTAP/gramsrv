@@ -212,19 +212,19 @@ func TestTgUsernamesFromRegistryDegradesToScalar(t *testing.T) {
 	}
 }
 
-func TestUsernameRegistryProjectionCachesNegativeResultUntilExactInvalidation(t *testing.T) {
+func TestUsernameRegistryProjectionWithoutDurableVersionDoesNotRetainNegativeResult(t *testing.T) {
 	registry := newFakeUsernameRegistry()
 	router := New(Config{}, Deps{Usernames: registry}, zaptest.NewLogger(t), clock.System)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 4001}
 
 	for i := 0; i < 2; i++ {
 		got := router.usernameRegistryMap(context.Background(), []domain.Peer{peer})
-		if list, exists := got[peer]; !exists || len(list) != 0 {
-			t.Fatalf("negative projection call %d = %+v, want explicit empty entry", i+1, got)
+		if list, exists := got[peer]; exists || len(list) != 0 {
+			t.Fatalf("negative projection call %d = %+v, want omitted empty entry", i+1, got)
 		}
 	}
-	if batch, scalar := registry.readCounts(); batch != 0 || scalar != 1 {
-		t.Fatalf("negative registry reads = batch %d / scalar %d, want 0/1", batch, scalar)
+	if batch, scalar := registry.readCounts(); batch != 0 || scalar != 2 {
+		t.Fatalf("negative registry reads = batch %d / scalar %d, want 0/2", batch, scalar)
 	}
 
 	registry.byPeer[peer] = []domain.Username{{
@@ -237,8 +237,8 @@ func TestUsernameRegistryProjectionCachesNegativeResultUntilExactInvalidation(t 
 	if len(got[peer]) != 1 || got[peer][0].Username != "cached_after_invalidation" {
 		t.Fatalf("projection after invalidation = %+v", got)
 	}
-	if batch, scalar := registry.readCounts(); batch != 0 || scalar != 2 {
-		t.Fatalf("registry reads after invalidation = batch %d / scalar %d, want 0/2", batch, scalar)
+	if batch, scalar := registry.readCounts(); batch != 0 || scalar != 3 {
+		t.Fatalf("registry reads after invalidation = batch %d / scalar %d, want 0/3", batch, scalar)
 	}
 }
 

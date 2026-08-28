@@ -345,10 +345,59 @@ type CoreConfig struct {
 	TranslationRateWindow              time.Duration
 	TempKeyResolveCacheMaxEntries      int
 	TempKeyResolveCacheTTL             time.Duration
+	ReadModelVersionCacheMaxEntries    int
+	ReadModelVersionBatchMaxKeys       int
+	ReadModelVersionBatchWait          time.Duration
+	ReadModelVersionBatchQueue         int
+	ReadModelVersionBatchTimeout       time.Duration
+	AuthKeyGetBatchMax                 int
+	AuthKeyGetBatchWait                time.Duration
+	AuthKeyGetBatchQueue               int
+	AuthKeyGetBatchTimeout             time.Duration
+	ContactReverseBatchMaxPairs        int
+	ContactReverseBatchWait            time.Duration
+	ContactReverseBatchQueue           int
+	ContactReverseBatchTimeout         time.Duration
+	ContactSnapshotCacheMaxViewers     int
+	ProfilePhotoCacheMaxEntries        int
+	ProfilePhotoCacheTTL               time.Duration
+	PeerIdentityCacheMaxEntries        int
+	DialogPrivatePeerCacheMaxEntries   int
+	DialogPrivatePeerCacheMaxBytes     int64
+	DialogDraftCacheMaxEntries         int
+	DialogDraftCacheMaxBytes           int64
+	UserProjectionFactCacheMaxEntries  int
+	StoryActivePeerCacheMaxEntries     int
+	StoryHiddenListCacheMaxEntries     int
+	StoryHiddenListCacheMaxBytes       int64
+	DialogListSnapshotCacheMaxEntries  int
+	DialogListSnapshotCacheMaxHeaders  int64
+	DialogListSnapshotCacheTTL         time.Duration
+	DialogListSnapshotRedisTTL         time.Duration
+	ActiveChannelIDsCacheMaxEntries    int
+	ActiveChannelIDsCacheTTL           time.Duration
+	ActiveChannelIDsRedisTTL           time.Duration
+	ActiveChannelIDsBatchMax           int
+	ActiveChannelIDsBatchWait          time.Duration
+	ActiveChannelIDsBatchQueue         int
+	ActiveChannelIDsBatchTimeout       time.Duration
+	BootstrapReadyBatchMax             int
+	BootstrapReadyBatchWait            time.Duration
+	BootstrapReadyBatchQueue           int
+	BootstrapReadyBatchTimeout         time.Duration
+	PresenceLastSeenBatchMax           int
+	PresenceLastSeenBatchWait          time.Duration
+	PresenceLastSeenBatchQueue         int
+	PresenceLastSeenBatchTimeout       time.Duration
+	PresenceLastSeenDrainTimeout       time.Duration
 	AuthUserCacheTTL                   time.Duration
 	ChannelRowCacheMaxEntries          int
+	ChannelTopMessageCacheMaxEntries   int
 	ChannelMemberCacheMaxEntries       int
 	ChannelDialogCacheMaxEntries       int
+	ChannelDifferenceCacheMaxEntries   int
+	ChannelDifferenceCacheMaxBytes     int64
+	ChannelDifferenceCacheTTL          time.Duration
 	ChannelBoostCacheMaxEntries        int
 	ChannelBoostCacheTTL               time.Duration
 	OutboxLeaseTimeout                 time.Duration
@@ -606,10 +655,59 @@ func coreConfigFromConfig(c Config) CoreConfig {
 		TranslationRateWindow:              c.TranslationRateWindow,
 		TempKeyResolveCacheMaxEntries:      c.TempKeyResolveCacheMaxEntries,
 		TempKeyResolveCacheTTL:             c.TempKeyResolveCacheTTL,
+		ReadModelVersionCacheMaxEntries:    c.ReadModelVersionCacheMaxEntries,
+		ReadModelVersionBatchMaxKeys:       c.ReadModelVersionBatchMaxKeys,
+		ReadModelVersionBatchWait:          c.ReadModelVersionBatchWait,
+		ReadModelVersionBatchQueue:         c.ReadModelVersionBatchQueue,
+		ReadModelVersionBatchTimeout:       c.ReadModelVersionBatchTimeout,
+		AuthKeyGetBatchMax:                 c.AuthKeyGetBatchMax,
+		AuthKeyGetBatchWait:                c.AuthKeyGetBatchWait,
+		AuthKeyGetBatchQueue:               c.AuthKeyGetBatchQueue,
+		AuthKeyGetBatchTimeout:             c.AuthKeyGetBatchTimeout,
+		ContactReverseBatchMaxPairs:        c.ContactReverseBatchMaxPairs,
+		ContactReverseBatchWait:            c.ContactReverseBatchWait,
+		ContactReverseBatchQueue:           c.ContactReverseBatchQueue,
+		ContactReverseBatchTimeout:         c.ContactReverseBatchTimeout,
+		ContactSnapshotCacheMaxViewers:     c.ContactSnapshotCacheMaxViewers,
+		ProfilePhotoCacheMaxEntries:        c.ProfilePhotoCacheMaxEntries,
+		ProfilePhotoCacheTTL:               c.ProfilePhotoCacheTTL,
+		PeerIdentityCacheMaxEntries:        c.PeerIdentityCacheMaxEntries,
+		DialogPrivatePeerCacheMaxEntries:   c.DialogPrivatePeerCacheMaxEntries,
+		DialogPrivatePeerCacheMaxBytes:     c.DialogPrivatePeerCacheMaxBytes,
+		DialogDraftCacheMaxEntries:         c.DialogDraftCacheMaxEntries,
+		DialogDraftCacheMaxBytes:           c.DialogDraftCacheMaxBytes,
+		UserProjectionFactCacheMaxEntries:  c.UserProjectionFactCacheMaxEntries,
+		StoryActivePeerCacheMaxEntries:     c.StoryActivePeerCacheMaxEntries,
+		StoryHiddenListCacheMaxEntries:     c.StoryHiddenListCacheMaxEntries,
+		StoryHiddenListCacheMaxBytes:       c.StoryHiddenListCacheMaxBytes,
+		DialogListSnapshotCacheMaxEntries:  c.DialogListSnapshotCacheMaxEntries,
+		DialogListSnapshotCacheMaxHeaders:  c.DialogListSnapshotCacheMaxHeaders,
+		DialogListSnapshotCacheTTL:         c.DialogListSnapshotCacheTTL,
+		DialogListSnapshotRedisTTL:         c.DialogListSnapshotRedisTTL,
+		ActiveChannelIDsCacheMaxEntries:    c.ActiveChannelIDsCacheMaxEntries,
+		ActiveChannelIDsCacheTTL:           c.ActiveChannelIDsCacheTTL,
+		ActiveChannelIDsRedisTTL:           c.ActiveChannelIDsRedisTTL,
+		ActiveChannelIDsBatchMax:           c.ActiveChannelIDsBatchMax,
+		ActiveChannelIDsBatchWait:          c.ActiveChannelIDsBatchWait,
+		ActiveChannelIDsBatchQueue:         c.ActiveChannelIDsBatchQueue,
+		ActiveChannelIDsBatchTimeout:       c.ActiveChannelIDsBatchTimeout,
+		BootstrapReadyBatchMax:             c.BootstrapReadyBatchMax,
+		BootstrapReadyBatchWait:            c.BootstrapReadyBatchWait,
+		BootstrapReadyBatchQueue:           c.BootstrapReadyBatchQueue,
+		BootstrapReadyBatchTimeout:         c.BootstrapReadyBatchTimeout,
+		PresenceLastSeenBatchMax:           c.PresenceLastSeenBatchMax,
+		PresenceLastSeenBatchWait:          c.PresenceLastSeenBatchWait,
+		PresenceLastSeenBatchQueue:         c.PresenceLastSeenBatchQueue,
+		PresenceLastSeenBatchTimeout:       c.PresenceLastSeenBatchTimeout,
+		PresenceLastSeenDrainTimeout:       c.PresenceLastSeenDrainTimeout,
 		AuthUserCacheTTL:                   c.AuthUserCacheTTL,
 		ChannelRowCacheMaxEntries:          c.ChannelRowCacheMaxEntries,
+		ChannelTopMessageCacheMaxEntries:   c.ChannelTopMessageCacheMaxEntries,
 		ChannelMemberCacheMaxEntries:       c.ChannelMemberCacheMaxEntries,
 		ChannelDialogCacheMaxEntries:       c.ChannelDialogCacheMaxEntries,
+		ChannelDifferenceCacheMaxEntries:   c.ChannelDifferenceCacheMaxEntries,
+		ChannelDifferenceCacheMaxBytes:     c.ChannelDifferenceCacheMaxBytes,
+		ChannelDifferenceCacheTTL:          c.ChannelDifferenceCacheTTL,
 		ChannelBoostCacheMaxEntries:        c.ChannelBoostCacheMaxEntries,
 		ChannelBoostCacheTTL:               c.ChannelBoostCacheTTL,
 		OutboxLeaseTimeout:                 c.OutboxLeaseTimeout,

@@ -881,6 +881,21 @@ func (s *UserStore) UpdateLastSeen(_ context.Context, userID int64, lastSeenAt i
 	return nil
 }
 
+func (s *UserStore) UpdateLastSeenBatch(ctx context.Context, updates []store.UserLastSeenUpdate) error {
+	latest := make(map[int64]int, len(updates))
+	for _, update := range updates {
+		if update.UserID != 0 && update.LastSeenAt > latest[update.UserID] {
+			latest[update.UserID] = update.LastSeenAt
+		}
+	}
+	for userID, lastSeenAt := range latest {
+		if err := s.UpdateLastSeen(ctx, userID, lastSeenAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func userMatchesSearch(u domain.User, query, phoneQuery string) bool {
 	if phoneQuery != "" && strings.HasPrefix(u.Phone, phoneQuery) {
 		return true

@@ -36,9 +36,14 @@ type UpdatesDeliveryAction struct {
 	ReadyRawAuthKey  [8]byte
 	ReadySessionID   int64
 	ReadyUserID      int64
+	ActivationToken  uint64
 
-	PublishBootstrap bool
-	BootstrapUserID  int64
+	PublishBootstrap    bool
+	BootstrapUserID     int64
+	BootstrapAuthKey    [8]byte
+	BootstrapRawAuthKey [8]byte
+	BootstrapSessionID  int64
+	BootstrapProbeToken uint64
 }
 
 // AccountAuthorizationTeardownAction carries only the device-scoped runtime

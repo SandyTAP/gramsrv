@@ -151,6 +151,11 @@ message UpdatesDeliveryAction {
 
   bool publish_bootstrap = 13;
   int64 bootstrap_user_id = 14;
+  uint64 activation_token = 15;
+  bytes bootstrap_auth_key_id = 16;
+  int64 bootstrap_session_id = 17;
+  uint64 bootstrap_probe_token = 18;
+  bytes bootstrap_raw_auth_key_id = 19;
 }
 
 message PrepareReplayResponse {

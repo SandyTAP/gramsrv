@@ -173,6 +173,7 @@ func (r *Router) PrepareAdmittedReplay(
 				restoreErr = fmt.Errorf("prepare delivered exact RPC replay metadata: %w", prepareErr)
 				return
 			}
+			defer updatesDelivery.releaseSessionActivation()
 			replayCtx = r.applyLayerRPCWrapperEffects(replayCtx, profile, profileKnown, identity, effects, msgID, admissionSeq, layerRPCWrapperApplyReplayRestore)
 			if profileKnown && layerRPCProfileEvidenceFresh(replayCtx) {
 				r.maybeMarkSessionReceivesUpdates(replayCtx)
@@ -184,7 +185,9 @@ func (r *Router) PrepareAdmittedReplay(
 				// base for ordinary post-response work. Replay restoration is a
 				// stricter ordered barrier, so every phase shares the overall deadline.
 				updatesDelivery.baseCtx = replayCtx
-				r.runUpdatesDeliveryPlan(updatesDelivery.snapshot())
+				snapshot := updatesDelivery.snapshot()
+				updatesDelivery.disownSessionActivation()
+				r.runUpdatesDeliveryPlan(snapshot)
 			}
 			if err := replayCtx.Err(); err != nil {
 				restoreErr = fmt.Errorf("restore delivered exact RPC replay metadata: %w", err)
@@ -236,6 +239,7 @@ func (r *Router) DispatchAdmitted(
 	if err != nil {
 		return nil, method, err
 	}
+	defer updatesDelivery.releaseSessionActivation()
 	ctx, err = r.applyLayerRPCWrappers(ctx, msgID, admissionSeq, request)
 	if err != nil {
 		return nil, method, err
@@ -278,8 +282,9 @@ func (r *Router) DispatchAdmitted(
 	dur := time.Since(start)
 	dbDelta := dbtrace.SnapshotFromContext(ctx).Sub(dbBefore)
 	logLevel := zap.DebugLevel
-	if err != nil || dur > 100*time.Millisecond {
-		// Errors and slow requests remain visible at Info even when Debug is off.
+	if err != nil {
+		// Errors remain visible at Info even when Debug is off. Successful hot-path
+		// RPCs, including slow ones, stay at Debug and are observed through metrics.
 		logLevel = zap.InfoLevel
 	}
 	if r.log != nil {

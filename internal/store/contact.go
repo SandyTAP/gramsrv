@@ -315,6 +315,13 @@ type SparseContactProjectionStore interface {
 	ContactProjectionForViewerUserIDs(ctx context.Context, contactUserIDsByViewer map[int64][]int64) (domain.ContactProjectionBatch, error)
 }
 
+// SparseReverseContactStore reads only explicitly requested owner->viewer
+// relationship pairs, allowing the bounded batcher to combine requests
+// without widening them into a cross product.
+type SparseReverseContactStore interface {
+	GetReverseContactsForViewerUserIDs(ctx context.Context, viewerUserIDsByOwner map[int64][]int64) (map[int64]map[int64]domain.Contact, error)
+}
+
 type ContactPersonalPhotoDeliverySnapshot struct {
 	ViewerUserID  int64
 	ContactUserID int64

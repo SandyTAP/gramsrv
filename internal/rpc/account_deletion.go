@@ -64,6 +64,7 @@ func (r *Router) onAccountDeleteAccount(ctx context.Context, req *tg.AccountDele
 	if err := r.finishDeletedAccountAuthorizations(ctx, userID, outcome.Deletion.RevokedAuthorizations); err != nil {
 		return false, internalErr()
 	}
+	r.invalidateDeletedUserProjectionFacts(userID)
 	// A tombstone changes this target for every viewer. Flushing once is bounded
 	// and avoids four full-cache predicate scans; the PostgreSQL user_deleted
 	// event performs the same coarse invalidation on other instances.
@@ -172,7 +173,16 @@ func (r *Router) NotifyModerationAccountDeletion(ctx context.Context, result dom
 	if err := r.finishDeletedAccountAuthorizations(ctx, result.User.ID, result.RevokedAuthorizations); err != nil {
 		r.log.Error("moderation account deletion authorization teardown unavailable", zap.Error(err))
 	}
+	r.invalidateDeletedUserProjectionFacts(result.User.ID)
 	r.flushRPCProjectionCache()
+}
+
+func (r *Router) invalidateDeletedUserProjectionFacts(userID int64) {
+	if r == nil || userID == 0 || r.deps.UserProjectionFacts == nil {
+		return
+	}
+	r.deps.UserProjectionFacts.InvalidateAccountFreezeFact(userID)
+	r.deps.UserProjectionFacts.InvalidateCollectiblePhoneFact(userID)
 }
 
 func accountDeletionErr(err error) error {

@@ -95,46 +95,50 @@ func (s Stores) NewPrivacyService() *privacyapp.Service {
 }
 
 type CacheSetDeps struct {
-	ContactExtras      []postgres.ContactReadModelCache
-	Dialogs            postgres.DialogReadModelCache
-	Privacy            postgres.PrivacyReadModelCache
-	Stories            postgres.StoryReadModelCache
-	ChannelFullBots    postgres.ChannelFullBotReadModelCache
-	ChannelBotMembers  postgres.ChannelBotMemberReadModelCache
-	ChannelMediaCounts postgres.ChannelMediaCountReadModelCache
-	PrivateMediaCounts postgres.PrivateMediaCountReadModelCache
-	RPCProjections     postgres.RPCProjectionReadModelCache
-	BotProfiles        postgres.BotProfileReadModelCache
-	StarGifts          postgres.StarGiftCatalogCache
-	AccountSettings    postgres.AccountSettingsReadModelCache
-	AccountFreezes     postgres.AccountFreezeReadModelCache
-	BusinessAutomation postgres.BusinessAutomationReadModelCache
+	ContactExtras       []postgres.ContactReadModelCache
+	Dialogs             postgres.DialogReadModelCache
+	Privacy             postgres.PrivacyReadModelCache
+	Stories             postgres.StoryReadModelCache
+	ChannelFullBots     postgres.ChannelFullBotReadModelCache
+	ChannelBotMembers   postgres.ChannelBotMemberReadModelCache
+	ChannelMediaCounts  postgres.ChannelMediaCountReadModelCache
+	PrivateMediaCounts  postgres.PrivateMediaCountReadModelCache
+	RPCProjections      postgres.RPCProjectionReadModelCache
+	PeerIdentities      postgres.PeerIdentityReadModelCache
+	BotProfiles         postgres.BotProfileReadModelCache
+	StarGifts           postgres.StarGiftCatalogCache
+	AccountSettings     postgres.AccountSettingsReadModelCache
+	AccountFreezes      postgres.AccountFreezeReadModelCache
+	UserProjectionFacts postgres.UserProjectionFactReadModelCache
+	BusinessAutomation  postgres.BusinessAutomationReadModelCache
 }
 
 func (s Stores) ReadModelCacheSet(deps CacheSetDeps) postgres.ReadModelCacheSet {
 	return postgres.ReadModelCacheSet{
-		ReadModelVersions:  s.ReadModelVersions,
-		ChannelRows:        s.ChannelRowCache,
-		ChannelMembers:     s.ChannelMemberCache,
-		ChannelDialogs:     s.ChannelDialogCache,
-		ChannelBoosts:      s.ChannelBoostCache,
-		Contacts:           mergeContactCaches(s.ContactStore, deps.ContactExtras...),
-		Dialogs:            deps.Dialogs,
-		Privacy:            deps.Privacy,
-		ProfilePhotos:      s.Photos,
-		Stories:            deps.Stories,
-		ChannelFullBots:    deps.ChannelFullBots,
-		ChannelBotMembers:  deps.ChannelBotMembers,
-		ChannelMediaCounts: deps.ChannelMediaCounts,
-		PrivateMediaCounts: deps.PrivateMediaCounts,
-		RPCProjections:     deps.RPCProjections,
-		BaseUsers:          s.UserCache,
-		BotProfiles:        deps.BotProfiles,
-		StarGifts:          deps.StarGifts,
-		AccountSettings:    deps.AccountSettings,
-		AccountFreezes:     deps.AccountFreezes,
-		CollectiblePhones:  s.CollectiblePhoneStore,
-		BusinessAutomation: deps.BusinessAutomation,
+		ReadModelVersions:   s.ReadModelVersions,
+		ChannelRows:         s.ChannelRowCache,
+		ChannelMembers:      s.ChannelMemberCache,
+		ChannelDialogs:      s.ChannelDialogCache,
+		ChannelBoosts:       s.ChannelBoostCache,
+		Contacts:            mergeContactCaches(s.ContactStore, deps.ContactExtras...),
+		Dialogs:             deps.Dialogs,
+		Privacy:             deps.Privacy,
+		ProfilePhotos:       s.Photos,
+		Stories:             deps.Stories,
+		ChannelFullBots:     deps.ChannelFullBots,
+		ChannelBotMembers:   deps.ChannelBotMembers,
+		ChannelMediaCounts:  deps.ChannelMediaCounts,
+		PrivateMediaCounts:  deps.PrivateMediaCounts,
+		RPCProjections:      deps.RPCProjections,
+		PeerIdentities:      deps.PeerIdentities,
+		BaseUsers:           s.UserCache,
+		BotProfiles:         deps.BotProfiles,
+		StarGifts:           deps.StarGifts,
+		AccountSettings:     deps.AccountSettings,
+		AccountFreezes:      deps.AccountFreezes,
+		UserProjectionFacts: deps.UserProjectionFacts,
+		CollectiblePhones:   s.CollectiblePhoneStore,
+		BusinessAutomation:  deps.BusinessAutomation,
 	}
 }
 

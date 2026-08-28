@@ -46,14 +46,16 @@ const retryableChannelTxAttempts = 3
 
 // ChannelStore 用 PostgreSQL 实现 store.ChannelStore。
 type ChannelStore struct {
-	db          sqlcgen.DBTX
-	ids         store.ChannelIDAllocator
-	msgIDs      store.ChannelMessageIDAllocator
-	log         *zap.Logger
-	rowCache    *ChannelRowCache
-	memberCache *ChannelMemberCache
-	dialogCache *ChannelDialogCache
-	boostCache  *ChannelBoostCache
+	db              sqlcgen.DBTX
+	ids             store.ChannelIDAllocator
+	msgIDs          store.ChannelMessageIDAllocator
+	log             *zap.Logger
+	rowCache        *ChannelRowCache
+	topMsgCache     *ChannelTopMessageCache
+	memberCache     *ChannelMemberCache
+	dialogCache     *ChannelDialogCache
+	boostCache      *ChannelBoostCache
+	differenceCache *ChannelDifferenceBaseCache
 	// paidReactionStartingGrant mirrors app/stars lazy grant policy inside the
 	// paid reaction settlement transaction.
 	paidReactionStartingGrant int64
@@ -85,6 +87,14 @@ func WithChannelRowCache(cache *ChannelRowCache) ChannelStoreOption {
 	}
 }
 
+// WithChannelTopMessageCache injects the shared dialog-top message cache. The
+// cache never contains viewer reaction/read overlays.
+func WithChannelTopMessageCache(cache *ChannelTopMessageCache) ChannelStoreOption {
+	return func(s *ChannelStore) {
+		s.topMsgCache = cache
+	}
+}
+
 // WithChannelMemberCache 注入「频道成员/访问态」进程内缓存。
 // 传 nil 等于禁用；事务内仍绕过，提交后由 read model listener 失效。
 func WithChannelMemberCache(cache *ChannelMemberCache) ChannelStoreOption {
@@ -109,6 +119,15 @@ func WithChannelBoostCache(cache *ChannelBoostCache) ChannelStoreOption {
 	}
 }
 
+// WithChannelDifferenceBaseCache injects the shared immutable event/message
+// page cache used by updates.getChannelDifference. Viewer access and overlays
+// remain outside this cache.
+func WithChannelDifferenceBaseCache(cache *ChannelDifferenceBaseCache) ChannelStoreOption {
+	return func(s *ChannelStore) {
+		s.differenceCache = cache
+	}
+}
+
 // WithChannelStarsStartingGrant keeps paid reaction's atomic debit aligned
 // with the configured app/stars lazy first-use grant.
 func WithChannelStarsStartingGrant(amount int64) ChannelStoreOption {
@@ -125,6 +144,10 @@ func WithChannelStarsStartingGrant(amount int64) ChannelStoreOption {
 // 事务内(db != s.db)一律绕过缓存实时读，保证事务读己写。
 func (s *ChannelStore) cacheActive(db sqlcgen.DBTX) bool {
 	return s.rowCache != nil && db == s.db
+}
+
+func (s *ChannelStore) topMessageCacheActive(db sqlcgen.DBTX) bool {
+	return s.topMsgCache != nil && db == s.db
 }
 
 func (s *ChannelStore) memberCacheActive(db sqlcgen.DBTX) bool {

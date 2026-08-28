@@ -123,6 +123,22 @@ func (c *controlFabricController) SetReceivesUpdatesForAuthKey(rawAuthKeyID [8]b
 	c.fabric.SetReceivesUpdatesForAuthKey(rawAuthKeyID, sessionID, receives)
 }
 
+func (c *controlFabricController) BeginSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64) (uint64, bool) {
+	return c.fabric.BeginSessionUpdatesActivation(rawAuthKeyID, sessionID)
+}
+
+func (c *controlFabricController) EndSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64, token uint64) {
+	c.fabric.EndSessionUpdatesActivation(rawAuthKeyID, sessionID, token)
+}
+
+func (c *controlFabricController) BeginSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64) (uint64, bool) {
+	return c.fabric.BeginSessionBootstrapProbe(rawAuthKeyID, sessionID)
+}
+
+func (c *controlFabricController) EndSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64, token uint64, success bool) {
+	c.fabric.EndSessionBootstrapProbe(rawAuthKeyID, sessionID, token, success)
+}
+
 func (c *controlFabricController) SetClientLayerForAuthKey(rawAuthKeyID [8]byte, sessionID int64, layer int) {
 	c.fabric.SetClientLayerForAuthKey(rawAuthKeyID, sessionID, layer)
 }
@@ -327,6 +343,53 @@ func (f *SessionControlFabric) SetReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte
 		SessionID:       sessionID,
 		ReceivesUpdates: receives,
 	}, f.rawSessionTargets(rawAuthKeyID, sessionID))
+}
+
+func (f *SessionControlFabric) BeginSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64) (uint64, bool) {
+	return f.beginSessionLifecycle(rawAuthKeyID, sessionID, SessionControlBeginUpdatesActivation)
+}
+
+func (f *SessionControlFabric) EndSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64, token uint64) {
+	f.endSessionLifecycle(rawAuthKeyID, sessionID, token, false, SessionControlEndUpdatesActivation)
+}
+
+func (f *SessionControlFabric) BeginSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64) (uint64, bool) {
+	return f.beginSessionLifecycle(rawAuthKeyID, sessionID, SessionControlBeginBootstrapProbe)
+}
+
+func (f *SessionControlFabric) EndSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64, token uint64, success bool) {
+	f.endSessionLifecycle(rawAuthKeyID, sessionID, token, success, SessionControlEndBootstrapProbe)
+}
+
+func (f *SessionControlFabric) beginSessionLifecycle(rawAuthKeyID [8]byte, sessionID int64, kind SessionControlKind) (uint64, bool) {
+	if f == nil || rawAuthKeyID == ([8]byte{}) || sessionID == 0 {
+		return 0, false
+	}
+	targets := f.rawSessionTargets(rawAuthKeyID, sessionID)
+	if len(targets) != 1 {
+		return 0, false
+	}
+	ack, err := f.sendLivePushCommand(context.Background(), targets[0], SessionControlCommand{
+		Kind: kind, RawAuthKeyID: rawAuthKeyID, SessionID: sessionID,
+	})
+	if err != nil || ack.Error != "" || ack.Affected != 1 || ack.LifecycleToken == 0 {
+		return 0, false
+	}
+	return ack.LifecycleToken, true
+}
+
+func (f *SessionControlFabric) endSessionLifecycle(rawAuthKeyID [8]byte, sessionID int64, token uint64, success bool, kind SessionControlKind) {
+	if f == nil || rawAuthKeyID == ([8]byte{}) || sessionID == 0 || token == 0 {
+		return
+	}
+	targets := f.rawSessionTargets(rawAuthKeyID, sessionID)
+	if len(targets) != 1 {
+		return
+	}
+	_, _ = f.sendLivePushCommand(context.Background(), targets[0], SessionControlCommand{
+		Kind: kind, RawAuthKeyID: rawAuthKeyID, SessionID: sessionID,
+		LifecycleToken: token, LifecycleSuccess: success,
+	})
 }
 
 func (f *SessionControlFabric) SetClientLayerForAuthKey(rawAuthKeyID [8]byte, sessionID int64, layer int) {
@@ -1349,6 +1412,24 @@ func HandleSessionControlCommandContext(ctx context.Context, local FullControlle
 		ack.Affected = local.UnbindAuthKey(cmd.AuthKeyID)
 	case SessionControlSetReceivesUpdates:
 		local.SetReceivesUpdatesForAuthKey(cmd.RawAuthKeyID, cmd.SessionID, cmd.ReceivesUpdates)
+		ack.Affected = 1
+	case SessionControlBeginUpdatesActivation:
+		token, ok := local.BeginSessionUpdatesActivation(cmd.RawAuthKeyID, cmd.SessionID)
+		if ok {
+			ack.Affected = 1
+			ack.LifecycleToken = token
+		}
+	case SessionControlEndUpdatesActivation:
+		local.EndSessionUpdatesActivation(cmd.RawAuthKeyID, cmd.SessionID, cmd.LifecycleToken)
+		ack.Affected = 1
+	case SessionControlBeginBootstrapProbe:
+		token, ok := local.BeginSessionBootstrapProbe(cmd.RawAuthKeyID, cmd.SessionID)
+		if ok {
+			ack.Affected = 1
+			ack.LifecycleToken = token
+		}
+	case SessionControlEndBootstrapProbe:
+		local.EndSessionBootstrapProbe(cmd.RawAuthKeyID, cmd.SessionID, cmd.LifecycleToken, cmd.LifecycleSuccess)
 		ack.Affected = 1
 	case SessionControlSetClientLayer:
 		local.SetClientLayerForAuthKey(cmd.RawAuthKeyID, cmd.SessionID, cmd.Layer)

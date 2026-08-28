@@ -32,6 +32,9 @@ func (r *Router) InvalidateUserProjection(userID int64) {
 	if r == nil || userID <= 0 {
 		return
 	}
+	if r.deps.UserProjectionFacts != nil {
+		r.deps.UserProjectionFacts.InvalidateCollectiblePhoneFact(userID)
+	}
 	r.invalidateRPCProjectionForUser(userID)
 }
 
@@ -77,6 +80,9 @@ func (r *Router) starsBalanceDeliveryEffects(balance domain.StarsBalance, exclud
 func (r *Router) NotifyAccountFreezeChanged(_ context.Context, freeze domain.AccountFreeze) error {
 	if r == nil || freeze.UserID == 0 {
 		return nil
+	}
+	if r.deps.UserProjectionFacts != nil {
+		r.deps.UserProjectionFacts.InvalidateAccountFreezeFact(freeze.UserID)
 	}
 	r.invalidateRPCProjectionForUser(freeze.UserID)
 	if r.accountFreezeWake != nil {

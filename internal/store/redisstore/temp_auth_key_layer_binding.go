@@ -15,12 +15,17 @@ import (
 // retried by the client without a compatibility path.
 type LayerAwareTempAuthKeyBindingStore struct {
 	base   store.TempAuthKeyBindingStore
-	layers store.AuthKeySessionLayerIdentityBinder
+	layers layerIdentityBindingStore
+}
+
+type layerIdentityBindingStore interface {
+	store.AuthKeySessionLayerIdentityBinder
+	store.AuthKeySessionLayerStore
 }
 
 func NewLayerAwareTempAuthKeyBindingStore(
 	base store.TempAuthKeyBindingStore,
-	layers store.AuthKeySessionLayerIdentityBinder,
+	layers layerIdentityBindingStore,
 ) (*LayerAwareTempAuthKeyBindingStore, error) {
 	if base == nil || layers == nil {
 		return nil, errors.New("temp auth key Layer binding dependencies are required")
@@ -29,17 +34,32 @@ func NewLayerAwareTempAuthKeyBindingStore(
 }
 
 func (s *LayerAwareTempAuthKeyBindingStore) Save(ctx context.Context, binding domain.TempAuthKeyBinding) error {
+	_, err := s.SaveWithState(ctx, binding)
+	return err
+}
+
+func (s *LayerAwareTempAuthKeyBindingStore) SaveWithState(ctx context.Context, binding domain.TempAuthKeyBinding) (domain.TempAuthKeyBindingResult, error) {
 	if s == nil || s.base == nil || s.layers == nil {
-		return store.ErrAuthKeySessionLayerStoreRequired
+		return domain.TempAuthKeyBindingResult{}, store.ErrAuthKeySessionLayerStoreRequired
 	}
-	if err := s.base.Save(ctx, binding); err != nil {
-		return err
+	if _, err := s.base.SaveWithState(ctx, binding); err != nil {
+		return domain.TempAuthKeyBindingResult{}, err
 	}
 	var effective [8]byte
 	binary.LittleEndian.PutUint64(effective[:], uint64(binding.PermAuthKeyID))
-	return s.layers.BindAuthKeyLayerIdentity(
+	if err := s.layers.BindAuthKeyLayerIdentity(
 		ctx, binding.TempAuthKeyID, effective, binding.ExpiresAt,
-	)
+	); err != nil {
+		return domain.TempAuthKeyBindingResult{}, err
+	}
+	current, found, err := s.layers.GetAuthKeyLayerDefault(ctx, binding.TempAuthKeyID)
+	if err != nil {
+		return domain.TempAuthKeyBindingResult{}, err
+	}
+	if !found {
+		return domain.TempAuthKeyBindingResult{}, nil
+	}
+	return domain.TempAuthKeyBindingResult{Layer: current.Layer, LayerObservationID: current.ObservationID}, nil
 }
 
 func (s *LayerAwareTempAuthKeyBindingStore) GetByTemp(

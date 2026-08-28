@@ -55,6 +55,7 @@ import (
 	translationapp "telesrv/internal/app/translation"
 	"telesrv/internal/app/updates"
 	usernamesapp "telesrv/internal/app/usernames"
+	"telesrv/internal/app/userprojection"
 	"telesrv/internal/app/users"
 	verificationapp "telesrv/internal/app/verification"
 	welcomemessagesapp "telesrv/internal/app/welcomemessages"
@@ -684,6 +685,14 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	}
 
 	authKeyStore := postgres.NewAuthKeyStore(pool)
+	authKeyGetBatchStore, err := postgres.NewBatchedAuthKeyStore(authKeyStore, postgres.AuthKeyGetBatchConfig{
+		MaxSize: cfg.AuthKeyGetBatchMax, MaxWait: cfg.AuthKeyGetBatchWait,
+		QueueSize: cfg.AuthKeyGetBatchQueue, QueryTimeout: cfg.AuthKeyGetBatchTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize auth-key lookup batcher: %w", err)
+	}
+	defer authKeyGetBatchStore.Close()
 	baseTempAuthKeyStore := postgres.NewTempAuthKeyBindingStore(pool)
 	authKeySessionLayers, err := redisstore.NewAuthKeySessionLayerStore(rdb, authKeyStore)
 	if err != nil {
@@ -701,7 +710,18 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	updateEventStore := postgres.NewUpdateEventStore(pool, postgres.WithUpdateEventLogger(logger.Named("store").Named("updates")))
 	phoneChangeStore := postgres.NewPhoneChangeStore(pool)
 	deliveryOutboxStore := postgres.NewDeliveryOutboxStore(pool, postgres.WithDeliveryLeaseTimeout(cfg.OutboxLeaseTimeout))
-	bootstrapUpdateStore := postgres.NewBootstrapUpdateJobStore(pool)
+	bootstrapUpdateStore, err := postgres.NewBatchedBootstrapUpdateJobStore(
+		postgres.NewBootstrapUpdateJobStore(pool),
+		postgres.BootstrapReadyBatchConfig{
+			MaxSize: cfg.BootstrapReadyBatchMax, MaxWait: cfg.BootstrapReadyBatchWait,
+			QueueSize: cfg.BootstrapReadyBatchQueue, QueryTimeout: cfg.BootstrapReadyBatchTimeout,
+			Metrics: metricRegistry,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize bootstrap readiness batcher: %w", err)
+	}
+	defer bootstrapUpdateStore.Close()
 	botAPIUpdateStore := postgres.NewBotAPIUpdateStore(pool)
 	botCallbackStore := redisstore.NewBotCallbackRegistryStore(rdb)
 	loginTokenStore := redisstore.NewLoginTokenRegistryStore(rdb)
@@ -715,6 +735,12 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, counterRecovery.ChannelIDSource())
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, counterRecovery.ChannelMessageIDSource())
 	readModelRedisBus := redisstore.NewReadModelInvalidationBus(rdb, logger.Named("store").Named("read-model-redis"))
+	channelTopMessageCache := postgres.NewChannelTopMessageCache(cfg.ChannelTopMessageCacheMaxEntries)
+	channelDifferenceCache := postgres.NewChannelDifferenceBaseCache(
+		cfg.ChannelDifferenceCacheMaxEntries,
+		cfg.ChannelDifferenceCacheMaxBytes,
+		cfg.ChannelDifferenceCacheTTL,
+	)
 	projectionStores := nodeprojection.NewStores(pool, rdb, nodeprojection.StoreConfig{
 		ChannelRowCacheMaxEntries:    cfg.ChannelRowCacheMaxEntries,
 		ChannelMemberCacheMaxEntries: cfg.ChannelMemberCacheMaxEntries,
@@ -725,6 +751,8 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		ChannelOptions: []postgres.ChannelStoreOption{
 			postgres.WithChannelAllocators(channelIDAllocator, channelMessageIDAllocator),
 			postgres.WithChannelStarsStartingGrant(cfg.StarsStartingGrant),
+			postgres.WithChannelTopMessageCache(channelTopMessageCache),
+			postgres.WithChannelDifferenceBaseCache(channelDifferenceCache),
 		},
 		MessageOptions: []postgres.MessageStoreOption{
 			postgres.WithMessageAllocators(boxIDAllocator),
@@ -732,6 +760,37 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 			postgres.WithPlainPrivateSendBatchObserver(metricRegistry),
 		},
 	}, logger)
+	readModelVersionBatchStore, err := storepkg.NewBatchedReadModelVersionStore(
+		postgres.NewReadModelVersionStore(pool),
+		storepkg.ReadModelVersionBatchConfig{
+			MaxKeys: cfg.ReadModelVersionBatchMaxKeys, MaxWait: cfg.ReadModelVersionBatchWait,
+			QueueSize: cfg.ReadModelVersionBatchQueue, QueryTimeout: cfg.ReadModelVersionBatchTimeout,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize read-model version batcher: %w", err)
+	}
+	defer readModelVersionBatchStore.Close()
+	projectionStores.ReadModelVersions = storepkg.NewCachedReadModelVersionStore(
+		readModelVersionBatchStore, 0, cfg.ReadModelVersionCacheMaxEntries,
+	)
+	reverseContactStore, err := storepkg.NewBatchedReverseContactStore(
+		postgres.NewContactStore(pool),
+		storepkg.ReverseContactBatchConfig{
+			MaxPairs: cfg.ContactReverseBatchMaxPairs, MaxWait: cfg.ContactReverseBatchWait,
+			QueueSize: cfg.ContactReverseBatchQueue, QueryTimeout: cfg.ContactReverseBatchTimeout,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize reverse-contact batcher: %w", err)
+	}
+	defer reverseContactStore.Close()
+	projectionStores.ContactStore = userprojection.NewCachedContactStoreWithMaxViewers(
+		reverseContactStore, 0, cfg.ContactSnapshotCacheMaxViewers,
+	)
+	projectionStores.Photos = userprojection.NewCachedPhotoProviderWithMaxEntries(
+		projectionStores.MediaStore, cfg.ProfilePhotoCacheTTL, cfg.ProfilePhotoCacheMaxEntries,
+	)
 	userStore := projectionStores.UserStore
 	contactStore := projectionStores.ContactStore
 	collectiblePhoneStore := projectionStores.CollectiblePhoneStore
@@ -744,11 +803,35 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	broadcastService := broadcastapp.NewService(broadcastStore, messageStore, logger.Named("app").Named("broadcast"))
 	channelRowCache := projectionStores.ChannelRowCache
 	channelStore := projectionStores.ChannelStore
-	communityStore := postgres.NewCommunityStore(pool, channelIDAllocator, channelMessageIDAllocator)
+	activeChannelIDsPageBatcher, err := postgres.NewActiveChannelIDsPageBatcher(channelStore, postgres.ActiveChannelIDsBatchConfig{
+		MaxSize: cfg.ActiveChannelIDsBatchMax, MaxWait: cfg.ActiveChannelIDsBatchWait,
+		QueueSize: cfg.ActiveChannelIDsBatchQueue, QueryTimeout: cfg.ActiveChannelIDsBatchTimeout,
+		Metrics: metricRegistry,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize active-channel page batcher: %w", err)
+	}
+	defer activeChannelIDsPageBatcher.Close()
+	dialogListSnapshotCache := redisstore.NewDialogListSnapshotCache(rdb, cfg.DialogListSnapshotRedisTTL)
+	activeChannelIDsPageCache := redisstore.NewActiveChannelIDsPageCache(rdb, cfg.ActiveChannelIDsRedisTTL)
+	communityCatalogCache := postgres.NewCommunityCatalogCache()
+	communityStore := postgres.NewCommunityStore(pool, channelIDAllocator, channelMessageIDAllocator,
+		postgres.WithCommunityCatalogCache(communityCatalogCache))
 	pollStore := postgres.NewPollStore(pool)
 	mediaStore := projectionStores.MediaStore
 	gifCatalogStore := postgres.NewGifCatalogStore(pool)
 	cachedPhotos := projectionStores.Photos
+	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
+		snapshot := channelDifferenceCache.Snapshot()
+		return []obsmetrics.GaugeSample{
+			{Name: "telesrv_channel_difference_cache_entries", Value: float64(snapshot.Entries)},
+			{Name: "telesrv_channel_difference_cache_weight_bytes", Value: float64(snapshot.Weight)},
+			{Name: "telesrv_channel_difference_cache_hits", Value: float64(snapshot.Hits)},
+			{Name: "telesrv_channel_difference_cache_misses", Value: float64(snapshot.Misses)},
+			{Name: "telesrv_channel_difference_cache_loads", Value: float64(snapshot.Loads)},
+			{Name: "telesrv_channel_difference_cache_load_errors", Value: float64(snapshot.LoadErrors)},
+		}
+	})
 	storyStore := postgres.NewStoryStore(pool)
 	fileGRPCTargets, err := filedata.ParseGRPCTargetsForResolver(cfg.FileGRPCTargets, cfg.FileGRPCResolver)
 	if err != nil {
@@ -895,6 +978,12 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		Restrictions:  adminStore,
 		OfficialGifts: officialgifts.New(cfg.OfficialGiftsDir),
 	})
+	userProjectionFacts := userprojection.NewDurableUserProjectionFacts(
+		adminService,
+		collectiblePhoneStore,
+		readModelVersionStore,
+		cfg.UserProjectionFactCacheMaxEntries,
+	)
 	go maintenance.NewRetentionWorker(tempAuthKeyStore, logger.Named("maintenance").Named("retention"),
 		cfg.UpdateEventRetention,
 		cfg.RetentionInterval,
@@ -913,8 +1002,8 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	contactsService := contacts.NewService(contactStore, userStore).Configure(
 		contacts.WithPhotoProvider(cachedPhotos),
 		contacts.WithPrivacyEvaluator(privacyService),
-		contacts.WithAccountFreezeProvider(adminService),
-		contacts.WithCollectiblePhoneProvider(collectiblePhoneStore),
+		contacts.WithAccountFreezeProvider(userProjectionFacts),
+		contacts.WithCollectiblePhoneProvider(userProjectionFacts),
 		contacts.WithReadModelVersions(readModelVersionStore),
 	)
 	if seeded, err := langPackService.SeedDirectory(ctx, cfg.LangPackSeedDir); err != nil {
@@ -1211,7 +1300,15 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		passkeyapp.WithAllowedOrigins(cfg.PasskeyAllowedOrigins))
 	// 自定义云主题(Create a New Theme):主题目录与每用户已安装列表均持久化到 postgres。
 	themeService := themesapp.NewService(postgres.NewThemeStore(pool))
-	usersService := users.NewService(userStore, users.WithBaseUserCache(userCache), users.WithContactStore(contactStore), users.WithPhotoProvider(cachedPhotos), users.WithPrivacyEvaluator(privacyService), users.WithAccountFreezeProvider(adminService), users.WithCollectiblePhoneStore(collectiblePhoneStore))
+	usersService := users.NewService(userStore,
+		users.WithBaseUserCache(userCache),
+		users.WithContactStore(contactStore),
+		users.WithPhotoProvider(cachedPhotos),
+		users.WithPrivacyEvaluator(privacyService),
+		users.WithAccountFreezeProvider(userProjectionFacts),
+		users.WithCollectiblePhoneStore(collectiblePhoneStore),
+		users.WithCollectiblePhoneProvider(userProjectionFacts),
+	)
 	privacyService.ConfigureReadModels(usersService, channelStore)
 	aiComposeService := aiapp.NewService(aiComposeStore, newAIComposeOptions(cfg, rateLimiter, usersService.PremiumActive, logger)...)
 	botsService.SetAIChatGenerator(aiComposeService)
@@ -1219,14 +1316,33 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		dialogs.WithContactStore(contactStore),
 		dialogs.WithPhotoProvider(cachedPhotos),
 		dialogs.WithPrivacyEvaluator(privacyService),
-		dialogs.WithAccountFreezeProvider(adminService),
-		dialogs.WithCollectiblePhoneProvider(collectiblePhoneStore),
+		dialogs.WithAccountFreezeProvider(userProjectionFacts),
+		dialogs.WithCollectiblePhoneProvider(userProjectionFacts),
 		dialogs.WithPremiumChecker(usersService.PremiumActive),
 		dialogs.WithReadModelVersions(readModelVersionStore),
+		dialogs.WithDialogHydrationCaches(
+			cfg.DialogPrivatePeerCacheMaxEntries,
+			cfg.DialogPrivatePeerCacheMaxBytes,
+			cfg.DialogDraftCacheMaxEntries,
+			cfg.DialogDraftCacheMaxBytes,
+		),
+		dialogs.WithDialogListSnapshotCache(
+			cfg.DialogListSnapshotCacheMaxEntries,
+			cfg.DialogListSnapshotCacheMaxHeaders,
+			cfg.DialogListSnapshotCacheTTL,
+		),
+		dialogs.WithSharedDialogListSnapshotCache(dialogListSnapshotCache),
 	)
 	channelsService := channelapp.NewService(channelStore,
 		channelapp.WithBotProfileResolver(botsService),
 		channelapp.WithReadModelVersions(readModelVersionStore),
+		channelapp.WithActiveChannelIDsReadModel(
+			activeChannelIDsPageCache,
+			activeChannelIDsPageBatcher,
+			cfg.ActiveChannelIDsCacheMaxEntries,
+			cfg.ActiveChannelIDsCacheTTL,
+			metricRegistry,
+		),
 		channelapp.WithSendPermissionChecker(adminService),
 	)
 	communitiesService := communitiesapp.NewService(communityStore)
@@ -1244,8 +1360,8 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		messageapp.WithContactStore(contactStore),
 		messageapp.WithPhotoProvider(cachedPhotos),
 		messageapp.WithPrivacyEvaluator(privacyService),
-		messageapp.WithAccountFreezeProvider(adminService),
-		messageapp.WithCollectiblePhoneProvider(collectiblePhoneStore),
+		messageapp.WithAccountFreezeProvider(userProjectionFacts),
+		messageapp.WithCollectiblePhoneProvider(userProjectionFacts),
 		messageapp.WithReadModelVersions(readModelVersionStore),
 		messageapp.WithBotResponder(botsService),
 		messageapp.WithSendPermissionChecker(adminService),
@@ -1272,7 +1388,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		dialogStore,
 		newTranslationOptions(cfg, rateLimiter, logger)...,
 	)
-	authService := auth.NewService(userStore, authzStore, codeStore, authKeyStore, tempAuthKeyStore, cfg.DevAuthCode,
+	authService := auth.NewService(userStore, authzStore, codeStore, authKeyGetBatchStore, tempAuthKeyStore, cfg.DevAuthCode,
 		auth.WithLoginMessages(messageStore, dialogStore),
 		auth.WithLoginCodeDelivery(messageStore),
 		auth.WithPasswords(passwordStore),
@@ -1402,70 +1518,82 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		PublicAppLinkBase:        cfg.PublicAppLinkBase,
 		// PFS temp→perm 解析缓存：显式撤销会清缓存并断开连接，re-bind 即时失效；
 		// 配置 TTL 只承担跨进程/异常失效兜底，避免大连接数周期性打满 PG。
-		TempKeyResolveCacheTTL:        cfg.TempKeyResolveCacheTTL,
-		TempKeyResolveCacheMaxEntries: cfg.TempKeyResolveCacheMaxEntries,
-		AuthUserCacheTTL:              cfg.AuthUserCacheTTL,
+		TempKeyResolveCacheTTL:         cfg.TempKeyResolveCacheTTL,
+		TempKeyResolveCacheMaxEntries:  cfg.TempKeyResolveCacheMaxEntries,
+		AuthUserCacheTTL:               cfg.AuthUserCacheTTL,
+		PeerIdentityCacheMaxEntries:    cfg.PeerIdentityCacheMaxEntries,
+		StoryActivePeerCacheMaxEntries: cfg.StoryActivePeerCacheMaxEntries,
+		StoryHiddenListCacheMaxEntries: cfg.StoryHiddenListCacheMaxEntries,
+		StoryHiddenListCacheMaxBytes:   cfg.StoryHiddenListCacheMaxBytes,
+		PresenceLastSeenBatchMax:       cfg.PresenceLastSeenBatchMax,
+		PresenceLastSeenBatchWait:      cfg.PresenceLastSeenBatchWait,
+		PresenceLastSeenBatchQueue:     cfg.PresenceLastSeenBatchQueue,
+		PresenceLastSeenBatchTimeout:   cfg.PresenceLastSeenBatchTimeout,
+		PresenceLastSeenDrainTimeout:   cfg.PresenceLastSeenDrainTimeout,
 	}, rpc.Deps{
 		Auth:                 authService,
 		AuthInvalidations:    authInvalidationBroker,
 		AuthDeliveryReports:  authDeliveryReportService,
 		ClientTelemetry:      clientTelemetryService,
 		AuthKeySessionLayers: authKeySessionLayers,
+		ReadModelVersions:    readModelVersionStore,
+		UserProjectionFacts:  userProjectionFacts,
 		Account:              accountService,
 		Privacy:              privacyService,
 		Help: help.NewService(helpStore, helpStore,
 			help.WithMapboxToken(cfg.MapboxToken),
 			help.WithPremiumBotUsername(cfg.PremiumBotUsername),
 			help.WithAccountFreezeProvider(adminService)),
-		AppUpdates:              appUpdateResolver,
-		AccountFreeze:           adminService,
-		AICompose:               aiComposeService,
-		Ephemeral:               ephemeralService,
-		EphemeralPush:           ephemeralStore,
-		WelcomeMessages:         welcomeMessageService,
-		Moderation:              moderationService,
-		Users:                   usersService,
-		Usernames:               usernamesService,
-		CollectiblePhones:       collectiblePhoneStore,
-		AccountRatings:          ratingService,
-		BotVerifications:        botVerificationService,
-		TelegramLogin:           telegramLoginRPCDependency(telegramLoginService),
-		Updates:                 updatesService,
-		DeliveryOutbox:          deliveryOutboxStore,
-		BootstrapUpdates:        bootstrapUpdateStore,
-		BotAPIUpdates:           botAPIUpdateStore,
-		BotCallbacks:            botCallbackStore,
-		LoginTokens:             loginTokenStore,
-		Contacts:                contactsService,
-		Dialogs:                 dialogsService,
-		Chatlists:               chatlistsService,
-		Messages:                messagesService,
-		Translation:             translationService,
-		Channels:                channelsService,
-		Communities:             communitiesService,
-		Files:                   filesService,
-		PremiumPromo:            filesService,
-		Bots:                    botsService,
-		ServiceBotCallbacks:     botsService,
-		ServiceBotInlineResults: botsService,
-		Polls:                   pollsapp.NewService(pollStore),
-		Stories:                 storiesService,
-		Phone:                   phoneService,
-		SecretChats:             secretChatService,
-		Stars:                   starsService,
-		Premium:                 premiumService,
-		Gifts:                   giftsService,
-		Passkey:                 passkeyService,
-		Themes:                  themeService,
-		GroupCalls:              groupCallsService,
-		LiveStreams:             liveStreamDep(liveStreamService),
-		SFU:                     sfuService,
-		TURN:                    turnService,
-		LangPack:                langPackService,
-		Sessions:                edgeControl,
-		Metrics:                 metricRegistry,
-		Inline:                  inlineRegistryStore,
-		Limiter:                 rateLimiter,
+		AppUpdates:                 appUpdateResolver,
+		AccountFreeze:              userProjectionFacts,
+		AccountFreezeNotifications: adminService,
+		AICompose:                  aiComposeService,
+		Ephemeral:                  ephemeralService,
+		EphemeralPush:              ephemeralStore,
+		WelcomeMessages:            welcomeMessageService,
+		Moderation:                 moderationService,
+		Users:                      usersService,
+		Usernames:                  usernamesService,
+		CollectiblePhones:          collectiblePhoneStore,
+		AccountRatings:             ratingService,
+		BotVerifications:           botVerificationService,
+		TelegramLogin:              telegramLoginRPCDependency(telegramLoginService),
+		Updates:                    updatesService,
+		DeliveryOutbox:             deliveryOutboxStore,
+		BootstrapUpdates:           bootstrapUpdateStore,
+		BotAPIUpdates:              botAPIUpdateStore,
+		BotCallbacks:               botCallbackStore,
+		LoginTokens:                loginTokenStore,
+		Contacts:                   contactsService,
+		Dialogs:                    dialogsService,
+		Chatlists:                  chatlistsService,
+		Messages:                   messagesService,
+		Translation:                translationService,
+		Channels:                   channelsService,
+		Communities:                communitiesService,
+		Files:                      filesService,
+		PremiumPromo:               filesService,
+		Bots:                       botsService,
+		ServiceBotCallbacks:        botsService,
+		ServiceBotInlineResults:    botsService,
+		Polls:                      pollsapp.NewService(pollStore),
+		Stories:                    storiesService,
+		Phone:                      phoneService,
+		SecretChats:                secretChatService,
+		Stars:                      starsService,
+		Premium:                    premiumService,
+		Gifts:                      giftsService,
+		Passkey:                    passkeyService,
+		Themes:                     themeService,
+		GroupCalls:                 groupCallsService,
+		LiveStreams:                liveStreamDep(liveStreamService),
+		SFU:                        sfuService,
+		TURN:                       turnService,
+		LangPack:                   langPackService,
+		Sessions:                   edgeControl,
+		Metrics:                    metricRegistry,
+		Inline:                     inlineRegistryStore,
+		Limiter:                    rateLimiter,
 	}, logger.Named("rpc"), clock.System)
 	verificationVerifier.userDelivery = router.UserAudienceDeliveryEffects
 	usernamesService.SetUserAudienceDelivery(router.UsernameAudienceDeliveryEffects)
@@ -1478,29 +1606,35 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		TLSKeyFile:        cfg.CoreExecGRPCTLSKeyFile,
 		TLSClientCAFile:   cfg.CoreExecGRPCTLSClientCAFile,
 		Handler:           router,
-		AuthKeys:          authKeyStore,
+		AuthKeys:          authKeyGetBatchStore,
 		AuthInvalidations: authInvalidationBroker,
 		Logger:            logger.Named("coreexec").Named("grpc"),
 		Metrics:           metricRegistry,
 	}); err != nil {
 		return fmt.Errorf("start coreexec grpc: %w", err)
 	}
-	readModelListener := postgres.NewReadModelChangeListener(cfg.PostgresDSN, projectionStores.ReadModelCacheSet(nodeprojection.CacheSetDeps{
-		ContactExtras:      []postgres.ContactReadModelCache{contactsService},
-		Dialogs:            dialogsService,
-		Privacy:            privacyService,
-		Stories:            router,
-		ChannelFullBots:    router,
-		ChannelBotMembers:  channelsService,
-		ChannelMediaCounts: channelsService,
-		PrivateMediaCounts: messagesService,
-		RPCProjections:     router,
-		BotProfiles:        botsService,
-		StarGifts:          giftsService,
-		AccountSettings:    router,
-		AccountFreezes:     adminService,
-		BusinessAutomation: businessAutomationStore,
-	}), logger.Named("store").Named("read-model-listener"))
+	readModelCaches := projectionStores.ReadModelCacheSet(nodeprojection.CacheSetDeps{
+		ContactExtras:       []postgres.ContactReadModelCache{contactsService},
+		Dialogs:             dialogsService,
+		Privacy:             privacyService,
+		Stories:             router,
+		ChannelFullBots:     router,
+		ChannelBotMembers:   channelsService,
+		ChannelMediaCounts:  channelsService,
+		PrivateMediaCounts:  messagesService,
+		RPCProjections:      router,
+		PeerIdentities:      router,
+		BotProfiles:         botsService,
+		StarGifts:           giftsService,
+		AccountSettings:     router,
+		AccountFreezes:      adminService,
+		UserProjectionFacts: userProjectionFacts,
+		BusinessAutomation:  businessAutomationStore,
+	})
+	readModelCaches.ChannelTopMessages = channelTopMessageCache
+	readModelCaches.ChannelDifferences = channelDifferenceCache
+	readModelCaches.CommunityCatalog = communityCatalogCache
+	readModelListener := postgres.NewReadModelChangeListener(cfg.PostgresDSN, readModelCaches, logger.Named("store").Named("read-model-listener"))
 	go readModelListener.Run(ctx)
 	go readModelRedisBus.Run(ctx,
 		func() { readModelListener.FlushRelayedReadModelCaches("redis_subscribe") },
@@ -1646,6 +1780,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 	go rpc.NewPhoneExpiryDispatcher(router, logger.Named("rpc").Named("phone-expiry"), cfg.CallExpiryInterval).Run(ctx)
 	go rpc.NewGroupCallSweepDispatcher(router, logger.Named("rpc").Named("groupcall-sweep"), cfg.GroupCallSweepInterval, cfg.GroupCallCheckTTL).Run(ctx)
 	go router.RunBotAPIEnqueue(ctx)
+	go router.RunPresenceLastSeenBatch(ctx)
 	go router.RunPresenceSweeper(ctx, time.Minute)
 	go router.RunPremiumSweeper(ctx, cfg.PremiumSweepInterval, cfg.PremiumSweepBatch)
 	go router.RunAccountLifecycle(ctx, time.Minute, 500)

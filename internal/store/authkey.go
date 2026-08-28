@@ -70,6 +70,16 @@ type AuthKeyClientInfo struct {
 	AppVersion    string
 }
 
+// AuthKeyBindingKeys is the authoritative pair used to verify one
+// auth.bindTempAuthKey proof. Both rows are loaded and activity-touched in one
+// store operation.
+type AuthKeyBindingKeys struct {
+	Temporary      AuthKeyData
+	TemporaryFound bool
+	Permanent      AuthKeyData
+	PermanentFound bool
+}
+
 type authKeyDeleteOriginContextKey struct{}
 
 // AuthKeyDeleteOrigin carries wire-level destroy_auth_key origin metadata across
@@ -134,6 +144,8 @@ type AuthKeyStore interface {
 	Save(ctx context.Context, k AuthKeyData) error
 	// Get 按 auth_key_id 查询；不存在时 found=false。
 	Get(ctx context.Context, id [8]byte) (data AuthKeyData, found bool, err error)
+	Revalidate(ctx context.Context, id [8]byte) (data AuthKeyData, found bool, err error)
+	LoadBindingKeys(ctx context.Context, tempID, permID [8]byte) (AuthKeyBindingKeys, error)
 	// UpdateClientInfo 合并更新 auth key 的客户端协商元数据。目标 key 不存在时
 	// 必须返回 ErrAuthKeyNotFound，禁止把缺失 primary 当成成功后继续更新 mirror。
 	// 空字段不覆盖已有值，layer/api_id 为 0 时不覆盖。

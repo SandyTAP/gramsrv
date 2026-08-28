@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,8 @@ type RunConfig struct {
 	EventsPath          string
 	FileFixturePath     string
 	ServerMetricsURL    string
+	StartOrder          string
+	StartOrderSeed      int64
 	SessionLimit        int
 	Duration            time.Duration
 	RecoveryDuration    time.Duration
@@ -64,6 +67,8 @@ type RunConfig struct {
 	MinimumReadyRatio   float64
 	ExpectServerRestart bool
 }
+
+const RunReportVersion = 7
 
 func (c RunConfig) validate() error {
 	if c.ManifestPath == "" || c.SessionKeyPath == "" || c.ReportPath == "" {
@@ -95,6 +100,9 @@ func (c RunConfig) validate() error {
 	}
 	if c.OfflineFraction > 0 && (c.OfflineAt <= 0 || c.OfflineFor <= 0 || c.OfflineAt+c.OfflineFor >= c.Duration) {
 		return errors.New("offline window must be positive and fit inside load duration")
+	}
+	if c.StartOrder != "" && c.StartOrder != StartupOrderShuffled && c.StartOrder != StartupOrderAccountIndex {
+		return fmt.Errorf("unknown run start order %q", c.StartOrder)
 	}
 	return nil
 }
@@ -281,6 +289,7 @@ func (w *loadWorker) supervise(ctx context.Context, wg *sync.WaitGroup) {
 
 func (w *loadWorker) runClient(ctx context.Context) error {
 	reconnectSignal := make(chan struct{}, 1)
+	var readySeen atomic.Bool
 	client, err := newClient(w.endpoint, w.publicKey, w.storage, clientHooks{
 		Update: telegram.UpdateHandlerFunc(func(_ context.Context, updates tg.UpdatesClass) error {
 			w.counters.updates.Add(1)
@@ -296,9 +305,9 @@ func (w *loadWorker) runClient(ctx context.Context) error {
 					w.counters.reconnects.Add(1)
 				}
 			case telegram.ConnectionStateReady:
-				wasReady := w.everReady.Swap(true)
+				needsCatchUp := markClientReady(&w.everReady, &readySeen)
 				w.state.Store(workerReady)
-				if wasReady {
+				if needsCatchUp {
 					select {
 					case reconnectSignal <- struct{}{}:
 					default:
@@ -381,6 +390,19 @@ func (w *loadWorker) runClient(ctx context.Context) error {
 			}
 		}
 	})
+}
+
+// markClientReady distinguishes a transport reconnect inside one live gotd
+// Client from the first Ready transition of a newly constructed Client. The
+// client.Run callback already performs one cursor catch-up when it starts, so
+// enqueueing a second catch-up for that first transition would duplicate every
+// explicit offline->online getDifference request. Later Ready transitions do
+// need the signal because the callback remains running across transport-level
+// reconnects.
+func markClientReady(everReady, readySeen *atomic.Bool) bool {
+	firstForClient := !readySeen.Swap(true)
+	wasReady := everReady.Swap(true)
+	return wasReady && !firstForClient
 }
 
 func (w *loadWorker) runRPC(ctx context.Context, client *telegram.Client, raw *tg.Client, cycle int) {
@@ -788,10 +810,20 @@ func Run(ctx context.Context, cfg RunConfig) (*RunReport, error) {
 		workerWG.Add(1)
 		go worker.supervise(loadCtx, &workerWG)
 	}
-	for i, worker := range workers {
+	startOrder := cfg.StartOrder
+	if startOrder == "" {
+		startOrder = StartupOrderAccountIndex
+	}
+	startOrderSeed := cfg.StartOrderSeed
+	if startOrderSeed == 0 {
+		startOrderSeed = 20260827
+	}
+	launchOrder := startupAccountOrder(len(workers), startOrder, startOrderSeed)
+	for position, workerIndex := range launchOrder {
+		worker := workers[workerIndex]
 		delay := time.Duration(0)
 		if len(workers) > 1 {
-			delay = time.Duration(i) * cfg.RampDuration / time.Duration(len(workers)-1)
+			delay = time.Duration(position) * cfg.RampDuration / time.Duration(len(workers)-1)
 		}
 		go func(w *loadWorker, d time.Duration) {
 			timer := time.NewTimer(d)
@@ -882,6 +914,22 @@ loadFinished:
 		reconcileDeliveries(reconcileCtx, workers)
 		cancelReconcile()
 	}
+	// Take the authoritative business-work cutoff before canceling clients.
+	// Coordinated teardown can cancel an RPC already in flight; both server
+	// outcome counters and client operation counters must therefore stop before
+	// that cancellation begins. FinalServerMetrics remains the post-recovery
+	// resource-reclamation snapshot.
+	var workloadEndServerMetrics map[string]float64
+	if serverMetrics != nil {
+		if sample, scrapeErr := serverMetrics.scrape(ctx); scrapeErr == nil {
+			workloadEndServerMetrics = sample
+			finalServerMetrics = sample
+			events.write(map[string]any{"type": "server_workload_end", "at": time.Now().UTC(), "server_metrics": sample})
+		} else {
+			events.write(map[string]any{"type": "server_workload_end_error", "at": time.Now().UTC(), "class": classifyError(scrapeErr)})
+		}
+	}
+	workloadEndOperations := metrics.freeze()
 	finalReady := countWorkerState(workers, workerReady)
 	stopLoad()
 	workerWG.Wait()
@@ -920,19 +968,24 @@ recoveryFinished:
 		steadyRatio = float64(steadyReadySum) / float64(steadySamples*len(workers))
 	}
 	report := &RunReport{
-		Version: 3, StartedAt: startedAt, LoadEndedAt: loadEndedAt, FinishedAt: time.Now().UTC(),
+		Version: RunReportVersion, StartedAt: startedAt, LoadEndedAt: loadEndedAt, FinishedAt: time.Now().UTC(),
+		StartOrder: startOrder, StartOrderSeed: startOrderSeed,
 		RequestedDuration: cfg.Duration.String(), RecoveryDuration: cfg.RecoveryDuration.String(),
 		ExpectedSessions: len(workers), PeakReadySessions: peakReady, FinalReadySessions: finalReady,
 		ConnectionAttempts: counters.connectionAttempts.Load(), Reconnects: counters.reconnects.Load(),
 		Disconnects: counters.disconnects.Load(), UpdatesReceived: counters.updates.Load(), DownloadedBytes: counters.downloadBytes.Load(),
-		WorkerFatalErrors: counters.fatalErrors.Load(), Operations: metrics.report(),
-		BaselineServerMetrics: baselineServerMetrics, FinalServerMetrics: finalServerMetrics,
+		WorkerFatalErrors: counters.fatalErrors.Load(), Operations: workloadEndOperations,
+		BaselineServerMetrics: baselineServerMetrics, WorkloadEndServerMetrics: workloadEndServerMetrics, FinalServerMetrics: finalServerMetrics,
 		ServerMetricsScrapes: serverMetrics.successes(), ServerMetricsErrors: serverMetrics.failures(),
 		SteadySamples: steadySamples, SteadyReadyRatio: steadyRatio, MinSteadyReadySessions: steadyReadyMinimum,
 		MessageRatePerSecond: cfg.MessageRate, MessageScheduled: counters.messageScheduled.Load(),
 		MessageEnqueued: counters.messageEnqueued.Load(), MessageCompleted: counters.messageCompleted.Load(), MessageQueueFull: counters.messageQueueFull.Load(),
 		MessageNotReady: counters.messageNotReady.Load(), Delivery: delivery.report(),
 	}
+	report.ResponseBytes = startupResponseBytes(baselineServerMetrics, workloadEndServerMetrics)
+	report.RPCDeliveryOutcomes = startupRPCDeliveryOutcomes(baselineServerMetrics, workloadEndServerMetrics)
+	report.DatabaseWork = startupDatabaseWork(baselineServerMetrics, workloadEndServerMetrics)
+	report.EventsWritten, report.EventsDropped = events.counts()
 	evaluateReport(report, cfg)
 	if err := WriteReport(cfg.ReportPath, report); err != nil {
 		return nil, err
@@ -1210,6 +1263,34 @@ func evaluateReport(report *RunReport, cfg RunConfig) {
 			report.Failures = append(report.Failures, fmt.Sprintf("%s returned %d unexpected non-cancel errors", name, unexpectedErrors))
 		}
 	}
+	methods := make([]string, 0, len(report.RPCDeliveryOutcomes))
+	for method := range report.RPCDeliveryOutcomes {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	for _, method := range methods {
+		outcomes := report.RPCDeliveryOutcomes[method]
+		outcomeNames := make([]string, 0, len(outcomes))
+		for outcome := range outcomes {
+			outcomeNames = append(outcomeNames, outcome)
+		}
+		sort.Strings(outcomeNames)
+		for _, outcome := range outcomeNames {
+			if count := outcomes[outcome]; outcome != "ok" && count > 0 {
+				report.Failures = append(report.Failures, fmt.Sprintf("%s rpc_result delivery outcome %s: %d", method, outcome, count))
+			}
+		}
+	}
+	methods = methods[:0]
+	for method := range report.DatabaseWork {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	for _, method := range methods {
+		if errors := report.DatabaseWork[method].Errors; errors > 0 {
+			report.Failures = append(report.Failures, fmt.Sprintf("%s database errors: %d", method, errors))
+		}
+	}
 	if cfg.ExpectServerRestart && report.Reconnects < uint64(requiredReady) {
 		report.Failures = append(report.Failures, fmt.Sprintf("server restart expected at least %d reconnect attempts, observed %d", requiredReady, report.Reconnects))
 	}
@@ -1235,6 +1316,9 @@ func evaluateReport(report *RunReport, cfg RunConfig) {
 	if strings.TrimSpace(cfg.ServerMetricsURL) != "" && report.FinalServerMetrics == nil {
 		report.Failures = append(report.Failures, "final post-recovery server metrics scrape failed")
 	}
+	if strings.TrimSpace(cfg.ServerMetricsURL) != "" && report.WorkloadEndServerMetrics == nil {
+		report.Failures = append(report.Failures, "pre-teardown workload-end server metrics scrape failed")
+	}
 	if strings.TrimSpace(cfg.ServerMetricsURL) != "" && report.BaselineServerMetrics == nil {
 		report.Failures = append(report.Failures, "pre-load server metrics baseline scrape failed")
 	}
@@ -1242,9 +1326,16 @@ func evaluateReport(report *RunReport, cfg RunConfig) {
 }
 
 func metricValue(values map[string]float64, name string) float64 {
+	// The scraper always stores an aggregate family value in the bare key and
+	// may additionally retain bounded state/method label breakdowns. Prefer that
+	// aggregate; summing both would double-count every labeled family in resource
+	// recovery checks (for example retained/offline logical sessions).
+	if value, ok := values[name]; ok {
+		return value
+	}
 	var total float64
 	for key, value := range values {
-		if key == name || strings.HasPrefix(key, name+"{") {
+		if strings.HasPrefix(key, name+"{") {
 			total += value
 		}
 	}
@@ -1329,6 +1420,8 @@ func classifyErrorReason(err error) string {
 		return "dns"
 	case strings.Contains(message, "BROKEN PIPE"):
 		return "broken_pipe"
+	case strings.Contains(message, "ENDED BEFORE BUSINESS READINESS"):
+		return "business_readiness_incomplete"
 	case strings.Contains(message, "EOF"):
 		return "eof"
 	case errors.Is(err, context.DeadlineExceeded):

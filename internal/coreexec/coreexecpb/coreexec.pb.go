@@ -1041,23 +1041,28 @@ func (x *UpdateState) GetSeq() int32 {
 }
 
 type UpdatesDeliveryAction struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	CommitCursor        bool                   `protobuf:"varint,1,opt,name=commit_cursor,json=commitCursor,proto3" json:"commit_cursor,omitempty"`
-	CursorAuthKeyId     []byte                 `protobuf:"bytes,2,opt,name=cursor_auth_key_id,json=cursorAuthKeyId,proto3" json:"cursor_auth_key_id,omitempty"`
-	CursorUserId        int64                  `protobuf:"varint,3,opt,name=cursor_user_id,json=cursorUserId,proto3" json:"cursor_user_id,omitempty"`
-	CursorState         *UpdateState           `protobuf:"bytes,4,opt,name=cursor_state,json=cursorState,proto3" json:"cursor_state,omitempty"`
-	CursorMode          UpdateStateCommitMode  `protobuf:"varint,5,opt,name=cursor_mode,json=cursorMode,proto3,enum=telesrv.coreexec.v1.UpdateStateCommitMode" json:"cursor_mode,omitempty"`
-	MarkSecretDelivered bool                   `protobuf:"varint,6,opt,name=mark_secret_delivered,json=markSecretDelivered,proto3" json:"mark_secret_delivered,omitempty"`
-	SecretDeviceKey     int64                  `protobuf:"varint,7,opt,name=secret_device_key,json=secretDeviceKey,proto3" json:"secret_device_key,omitempty"`
-	SecretEventIds      []int64                `protobuf:"varint,8,rep,packed,name=secret_event_ids,json=secretEventIds,proto3" json:"secret_event_ids,omitempty"`
-	MarkSessionReady    bool                   `protobuf:"varint,9,opt,name=mark_session_ready,json=markSessionReady,proto3" json:"mark_session_ready,omitempty"`
-	ReadyRawAuthKeyId   []byte                 `protobuf:"bytes,10,opt,name=ready_raw_auth_key_id,json=readyRawAuthKeyId,proto3" json:"ready_raw_auth_key_id,omitempty"`
-	ReadySessionId      int64                  `protobuf:"varint,11,opt,name=ready_session_id,json=readySessionId,proto3" json:"ready_session_id,omitempty"`
-	ReadyUserId         int64                  `protobuf:"varint,12,opt,name=ready_user_id,json=readyUserId,proto3" json:"ready_user_id,omitempty"`
-	PublishBootstrap    bool                   `protobuf:"varint,13,opt,name=publish_bootstrap,json=publishBootstrap,proto3" json:"publish_bootstrap,omitempty"`
-	BootstrapUserId     int64                  `protobuf:"varint,14,opt,name=bootstrap_user_id,json=bootstrapUserId,proto3" json:"bootstrap_user_id,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	CommitCursor          bool                   `protobuf:"varint,1,opt,name=commit_cursor,json=commitCursor,proto3" json:"commit_cursor,omitempty"`
+	CursorAuthKeyId       []byte                 `protobuf:"bytes,2,opt,name=cursor_auth_key_id,json=cursorAuthKeyId,proto3" json:"cursor_auth_key_id,omitempty"`
+	CursorUserId          int64                  `protobuf:"varint,3,opt,name=cursor_user_id,json=cursorUserId,proto3" json:"cursor_user_id,omitempty"`
+	CursorState           *UpdateState           `protobuf:"bytes,4,opt,name=cursor_state,json=cursorState,proto3" json:"cursor_state,omitempty"`
+	CursorMode            UpdateStateCommitMode  `protobuf:"varint,5,opt,name=cursor_mode,json=cursorMode,proto3,enum=telesrv.coreexec.v1.UpdateStateCommitMode" json:"cursor_mode,omitempty"`
+	MarkSecretDelivered   bool                   `protobuf:"varint,6,opt,name=mark_secret_delivered,json=markSecretDelivered,proto3" json:"mark_secret_delivered,omitempty"`
+	SecretDeviceKey       int64                  `protobuf:"varint,7,opt,name=secret_device_key,json=secretDeviceKey,proto3" json:"secret_device_key,omitempty"`
+	SecretEventIds        []int64                `protobuf:"varint,8,rep,packed,name=secret_event_ids,json=secretEventIds,proto3" json:"secret_event_ids,omitempty"`
+	MarkSessionReady      bool                   `protobuf:"varint,9,opt,name=mark_session_ready,json=markSessionReady,proto3" json:"mark_session_ready,omitempty"`
+	ReadyRawAuthKeyId     []byte                 `protobuf:"bytes,10,opt,name=ready_raw_auth_key_id,json=readyRawAuthKeyId,proto3" json:"ready_raw_auth_key_id,omitempty"`
+	ReadySessionId        int64                  `protobuf:"varint,11,opt,name=ready_session_id,json=readySessionId,proto3" json:"ready_session_id,omitempty"`
+	ReadyUserId           int64                  `protobuf:"varint,12,opt,name=ready_user_id,json=readyUserId,proto3" json:"ready_user_id,omitempty"`
+	PublishBootstrap      bool                   `protobuf:"varint,13,opt,name=publish_bootstrap,json=publishBootstrap,proto3" json:"publish_bootstrap,omitempty"`
+	BootstrapUserId       int64                  `protobuf:"varint,14,opt,name=bootstrap_user_id,json=bootstrapUserId,proto3" json:"bootstrap_user_id,omitempty"`
+	ActivationToken       uint64                 `protobuf:"varint,15,opt,name=activation_token,json=activationToken,proto3" json:"activation_token,omitempty"`
+	BootstrapAuthKeyId    []byte                 `protobuf:"bytes,16,opt,name=bootstrap_auth_key_id,json=bootstrapAuthKeyId,proto3" json:"bootstrap_auth_key_id,omitempty"`
+	BootstrapSessionId    int64                  `protobuf:"varint,17,opt,name=bootstrap_session_id,json=bootstrapSessionId,proto3" json:"bootstrap_session_id,omitempty"`
+	BootstrapProbeToken   uint64                 `protobuf:"varint,18,opt,name=bootstrap_probe_token,json=bootstrapProbeToken,proto3" json:"bootstrap_probe_token,omitempty"`
+	BootstrapRawAuthKeyId []byte                 `protobuf:"bytes,19,opt,name=bootstrap_raw_auth_key_id,json=bootstrapRawAuthKeyId,proto3" json:"bootstrap_raw_auth_key_id,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *UpdatesDeliveryAction) Reset() {
@@ -1186,6 +1191,41 @@ func (x *UpdatesDeliveryAction) GetBootstrapUserId() int64 {
 		return x.BootstrapUserId
 	}
 	return 0
+}
+
+func (x *UpdatesDeliveryAction) GetActivationToken() uint64 {
+	if x != nil {
+		return x.ActivationToken
+	}
+	return 0
+}
+
+func (x *UpdatesDeliveryAction) GetBootstrapAuthKeyId() []byte {
+	if x != nil {
+		return x.BootstrapAuthKeyId
+	}
+	return nil
+}
+
+func (x *UpdatesDeliveryAction) GetBootstrapSessionId() int64 {
+	if x != nil {
+		return x.BootstrapSessionId
+	}
+	return 0
+}
+
+func (x *UpdatesDeliveryAction) GetBootstrapProbeToken() uint64 {
+	if x != nil {
+		return x.BootstrapProbeToken
+	}
+	return 0
+}
+
+func (x *UpdatesDeliveryAction) GetBootstrapRawAuthKeyId() []byte {
+	if x != nil {
+		return x.BootstrapRawAuthKeyId
+	}
+	return nil
 }
 
 type PrepareReplayResponse struct {
@@ -2347,7 +2387,7 @@ const file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc = "" +
 	"\x03pts\x18\x01 \x01(\x05R\x03pts\x12\x10\n" +
 	"\x03qts\x18\x02 \x01(\x05R\x03qts\x12\x12\n" +
 	"\x04date\x18\x03 \x01(\x05R\x04date\x12\x10\n" +
-	"\x03seq\x18\x04 \x01(\x05R\x03seq\"\xb2\x05\n" +
+	"\x03seq\x18\x04 \x01(\x05R\x03seq\"\xb0\a\n" +
 	"\x15UpdatesDeliveryAction\x12#\n" +
 	"\rcommit_cursor\x18\x01 \x01(\bR\fcommitCursor\x12+\n" +
 	"\x12cursor_auth_key_id\x18\x02 \x01(\fR\x0fcursorAuthKeyId\x12$\n" +
@@ -2364,7 +2404,12 @@ const file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc = "" +
 	"\x10ready_session_id\x18\v \x01(\x03R\x0ereadySessionId\x12\"\n" +
 	"\rready_user_id\x18\f \x01(\x03R\vreadyUserId\x12+\n" +
 	"\x11publish_bootstrap\x18\r \x01(\bR\x10publishBootstrap\x12*\n" +
-	"\x11bootstrap_user_id\x18\x0e \x01(\x03R\x0fbootstrapUserId\"C\n" +
+	"\x11bootstrap_user_id\x18\x0e \x01(\x03R\x0fbootstrapUserId\x12)\n" +
+	"\x10activation_token\x18\x0f \x01(\x04R\x0factivationToken\x121\n" +
+	"\x15bootstrap_auth_key_id\x18\x10 \x01(\fR\x12bootstrapAuthKeyId\x120\n" +
+	"\x14bootstrap_session_id\x18\x11 \x01(\x03R\x12bootstrapSessionId\x122\n" +
+	"\x15bootstrap_probe_token\x18\x12 \x01(\x04R\x13bootstrapProbeToken\x128\n" +
+	"\x19bootstrap_raw_auth_key_id\x18\x13 \x01(\fR\x15bootstrapRawAuthKeyId\"C\n" +
 	"\x15PrepareReplayResponse\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"+\n" +

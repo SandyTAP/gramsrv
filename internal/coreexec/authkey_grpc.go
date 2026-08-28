@@ -137,6 +137,31 @@ func (s *CachedAuthKeyStore) Get(ctx context.Context, id [8]byte) (store.AuthKey
 	return res.data, res.found, nil
 }
 
+// Revalidate deliberately bypasses the Edge hot cache at the activation
+// boundary. The remote Core read is authoritative; a successful value then
+// refreshes the cache used by subsequent encrypted frames.
+func (s *CachedAuthKeyStore) Revalidate(ctx context.Context, id [8]byte) (store.AuthKeyData, bool, error) {
+	if s == nil || s.remote == nil {
+		return store.AuthKeyData{}, false, ErrRemoteRPCUnavailable
+	}
+	data, found, err := s.remote.Revalidate(ctx, id)
+	if err != nil || !found {
+		if !found {
+			s.Invalidate(id)
+		}
+		return data, found, err
+	}
+	s.store(authKeyHotCacheData(data))
+	return data, true, nil
+}
+
+func (s *CachedAuthKeyStore) LoadBindingKeys(ctx context.Context, tempID, permID [8]byte) (store.AuthKeyBindingKeys, error) {
+	if s == nil || s.remote == nil {
+		return store.AuthKeyBindingKeys{}, ErrRemoteRPCUnavailable
+	}
+	return s.remote.LoadBindingKeys(ctx, tempID, permID)
+}
+
 func (s *CachedAuthKeyStore) UpdateClientInfo(ctx context.Context, id [8]byte, info store.AuthKeyClientInfo) error {
 	if s == nil || s.remote == nil {
 		return ErrRemoteRPCUnavailable
@@ -362,6 +387,19 @@ func (r *GRPCRemote) Get(ctx context.Context, id [8]byte) (store.AuthKeyData, bo
 	}
 	observeCoreExecGRPCCall(r.metrics, "client", "get_auth_key", start, "ok")
 	return data, true, nil
+}
+
+func (r *GRPCRemote) Revalidate(ctx context.Context, id [8]byte) (store.AuthKeyData, bool, error) {
+	// CoreExec's GetAuthKey is the only Edge-facing authoritative auth-key read.
+	// Revalidation occurs once at activation and intentionally bypasses the
+	// CachedAuthKeyStore above this remote.
+	return r.Get(ctx, id)
+}
+
+func (r *GRPCRemote) LoadBindingKeys(context.Context, [8]byte, [8]byte) (store.AuthKeyBindingKeys, error) {
+	// Temp-key proof validation is Core business logic and must never execute on
+	// Edge through the auth-key transport facade.
+	return store.AuthKeyBindingKeys{}, errCoreExecAuthKeyStoreUnavailable
 }
 
 func (r *GRPCRemote) UpdateClientInfo(ctx context.Context, id [8]byte, info store.AuthKeyClientInfo) error {

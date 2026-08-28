@@ -93,6 +93,10 @@ func TestEvaluateReportRequiresReclamationAndNoFloodWait(t *testing.T) {
 			"telesrv_mtproto_raw_connections":      2,
 			"telesrv_mtproto_logical_outbox_bytes": 3,
 		},
+		WorkloadEndServerMetrics: map[string]float64{
+			"telesrv_mtproto_raw_connections":      12,
+			"telesrv_mtproto_logical_outbox_bytes": 4,
+		},
 		FinalServerMetrics: map[string]float64{
 			"telesrv_mtproto_raw_connections":      2,
 			"telesrv_mtproto_logical_outbox_bytes": 4,
@@ -113,6 +117,11 @@ func TestEvaluateReportAcceptsReturnToNonZeroSharedServerBaseline(t *testing.T) 
 			"telesrv_mtproto_raw_connections":      2,
 			"telesrv_mtproto_logical_sessions":     2,
 			"telesrv_mtproto_logical_outbox_bytes": 1024,
+		},
+		WorkloadEndServerMetrics: map[string]float64{
+			"telesrv_mtproto_raw_connections":      12,
+			"telesrv_mtproto_logical_sessions":     12,
+			"telesrv_mtproto_logical_outbox_bytes": 2048,
 		},
 		FinalServerMetrics: map[string]float64{
 			"telesrv_mtproto_raw_connections":      2,

@@ -1013,7 +1013,7 @@ WHERE channel_id = $1 AND user_id = $2`, req.ChannelID, req.UserID, maxID, req.D
 	}
 	msg, _ := s.getChannelMessage(ctx, tx, req.ChannelID, channel.TopMessageID)
 	if watermarkChanged {
-		outboxUpdates, err = advanceChannelReadOutboxTx(ctx, tx, channel, msg, req.UserID, previous, maxID)
+		outboxUpdates, err = advanceChannelReadOutboxTx(ctx, tx, channel.ID, req.UserID, previous, maxID)
 		if err != nil {
 			return domain.ReadChannelHistoryResult{}, err
 		}

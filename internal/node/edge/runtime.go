@@ -268,6 +268,8 @@ func runWithConfig(
 		RPCGlobalWorkers:              cfg.MTProtoRPCGlobalWorkers,
 		RPCGlobalMaxTasks:             cfg.MTProtoRPCGlobalMaxTasks,
 		RPCGlobalMaxBytes:             cfg.MTProtoRPCGlobalMaxBytes,
+		RPCDeliveryHookWorkers:        cfg.MTProtoRPCDeliveryHookWorkers,
+		RPCDeliveryHookMaxPending:     cfg.MTProtoRPCDeliveryHookMaxPending,
 		RPCExecutionMaxEntries:        cfg.MTProtoRPCExecutionMaxEntries,
 		RPCExecutionAuthMaxEntries:    cfg.MTProtoRPCExecutionAuthMaxEntries,
 		RPCExecutionSessionMaxEntries: cfg.MTProtoRPCExecutionSessionMaxEntries,

@@ -283,6 +283,13 @@ func (s *ChannelStore) ResolveChannel(ctx context.Context, viewerUserID, channel
 	return view, nil
 }
 
+// AuthoritativeResolveChannelCache declares that ResolveChannel is already
+// protected by ChannelRowCache + ChannelMemberCache. Both consume exact
+// channel_base/channel_member invalidations, reject stale in-flight writes by
+// epoch, and flush after listener reconnect. The app layer must therefore not
+// place a second read_model_versions gate in front of this store path.
+func (*ChannelStore) AuthoritativeResolveChannelCache() {}
+
 func (s *ChannelStore) GetChannels(ctx context.Context, viewerUserID int64, channelIDs []int64) ([]domain.ChannelView, error) {
 	if viewerUserID == 0 || len(channelIDs) == 0 {
 		return nil, nil
@@ -553,19 +560,6 @@ WHERE id = $1`, channel.ID, participants, admins, kicked, banned); err != nil {
 	channel.KickedCount = kicked
 	channel.BannedCount = banned
 	return channel, nil
-}
-
-func addPeerRef(peer domain.Peer, currentChannelID int64, userRefs, channelRefs map[int64]struct{}) {
-	switch peer.Type {
-	case domain.PeerTypeUser:
-		if peer.ID != 0 {
-			userRefs[peer.ID] = struct{}{}
-		}
-	case domain.PeerTypeChannel:
-		if peer.ID != 0 && peer.ID != currentChannelID {
-			channelRefs[peer.ID] = struct{}{}
-		}
-	}
 }
 
 func mapKeysInt64(items map[int64]struct{}) []int64 {

@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -981,6 +982,46 @@ func TestAccountAuthorizationTeardownPostResponseActionCodec(t *testing.T) {
 	}
 	if _, err := postResponseActionsFromPB([]*coreexecpb.PostResponseAction{malformed}); err == nil {
 		t.Fatal("malformed account authorization teardown auth key was accepted")
+	}
+}
+
+func TestUpdatesDeliveryLifecyclePostResponseActionCodec(t *testing.T) {
+	want := postresponse.Action{
+		Kind: postresponse.ActionUpdatesDelivery,
+		UpdatesDelivery: postresponse.UpdatesDeliveryAction{
+			MarkSessionReady:    true,
+			ReadyRawAuthKey:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			ReadySessionID:      101,
+			ReadyUserID:         202,
+			ActivationToken:     303,
+			PublishBootstrap:    true,
+			BootstrapUserID:     404,
+			BootstrapAuthKey:    [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+			BootstrapRawAuthKey: [8]byte{9, 8, 7, 6, 5, 4, 3, 2},
+			BootstrapSessionID:  505,
+			BootstrapProbeToken: 606,
+		},
+	}
+	pbActions, err := postResponseActionsToPB([]postresponse.Action{want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pbActions) != 1 {
+		t.Fatalf("encoded actions = %d, want 1", len(pbActions))
+	}
+	encoded := pbActions[0].GetUpdatesDelivery()
+	if encoded == nil || encoded.GetActivationToken() != 303 ||
+		encoded.GetBootstrapProbeToken() != 606 || encoded.GetBootstrapSessionId() != 505 ||
+		string(encoded.GetBootstrapAuthKeyId()) != string(want.UpdatesDelivery.BootstrapAuthKey[:]) ||
+		string(encoded.GetBootstrapRawAuthKeyId()) != string(want.UpdatesDelivery.BootstrapRawAuthKey[:]) {
+		t.Fatalf("encoded updates delivery lifecycle = %+v", encoded)
+	}
+	roundTrip, err := postResponseActionsFromPB(pbActions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roundTrip) != 1 || !reflect.DeepEqual(roundTrip[0], want) {
+		t.Fatalf("round-trip updates delivery = %+v, want %+v", roundTrip, want)
 	}
 }
 

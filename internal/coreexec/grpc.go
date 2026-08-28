@@ -40,14 +40,15 @@ const (
 	defaultMaxGRPCMessageSize               = 16 << 20
 	accountTeardownCommitMaxAttempts        = 3
 	accountTeardownCommitInitialBackoff     = 25 * time.Millisecond
-	coreExecGRPCProtocolVersion             = 3
-	coreExecGRPCMinSupportedProtocolVersion = 3
+	coreExecGRPCProtocolVersion             = 4
+	coreExecGRPCMinSupportedProtocolVersion = 4
 	coreExecGRPCRequestIDMetadataKey        = "x-telesrv-coreexec-request-id"
 	coreExecGRPCRequestIDBytes              = 16
 )
 
 var coreExecGRPCCapabilities = []string{
 	"tl-wire-passthrough",
+	"updates-lifecycle-fencing",
 	"dispatch-admitted",
 	"profile-evidence",
 	"identity-hint",
@@ -60,6 +61,7 @@ var coreExecGRPCCapabilities = []string{
 var coreExecGRPCRequiredCapabilities = []string{
 	"auth-key-authority",
 	"session-updates-readiness-hint",
+	"updates-lifecycle-fencing",
 }
 
 var (
@@ -1128,8 +1130,15 @@ func postResponseActionsToPB(actions []postresponse.Action) ([]*coreexecpb.PostR
 						ReadyRawAuthKeyId:   append([]byte(nil), updates.ReadyRawAuthKey[:]...),
 						ReadySessionId:      updates.ReadySessionID,
 						ReadyUserId:         updates.ReadyUserID,
+						ActivationToken:     updates.ActivationToken,
 						PublishBootstrap:    updates.PublishBootstrap,
 						BootstrapUserId:     updates.BootstrapUserID,
+						BootstrapAuthKeyId:  append([]byte(nil), updates.BootstrapAuthKey[:]...),
+						BootstrapSessionId:  updates.BootstrapSessionID,
+						BootstrapProbeToken: updates.BootstrapProbeToken,
+						BootstrapRawAuthKeyId: append(
+							[]byte(nil), updates.BootstrapRawAuthKey[:]...,
+						),
 					},
 				},
 			})
@@ -1184,6 +1193,29 @@ func postResponseActionsFromPB(actions []*coreexecpb.PostResponseAction) ([]post
 				}
 				readyRawAuthKey = parsed
 			}
+			var bootstrapAuthKey [8]byte
+			if updatesPB.GetPublishBootstrap() {
+				parsed, err := authKeyIDFromBytes(updatesPB.GetBootstrapAuthKeyId())
+				if err != nil {
+					return nil, fmt.Errorf("coreexec grpc: post-response action %d has bad bootstrap_auth_key_id", i)
+				}
+				bootstrapAuthKey = parsed
+			}
+			var bootstrapRawAuthKey [8]byte
+			if updatesPB.GetBootstrapProbeToken() != 0 {
+				if !updatesPB.GetPublishBootstrap() || updatesPB.GetBootstrapSessionId() == 0 {
+					return nil, fmt.Errorf("coreexec grpc: post-response action %d has invalid bootstrap lifecycle", i)
+				}
+				parsed, err := authKeyIDFromBytes(updatesPB.GetBootstrapRawAuthKeyId())
+				if err != nil || parsed == ([8]byte{}) {
+					return nil, fmt.Errorf("coreexec grpc: post-response action %d has bad bootstrap_raw_auth_key_id", i)
+				}
+				bootstrapRawAuthKey = parsed
+			}
+			if updatesPB.GetActivationToken() != 0 &&
+				(!updatesPB.GetMarkSessionReady() || readyRawAuthKey == ([8]byte{}) || updatesPB.GetReadySessionId() == 0) {
+				return nil, fmt.Errorf("coreexec grpc: post-response action %d has invalid activation lifecycle", i)
+			}
 			out = append(out, postresponse.Action{
 				Kind: postresponse.ActionUpdatesDelivery,
 				UpdatesDelivery: postresponse.UpdatesDeliveryAction{
@@ -1199,8 +1231,13 @@ func postResponseActionsFromPB(actions []*coreexecpb.PostResponseAction) ([]post
 					ReadyRawAuthKey:     readyRawAuthKey,
 					ReadySessionID:      updatesPB.GetReadySessionId(),
 					ReadyUserID:         updatesPB.GetReadyUserId(),
+					ActivationToken:     updatesPB.GetActivationToken(),
 					PublishBootstrap:    updatesPB.GetPublishBootstrap(),
 					BootstrapUserID:     updatesPB.GetBootstrapUserId(),
+					BootstrapAuthKey:    bootstrapAuthKey,
+					BootstrapRawAuthKey: bootstrapRawAuthKey,
+					BootstrapSessionID:  updatesPB.GetBootstrapSessionId(),
+					BootstrapProbeToken: updatesPB.GetBootstrapProbeToken(),
 				},
 			})
 		case *coreexecpb.PostResponseAction_AccountAuthorizationTeardown:

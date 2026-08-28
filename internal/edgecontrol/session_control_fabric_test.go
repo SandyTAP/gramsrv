@@ -74,6 +74,61 @@ func TestHandleSessionControlCommandAppliesSessionMutations(t *testing.T) {
 	}
 }
 
+func TestHandleSessionControlCommandAppliesLifecycleFences(t *testing.T) {
+	local := &captureFullController{activationBeginToken: 71, bootstrapBeginToken: 81}
+	raw := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+
+	activation := HandleSessionControlCommand(local, SessionControlCommand{
+		Kind: SessionControlBeginUpdatesActivation, RawAuthKeyID: raw, SessionID: 10,
+	})
+	if activation.Error != "" || activation.Affected != 1 || activation.LifecycleToken != 71 {
+		t.Fatalf("begin activation ack = %+v", activation)
+	}
+	ended := HandleSessionControlCommand(local, SessionControlCommand{
+		Kind: SessionControlEndUpdatesActivation, RawAuthKeyID: raw, SessionID: 10, LifecycleToken: 71,
+	})
+	if ended.Error != "" || ended.Affected != 1 || local.activationEndToken != 71 {
+		t.Fatalf("end activation ack=%+v token=%d", ended, local.activationEndToken)
+	}
+
+	bootstrap := HandleSessionControlCommand(local, SessionControlCommand{
+		Kind: SessionControlBeginBootstrapProbe, RawAuthKeyID: raw, SessionID: 10,
+	})
+	if bootstrap.Error != "" || bootstrap.Affected != 1 || bootstrap.LifecycleToken != 81 {
+		t.Fatalf("begin bootstrap ack = %+v", bootstrap)
+	}
+	completed := HandleSessionControlCommand(local, SessionControlCommand{
+		Kind: SessionControlEndBootstrapProbe, RawAuthKeyID: raw, SessionID: 10,
+		LifecycleToken: 81, LifecycleSuccess: true,
+	})
+	if completed.Error != "" || completed.Affected != 1 || local.bootstrapEndToken != 81 || !local.bootstrapSuccess {
+		t.Fatalf("end bootstrap ack=%+v token=%d success=%v", completed, local.bootstrapEndToken, local.bootstrapSuccess)
+	}
+}
+
+func TestSessionControlFabricRoutesLifecycleFenceToOwningEdge(t *testing.T) {
+	raw := [8]byte{8, 7, 6, 5, 4, 3, 2, 1}
+	registry := &captureLocationRegistry{raw: map[[8]byte][]LocationRecord{
+		raw: {{InstanceID: "edge-a", RawAuthKeyID: raw, SessionID: 10, LocationRevision: 1}},
+	}}
+	bus := &captureSessionBus{affected: 1, lifecycleToken: 99}
+	fabric := NewSessionControlFabric(SessionControlFabricConfig{
+		InstanceID: "core-a", Registry: registry, Bus: bus,
+	})
+
+	token, ok := fabric.BeginSessionBootstrapProbe(raw, 10)
+	if !ok || token != 99 {
+		t.Fatalf("begin bootstrap = (%d,%v), want (99,true)", token, ok)
+	}
+	fabric.EndSessionBootstrapProbe(raw, 10, token, true)
+	if len(bus.sent) != 2 || bus.sent[0].target != "edge-a" ||
+		bus.sent[0].cmd.Kind != SessionControlBeginBootstrapProbe ||
+		bus.sent[1].cmd.Kind != SessionControlEndBootstrapProbe ||
+		bus.sent[1].cmd.LifecycleToken != 99 || !bus.sent[1].cmd.LifecycleSuccess {
+		t.Fatalf("lifecycle commands = %+v", bus.sent)
+	}
+}
+
 func TestSessionControlFabricRoutesBindUserToOwningRemoteEdge(t *testing.T) {
 	raw := [8]byte{1}
 	registry := &captureLocationRegistry{raw: map[[8]byte][]LocationRecord{
@@ -818,6 +873,12 @@ type captureFullController struct {
 	layerSession int64
 	layer        int
 
+	activationBeginToken uint64
+	activationEndToken   uint64
+	bootstrapBeginToken  uint64
+	bootstrapEndToken    uint64
+	bootstrapSuccess     bool
+
 	seedRawKey      [8]byte
 	seedRawLayer    int
 	seedRawAffected int
@@ -847,6 +908,23 @@ type captureFullController struct {
 	membershipSyncID int64
 	channelSyncID    int64
 	channelTTL       time.Duration
+}
+
+func (c *captureFullController) BeginSessionUpdatesActivation([8]byte, int64) (uint64, bool) {
+	return c.activationBeginToken, c.activationBeginToken != 0
+}
+
+func (c *captureFullController) EndSessionUpdatesActivation(_ [8]byte, _ int64, token uint64) {
+	c.activationEndToken = token
+}
+
+func (c *captureFullController) BeginSessionBootstrapProbe([8]byte, int64) (uint64, bool) {
+	return c.bootstrapBeginToken, c.bootstrapBeginToken != 0
+}
+
+func (c *captureFullController) EndSessionBootstrapProbe(_ [8]byte, _ int64, token uint64, success bool) {
+	c.bootstrapEndToken = token
+	c.bootstrapSuccess = success
 }
 
 func (c *captureFullController) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte) {
@@ -1120,11 +1198,12 @@ type captureSessionBus struct {
 	membershipSyncDisposition ChannelMembershipSyncDisposition
 	ackErr                    string
 	err                       error
+	lifecycleToken            uint64
 }
 
 func (b *captureSessionBus) SendSessionControl(_ context.Context, targetInstanceID string, cmd SessionControlCommand) (SessionControlAck, error) {
 	b.sent = append(b.sent, sentSessionControl{target: targetInstanceID, cmd: cmd})
-	return SessionControlAck{CommandID: cmd.CommandID, Affected: b.affected, MembershipSyncID: b.membershipSyncID, MembershipSyncDisposition: b.membershipSyncDisposition, Error: b.ackErr}, b.err
+	return SessionControlAck{CommandID: cmd.CommandID, Affected: b.affected, MembershipSyncID: b.membershipSyncID, MembershipSyncDisposition: b.membershipSyncDisposition, LifecycleToken: b.lifecycleToken, Error: b.ackErr}, b.err
 }
 
 func (b *captureSessionBus) SubscribeSessionControls(context.Context, string, SessionControlCommandHandler) error {

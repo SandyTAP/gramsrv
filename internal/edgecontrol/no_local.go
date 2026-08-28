@@ -40,7 +40,15 @@ func (*NoLocalController) PushToSessionForAuthKeyImmediate(context.Context, [8]b
 	return ErrNoLocalSessionController
 }
 func (*NoLocalController) ReceivesUpdatesForAuthKey([8]byte, int64) bool { return false }
-func (*NoLocalController) SetClientLayerForAuthKey([8]byte, int64, int)  {}
+func (*NoLocalController) BeginSessionUpdatesActivation([8]byte, int64) (uint64, bool) {
+	return 0, false
+}
+func (*NoLocalController) EndSessionUpdatesActivation([8]byte, int64, uint64) {}
+func (*NoLocalController) BeginSessionBootstrapProbe([8]byte, int64) (uint64, bool) {
+	return 0, false
+}
+func (*NoLocalController) EndSessionBootstrapProbe([8]byte, int64, uint64, bool) {}
+func (*NoLocalController) SetClientLayerForAuthKey([8]byte, int64, int)          {}
 func (*NoLocalController) SeedInheritedLayerForRawAuthKey([8]byte, int) int {
 	return 0
 }

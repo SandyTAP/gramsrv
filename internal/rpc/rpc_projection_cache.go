@@ -199,41 +199,6 @@ type channelFullProjectionCache struct {
 	*projectionCache[channelFullProjectionKey, channelFullProjection]
 }
 
-type peerUsernameProjectionCache struct {
-	*projectionCache[domain.Peer, []domain.Username]
-}
-
-func newPeerUsernameProjectionCache(clock func() time.Time) *peerUsernameProjectionCache {
-	return &peerUsernameProjectionCache{
-		newProjectionCache[domain.Peer, []domain.Username](rpcProjectionCacheMaxEntries, rpcProjectionCacheTTL, clock, cloneDomainUsernames),
-	}
-}
-
-func (c *peerUsernameProjectionCache) Lookup(peer domain.Peer) ([]domain.Username, bool) {
-	if c == nil || peer.ID == 0 {
-		return nil, false
-	}
-	return c.lookup(peer)
-}
-
-func (c *peerUsernameProjectionCache) StoreIfEpoch(peer domain.Peer, usernames []domain.Username, loadEpoch uint64) {
-	if c == nil || peer.ID == 0 {
-		return
-	}
-	c.storeIfEpoch(peer, usernames, loadEpoch)
-}
-
-func (c *peerUsernameProjectionCache) DeletePeer(peer domain.Peer) {
-	if c == nil || peer.ID == 0 {
-		return
-	}
-	c.deleteKey(peer)
-}
-
-func cloneDomainUsernames(in []domain.Username) []domain.Username {
-	return append([]domain.Username(nil), in...)
-}
-
 func newChannelFullProjectionCache(clock func() time.Time) *channelFullProjectionCache {
 	return &channelFullProjectionCache{
 		newProjectionCache[channelFullProjectionKey, channelFullProjection](rpcProjectionCacheMaxEntries, rpcProjectionCacheTTL, clock, cloneChannelFullProjection),
@@ -380,9 +345,6 @@ func (r *Router) invalidateRPCProjectionForUser(userID int64) {
 		r.peerSettingsProjectionCache.DeleteViewer(userID)
 		r.peerSettingsProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeUser, ID: userID})
 	}
-	if r.peerUsernameProjectionCache != nil {
-		r.peerUsernameProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeUser, ID: userID})
-	}
 }
 
 // InvalidateStarGiftProfiles is the Core background-worker hook for hosted
@@ -424,9 +386,6 @@ func (r *Router) invalidateRPCProjectionForChannel(channelID int64) {
 	if r.peerSettingsProjectionCache != nil {
 		r.peerSettingsProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
 	}
-	if r.peerUsernameProjectionCache != nil {
-		r.peerUsernameProjectionCache.DeletePeer(domain.Peer{Type: domain.PeerTypeChannel, ID: channelID})
-	}
 }
 
 func (r *Router) flushRPCProjectionCache() {
@@ -441,9 +400,6 @@ func (r *Router) flushRPCProjectionCache() {
 	}
 	if r.channelFullProjectionCache != nil {
 		r.channelFullProjectionCache.Clear()
-	}
-	if r.peerUsernameProjectionCache != nil {
-		r.peerUsernameProjectionCache.Clear()
 	}
 }
 

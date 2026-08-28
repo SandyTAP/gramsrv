@@ -315,6 +315,9 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	if err := lockUsersForUpdate(ctx, tx, lockUserIDs...); err != nil {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send users: %w", err)
 	}
+	if err := lockDispatchOutboxAppendFences(ctx, tx, []int64{req.SenderUserID, req.RecipientUserID}); err != nil {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send dispatch append fences: %w", err)
+	}
 	if hooks.before != nil {
 		// The preflight above cannot observe another first request until it commits.
 		// Recheck after the per-user transaction lock so aggregate-backed sends

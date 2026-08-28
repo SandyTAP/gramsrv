@@ -151,6 +151,8 @@ type EdgeConfig struct {
 	MTProtoRPCGlobalWorkers              int
 	MTProtoRPCGlobalMaxTasks             int
 	MTProtoRPCGlobalMaxBytes             int64
+	MTProtoRPCDeliveryHookWorkers        int
+	MTProtoRPCDeliveryHookMaxPending     int
 	MTProtoRPCExecutionMaxEntries        int
 	MTProtoRPCExecutionAuthMaxEntries    int
 	MTProtoRPCExecutionSessionMaxEntries int
@@ -223,6 +225,7 @@ func edgeConfigFromConfig(c Config) EdgeConfig {
 		MTProtoMaxConnections: c.MTProtoMaxConnections, MTProtoMaxConnectionsPerIP: c.MTProtoMaxConnectionsPerIP, MTProtoMaxConcurrentHandshakes: c.MTProtoMaxConcurrentHandshakes,
 		MTProtoRPCMaxInflight: c.MTProtoRPCMaxInflight, MTProtoRPCQueueSize: c.MTProtoRPCQueueSize, MTProtoRPCTimeout: c.MTProtoRPCTimeout,
 		MTProtoRPCGlobalWorkers: c.MTProtoRPCGlobalWorkers, MTProtoRPCGlobalMaxTasks: c.MTProtoRPCGlobalMaxTasks, MTProtoRPCGlobalMaxBytes: c.MTProtoRPCGlobalMaxBytes,
+		MTProtoRPCDeliveryHookWorkers: c.MTProtoRPCDeliveryHookWorkers, MTProtoRPCDeliveryHookMaxPending: c.MTProtoRPCDeliveryHookMaxPending,
 		MTProtoRPCExecutionMaxEntries: c.MTProtoRPCExecutionMaxEntries, MTProtoRPCExecutionAuthMaxEntries: c.MTProtoRPCExecutionAuthMaxEntries,
 		MTProtoRPCExecutionSessionMaxEntries: c.MTProtoRPCExecutionSessionMaxEntries, MTProtoRPCExecutionPendingPerAuth: c.MTProtoRPCExecutionPendingPerAuth,
 		MTProtoInboundFrameGlobalMaxBytes: c.MTProtoInboundFrameGlobalMaxBytes, MTProtoOutboundQueueSize: c.MTProtoOutboundQueueSize,

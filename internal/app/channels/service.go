@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	"telesrv/internal/app/readmodel"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
@@ -22,6 +24,9 @@ type Service struct {
 	mediaCountCache   *mediaCountReadModelCache
 	participantCache  *participantsReadModelCache
 	activeIDsCache    *activeChannelIDsReadModelCache
+	activeIDsShared   store.ActiveChannelIDsPageCache
+	activeIDsLoader   store.ActiveChannelIDsPageLoader
+	activeIDsMetrics  ActiveChannelIDsReadModelMetrics
 	botMemberIDsCache *activeBotMemberIDsCache
 }
 
@@ -48,7 +53,7 @@ func NewService(channels store.ChannelStore, opts ...Option) *Service {
 		resolveCache:      newChannelResolveReadModelCache(defaultChannelResolveReadModelTTL),
 		mediaCountCache:   newMediaCountReadModelCache(defaultMediaCountReadModelTTL),
 		participantCache:  newParticipantsReadModelCache(defaultParticipantsReadModelTTL),
-		activeIDsCache:    newActiveChannelIDsReadModelCache(defaultActiveChannelIDsReadModelTTL),
+		activeIDsCache:    newActiveChannelIDsReadModelCache(0, defaultActiveChannelIDsReadModelTTL),
 		botMemberIDsCache: newActiveBotMemberIDsCache(),
 	}
 	for _, opt := range opts {
@@ -68,6 +73,25 @@ func WithBotProfileResolver(bots BotProfileResolver) Option {
 func WithReadModelVersions(v store.ReadModelVersionStore) Option {
 	return func(s *Service) {
 		s.versions = v
+	}
+}
+
+// WithActiveChannelIDsReadModel installs the production shared readiness page
+// cache and its bounded authoritative cold loader. Supplying the shared cache
+// without either durable versions or a loader is a configuration error at read
+// time; the service never silently falls back to per-session PostgreSQL reads.
+func WithActiveChannelIDsReadModel(
+	shared store.ActiveChannelIDsPageCache,
+	loader store.ActiveChannelIDsPageLoader,
+	maxEntries int,
+	ttl time.Duration,
+	metrics ActiveChannelIDsReadModelMetrics,
+) Option {
+	return func(s *Service) {
+		s.activeIDsShared = shared
+		s.activeIDsLoader = loader
+		s.activeIDsMetrics = metrics
+		s.activeIDsCache = newActiveChannelIDsReadModelCache(maxEntries, ttl)
 	}
 }
 
@@ -2045,7 +2069,15 @@ func (s *Service) SendMonoforumMessage(ctx context.Context, req domain.SendMonof
 	if err := s.ensureCanSend(ctx, req.SenderUserID); err != nil {
 		return domain.SendChannelMessageResult{}, err
 	}
-	return s.channels.SendMonoforumMessage(ctx, req)
+	result, err := s.channels.SendMonoforumMessage(ctx, req)
+	if err != nil {
+		return result, err
+	}
+	// The saved-peer owner gains (or refreshes) monoforum readiness visibility.
+	// Evict locally at commit return; migration 0201 advances the durable token
+	// and NOTIFY handles every other process.
+	s.invalidateActiveChannelIDs(req.SavedPeer.ID)
+	return result, nil
 }
 
 // ListMonoforumHistory 拉取某订阅者在频道私信(monoforum)内的历史。
@@ -2404,7 +2436,20 @@ func activeMembershipUserIDsFromMembers(primary int64, members []domain.ChannelM
 }
 
 func (s *Service) invalidateActiveChannelIDs(userIDs ...int64) {
-	if s == nil || s.activeIDsCache == nil {
+	if s == nil {
+		return
+	}
+	if versionCache, ok := s.versions.(store.ReadModelVersionCache); ok {
+		for _, userID := range uniqueNonZero(userIDs) {
+			versionCache.InvalidateReadModel(store.ReadModelKey{
+				Model:       readmodel.ModelChannelActiveIDs,
+				OwnerUserID: userID,
+				PeerType:    domain.PeerTypeUser,
+				PeerID:      userID,
+			})
+		}
+	}
+	if s.activeIDsCache == nil {
 		return
 	}
 	s.activeIDsCache.invalidateUsers(userIDs...)

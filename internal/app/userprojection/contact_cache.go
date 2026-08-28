@@ -19,14 +19,16 @@ const (
 	// Normal correctness relies on write-path invalidation, not natural expiry.
 	DefaultContactProjectionCacheTTL = 24 * time.Hour
 
-	contactSnapshotMaxViewers       = 4096
-	contactReversePairMaxEntries    = 262144
-	contactProjectionPairMaxEntries = 262144
+	// DefaultContactSnapshotMaxViewers covers the 10k online target plus bounded
+	// reconnect overlap. Eviction is exact LRU; reaching the limit must never
+	// clear every viewer snapshot at once.
+	DefaultContactSnapshotMaxViewers = 16_384
+	contactReversePairMaxEntries     = 262144
+	contactProjectionPairMaxEntries  = 262144
 	// One dense request must not monopolize the pair LRU or hold the global
 	// cache lock while inserting and evicting hundreds of thousands of cells.
 	// Larger results are still returned; they simply are not admitted per pair.
 	contactProjectionDenseAdmissionMaxCells = contactProjectionPairMaxEntries / 16
-	contactPersonalPhotoSnapshotCap         = 4096
 )
 
 type contactAccountSnapshot struct {
@@ -153,6 +155,16 @@ type contactProjectionLoadResult struct {
 	current bool
 }
 
+type contactCacheViewerFence struct {
+	userID     int64
+	generation uint64
+}
+
+type contactCacheFence struct {
+	flushGeneration uint64
+	viewers         []contactCacheViewerFence
+}
+
 // CachedContactStore wraps ContactStore with account-level read model snapshots.
 //
 // Contact data is low-churn and high-read: TDesktop repeatedly asks for the same
@@ -167,7 +179,13 @@ type CachedContactStore struct {
 
 	mu                 sync.RWMutex
 	contacts           map[int64]contactAccountSnapshot
+	contactLRU         *list.List
+	contactElements    map[int64]*list.Element
+	contactCap         int
 	personalPhotos     map[int64]personalPhotoSnapshot
+	personalPhotoLRU   *list.List
+	personalElements   map[int64]*list.Element
+	personalPhotoCap   int
 	reverse            map[reverseContactKey]*list.Element
 	reverseLRU         *list.List
 	reverseByOwner     map[int64]map[int64]struct{}
@@ -177,23 +195,37 @@ type CachedContactStore struct {
 	projectionByViewer map[int64]map[int64]struct{}
 	projectionByTarget map[int64]map[int64]struct{}
 	projectionCap      int
-	epoch              uint64
+	flushGeneration    uint64
+	viewerGenerations  map[int64]uint64
 	sf                 singleflight.Group
 }
 
 func NewCachedContactStore(inner store.ContactStore, ttl time.Duration) *CachedContactStore {
+	return NewCachedContactStoreWithMaxViewers(inner, ttl, DefaultContactSnapshotMaxViewers)
+}
+
+func NewCachedContactStoreWithMaxViewers(inner store.ContactStore, ttl time.Duration, maxViewers int) *CachedContactStore {
 	if inner == nil {
 		return nil
 	}
 	if ttl <= 0 {
 		ttl = DefaultContactProjectionCacheTTL
 	}
+	if maxViewers <= 0 {
+		maxViewers = DefaultContactSnapshotMaxViewers
+	}
 	return &CachedContactStore{
 		inner:              inner,
 		ttl:                ttl,
 		now:                time.Now,
 		contacts:           make(map[int64]contactAccountSnapshot, 1024),
+		contactLRU:         list.New(),
+		contactElements:    make(map[int64]*list.Element, 1024),
+		contactCap:         maxViewers,
 		personalPhotos:     make(map[int64]personalPhotoSnapshot, 1024),
+		personalPhotoLRU:   list.New(),
+		personalElements:   make(map[int64]*list.Element, 1024),
+		personalPhotoCap:   maxViewers,
 		reverse:            make(map[reverseContactKey]*list.Element, 4096),
 		reverseLRU:         list.New(),
 		reverseByOwner:     make(map[int64]map[int64]struct{}, 1024),
@@ -203,6 +235,7 @@ func NewCachedContactStore(inner store.ContactStore, ttl time.Duration) *CachedC
 		projectionByViewer: make(map[int64]map[int64]struct{}, 1024),
 		projectionByTarget: make(map[int64]map[int64]struct{}, 1024),
 		projectionCap:      contactProjectionPairMaxEntries,
+		viewerGenerations:  make(map[int64]uint64, 1024),
 	}
 }
 
@@ -308,7 +341,7 @@ func (c *CachedContactStore) ContactProjectionForViewers(ctx context.Context, vi
 			Contacts:       make(map[int64]map[int64]domain.Contact, len(viewers)),
 			PersonalPhotos: make(map[int64]map[int64]domain.ProfilePhotoRef, len(viewers)),
 		}
-		readEpoch := c.cacheEpoch()
+		readFence := c.captureCacheFenceSlices(viewers, targets)
 		now := c.now()
 		coldViewers := make(map[int64]struct{}, len(viewers))
 		coldTargets := make(map[int64]struct{}, len(targets))
@@ -355,7 +388,7 @@ func (c *CachedContactStore) ContactProjectionForViewers(ctx context.Context, vi
 				coldTargets[targetID] = struct{}{}
 			}
 		}
-		if c.cacheEpoch() != readEpoch {
+		if !c.cacheFenceCurrent(readFence) {
 			if err := ctx.Err(); err != nil {
 				return domain.ContactProjectionBatch{}, err
 			}
@@ -376,7 +409,7 @@ func (c *CachedContactStore) ContactProjectionForViewers(ctx context.Context, vi
 		if err != nil {
 			return domain.ContactProjectionBatch{}, err
 		}
-		if c.cacheEpoch() != readEpoch {
+		if !c.cacheFenceCurrent(readFence) {
 			if err := ctx.Err(); err != nil {
 				return domain.ContactProjectionBatch{}, err
 			}
@@ -395,7 +428,7 @@ func (c *CachedContactStore) loadContactProjectionForViewers(ctx context.Context
 	sfKey := fmt.Sprintf("contact-projection:%v:%v", viewers, targets)
 	for {
 		v, err, _ := c.sf.Do(sfKey, func() (any, error) {
-			loadEpoch := c.cacheEpoch()
+			loadFence := c.captureCacheFenceSlices(viewers, targets)
 			batch, err := c.inner.ContactProjectionForViewers(ctx, viewers, targets)
 			if err != nil {
 				return contactProjectionLoadResult{}, err
@@ -404,7 +437,7 @@ func (c *CachedContactStore) loadContactProjectionForViewers(ctx context.Context
 			expireAt := now.Add(c.ttl)
 			admitPairs := admitDenseContactProjectionPairs(len(viewers), len(targets))
 			c.mu.Lock()
-			current := c.epoch == loadEpoch
+			current := c.cacheFenceCurrentLocked(loadFence)
 			if current && admitPairs {
 				for _, viewerID := range viewers {
 					for _, targetID := range targets {
@@ -454,7 +487,7 @@ func (c *CachedContactStore) loadReverseContacts(ctx context.Context, userID int
 	sfKey := fmt.Sprintf("contact-reverse:%d:%v", userID, owners)
 	for {
 		v, err, _ := c.sf.Do(sfKey, func() (any, error) {
-			loadEpoch := c.cacheEpoch()
+			loadFence := c.captureCacheFenceSlices(owners, []int64{userID})
 			contacts, err := c.inner.GetReverseContacts(ctx, userID, owners)
 			if err != nil {
 				return reverseContactLoadResult{}, err
@@ -462,7 +495,7 @@ func (c *CachedContactStore) loadReverseContacts(ctx context.Context, userID int
 			now := c.now()
 			expireAt := now.Add(c.ttl)
 			c.mu.Lock()
-			stored := c.epoch == loadEpoch
+			stored := c.cacheFenceCurrentLocked(loadFence)
 			if stored {
 				for _, ownerID := range owners {
 					key := reverseContactKey{ownerUserID: ownerID, contactUserID: userID}
@@ -577,20 +610,16 @@ func (c *CachedContactStore) contactSnapshot(ctx context.Context, userID int64) 
 			if snap, ok := c.lookupContactSnapshot(userID, now); ok {
 				return contactSnapshotLoadResult{snap: snap, stored: true}, nil
 			}
-			loadEpoch := c.cacheEpoch()
+			loadFence := c.captureCacheFence(userID)
 			list, err := c.inner.ListByUser(ctx, userID)
 			if err != nil {
 				return contactSnapshotLoadResult{}, err
 			}
 			snap := buildContactAccountSnapshot(list, now.Add(c.ttl))
 			c.mu.Lock()
-			stored := c.epoch == loadEpoch
+			stored := c.cacheFenceCurrentLocked(loadFence)
 			if stored {
-				if len(c.contacts) >= contactSnapshotMaxViewers {
-					c.contacts = make(map[int64]contactAccountSnapshot, 1024)
-					c.personalPhotos = make(map[int64]personalPhotoSnapshot, 1024)
-				}
-				c.contacts[userID] = snap
+				c.storeContactSnapshotLocked(userID, snap)
 			}
 			c.mu.Unlock()
 			return contactSnapshotLoadResult{snap: snap, stored: stored}, nil
@@ -609,16 +638,43 @@ func (c *CachedContactStore) contactSnapshot(ctx context.Context, userID int64) 
 }
 
 func (c *CachedContactStore) lookupContactSnapshot(userID int64, now time.Time) (contactAccountSnapshot, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
 	snap, ok := c.contacts[userID]
-	c.mu.RUnlock()
-	if !ok || !snap.expireAt.After(now) {
-		if ok {
-			c.InvalidateViewers(userID)
-		}
+	if !ok {
+		c.mu.Unlock()
 		return contactAccountSnapshot{}, false
 	}
+	if !snap.expireAt.After(now) {
+		c.advanceViewerGenerationLocked(userID)
+		c.invalidateViewerLocked(userID)
+		c.mu.Unlock()
+		return contactAccountSnapshot{}, false
+	}
+	if element := c.contactElements[userID]; element != nil {
+		c.contactLRU.MoveToFront(element)
+	}
+	c.mu.Unlock()
 	return snap, true
+}
+
+func (c *CachedContactStore) storeContactSnapshotLocked(userID int64, snap contactAccountSnapshot) {
+	if element := c.contactElements[userID]; element != nil {
+		c.contacts[userID] = snap
+		c.contactLRU.MoveToFront(element)
+		return
+	}
+	c.contacts[userID] = snap
+	c.contactElements[userID] = c.contactLRU.PushFront(userID)
+	for c.contactLRU.Len() > c.contactCap {
+		oldest := c.contactLRU.Back()
+		if oldest == nil {
+			break
+		}
+		oldestUserID := oldest.Value.(int64)
+		delete(c.contacts, oldestUserID)
+		delete(c.contactElements, oldestUserID)
+		c.contactLRU.Remove(oldest)
+	}
 }
 
 func (c *CachedContactStore) personalPhotoSnapshot(ctx context.Context, userID int64) (personalPhotoSnapshot, error) {
@@ -631,7 +687,7 @@ func (c *CachedContactStore) personalPhotoSnapshot(ctx context.Context, userID i
 			if snap, ok := c.lookupPersonalPhotoSnapshot(userID, now); ok {
 				return personalPhotoSnapshotLoadResult{snap: snap, stored: true}, nil
 			}
-			loadEpoch := c.cacheEpoch()
+			loadFence := c.captureCacheFence(userID)
 			contacts, err := c.contactSnapshot(ctx, userID)
 			if err != nil {
 				return personalPhotoSnapshotLoadResult{}, err
@@ -649,12 +705,9 @@ func (c *CachedContactStore) personalPhotoSnapshot(ctx context.Context, userID i
 			}
 			snap := personalPhotoSnapshot{refs: cloneCachedProfilePhotoRefs(refs), expireAt: now.Add(c.ttl)}
 			c.mu.Lock()
-			stored := c.epoch == loadEpoch
+			stored := c.cacheFenceCurrentLocked(loadFence)
 			if stored {
-				if len(c.personalPhotos) >= contactPersonalPhotoSnapshotCap {
-					c.personalPhotos = make(map[int64]personalPhotoSnapshot, 1024)
-				}
-				c.personalPhotos[userID] = snap
+				c.storePersonalPhotoSnapshotLocked(userID, snap)
 			}
 			c.mu.Unlock()
 			return personalPhotoSnapshotLoadResult{snap: snap, stored: stored}, nil
@@ -673,16 +726,43 @@ func (c *CachedContactStore) personalPhotoSnapshot(ctx context.Context, userID i
 }
 
 func (c *CachedContactStore) lookupPersonalPhotoSnapshot(userID int64, now time.Time) (personalPhotoSnapshot, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
 	snap, ok := c.personalPhotos[userID]
-	c.mu.RUnlock()
-	if !ok || !snap.expireAt.After(now) {
-		if ok {
-			c.InvalidateViewers(userID)
-		}
+	if !ok {
+		c.mu.Unlock()
 		return personalPhotoSnapshot{}, false
 	}
+	if !snap.expireAt.After(now) {
+		c.advanceViewerGenerationLocked(userID)
+		c.invalidateViewerLocked(userID)
+		c.mu.Unlock()
+		return personalPhotoSnapshot{}, false
+	}
+	if element := c.personalElements[userID]; element != nil {
+		c.personalPhotoLRU.MoveToFront(element)
+	}
+	c.mu.Unlock()
 	return snap, true
+}
+
+func (c *CachedContactStore) storePersonalPhotoSnapshotLocked(userID int64, snap personalPhotoSnapshot) {
+	if element := c.personalElements[userID]; element != nil {
+		c.personalPhotos[userID] = snap
+		c.personalPhotoLRU.MoveToFront(element)
+		return
+	}
+	c.personalPhotos[userID] = snap
+	c.personalElements[userID] = c.personalPhotoLRU.PushFront(userID)
+	for c.personalPhotoLRU.Len() > c.personalPhotoCap {
+		oldest := c.personalPhotoLRU.Back()
+		if oldest == nil {
+			break
+		}
+		oldestUserID := oldest.Value.(int64)
+		delete(c.personalPhotos, oldestUserID)
+		delete(c.personalElements, oldestUserID)
+		c.personalPhotoLRU.Remove(oldest)
+	}
 }
 
 func (c *CachedContactStore) lookupReverseContact(ownerUserID, contactUserID int64, now time.Time) (domain.Contact, bool, bool) {
@@ -845,11 +925,16 @@ func (c *CachedContactStore) InvalidateViewers(ids ...int64) {
 		return
 	}
 	c.mu.Lock()
-	c.epoch++
+	seen := make(map[int64]struct{}, len(ids))
 	for _, id := range ids {
 		if id == 0 {
 			continue
 		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		c.advanceViewerGenerationLocked(id)
 		c.invalidateViewerLocked(id)
 	}
 	c.mu.Unlock()
@@ -857,7 +942,15 @@ func (c *CachedContactStore) InvalidateViewers(ids ...int64) {
 
 func (c *CachedContactStore) invalidateViewerLocked(id int64) {
 	delete(c.contacts, id)
+	if element := c.contactElements[id]; element != nil {
+		delete(c.contactElements, id)
+		c.contactLRU.Remove(element)
+	}
 	delete(c.personalPhotos, id)
+	if element := c.personalElements[id]; element != nil {
+		delete(c.personalElements, id)
+		c.personalPhotoLRU.Remove(element)
+	}
 	for contactUserID := range c.reverseByOwner[id] {
 		c.removeReverseKeyLocked(reverseContactKey{ownerUserID: id, contactUserID: contactUserID})
 	}
@@ -886,9 +979,14 @@ func (c *CachedContactStore) FlushReadModelCache() {
 		return
 	}
 	c.mu.Lock()
-	c.epoch++
+	c.flushGeneration++
+	c.viewerGenerations = make(map[int64]uint64, 1024)
 	c.contacts = make(map[int64]contactAccountSnapshot, 1024)
+	c.contactElements = make(map[int64]*list.Element, 1024)
+	c.contactLRU.Init()
 	c.personalPhotos = make(map[int64]personalPhotoSnapshot, 1024)
+	c.personalElements = make(map[int64]*list.Element, 1024)
+	c.personalPhotoLRU.Init()
 	c.reverse = make(map[reverseContactKey]*list.Element, 4096)
 	c.reverseLRU.Init()
 	c.reverseByOwner = make(map[int64]map[int64]struct{}, 1024)
@@ -899,11 +997,52 @@ func (c *CachedContactStore) FlushReadModelCache() {
 	c.mu.Unlock()
 }
 
-func (c *CachedContactStore) cacheEpoch() uint64 {
+func (c *CachedContactStore) captureCacheFence(userIDs ...int64) contactCacheFence {
+	return c.captureCacheFenceSlices(userIDs, nil)
+}
+
+func (c *CachedContactStore) captureCacheFenceSlices(first, second []int64) contactCacheFence {
 	c.mu.RLock()
-	epoch := c.epoch
+	fence := contactCacheFence{
+		flushGeneration: c.flushGeneration,
+		viewers:         make([]contactCacheViewerFence, 0, len(first)+len(second)),
+	}
+	for _, userIDs := range [][]int64{first, second} {
+		for _, userID := range userIDs {
+			if userID == 0 {
+				continue
+			}
+			fence.viewers = append(fence.viewers, contactCacheViewerFence{
+				userID:     userID,
+				generation: c.viewerGenerations[userID],
+			})
+		}
+	}
 	c.mu.RUnlock()
-	return epoch
+	return fence
+}
+
+func (c *CachedContactStore) cacheFenceCurrent(fence contactCacheFence) bool {
+	c.mu.RLock()
+	current := c.cacheFenceCurrentLocked(fence)
+	c.mu.RUnlock()
+	return current
+}
+
+func (c *CachedContactStore) cacheFenceCurrentLocked(fence contactCacheFence) bool {
+	if c.flushGeneration != fence.flushGeneration {
+		return false
+	}
+	for _, viewer := range fence.viewers {
+		if c.viewerGenerations[viewer.userID] != viewer.generation {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *CachedContactStore) advanceViewerGenerationLocked(userID int64) {
+	c.viewerGenerations[userID]++
 }
 
 func buildContactAccountSnapshot(list domain.ContactList, expireAt time.Time) contactAccountSnapshot {

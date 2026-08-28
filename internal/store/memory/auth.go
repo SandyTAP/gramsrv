@@ -79,6 +79,23 @@ func (s *AuthKeyStore) Get(_ context.Context, id [8]byte) (store.AuthKeyData, bo
 	return k, ok, nil
 }
 
+func (s *AuthKeyStore) Revalidate(ctx context.Context, id [8]byte) (store.AuthKeyData, bool, error) {
+	return s.Get(ctx, id)
+}
+
+func (s *AuthKeyStore) LoadBindingKeys(_ context.Context, tempID, permID [8]byte) (store.AuthKeyBindingKeys, error) {
+	s.state.mu.RLock()
+	temp, tempFound := s.state.keys[tempID]
+	perm, permFound := s.state.keys[permID]
+	s.state.mu.RUnlock()
+	return store.AuthKeyBindingKeys{
+		Temporary:      temp,
+		TemporaryFound: tempFound,
+		Permanent:      perm,
+		PermanentFound: permFound,
+	}, nil
+}
+
 func (s *AuthKeyStore) UpdateClientInfo(_ context.Context, id [8]byte, info store.AuthKeyClientInfo) error {
 	s.state.mu.Lock()
 	k, ok := s.state.keys[id]
@@ -198,19 +215,24 @@ func NewTempAuthKeyBindingStore(authKeys *AuthKeyStore) *TempAuthKeyBindingStore
 	return &TempAuthKeyBindingStore{state: authKeys.state}
 }
 
-func (s *TempAuthKeyBindingStore) Save(_ context.Context, b domain.TempAuthKeyBinding) error {
+func (s *TempAuthKeyBindingStore) Save(ctx context.Context, b domain.TempAuthKeyBinding) error {
+	_, err := s.SaveWithState(ctx, b)
+	return err
+}
+
+func (s *TempAuthKeyBindingStore) SaveWithState(_ context.Context, b domain.TempAuthKeyBinding) (domain.TempAuthKeyBindingResult, error) {
 	b.EncryptedMessage = append([]byte(nil), b.EncryptedMessage...)
 	s.state.mu.Lock()
 	defer s.state.mu.Unlock()
 	if current, ok := s.state.bindings[b.TempAuthKeyID]; ok && current.PermAuthKeyID != b.PermAuthKeyID {
-		return store.ErrTempAuthKeyAlreadyBound
+		return domain.TempAuthKeyBindingResult{}, store.ErrTempAuthKeyAlreadyBound
 	}
 	temp, tempFound := s.state.keys[b.TempAuthKeyID]
 	var permID [8]byte
 	binary.LittleEndian.PutUint64(permID[:], uint64(b.PermAuthKeyID))
 	perm, permFound := s.state.keys[permID]
 	if !tempFound || !permFound || temp.ExpiresAt <= 0 || perm.ExpiresAt != 0 || b.ExpiresAt != temp.ExpiresAt {
-		return store.ErrAuthKeyBindingInvalid
+		return domain.TempAuthKeyBindingResult{}, store.ErrAuthKeyBindingInvalid
 	}
 	// Binding and Layer-default normalization are one state transition. Exact
 	// session evidence remains keyed by the raw temp key; only the inherited
@@ -220,7 +242,7 @@ func (s *TempAuthKeyBindingStore) Save(_ context.Context, b domain.TempAuthKeyBi
 		perm.Layer, perm.LayerObservationID,
 	)
 	if err != nil {
-		return err
+		return domain.TempAuthKeyBindingResult{}, err
 	}
 	temp.Layer, temp.LayerObservationID = layer, observationID
 	perm.Layer, perm.LayerObservationID = layer, observationID
@@ -228,7 +250,7 @@ func (s *TempAuthKeyBindingStore) Save(_ context.Context, b domain.TempAuthKeyBi
 	s.state.keys[permID] = perm
 	s.state.bindings[b.TempAuthKeyID] = b
 	s.state.mirrorAuthorizationLayersLocked([][8]byte{b.TempAuthKeyID, permID}, layer)
-	return nil
+	return domain.TempAuthKeyBindingResult{Layer: layer, LayerObservationID: observationID}, nil
 }
 
 func (s *TempAuthKeyBindingStore) GetByTemp(_ context.Context, tempAuthKeyID [8]byte) (domain.TempAuthKeyBinding, bool, error) {

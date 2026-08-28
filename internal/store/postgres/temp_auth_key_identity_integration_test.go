@@ -11,12 +11,68 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+func TestTempAuthKeyBindingStoreUsesOneDatabaseStatementPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	keys := NewAuthKeyStore(pool)
+	handshakeExpiry := int(time.Now().Add(time.Hour).Unix())
+	temp := saveTempIdentityTestAuthKey(t, ctx, pool, keys, handshakeExpiry)
+	perm := saveTempIdentityTestAuthKey(t, ctx, pool, keys, 0)
+	counter := &tempAuthKeyBindStatementCounter{Pool: pool}
+
+	err := NewTempAuthKeyBindingStore(counter).Save(ctx, domain.TempAuthKeyBinding{
+		TempAuthKeyID: temp, PermAuthKeyID: authKeyIDToInt64(perm),
+		Nonce: 801, TempSessionID: 802, ExpiresAt: handshakeExpiry,
+		EncryptedMessage: []byte("one database statement"),
+	})
+	if err != nil {
+		t.Fatalf("bind temporary auth key: %v", err)
+	}
+	if counter.statements != 1 {
+		t.Fatalf("binding transaction statements = %d, want 1", counter.statements)
+	}
+}
+
+type tempAuthKeyBindStatementCounter struct {
+	*pgxpool.Pool
+	statements int
+}
+
+func (c *tempAuthKeyBindStatementCounter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := c.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &tempAuthKeyBindCountingTx{Tx: tx, statements: &c.statements}, nil
+}
+
+type tempAuthKeyBindCountingTx struct {
+	pgx.Tx
+	statements *int
+}
+
+func (tx *tempAuthKeyBindCountingTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	*tx.statements++
+	return tx.Tx.Exec(ctx, sql, arguments...)
+}
+
+func (tx *tempAuthKeyBindCountingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	*tx.statements++
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *tempAuthKeyBindCountingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	*tx.statements++
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
 
 func TestTempAuthKeyBindingStoreRejectsIntegerWraparoundPostgres(t *testing.T) {
 	if strconv.IntSize < 64 {

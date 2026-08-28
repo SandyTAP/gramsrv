@@ -177,6 +177,22 @@ func ValidateUserBatchDeliveryEffects(users []domain.User, effects []DeliveryEff
 	return nil
 }
 
+// UserLastSeenUpdate is one monotonic durable presence watermark. Writers must
+// apply the maximum timestamp for duplicate user IDs and must never move the
+// stored value backwards.
+type UserLastSeenUpdate struct {
+	UserID     int64
+	LastSeenAt int
+}
+
+// UserLastSeenBatchStore is the optional production write boundary used by
+// lifecycle presence batching. It deliberately remains separate from
+// UserStore so narrow test stores and read-only projections do not acquire a
+// fake batch capability accidentally.
+type UserLastSeenBatchStore interface {
+	UpdateLastSeenBatch(ctx context.Context, updates []UserLastSeenUpdate) error
+}
+
 // UserCache 缓存 viewer 无关的 users 表基础资料。
 // 联系人备注、隐私裁剪、头像选择和 presence 不应写入该缓存。
 type UserCache interface {

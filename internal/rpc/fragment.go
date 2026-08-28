@@ -269,6 +269,7 @@ func (r *Router) deactivateAllRegistryUsernames(ctx context.Context, peer domain
 // invalidateRegistryProjection drops the cached user/channel projections that
 // embed the username vector, so the next getFullUser / getFullChannel rebuilds it.
 func (r *Router) invalidateRegistryProjection(peer domain.Peer) {
+	r.InvalidatePeerIdentityReadModel(peer)
 	switch peer.Type {
 	case domain.PeerTypeUser:
 		r.invalidateRPCProjectionForUser(peer.ID)
@@ -420,37 +421,24 @@ func (r *Router) usernameRegistryMap(ctx context.Context, peers []domain.Peer) m
 	if r.deps.Usernames == nil || len(peers) == 0 {
 		return nil
 	}
-	loadEpoch := r.peerUsernameProjectionCache.LoadEpoch()
-	result := make(map[domain.Peer][]domain.Username, len(peers))
-	missing := make([]domain.Peer, 0, len(peers))
-	for _, peer := range peers {
-		if cached, ok := r.peerUsernameProjectionCache.Lookup(peer); ok {
-			result[peer] = cached
-		} else {
-			missing = append(missing, peer)
-		}
-	}
-	if len(missing) == 0 {
-		return result
-	}
-	loaded := make(map[domain.Peer][]domain.Username, len(missing))
-	if len(missing) == 1 {
-		list, err := r.deps.Usernames.PeerUsernames(ctx, missing[0])
+	usernames, _ := r.peerIdentityMaps(ctx, peers, true, false)
+	return usernames
+}
+
+func (r *Router) loadUsernameRegistryMap(ctx context.Context, peers []domain.Peer) (map[domain.Peer][]domain.Username, error) {
+	if len(peers) == 1 {
+		list, err := r.deps.Usernames.PeerUsernames(ctx, peers[0])
 		if err != nil {
-			return nil
+			return nil, err
 		}
-		loaded[missing[0]] = list
-	} else {
-		byPeer, err := r.deps.Usernames.UsernamesBatch(ctx, missing)
-		if err != nil {
-			return nil
+		if len(list) == 0 {
+			return map[domain.Peer][]domain.Username{}, nil
 		}
-		loaded = byPeer
+		return map[domain.Peer][]domain.Username{peers[0]: list}, nil
 	}
-	for _, peer := range missing {
-		list := loaded[peer]
-		r.peerUsernameProjectionCache.StoreIfEpoch(peer, list, loadEpoch)
-		result[peer] = list
+	byPeer, err := r.deps.Usernames.UsernamesBatch(ctx, peers)
+	if err != nil {
+		return nil, err
 	}
-	return result
+	return byPeer, nil
 }

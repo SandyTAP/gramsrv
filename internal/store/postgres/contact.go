@@ -165,6 +165,59 @@ WHERE c.contact_user_id = $1
 	return out, nil
 }
 
+// GetReverseContactsForViewerUserIDs reads an exact set of owner->viewer
+// relationship pairs for cross-request privacy batching. Privacy evaluation
+// only consumes relationship facts (existence/close_friend), so this query must
+// not join or copy viewer-independent users-table payloads into every pair.
+func (s *ContactStore) GetReverseContactsForViewerUserIDs(
+	ctx context.Context,
+	viewerUserIDsByOwner map[int64][]int64,
+) (map[int64]map[int64]domain.Contact, error) {
+	out := make(map[int64]map[int64]domain.Contact, len(viewerUserIDsByOwner))
+	ownerIDs, viewerIDs := flattenContactProjectionPairs(viewerUserIDsByOwner)
+	if len(ownerIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(ctx, `
+/* reverse_contact_pair_batch */
+WITH requested(owner_user_id, viewer_user_id) AS (
+  SELECT * FROM unnest($1::bigint[], $2::bigint[])
+)
+SELECT
+  c.user_id AS owner_user_id,
+  c.contact_user_id AS viewer_user_id,
+  c.mutual,
+  c.close_friend,
+  c.contact_phone,
+  c.contact_first_name,
+  c.contact_last_name,
+  c.note,
+  COALESCE(c.note_entities::text, '[]')::text AS note_entities_json
+FROM requested r
+JOIN contacts c
+  ON c.user_id = r.owner_user_id
+ AND c.contact_user_id = r.viewer_user_id
+`, ownerIDs, viewerIDs)
+	if err != nil {
+		return nil, fmt.Errorf("get sparse reverse contacts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		ownerID, contact, scanErr := scanSparseContactProjectionRows(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if out[ownerID] == nil {
+			out[ownerID] = make(map[int64]domain.Contact)
+		}
+		out[ownerID][contact.User.ID] = contact
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *ContactStore) ContactProjectionForViewers(ctx context.Context, viewerUserIDs, contactUserIDs []int64) (domain.ContactProjectionBatch, error) {
 	out := domain.ContactProjectionBatch{
 		Contacts:       make(map[int64]map[int64]domain.Contact, len(viewerUserIDs)),

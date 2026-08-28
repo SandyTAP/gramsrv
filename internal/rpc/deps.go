@@ -18,7 +18,7 @@ import (
 
 // AuthService 抽象登录/注册业务。
 type AuthService interface {
-	BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) error
+	BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) (domain.TempAuthKeyBindingResult, error)
 	ResolveAuthKey(ctx context.Context, authKeyID [8]byte) ([8]byte, bool, error)
 	UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
 	PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
@@ -63,6 +63,8 @@ type RawAuthKeyIdentityBinder = edgecontrol.RawAuthKeyIdentityBinder
 type RawAuthKeyMetadataProvider = edgecontrol.RawAuthKeyMetadataProvider
 type ImmediateSessionPusher = edgecontrol.ImmediateSessionPusher
 type SessionUpdatesStateProvider = edgecontrol.SessionUpdatesStateProvider
+type SessionUpdatesActivationProvider = edgecontrol.SessionUpdatesActivationProvider
+type SessionBootstrapProbeProvider = edgecontrol.SessionBootstrapProbeProvider
 type ClientLayerBinder = edgecontrol.ClientLayerBinder
 type AuthKeyLayerBinder = edgecontrol.AuthKeyLayerBinder
 type BusinessAuthKeyLayerBinder = edgecontrol.BusinessAuthKeyLayerBinder
@@ -110,6 +112,11 @@ type UsersService interface {
 
 type CollectiblePhoneService interface {
 	CollectiblePhone(ctx context.Context, phone string) (domain.CollectiblePhone, error)
+}
+
+type UserProjectionFactInvalidator interface {
+	InvalidateAccountFreezeFact(userID int64)
+	InvalidateCollectiblePhoneFact(userID int64)
 }
 
 // TelegramLoginService is the domain-only boundary shared by the MTProto RPC
@@ -326,6 +333,13 @@ type HelpService interface {
 // central RPC mutation gate. It is domain-only and shared with app/help.
 type AccountFreezeService interface {
 	AccountFreeze(ctx context.Context, userID int64) (domain.AccountFreeze, bool, error)
+}
+
+// AccountFreezeNotificationService owns the durable non-PTS notification
+// queue independently from the versioned freeze fact used by the hot RPC gate.
+type AccountFreezeNotificationService interface {
+	ClaimAccountFreezeNotifications(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]domain.AccountFreezeNotification, error)
+	CommitAccountFreezeNotificationDelivery(ctx context.Context, id, version int64, payload []byte, now time.Time) error
 }
 
 // UpdatesService 抽象 update 状态查询。
@@ -918,59 +932,62 @@ type Deps struct {
 	// AuthKeySessionLayers is the protocol-only durable ordering boundary for
 	// explicit invokeWithLayer evidence. Production must wire the same auth-key
 	// store used by the MTProto edge; nil is reserved for isolated router tests.
-	AuthKeySessionLayers    store.AuthKeySessionLayerStore
-	Account                 AccountService
-	Privacy                 PrivacyService
-	Help                    HelpService
-	AppUpdates              updatecdn.Resolver
-	AccountFreeze           AccountFreezeService
-	AICompose               AIComposeService
-	Ephemeral               EphemeralService
-	EphemeralPush           store.EphemeralPushBroker
-	WelcomeMessages         WelcomeMessageService
-	Moderation              ModerationService
-	Users                   UsersService
-	Usernames               UsernameRegistryService
-	CollectiblePhones       CollectiblePhoneService
-	AccountRatings          AccountRatingService
-	BotVerifications        BotVerificationService
-	TelegramLogin           TelegramLoginService
-	Updates                 UpdatesService
-	DeliveryOutbox          store.DeliveryOutboxStore
-	BootstrapUpdates        store.BootstrapUpdateJobStore
-	BotAPIUpdates           store.BotAPIUpdateStore
-	BotCallbacks            store.BotCallbackRegistryStore
-	LoginTokens             store.LoginTokenRegistryStore
-	Contacts                ContactsService
-	Dialogs                 DialogsService
-	Chatlists               ChatlistsService
-	Messages                MessagesService
-	Translation             TranslationService
-	Stories                 StoriesService
-	Channels                ChannelsService
-	Communities             CommunitiesService
-	Files                   FilesService
-	PremiumPromo            PremiumPromoService
-	Premium                 PremiumService
-	Bots                    BotsService
-	ServiceBotCallbacks     ServiceBotCallbacks
-	ServiceBotInlineResults ServiceBotInlineResults
-	Polls                   PollsService
-	Phone                   PhoneService
-	GroupCalls              GroupCallsService
-	LiveStreams             LiveStreamsService
-	SFU                     sfu.Service
-	TURN                    turnsrv.Service
-	LangPack                LangPackService
-	Sessions                EdgeController
-	Inline                  store.InlineRegistryStore
-	Limiter                 RateLimiter
-	Metrics                 Metrics
-	SecretChats             SecretChatService
-	Stars                   StarsService
-	Gifts                   GiftsService
-	Passkey                 PasskeyService
-	Themes                  ThemeService
+	AuthKeySessionLayers       store.AuthKeySessionLayerStore
+	ReadModelVersions          store.ReadModelVersionStore
+	UserProjectionFacts        UserProjectionFactInvalidator
+	Account                    AccountService
+	Privacy                    PrivacyService
+	Help                       HelpService
+	AppUpdates                 updatecdn.Resolver
+	AccountFreeze              AccountFreezeService
+	AccountFreezeNotifications AccountFreezeNotificationService
+	AICompose                  AIComposeService
+	Ephemeral                  EphemeralService
+	EphemeralPush              store.EphemeralPushBroker
+	WelcomeMessages            WelcomeMessageService
+	Moderation                 ModerationService
+	Users                      UsersService
+	Usernames                  UsernameRegistryService
+	CollectiblePhones          CollectiblePhoneService
+	AccountRatings             AccountRatingService
+	BotVerifications           BotVerificationService
+	TelegramLogin              TelegramLoginService
+	Updates                    UpdatesService
+	DeliveryOutbox             store.DeliveryOutboxStore
+	BootstrapUpdates           store.BootstrapUpdateJobStore
+	BotAPIUpdates              store.BotAPIUpdateStore
+	BotCallbacks               store.BotCallbackRegistryStore
+	LoginTokens                store.LoginTokenRegistryStore
+	Contacts                   ContactsService
+	Dialogs                    DialogsService
+	Chatlists                  ChatlistsService
+	Messages                   MessagesService
+	Translation                TranslationService
+	Stories                    StoriesService
+	Channels                   ChannelsService
+	Communities                CommunitiesService
+	Files                      FilesService
+	PremiumPromo               PremiumPromoService
+	Premium                    PremiumService
+	Bots                       BotsService
+	ServiceBotCallbacks        ServiceBotCallbacks
+	ServiceBotInlineResults    ServiceBotInlineResults
+	Polls                      PollsService
+	Phone                      PhoneService
+	GroupCalls                 GroupCallsService
+	LiveStreams                LiveStreamsService
+	SFU                        sfu.Service
+	TURN                       turnsrv.Service
+	LangPack                   LangPackService
+	Sessions                   EdgeController
+	Inline                     store.InlineRegistryStore
+	Limiter                    RateLimiter
+	Metrics                    Metrics
+	SecretChats                SecretChatService
+	Stars                      StarsService
+	Gifts                      GiftsService
+	Passkey                    PasskeyService
+	Themes                     ThemeService
 }
 
 // ThemeService 抽象自定义云主题(app/themes):创建/更新/查询主题 + 维护每用户已安装列表。

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	runtimemetrics "runtime/metrics"
 	"strings"
 	"syscall"
 	"time"
@@ -148,8 +149,9 @@ func startDebugServer(ctx context.Context, addr string, metricsHandler http.Hand
 func goRuntimeGaugeSamples() []obsmetrics.GaugeSample {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	return []obsmetrics.GaugeSample{
+	samples := []obsmetrics.GaugeSample{
 		{Name: "telesrv_go_goroutines", Value: float64(runtime.NumGoroutine())},
+		{Name: "telesrv_go_scheduler_busy_seconds", Value: goSchedulerBusySeconds()},
 		{Name: "telesrv_go_heap_alloc_bytes", Value: float64(mem.HeapAlloc)},
 		{Name: "telesrv_go_heap_inuse_bytes", Value: float64(mem.HeapInuse)},
 		{Name: "telesrv_go_heap_objects", Value: float64(mem.HeapObjects)},
@@ -158,6 +160,24 @@ func goRuntimeGaugeSamples() []obsmetrics.GaugeSample {
 		{Name: "telesrv_go_gc_cycles", Value: float64(mem.NumGC)},
 		{Name: "telesrv_go_gc_pause_seconds", Value: time.Duration(mem.PauseTotalNs).Seconds()},
 	}
+	if value, ok := processCPUSeconds(); ok {
+		samples = append(samples, obsmetrics.GaugeSample{Name: "telesrv_process_cpu_seconds", Value: value})
+	}
+	return samples
+}
+
+func goSchedulerBusySeconds() float64 {
+	samples := []runtimemetrics.Sample{
+		{Name: "/cpu/classes/total:cpu-seconds"},
+		{Name: "/cpu/classes/idle:cpu-seconds"},
+	}
+	runtimemetrics.Read(samples)
+	total := samples[0].Value.Float64()
+	idle := samples[1].Value.Float64()
+	if total <= idle {
+		return 0
+	}
+	return total - idle
 }
 
 func MTProtoRuntimeGaugeSamples(snapshot mtprotoedge.RuntimeSnapshot) []obsmetrics.GaugeSample {
@@ -178,6 +198,15 @@ func MTProtoRuntimeGaugeSamples(snapshot mtprotoedge.RuntimeSnapshot) []obsmetri
 		{Name: "telesrv_mtproto_inbound_rpc_ready_connections", Value: float64(snapshot.InboundRPCReadyConnections)},
 		{Name: "telesrv_mtproto_inbound_rpc_task_limit", Value: float64(snapshot.InboundRPCMaxTasks)},
 		{Name: "telesrv_mtproto_inbound_rpc_byte_limit", Value: float64(snapshot.InboundRPCMaxBytes)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_workers", Value: float64(snapshot.RPCDeliveryHookWorkers)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_capacity", Value: float64(snapshot.RPCDeliveryHookCapacity)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_reserved", Value: float64(snapshot.RPCDeliveryHookReserved)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_queued", Value: float64(snapshot.RPCDeliveryHookQueued)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_running", Value: float64(snapshot.RPCDeliveryHookRunning)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_completed_total", Value: float64(snapshot.RPCDeliveryHookCompleted)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_rejected_total", Value: float64(snapshot.RPCDeliveryHookRejected)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_panics_total", Value: float64(snapshot.RPCDeliveryHookPanics)},
+		{Name: "telesrv_mtproto_rpc_delivery_hook_duration_seconds_total", Value: snapshot.RPCDeliveryHookDurationSeconds},
 		{Name: "telesrv_mtproto_inbound_frame_bytes", Value: float64(snapshot.InboundFrameBytes)},
 		{Name: "telesrv_mtproto_inbound_frame_byte_limit", Value: float64(snapshot.InboundFrameMaxBytes)},
 		{Name: "telesrv_mtproto_outbound_tracked_bytes", Labels: []obsmetrics.Label{{Name: "kind", Value: "body"}}, Value: float64(snapshot.OutboundTrackedBytes)},

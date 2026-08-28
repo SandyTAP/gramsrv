@@ -18,8 +18,9 @@ type fakeStoryReadModelCache struct {
 }
 
 type fakeRPCProjectionReadModelCache struct {
-	users   []int64
-	flushes int
+	users    []int64
+	channels []int64
+	flushes  int
 }
 
 type fakeAccountFreezeReadModelCache struct {
@@ -43,7 +44,9 @@ func (f *fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForUse
 }
 func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForPeer(int64, domain.Peer) {
 }
-func (*fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForChannel(int64) {}
+func (f *fakeRPCProjectionReadModelCache) InvalidateRPCProjectionReadModelForChannel(id int64) {
+	f.channels = append(f.channels, id)
+}
 func (f *fakeRPCProjectionReadModelCache) FlushRPCProjectionReadModel() {
 	f.flushes++
 }

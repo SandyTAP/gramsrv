@@ -13,17 +13,17 @@ import (
 
 // StoryStore is the in-memory implementation of store.StoryStore.
 type StoryStore struct {
-	mu        sync.RWMutex
-	stories   map[storyKey]domain.Story
-	read      map[storyReadKey]domain.StoryReadState
-	views     map[storyViewKey]domain.StoryView
-	exposures map[storyViewKey]int
-	hidden    map[storyHiddenKey]bool
-	profiles  map[int64]domain.User
-	contacts  map[int64]map[int64]domain.Contact
-	blocked   map[int64]map[int64]bool
-	channels  *ChannelStore
-	members   map[int64]map[int64]bool
+	mu           sync.RWMutex
+	stories      map[storyKey]domain.Story
+	read         map[storyReadKey]domain.StoryReadState
+	views        map[storyViewKey]domain.StoryView
+	exposures    map[storyViewKey]int
+	hidden       map[storyHiddenKey]bool
+	profiles     map[int64]domain.User
+	contacts     map[int64]map[int64]domain.Contact
+	blocked      map[int64]map[int64]bool
+	channels     *ChannelStore
+	members      map[int64]map[int64]bool
 	updateEvents *UpdateEventStore
 }
 
@@ -59,16 +59,16 @@ func NewStoryStore(channels ...*ChannelStore) *StoryStore {
 		channelStore = channels[0]
 	}
 	return &StoryStore{
-		stories:   make(map[storyKey]domain.Story),
-		read:      make(map[storyReadKey]domain.StoryReadState),
-		views:     make(map[storyViewKey]domain.StoryView),
-		exposures: make(map[storyViewKey]int),
-		hidden:    make(map[storyHiddenKey]bool),
-		profiles:  make(map[int64]domain.User),
-		contacts:  make(map[int64]map[int64]domain.Contact),
-		blocked:   make(map[int64]map[int64]bool),
-		channels:  channelStore,
-		members:   make(map[int64]map[int64]bool),
+		stories:      make(map[storyKey]domain.Story),
+		read:         make(map[storyReadKey]domain.StoryReadState),
+		views:        make(map[storyViewKey]domain.StoryView),
+		exposures:    make(map[storyViewKey]int),
+		hidden:       make(map[storyHiddenKey]bool),
+		profiles:     make(map[int64]domain.User),
+		contacts:     make(map[int64]map[int64]domain.Contact),
+		blocked:      make(map[int64]map[int64]bool),
+		channels:     channelStore,
+		members:      make(map[int64]map[int64]bool),
 		updateEvents: NewUpdateEventStore(),
 	}
 }

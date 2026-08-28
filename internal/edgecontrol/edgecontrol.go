@@ -571,6 +571,10 @@ const (
 	SessionControlBindUser                             SessionControlKind = "bind_user"
 	SessionControlUnbindAuthKey                        SessionControlKind = "unbind_auth_key"
 	SessionControlSetReceivesUpdates                   SessionControlKind = "set_receives_updates"
+	SessionControlBeginUpdatesActivation               SessionControlKind = "begin_updates_activation"
+	SessionControlEndUpdatesActivation                 SessionControlKind = "end_updates_activation"
+	SessionControlBeginBootstrapProbe                  SessionControlKind = "begin_bootstrap_probe"
+	SessionControlEndBootstrapProbe                    SessionControlKind = "end_bootstrap_probe"
 	SessionControlSetClientLayer                       SessionControlKind = "set_client_layer"
 	SessionControlSeedRawLayer                         SessionControlKind = "seed_raw_layer"
 	SessionControlSeedBusinessLayer                    SessionControlKind = "seed_business_layer"
@@ -655,6 +659,8 @@ type SessionControlCommand struct {
 	ChannelIDs        []int64
 	SubscriptionTTL   time.Duration
 	MembershipSyncID  int64
+	LifecycleToken    uint64
+	LifecycleSuccess  bool
 }
 
 type SessionControlAck struct {
@@ -664,6 +670,7 @@ type SessionControlAck struct {
 	Affected                  int
 	MembershipSyncID          int64
 	MembershipSyncDisposition ChannelMembershipSyncDisposition
+	LifecycleToken            uint64
 	Error                     string
 }
 
@@ -829,6 +836,8 @@ type FullController interface {
 	RawAuthKeyMetadataProvider
 	ImmediateSessionPusher
 	SessionUpdatesStateProvider
+	SessionUpdatesActivationProvider
+	SessionBootstrapProbeProvider
 	ClientLayerBinder
 	AuthKeyLayerBinder
 	BusinessAuthKeyLayerBinder
@@ -874,6 +883,20 @@ type ImmediateSessionPusher interface {
 // SessionUpdatesStateProvider exposes whether a live session is ready to receive updates.
 type SessionUpdatesStateProvider interface {
 	ReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64) bool
+}
+
+// SessionUpdatesActivationProvider fences one expensive readiness transition
+// to the physical connection generation that owns the raw session on Edge.
+type SessionUpdatesActivationProvider interface {
+	BeginSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64) (token uint64, ok bool)
+	EndSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64, token uint64)
+}
+
+// SessionBootstrapProbeProvider records the durable bootstrap readiness probe
+// as a retryable one-shot owned by the physical Edge connection generation.
+type SessionBootstrapProbeProvider interface {
+	BeginSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64) (token uint64, ok bool)
+	EndSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64, token uint64, success bool)
 }
 
 // ClientLayerBinder records explicit per-session layer evidence observed at Edge.

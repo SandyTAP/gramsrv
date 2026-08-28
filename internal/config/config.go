@@ -61,12 +61,14 @@ type Config struct {
 	// MTProto RPC 使用 Server 共享公平调度器；per-connection 与 global 预算共同限制
 	// goroutine、排队任务和 request memory charge。legacy charge 等于 copied body，
 	// exact charge 是 typed decode 前的保守 materialization 上界，不等同 wire bytes。
-	MTProtoRPCMaxInflight    int
-	MTProtoRPCQueueSize      int
-	MTProtoRPCTimeout        time.Duration
-	MTProtoRPCGlobalWorkers  int
-	MTProtoRPCGlobalMaxTasks int
-	MTProtoRPCGlobalMaxBytes int64
+	MTProtoRPCMaxInflight            int
+	MTProtoRPCQueueSize              int
+	MTProtoRPCTimeout                time.Duration
+	MTProtoRPCGlobalWorkers          int
+	MTProtoRPCGlobalMaxTasks         int
+	MTProtoRPCGlobalMaxBytes         int64
+	MTProtoRPCDeliveryHookWorkers    int
+	MTProtoRPCDeliveryHookMaxPending int
 	// Pending ownership and compact completed receipts share three-level
 	// global/raw-auth/session entry accounting. Result bodies are never cached
 	// here; the logical-session outbox owns unacknowledged wire bytes.
@@ -384,7 +386,52 @@ type Config struct {
 	TempKeyResolveCacheMaxEntries int
 	// TempKeyResolveCacheTTL 是 temp→perm 绑定的进程内复核周期。绑定/revoke 有精确
 	// 失效，TTL 作为跨进程或异常路径兜底；默认 30m 避免大连接数下每 5s 全量打 PG。
-	TempKeyResolveCacheTTL time.Duration
+	TempKeyResolveCacheTTL            time.Duration
+	ReadModelVersionCacheMaxEntries   int
+	ReadModelVersionBatchMaxKeys      int
+	ReadModelVersionBatchWait         time.Duration
+	ReadModelVersionBatchQueue        int
+	ReadModelVersionBatchTimeout      time.Duration
+	AuthKeyGetBatchMax                int
+	AuthKeyGetBatchWait               time.Duration
+	AuthKeyGetBatchQueue              int
+	AuthKeyGetBatchTimeout            time.Duration
+	ContactReverseBatchMaxPairs       int
+	ContactReverseBatchWait           time.Duration
+	ContactReverseBatchQueue          int
+	ContactReverseBatchTimeout        time.Duration
+	ContactSnapshotCacheMaxViewers    int
+	ProfilePhotoCacheMaxEntries       int
+	ProfilePhotoCacheTTL              time.Duration
+	PeerIdentityCacheMaxEntries       int
+	DialogPrivatePeerCacheMaxEntries  int
+	DialogPrivatePeerCacheMaxBytes    int64
+	DialogDraftCacheMaxEntries        int
+	DialogDraftCacheMaxBytes          int64
+	UserProjectionFactCacheMaxEntries int
+	StoryActivePeerCacheMaxEntries    int
+	StoryHiddenListCacheMaxEntries    int
+	StoryHiddenListCacheMaxBytes      int64
+	DialogListSnapshotCacheMaxEntries int
+	DialogListSnapshotCacheMaxHeaders int64
+	DialogListSnapshotCacheTTL        time.Duration
+	DialogListSnapshotRedisTTL        time.Duration
+	ActiveChannelIDsCacheMaxEntries   int
+	ActiveChannelIDsCacheTTL          time.Duration
+	ActiveChannelIDsRedisTTL          time.Duration
+	ActiveChannelIDsBatchMax          int
+	ActiveChannelIDsBatchWait         time.Duration
+	ActiveChannelIDsBatchQueue        int
+	ActiveChannelIDsBatchTimeout      time.Duration
+	BootstrapReadyBatchMax            int
+	BootstrapReadyBatchWait           time.Duration
+	BootstrapReadyBatchQueue          int
+	BootstrapReadyBatchTimeout        time.Duration
+	PresenceLastSeenBatchMax          int
+	PresenceLastSeenBatchWait         time.Duration
+	PresenceLastSeenBatchQueue        int
+	PresenceLastSeenBatchTimeout      time.Duration
+	PresenceLastSeenDrainTimeout      time.Duration
 	// AuthUserCacheTTL 是 auth_key->user 正向授权缓存的兜底复核周期。写侧
 	// invalidation 仍是主路径；TTL 防止跨 Core pub/sub/control 丢失后旧授权永久留在内存。
 	AuthUserCacheTTL time.Duration
@@ -398,13 +445,17 @@ type Config struct {
 
 	// ChannelRowCacheMaxEntries 是「共享频道行」进程内缓存容量(channelID→domain.Channel)。
 	// 由 channels 表 LISTEN/NOTIFY 触发器实时失效(强一致、零 TTL)。<=0 禁用缓存与监听。
-	ChannelRowCacheMaxEntries int
+	ChannelRowCacheMaxEntries        int
+	ChannelTopMessageCacheMaxEntries int
 	// ChannelMemberCacheMaxEntries 是频道成员/访问态 read-model 缓存容量((channelID,userID)→member)。
 	// 由 read_model_versions 统一通知实时失效。<=0 禁用缓存。
 	ChannelMemberCacheMaxEntries int
 	// ChannelDialogCacheMaxEntries 是频道 dialog 读投影缓存容量((viewerUserID,channelID)→dialog)。
 	// 由 channel_base/channel_member/dialog_light 统一通知实时失效。<=0 禁用缓存。
-	ChannelDialogCacheMaxEntries int
+	ChannelDialogCacheMaxEntries     int
+	ChannelDifferenceCacheMaxEntries int
+	ChannelDifferenceCacheMaxBytes   int64
+	ChannelDifferenceCacheTTL        time.Duration
 	// ChannelBoostCacheMaxEntries 是频道 boost read-model 缓存容量，覆盖当前用户
 	// SelfBoostsApplied 与频道总 active boost 数两类投影。写入 channel_boost_slots
 	// 时精确失效，TTL 兜底自然过期。<=0 禁用缓存。
@@ -868,8 +919,10 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		MTProtoRPCQueueSize:               envIntOr("TELESRV_MTPROTO_RPC_QUEUE_SIZE", 64),
 		MTProtoRPCTimeout:                 envDurationOr("TELESRV_MTPROTO_RPC_TIMEOUT", 30*time.Second),
 		MTProtoRPCGlobalWorkers:           envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_WORKERS", 256),
-		MTProtoRPCGlobalMaxTasks:          envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS", 8192),
+		MTProtoRPCGlobalMaxTasks:          envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS", 32768),
 		MTProtoRPCGlobalMaxBytes:          envInt64Or("TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES", 512<<20),
+		MTProtoRPCDeliveryHookWorkers:     envIntOr("TELESRV_MTPROTO_RPC_DELIVERY_HOOK_WORKERS", 32),
+		MTProtoRPCDeliveryHookMaxPending:  envIntOr("TELESRV_MTPROTO_RPC_DELIVERY_HOOK_MAX_PENDING", 16_384),
 		MTProtoRPCExecutionMaxEntries:     envIntOr("TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES", 1<<18),
 		MTProtoRPCExecutionAuthMaxEntries: envIntOr("TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES", 1<<15),
 		MTProtoRPCExecutionSessionMaxEntries: envIntOr(
@@ -971,81 +1024,130 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 			"TELESRV_EDGE_LOCATION_HEARTBEAT_INTERVAL", 30*time.Second,
 		),
 
-		DevAuthCode:                   envOr("TELESRV_DEV_AUTH_CODE", "12345"),
-		AuthCodeTTL:                   envDurationOr("TELESRV_AUTH_CODE_TTL", 5*time.Minute),
-		PhoneCodeLength:               envIntOr("TELESRV_PHONE_CODE_LENGTH", 5),
-		AuthCodeMaxAttempts:           envIntOr("TELESRV_AUTH_CODE_MAX_ATTEMPTS", 5),
-		AuthCodePhoneRateLimit:        envIntOr("TELESRV_AUTH_CODE_PHONE_RATE_LIMIT", 5),
-		AuthCodeAuthKeyRateLimit:      envIntOr("TELESRV_AUTH_CODE_AUTH_KEY_RATE_LIMIT", 20),
-		AuthCodeRateWindow:            envDurationOr("TELESRV_AUTH_CODE_RATE_WINDOW", 10*time.Minute),
-		LoginEmailEnable:              envBoolOr("TELESRV_LOGIN_EMAIL_ENABLE", false),
-		LoginEmailRequireSetup:        envBoolOr("TELESRV_LOGIN_EMAIL_REQUIRE_SETUP", false),
-		LoginEmailCodeLength:          envIntOr("TELESRV_LOGIN_EMAIL_CODE_LENGTH", 6),
-		PhoneCodeDeliveryProvider:     strings.ToLower(strings.TrimSpace(envOr("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "development"))),
-		EmailCodeDeliveryProvider:     strings.ToLower(strings.TrimSpace(envOr("TELESRV_EMAIL_CODE_DELIVERY_PROVIDER", "smtp"))),
-		OTPWebhookURL:                 envOr("TELESRV_OTP_WEBHOOK_URL", ""),
-		OTPWebhookSecret:              envOr("TELESRV_OTP_WEBHOOK_SECRET", ""),
-		OTPWebhookTimeout:             envDurationOr("TELESRV_OTP_WEBHOOK_TIMEOUT", 5*time.Second),
-		SMTPHost:                      envOr("TELESRV_SMTP_HOST", ""),
-		SMTPPort:                      envIntOr("TELESRV_SMTP_PORT", 587),
-		SMTPUsername:                  envOr("TELESRV_SMTP_USERNAME", ""),
-		SMTPPassword:                  envOr("TELESRV_SMTP_PASSWORD", ""),
-		SMTPFrom:                      envOr("TELESRV_SMTP_FROM", ""),
-		SMTPFromName:                  envOr("TELESRV_SMTP_FROM_NAME", brandConfig.ProductName),
-		SMTPTLSMode:                   strings.ToLower(strings.TrimSpace(envOr("TELESRV_SMTP_TLS", "starttls"))),
-		SMTPTimeout:                   envDurationOr("TELESRV_SMTP_TIMEOUT", 10*time.Second),
-		LangPackSeedDir:               envOr("TELESRV_LANGPACK_SEED_DIR", "data/langpack"),
-		OfficialGiftsDir:              envOr("TELESRV_OFFICIAL_GIFTS_DIR", "data/official-gifts"),
-		StarGiftTONStartingGrant:      envInt64Or("TELESRV_STARGIFT_TON_STARTING_GRANT", 10_000_000_000),
-		BlobBackendKind:               strings.ToLower(strings.TrimSpace(envOr("TELESRV_BLOB_BACKEND", "localfs"))),
-		BlobDir:                       envOr("TELESRV_BLOB_DIR", "data/blobs"),
-		BlobStagingDir:                envOr("TELESRV_BLOB_STAGING_DIR", "data/blob-staging"),
-		S3Endpoint:                    strings.TrimSpace(envOr("TELESRV_S3_ENDPOINT", "")),
-		S3Region:                      strings.TrimSpace(envOr("TELESRV_S3_REGION", "us-east-1")),
-		S3Bucket:                      strings.TrimSpace(envOr("TELESRV_S3_BUCKET", "")),
-		S3AccessKeyID:                 envOr("TELESRV_S3_ACCESS_KEY_ID", ""),
-		S3SecretAccessKey:             envOr("TELESRV_S3_SECRET_ACCESS_KEY", ""),
-		S3UseSSL:                      envBoolOr("TELESRV_S3_USE_SSL", true),
-		S3PathStyle:                   envBoolOr("TELESRV_S3_PATH_STYLE", false),
-		S3CreateBucket:                envBoolOr("TELESRV_S3_CREATE_BUCKET", false),
-		StorageLowSpaceGuardEnable:    envBoolOr("TELESRV_STORAGE_LOW_SPACE_GUARD_ENABLE", true),
-		StorageMinFreeBytes:           envInt64Or("TELESRV_STORAGE_MIN_FREE_BYTES", 1<<30),
-		StorageMaxTotalBytes:          envInt64Or("TELESRV_STORAGE_MAX_TOTAL_BYTES", 0),
-		StorageUsageRefreshInterval:   envDurationOr("TELESRV_STORAGE_USAGE_REFRESH_INTERVAL", time.Minute),
-		StickerSeedDir:                envOr("TELESRV_STICKER_SEED_DIR", "data/sticker-seed"),
-		GifSeedDir:                    envOr("TELESRV_GIF_SEED_DIR", "data/gifs"),
-		StickerSeedMaxSets:            envIntOr("TELESRV_STICKER_SEED_MAX_SETS", 300),
-		PremiumPromoSeedDir:           envOr("TELESRV_PREMIUM_PROMO_SEED_DIR", "data/premium-promo"),
-		MapboxToken:                   envOr("TELESRV_MAPBOX_TOKEN", ""),
-		MapTileCacheDir:               envOr("TELESRV_MAPTILE_CACHE_DIR", "data/maptiles"),
-		ExternalMediaEnable:           envBoolOr("TELESRV_EXTERNAL_MEDIA_ENABLE", true),
-		ExternalMediaMaxBytes:         int64(envIntOr("TELESRV_EXTERNAL_MEDIA_MAX_BYTES", 10<<20)),
-		ExternalMediaRatePerMin:       envIntOr("TELESRV_EXTERNAL_MEDIA_RATE_PER_MIN", 60),
-		WebPagePreviewEnable:          envBoolOr("TELESRV_WEBPAGE_PREVIEW_ENABLE", true),
-		WebPagePreviewMaxBytes:        int64(envIntOr("TELESRV_WEBPAGE_PREVIEW_MAX_BYTES", 5<<20)),
-		WebPagePreviewRatePerMin:      envIntOr("TELESRV_WEBPAGE_PREVIEW_RATE_PER_MIN", 300),
-		BusinessAIProvider:            envOr("TELESRV_BUSINESS_AI_PROVIDER", "echo"),
-		AIEnabled:                     envBoolOr("TELESRV_AI_ENABLED", true),
-		AIProviders:                   loadAIProviders(fileEnv),
-		AITimeout:                     envDurationOr("TELESRV_AI_TIMEOUT", 15*time.Second),
-		AIRateLimit:                   envIntOr("TELESRV_AI_RATE_LIMIT", 20),
-		AIRateWindow:                  envDurationOr("TELESRV_AI_RATE_WINDOW", time.Minute),
-		AIPrivacyLogContent:           envBoolOr("TELESRV_AI_LOG_CONTENT", false),
-		TranslationEnabled:            envBoolOr("TELESRV_TRANSLATION_ENABLED", true),
-		TranslationProviders:          envListOr("TELESRV_TRANSLATION_PROVIDERS", []string{}),
-		TranslationTimeout:            envDurationOr("TELESRV_TRANSLATION_TIMEOUT", 15*time.Second),
-		TranslationRateLimit:          envIntOr("TELESRV_TRANSLATION_RATE_LIMIT", 60),
-		TranslationRateWindow:         envDurationOr("TELESRV_TRANSLATION_RATE_WINDOW", time.Minute),
-		TempKeyResolveCacheMaxEntries: envIntOr("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", 262144),
-		TempKeyResolveCacheTTL:        envDurationOr("TELESRV_TEMP_KEY_CACHE_TTL", 30*time.Minute),
-		AuthUserCacheTTL:              envDurationOr("TELESRV_AUTH_USER_CACHE_TTL", time.Minute),
-		AuthKeyCacheMaxEntries:        envIntOr("TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES", 262144),
-		AuthKeyCacheTTL:               envDurationOr("TELESRV_AUTH_KEY_CACHE_TTL", 30*time.Minute),
-		ChannelRowCacheMaxEntries:     envIntOr("TELESRV_CHANNEL_ROW_CACHE_MAX", 50000),
-		ChannelMemberCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_MEMBER_CACHE_MAX", 100000),
-		ChannelDialogCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_DIALOG_CACHE_MAX", 100000),
-		ChannelBoostCacheMaxEntries:   envIntOr("TELESRV_CHANNEL_BOOST_CACHE_MAX", 100000),
-		ChannelBoostCacheTTL:          envDurationOr("TELESRV_CHANNEL_BOOST_CACHE_TTL", 10*time.Second),
+		DevAuthCode:                       envOr("TELESRV_DEV_AUTH_CODE", "12345"),
+		AuthCodeTTL:                       envDurationOr("TELESRV_AUTH_CODE_TTL", 5*time.Minute),
+		PhoneCodeLength:                   envIntOr("TELESRV_PHONE_CODE_LENGTH", 5),
+		AuthCodeMaxAttempts:               envIntOr("TELESRV_AUTH_CODE_MAX_ATTEMPTS", 5),
+		AuthCodePhoneRateLimit:            envIntOr("TELESRV_AUTH_CODE_PHONE_RATE_LIMIT", 5),
+		AuthCodeAuthKeyRateLimit:          envIntOr("TELESRV_AUTH_CODE_AUTH_KEY_RATE_LIMIT", 20),
+		AuthCodeRateWindow:                envDurationOr("TELESRV_AUTH_CODE_RATE_WINDOW", 10*time.Minute),
+		LoginEmailEnable:                  envBoolOr("TELESRV_LOGIN_EMAIL_ENABLE", false),
+		LoginEmailRequireSetup:            envBoolOr("TELESRV_LOGIN_EMAIL_REQUIRE_SETUP", false),
+		LoginEmailCodeLength:              envIntOr("TELESRV_LOGIN_EMAIL_CODE_LENGTH", 6),
+		PhoneCodeDeliveryProvider:         strings.ToLower(strings.TrimSpace(envOr("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "development"))),
+		EmailCodeDeliveryProvider:         strings.ToLower(strings.TrimSpace(envOr("TELESRV_EMAIL_CODE_DELIVERY_PROVIDER", "smtp"))),
+		OTPWebhookURL:                     envOr("TELESRV_OTP_WEBHOOK_URL", ""),
+		OTPWebhookSecret:                  envOr("TELESRV_OTP_WEBHOOK_SECRET", ""),
+		OTPWebhookTimeout:                 envDurationOr("TELESRV_OTP_WEBHOOK_TIMEOUT", 5*time.Second),
+		SMTPHost:                          envOr("TELESRV_SMTP_HOST", ""),
+		SMTPPort:                          envIntOr("TELESRV_SMTP_PORT", 587),
+		SMTPUsername:                      envOr("TELESRV_SMTP_USERNAME", ""),
+		SMTPPassword:                      envOr("TELESRV_SMTP_PASSWORD", ""),
+		SMTPFrom:                          envOr("TELESRV_SMTP_FROM", ""),
+		SMTPFromName:                      envOr("TELESRV_SMTP_FROM_NAME", brandConfig.ProductName),
+		SMTPTLSMode:                       strings.ToLower(strings.TrimSpace(envOr("TELESRV_SMTP_TLS", "starttls"))),
+		SMTPTimeout:                       envDurationOr("TELESRV_SMTP_TIMEOUT", 10*time.Second),
+		LangPackSeedDir:                   envOr("TELESRV_LANGPACK_SEED_DIR", "data/langpack"),
+		OfficialGiftsDir:                  envOr("TELESRV_OFFICIAL_GIFTS_DIR", "data/official-gifts"),
+		StarGiftTONStartingGrant:          envInt64Or("TELESRV_STARGIFT_TON_STARTING_GRANT", 10_000_000_000),
+		BlobBackendKind:                   strings.ToLower(strings.TrimSpace(envOr("TELESRV_BLOB_BACKEND", "localfs"))),
+		BlobDir:                           envOr("TELESRV_BLOB_DIR", "data/blobs"),
+		BlobStagingDir:                    envOr("TELESRV_BLOB_STAGING_DIR", "data/blob-staging"),
+		S3Endpoint:                        strings.TrimSpace(envOr("TELESRV_S3_ENDPOINT", "")),
+		S3Region:                          strings.TrimSpace(envOr("TELESRV_S3_REGION", "us-east-1")),
+		S3Bucket:                          strings.TrimSpace(envOr("TELESRV_S3_BUCKET", "")),
+		S3AccessKeyID:                     envOr("TELESRV_S3_ACCESS_KEY_ID", ""),
+		S3SecretAccessKey:                 envOr("TELESRV_S3_SECRET_ACCESS_KEY", ""),
+		S3UseSSL:                          envBoolOr("TELESRV_S3_USE_SSL", true),
+		S3PathStyle:                       envBoolOr("TELESRV_S3_PATH_STYLE", false),
+		S3CreateBucket:                    envBoolOr("TELESRV_S3_CREATE_BUCKET", false),
+		StorageLowSpaceGuardEnable:        envBoolOr("TELESRV_STORAGE_LOW_SPACE_GUARD_ENABLE", true),
+		StorageMinFreeBytes:               envInt64Or("TELESRV_STORAGE_MIN_FREE_BYTES", 1<<30),
+		StorageMaxTotalBytes:              envInt64Or("TELESRV_STORAGE_MAX_TOTAL_BYTES", 0),
+		StorageUsageRefreshInterval:       envDurationOr("TELESRV_STORAGE_USAGE_REFRESH_INTERVAL", time.Minute),
+		StickerSeedDir:                    envOr("TELESRV_STICKER_SEED_DIR", "data/sticker-seed"),
+		GifSeedDir:                        envOr("TELESRV_GIF_SEED_DIR", "data/gifs"),
+		StickerSeedMaxSets:                envIntOr("TELESRV_STICKER_SEED_MAX_SETS", 300),
+		PremiumPromoSeedDir:               envOr("TELESRV_PREMIUM_PROMO_SEED_DIR", "data/premium-promo"),
+		MapboxToken:                       envOr("TELESRV_MAPBOX_TOKEN", ""),
+		MapTileCacheDir:                   envOr("TELESRV_MAPTILE_CACHE_DIR", "data/maptiles"),
+		ExternalMediaEnable:               envBoolOr("TELESRV_EXTERNAL_MEDIA_ENABLE", true),
+		ExternalMediaMaxBytes:             int64(envIntOr("TELESRV_EXTERNAL_MEDIA_MAX_BYTES", 10<<20)),
+		ExternalMediaRatePerMin:           envIntOr("TELESRV_EXTERNAL_MEDIA_RATE_PER_MIN", 60),
+		WebPagePreviewEnable:              envBoolOr("TELESRV_WEBPAGE_PREVIEW_ENABLE", true),
+		WebPagePreviewMaxBytes:            int64(envIntOr("TELESRV_WEBPAGE_PREVIEW_MAX_BYTES", 5<<20)),
+		WebPagePreviewRatePerMin:          envIntOr("TELESRV_WEBPAGE_PREVIEW_RATE_PER_MIN", 300),
+		BusinessAIProvider:                envOr("TELESRV_BUSINESS_AI_PROVIDER", "echo"),
+		AIEnabled:                         envBoolOr("TELESRV_AI_ENABLED", true),
+		AIProviders:                       loadAIProviders(fileEnv),
+		AITimeout:                         envDurationOr("TELESRV_AI_TIMEOUT", 15*time.Second),
+		AIRateLimit:                       envIntOr("TELESRV_AI_RATE_LIMIT", 20),
+		AIRateWindow:                      envDurationOr("TELESRV_AI_RATE_WINDOW", time.Minute),
+		AIPrivacyLogContent:               envBoolOr("TELESRV_AI_LOG_CONTENT", false),
+		TranslationEnabled:                envBoolOr("TELESRV_TRANSLATION_ENABLED", true),
+		TranslationProviders:              envListOr("TELESRV_TRANSLATION_PROVIDERS", []string{}),
+		TranslationTimeout:                envDurationOr("TELESRV_TRANSLATION_TIMEOUT", 15*time.Second),
+		TranslationRateLimit:              envIntOr("TELESRV_TRANSLATION_RATE_LIMIT", 60),
+		TranslationRateWindow:             envDurationOr("TELESRV_TRANSLATION_RATE_WINDOW", time.Minute),
+		TempKeyResolveCacheMaxEntries:     envIntOr("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", 262144),
+		TempKeyResolveCacheTTL:            envDurationOr("TELESRV_TEMP_KEY_CACHE_TTL", 30*time.Minute),
+		ReadModelVersionCacheMaxEntries:   envIntOr("TELESRV_READ_MODEL_VERSION_CACHE_MAX", 1_000_000),
+		ReadModelVersionBatchMaxKeys:      envIntOr("TELESRV_READ_MODEL_VERSION_BATCH_MAX_KEYS", 4096),
+		ReadModelVersionBatchWait:         envDurationOr("TELESRV_READ_MODEL_VERSION_BATCH_WAIT", 250*time.Microsecond),
+		ReadModelVersionBatchQueue:        envIntOr("TELESRV_READ_MODEL_VERSION_BATCH_QUEUE", 16_384),
+		ReadModelVersionBatchTimeout:      envDurationOr("TELESRV_READ_MODEL_VERSION_BATCH_TIMEOUT", 5*time.Second),
+		AuthKeyGetBatchMax:                envIntOr("TELESRV_AUTH_KEY_GET_BATCH_MAX", 256),
+		AuthKeyGetBatchWait:               envDurationOr("TELESRV_AUTH_KEY_GET_BATCH_WAIT", 250*time.Microsecond),
+		AuthKeyGetBatchQueue:              envIntOr("TELESRV_AUTH_KEY_GET_BATCH_QUEUE", 16_384),
+		AuthKeyGetBatchTimeout:            envDurationOr("TELESRV_AUTH_KEY_GET_BATCH_TIMEOUT", 5*time.Second),
+		ContactReverseBatchMaxPairs:       envIntOr("TELESRV_CONTACT_REVERSE_BATCH_MAX_PAIRS", 4096),
+		ContactReverseBatchWait:           envDurationOr("TELESRV_CONTACT_REVERSE_BATCH_WAIT", 2*time.Millisecond),
+		ContactReverseBatchQueue:          envIntOr("TELESRV_CONTACT_REVERSE_BATCH_QUEUE", 16_384),
+		ContactReverseBatchTimeout:        envDurationOr("TELESRV_CONTACT_REVERSE_BATCH_TIMEOUT", 5*time.Second),
+		ContactSnapshotCacheMaxViewers:    envIntOr("TELESRV_CONTACT_SNAPSHOT_CACHE_MAX_VIEWERS", 16_384),
+		ProfilePhotoCacheMaxEntries:       envIntOr("TELESRV_PROFILE_PHOTO_CACHE_MAX", 200_000),
+		ProfilePhotoCacheTTL:              envDurationOr("TELESRV_PROFILE_PHOTO_CACHE_TTL", 24*time.Hour),
+		PeerIdentityCacheMaxEntries:       envIntOr("TELESRV_PEER_IDENTITY_CACHE_MAX", 1_000_000),
+		DialogPrivatePeerCacheMaxEntries:  envIntOr("TELESRV_DIALOG_PRIVATE_PEER_CACHE_MAX", 500_000),
+		DialogPrivatePeerCacheMaxBytes:    envInt64Or("TELESRV_DIALOG_PRIVATE_PEER_CACHE_BYTES_MAX", 256<<20),
+		DialogDraftCacheMaxEntries:        envIntOr("TELESRV_DIALOG_DRAFT_CACHE_MAX", 1_000_000),
+		DialogDraftCacheMaxBytes:          envInt64Or("TELESRV_DIALOG_DRAFT_CACHE_BYTES_MAX", 256<<20),
+		UserProjectionFactCacheMaxEntries: envIntOr("TELESRV_USER_PROJECTION_FACT_CACHE_MAX", 1_000_000),
+		StoryActivePeerCacheMaxEntries:    envIntOr("TELESRV_STORY_ACTIVE_PEER_CACHE_MAX", 1_000_000),
+		StoryHiddenListCacheMaxEntries:    envIntOr("TELESRV_STORY_HIDDEN_LIST_CACHE_MAX", 100_000),
+		StoryHiddenListCacheMaxBytes:      envInt64Or("TELESRV_STORY_HIDDEN_LIST_CACHE_BYTES_MAX", 64<<20),
+		DialogListSnapshotCacheMaxEntries: envIntOr("TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_MAX", 10_000),
+		DialogListSnapshotCacheMaxHeaders: envInt64Or("TELESRV_DIALOG_LIST_SNAPSHOT_HEADERS_MAX", 1_000_000),
+		DialogListSnapshotCacheTTL:        envDurationOr("TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_TTL", 5*time.Minute),
+		DialogListSnapshotRedisTTL:        envDurationOr("TELESRV_DIALOG_LIST_SNAPSHOT_REDIS_TTL", time.Hour),
+		ActiveChannelIDsCacheMaxEntries:   envIntOr("TELESRV_ACTIVE_CHANNEL_IDS_CACHE_MAX", 32_768),
+		ActiveChannelIDsCacheTTL:          envDurationOr("TELESRV_ACTIVE_CHANNEL_IDS_CACHE_TTL", 24*time.Hour),
+		ActiveChannelIDsRedisTTL:          envDurationOr("TELESRV_ACTIVE_CHANNEL_IDS_REDIS_TTL", 24*time.Hour),
+		ActiveChannelIDsBatchMax:          envIntOr("TELESRV_ACTIVE_CHANNEL_IDS_BATCH_MAX", 128),
+		ActiveChannelIDsBatchWait:         envDurationOr("TELESRV_ACTIVE_CHANNEL_IDS_BATCH_WAIT", 100*time.Millisecond),
+		ActiveChannelIDsBatchQueue:        envIntOr("TELESRV_ACTIVE_CHANNEL_IDS_BATCH_QUEUE", 16_384),
+		ActiveChannelIDsBatchTimeout:      envDurationOr("TELESRV_ACTIVE_CHANNEL_IDS_BATCH_TIMEOUT", 5*time.Second),
+		BootstrapReadyBatchMax:            envIntOr("TELESRV_BOOTSTRAP_READY_BATCH_MAX", 32),
+		BootstrapReadyBatchWait:           envDurationOr("TELESRV_BOOTSTRAP_READY_BATCH_WAIT", 100*time.Millisecond),
+		BootstrapReadyBatchQueue:          envIntOr("TELESRV_BOOTSTRAP_READY_BATCH_QUEUE", 16_384),
+		BootstrapReadyBatchTimeout:        envDurationOr("TELESRV_BOOTSTRAP_READY_BATCH_TIMEOUT", 5*time.Second),
+		PresenceLastSeenBatchMax:          envIntOr("TELESRV_PRESENCE_LAST_SEEN_BATCH_MAX", 512),
+		PresenceLastSeenBatchWait:         envDurationOr("TELESRV_PRESENCE_LAST_SEEN_BATCH_WAIT", time.Second),
+		PresenceLastSeenBatchQueue:        envIntOr("TELESRV_PRESENCE_LAST_SEEN_BATCH_QUEUE", 65_536),
+		PresenceLastSeenBatchTimeout:      envDurationOr("TELESRV_PRESENCE_LAST_SEEN_BATCH_TIMEOUT", 5*time.Second),
+		PresenceLastSeenDrainTimeout:      envDurationOr("TELESRV_PRESENCE_LAST_SEEN_DRAIN_TIMEOUT", 10*time.Second),
+		AuthUserCacheTTL:                  envDurationOr("TELESRV_AUTH_USER_CACHE_TTL", time.Minute),
+		AuthKeyCacheMaxEntries:            envIntOr("TELESRV_AUTH_KEY_CACHE_MAX_ENTRIES", 262144),
+		AuthKeyCacheTTL:                   envDurationOr("TELESRV_AUTH_KEY_CACHE_TTL", 30*time.Minute),
+		ChannelRowCacheMaxEntries:         envIntOr("TELESRV_CHANNEL_ROW_CACHE_MAX", 50000),
+		ChannelTopMessageCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_TOP_MESSAGE_CACHE_MAX", 100_000),
+		ChannelMemberCacheMaxEntries:      envIntOr("TELESRV_CHANNEL_MEMBER_CACHE_MAX", 1_000_000),
+		ChannelDialogCacheMaxEntries:      envIntOr("TELESRV_CHANNEL_DIALOG_CACHE_MAX", 1_000_000),
+		ChannelDifferenceCacheMaxEntries:  envIntOr("TELESRV_CHANNEL_DIFFERENCE_CACHE_MAX", 8192),
+		ChannelDifferenceCacheMaxBytes:    envInt64Or("TELESRV_CHANNEL_DIFFERENCE_CACHE_BYTES_MAX", 256<<20),
+		ChannelDifferenceCacheTTL:         envDurationOr("TELESRV_CHANNEL_DIFFERENCE_CACHE_TTL", 5*time.Minute),
+		ChannelBoostCacheMaxEntries:       envIntOr("TELESRV_CHANNEL_BOOST_CACHE_MAX", 100000),
+		ChannelBoostCacheTTL:              envDurationOr("TELESRV_CHANNEL_BOOST_CACHE_TTL", 10*time.Second),
 
 		OutboxWorkers:              envIntOr("TELESRV_OUTBOX_WORKERS", 4),
 		OutboxBatch:                envIntOr("TELESRV_OUTBOX_BATCH", 100),
@@ -1209,6 +1311,9 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateRPCExecutionConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validatePerformanceConfig(cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateStarGiftConfig(cfg); err != nil {
@@ -1913,6 +2018,9 @@ func validateCollectibleUsernameConfig(cfg Config) error {
 }
 
 func validateRPCExecutionConfig(cfg Config) error {
+	if cfg.MTProtoRPCDeliveryHookWorkers <= 0 || cfg.MTProtoRPCDeliveryHookMaxPending < cfg.MTProtoRPCDeliveryHookWorkers {
+		return fmt.Errorf("MTProto rpc delivery hook capacity must satisfy pending >= workers > 0: %d/%d", cfg.MTProtoRPCDeliveryHookMaxPending, cfg.MTProtoRPCDeliveryHookWorkers)
+	}
 	if cfg.MTProtoRPCExecutionMaxEntries <= 0 || cfg.MTProtoRPCExecutionAuthMaxEntries <= 0 ||
 		cfg.MTProtoRPCExecutionSessionMaxEntries <= 0 {
 		return fmt.Errorf("MTProto rpc execution entry limits must be positive")
@@ -1927,6 +2035,69 @@ func validateRPCExecutionConfig(cfg Config) error {
 		cfg.MTProtoRPCExecutionPendingPerAuth > cfg.MTProtoRPCExecutionAuthMaxEntries {
 		return fmt.Errorf("MTProto rpc execution pending-per-auth %d must be positive and <= global pending %d and auth entries %d",
 			cfg.MTProtoRPCExecutionPendingPerAuth, cfg.MTProtoRPCGlobalMaxTasks, cfg.MTProtoRPCExecutionAuthMaxEntries)
+	}
+	return nil
+}
+
+func validatePerformanceConfig(cfg Config) error {
+	positive := []struct {
+		name  string
+		value int
+	}{
+		{"TELESRV_READ_MODEL_VERSION_CACHE_MAX", cfg.ReadModelVersionCacheMaxEntries},
+		{"TELESRV_READ_MODEL_VERSION_BATCH_MAX_KEYS", cfg.ReadModelVersionBatchMaxKeys},
+		{"TELESRV_READ_MODEL_VERSION_BATCH_QUEUE", cfg.ReadModelVersionBatchQueue},
+		{"TELESRV_AUTH_KEY_GET_BATCH_MAX", cfg.AuthKeyGetBatchMax},
+		{"TELESRV_AUTH_KEY_GET_BATCH_QUEUE", cfg.AuthKeyGetBatchQueue},
+		{"TELESRV_CONTACT_REVERSE_BATCH_MAX_PAIRS", cfg.ContactReverseBatchMaxPairs},
+		{"TELESRV_CONTACT_REVERSE_BATCH_QUEUE", cfg.ContactReverseBatchQueue},
+		{"TELESRV_CONTACT_SNAPSHOT_CACHE_MAX_VIEWERS", cfg.ContactSnapshotCacheMaxViewers},
+		{"TELESRV_PROFILE_PHOTO_CACHE_MAX", cfg.ProfilePhotoCacheMaxEntries},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_CACHE_MAX", cfg.ActiveChannelIDsCacheMaxEntries},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_BATCH_MAX", cfg.ActiveChannelIDsBatchMax},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_BATCH_QUEUE", cfg.ActiveChannelIDsBatchQueue},
+		{"TELESRV_BOOTSTRAP_READY_BATCH_MAX", cfg.BootstrapReadyBatchMax},
+		{"TELESRV_BOOTSTRAP_READY_BATCH_QUEUE", cfg.BootstrapReadyBatchQueue},
+		{"TELESRV_PRESENCE_LAST_SEEN_BATCH_MAX", cfg.PresenceLastSeenBatchMax},
+		{"TELESRV_PRESENCE_LAST_SEEN_BATCH_QUEUE", cfg.PresenceLastSeenBatchQueue},
+	}
+	for _, item := range positive {
+		if item.value <= 0 {
+			return fmt.Errorf("%s must be positive", item.name)
+		}
+	}
+	durations := []struct {
+		name  string
+		value time.Duration
+	}{
+		{"TELESRV_READ_MODEL_VERSION_BATCH_WAIT", cfg.ReadModelVersionBatchWait},
+		{"TELESRV_READ_MODEL_VERSION_BATCH_TIMEOUT", cfg.ReadModelVersionBatchTimeout},
+		{"TELESRV_AUTH_KEY_GET_BATCH_WAIT", cfg.AuthKeyGetBatchWait},
+		{"TELESRV_AUTH_KEY_GET_BATCH_TIMEOUT", cfg.AuthKeyGetBatchTimeout},
+		{"TELESRV_CONTACT_REVERSE_BATCH_WAIT", cfg.ContactReverseBatchWait},
+		{"TELESRV_CONTACT_REVERSE_BATCH_TIMEOUT", cfg.ContactReverseBatchTimeout},
+		{"TELESRV_PROFILE_PHOTO_CACHE_TTL", cfg.ProfilePhotoCacheTTL},
+		{"TELESRV_DIALOG_LIST_SNAPSHOT_REDIS_TTL", cfg.DialogListSnapshotRedisTTL},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_CACHE_TTL", cfg.ActiveChannelIDsCacheTTL},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_REDIS_TTL", cfg.ActiveChannelIDsRedisTTL},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_BATCH_WAIT", cfg.ActiveChannelIDsBatchWait},
+		{"TELESRV_ACTIVE_CHANNEL_IDS_BATCH_TIMEOUT", cfg.ActiveChannelIDsBatchTimeout},
+		{"TELESRV_BOOTSTRAP_READY_BATCH_WAIT", cfg.BootstrapReadyBatchWait},
+		{"TELESRV_BOOTSTRAP_READY_BATCH_TIMEOUT", cfg.BootstrapReadyBatchTimeout},
+		{"TELESRV_PRESENCE_LAST_SEEN_BATCH_WAIT", cfg.PresenceLastSeenBatchWait},
+		{"TELESRV_PRESENCE_LAST_SEEN_BATCH_TIMEOUT", cfg.PresenceLastSeenBatchTimeout},
+		{"TELESRV_PRESENCE_LAST_SEEN_DRAIN_TIMEOUT", cfg.PresenceLastSeenDrainTimeout},
+	}
+	for _, item := range durations {
+		if item.value <= 0 {
+			return fmt.Errorf("%s must be positive", item.name)
+		}
+	}
+	if cfg.AuthKeyGetBatchQueue < cfg.AuthKeyGetBatchMax || cfg.ActiveChannelIDsBatchQueue < cfg.ActiveChannelIDsBatchMax || cfg.BootstrapReadyBatchQueue < cfg.BootstrapReadyBatchMax || cfg.PresenceLastSeenBatchQueue < cfg.PresenceLastSeenBatchMax {
+		return fmt.Errorf("performance batch queues must be at least their batch size")
+	}
+	if cfg.ChannelDifferenceCacheMaxEntries > 0 && (cfg.ChannelDifferenceCacheMaxBytes <= 0 || cfg.ChannelDifferenceCacheTTL <= 0) {
+		return fmt.Errorf("channel difference cache bytes and ttl must be positive when enabled")
 	}
 	return nil
 }
@@ -2146,12 +2317,18 @@ func validateStrictMTProtoCapacityEnv(e envSource) error {
 		"TELESRV_MTPROTO_RPC_QUEUE_SIZE",
 		"TELESRV_MTPROTO_RPC_GLOBAL_WORKERS",
 		"TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS",
+		"TELESRV_MTPROTO_RPC_DELIVERY_HOOK_WORKERS",
+		"TELESRV_MTPROTO_RPC_DELIVERY_HOOK_MAX_PENDING",
 		"TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES",
 		"TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES",
 		"TELESRV_MTPROTO_RPC_EXECUTION_SESSION_MAX_ENTRIES",
 		"TELESRV_MTPROTO_RPC_EXECUTION_PENDING_PER_AUTH",
 		"TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE",
 		"TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE",
+		"TELESRV_CONTACT_REVERSE_BATCH_MAX_PAIRS",
+		"TELESRV_CONTACT_REVERSE_BATCH_QUEUE",
+		"TELESRV_CONTACT_SNAPSHOT_CACHE_MAX_VIEWERS",
+		"TELESRV_PROFILE_PHOTO_CACHE_MAX",
 	} {
 		if raw := e.envOr(key, ""); raw != "" {
 			if _, err := strconv.Atoi(raw); err != nil {

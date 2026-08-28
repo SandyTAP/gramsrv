@@ -922,7 +922,7 @@ func TestLoadRejectsInvalidRPCExecutionFairBudgets(t *testing.T) {
 		value string
 	}{
 		{name: "entry hierarchy", key: "TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES", value: "1024"},
-		{name: "pending hierarchy", key: "TELESRV_MTPROTO_RPC_EXECUTION_PENDING_PER_AUTH", value: "9000"},
+		{name: "pending hierarchy", key: "TELESRV_MTPROTO_RPC_EXECUTION_PENDING_PER_AUTH", value: "33000"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

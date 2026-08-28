@@ -50,6 +50,9 @@ func (r *Router) sweepExpiredPremium(ctx context.Context, batch int) {
 			return
 		}
 		for _, u := range users {
+			if r.deps.UserProjectionFacts != nil {
+				r.deps.UserProjectionFacts.InvalidateCollectiblePhoneFact(u.ID)
+			}
 			r.invalidatePremiumUserCaches(ctx, u.ID)
 			r.invalidateRPCProjectionForUser(u.ID)
 		}
