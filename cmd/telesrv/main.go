@@ -756,16 +756,15 @@ func run(logger *zap.Logger) error {
 	}
 	defer authKeySessionLayerStore.Close()
 	userStore := postgres.NewUserStore(pool)
-	// The official system account (777000) is seeded with the default product
-	// username; align it with the active branding so it resolves in search and
-	// cannot be hijacked. UpdateUsername writes both users.username and the
-	// peer_usernames registry, so the change is idempotent against the DB row.
-	if cur, _, err := userStore.ByID(ctx, domain.OfficialSystemUserID); err == nil {
-		if want := branding.ProductUsername(); cur.Username != want {
-			if _, err := userStore.UpdateUsername(ctx, domain.OfficialSystemUserID, want); err != nil {
-				logger.Warn("sync system account username", zap.Error(err))
-			}
-		}
+	// The configured product username belongs to the official 777000 identity.
+	// Claiming it is atomic with clearing an ordinary account that occupied the
+	// editable slot; protected identities and collectible names are not seized.
+	if claim, err := userStore.ClaimOfficialUsername(ctx, branding.ProductUsername()); err != nil {
+		logger.Warn("sync system account username", zap.Error(err))
+	} else if claim.DisplacedUserID != 0 {
+		logger.Warn("reclaimed system account username from ordinary user",
+			zap.String("username", claim.Official.Username),
+			zap.Int64("displaced_user_id", claim.DisplacedUserID))
 	}
 	authzStore := postgres.NewAuthorizationStore(pool)
 	adminStore := postgres.NewAdminStore(pool)
@@ -1150,15 +1149,14 @@ func run(logger *zap.Logger) error {
 	// them with the active branding on startup so the seeded "telesrv" text is
 	// replaced. SetBotInfo writes both fields; the sync is a no-op when the text
 	// already matches.
-	productName := branding.ProductName()
 	for _, botID := range []int64{domain.ChatBotUserID, domain.StickersBotUserID} {
 		var wantAbout, wantDesc string
 		switch botID {
 		case domain.ChatBotUserID:
-			wantAbout = "Chat with the configured " + productName + " AI provider."
+			wantAbout = domain.ChatBotDescription()
 			wantDesc = wantAbout
 		case domain.StickersBotUserID:
-			wantAbout = "Create custom sticker and emoji packs for " + productName + "."
+			wantAbout = domain.StickersBotDescription()
 			wantDesc = wantAbout
 		}
 		if _, curAbout, curDesc, err := botsService.GetBotInfo(ctx, botID); err == nil && curAbout == wantAbout && curDesc == wantDesc {

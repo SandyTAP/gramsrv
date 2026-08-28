@@ -19,10 +19,12 @@ const (
 	chatBotStreamMaxDrafts       = 24
 	chatBotHistoryLimit          = 12
 	chatBotTranscriptLineLimit   = 800
+	chatBotHelpPrefix            = "Send me a message and I will answer with the configured "
+	chatBotHelpSuffix            = " AI provider.\n\n/help - show this message\n/reset - clear the local AI context"
 )
 
 func chatBotHelpText() string {
-	return "Send me a message and I will answer with the configured " + branding.ProductName() + " AI provider.\n\n/help - show this message\n/reset - clear the local AI context"
+	return chatBotHelpPrefix + branding.ProductName() + chatBotHelpSuffix
 }
 
 func chatBotInstruction() string {
@@ -167,7 +169,15 @@ func chatBotTranscriptLine(speaker, text string) string {
 
 func chatBotCommandReply(text string) bool {
 	text = strings.TrimSpace(text)
-	return text == chatBotHelpText() || text == chatBotResetText || text == chatBotUnknownCommand || text == chatBotTextOnlyText
+	return chatBotHelpReply(text) || text == chatBotResetText || text == chatBotUnknownCommand || text == chatBotTextOnlyText
+}
+
+func chatBotHelpReply(text string) bool {
+	if !strings.HasPrefix(text, chatBotHelpPrefix) || !strings.HasSuffix(text, chatBotHelpSuffix) {
+		return false
+	}
+	brand := strings.TrimSuffix(strings.TrimPrefix(text, chatBotHelpPrefix), chatBotHelpSuffix)
+	return strings.TrimSpace(brand) != ""
 }
 
 func chatBotLooksLikePromptEcho(text, prompt string) bool {

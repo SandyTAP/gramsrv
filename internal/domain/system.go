@@ -124,6 +124,18 @@ func OfficialSystemUser() User {
 	}
 }
 
+// ChatBotDescription and StickersBotDescription are the shared branded seed
+// text for both user.about and bots.description. PostgreSQL migrations contain
+// only the default snapshot; startup reconciliation and the memory backend use
+// these helpers so custom deployments do not expose stale "telesrv" text.
+func ChatBotDescription() string {
+	return "Chat with the configured " + branding.ProductName() + " AI provider."
+}
+
+func StickersBotDescription() string {
+	return "Create custom sticker and emoji packs for " + branding.ProductName() + "."
+}
+
 // BotFatherUser 返回内置 BotFather 账号。username 不以 bot 结尾属种子例外（与官方一致）。
 func BotFatherUser() User {
 	return User{
@@ -144,6 +156,7 @@ func StickersBotUser() User {
 		AccessHash:     StickersBotAccessHash,
 		FirstName:      "Stickers",
 		Username:       "Stickers",
+		About:          StickersBotDescription(),
 		Verified:       true,
 		Bot:            true,
 		BotInfoVersion: 2,
@@ -157,6 +170,7 @@ func ChatBotUser() User {
 		AccessHash:     ChatBotAccessHash,
 		FirstName:      "ChatBot",
 		Username:       "ChatBot",
+		About:          ChatBotDescription(),
 		Verified:       true,
 		Bot:            true,
 		BotInfoVersion: 1,
