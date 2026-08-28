@@ -764,6 +764,8 @@ Third-party verification is the other badge (`botVerification`, projected onto `
 **verifier bot** marks peers with its own icon and description. The operator grants verifier status to a bot; the bot
 then applies its mark through `bots.setCustomVerification`, or through the application queue its own dialog drives. It is
 never a second route to the platform checkmark above, and the two mechanisms never read or write each other's state.
+The client-editable description limit is published as appConfig
+`bot_verification_description_length_limit=128`.
 
 The icon is a custom emoji **document id**, and clients resolve it through `messages.getCustomEmojiDocuments`. An id
 that names no fetchable custom emoji document therefore renders as *nothing at all*: the badge is invisible, the peer
