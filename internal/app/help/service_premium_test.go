@@ -79,7 +79,7 @@ func TestAppConfigPremiumKeys(t *testing.T) {
 		"gift_text_length_max":                      domain.MaxPremiumGiftMessageRunes,
 		"about_length_limit_default":                70,
 		"about_length_limit_premium":                140,
-		"bot_verification_description_length_limit": 70,
+		"bot_verification_description_length_limit": domain.MaxCustomVerificationDescriptionLength,
 		"dialogs_pinned_limit_default":              5,
 		"dialogs_pinned_limit_premium":              10,
 		"dialogs_folder_pinned_limit_default":       100,

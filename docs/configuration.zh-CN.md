@@ -743,7 +743,7 @@ Core 的 `star_gifts.export.ton` 仅在 `mode: ton` 时启用正式链路：
 
 ### 第三方 bot 认证
 
-第三方认证对应 `botVerification`，由管理员授权的 verifier bot 使用自己的 custom emoji document 与描述标记 user/channel，不会授予官方 checkmark。Icon 必须是客户端可通过 `messages.getCustomEmojiDocuments` 读取的真实 document。每个 peer 只保留一个 wire-visible mark；新的 verifier 替换旧 mark，禁止旧 badge 在撤销或 kill switch 后意外复活。客户端自定义描述上限通过 appConfig `bot_verification_description_length_limit=70` 发布。
+第三方认证对应 `botVerification`，由管理员授权的 verifier bot 使用自己的 custom emoji document 与描述标记 user/channel，不会授予官方 checkmark。Icon 必须是客户端可通过 `messages.getCustomEmojiDocuments` 读取的真实 document。每个 peer 只保留一个 wire-visible mark；新的 verifier 替换旧 mark，禁止旧 badge 在撤销或 kill switch 后意外复活。客户端自定义描述上限通过 appConfig `bot_verification_description_length_limit=128` 发布。
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
