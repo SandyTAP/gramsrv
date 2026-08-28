@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -276,6 +278,56 @@ func (s *UserStore) UpdateLastSeen(ctx context.Context, userID int64, lastSeenAt
 		LastSeenAt: int64(lastSeenAt),
 	}); err != nil {
 		return fmt.Errorf("update user last seen: %w", err)
+	}
+	return nil
+}
+
+// UpdateLastSeenBatch applies a set of monotonic presence watermarks with one
+// PostgreSQL round trip. Duplicate user IDs are collapsed to their maximum
+// timestamp before the query so UPDATE ... FROM never has an ambiguous source
+// row. Missing/deleted users are intentionally ignored, matching the ordinary
+// UpdateLastSeen WHERE boundary.
+func (s *UserStore) UpdateLastSeenBatch(ctx context.Context, updates []store.UserLastSeenUpdate) error {
+	latest := make(map[int64]int, len(updates))
+	for _, update := range updates {
+		if update.UserID == 0 || update.LastSeenAt <= 0 {
+			continue
+		}
+		if current := latest[update.UserID]; update.LastSeenAt > current {
+			latest[update.UserID] = update.LastSeenAt
+		}
+	}
+	if len(latest) == 0 {
+		return nil
+	}
+	userIDs := make([]int64, 0, len(latest))
+	for userID := range latest {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+	lastSeen := make([]int64, len(userIDs))
+	for index, userID := range userIDs {
+		lastSeen[index] = int64(latest[userID])
+	}
+	if _, err := s.db.Exec(ctx, `
+WITH incoming AS MATERIALIZED (
+  SELECT user_id, last_seen_at
+  FROM unnest($1::bigint[], $2::bigint[]) AS value(user_id, last_seen_at)
+), locked AS MATERIALIZED (
+  SELECT target.id, incoming.last_seen_at
+  FROM users AS target
+  JOIN incoming ON incoming.user_id = target.id
+  WHERE target.deleted_at IS NULL
+  ORDER BY target.id
+  FOR UPDATE OF target
+)
+UPDATE users AS target
+SET last_seen_at = GREATEST(target.last_seen_at, locked.last_seen_at),
+    updated_at = now()
+FROM locked
+WHERE target.id = locked.id
+`, userIDs, lastSeen); err != nil {
+		return fmt.Errorf("update user last seen batch: %w", err)
 	}
 	return nil
 }

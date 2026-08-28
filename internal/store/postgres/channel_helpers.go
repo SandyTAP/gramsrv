@@ -564,6 +564,27 @@ func listChannelsByIDs(ctx context.Context, db sqlcgen.DBTX, ids []int64) ([]dom
 	return out, nil
 }
 
+// channelsByIDs hydrates viewer-independent channel rows in one batch and
+// reuses them across owners. The per-viewer member/dialog state stays outside
+// this cache and is read by its own owner-scoped query.
+func (s *ChannelStore) channelsByIDs(ctx context.Context, db sqlcgen.DBTX, ids []int64) (map[int64]domain.Channel, error) {
+	load := func(ctx context.Context, missing []int64) (map[int64]domain.Channel, error) {
+		channels, err := listChannelsByIDs(ctx, db, missing)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[int64]domain.Channel, len(channels))
+		for _, channel := range channels {
+			out[channel.ID] = channel
+		}
+		return out, nil
+	}
+	if s.cacheActive(db) {
+		return s.rowCache.getOrLoadBatch(ctx, ids, load)
+	}
+	return load(ctx, ids)
+}
+
 func listChannelsByIDsInOrder(ctx context.Context, db sqlcgen.DBTX, ids []int64) ([]domain.Channel, error) {
 	channels, err := listChannelsByIDs(ctx, db, ids)
 	if err != nil {

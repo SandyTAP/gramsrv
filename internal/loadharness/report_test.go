@@ -5,12 +5,51 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/iamxvbaba/td/pool"
 	tdrpc "github.com/iamxvbaba/td/rpc"
 )
+
+func TestMarkClientReadyAvoidsDuplicateInitialCatchUp(t *testing.T) {
+	var everReady atomic.Bool
+	var firstClient atomic.Bool
+	if markClientReady(&everReady, &firstClient) {
+		t.Fatal("first Ready transition requested a catch-up")
+	}
+	if !markClientReady(&everReady, &firstClient) {
+		t.Fatal("transport reconnect did not request a catch-up")
+	}
+
+	var replacementClient atomic.Bool
+	if markClientReady(&everReady, &replacementClient) {
+		t.Fatal("replacement Client duplicated its callback-owned initial catch-up")
+	}
+	if !markClientReady(&everReady, &replacementClient) {
+		t.Fatal("replacement Client transport reconnect did not request a catch-up")
+	}
+}
+
+func TestEventWriterCapsConnectionDetailsWithoutDroppingSamples(t *testing.T) {
+	w, err := newEventWriter(filepath.Join(t.TempDir(), "events.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxConnectionDeadEventLines+1; i++ {
+		w.write(map[string]any{"type": "connection_dead", "class": "connection"})
+	}
+	w.write(map[string]any{"type": "sample", "ready": 0})
+	written, dropped := w.counts()
+	if written != maxConnectionDeadEventLines+1 || dropped != 1 {
+		t.Fatalf("event counts = %d/%d", written, dropped)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestOperationMetricsUsesBoundedHistogramAndFixedErrorClasses(t *testing.T) {
 	metrics := &operationMetrics{}
@@ -33,6 +72,7 @@ func TestClassifyErrorReasonUsesFiniteRedactedVocabulary(t *testing.T) {
 		{errors.New("dial tcp 10.0.0.1:2398: socket: too many open files"), "file_descriptor_limit"},
 		{errors.New("read: temporary auth key not found: pfs reconnect required"), "pfs_reconnect"},
 		{errors.New("read tcp: EOF auth_key_id=secret"), "eof"},
+		{errors.New("startup session ended before business readiness"), "business_readiness_incomplete"},
 	}
 	for _, test := range tests {
 		if got := classifyErrorReason(test.err); got != test.want {
@@ -61,6 +101,20 @@ func TestOperationMetricsSeparatesHarnessCancellation(t *testing.T) {
 	report := metrics.report()
 	if report.Count != 1 || report.Canceled != 1 || report.Errors != 0 {
 		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestMetricSetFreezeExcludesCoordinatedTeardown(t *testing.T) {
+	metrics := newMetricSet("ping")
+	metrics.observe("ping", time.Now(), nil)
+	cut := metrics.freeze()
+	metrics.observe("ping", time.Now(), fmt.Errorf("engine forcibly closed: %w", context.Canceled))
+
+	if got := cut["ping"]; got.Count != 1 || got.Errors != 0 || got.Canceled != 0 {
+		t.Fatalf("workload cut = %#v", got)
+	}
+	if got := metrics.report()["ping"]; got != cut["ping"] {
+		t.Fatalf("post-freeze metrics changed: got %#v want %#v", got, cut["ping"])
 	}
 }
 
@@ -98,6 +152,24 @@ func TestEvaluateReportAllowsOnlyConnectionErrorsForExpectedRestart(t *testing.T
 	}
 }
 
+func TestEvaluateReportRejectsServerDeliveryAndDatabaseErrors(t *testing.T) {
+	report := &RunReport{
+		ExpectedSessions: 1, PeakReadySessions: 1,
+		SteadySamples: 1, SteadyReadyRatio: 1, MinSteadyReadySessions: 1,
+		Operations: map[string]OperationReport{},
+		RPCDeliveryOutcomes: map[string]map[string]uint64{
+			"updates.getState": {"ok": 1, "edge_overload": 2},
+		},
+		DatabaseWork: map[string]StartupDatabaseWork{
+			"messages.getDialogs": {Errors: 3},
+		},
+	}
+	evaluateReport(report, RunConfig{MinimumReadyRatio: 1})
+	if report.Pass || len(report.Failures) != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func TestEvaluateReportRequiresReclamationAndNoFloodWait(t *testing.T) {
 	report := &RunReport{
 		ExpectedSessions: 10, PeakReadySessions: 10, ServerMetricsScrapes: 1,
@@ -111,6 +183,7 @@ func TestEvaluateReportRequiresReclamationAndNoFloodWait(t *testing.T) {
 			"telesrv_mtproto_raw_connections":      2,
 			"telesrv_mtproto_logical_outbox_bytes": 4,
 		},
+		WorkloadEndServerMetrics: map[string]float64{},
 	}
 	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsURL: "http://metrics"})
 	if report.Pass || len(report.Failures) != 1 {
@@ -133,6 +206,7 @@ func TestEvaluateReportAcceptsReturnToNonZeroSharedServerBaseline(t *testing.T) 
 			"telesrv_mtproto_logical_sessions":     2,
 			"telesrv_mtproto_logical_outbox_bytes": 1024,
 		},
+		WorkloadEndServerMetrics: map[string]float64{},
 	}
 	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsURL: "http://metrics"})
 	if !report.Pass || len(report.Failures) != 0 {

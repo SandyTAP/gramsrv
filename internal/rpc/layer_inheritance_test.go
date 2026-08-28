@@ -104,6 +104,34 @@ func TestResolveInheritedAuthKeyLayerNormalizesBoundTempToPermanent(t *testing.T
 	}
 }
 
+func TestPositiveBindingResolutionIsSharedByLayerAndDispatchPaths(t *testing.T) {
+	rawAuthKeyID := [8]byte{0x31, 1}
+	permAuthKeyID := [8]byte{0x32, 1}
+	const sessionID = int64(311)
+	auth := &captureAuthService{
+		resolvedAuthKeyID: permAuthKeyID,
+		hasResolved:       true,
+		authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
+			permAuthKeyID: {Layer: 227},
+		},
+	}
+	sessions := &captureSessions{}
+	r := New(Config{DC: 2, TempKeyResolveCacheTTL: time.Minute}, Deps{
+		Auth: auth, Sessions: sessions,
+	}, zaptest.NewLogger(t), clock.System)
+
+	if layer, found, err := r.ResolveInheritedAuthKeyLayer(context.Background(), rawAuthKeyID); err != nil || !found || layer != 227 {
+		t.Fatalf("inherited layer = (%d,%v,%v), want (227,true,nil)", layer, found, err)
+	}
+	if got, err := r.effectiveAuthKeyID(context.Background(), rawAuthKeyID, sessionID); err != nil || got != permAuthKeyID {
+		t.Fatalf("effective auth key = (%x,%v), want (%x,nil)", got, err, permAuthKeyID)
+	}
+	freezeAndPublishLayer(t, r, rawAuthKeyID, sessionID, 10, 1, 227)
+	if auth.resolveCount != 1 {
+		t.Fatalf("ResolveAuthKey calls across inherited/dispatch/publication = %d, want 1", auth.resolveCount)
+	}
+}
+
 func TestResolveInheritedAuthKeyLayerMarksOnlyAvailabilityFailures(t *testing.T) {
 	boom := errors.New("postgres temporarily unavailable")
 	for _, tt := range []struct {
@@ -254,8 +282,8 @@ func TestBindTempAuthKeyLayerPrecedenceAndRawShadow(t *testing.T) {
 			auth := &captureAuthService{authKeyClientInfos: map[[8]byte]domain.AuthKeyClientInfo{
 				permAuthKeyID: {Layer: 225},
 			}}
-			// Model the store-owned bind transaction. The router must only reload
-			// this merged permanent primary; it must not derive or persist a winner
+			// Model the store-owned bind transaction. Bind returns the exact committed
+			// tuple; the router must not re-read a later permanent row or derive a winner
 			// from its process-local exact-session registry after Bind returns.
 			auth.bindTempHook = func(domain.TempAuthKeyBinding) error {
 				auth.authKeyClientInfos[rawAuthKeyID] = domain.AuthKeyClientInfo{Layer: tt.want, LayerObservationID: 42}
@@ -272,6 +300,10 @@ func TestBindTempAuthKeyLayerPrecedenceAndRawShadow(t *testing.T) {
 			ok, err := r.onAuthBindTempAuthKey(ctx, &tg.AuthBindTempAuthKeyRequest{PermAuthKeyID: businessAuthKeyInt64(permAuthKeyID)})
 			if err != nil || !ok {
 				t.Fatalf("bind = (%v,%v), want (true,nil)", ok, err)
+			}
+			if auth.authKeyInfoLookups != 0 || auth.authorizationLookups != 0 {
+				t.Fatalf("bind re-read durable Layer state: key=%d authorization=%d",
+					auth.authKeyInfoLookups, auth.authorizationLookups)
 			}
 			if got := auth.authKeyClientInfos[rawAuthKeyID].Layer; got != tt.want {
 				t.Fatalf("raw shadow = %d, want %d", got, tt.want)

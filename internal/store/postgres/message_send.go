@@ -281,6 +281,9 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	if err := lockUsersForUpdate(ctx, tx, req.SenderUserID, req.RecipientUserID); err != nil {
 		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send users: %w", err)
 	}
+	if err := lockDispatchOutboxAppendFences(ctx, tx, []int64{req.SenderUserID, req.RecipientUserID}); err != nil {
+		return domain.SendPrivateTextResult{}, fmt.Errorf("lock send dispatch append fences: %w", err)
+	}
 	if hooks.before != nil {
 		if err := hooks.before(ctx, tx, &req); err != nil {
 			return domain.SendPrivateTextResult{}, err

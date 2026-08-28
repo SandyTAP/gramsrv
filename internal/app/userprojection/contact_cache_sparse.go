@@ -20,7 +20,7 @@ func (c *CachedContactStore) ContactProjectionForViewerUserIDs(ctx context.Conte
 	}
 	for {
 		out := emptyContactProjectionBatch()
-		readEpoch := c.cacheEpoch()
+		readFence := c.captureCacheFence(sparseContactProjectionFenceIDs(pairs)...)
 		now := c.now()
 		cold := make(map[int64][]int64)
 		for _, pair := range pairs {
@@ -56,7 +56,7 @@ func (c *CachedContactStore) ContactProjectionForViewerUserIDs(ctx context.Conte
 			}
 			cold[pair.viewerUserID] = append(cold[pair.viewerUserID], pair.contactUserID)
 		}
-		if c.cacheEpoch() != readEpoch {
+		if !c.cacheFenceCurrent(readFence) {
 			if err := ctx.Err(); err != nil {
 				return domain.ContactProjectionBatch{}, err
 			}
@@ -69,7 +69,7 @@ func (c *CachedContactStore) ContactProjectionForViewerUserIDs(ctx context.Conte
 		if err != nil {
 			return domain.ContactProjectionBatch{}, err
 		}
-		if c.cacheEpoch() != readEpoch {
+		if !c.cacheFenceCurrent(readFence) {
 			if err := ctx.Err(); err != nil {
 				return domain.ContactProjectionBatch{}, err
 			}
@@ -123,7 +123,7 @@ func (c *CachedContactStore) loadSparseContactProjection(ctx context.Context, re
 			if !ok {
 				return contactProjectionLoadResult{}, fmt.Errorf("contact store does not support sparse projection")
 			}
-			loadEpoch := c.cacheEpoch()
+			loadFence := c.captureCacheFence(sparseContactProjectionFenceIDs(pairs)...)
 			batch, err := loader.ContactProjectionForViewerUserIDs(ctx, canonical)
 			if err != nil {
 				return contactProjectionLoadResult{}, err
@@ -131,7 +131,7 @@ func (c *CachedContactStore) loadSparseContactProjection(ctx context.Context, re
 			expireAt := c.now().Add(c.ttl)
 			admitPairs := len(pairs) <= contactProjectionDenseAdmissionMaxCells
 			c.mu.Lock()
-			current := c.epoch == loadEpoch
+			current := c.cacheFenceCurrentLocked(loadFence)
 			if current && admitPairs {
 				for _, pair := range pairs {
 					contact, contactFound := batch.Contacts[pair.viewerUserID][pair.contactUserID]
@@ -156,6 +156,14 @@ func (c *CachedContactStore) loadSparseContactProjection(ctx context.Context, re
 			return domain.ContactProjectionBatch{}, err
 		}
 	}
+}
+
+func sparseContactProjectionFenceIDs(pairs []sparseContactProjectionPair) []int64 {
+	ids := make([]int64, 0, len(pairs)*2)
+	for _, pair := range pairs {
+		ids = append(ids, pair.viewerUserID, pair.contactUserID)
+	}
+	return ids
 }
 
 func emptyContactProjectionBatch() domain.ContactProjectionBatch {

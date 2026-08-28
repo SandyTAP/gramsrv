@@ -230,12 +230,14 @@ func NewService(users store.UserStore, auths store.AuthorizationStore, codes sto
 }
 
 // BindTempAuthKey 校验并记录 TDesktop PFS temp→perm auth key 绑定。
-func (s *Service) BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) error {
+func (s *Service) BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) (domain.TempAuthKeyBindingResult, error) {
+	var validated domain.TempAuthKeyBindingResult
 	if s.authKeys != nil {
-		inner, protocolExpiresAt, err := s.validateBindTempAuthKey(ctx, sessionID, binding)
+		inner, protocolExpiresAt, result, err := s.validateBindTempAuthKey(ctx, sessionID, binding)
 		if err != nil {
-			return err
+			return domain.TempAuthKeyBindingResult{}, err
 		}
+		validated = result
 		binding.TempSessionID = inner.TempSessionID
 		// The bind request's expires_at is a signed client assertion. TDesktop
 		// intentionally adds a small grace interval, while Android derives its
@@ -247,21 +249,22 @@ func (s *Service) BindTempAuthKey(ctx context.Context, sessionID int64, binding 
 		// The edge may admit the frame immediately before the temporary key's
 		// absolute boundary and the encrypted proof may cross it. This is a temp-key
 		// rotation condition, never a destructive permanent-key proof failure.
-		return ErrTempAuthKeyEmpty
+		return domain.TempAuthKeyBindingResult{}, ErrTempAuthKeyEmpty
 	}
 	if s.tempKeys == nil {
-		return nil
+		return validated, nil
 	}
-	if err := s.tempKeys.Save(ctx, binding); err != nil {
+	result, err := s.tempKeys.SaveWithState(ctx, binding)
+	if err != nil {
 		if errors.Is(err, store.ErrTempAuthKeyAlreadyBound) {
-			return ErrTempAuthKeyAlreadyBound
+			return domain.TempAuthKeyBindingResult{}, ErrTempAuthKeyAlreadyBound
 		}
 		if errors.Is(err, store.ErrAuthKeyBindingInvalid) {
-			return s.classifyBindingStoreInvalid(ctx, binding)
+			return domain.TempAuthKeyBindingResult{}, s.classifyBindingStoreInvalid(ctx, binding)
 		}
-		return err
+		return domain.TempAuthKeyBindingResult{}, err
 	}
-	return nil
+	return result, nil
 }
 
 // ResolveAuthKey 将已绑定的 temp auth_key 解析为对应 perm auth_key。
@@ -1306,7 +1309,11 @@ func (s *Service) AuthKeyClientInfo(ctx context.Context, authKeyID [8]byte) (dom
 	if s == nil || s.authKeys == nil || authKeyID == ([8]byte{}) {
 		return domain.AuthKeyClientInfo{}, false, nil
 	}
-	key, found, err := s.authKeys.Get(ctx, authKeyID)
+	// Client metadata is a read-only projection. The physical connection's
+	// first-frame Get and active-key heartbeat already own the durable orphan
+	// lease, so this path must not turn every init/profile read into another
+	// last_used_at write.
+	key, found, err := s.authKeys.Revalidate(ctx, authKeyID)
 	if err != nil || !found {
 		return domain.AuthKeyClientInfo{}, found, err
 	}
@@ -1469,53 +1476,58 @@ func (s *Service) recordLoginMessage(ctx context.Context, userID int64, code str
 	return msg, nil
 }
 
-func (s *Service) validateBindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) (mtcrypto.BindAuthKeyInner, int, error) {
+func (s *Service) validateBindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) (mtcrypto.BindAuthKeyInner, int, domain.TempAuthKeyBindingResult, error) {
 	if binding.ExpiresAt <= int(time.Now().Unix()) {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrExpiresAtInvalid
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrExpiresAtInvalid
 	}
-	temp, found, err := s.authKeys.Get(ctx, binding.TempAuthKeyID)
+	permID := authKeyIDFromInt64(binding.PermAuthKeyID)
+	pair, err := s.authKeys.LoadBindingKeys(ctx, binding.TempAuthKeyID, permID)
 	if err != nil {
-		return mtcrypto.BindAuthKeyInner{}, 0, err
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, err
 	}
 	// expires_at in auth.bindTempAuthKey is client-supplied and must only attest
 	// to a still-live binding. It may never create or reclassify a protocol key;
 	// the caller normalizes durable retention to this handshake-authoritative
 	// temp.ExpiresAt instead of trusting the client value.
-	if !found || temp.ExpiresAt <= int(time.Now().Unix()) {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrTempAuthKeyEmpty
+	if !pair.TemporaryFound || pair.Temporary.ExpiresAt <= int(time.Now().Unix()) {
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrTempAuthKeyEmpty
 	}
 
-	permID := authKeyIDFromInt64(binding.PermAuthKeyID)
-	perm, found, err := s.authKeys.Get(ctx, permID)
-	if err != nil {
-		return mtcrypto.BindAuthKeyInner{}, 0, err
-	}
-	if !found || perm.ExpiresAt != 0 {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrEncryptedMessageInvalid
+	if !pair.PermanentFound || pair.Permanent.ExpiresAt != 0 {
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrEncryptedMessageInvalid
 	}
 
-	inner, err := decryptBindAuthKeyInner(perm, binding.EncryptedMessage)
+	inner, err := decryptBindAuthKeyInner(pair.Permanent, binding.EncryptedMessage)
 	if err != nil {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrEncryptedMessageInvalid
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrEncryptedMessageInvalid
 	}
 	if inner.Nonce != binding.Nonce ||
 		inner.TempAuthKeyID != authKeyIDInt64(binding.TempAuthKeyID) ||
 		inner.PermAuthKeyID != binding.PermAuthKeyID ||
 		inner.TempSessionID != sessionID ||
 		inner.ExpiresAt != binding.ExpiresAt {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrEncryptedMessageInvalid
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrEncryptedMessageInvalid
 	}
-	if temp.ExpiresAt <= int(time.Now().Unix()) {
-		return mtcrypto.BindAuthKeyInner{}, 0, ErrTempAuthKeyEmpty
+	if pair.Temporary.ExpiresAt <= int(time.Now().Unix()) {
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, ErrTempAuthKeyEmpty
 	}
-	return inner, temp.ExpiresAt, nil
+	layer, observationID, err := store.MergeAuthKeyLayerObservations(
+		pair.Temporary.Layer, pair.Temporary.LayerObservationID,
+		pair.Permanent.Layer, pair.Permanent.LayerObservationID,
+	)
+	if err != nil {
+		return mtcrypto.BindAuthKeyInner{}, 0, domain.TempAuthKeyBindingResult{}, err
+	}
+	return inner, pair.Temporary.ExpiresAt, domain.TempAuthKeyBindingResult{
+		Layer: layer, LayerObservationID: observationID,
+	}, nil
 }
 
 func (s *Service) classifyBindingStoreInvalid(ctx context.Context, binding domain.TempAuthKeyBinding) error {
 	if s == nil || s.authKeys == nil {
 		return ErrEncryptedMessageInvalid
 	}
-	temp, found, err := s.authKeys.Get(ctx, binding.TempAuthKeyID)
+	temp, found, err := s.authKeys.Revalidate(ctx, binding.TempAuthKeyID)
 	if err != nil {
 		return err
 	}

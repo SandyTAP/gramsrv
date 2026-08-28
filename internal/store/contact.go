@@ -33,3 +33,11 @@ type ContactStore interface {
 type SparseContactProjectionStore interface {
 	ContactProjectionForViewerUserIDs(ctx context.Context, contactUserIDsByViewer map[int64][]int64) (domain.ContactProjectionBatch, error)
 }
+
+// SparseReverseContactStore reads only explicitly requested owner->viewer
+// relationship pairs. It is the database-facing primitive behind batched
+// privacy projection: unlike GetReverseContacts it can combine different
+// viewers in one query without broadening the request into a cross product.
+type SparseReverseContactStore interface {
+	GetReverseContactsForViewerUserIDs(ctx context.Context, viewerUserIDsByOwner map[int64][]int64) (map[int64]map[int64]domain.Contact, error)
+}

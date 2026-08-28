@@ -1297,7 +1297,7 @@ func (c *Conn) send(ctx context.Context, t proto.MessageType, msg bin.Encoder, c
 
 func (c *Conn) SendEncoded(ctx context.Context, t proto.MessageType, encoded *encodedOutboundMessage) error {
 	if encoded != nil {
-		if err := encoded.prepareDeliveryHook(defaultRPCDeliveryHookExecutor); err != nil {
+		if err := encoded.prepareDeliveryHook(c.deliveryHookExecutor()); err != nil {
 			return err
 		}
 	}
@@ -1336,7 +1336,7 @@ func (c *Conn) enqueueEncodedDeliveryReserved(
 		return ErrConnClosed
 	}
 	if encoded != nil {
-		if err := encoded.prepareDeliveryHook(defaultRPCDeliveryHookExecutor); err != nil {
+		if err := encoded.prepareDeliveryHook(c.deliveryHookExecutor()); err != nil {
 			return err
 		}
 	}
@@ -1382,6 +1382,13 @@ func (c *Conn) enqueueEncodedDeliveryReserved(
 	}
 	c.endOutboundEnqueue()
 	return nil
+}
+
+func (c *Conn) deliveryHookExecutor() *rpcDeliveryHookExecutor {
+	if c != nil && c.rpcDeliveryHooks != nil {
+		return c.rpcDeliveryHooks
+	}
+	return defaultRPCDeliveryHookExecutor
 }
 
 func (c *Conn) sendOutbound(ctx context.Context, t proto.MessageType, msg bin.Encoder, encoded *encodedOutboundMessage, control bool) error {

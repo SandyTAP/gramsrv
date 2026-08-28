@@ -17,6 +17,7 @@ This document describes every setting loaded by `internal/config`. Defaults and 
 - Booleans accept `1/true/TRUE/True/yes/on` and `0/false/FALSE/False/no/off`. Lists are comma-separated. Durations use Go duration syntax such as `200ms`, `30s`, `5m`, or `168h`.
 - Invalid integer, float, boolean, or duration text falls back to the code default. URL, app-scheme, app-name, and login-email dependency validation fails startup instead.
 - Never commit real passwords, tokens, private DSNs, or TURN secrets. Prefer a secret manager or protected service environment in production.
+- `TELESRV_LOG_LEVEL` is read from the **process environment before the config file is loaded**; default `info`, with standard zap levels such as `debug`, `warn`, and `error`. Successful per-RPC traces are Debug-only, while errors, delivery fences and compatibility traces remain visible at Info or above. Putting this key only in `.env` has no effect.
 
 ## 2. MTProto listener, transport, and resource budgets
 
@@ -31,14 +32,16 @@ This document describes every setting loaded by `internal/config`. Defaults and 
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | Enables MTProto-over-WebSocket demultiplexing on the MTProto listener. |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | Browser WebSocket origin allow-list. `*` is for temporary debugging only. |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | Global physical connection admission limit. Negative disables this gate. |
-| `TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP` | int / `4096` | Per-source-IP physical connection limit. Negative disables this gate. |
+| `TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP` | int / `4096` | Per-source-IP physical connection limit. A single-host/NAT 10,000-session capacity run must explicitly raise it above the expected connection count (the local acceptance profile uses `20000`); negative disables this gate. |
 | `TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES` | int / `256` | Concurrent expensive RSA/DH handshakes. Negative disables this gate. |
 | `TELESRV_MTPROTO_RPC_MAX_INFLIGHT` | int / `32` | Per-connection concurrent RPC budget; non-positive values are normalized by the edge to its safe default. |
 | `TELESRV_MTPROTO_RPC_QUEUE_SIZE` | int / `64` | Per-connection queued RPC budget; non-positive values use the edge default. |
 | `TELESRV_MTPROTO_RPC_TIMEOUT` | duration / `30s` | End-to-end handler timeout for scheduled RPC work. |
 | `TELESRV_MTPROTO_RPC_GLOBAL_WORKERS` | int / `256` | Shared fair-scheduler worker count. |
-| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS` | int / `8192` | Process-wide scheduled/in-flight RPC task cap. |
+| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS` | int / `32768` | Process-wide reserved/queued/in-flight RPC task and active-owner cap. The default covers a 10,000-session startup ramp while the 512 MiB materialization charge, per-connection/per-auth limits, and deadlines remain independent hard gates. |
 | `TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES` | int64 charge bytes / `536870912` | Process-wide reserved/queued/in-flight RPC memory charge. Exact admission reserves a conservative typed-materialization charge from wire size and grows it atomically before a nested-gzip-expanded graph is decoded; grow failure rejects the complete candidate batch. This is not an equal amount of concurrently receivable wire bytes. |
+| `TELESRV_MTPROTO_RPC_DELIVERY_HOOK_WORKERS` | int / `32` | Bounded workers for post-physical-delivery correctness transitions such as delivered cursors and first-session readiness; keep this within downstream database concurrency. |
+| `TELESRV_MTPROTO_RPC_DELIVERY_HOOK_MAX_PENDING` | int / `16384` | Per-Server cap across reserved + queued + running delivery hooks; must be at least the worker count. Exhaustion fails closed instead of acknowledging a result and dropping state. |
 | `TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES` | int / `262144` | Global cap for pending owners and compact unacknowledged execution receipts. Receipts retain request identity, execution outcome, and Layer admission metadata only—never TL bodies. `msgs_ack` removes them immediately; 331 seconds is only the no-ACK safety horizon. |
 | `TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES` | int / `32768` | Per-raw-auth owner/receipt cap; limits satisfy `global >= auth >= session`. |
 | `TELESRV_MTPROTO_RPC_EXECUTION_SESSION_MAX_ENTRIES` | int / `16384` | Per `raw auth key + session_id` owner/receipt cap. |
@@ -558,9 +561,62 @@ The following fallback keys are accepted from the **process environment only**. 
 |---|---|---|
 | `TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Router temporary→permanent auth-key binding cache capacity. |
 | `TELESRV_TEMP_KEY_CACHE_TTL` | duration / `30m` | Recheck period; exact bind/revoke invalidation handles normal writes, while TTL covers cross-process/exception paths. |
+| `TELESRV_READ_MODEL_VERSION_CACHE_MAX` | int / `1000000` | In-process LRU capacity for durable read-model hashes. NOTIFY updates/invalidates entries; capacity pressure evicts one entry instead of flushing the whole cache. |
+| `TELESRV_READ_MODEL_VERSION_BATCH_MAX_KEYS` | int / `4096` | Maximum exact read-model selectors combined by the synchronous cross-request PostgreSQL loader. |
+| `TELESRV_READ_MODEL_VERSION_BATCH_WAIT` | duration / `250us` | Maximum collection delay for a version cold batch; every caller waits for its exact result. |
+| `TELESRV_READ_MODEL_VERSION_BATCH_QUEUE` | int / `16384` | Bounded version-selector queue; saturation fails explicitly and never starts per-request fallback reads. |
+| `TELESRV_READ_MODEL_VERSION_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one version batch query. |
+| `TELESRV_AUTH_KEY_GET_BATCH_MAX` | int / `256` | Maximum distinct first-frame permanent auth-key lookups/touches combined in one PostgreSQL query. |
+| `TELESRV_AUTH_KEY_GET_BATCH_WAIT` | duration / `250us` | Maximum synchronous collection delay for first-frame auth-key lookups. |
+| `TELESRV_AUTH_KEY_GET_BATCH_QUEUE` | int / `16384` | Bounded first-frame lookup queue; it must not be smaller than the batch maximum. |
+| `TELESRV_AUTH_KEY_GET_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one auth-key lookup batch. Revalidation after authentication remains a separate authoritative read. |
+| `TELESRV_CONTACT_REVERSE_BATCH_MAX_PAIRS` | int / `4096` | Maximum exact `(contact owner, viewer)` relationship pairs combined in one sparse PostgreSQL query. |
+| `TELESRV_CONTACT_REVERSE_BATCH_WAIT` | duration / `2ms` | Maximum synchronous collection delay for sparse reverse-contact pairs. |
+| `TELESRV_CONTACT_REVERSE_BATCH_QUEUE` | int / `16384` | Bounded reverse-contact pair queue; errors and saturation do not fall back to owner-wide scans. |
+| `TELESRV_CONTACT_REVERSE_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one exact reverse-contact batch query. |
+| `TELESRV_CONTACT_SNAPSHOT_CACHE_MAX_VIEWERS` | int / `16384` | Viewer LRU limit independently applied to owner contact-list and personal-photo snapshots; pressure evicts only the oldest item. Must be positive. |
+| `TELESRV_PROFILE_PHOTO_CACHE_MAX` | int / `200000` | Total positive/negative owner profile/fallback-ref LRU entries; pressure evicts one item. Must be positive. |
+| `TELESRV_PROFILE_PHOTO_CACHE_TTL` | duration / `24h` | Safety recheck for missed notifications or manual database edits. Exact-owner `profile_photo` NOTIFY and listener-reconnect flush provide normal freshness. Must be in `(0,168h]`. |
+| `TELESRV_PEER_IDENTITY_CACHE_MAX` | int / `1000000` | Entry bound for the combined viewer-independent username-vector and third-party-verification `peer_identity` LRU. Durable tokens plus NOTIFY invalidate positive and negative values exactly; permissions are never cached here. |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_MAX` | int / `10000` | Maximum materialized owner dialog snapshots retained in-process. |
+| `TELESRV_DIALOG_PRIVATE_PEER_CACHE_MAX` | int / `500000` | Maximum private-dialog structural LRU entries; viewer-shaped user projections are excluded. |
+| `TELESRV_DIALOG_PRIVATE_PEER_CACHE_BYTES_MAX` | bytes / `268435456` | Approximate memory-weight limit for the private-dialog structural LRU. |
+| `TELESRV_DIALOG_DRAFT_CACHE_MAX` | int / `1000000` | Maximum positive/negative cloud-draft entries validated by `dialog_light`. |
+| `TELESRV_DIALOG_DRAFT_CACHE_BYTES_MAX` | bytes / `268435456` | Approximate memory-weight limit for the cloud-draft cache. |
+| `TELESRV_USER_PROJECTION_FACT_CACHE_MAX` | int / `1000000` | Per-cache entry bound for the durable freeze and collectible-phone positive/negative user-fact LRUs. |
+| `TELESRV_STORY_ACTIVE_PEER_CACHE_MAX` | int / `1000000` | Maximum viewer-independent active-story positive/negative candidates validated by `story_peer`; positive values self-expire at durable `expire_date`. |
+| `TELESRV_STORY_HIDDEN_LIST_CACHE_MAX` | int / `100000` | Maximum owner entries for sparse per-viewer `story_hidden_list` sets. |
+| `TELESRV_STORY_HIDDEN_LIST_CACHE_BYTES_MAX` | bytes / `67108864` | Approximate aggregate memory-weight limit for all viewer hidden-peer sets. |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_HEADERS_MAX` | int / `1000000` | Aggregate header-equivalent weight budget across materialized owner snapshots; enforced with the entry limit. The variable name is retained for deployment compatibility and does not mean the snapshot is header-only. |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_TTL` | duration / `5m` | Safety TTL in addition to NOTIFY/version invalidation; it is not a correctness clock. |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_REDIS_TTL` | duration / `1h` | Redis lifetime for cross-process materialized owner dialog snapshots; durable generations validate correctness, while shared channel rows/top payloads are not duplicated per owner. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_CACHE_MAX` | int / `32768` | In-process LRU entry cap for session-readiness active-channel pages, covering 10,000 owners plus bounded page overlap. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_CACHE_TTL` | duration / `24h` | Missed-notification safety TTL for active-channel L1; durable generations provide normal freshness. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_REDIS_TTL` | duration / `24h` | Lifetime of cross-process, version-addressed active-channel ID pages; old-generation keys expire naturally. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_MAX` | int / `128` | Maximum distinct owner/page selectors combined in one PostgreSQL ordinality query after Redis misses. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_WAIT` | duration / `100ms` | Maximum synchronous cold-selector collection delay; it applies only to Redis misses. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_QUEUE` | int / `16384` | Bounded cold-selector queue; saturation fails explicitly instead of falling back per account. |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one active-channel cold batch query. |
+| `TELESRV_LAYER_ADVANCE_BATCH_MAX` | int / `256` | Maximum distinct raw-session Layer high-water inputs in one PostgreSQL statement; one session appears at most once per batch. |
+| `TELESRV_LAYER_ADVANCE_BATCH_WAIT` | duration / `250us` | Maximum synchronous microbatch collection delay for Layer fast attempts; callers wait for commit/failure. |
+| `TELESRV_LAYER_ADVANCE_BATCH_QUEUE` | int / `8192` | Bounded Layer-advance wait queue; it must not be smaller than the batch maximum. |
+| `TELESRV_LAYER_ADVANCE_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one shared batch SQL; it never enables asynchronous repair or success fallback. |
+| `TELESRV_BOOTSTRAP_READY_BATCH_MAX` | int / `32` | Maximum distinct `(user, auth-key)` baseline-readiness selectors in one PostgreSQL statement; one fence appears at most once per batch. |
+| `TELESRV_BOOTSTRAP_READY_BATCH_WAIT` | duration / `100ms` | Maximum synchronous post-response readiness collection delay; accepted callbacks wait for commit/failure. |
+| `TELESRV_BOOTSTRAP_READY_BATCH_QUEUE` | int / `16384` | Bounded readiness-selector wait queue; capacity pressure never silently drops a durable fence. |
+| `TELESRV_BOOTSTRAP_READY_BATCH_TIMEOUT` | duration / `5s` | Fail-closed timeout for one readiness batch SQL; failures leave the job pending. |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_MAX` | int / `512` | Maximum distinct users in one lifecycle last-seen PostgreSQL batch; duplicate users keep the maximum timestamp. |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_WAIT` | duration / `1s` | Maximum lifecycle last-seen microbatch collection delay; it does not affect live presence authority or wire `WasOnline`. |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_QUEUE` | int / `65536` | Bounded queue for accepted asynchronous lifecycle last-seen updates; saturation is counted and uses an authoritative direct-write safety valve. |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_TIMEOUT` | duration / `5s` | Per-attempt timeout for the batch database write plus exact user-cache invalidation; failures retry with bounded backoff. |
+| `TELESRV_PRESENCE_LAST_SEEN_DRAIN_TIMEOUT` | duration / `10s` | Bounded shutdown drain before persistence dependencies close. |
 | `TELESRV_CHANNEL_ROW_CACHE_MAX` | int / `50000` | Shared channel-row cache capacity. `<=0` disables both cache and its LISTEN/NOTIFY listener. |
-| `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `100000` | Channel member/access read-model cache capacity; `<=0` disables it. |
-| `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `100000` | Viewer/channel dialog projection cache capacity; `<=0` disables it. |
+| `TELESRV_CHANNEL_TOP_MESSAGE_CACHE_MAX` | int / `100000` | Shared dialog-top channel-message cache capacity. Viewer read/reaction overlays are excluded; `channel_base` notifications invalidate by channel. `<=0` disables it. |
+| `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `1000000` | Channel member/access read-model capacity. Materialized owner snapshots warm it within the same invalidation epoch to cover active memberships for 10,000 online accounts; `<=0` disables it. |
+| `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `1000000` | Viewer/channel dialog projection cache capacity with channel-indexed invalidation; `<=0` disables it. |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_MAX` | int / `8192` | Maximum shared channel-difference base pages. Viewer access, unread state, and dialog overlays are excluded; `<=0` disables it. |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_BYTES_MAX` | bytes / `268435456` | Approximate aggregate memory bound for shared difference base pages, enforced with the entry limit. |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_TTL` | duration / `5m` | Out-of-band-write safety rail; normal invalidation uses stable-cut keys and read-model notifications. |
 | `TELESRV_CHANNEL_BOOST_CACHE_MAX` | int / `100000` | Channel boost read-model cache capacity; `<=0` disables it. |
 | `TELESRV_CHANNEL_BOOST_CACHE_TTL` | duration / `10s` | Maximum stale window if a boost invalidation notification is missed. |
 

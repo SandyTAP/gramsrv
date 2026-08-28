@@ -95,3 +95,63 @@ func TestContactProjectionForViewerUserIDsPostgresDoesNotCrossPairs(t *testing.T
 		t.Fatalf("viewer B personal photos = %+v", got.PersonalPhotos[viewerB.ID])
 	}
 }
+
+func TestGetReverseContactsForViewerUserIDsPostgresDoesNotCrossPairs(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	users := NewUserStore(pool)
+	viewerA := createTestUser(t, ctx, users, "+1911"+suffix+"01", "Viewer", "A")
+	viewerB := createTestUser(t, ctx, users, "+1911"+suffix+"02", "Viewer", "B")
+	ownerA := createTestUser(t, ctx, users, "+1911"+suffix+"03", "Owner", "A")
+	ownerB := createTestUser(t, ctx, users, "+1911"+suffix+"04", "Owner", "B")
+	userIDs := []int64{viewerA.ID, viewerB.ID, ownerA.ID, ownerB.ID}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", userIDs)
+	})
+
+	contacts := NewContactStore(pool)
+	for _, row := range []struct {
+		owner  int64
+		viewer int64
+		name   string
+	}{
+		{ownerA.ID, viewerA.ID, "A expected"},
+		{ownerA.ID, viewerB.ID, "A cross"},
+		{ownerB.ID, viewerA.ID, "B cross"},
+		{ownerB.ID, viewerB.ID, "B expected"},
+	} {
+		if _, err := contacts.Upsert(ctx, row.owner, domain.ContactInput{
+			ContactUserID: row.viewer,
+			FirstName:     row.name,
+			Note:          "relationship-only",
+		}); err != nil {
+			t.Fatalf("Upsert %d->%d: %v", row.owner, row.viewer, err)
+		}
+	}
+	if _, err := contacts.SetCloseFriends(ctx, ownerA.ID, []int64{viewerA.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := contacts.GetReverseContactsForViewerUserIDs(ctx, map[int64][]int64{
+		ownerA.ID: {viewerA.ID},
+		ownerB.ID: {viewerB.ID},
+	})
+	if err != nil {
+		t.Fatalf("GetReverseContactsForViewerUserIDs: %v", err)
+	}
+	contactA, found := got[ownerA.ID][viewerA.ID]
+	if !found || contactA.User.ID != viewerA.ID || contactA.FirstName != "A expected" || !contactA.CloseFriend {
+		t.Fatalf("owner A exact relationship = %+v found=%v", contactA, found)
+	}
+	contactB, found := got[ownerB.ID][viewerB.ID]
+	if !found || contactB.User.ID != viewerB.ID || contactB.FirstName != "B expected" || contactB.CloseFriend {
+		t.Fatalf("owner B exact relationship = %+v found=%v", contactB, found)
+	}
+	if _, found := got[ownerA.ID][viewerB.ID]; found {
+		t.Fatal("owner A received crossed viewer B")
+	}
+	if _, found := got[ownerB.ID][viewerA.ID]; found {
+		t.Fatal("owner B received crossed viewer A")
+	}
+}

@@ -155,6 +155,12 @@ type countingChannelStore struct {
 	resolveStartOnce         sync.Once
 }
 
+type authoritativeCountingChannelStore struct {
+	*countingChannelStore
+}
+
+func (*authoritativeCountingChannelStore) AuthoritativeResolveChannelCache() {}
+
 func (s *countingChannelStore) GetChannel(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelView, error) {
 	s.getChannelCalls++
 	return s.ChannelStore.GetChannel(ctx, viewerUserID, channelID)
@@ -196,6 +202,20 @@ func (s *countingChannelStore) ListActiveChannelMemberIDs(ctx context.Context, v
 
 type fakeReadModelVersions struct {
 	hashes map[store.ReadModelKey]int64
+}
+
+type countingReadModelVersions struct {
+	calls int
+}
+
+func (v *countingReadModelVersions) ReadModelHash(context.Context, string, int64, domain.PeerType, int64) (int64, bool, error) {
+	v.calls++
+	return 0, false, nil
+}
+
+func (v *countingReadModelVersions) ReadModelHashes(context.Context, []store.ReadModelKey) (map[store.ReadModelKey]int64, error) {
+	v.calls++
+	return map[store.ReadModelKey]int64{}, nil
 }
 
 func (f *fakeReadModelVersions) ReadModelHash(_ context.Context, model string, ownerUserID int64, peerType domain.PeerType, peerID int64) (int64, bool, error) {
@@ -328,6 +348,39 @@ func TestResolveChannelCachesAccessViewByCompositeReadModelHash(t *testing.T) {
 	}
 	if base.resolveChannelCalls != 3 {
 		t.Fatalf("ResolveChannel calls after base hash bump = %d, want 3", base.resolveChannelCalls)
+	}
+}
+
+func TestResolveChannelDelegatesToAuthoritativeStoreCacheWithoutVersionRead(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	created, err := base.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: ownerID, Title: "Store-owned Resolve", Megagroup: true, Date: 1700004105,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	versions := &countingReadModelVersions{}
+	service := NewService(
+		&authoritativeCountingChannelStore{countingChannelStore: base},
+		WithReadModelVersions(versions),
+	)
+
+	for range 2 {
+		view, resolveErr := service.ResolveChannel(ctx, ownerID, created.Channel.ID)
+		if resolveErr != nil {
+			t.Fatalf("ResolveChannel: %v", resolveErr)
+		}
+		if view.Channel.ID != created.Channel.ID || view.Self.UserID != ownerID {
+			t.Fatalf("resolve view = %+v", view)
+		}
+	}
+	if base.resolveChannelCalls != 2 {
+		t.Fatalf("authoritative store calls = %d, want 2", base.resolveChannelCalls)
+	}
+	if versions.calls != 0 {
+		t.Fatalf("read-model version calls = %d, want 0", versions.calls)
 	}
 }
 

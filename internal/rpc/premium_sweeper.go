@@ -82,6 +82,12 @@ func (r *Router) NotifyUserChanged(ctx context.Context, u domain.User) error {
 	if r == nil || u.ID == 0 {
 		return nil
 	}
+	if r.deps.UserProjectionFacts != nil {
+		// Admin collectible-number mutations converge through this standard user
+		// hook. Conservative invalidation on other low-frequency admin profile
+		// writes is harmless and preserves read-your-write without waiting for NOTIFY.
+		r.deps.UserProjectionFacts.InvalidateCollectiblePhoneFact(u.ID)
+	}
 	r.invalidateRPCProjectionForUser(u.ID)
 	r.pushPremiumStatusUpdate(ctx, u)
 	return nil

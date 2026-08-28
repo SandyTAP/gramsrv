@@ -1466,6 +1466,16 @@ func (m *captureOutboxMetrics) OutboxFailed(error) {
 	m.failed++
 }
 
+func (m *captureOutboxMetrics) PresenceLastSeenBatch(int, time.Duration, error) {}
+
+func (m *captureOutboxMetrics) PresenceLastSeenSubmitted() {}
+
+func (m *captureOutboxMetrics) PresenceLastSeenPending(int) {}
+
+func (m *captureOutboxMetrics) PresenceLastSeenOverflow() {}
+
+func (m *captureOutboxMetrics) PresenceLastSeenDrainDropped(int) {}
+
 // interruptedBestEffortSessions 模拟 dispatcher context 到期：该中断可安全靠 lease 重试。
 type interruptedBestEffortSessions struct {
 	*captureSessions

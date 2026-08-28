@@ -21,7 +21,7 @@ import (
 
 // AuthService 抽象登录/注册业务。
 type AuthService interface {
-	BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) error
+	BindTempAuthKey(ctx context.Context, sessionID int64, binding domain.TempAuthKeyBinding) (domain.TempAuthKeyBindingResult, error)
 	ResolveAuthKey(ctx context.Context, authKeyID [8]byte) ([8]byte, bool, error)
 	UserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
 	PendingPasswordUserID(ctx context.Context, authKeyID [8]byte) (int64, bool, error)
@@ -99,6 +99,29 @@ type ImmediateSessionPusher interface {
 // 用于按 RPC 置位 receivesUpdates 时的幂等短路；不实现时每次都走完整置位（幂等，仅多余开销）。
 type SessionUpdatesStateProvider interface {
 	ReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64) bool
+}
+
+// SessionUpdatesActivationProvider serializes the expensive transition from an
+// authenticated physical session to updates-ready. A successful claim belongs
+// to exactly one physical connection generation; the token prevents a delayed
+// callback from an old connection clearing a replacement's claim.
+//
+// This capability gates only membership synchronization and readiness. Each
+// updates.getState/getDifference delivery keeps its own cursor commit and must
+// never be coalesced with another RPC.
+type SessionUpdatesActivationProvider interface {
+	BeginSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64) (token uint64, ok bool)
+	EndSessionUpdatesActivation(rawAuthKeyID [8]byte, sessionID int64, token uint64)
+}
+
+// SessionBootstrapProbeProvider makes the durable bootstrap-job readiness
+// lookup a one-shot per physical connection generation. A successful probe
+// includes an authoritative zero-row result. Failed delivery work releases the
+// claim so a later delivered baseline can retry; replacement connections own
+// independent state and reject completion from an older generation.
+type SessionBootstrapProbeProvider interface {
+	BeginSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64) (token uint64, ok bool)
+	EndSessionBootstrapProbe(rawAuthKeyID [8]byte, sessionID int64, token uint64, success bool)
 }
 
 // ClientLayerBinder 把协商 TL layer 即时下推到连接（可选能力）。
@@ -263,6 +286,11 @@ type UsersService interface {
 
 type CollectiblePhoneService interface {
 	CollectiblePhone(ctx context.Context, phone string) (domain.CollectiblePhone, error)
+}
+
+type UserProjectionFactInvalidator interface {
+	InvalidateAccountFreezeFact(userID int64)
+	InvalidateCollectiblePhoneFact(userID int64)
 }
 
 // TelegramLoginService is the domain-only boundary shared by the MTProto RPC
@@ -485,6 +513,15 @@ type HelpService interface {
 // central RPC mutation gate. It is domain-only and shared with app/help.
 type AccountFreezeService interface {
 	AccountFreeze(ctx context.Context, userID int64) (domain.AccountFreeze, bool, error)
+}
+
+// AccountFreezeNotificationService owns the durable non-PTS notification
+// queue. It is intentionally separate from AccountFreezeService so hot
+// read-only gates can use a versioned fact cache without disabling queue
+// consumption.
+type AccountFreezeNotificationService interface {
+	ClaimAccountFreezeNotifications(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]domain.AccountFreezeNotification, error)
+	CompleteAccountFreezeNotification(ctx context.Context, id, version int64, now time.Time) error
 }
 
 // UpdatesService 抽象 update 状态查询。
@@ -1074,57 +1111,60 @@ type Deps struct {
 	// AuthKeySessionLayers is the protocol-only durable ordering boundary for
 	// explicit invokeWithLayer evidence. Production must wire the same auth-key
 	// store used by the MTProto edge; nil is reserved for isolated router tests.
-	AuthKeySessionLayers    store.AuthKeySessionLayerStore
-	Account                 AccountService
-	Privacy                 PrivacyService
-	Help                    HelpService
-	AppUpdates              updatecdn.Resolver
-	AccountFreeze           AccountFreezeService
-	AICompose               AIComposeService
-	Ephemeral               EphemeralService
-	EphemeralPush           store.EphemeralPushBroker
-	WelcomeMessages         WelcomeMessageService
-	Moderation              ModerationService
-	Users                   UsersService
-	Usernames               UsernameRegistryService
-	CollectiblePhones       CollectiblePhoneService
-	AccountRatings          AccountRatingService
-	BotVerifications        BotVerificationService
-	TelegramLogin           TelegramLoginService
-	Updates                 UpdatesService
-	BootstrapUpdates        store.BootstrapUpdateJobStore
-	BotAPIUpdates           store.BotAPIUpdateStore
-	BotCallbacks            store.BotCallbackRegistryStore
-	Contacts                ContactsService
-	Dialogs                 DialogsService
-	Chatlists               ChatlistsService
-	Messages                MessagesService
-	Translation             TranslationService
-	Stories                 StoriesService
-	Channels                ChannelsService
-	Communities             CommunitiesService
-	Files                   FilesService
-	PremiumPromo            PremiumPromoService
-	Premium                 PremiumService
-	Bots                    BotsService
-	ServiceBotCallbacks     ServiceBotCallbacks
-	ServiceBotInlineResults ServiceBotInlineResults
-	Polls                   PollsService
-	Phone                   PhoneService
-	GroupCalls              GroupCallsService
-	LiveStreams             LiveStreamsService
-	SFU                     sfu.Service
-	TURN                    turnsrv.Service
-	LangPack                LangPackService
-	Sessions                SessionBinder
-	Inline                  store.InlineRegistryStore
-	Limiter                 RateLimiter
-	Metrics                 Metrics
-	SecretChats             SecretChatService
-	Stars                   StarsService
-	Gifts                   GiftsService
-	Passkey                 PasskeyService
-	Themes                  ThemeService
+	AuthKeySessionLayers       store.AuthKeySessionLayerStore
+	ReadModelVersions          store.ReadModelVersionStore
+	UserProjectionFacts        UserProjectionFactInvalidator
+	Account                    AccountService
+	Privacy                    PrivacyService
+	Help                       HelpService
+	AppUpdates                 updatecdn.Resolver
+	AccountFreeze              AccountFreezeService
+	AccountFreezeNotifications AccountFreezeNotificationService
+	AICompose                  AIComposeService
+	Ephemeral                  EphemeralService
+	EphemeralPush              store.EphemeralPushBroker
+	WelcomeMessages            WelcomeMessageService
+	Moderation                 ModerationService
+	Users                      UsersService
+	Usernames                  UsernameRegistryService
+	CollectiblePhones          CollectiblePhoneService
+	AccountRatings             AccountRatingService
+	BotVerifications           BotVerificationService
+	TelegramLogin              TelegramLoginService
+	Updates                    UpdatesService
+	BootstrapUpdates           store.BootstrapUpdateJobStore
+	BotAPIUpdates              store.BotAPIUpdateStore
+	BotCallbacks               store.BotCallbackRegistryStore
+	Contacts                   ContactsService
+	Dialogs                    DialogsService
+	Chatlists                  ChatlistsService
+	Messages                   MessagesService
+	Translation                TranslationService
+	Stories                    StoriesService
+	Channels                   ChannelsService
+	Communities                CommunitiesService
+	Files                      FilesService
+	PremiumPromo               PremiumPromoService
+	Premium                    PremiumService
+	Bots                       BotsService
+	ServiceBotCallbacks        ServiceBotCallbacks
+	ServiceBotInlineResults    ServiceBotInlineResults
+	Polls                      PollsService
+	Phone                      PhoneService
+	GroupCalls                 GroupCallsService
+	LiveStreams                LiveStreamsService
+	SFU                        sfu.Service
+	TURN                       turnsrv.Service
+	LangPack                   LangPackService
+	Sessions                   SessionBinder
+	Inline                     store.InlineRegistryStore
+	Limiter                    RateLimiter
+	Metrics                    Metrics
+	SecretChats                SecretChatService
+	Stars                      StarsService
+	Gifts                      GiftsService
+	Passkey                    PasskeyService
+	Themes                     ThemeService
 }
 
 // ThemeService 抽象自定义云主题(app/themes):创建/更新/查询主题 + 维护每用户已安装列表。

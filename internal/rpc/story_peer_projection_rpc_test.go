@@ -14,16 +14,19 @@ import (
 	appstories "telesrv/internal/app/stories"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
 type countingStoriesService struct {
 	StoriesService
-	maxIDCalls         int
-	hiddenCalls        int
-	projectionCalls    int
-	pinnedAvailCalls   int
-	pinnedStoriesCalls int
+	maxIDCalls           int
+	hiddenCalls          int
+	projectionCalls      int
+	activeCandidateCalls int
+	hiddenSnapshotCalls  int
+	pinnedAvailCalls     int
+	pinnedStoriesCalls   int
 }
 
 type blockingProjectionStoriesService struct {
@@ -67,6 +70,16 @@ func (s *countingStoriesService) GetPeerHiddenStates(ctx context.Context, viewer
 func (s *countingStoriesService) GetPeerStoryProjections(ctx context.Context, viewerUserID int64, peers []domain.Peer, now int) ([]domain.PeerStoryProjection, error) {
 	s.projectionCalls++
 	return s.StoriesService.GetPeerStoryProjections(ctx, viewerUserID, peers, now)
+}
+
+func (s *countingStoriesService) ActiveStoryPeerExpirations(ctx context.Context, peers []domain.Peer, now int) (map[domain.Peer]int, error) {
+	s.activeCandidateCalls++
+	return s.StoriesService.(storySparseProjectionProvider).ActiveStoryPeerExpirations(ctx, peers, now)
+}
+
+func (s *countingStoriesService) ListHiddenStoryPeers(ctx context.Context, viewerUserID int64) ([]domain.Peer, error) {
+	s.hiddenSnapshotCalls++
+	return s.StoriesService.(storySparseProjectionProvider).ListHiddenStoryPeers(ctx, viewerUserID)
 }
 
 func (s *countingStoriesService) HasPinnedStories(ctx context.Context, viewerUserID int64, peer domain.Peer, now int) (bool, error) {
@@ -127,6 +140,43 @@ func TestUsersProjectStoriesMaxID(t *testing.T) {
 	assertUserStoryMaxID(t, full.Users[0], 7)
 	if !full.FullUser.GetStoriesPinnedAvailable() {
 		t.Fatalf("user full stories_pinned_available = false, want true")
+	}
+}
+
+func TestStorySparseProjectionAvoidsViewerPeerNegativeMatrix(t *testing.T) {
+	ctx := context.Background()
+	const viewerID int64 = 94001
+	active := domain.Peer{Type: domain.PeerTypeUser, ID: 94002}
+	inactiveHidden := domain.Peer{Type: domain.PeerTypeChannel, ID: 94003}
+	storyStore := memory.NewStoryStore()
+	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
+		Owner: active, ID: 7, Date: 100, ExpireDate: 200, Public: true,
+	}}); err != nil {
+		t.Fatalf("upsert active story: %v", err)
+	}
+	if err := storyStore.SetPeerHidden(ctx, viewerID, inactiveHidden, true); err != nil {
+		t.Fatalf("hide inactive peer: %v", err)
+	}
+	service := &countingStoriesService{StoriesService: appstories.NewService(storyStore)}
+	versions := &fakeRPCReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		storyPeerVersionKey(active):         401,
+		storyPeerVersionKey(inactiveHidden): 402,
+		storyHiddenListVersionKey(viewerID): 403,
+	}}
+	r := New(Config{}, Deps{Stories: service, ReadModelVersions: versions}, zaptest.NewLogger(t), fixedClock{now: time.Unix(150, 0)})
+
+	for i := 0; i < 2; i++ {
+		recent, hidden := r.storyProjectionMaps(ctx, viewerID, []domain.Peer{active, inactiveHidden})
+		if story, ok := recent[active]; !ok || story.MaxID != 7 {
+			t.Fatalf("recent(%d) = %+v, want active max id 7", i, recent)
+		}
+		if _, ok := recent[inactiveHidden]; ok || !hidden[inactiveHidden] {
+			t.Fatalf("inactive hidden projection(%d) recent=%+v hidden=%+v", i, recent, hidden)
+		}
+	}
+	if service.activeCandidateCalls != 1 || service.hiddenSnapshotCalls != 1 || service.projectionCalls != 1 {
+		t.Fatalf("sparse loads active=%d hidden=%d viewerProjection=%d, want 1/1/1",
+			service.activeCandidateCalls, service.hiddenSnapshotCalls, service.projectionCalls)
 	}
 }
 

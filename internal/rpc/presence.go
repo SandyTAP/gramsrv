@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 const userOnlineTTL = 5 * time.Minute
@@ -375,6 +376,25 @@ func (r *Router) persistLastSeenAsync(ctx context.Context, userID int64, lastSee
 	if !ok {
 		return
 	}
+	if r.lastSeenBatch != nil {
+		if err := r.lastSeenBatch.submit(store.UserLastSeenUpdate{UserID: userID, LastSeenAt: lastSeenAt}); err == nil {
+			return
+		} else {
+			// Capacity/stopping is never a silent drop. The direct authoritative
+			// write is an overload safety valve, not a configurable legacy mode.
+			r.log.Error("presence last-seen batch admission failed; using authoritative direct write",
+				zap.Int64("user_id", userID), zap.Error(err))
+		}
+	}
+	r.persistReservedLastSeenAsync(ctx, updater, userID, lastSeenAt)
+}
+
+func (r *Router) persistReservedLastSeenAsync(
+	ctx context.Context,
+	updater userLastSeenUpdater,
+	userID int64,
+	lastSeenAt int,
+) {
 	bgCtx, cancel := r.presenceBackgroundContext(ctx, 10*time.Second)
 	go func() {
 		defer cancel()
@@ -387,6 +407,15 @@ func (r *Router) persistLastSeenAsync(ctx context.Context, userID int64, lastSee
 			r.log.Warn("Update user last seen failed", zap.Int64("user_id", userID), zap.Int("last_seen_at", lastSeenAt), zap.Error(err))
 		}
 	}()
+}
+
+// RunPresenceLastSeenBatch owns the lifecycle batch worker. The worker stops
+// accepting on cancellation and performs a bounded drain before returning.
+func (r *Router) RunPresenceLastSeenBatch(ctx context.Context) {
+	if r == nil || r.lastSeenBatch == nil {
+		return
+	}
+	r.lastSeenBatch.Run(ctx)
 }
 
 func (r *Router) pushSessionOnlineAsync(ctx context.Context, userID int64, status domain.UserStatus) {
@@ -471,8 +500,9 @@ func (r *Router) announceUserOfflineIfStillGone(rawAuthKeyID [8]byte, sessionID,
 		return
 	}
 	status := domain.UserStatus{Kind: domain.UserStatusOffline, WasOnline: disconnectedAt}
-	// 断连降级是权威 last_seen，强制落库（不去抖）。
-	r.persistLastSeen(ctx, userID, disconnectedAt, false)
+	// 断连降级是权威 last_seen，不去抖；生命周期写经有界 batch
+	// 合并，WasOnline 仍取真实断连时刻而不是 flush 时刻。
+	r.persistLastSeenAsync(ctx, userID, disconnectedAt, false)
 	r.pushUserStatus(ctx, userID, status)
 }
 
@@ -601,8 +631,7 @@ func (r *Router) tgSelfUser(u domain.User) *tg.User {
 func (r *Router) tgUsers(users []domain.User) []tg.UserClass {
 	out := tgUsers(r.withUsersPresence(users))
 	r.withBotProfileFlagsForUsers(context.Background(), out)
-	r.applyUsernamesToPeerObjects(context.Background(), out, nil)
-	r.applyBotVerificationIconsToPeerObjects(context.Background(), out, nil)
+	r.applyPeerIdentitiesToPeerObjects(context.Background(), out, nil)
 	return out
 }
 
@@ -611,8 +640,7 @@ func (r *Router) tgUsers(users []domain.User) []tg.UserClass {
 func (r *Router) tgUsersForViewer(viewerUserID int64, users []domain.User) []tg.UserClass {
 	out := tgUsersForViewer(viewerUserID, r.withUsersPresence(users))
 	r.withBotProfileFlagsForUsers(context.Background(), out)
-	r.applyUsernamesToPeerObjects(context.Background(), out, nil)
-	r.applyBotVerificationIconsToPeerObjects(context.Background(), out, nil)
+	r.applyPeerIdentitiesToPeerObjects(context.Background(), out, nil)
 	return out
 }
 
@@ -913,14 +941,16 @@ func (r *Router) presenceFanoutCandidates(ctx context.Context, userID int64) []i
 		}
 	}
 	if r.deps.Dialogs != nil {
-		list, err := r.deps.Dialogs.GetDialogs(ctx, userID, domain.DialogFilter{Limit: presenceDialogFanoutCandidateLimit})
-		if err != nil {
+		provider, ok := r.deps.Dialogs.(interface {
+			PrivateDialogPeerIDs(context.Context, int64, int) ([]int64, error)
+		})
+		if !ok {
+			failed = true
+		} else if ids, err := provider.PrivateDialogPeerIDs(ctx, userID, presenceDialogFanoutCandidateLimit); err != nil {
 			failed = true
 		} else {
-			for _, dialog := range list.Dialogs {
-				if dialog.Peer.Type == domain.PeerTypeUser {
-					add(dialog.Peer.ID)
-				}
+			for _, id := range ids {
+				add(id)
 			}
 		}
 	}

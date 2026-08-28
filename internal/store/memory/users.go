@@ -5,8 +5,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"telesrv/internal/domain"
 	"time"
+
+	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // UserStore 是 store.UserStore 的内存实现。ID 与 PG identity 使用同一业务起点。
@@ -429,6 +431,24 @@ func (s *UserStore) UpdateLastSeen(_ context.Context, userID int64, lastSeenAt i
 	if lastSeenAt > u.LastSeenAt {
 		u.LastSeenAt = lastSeenAt
 		s.byID[userID] = u
+	}
+	return nil
+}
+
+func (s *UserStore) UpdateLastSeenBatch(ctx context.Context, updates []store.UserLastSeenUpdate) error {
+	latest := make(map[int64]int, len(updates))
+	for _, update := range updates {
+		if update.UserID == 0 || update.LastSeenAt <= 0 {
+			continue
+		}
+		if current := latest[update.UserID]; update.LastSeenAt > current {
+			latest[update.UserID] = update.LastSeenAt
+		}
+	}
+	for userID, lastSeenAt := range latest {
+		if err := s.UpdateLastSeen(ctx, userID, lastSeenAt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

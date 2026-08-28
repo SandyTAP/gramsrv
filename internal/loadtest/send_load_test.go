@@ -323,11 +323,16 @@ type loadMetrics struct {
 	failed    atomic.Int64
 }
 
-func (m *loadMetrics) MessageSend(time.Duration, bool, error) {}
-func (m *loadMetrics) MessageRateLimited(int)                 {}
-func (m *loadMetrics) OutboxClaimed(n int)                    { m.claimed.Add(int64(n)) }
-func (m *loadMetrics) OutboxDelivered(time.Duration)          { m.delivered.Add(1) }
-func (m *loadMetrics) OutboxFailed(error)                     { m.failed.Add(1) }
+func (m *loadMetrics) MessageSend(time.Duration, bool, error)          {}
+func (m *loadMetrics) MessageRateLimited(int)                          {}
+func (m *loadMetrics) OutboxClaimed(n int)                             { m.claimed.Add(int64(n)) }
+func (m *loadMetrics) OutboxDelivered(time.Duration)                   { m.delivered.Add(1) }
+func (m *loadMetrics) OutboxFailed(error)                              { m.failed.Add(1) }
+func (m *loadMetrics) PresenceLastSeenBatch(int, time.Duration, error) {}
+func (m *loadMetrics) PresenceLastSeenSubmitted()                      {}
+func (m *loadMetrics) PresenceLastSeenPending(int)                     {}
+func (m *loadMetrics) PresenceLastSeenOverflow()                       {}
+func (m *loadMetrics) PresenceLastSeenDrainDropped(int)                {}
 
 func seedUsers(t *testing.T, ctx context.Context, store *postgres.UserStore, n int) []int64 {
 	t.Helper()

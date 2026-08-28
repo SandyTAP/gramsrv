@@ -19,25 +19,36 @@ const privacyReadModelWarmTimeout = 5 * time.Second
 // ReadModelCacheSet 是 read_model_versions 通知可失效的进程内投影缓存集合。
 // 后续新增 read model 时，把缓存接到这里即可复用同一条 LISTEN 连接。
 type ReadModelCacheSet struct {
-	ReadModelVersions  store.ReadModelVersionCache
-	ChannelRows        *ChannelRowCache
-	ChannelMembers     *ChannelMemberCache
-	ChannelDialogs     *ChannelDialogCache
-	ChannelBoosts      *ChannelBoostCache
-	Contacts           ContactReadModelCache
-	Dialogs            DialogReadModelCache
-	Privacy            PrivacyReadModelCache
-	ProfilePhotos      ProfilePhotoReadModelCache
-	Stories            StoryReadModelCache
-	ChannelFullBots    ChannelFullBotReadModelCache
-	ChannelBotMembers  ChannelBotMemberReadModelCache
-	ChannelMediaCounts ChannelMediaCountReadModelCache
-	PrivateMediaCounts PrivateMediaCountReadModelCache
-	RPCProjections     RPCProjectionReadModelCache
-	BaseUsers          BaseUserCache
-	BotProfiles        BotProfileReadModelCache
-	StarGifts          StarGiftCatalogCache
-	AccountSettings    AccountSettingsReadModelCache
+	ReadModelVersions   store.ReadModelVersionCache
+	ChannelRows         *ChannelRowCache
+	ChannelTopMessages  *ChannelTopMessageCache
+	CommunityCatalog    *CommunityCatalogCache
+	ChannelMembers      *ChannelMemberCache
+	ChannelDialogs      *ChannelDialogCache
+	ChannelDifferences  *ChannelDifferenceBaseCache
+	ChannelBoosts       *ChannelBoostCache
+	Contacts            ContactReadModelCache
+	Dialogs             DialogReadModelCache
+	Privacy             PrivacyReadModelCache
+	ProfilePhotos       ProfilePhotoReadModelCache
+	Stories             StoryReadModelCache
+	ChannelFullBots     ChannelFullBotReadModelCache
+	ChannelBotMembers   ChannelBotMemberReadModelCache
+	ChannelMediaCounts  ChannelMediaCountReadModelCache
+	PrivateMediaCounts  PrivateMediaCountReadModelCache
+	RPCProjections      RPCProjectionReadModelCache
+	PeerIdentities      PeerIdentityReadModelCache
+	BaseUsers           BaseUserCache
+	BotProfiles         BotProfileReadModelCache
+	StarGifts           StarGiftCatalogCache
+	AccountSettings     AccountSettingsReadModelCache
+	UserProjectionFacts UserProjectionFactReadModelCache
+}
+
+type UserProjectionFactReadModelCache interface {
+	InvalidateAccountFreezeFact(userID int64)
+	InvalidateCollectiblePhoneFact(userID int64)
+	FlushUserProjectionFactReadModel()
 }
 
 type StarGiftCatalogCache interface {
@@ -78,6 +89,14 @@ type ContactReadModelCache interface {
 type DialogReadModelCache interface {
 	InvalidateDialog(ownerUserID int64, peer domain.Peer)
 	FlushReadModelCache()
+}
+
+type DialogOwnerReadModelCache interface {
+	InvalidateDialogOwner(ownerUserID int64)
+}
+
+type ChannelDialogListReadModelCache interface {
+	InvalidateDialogListsForChannel(channelID int64)
 }
 
 // ContactReadModelCaches fans out invalidation to multiple contact read-model caches.
@@ -161,6 +180,11 @@ type RPCProjectionReadModelCache interface {
 	FlushRPCProjectionReadModel()
 }
 
+type PeerIdentityReadModelCache interface {
+	InvalidatePeerIdentityReadModel(domain.Peer)
+	FlushPeerIdentityReadModel()
+}
+
 type readModelChangePayload struct {
 	Model       string `json:"model"`
 	OwnerUserID int64  `json:"owner_user_id"`
@@ -237,8 +261,11 @@ func (l *ReadModelChangeListener) listenAndConsume(ctx context.Context) error {
 func (l *ReadModelChangeListener) empty() bool {
 	return l.caches.ReadModelVersions == nil &&
 		l.caches.ChannelRows == nil &&
+		l.caches.ChannelTopMessages == nil &&
+		l.caches.CommunityCatalog == nil &&
 		l.caches.ChannelMembers == nil &&
 		l.caches.ChannelDialogs == nil &&
+		l.caches.ChannelDifferences == nil &&
 		l.caches.ChannelBoosts == nil &&
 		l.caches.Contacts == nil &&
 		l.caches.Dialogs == nil &&
@@ -250,10 +277,12 @@ func (l *ReadModelChangeListener) empty() bool {
 		l.caches.ChannelMediaCounts == nil &&
 		l.caches.PrivateMediaCounts == nil &&
 		l.caches.RPCProjections == nil &&
+		l.caches.PeerIdentities == nil &&
 		l.caches.BaseUsers == nil &&
 		l.caches.BotProfiles == nil &&
 		l.caches.StarGifts == nil &&
-		l.caches.AccountSettings == nil
+		l.caches.AccountSettings == nil &&
+		l.caches.UserProjectionFacts == nil
 }
 
 func (l *ReadModelChangeListener) flush(reasons ...string) {
@@ -270,6 +299,14 @@ func (l *ReadModelChangeListener) flush(reasons ...string) {
 		l.caches.ChannelRows.flush()
 		flushed = append(flushed, "channel_rows")
 	}
+	if l.caches.ChannelTopMessages != nil {
+		l.caches.ChannelTopMessages.flush()
+		flushed = append(flushed, "channel_top_messages")
+	}
+	if l.caches.CommunityCatalog != nil {
+		l.caches.CommunityCatalog.flush()
+		flushed = append(flushed, "community_catalog")
+	}
 	if l.caches.ChannelMembers != nil {
 		l.caches.ChannelMembers.flush()
 		flushed = append(flushed, "channel_members")
@@ -277,6 +314,10 @@ func (l *ReadModelChangeListener) flush(reasons ...string) {
 	if l.caches.ChannelDialogs != nil {
 		l.caches.ChannelDialogs.flush()
 		flushed = append(flushed, "channel_dialogs")
+	}
+	if l.caches.ChannelDifferences != nil {
+		l.caches.ChannelDifferences.flush()
+		flushed = append(flushed, "channel_differences")
 	}
 	if l.caches.ChannelBoosts != nil {
 		l.caches.ChannelBoosts.flush()
@@ -322,6 +363,10 @@ func (l *ReadModelChangeListener) flush(reasons ...string) {
 		l.caches.RPCProjections.FlushRPCProjectionReadModel()
 		flushed = append(flushed, "rpc_projections")
 	}
+	if l.caches.PeerIdentities != nil {
+		l.caches.PeerIdentities.FlushPeerIdentityReadModel()
+		flushed = append(flushed, "peer_identities")
+	}
 	if l.caches.BotProfiles != nil {
 		l.caches.BotProfiles.FlushBotProfileReadModel()
 		flushed = append(flushed, "bot_profiles")
@@ -333,6 +378,10 @@ func (l *ReadModelChangeListener) flush(reasons ...string) {
 	if l.caches.AccountSettings != nil {
 		l.caches.AccountSettings.FlushAccountSettingsReadModel()
 		flushed = append(flushed, "account_settings")
+	}
+	if l.caches.UserProjectionFacts != nil {
+		l.caches.UserProjectionFacts.FlushUserProjectionFactReadModel()
+		flushed = append(flushed, "user_projection_facts")
 	}
 	// 注意：BaseUsers(Redis) 刻意不在重连时 flush——它是跨实例共享缓存，整库清空会误伤
 	// 其它实例；漏掉的通知由其 5min TTL 兜底。
@@ -362,6 +411,10 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		}
 	}
 	switch evt.Model {
+	case "community_catalog":
+		if l.caches.CommunityCatalog != nil {
+			l.caches.CommunityCatalog.invalidate()
+		}
 	case "account_settings":
 		if evt.OwnerUserID != 0 && l.caches.AccountSettings != nil {
 			l.caches.AccountSettings.InvalidateAccountSettingsReadModel(evt.OwnerUserID)
@@ -394,6 +447,16 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 						zap.Int64("user_id", evt.PeerID), zap.Error(err))
 				}
 			}
+			// The deleted base user is no longer projected, but exact eviction keeps
+			// negative/positive durable overlay entries from occupying the bounded
+			// caches until unrelated LRU pressure removes them.
+			if l.caches.UserProjectionFacts != nil {
+				l.caches.UserProjectionFacts.InvalidateAccountFreezeFact(evt.PeerID)
+				l.caches.UserProjectionFacts.InvalidateCollectiblePhoneFact(evt.PeerID)
+			}
+			if l.caches.PeerIdentities != nil {
+				l.caches.PeerIdentities.InvalidatePeerIdentityReadModel(domain.Peer{Type: domain.PeerTypeUser, ID: evt.PeerID})
+			}
 		}
 	case "user_base":
 		if evt.PeerType == "user" && evt.PeerID != 0 {
@@ -418,11 +481,33 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		}
 	case "user_visibility":
 		if evt.PeerType == "user" && evt.PeerID != 0 {
+			if l.caches.UserProjectionFacts != nil {
+				l.caches.UserProjectionFacts.InvalidateAccountFreezeFact(evt.PeerID)
+			}
 			if l.caches.RPCProjections != nil {
 				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForUser(evt.PeerID)
 			}
 			if l.caches.Stories != nil {
 				l.caches.Stories.InvalidateStoryReadModelPeer(domain.Peer{Type: domain.PeerTypeUser, ID: evt.PeerID})
+			}
+		}
+	case "user_collectible_phone":
+		if evt.PeerType == "user" && evt.PeerID != 0 && l.caches.UserProjectionFacts != nil {
+			l.caches.UserProjectionFacts.InvalidateCollectiblePhoneFact(evt.PeerID)
+		}
+	case "peer_identity":
+		if evt.PeerID != 0 {
+			if peerType, ok := readModelPeerType(evt.PeerType); ok && l.caches.PeerIdentities != nil {
+				l.caches.PeerIdentities.InvalidatePeerIdentityReadModel(domain.Peer{Type: peerType, ID: evt.PeerID})
+			}
+			if l.caches.RPCProjections == nil {
+				break
+			}
+			switch evt.PeerType {
+			case "user":
+				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForUser(evt.PeerID)
+			case "channel":
+				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForChannel(evt.PeerID)
 			}
 		}
 	case "bot_full":
@@ -445,10 +530,15 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 			l.caches.RPCProjections.InvalidateRPCProjectionReadModelForViewer(evt.OwnerUserID)
 		}
 	case "story_peer":
-		// stories / story_hidden_peers 写(0135 触发器)→ 按 owner peer 失效该 peer 的
+		// stories / story_hidden_peers 写(基础 trigger + 0194 sparse read-model trigger)
+		// → 按 owner peer 失效该 peer 的
 		// 故事投影(ring/hidden/置顶可用性/置顶分页),实现跨实例失效。
 		if peerType, ok := readModelPeerType(evt.PeerType); ok && evt.PeerID != 0 && l.caches.Stories != nil {
 			l.caches.Stories.InvalidateStoryReadModelPeer(domain.Peer{Type: peerType, ID: evt.PeerID})
+		}
+	case "story_hidden_list":
+		if evt.OwnerUserID != 0 && evt.PeerType == "user" && evt.PeerID == evt.OwnerUserID && l.caches.Stories != nil {
+			l.caches.Stories.InvalidateStoryReadModelViewers(evt.OwnerUserID)
 		}
 	case "privacy_rules":
 		if evt.OwnerUserID != 0 && l.caches.Privacy != nil {
@@ -483,6 +573,12 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 				l.caches.RPCProjections.InvalidateRPCProjectionReadModelForPeer(evt.OwnerUserID, peer)
 			}
 		}
+	case "dialog_owner":
+		if evt.OwnerUserID != 0 {
+			if cache, ok := l.caches.Dialogs.(DialogOwnerReadModelCache); ok {
+				cache.InvalidateDialogOwner(evt.OwnerUserID)
+			}
+		}
 	case "profile_photo":
 		if peerType, ok := readModelPeerType(evt.PeerType); ok && evt.PeerID != 0 && l.caches.ProfilePhotos != nil {
 			l.caches.ProfilePhotos.InvalidateOwner(peerType, evt.PeerID)
@@ -496,14 +592,23 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 		}
 	case "channel_base":
 		if evt.PeerType == "channel" && evt.PeerID != 0 {
+			if cache, ok := l.caches.Dialogs.(ChannelDialogListReadModelCache); ok {
+				cache.InvalidateDialogListsForChannel(evt.PeerID)
+			}
 			if l.caches.ChannelRows != nil {
 				l.caches.ChannelRows.delete(evt.PeerID)
+			}
+			if l.caches.ChannelTopMessages != nil {
+				l.caches.ChannelTopMessages.deleteChannel(evt.PeerID)
 			}
 			if l.caches.ChannelMembers != nil {
 				l.caches.ChannelMembers.deleteChannel(evt.PeerID)
 			}
 			if l.caches.ChannelDialogs != nil {
 				l.caches.ChannelDialogs.deleteChannel(evt.PeerID)
+			}
+			if l.caches.ChannelDifferences != nil {
+				l.caches.ChannelDifferences.deleteChannel(evt.PeerID)
 			}
 			if l.caches.ChannelFullBots != nil {
 				l.caches.ChannelFullBots.InvalidateChannelFullBotInfoReadModel(evt.PeerID)
@@ -517,6 +622,10 @@ func (l *ReadModelChangeListener) handlePayload(payload string) {
 			if cache, ok := l.caches.Privacy.(PrivacyMembershipReadModelCache); ok {
 				cache.InvalidateChannelMemberships(evt.PeerID)
 			}
+		}
+	case "channel_difference_base":
+		if evt.PeerType == "channel" && evt.PeerID != 0 && l.caches.ChannelDifferences != nil {
+			l.caches.ChannelDifferences.deleteChannel(evt.PeerID)
 		}
 	case "channel_media_counts":
 		if evt.PeerType == "channel" && evt.PeerID != 0 && l.caches.ChannelMediaCounts != nil {

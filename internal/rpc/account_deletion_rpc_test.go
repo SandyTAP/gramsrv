@@ -32,7 +32,8 @@ func TestAccountDeleteRPCDeliversResultBeforeClosingCurrentSession(t *testing.T)
 		},
 	}
 	sessions := &deletionCaptureSessions{}
-	r := New(Config{}, Deps{Account: accountSvc, Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	facts := &recordingUserProjectionFactInvalidator{}
+	r := New(Config{}, Deps{Account: accountSvc, Sessions: sessions, UserProjectionFacts: facts}, zaptest.NewLogger(t), clock.System)
 	ctx := postresponse.WithCallbacks(WithSessionID(WithAuthKeyID(WithUserID(context.Background(), 42), current), 77))
 	ok, err := r.onAccountDeleteAccount(ctx, &tg.AccountDeleteAccountRequest{Reason: "manual"})
 	if err != nil || !ok {
@@ -46,6 +47,9 @@ func TestAccountDeleteRPCDeliversResultBeforeClosingCurrentSession(t *testing.T)
 	}
 	if accountSvc.sweepCalls != 0 {
 		t.Fatalf("account lifecycle sweeps before rpc_result delivery = %d, want 0", accountSvc.sweepCalls)
+	}
+	if len(facts.freezes) != 1 || facts.freezes[0] != 42 || len(facts.phones) != 1 || facts.phones[0] != 42 {
+		t.Fatalf("deleted user fact invalidations freezes=%v phones=%v, want [42]/[42]", facts.freezes, facts.phones)
 	}
 	postresponse.Run(ctx)
 	if !sessions.wasClosed(current) {
@@ -100,7 +104,8 @@ func TestAccountLifecyclePartialSweepFinishesCommittedDeletion(t *testing.T) {
 func TestModerationAccountDeletionClosesRevokedSessions(t *testing.T) {
 	revoked := [8]byte{4}
 	sessions := &deletionCaptureSessions{}
-	r := New(Config{}, Deps{Sessions: sessions}, zaptest.NewLogger(t), clock.System)
+	facts := &recordingUserProjectionFactInvalidator{}
+	r := New(Config{}, Deps{Sessions: sessions, UserProjectionFacts: facts}, zaptest.NewLogger(t), clock.System)
 	r.NotifyModerationAccountDeletion(context.Background(), domain.AccountDeletionResult{
 		Changed:               true,
 		User:                  domain.User{ID: 42, Deleted: true},
@@ -108,6 +113,9 @@ func TestModerationAccountDeletionClosesRevokedSessions(t *testing.T) {
 	})
 	if !sessions.wasClosed(revoked) {
 		t.Fatal("moderation-deleted authorization session was not closed")
+	}
+	if len(facts.freezes) != 1 || facts.freezes[0] != 42 || len(facts.phones) != 1 || facts.phones[0] != 42 {
+		t.Fatalf("moderation-deleted user fact invalidations freezes=%v phones=%v, want [42]/[42]", facts.freezes, facts.phones)
 	}
 }
 

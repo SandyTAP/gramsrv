@@ -48,7 +48,7 @@ func TestBindTempAuthKeyValidatesEncryptedMessage(t *testing.T) {
 		t.Fatalf("encrypt bind message: %v", err)
 	}
 
-	err = svc.BindTempAuthKey(ctx, sessionID, domain.TempAuthKeyBinding{
+	_, err = svc.BindTempAuthKey(ctx, sessionID, domain.TempAuthKeyBinding{
 		TempAuthKeyID:    tempKey.ID,
 		PermAuthKeyID:    permKey.IntID(),
 		Nonce:            nonce,
@@ -59,7 +59,7 @@ func TestBindTempAuthKeyValidatesEncryptedMessage(t *testing.T) {
 		t.Fatalf("BindTempAuthKey valid message: %v", err)
 	}
 
-	err = svc.BindTempAuthKey(ctx, sessionID+1, domain.TempAuthKeyBinding{
+	_, err = svc.BindTempAuthKey(ctx, sessionID+1, domain.TempAuthKeyBinding{
 		TempAuthKeyID:    tempKey.ID,
 		PermAuthKeyID:    permKey.IntID(),
 		Nonce:            nonce,
@@ -89,7 +89,7 @@ func TestBindTempAuthKeyValidatesEncryptedMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt extended bind message: %v", err)
 	}
-	err = svc.BindTempAuthKey(ctx, sessionID, domain.TempAuthKeyBinding{
+	_, err = svc.BindTempAuthKey(ctx, sessionID, domain.TempAuthKeyBinding{
 		TempAuthKeyID:    tempKey.ID,
 		PermAuthKeyID:    permKey.IntID(),
 		Nonce:            nonce,
@@ -120,17 +120,17 @@ func TestBindTempAuthKeyClassifiesExpiryWithoutDestroyingPermanentKey(t *testing
 		PermAuthKeyID: permKey.IntID(),
 		ExpiresAt:     int(time.Now().Add(time.Hour).Unix()),
 	}
-	if err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrTempAuthKeyEmpty) {
+	if _, err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrTempAuthKeyEmpty) {
 		t.Fatalf("expired protocol temp key err = %v, want ErrTempAuthKeyEmpty", err)
 	}
 
 	request.TempAuthKeyID = testAuthKey(0x33).ID
-	if err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrTempAuthKeyEmpty) {
+	if _, err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrTempAuthKeyEmpty) {
 		t.Fatalf("missing protocol temp key err = %v, want ErrTempAuthKeyEmpty", err)
 	}
 
 	request.ExpiresAt = int(time.Now().Add(-time.Second).Unix())
-	if err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrExpiresAtInvalid) {
+	if _, err := svc.BindTempAuthKey(ctx, 1001, request); !errors.Is(err, ErrExpiresAtInvalid) {
 		t.Fatalf("expired request proof err = %v, want ErrExpiresAtInvalid", err)
 	}
 }

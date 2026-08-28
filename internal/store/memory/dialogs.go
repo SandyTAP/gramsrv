@@ -98,6 +98,39 @@ func (s *DialogStore) ListByPeers(_ context.Context, userID int64, peers []domai
 	return out, nil
 }
 
+// ListPrivateDialogPeerIDs returns the bounded private-dialog peer set used by
+// presence fan-out. Keep this narrow read available in the in-memory
+// production-shaped fake as well: callers must not fall back to hydrating a
+// complete dialog page when a store implementation lacks the optimized path.
+func (s *DialogStore) ListPrivateDialogPeerIDs(_ context.Context, userID int64, limit int) ([]int64, error) {
+	s.mu.RLock()
+	dialogs := cloneDialogs(s.m[userID].Dialogs)
+	s.mu.RUnlock()
+
+	sort.SliceStable(dialogs, func(i, j int) bool {
+		return dialogLess(dialogs[i], dialogs[j])
+	})
+	if limit <= 0 || limit > 4096 {
+		limit = 4096
+	}
+	out := make([]int64, 0, min(limit, len(dialogs)))
+	seen := make(map[int64]struct{}, min(limit, len(dialogs)))
+	for _, dialog := range dialogs {
+		if dialog.Peer.Type != domain.PeerTypeUser || dialog.Peer.ID == 0 || dialog.Peer.ID == userID {
+			continue
+		}
+		if _, ok := seen[dialog.Peer.ID]; ok {
+			continue
+		}
+		seen[dialog.Peer.ID] = struct{}{}
+		out = append(out, dialog.Peer.ID)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // SaveList 保存一份用户会话列表，供测试和本地替身使用。
 func (s *DialogStore) SaveList(_ context.Context, userID int64, list domain.DialogList) error {
 	list.Dialogs = cloneDialogs(list.Dialogs)

@@ -560,8 +560,26 @@ func appendUniqueTGChats(base []tg.ChatClass, extra ...tg.ChatClass) []tg.ChatCl
 // helpers instead.
 func (r *Router) applyPeerReadModels(ctx context.Context, viewerUserID int64, users []tg.UserClass, chats []tg.ChatClass) {
 	r.applyStoryMaxIDsToPeerObjects(ctx, viewerUserID, users, chats)
-	r.applyUsernamesToPeerObjects(ctx, users, chats)
-	r.applyBotVerificationIconsToPeerObjects(ctx, users, chats)
+	r.applyPeerIdentitiesToPeerObjects(ctx, users, chats)
+}
+
+func (r *Router) applyPeerIdentitiesToPeerObjects(ctx context.Context, users []tg.UserClass, chats []tg.ChatClass) {
+	if len(users)+len(chats) == 0 || (r.deps.Usernames == nil && r.deps.BotVerifications == nil) {
+		return
+	}
+	peers := make([]domain.Peer, 0, len(users)+len(chats))
+	seen := make(map[domain.Peer]struct{}, len(users)+len(chats))
+	peers = appendUsernameProjectionPeers(peers, seen, users, chats)
+	if len(peers) == 0 {
+		return
+	}
+	usernames, verifications := r.peerIdentityMaps(ctx, peers, r.deps.Usernames != nil, r.deps.BotVerifications != nil)
+	if len(usernames) > 0 {
+		applyUsernamesFromRegistry(users, chats, usernames)
+	}
+	if len(verifications) > 0 {
+		applyBotVerificationIconsFromMap(users, chats, verifications)
+	}
 }
 
 func (r *Router) applyStoryMaxIDsToPeerObjects(ctx context.Context, viewerUserID int64, users []tg.UserClass, chats []tg.ChatClass) {

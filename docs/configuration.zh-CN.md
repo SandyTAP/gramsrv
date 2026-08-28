@@ -17,6 +17,7 @@
 - bool 接受 `1/true/TRUE/True/yes/on` 和 `0/false/FALSE/False/no/off`；列表使用逗号分隔；时长使用 Go 格式，例如 `200ms`、`30s`、`5m`、`168h`。
 - int、float、bool、duration 的非法文本会回退代码默认值；URL、app scheme、app name 以及登录邮箱依赖关系校验失败会阻止启动。
 - 不要提交真实密码、token、私有 DSN 或 TURN secret。生产环境应使用受保护的 service environment 或密钥管理系统。
+- `TELESRV_LOG_LEVEL` 在配置文件加载前从**进程环境变量**读取；默认 `info`，支持 `debug`、`warn`、`error` 等 zap level。成功 RPC 的逐请求轨迹只在 Debug 输出，错误、delivery fence 与 compatibility trace 在 Info 或更高等级保留。只把该键写进 `.env` 不生效。
 
 ## 2. MTProto 监听、传输与资源预算
 
@@ -31,14 +32,16 @@
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | 在 MTProto 监听端口启用 MTProto-over-WebSocket 分流。 |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | 浏览器 WebSocket origin 白名单；`*` 只用于临时调试。 |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | 全局物理连接 admission 上限；负数关闭该门禁。 |
-| `TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP` | int / `4096` | 单来源 IP 物理连接上限；负数关闭该门禁。 |
+| `TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP` | int / `4096` | 单来源 IP 物理连接上限。单机或同一 NAT 的 10,000-session 容量轮必须显式提高到预期连接数以上（本地验收 profile 使用 `20000`）；负数关闭该门禁。 |
 | `TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES` | int / `256` | 高成本 RSA/DH 握手并发上限；负数关闭该门禁。 |
 | `TELESRV_MTPROTO_RPC_MAX_INFLIGHT` | int / `32` | 单连接同时执行的 RPC 上限；非正值由 edge 归一为安全默认值。 |
 | `TELESRV_MTPROTO_RPC_QUEUE_SIZE` | int / `64` | 单连接 RPC 排队容量；非正值使用 edge 默认值。 |
 | `TELESRV_MTPROTO_RPC_TIMEOUT` | duration / `30s` | 调度后 RPC handler 的端到端超时。 |
 | `TELESRV_MTPROTO_RPC_GLOBAL_WORKERS` | int / `256` | 共享公平调度器 worker 数。 |
-| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS` | int / `8192` | 进程级排队与执行中的 RPC task 上限。 |
+| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS` | int / `32768` | 进程级已预留、排队与执行中的 RPC task/active owner 上限；默认覆盖 10,000-session 启动爬升，仍同时受 512MiB 请求 materialization charge、单连接/单 auth 和 deadline 门禁约束。 |
 | `TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES` | int64 charge bytes / `536870912` | 进程级已预留/排队/执行中 RPC 内存 charge 预算；legacy 等于 copied body，exact 是 typed decode 前按 wire 与生成对象放大计算的保守 materialization charge。nested gzip 展开后会在 decoder 分配 typed graph 前原子增长该 charge，grow 失败原子拒绝整批候选 RPC；该值不代表可并发接收同等大小的 wire body。 |
+| `TELESRV_MTPROTO_RPC_DELIVERY_HOOK_WORKERS` | int / `32` | 物理回包后 delivered cursor、session readiness 等可靠状态迁移的有界 worker 数；不应超过下游数据库并发能力。 |
+| `TELESRV_MTPROTO_RPC_DELIVERY_HOOK_MAX_PENDING` | int / `16384` | 每个 Server 的 reserved + queued + running delivery hook 总上限；必须不小于 worker 数。耗尽时 fail-closed，不先回成功再丢状态。 |
 | `TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES` | int / `262144` | pending owner 与未 ACK execution receipt 的全局上限。receipt 只存请求身份、执行结果和 Layer admission 元数据，不存 TL body；收到 `msgs_ack` 立即删除，331 秒仅是无 ACK 时的安全上限。 |
 | `TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES` | int / `32768` | 单 raw auth key 的 owner/receipt 条目上限；必须满足 `global >= auth >= session`。 |
 | `TELESRV_MTPROTO_RPC_EXECUTION_SESSION_MAX_ENTRIES` | int / `16384` | 单 `raw auth key + session_id` 的 owner/receipt 条目上限。 |
@@ -538,9 +541,62 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 |---|---|---|
 | `TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES` | int / `262144` | Router temp→perm auth-key binding 缓存容量。 |
 | `TELESRV_TEMP_KEY_CACHE_TTL` | duration / `30m` | 复核周期；正常写入由 bind/revoke 精确失效，TTL 兜底跨进程/异常路径。 |
+| `TELESRV_READ_MODEL_VERSION_CACHE_MAX` | int / `1000000` | durable read-model hash 的进程内 LRU 容量；NOTIFY 实时更新/失效，满载时只逐项驱逐，不再整表清空。 |
+| `TELESRV_READ_MODEL_VERSION_BATCH_MAX_KEYS` | int / `4096` | 同步跨请求 PostgreSQL loader 单批最多合并的 exact read-model selector 数。 |
+| `TELESRV_READ_MODEL_VERSION_BATCH_WAIT` | duration / `250us` | version cold batch 最大收集等待；每个调用者都等待自己的 exact result。 |
+| `TELESRV_READ_MODEL_VERSION_BATCH_QUEUE` | int / `16384` | version selector 有界队列；饱和显式失败，不启动逐请求 fallback read。 |
+| `TELESRV_READ_MODEL_VERSION_BATCH_TIMEOUT` | duration / `5s` | 单个 version batch 查询的 fail-closed 超时。 |
+| `TELESRV_AUTH_KEY_GET_BATCH_MAX` | int / `256` | 一条 PostgreSQL 查询最多合并的不同 first-frame permanent auth-key lookup/touch。 |
+| `TELESRV_AUTH_KEY_GET_BATCH_WAIT` | duration / `250us` | first-frame auth-key lookup 的最大同步微批等待。 |
+| `TELESRV_AUTH_KEY_GET_BATCH_QUEUE` | int / `16384` | first-frame lookup 有界队列；不得小于 batch max。 |
+| `TELESRV_AUTH_KEY_GET_BATCH_TIMEOUT` | duration / `5s` | 单个 auth-key lookup batch 的 fail-closed 超时；认证后的 revalidation 仍是独立权威读取。 |
+| `TELESRV_CONTACT_REVERSE_BATCH_MAX_PAIRS` | int / `4096` | 一条稀疏 PostgreSQL 查询最多合并的 exact `(contact owner, viewer)` relationship pair。 |
+| `TELESRV_CONTACT_REVERSE_BATCH_WAIT` | duration / `2ms` | sparse reverse-contact pair 的最大同步收集等待。 |
+| `TELESRV_CONTACT_REVERSE_BATCH_QUEUE` | int / `16384` | reverse-contact pair 有界队列；错误或饱和不回退 owner-wide scan。 |
+| `TELESRV_CONTACT_REVERSE_BATCH_TIMEOUT` | duration / `5s` | 单个 exact reverse-contact batch 查询的 fail-closed 超时。 |
+| `TELESRV_CONTACT_SNAPSHOT_CACHE_MAX_VIEWERS` | int / `16384` | owner contact-list 与 personal-photo snapshot 各自的 viewer LRU 上限；达限只驱逐最旧单项，必须为正数。 |
+| `TELESRV_PROFILE_PHOTO_CACHE_MAX` | int / `200000` | owner profile/fallback ref 正/负 LRU 的总条目上限；达限逐项驱逐，必须为正数。 |
+| `TELESRV_PROFILE_PHOTO_CACHE_TTL` | duration / `24h` | 漏通知/手工改库的安全复核周期；正常新鲜度由 `profile_photo` exact-owner NOTIFY 和 listener reconnect flush 保证，必须在 `(0,168h]`。 |
+| `TELESRV_PEER_IDENTITY_CACHE_MAX` | int / `1000000` | 合并后的 username vector + 第三方 verification viewer-independent `peer_identity` LRU 条目上限；durable token + NOTIFY 保证正/负值精确失效，不缓存权限。 |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_MAX` | int / `10000` | 进程内 materialized owner dialog snapshot 最大 owner 条目数。 |
+| `TELESRV_DIALOG_PRIVATE_PEER_CACHE_MAX` | int / `500000` | 私聊 dialog 结构事实 LRU 最大条目数；不缓存 viewer-shaped 用户投影。 |
+| `TELESRV_DIALOG_PRIVATE_PEER_CACHE_BYTES_MAX` | bytes / `268435456` | 私聊 dialog 结构事实 LRU 估算内存权重上限。 |
+| `TELESRV_DIALOG_DRAFT_CACHE_MAX` | int / `1000000` | 以 `dialog_light` 校验的 cloud-draft 正/负缓存最大条目数。 |
+| `TELESRV_DIALOG_DRAFT_CACHE_BYTES_MAX` | bytes / `268435456` | cloud-draft 正/负缓存估算内存权重上限。 |
+| `TELESRV_USER_PROJECTION_FACT_CACHE_MAX` | int / `1000000` | freeze 与 collectible-phone 两个 durable user fact 正/负 LRU 各自的条目上限。 |
+| `TELESRV_STORY_ACTIVE_PEER_CACHE_MAX` | int / `1000000` | 由 `story_peer` token 校验的 viewer-independent active-story 正/负 candidate 最大条目数；正值按 durable `expire_date` 自行到期。 |
+| `TELESRV_STORY_HIDDEN_LIST_CACHE_MAX` | int / `100000` | `story_hidden_list` 每 viewer 稀疏 hidden-peer 集合的最大 owner 条目数。 |
+| `TELESRV_STORY_HIDDEN_LIST_CACHE_BYTES_MAX` | bytes / `67108864` | 所有 viewer hidden-peer 稀疏集合的估算内存权重上限。 |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_HEADERS_MAX` | int / `1000000` | 所有 materialized owner snapshot 可驻留的 header-equivalent 总权重；与条目上限同时生效。变量名为兼容既有部署保留，不表示快照仍是 header-only。 |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_CACHE_TTL` | duration / `5m` | NOTIFY/版本失效之外的兜底 TTL；不是正确性时钟。 |
+| `TELESRV_DIALOG_LIST_SNAPSHOT_REDIS_TTL` | duration / `1h` | 跨进程 materialized owner dialog 快照的 Redis 保留时间；正确性由 durable read-model 版本校验保证。共享 channel row/top payload 不按 owner 重复存储。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_CACHE_MAX` | int / `32768` | session readiness active-channel page 的进程内 LRU 条目上限，覆盖 10,000 owner 与有界分页重叠。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_CACHE_TTL` | duration / `24h` | active-channel L1 的漏通知安全 TTL；正常新鲜度由 durable generation 保证。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_REDIS_TTL` | duration / `24h` | 跨进程、版本寻址的 active-channel ID page 保留时间；旧 generation key 自然过期。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_MAX` | int / `128` | Redis cold miss 的一条 PostgreSQL ordinality 查询最多合并的不同 owner/page selector。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_WAIT` | duration / `100ms` | cold selector 同步微批最大收集时间；只作用于 Redis miss。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_QUEUE` | int / `16384` | cold selector 有界等待队列；容量耗尽显式失败，不逐账号 fallback。 |
+| `TELESRV_ACTIVE_CHANNEL_IDS_BATCH_TIMEOUT` | duration / `5s` | 单个 active-channel cold batch 查询的 fail-closed 超时。 |
+| `TELESRV_LAYER_ADVANCE_BATCH_MAX` | int / `256` | 一条 PostgreSQL statement 最多包含的不同 raw-session Layer high-water 输入；同一 session 每批最多一次。 |
+| `TELESRV_LAYER_ADVANCE_BATCH_WAIT` | duration / `250us` | 收集同步 Layer fast attempt 的最大微批等待；调用必须等事务提交/失败后才返回。 |
+| `TELESRV_LAYER_ADVANCE_BATCH_QUEUE` | int / `8192` | Layer advance 有界等待队列；不得小于 batch max。 |
+| `TELESRV_LAYER_ADVANCE_BATCH_TIMEOUT` | duration / `5s` | 单个共享 batch SQL 的 fail-closed 超时；不触发异步补写或成功降级。 |
+| `TELESRV_BOOTSTRAP_READY_BATCH_MAX` | int / `32` | 一条 PostgreSQL statement 最多包含的不同 `(user,auth-key)` baseline readiness selector；同一 fence 每批最多一次。 |
+| `TELESRV_BOOTSTRAP_READY_BATCH_WAIT` | duration / `100ms` | post-response readiness 同步微批的最大收集等待；已接纳 callback 等待提交/失败。 |
+| `TELESRV_BOOTSTRAP_READY_BATCH_QUEUE` | int / `16384` | readiness selector 有界等待队列；不得小于 batch max，容量压力不会静默丢弃 durable fence。 |
+| `TELESRV_BOOTSTRAP_READY_BATCH_TIMEOUT` | duration / `5s` | 单个 readiness batch SQL 的 fail-closed 超时；失败时 job 保持 pending。 |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_MAX` | int / `512` | 一次 lifecycle last-seen PostgreSQL 批写的最大不同用户数；同用户取最大时间戳。 |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_WAIT` | duration / `1s` | lifecycle last-seen 微批最大收集时间；不影响内存在线判定或 wire `WasOnline`。 |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_QUEUE` | int / `65536` | 已接纳异步 lifecycle last-seen 的有界队列；满载会显式计数并执行权威直写安全阀。 |
+| `TELESRV_PRESENCE_LAST_SEEN_BATCH_TIMEOUT` | duration / `5s` | 单批数据库写与精确用户缓存失效的尝试超时；失败按有界退避重试。 |
+| `TELESRV_PRESENCE_LAST_SEEN_DRAIN_TIMEOUT` | duration / `10s` | 进程停止接纳后、持久化依赖关闭前的有界 drain 时间。 |
 | `TELESRV_CHANNEL_ROW_CACHE_MAX` | int / `50000` | 共享 channel row 缓存容量；`<=0` 同时关闭缓存及 LISTEN/NOTIFY listener。 |
-| `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `100000` | channel member/access read-model 缓存容量；`<=0` 关闭。 |
-| `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `100000` | viewer/channel dialog 投影缓存容量；`<=0` 关闭。 |
+| `TELESRV_CHANNEL_TOP_MESSAGE_CACHE_MAX` | int / `100000` | dialog 顶部频道消息共享缓存容量；不缓存 viewer 未读/reaction overlay，由 `channel_base` 通知按频道失效。`<=0` 禁用。 |
+| `TELESRV_CHANNEL_MEMBER_CACHE_MAX` | int / `1000000` | channel member/access read-model 缓存容量；materialized owner snapshot 会在同一失效 epoch 内暖写，覆盖 10,000 在线账号的活跃 membership；`<=0` 关闭。 |
+| `TELESRV_CHANNEL_DIALOG_CACHE_MAX` | int / `1000000` | viewer/channel dialog 投影缓存容量；按频道倒排精准失效，`<=0` 关闭。 |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_MAX` | int / `8192` | 共享 channel difference 基础页最大条目数；不含 viewer 权限/未读/dialog overlay，`<=0` 关闭。 |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_BYTES_MAX` | bytes / `268435456` | 共享 difference 基础页估算总内存上限，与条目数同时约束。 |
+| `TELESRV_CHANNEL_DIFFERENCE_CACHE_TTL` | duration / `5m` | 带外写安全兜底；正常失效依赖 `channel_base`/`channel_difference_base` 通知与稳定切面。 |
 | `TELESRV_CHANNEL_BOOST_CACHE_MAX` | int / `100000` | channel boost read-model 缓存容量；`<=0` 关闭。 |
 | `TELESRV_CHANNEL_BOOST_CACHE_TTL` | duration / `10s` | boost 失效通知遗漏时允许的最大陈旧窗口。 |
 

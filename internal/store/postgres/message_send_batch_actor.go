@@ -395,7 +395,7 @@ func lockDispatchOutboxAppendFences(ctx context.Context, tx pgx.Tx, userIDs []in
 SELECT pg_advisory_xact_lock_shared(dispatch_outbox_lane_advisory_key(streams.target_user_id))
 FROM unnest($1::bigint[]) AS streams(target_user_id)
 ORDER BY streams.target_user_id`, userIDs); err != nil {
-		return fmt.Errorf("lock plain private send dispatch append fences: %w", err)
+		return fmt.Errorf("lock dispatch outbox append fences: %w", err)
 	}
 	return nil
 }

@@ -61,6 +61,10 @@ const (
 	maxChannelSubscriptionsPerSession = 10
 	defaultChannelSubscriptionTTL     = 75 * time.Second
 	maxChannelSubscriptionTTL         = 2 * time.Minute
+	// A claim is normally released by its rpc_result delivery callback or the
+	// pending-update flush it starts. This lease only recovers the exceptional
+	// path where result encoding is replaced before the callback can be attached.
+	updatesActivationClaimTTL = time.Minute
 )
 
 // forceCloseBatchTimeout is one deadline for a whole revoke/replace/eviction batch. Conn.Close
@@ -193,6 +197,8 @@ type SessionManager struct {
 	flushing               map[sessionKey]bool         // 置位时暂存正在排空的 session；排空完成前推送继续进 pending 保序
 	pendingBudget          *outboundTrackedBudget      // 未就绪 session 暂存 encoded body 的进程级上限
 	logicalSessionReleased func(sessionKey)
+	updatesActivationSeq   uint64
+	bootstrapProbeSeq      uint64
 
 	lifecycle SessionLifecycleObserver
 	log       *zap.Logger
@@ -772,6 +778,8 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 		if old != userID {
 			m.clearSessionChannelIndexesLocked(c, key)
 			c.membershipsSynced.Store(false)
+			m.clearUpdatesActivationLocked(c)
+			m.clearBootstrapProbeLocked(c)
 			// 身份变化即丢弃暂存推送：它们属于前一个账号，flush 给新账号是跨账号泄露。
 			// 同时取消进行中的排空（runFlush 还另有 owner 校验做批内兜底）。
 			m.deletePendingLocked(key)
@@ -784,6 +792,8 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 	} else {
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
+		m.clearUpdatesActivationLocked(c)
+		m.clearBootstrapProbeLocked(c)
 		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 	}
@@ -849,6 +859,8 @@ func (m *SessionManager) bindAuthKeyLocked(c *Conn, key sessionKey, authKeyID [8
 		}
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
+		m.clearUpdatesActivationLocked(c)
+		m.clearBootstrapProbeLocked(c)
 		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 		c.userID.Store(0)
@@ -1117,6 +1129,8 @@ func (m *SessionManager) UnbindAuthKey(authKeyID [8]byte) int {
 		}
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
+		m.clearUpdatesActivationLocked(c)
+		m.clearBootstrapProbeLocked(c)
 		// 授权解除后暂存推送属于已登出的账号，不能等下一个登录者置位时 flush 出去。
 		m.deletePendingLocked(key)
 		delete(m.flushing, key)
@@ -1136,6 +1150,7 @@ func (m *SessionManager) setReceivesUpdatesLocked(c *Conn, key sessionKey, recei
 		c.receivesUpdates.Store(false)
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
+		m.clearUpdatesActivationLocked(c)
 		// 取消进行中的排空激活：runFlush 在置位前会复查该标志，标志已删则放弃置位，
 		// 避免把刚置 false 的开关翻回 true。
 		delete(m.flushing, key)
@@ -1149,11 +1164,15 @@ func (m *SessionManager) setReceivesUpdatesLocked(c *Conn, key sessionKey, recei
 		c.receivesUpdates.Store(false)
 		m.clearSessionChannelIndexesLocked(c, key)
 		c.membershipsSynced.Store(false)
+		m.clearUpdatesActivationLocked(c)
 		delete(m.flushing, key)
 		return 0, false
 	}
 	if c.receivesUpdates.Load() || m.flushing[key] {
 		// 已就绪，或已有排空协程在跑（完成时会自行取走新增暂存并置位）。
+		if c.receivesUpdates.Load() {
+			m.clearUpdatesActivationLocked(c)
+		}
 		return 0, false
 	}
 	if len(m.pending[key]) == 0 {
@@ -1183,6 +1202,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 			// 排空期间发生登出/换号：剩余暂存属于旧账号，丢弃且不得发给新账号。
 			m.deletePendingLocked(key)
 			delete(m.flushing, key)
+			m.clearUpdatesActivationLocked(c)
 			m.mu.Unlock()
 			return
 		}
@@ -1190,6 +1210,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 		if len(batch) == 0 {
 			c.receivesUpdates.Store(true)
 			delete(m.flushing, key)
+			m.clearUpdatesActivationLocked(c)
 			m.mu.Unlock()
 			return
 		}
@@ -1201,6 +1222,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				m.mu.Lock()
 				m.deletePendingLocked(key)
 				delete(m.flushing, key)
+				m.clearUpdatesActivationLocked(c)
 				m.mu.Unlock()
 				releaseQueuedPushes(batch[i:])
 				return
@@ -1247,6 +1269,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				if c.userID.Load() != owner {
 					m.deletePendingLocked(key)
 					delete(m.flushing, key)
+					m.clearUpdatesActivationLocked(c)
 				}
 				m.mu.Unlock()
 				releaseQueuedPushes(batch[i:])
@@ -1267,6 +1290,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 				c.receivesUpdates.Store(true)
 				m.deletePendingLocked(key)
 				delete(m.flushing, key)
+				m.clearUpdatesActivationLocked(c)
 				m.mu.Unlock()
 				m.log.Debug("Flush gave up after retries; activated with getDifference fallback",
 					zap.String("auth_key_id", sessionKeyLog(key.authKeyID)),
@@ -1305,6 +1329,119 @@ func (m *SessionManager) ReceivesUpdatesForAuthKey(authKeyID [8]byte, sessionID 
 	}
 	_, hasProfile := c.LayerProfile()
 	return hasProfile && c.receivesUpdates.Load() && c.membershipsSynced.Load()
+}
+
+// BeginSessionUpdatesActivation claims the readiness transition for the
+// current physical connection. Ordinary startup RPCs race here before they
+// register delivery hooks, so at most one of them can enqueue the expensive
+// channel-membership synchronization. Cursor commits remain request-owned.
+func (m *SessionManager) BeginSessionUpdatesActivation(authKeyID [8]byte, sessionID int64) (uint64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.bySession[key]
+	if c == nil || c.isRetired() {
+		return 0, false
+	}
+	if _, hasProfile := c.LayerProfile(); hasProfile && c.receivesUpdates.Load() && c.membershipsSynced.Load() {
+		return 0, false
+	}
+	now := time.Now()
+	if c.now != nil {
+		now = c.now()
+	}
+	if c.updatesActivationToken != 0 {
+		// A pending FIFO flush owns the activation until it reaches a terminal
+		// outcome. Never lease-steal while that ordered delivery is in progress.
+		if m.flushing[key] || now.Sub(c.updatesActivationAt) < updatesActivationClaimTTL {
+			return 0, false
+		}
+	}
+	m.updatesActivationSeq++
+	if m.updatesActivationSeq == 0 {
+		m.updatesActivationSeq++
+	}
+	c.updatesActivationToken = m.updatesActivationSeq
+	c.updatesActivationAt = now
+	return c.updatesActivationToken, true
+}
+
+// EndSessionUpdatesActivation releases only the token owned by the caller and
+// only on the same current physical Conn. If SetReceivesUpdates started an
+// ordered pending flush, that flush retains and releases the claim itself.
+func (m *SessionManager) EndSessionUpdatesActivation(authKeyID [8]byte, sessionID int64, token uint64) {
+	if m == nil || token == 0 {
+		return
+	}
+	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.bySession[key]
+	if c == nil || c.updatesActivationToken != token || m.flushing[key] {
+		return
+	}
+	m.clearUpdatesActivationLocked(c)
+}
+
+// BeginSessionBootstrapProbe claims the first durable bootstrap-job lookup for
+// the current physical connection generation. Unlike updates activation, this
+// is completed only by a delivered getState/getDifference baseline.
+func (m *SessionManager) BeginSessionBootstrapProbe(authKeyID [8]byte, sessionID int64) (uint64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.bySession[key]
+	if c == nil || c.isRetired() || c.bootstrapProbed || c.bootstrapProbeToken != 0 {
+		return 0, false
+	}
+	m.bootstrapProbeSeq++
+	if m.bootstrapProbeSeq == 0 {
+		m.bootstrapProbeSeq++
+	}
+	c.bootstrapProbeToken = m.bootstrapProbeSeq
+	return c.bootstrapProbeToken, true
+}
+
+// EndSessionBootstrapProbe completes or releases only the token on the same
+// current Conn. A delayed callback from a replaced connection cannot mutate the
+// replacement's one-shot state.
+func (m *SessionManager) EndSessionBootstrapProbe(authKeyID [8]byte, sessionID int64, token uint64, success bool) {
+	if m == nil || token == 0 {
+		return
+	}
+	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.bySession[key]
+	if c == nil || c.bootstrapProbeToken != token {
+		return
+	}
+	c.bootstrapProbeToken = 0
+	if success {
+		c.bootstrapProbed = true
+	}
+}
+
+func (m *SessionManager) clearUpdatesActivationLocked(c *Conn) {
+	if c == nil {
+		return
+	}
+	c.updatesActivationToken = 0
+	c.updatesActivationAt = time.Time{}
+}
+
+func (m *SessionManager) clearBootstrapProbeLocked(c *Conn) {
+	if c == nil {
+		return
+	}
+	c.bootstrapProbeToken = 0
+	c.bootstrapProbed = false
 }
 
 // SetReceivesUpdatesForAuthKey 标记指定 raw auth_key_id + session_id 是否接收主动 updates。
@@ -2298,6 +2435,7 @@ func (m *SessionManager) removeLocked(c *Conn, dropPending bool) int64 {
 		removeUserIndex(m.byUser, uid, key)
 	}
 	m.clearSessionChannelIndexesLocked(c, key)
+	m.clearUpdatesActivationLocked(c)
 	if dropPending {
 		m.deletePendingLocked(key)
 	}

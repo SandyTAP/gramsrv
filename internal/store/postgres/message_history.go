@@ -12,6 +12,8 @@ import (
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
+const retryableMessageTxAttempts = 3
+
 func (s *MessageStore) GetByIDs(ctx context.Context, userID int64, ids []int) (domain.MessageList, error) {
 	if userID == 0 || len(ids) == 0 {
 		return domain.MessageList{}, nil
@@ -301,7 +303,19 @@ func postgresSavedReactionKeys(reactions []domain.MessageReaction) []string {
 	return out
 }
 
-func (s *MessageStore) ReadHistory(ctx context.Context, req domain.ReadHistoryRequest) (res domain.ReadHistoryResult, err error) {
+func (s *MessageStore) ReadHistory(ctx context.Context, req domain.ReadHistoryRequest) (domain.ReadHistoryResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < retryableMessageTxAttempts; attempt++ {
+		res, err := s.readHistoryOnce(ctx, req)
+		if err == nil || !isRetryablePostgresTxError(err) || ctx.Err() != nil {
+			return res, err
+		}
+		lastErr = err
+	}
+	return domain.ReadHistoryResult{OwnerUserID: req.OwnerUserID, Peer: req.Peer, MaxID: req.MaxID}, lastErr
+}
+
+func (s *MessageStore) readHistoryOnce(ctx context.Context, req domain.ReadHistoryRequest) (res domain.ReadHistoryResult, err error) {
 	res = domain.ReadHistoryResult{OwnerUserID: req.OwnerUserID, Peer: req.Peer, MaxID: req.MaxID}
 	if req.OwnerUserID == 0 {
 		return res, fmt.Errorf("read history: missing owner user id")
@@ -332,6 +346,12 @@ func (s *MessageStore) ReadHistory(ctx context.Context, req domain.ReadHistoryRe
 	// advisory lock 串行化与会话对端的并发写（peer 即私聊另一方 / 回执 sender），须在行锁前获取。
 	if err := lockUsersForUpdate(ctx, tx, req.OwnerUserID, req.Peer.ID); err != nil {
 		return res, fmt.Errorf("lock read history users: %w", err)
+	}
+	// This transaction may append durable inbox and outbox receipts for two
+	// different users. Acquire both append fences before the first INSERT so a
+	// batched Egress completion cannot take the same lanes in the opposite order.
+	if err := lockDispatchOutboxAppendFences(ctx, tx, []int64{req.OwnerUserID, req.Peer.ID}); err != nil {
+		return res, fmt.Errorf("lock read history dispatch append fences: %w", err)
 	}
 
 	state, err := qtx.GetDialogReadStateForUpdate(ctx, sqlcgen.GetDialogReadStateForUpdateParams{

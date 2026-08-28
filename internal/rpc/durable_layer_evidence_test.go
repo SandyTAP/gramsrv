@@ -41,12 +41,40 @@ func TestDurableSessionLayerSurvivesRestartAndRejectsOldSelectorRollback(t *test
 		t.Fatalf("restart restore = (%d,%d,%v,%v)", layer, msgID, found, err)
 	}
 	layer, msgID, publish, err := restarted.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 10, 225, olderID)
-	if err != nil || layer != 227 || msgID != newerID || !publish {
+	if err != nil || layer != 227 || msgID != newerID || publish {
 		t.Fatalf("old selector after restart = (%d,%d,%v,%v)", layer, msgID, publish, err)
 	}
 	key, found, err := keys.Get(ctx, authKeyID)
 	if err != nil || !found || key.Layer != 227 {
 		t.Fatalf("durable default rolled back: key=%+v found=%v err=%v", key, found, err)
+	}
+}
+
+func TestDurableSessionLayerSameGenerationSkipsSharedPublication(t *testing.T) {
+	ctx := context.Background()
+	keys := memory.NewAuthKeyStore()
+	authKeyID := [8]byte{1, 0xb3}
+	if err := keys.Save(ctx, store.AuthKeyData{ID: authKeyID}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	msgIDs := proto.NewMessageIDGen(func() time.Time { return now })
+	firstID := int64(msgIDs.New(proto.MessageFromClient))
+	secondID := int64(msgIDs.New(proto.MessageFromClient))
+	r := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	if layer, msgID, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 11, 227, firstID); err != nil || layer != 227 || msgID != firstID || !publish {
+		t.Fatalf("first generation = (%d,%d,%v,%v)", layer, msgID, publish, err)
+	}
+	first, found, err := keys.GetSessionLayer(ctx, authKeyID, 11)
+	if err != nil || !found {
+		t.Fatalf("first row = (%+v,%v,%v)", first, found, err)
+	}
+	if layer, msgID, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 11, 227, secondID); err != nil || layer != 227 || msgID != secondID || publish {
+		t.Fatalf("same generation = (%d,%d,%v,%v)", layer, msgID, publish, err)
+	}
+	second, found, err := keys.GetSessionLayer(ctx, authKeyID, 11)
+	if err != nil || !found || second.ObservationID != first.ObservationID {
+		t.Fatalf("same-generation row = (%+v,%v,%v), first observation %d", second, found, err, first.ObservationID)
 	}
 }
 
@@ -174,6 +202,36 @@ func TestDurableSessionLayerCacheOrdersRebuiltRowsByObservationID(t *testing.T) 
 	}
 	if layer, msgID, found := r.NegotiatedSessionLayerEvidence(authKeyID, sessionID); !found || layer != 225 || msgID != 100 {
 		t.Fatalf("rebuilt local cache = (%d,%d,%v)", layer, msgID, found)
+	}
+}
+
+func TestDurableSessionLayerCacheAdvancesHighWaterWithinObservation(t *testing.T) {
+	now := time.Now().UTC()
+	r := New(Config{}, Deps{}, zaptest.NewLogger(t), clock.System)
+	authKeyID := [8]byte{3, 0xc6}
+	const sessionID = int64(306)
+	first := store.AuthKeySessionLayer{
+		Layer: 227, MessageID: 10_000, ObservationID: 10, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := r.cacheResolvedDurableSessionLayer(authKeyID, sessionID, first); err != nil {
+		t.Fatal(err)
+	}
+	advanced := first
+	advanced.MessageID = 20_000
+	advanced.ExpiresAt = now.Add(2 * time.Minute)
+	if err := r.cacheResolvedDurableSessionLayer(authKeyID, sessionID, advanced); err != nil {
+		t.Fatal(err)
+	}
+	if layer, msgID, found := r.NegotiatedSessionLayerEvidence(authKeyID, sessionID); !found || layer != 227 || msgID != 20_000 {
+		t.Fatalf("same-observation advance = (%d,%d,%v)", layer, msgID, found)
+	}
+	stale := first
+	stale.MessageID = 15_000
+	if err := r.cacheResolvedDurableSessionLayer(authKeyID, sessionID, stale); err != nil {
+		t.Fatal(err)
+	}
+	if layer, msgID, found := r.NegotiatedSessionLayerEvidence(authKeyID, sessionID); !found || layer != 227 || msgID != 20_000 {
+		t.Fatalf("stale same-observation read rolled cache back = (%d,%d,%v)", layer, msgID, found)
 	}
 }
 
