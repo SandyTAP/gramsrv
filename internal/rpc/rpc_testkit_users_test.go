@@ -38,6 +38,11 @@ func (s staticUsersService) ByID(_ context.Context, _, userID int64) (domain.Use
 	return domain.User{}, false, nil
 }
 
+func (s staticUsersService) BotStatus(_ context.Context, userID int64) (bool, bool, error) {
+	u, found, err := s.ByID(context.Background(), userID, userID)
+	return u.Bot, found, err
+}
+
 func (s staticUsersService) ByIDs(_ context.Context, _ int64, userIDs []int64) ([]domain.User, error) {
 	out := make([]domain.User, 0, len(userIDs))
 	seen := map[int64]struct{}{}
@@ -81,6 +86,11 @@ func (s mapUsersService) Self(_ context.Context, userID int64) (domain.User, err
 func (s mapUsersService) ByID(_ context.Context, _, userID int64) (domain.User, bool, error) {
 	u, ok := s.users[userID]
 	return u, ok, nil
+}
+
+func (s mapUsersService) BotStatus(_ context.Context, userID int64) (bool, bool, error) {
+	u, found := s.users[userID]
+	return u.Bot, found, nil
 }
 
 func (s mapUsersService) ByIDs(_ context.Context, _ int64, userIDs []int64) ([]domain.User, error) {

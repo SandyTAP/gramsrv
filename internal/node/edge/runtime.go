@@ -113,6 +113,7 @@ func runWithConfig(
 	}
 	edgeLocationRegistry := redisregistry.New(rdb)
 	edgeCommandBus := redisbus.New(rdb)
+	layerAuthority := &requiredAuthKeySessionLayerStore{}
 	codecRouter := rpc.New(rpc.Config{
 		DC:                            cfg.DC,
 		DefaultCountryCode:            cfg.DefaultCountryCode,
@@ -128,11 +129,10 @@ func runWithConfig(
 		TempKeyResolveCacheMaxEntries: cfg.TempKeyResolveCacheMaxEntries,
 		AuthUserCacheTTL:              cfg.AuthUserCacheTTL,
 	}, rpc.Deps{
-		Sessions: localEdgeControl,
-		Metrics:  metricRegistry,
+		Sessions:             localEdgeControl,
+		Metrics:              metricRegistry,
+		AuthKeySessionLayers: layerAuthority,
 	}, logger.Named("rpc").Named("edge-shell"), clock.System)
-	activeSessions.SetLifecycleObserver(codecRouter)
-
 	coreExecGRPCTargets, err := coreexec.ParseGRPCTargetsForResolver(cfg.CoreExecGRPCTargets, cfg.CoreExecGRPCResolver)
 	if err != nil {
 		return fmt.Errorf("parse TELESRV_CORE_EXEC_GRPC_TARGETS: %w", err)
@@ -158,6 +158,54 @@ func runWithConfig(
 	logger.Info("coreexec grpc health check passed",
 		zap.String("resolver", cfg.CoreExecGRPCResolver),
 		zap.Strings("targets", coreExecGRPCTargets))
+	lifecycleReporter, err := newEdgeSessionLifecycleReporter(
+		coreExecutor,
+		logger.Named("coreexec").Named("session-lifecycle"),
+	)
+	if err != nil {
+		return fmt.Errorf("create session lifecycle reporter: %w", err)
+	}
+	lifecycleObserver, err := newEdgeSessionLifecycleObserver(
+		codecRouter,
+		lifecycleReporter,
+		logger.Named("mtprotoedge").Named("session-lifecycle"),
+	)
+	if err != nil {
+		return fmt.Errorf("create session lifecycle observer: %w", err)
+	}
+	activeSessions.SetLifecycleObserver(lifecycleObserver)
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	go lifecycleReporter.Run(lifecycleCtx)
+	defer func() {
+		cancelLifecycle()
+		waitCtx, cancel := context.WithTimeout(context.Background(), edgeSessionOfflineDrainTimeout+time.Second)
+		defer cancel()
+		if err := lifecycleReporter.Wait(waitCtx); err != nil {
+			logger.Error("session lifecycle reporter did not stop cleanly", zap.Error(err))
+		}
+	}()
+	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
+		return []obsmetrics.GaugeSample{{
+			Name:  "telesrv_coreexec_session_offline_pending",
+			Value: float64(lifecycleReporter.Pending()),
+		}}
+	})
+	authKeyStore := coreexec.NewCachedAuthKeyStore(coreExecutor, coreexec.AuthKeyCacheConfig{
+		MaxEntries: cfg.AuthKeyCacheMaxEntries,
+		TTL:        cfg.AuthKeyCacheTTL,
+		Logger:     logger.Named("coreexec").Named("auth-key-cache"),
+	})
+	layerIdentitySource, err := newEdgeAuthKeyLayerIdentitySource(authKeyStore, coreExecutor, rdb)
+	if err != nil {
+		return fmt.Errorf("initialize Edge Layer identity source: %w", err)
+	}
+	authKeySessionLayers, err := redisstore.NewAuthKeySessionLayerStore(rdb, layerIdentitySource)
+	if err != nil {
+		return fmt.Errorf("initialize Edge Layer authority: %w", err)
+	}
+	if err := layerAuthority.Bind(authKeySessionLayers); err != nil {
+		return fmt.Errorf("bind Edge Layer authority: %w", err)
+	}
 
 	fileDataGRPCTargets, err := filedata.ParseGRPCTargetsForResolver(cfg.FileGRPCTargets, cfg.FileGRPCResolver)
 	if err != nil {
@@ -185,12 +233,6 @@ func runWithConfig(
 		zap.String("backend", fileDataRemote.Name()))
 
 	authInvalidationBroker := redisstore.NewAuthInvalidationBroker(rdb)
-	authKeyStore := coreexec.NewCachedAuthKeyStore(coreExecutor, coreexec.AuthKeyCacheConfig{
-		MaxEntries: cfg.AuthKeyCacheMaxEntries,
-		TTL:        cfg.AuthKeyCacheTTL,
-		Logger:     logger.Named("coreexec").Named("auth-key-cache"),
-	})
-
 	egressDeliveryGRPCTargets, err := egresssvc.ParseGRPCDeliveryTargetsForResolver(cfg.EgressDeliveryGRPCTargets, cfg.EgressDeliveryGRPCResolver)
 	if err != nil {
 		return fmt.Errorf("parse TELESRV_EGRESS_DELIVERY_GRPC_TARGETS: %w", err)

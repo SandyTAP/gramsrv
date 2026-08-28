@@ -65,7 +65,8 @@ func (r *Router) AdvanceNegotiatedSessionLayerEvidence(
 	if r.deps.AuthKeySessionLayers == nil {
 		return 0, 0, false, store.ErrAuthKeySessionLayerStoreRequired
 	}
-	current, _, err := r.deps.AuthKeySessionLayers.AdvanceSessionLayer(
+	profilePublished := r.hasPublishedAuthLayerProfile(rawAuthKeyID, layer)
+	current, applied, err := r.deps.AuthKeySessionLayers.AdvanceSessionLayer(
 		ctx,
 		rawAuthKeyID,
 		sessionID,
@@ -84,7 +85,21 @@ func (r *Router) AdvanceNegotiatedSessionLayerEvidence(
 	if err := r.cacheResolvedDurableSessionLayer(rawAuthKeyID, sessionID, current); err != nil {
 		return 0, 0, false, err
 	}
-	return current.Layer, current.MessageID, current.SharedDefault, nil
+	return current.Layer, current.MessageID,
+		applied && current.SharedDefault && !profilePublished, nil
+}
+
+// hasPublishedAuthLayerProfile reports only process-local publication state.
+// Durable exact-session restoration is not enough: after an Edge restart the
+// first fresh selector must still seed this process's live SessionManager.
+func (r *Router) hasPublishedAuthLayerProfile(rawAuthKeyID [8]byte, layer int) bool {
+	if r == nil || rawAuthKeyID == ([8]byte{}) || layer <= 0 {
+		return false
+	}
+	r.clientInfoMu.RLock()
+	current, found := r.authLayerEvidence[rawAuthKeyID]
+	r.clientInfoMu.RUnlock()
+	return found && current.durable && current.layer == layer
 }
 
 // cacheResolvedDurableSessionLayer updates only the bounded typed accelerator;

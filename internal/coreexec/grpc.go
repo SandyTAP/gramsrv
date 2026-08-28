@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"telesrv/internal/coreexec/coreexecpb"
+	"telesrv/internal/observability/dbtrace"
 	"telesrv/internal/postresponse"
 	"telesrv/internal/store"
 )
@@ -40,8 +41,8 @@ const (
 	defaultMaxGRPCMessageSize               = 16 << 20
 	accountTeardownCommitMaxAttempts        = 3
 	accountTeardownCommitInitialBackoff     = 25 * time.Millisecond
-	coreExecGRPCProtocolVersion             = 4
-	coreExecGRPCMinSupportedProtocolVersion = 4
+	coreExecGRPCProtocolVersion             = 5
+	coreExecGRPCMinSupportedProtocolVersion = 5
 	coreExecGRPCRequestIDMetadataKey        = "x-telesrv-coreexec-request-id"
 	coreExecGRPCRequestIDBytes              = 16
 )
@@ -53,6 +54,7 @@ var coreExecGRPCCapabilities = []string{
 	"profile-evidence",
 	"identity-hint",
 	"session-updates-readiness-hint",
+	"session-offline-batch",
 	"init-connection-observer",
 	"replay-prepare-commit",
 	"auth-key-authority",
@@ -60,6 +62,7 @@ var coreExecGRPCCapabilities = []string{
 
 var coreExecGRPCRequiredCapabilities = []string{
 	"auth-key-authority",
+	"session-offline-batch",
 	"session-updates-readiness-hint",
 	"updates-lifecycle-fencing",
 }
@@ -217,7 +220,7 @@ func StartGRPC(ctx context.Context, cfg GRPCServerConfig) (*grpc.Server, error) 
 		opts = append(opts, grpc.Creds(transportCreds))
 	}
 	srv := grpc.NewServer(opts...)
-	coreexecpb.RegisterCoreExecServiceServer(srv, newCoreExecGRPCServerWithRuntime(cfg.Handler, cfg.InstanceID, cfg.AuthKeys, cfg.AuthInvalidations))
+	coreexecpb.RegisterCoreExecServiceServer(srv, newCoreExecGRPCServerWithRuntime(cfg.Handler, cfg.InstanceID, cfg.AuthKeys, cfg.AuthInvalidations, cfg.Metrics))
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus(coreexecpb.CoreExecService_ServiceDesc.ServiceName, healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(srv, healthSrv)
@@ -773,6 +776,7 @@ type coreExecGRPCServer struct {
 	instanceID        string
 	authKeys          store.AuthKeyStore
 	authInvalidations store.AuthInvalidationBroker
+	metrics           Metrics
 	replayHookTTL     time.Duration
 	maxReplayHooks    int
 	replayMu          sync.Mutex
@@ -787,12 +791,17 @@ func newCoreExecGRPCServerWithInstanceID(handler Handler, instanceID string) *co
 	return newCoreExecGRPCServerWithRuntime(handler, instanceID, nil, nil)
 }
 
-func newCoreExecGRPCServerWithRuntime(handler Handler, instanceID string, authKeys store.AuthKeyStore, authInvalidations store.AuthInvalidationBroker) *coreExecGRPCServer {
+func newCoreExecGRPCServerWithRuntime(handler Handler, instanceID string, authKeys store.AuthKeyStore, authInvalidations store.AuthInvalidationBroker, metrics ...Metrics) *coreExecGRPCServer {
+	var registry Metrics
+	if len(metrics) != 0 {
+		registry = metrics[0]
+	}
 	return &coreExecGRPCServer{
 		handler:           handler,
 		instanceID:        strings.TrimSpace(instanceID),
 		authKeys:          authKeys,
 		authInvalidations: authInvalidations,
+		metrics:           coreExecMetrics(registry),
 		replayHookTTL:     defaultReplayHookTTL,
 		maxReplayHooks:    defaultMaxReplayHooks,
 		replayHooks:       make(map[string]replayHookEntry),
@@ -838,6 +847,17 @@ func (s *coreExecGRPCServer) DispatchAdmitted(ctx context.Context, req *coreexec
 	if got, want := proofFromAdmission(admitted), proofFromPB(req.GetProof()); got != want {
 		return nil, status.Error(codes.InvalidArgument, ErrWireProofMismatch.Error())
 	}
+	methodForMetrics := "unknown"
+	if _, method, ok := tlprofile.SemanticName(admitted.Call().Method()); ok && method != "" {
+		methodForMetrics = method
+	}
+	ctx, databaseStats := dbtrace.WithStats(ctx)
+	defer func() {
+		if databaseMetrics, ok := s.metrics.(RPCDatabaseMetrics); ok {
+			snapshot := databaseStats.Snapshot()
+			databaseMetrics.RPCDatabase(methodForMetrics, snapshot.Queries, snapshot.Duration, snapshot.Errors)
+		}
+	}()
 	ctx = postresponse.WithTypedActionDelivery(postresponse.WithCallbacks(ctx))
 	ctx = s.handler.WithLayerRPCProfileEvidenceFresh(ctx, req.GetProfileEvidenceFresh())
 	ctx, err = applyIdentityHintPB(ctx, s.handler, authKeyID, req.GetSessionId(), req.GetIdentityHint())
@@ -845,6 +865,9 @@ func (s *coreExecGRPCServer) DispatchAdmitted(ctx context.Context, req *coreexec
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	result, method, err := s.handler.DispatchAdmitted(ctx, authKeyID, req.GetSessionId(), req.GetMsgId(), req.GetAdmissionSeq(), admitted)
+	if method != "" {
+		methodForMetrics = method
+	}
 	res := &coreexecpb.DispatchResponse{Method: method}
 	if err != nil {
 		var rpcErr *tgerr.Error
@@ -1479,6 +1502,8 @@ func coreExecGRPCOperation(fullMethod string) string {
 		return "commit_admitted_replay"
 	case coreexecpb.CoreExecService_CommitPostResponseActions_FullMethodName:
 		return "commit_post_response_actions"
+	case coreexecpb.CoreExecService_ReportSessionOffline_FullMethodName:
+		return "report_session_offline"
 	case coreexecpb.CoreExecService_ResolveNegotiatedSessionLayer_FullMethodName:
 		return "resolve_negotiated_session_layer"
 	case coreexecpb.CoreExecService_ResolveInheritedAuthKeyLayer_FullMethodName:

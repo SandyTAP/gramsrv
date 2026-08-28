@@ -97,6 +97,7 @@ var selectedServerMetrics = map[string]struct{}{
 	"telesrv_presence_last_seen_pending":                       {},
 	"telesrv_presence_last_seen_overflow_total":                {},
 	"telesrv_presence_last_seen_drain_dropped_total":           {},
+	"telesrv_coreexec_grpc_calls_total":                        {},
 	"telesrv_metrics_dropped_observations_total":               {},
 }
 
@@ -163,7 +164,14 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 		// label. This supports attribution without copying auth/session/user
 		// cardinality.
 		values[name] += value
-		if isPerMethodOutcomeServerMetric(name) {
+		if isCoreExecOperationOutcomeServerMetric(name) {
+			side, sideOK := prometheusLabelValue(fields[0], "side")
+			operation, operationOK := prometheusLabelValue(fields[0], "operation")
+			outcome, outcomeOK := prometheusLabelValue(fields[0], "outcome")
+			if sideOK && operationOK && outcomeOK {
+				values[name+`{side="`+side+`",operation="`+operation+`",outcome="`+outcome+`"}`] += value
+			}
+		} else if isPerMethodOutcomeServerMetric(name) {
 			method, methodOK := prometheusLabelValue(fields[0], "method")
 			outcome, outcomeOK := prometheusLabelValue(fields[0], "outcome")
 			if methodOK && outcomeOK {
@@ -190,6 +198,10 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 	}
 	c.success.Add(1)
 	return values, nil
+}
+
+func isCoreExecOperationOutcomeServerMetric(name string) bool {
+	return name == "telesrv_coreexec_grpc_calls_total"
 }
 
 // waitForPresenceLastSeenSettlement waits until every expected lifecycle event

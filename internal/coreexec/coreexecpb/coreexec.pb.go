@@ -1456,6 +1456,126 @@ func (x *CommitPostResponseActionsResponse) GetError() string {
 	return ""
 }
 
+type SessionOfflineEvent struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	RawAuthKeyId   []byte                 `protobuf:"bytes,1,opt,name=raw_auth_key_id,json=rawAuthKeyId,proto3" json:"raw_auth_key_id,omitempty"`
+	SessionId      int64                  `protobuf:"varint,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	UserId         int64                  `protobuf:"varint,3,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	LastForUser    bool                   `protobuf:"varint,4,opt,name=last_for_user,json=lastForUser,proto3" json:"last_for_user,omitempty"`
+	DisconnectedAt int32                  `protobuf:"varint,5,opt,name=disconnected_at,json=disconnectedAt,proto3" json:"disconnected_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SessionOfflineEvent) Reset() {
+	*x = SessionOfflineEvent{}
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionOfflineEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionOfflineEvent) ProtoMessage() {}
+
+func (x *SessionOfflineEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionOfflineEvent.ProtoReflect.Descriptor instead.
+func (*SessionOfflineEvent) Descriptor() ([]byte, []int) {
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *SessionOfflineEvent) GetRawAuthKeyId() []byte {
+	if x != nil {
+		return x.RawAuthKeyId
+	}
+	return nil
+}
+
+func (x *SessionOfflineEvent) GetSessionId() int64 {
+	if x != nil {
+		return x.SessionId
+	}
+	return 0
+}
+
+func (x *SessionOfflineEvent) GetUserId() int64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *SessionOfflineEvent) GetLastForUser() bool {
+	if x != nil {
+		return x.LastForUser
+	}
+	return false
+}
+
+func (x *SessionOfflineEvent) GetDisconnectedAt() int32 {
+	if x != nil {
+		return x.DisconnectedAt
+	}
+	return 0
+}
+
+type SessionOfflineBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Events        []*SessionOfflineEvent `protobuf:"bytes,1,rep,name=events,proto3" json:"events,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionOfflineBatchRequest) Reset() {
+	*x = SessionOfflineBatchRequest{}
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionOfflineBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionOfflineBatchRequest) ProtoMessage() {}
+
+func (x *SessionOfflineBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionOfflineBatchRequest.ProtoReflect.Descriptor instead.
+func (*SessionOfflineBatchRequest) Descriptor() ([]byte, []int) {
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *SessionOfflineBatchRequest) GetEvents() []*SessionOfflineEvent {
+	if x != nil {
+		return x.Events
+	}
+	return nil
+}
+
 type AuthKeyRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RawAuthKeyId  []byte                 `protobuf:"bytes,1,opt,name=raw_auth_key_id,json=rawAuthKeyId,proto3" json:"raw_auth_key_id,omitempty"`
@@ -1469,7 +1589,7 @@ type AuthKeyRequest struct {
 
 func (x *AuthKeyRequest) Reset() {
 	*x = AuthKeyRequest{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[18]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1481,7 +1601,7 @@ func (x *AuthKeyRequest) String() string {
 func (*AuthKeyRequest) ProtoMessage() {}
 
 func (x *AuthKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[18]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1494,7 +1614,7 @@ func (x *AuthKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuthKeyRequest.ProtoReflect.Descriptor instead.
 func (*AuthKeyRequest) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{18}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *AuthKeyRequest) GetRawAuthKeyId() []byte {
@@ -1552,7 +1672,7 @@ type AuthKeyRecord struct {
 
 func (x *AuthKeyRecord) Reset() {
 	*x = AuthKeyRecord{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[19]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1564,7 +1684,7 @@ func (x *AuthKeyRecord) String() string {
 func (*AuthKeyRecord) ProtoMessage() {}
 
 func (x *AuthKeyRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[19]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1577,7 +1697,7 @@ func (x *AuthKeyRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuthKeyRecord.ProtoReflect.Descriptor instead.
 func (*AuthKeyRecord) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{19}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *AuthKeyRecord) GetAuthKeyId() []byte {
@@ -1675,7 +1795,7 @@ type GetAuthKeyResponse struct {
 
 func (x *GetAuthKeyResponse) Reset() {
 	*x = GetAuthKeyResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[20]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1687,7 +1807,7 @@ func (x *GetAuthKeyResponse) String() string {
 func (*GetAuthKeyResponse) ProtoMessage() {}
 
 func (x *GetAuthKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[20]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1700,7 +1820,7 @@ func (x *GetAuthKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAuthKeyResponse.ProtoReflect.Descriptor instead.
 func (*GetAuthKeyResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{20}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *GetAuthKeyResponse) GetAuthKey() *AuthKeyRecord {
@@ -1739,7 +1859,7 @@ type AuthKeyClientInfoRequest struct {
 
 func (x *AuthKeyClientInfoRequest) Reset() {
 	*x = AuthKeyClientInfoRequest{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[21]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1751,7 +1871,7 @@ func (x *AuthKeyClientInfoRequest) String() string {
 func (*AuthKeyClientInfoRequest) ProtoMessage() {}
 
 func (x *AuthKeyClientInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[21]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1764,7 +1884,7 @@ func (x *AuthKeyClientInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuthKeyClientInfoRequest.ProtoReflect.Descriptor instead.
 func (*AuthKeyClientInfoRequest) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{21}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *AuthKeyClientInfoRequest) GetAuthKeyId() []byte {
@@ -1830,7 +1950,7 @@ type PublishLayerEvidenceRequest struct {
 
 func (x *PublishLayerEvidenceRequest) Reset() {
 	*x = PublishLayerEvidenceRequest{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[22]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1842,7 +1962,7 @@ func (x *PublishLayerEvidenceRequest) String() string {
 func (*PublishLayerEvidenceRequest) ProtoMessage() {}
 
 func (x *PublishLayerEvidenceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[22]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1855,7 +1975,7 @@ func (x *PublishLayerEvidenceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishLayerEvidenceRequest.ProtoReflect.Descriptor instead.
 func (*PublishLayerEvidenceRequest) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{22}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PublishLayerEvidenceRequest) GetRawAuthKeyId() []byte {
@@ -1912,7 +2032,7 @@ type ResolveSessionLayerResponse struct {
 
 func (x *ResolveSessionLayerResponse) Reset() {
 	*x = ResolveSessionLayerResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[23]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1924,7 +2044,7 @@ func (x *ResolveSessionLayerResponse) String() string {
 func (*ResolveSessionLayerResponse) ProtoMessage() {}
 
 func (x *ResolveSessionLayerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[23]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1937,7 +2057,7 @@ func (x *ResolveSessionLayerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveSessionLayerResponse.ProtoReflect.Descriptor instead.
 func (*ResolveSessionLayerResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{23}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ResolveSessionLayerResponse) GetLayer() int32 {
@@ -1979,7 +2099,7 @@ type ResolveInheritedLayerResponse struct {
 
 func (x *ResolveInheritedLayerResponse) Reset() {
 	*x = ResolveInheritedLayerResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[24]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1991,7 +2111,7 @@ func (x *ResolveInheritedLayerResponse) String() string {
 func (*ResolveInheritedLayerResponse) ProtoMessage() {}
 
 func (x *ResolveInheritedLayerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[24]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2004,7 +2124,7 @@ func (x *ResolveInheritedLayerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveInheritedLayerResponse.ProtoReflect.Descriptor instead.
 func (*ResolveInheritedLayerResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{24}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ResolveInheritedLayerResponse) GetLayer() int32 {
@@ -2040,7 +2160,7 @@ type AdvanceSessionLayerResponse struct {
 
 func (x *AdvanceSessionLayerResponse) Reset() {
 	*x = AdvanceSessionLayerResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[25]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2052,7 +2172,7 @@ func (x *AdvanceSessionLayerResponse) String() string {
 func (*AdvanceSessionLayerResponse) ProtoMessage() {}
 
 func (x *AdvanceSessionLayerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[25]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2065,7 +2185,7 @@ func (x *AdvanceSessionLayerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdvanceSessionLayerResponse.ProtoReflect.Descriptor instead.
 func (*AdvanceSessionLayerResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{25}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *AdvanceSessionLayerResponse) GetCurrentLayer() int32 {
@@ -2106,7 +2226,7 @@ type DeleteSessionLayerResponse struct {
 
 func (x *DeleteSessionLayerResponse) Reset() {
 	*x = DeleteSessionLayerResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[26]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2118,7 +2238,7 @@ func (x *DeleteSessionLayerResponse) String() string {
 func (*DeleteSessionLayerResponse) ProtoMessage() {}
 
 func (x *DeleteSessionLayerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[26]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2131,7 +2251,7 @@ func (x *DeleteSessionLayerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSessionLayerResponse.ProtoReflect.Descriptor instead.
 func (*DeleteSessionLayerResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{26}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *DeleteSessionLayerResponse) GetDeleted() bool {
@@ -2166,7 +2286,7 @@ type ObserveInitConnectionRequest struct {
 
 func (x *ObserveInitConnectionRequest) Reset() {
 	*x = ObserveInitConnectionRequest{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[27]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2178,7 +2298,7 @@ func (x *ObserveInitConnectionRequest) String() string {
 func (*ObserveInitConnectionRequest) ProtoMessage() {}
 
 func (x *ObserveInitConnectionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[27]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2191,7 +2311,7 @@ func (x *ObserveInitConnectionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObserveInitConnectionRequest.ProtoReflect.Descriptor instead.
 func (*ObserveInitConnectionRequest) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{27}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ObserveInitConnectionRequest) GetAuthKeyId() []byte {
@@ -2273,7 +2393,7 @@ type ErrorResponse struct {
 
 func (x *ErrorResponse) Reset() {
 	*x = ErrorResponse{}
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[28]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2285,7 +2405,7 @@ func (x *ErrorResponse) String() string {
 func (*ErrorResponse) ProtoMessage() {}
 
 func (x *ErrorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[28]
+	mi := &file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2298,7 +2418,7 @@ func (x *ErrorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorResponse.ProtoReflect.Descriptor instead.
 func (*ErrorResponse) Descriptor() ([]byte, []int) {
-	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{28}
+	return file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ErrorResponse) GetError() string {
@@ -2420,7 +2540,16 @@ const file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc = "" +
 	" CommitPostResponseActionsRequest\x12A\n" +
 	"\aactions\x18\x01 \x03(\v2'.telesrv.coreexec.v1.PostResponseActionR\aactions\"9\n" +
 	"!CommitPostResponseActionsResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error\"\xa0\x01\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error\"\xc1\x01\n" +
+	"\x13SessionOfflineEvent\x12%\n" +
+	"\x0fraw_auth_key_id\x18\x01 \x01(\fR\frawAuthKeyId\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x02 \x01(\x03R\tsessionId\x12\x17\n" +
+	"\auser_id\x18\x03 \x01(\x03R\x06userId\x12\"\n" +
+	"\rlast_for_user\x18\x04 \x01(\bR\vlastForUser\x12'\n" +
+	"\x0fdisconnected_at\x18\x05 \x01(\x05R\x0edisconnectedAt\"^\n" +
+	"\x1aSessionOfflineBatchRequest\x12@\n" +
+	"\x06events\x18\x01 \x03(\v2(.telesrv.coreexec.v1.SessionOfflineEventR\x06events\"\xa0\x01\n" +
 	"\x0eAuthKeyRequest\x12%\n" +
 	"\x0fraw_auth_key_id\x18\x01 \x01(\fR\frawAuthKeyId\x12\x1d\n" +
 	"\n" +
@@ -2509,13 +2638,14 @@ const file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc = "" +
 	"\x15UpdateStateCommitMode\x12(\n" +
 	"$UPDATE_STATE_COMMIT_MODE_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"UPDATE_STATE_COMMIT_DELIVERED_ONLY\x10\x01\x127\n" +
-	"3UPDATE_STATE_COMMIT_DELIVERED_AND_OBSERVED_BASELINE\x10\x022\xef\f\n" +
+	"3UPDATE_STATE_COMMIT_DELIVERED_AND_OBSERVED_BASELINE\x10\x022\xdc\r\n" +
 	"\x0fCoreExecService\x12^\n" +
 	"\aGetInfo\x12(.telesrv.coreexec.v1.CoreExecInfoRequest\x1a).telesrv.coreexec.v1.CoreExecInfoResponse\x12_\n" +
 	"\x10DispatchAdmitted\x12$.telesrv.coreexec.v1.DispatchRequest\x1a%.telesrv.coreexec.v1.DispatchResponse\x12i\n" +
 	"\x15PrepareAdmittedReplay\x12$.telesrv.coreexec.v1.DispatchRequest\x1a*.telesrv.coreexec.v1.PrepareReplayResponse\x12k\n" +
 	"\x14CommitAdmittedReplay\x12(.telesrv.coreexec.v1.CommitReplayRequest\x1a).telesrv.coreexec.v1.CommitReplayResponse\x12\x8a\x01\n" +
-	"\x19CommitPostResponseActions\x125.telesrv.coreexec.v1.CommitPostResponseActionsRequest\x1a6.telesrv.coreexec.v1.CommitPostResponseActionsResponse\x12v\n" +
+	"\x19CommitPostResponseActions\x125.telesrv.coreexec.v1.CommitPostResponseActionsRequest\x1a6.telesrv.coreexec.v1.CommitPostResponseActionsResponse\x12k\n" +
+	"\x14ReportSessionOffline\x12/.telesrv.coreexec.v1.SessionOfflineBatchRequest\x1a\".telesrv.coreexec.v1.ErrorResponse\x12v\n" +
 	"\x1dResolveNegotiatedSessionLayer\x12#.telesrv.coreexec.v1.AuthKeyRequest\x1a0.telesrv.coreexec.v1.ResolveSessionLayerResponse\x12w\n" +
 	"\x1cResolveInheritedAuthKeyLayer\x12#.telesrv.coreexec.v1.AuthKeyRequest\x1a2.telesrv.coreexec.v1.ResolveInheritedLayerResponse\x12v\n" +
 	"\x1dAdvanceNegotiatedSessionLayer\x12#.telesrv.coreexec.v1.AuthKeyRequest\x1a0.telesrv.coreexec.v1.AdvanceSessionLayerResponse\x12t\n" +
@@ -2541,7 +2671,7 @@ func file_internal_coreexec_coreexecpb_coreexec_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_coreexec_coreexecpb_coreexec_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_internal_coreexec_coreexecpb_coreexec_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_internal_coreexec_coreexecpb_coreexec_proto_goTypes = []any{
 	(AdmissionMode)(0),                         // 0: telesrv.coreexec.v1.AdmissionMode
 	(UpdateStateCommitMode)(0),                 // 1: telesrv.coreexec.v1.UpdateStateCommitMode
@@ -2563,17 +2693,19 @@ var file_internal_coreexec_coreexecpb_coreexec_proto_goTypes = []any{
 	(*CommitReplayResponse)(nil),               // 17: telesrv.coreexec.v1.CommitReplayResponse
 	(*CommitPostResponseActionsRequest)(nil),   // 18: telesrv.coreexec.v1.CommitPostResponseActionsRequest
 	(*CommitPostResponseActionsResponse)(nil),  // 19: telesrv.coreexec.v1.CommitPostResponseActionsResponse
-	(*AuthKeyRequest)(nil),                     // 20: telesrv.coreexec.v1.AuthKeyRequest
-	(*AuthKeyRecord)(nil),                      // 21: telesrv.coreexec.v1.AuthKeyRecord
-	(*GetAuthKeyResponse)(nil),                 // 22: telesrv.coreexec.v1.GetAuthKeyResponse
-	(*AuthKeyClientInfoRequest)(nil),           // 23: telesrv.coreexec.v1.AuthKeyClientInfoRequest
-	(*PublishLayerEvidenceRequest)(nil),        // 24: telesrv.coreexec.v1.PublishLayerEvidenceRequest
-	(*ResolveSessionLayerResponse)(nil),        // 25: telesrv.coreexec.v1.ResolveSessionLayerResponse
-	(*ResolveInheritedLayerResponse)(nil),      // 26: telesrv.coreexec.v1.ResolveInheritedLayerResponse
-	(*AdvanceSessionLayerResponse)(nil),        // 27: telesrv.coreexec.v1.AdvanceSessionLayerResponse
-	(*DeleteSessionLayerResponse)(nil),         // 28: telesrv.coreexec.v1.DeleteSessionLayerResponse
-	(*ObserveInitConnectionRequest)(nil),       // 29: telesrv.coreexec.v1.ObserveInitConnectionRequest
-	(*ErrorResponse)(nil),                      // 30: telesrv.coreexec.v1.ErrorResponse
+	(*SessionOfflineEvent)(nil),                // 20: telesrv.coreexec.v1.SessionOfflineEvent
+	(*SessionOfflineBatchRequest)(nil),         // 21: telesrv.coreexec.v1.SessionOfflineBatchRequest
+	(*AuthKeyRequest)(nil),                     // 22: telesrv.coreexec.v1.AuthKeyRequest
+	(*AuthKeyRecord)(nil),                      // 23: telesrv.coreexec.v1.AuthKeyRecord
+	(*GetAuthKeyResponse)(nil),                 // 24: telesrv.coreexec.v1.GetAuthKeyResponse
+	(*AuthKeyClientInfoRequest)(nil),           // 25: telesrv.coreexec.v1.AuthKeyClientInfoRequest
+	(*PublishLayerEvidenceRequest)(nil),        // 26: telesrv.coreexec.v1.PublishLayerEvidenceRequest
+	(*ResolveSessionLayerResponse)(nil),        // 27: telesrv.coreexec.v1.ResolveSessionLayerResponse
+	(*ResolveInheritedLayerResponse)(nil),      // 28: telesrv.coreexec.v1.ResolveInheritedLayerResponse
+	(*AdvanceSessionLayerResponse)(nil),        // 29: telesrv.coreexec.v1.AdvanceSessionLayerResponse
+	(*DeleteSessionLayerResponse)(nil),         // 30: telesrv.coreexec.v1.DeleteSessionLayerResponse
+	(*ObserveInitConnectionRequest)(nil),       // 31: telesrv.coreexec.v1.ObserveInitConnectionRequest
+	(*ErrorResponse)(nil),                      // 32: telesrv.coreexec.v1.ErrorResponse
 }
 var file_internal_coreexec_coreexecpb_coreexec_proto_depIdxs = []int32{
 	5,  // 0: telesrv.coreexec.v1.WireProof.effective_profile:type_name -> telesrv.coreexec.v1.ProfileMark
@@ -2589,42 +2721,45 @@ var file_internal_coreexec_coreexecpb_coreexec_proto_depIdxs = []int32{
 	13, // 10: telesrv.coreexec.v1.UpdatesDeliveryAction.cursor_state:type_name -> telesrv.coreexec.v1.UpdateState
 	1,  // 11: telesrv.coreexec.v1.UpdatesDeliveryAction.cursor_mode:type_name -> telesrv.coreexec.v1.UpdateStateCommitMode
 	11, // 12: telesrv.coreexec.v1.CommitPostResponseActionsRequest.actions:type_name -> telesrv.coreexec.v1.PostResponseAction
-	21, // 13: telesrv.coreexec.v1.GetAuthKeyResponse.auth_key:type_name -> telesrv.coreexec.v1.AuthKeyRecord
-	2,  // 14: telesrv.coreexec.v1.CoreExecService.GetInfo:input_type -> telesrv.coreexec.v1.CoreExecInfoRequest
-	9,  // 15: telesrv.coreexec.v1.CoreExecService.DispatchAdmitted:input_type -> telesrv.coreexec.v1.DispatchRequest
-	9,  // 16: telesrv.coreexec.v1.CoreExecService.PrepareAdmittedReplay:input_type -> telesrv.coreexec.v1.DispatchRequest
-	16, // 17: telesrv.coreexec.v1.CoreExecService.CommitAdmittedReplay:input_type -> telesrv.coreexec.v1.CommitReplayRequest
-	18, // 18: telesrv.coreexec.v1.CoreExecService.CommitPostResponseActions:input_type -> telesrv.coreexec.v1.CommitPostResponseActionsRequest
-	20, // 19: telesrv.coreexec.v1.CoreExecService.ResolveNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	20, // 20: telesrv.coreexec.v1.CoreExecService.ResolveInheritedAuthKeyLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	20, // 21: telesrv.coreexec.v1.CoreExecService.AdvanceNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	20, // 22: telesrv.coreexec.v1.CoreExecService.DeleteNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	24, // 23: telesrv.coreexec.v1.CoreExecService.PublishLayerEvidence:input_type -> telesrv.coreexec.v1.PublishLayerEvidenceRequest
-	29, // 24: telesrv.coreexec.v1.CoreExecService.ObserveInitConnection:input_type -> telesrv.coreexec.v1.ObserveInitConnectionRequest
-	21, // 25: telesrv.coreexec.v1.CoreExecService.SaveAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRecord
-	20, // 26: telesrv.coreexec.v1.CoreExecService.GetAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	23, // 27: telesrv.coreexec.v1.CoreExecService.UpdateAuthKeyClientInfo:input_type -> telesrv.coreexec.v1.AuthKeyClientInfoRequest
-	20, // 28: telesrv.coreexec.v1.CoreExecService.DeleteAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRequest
-	3,  // 29: telesrv.coreexec.v1.CoreExecService.GetInfo:output_type -> telesrv.coreexec.v1.CoreExecInfoResponse
-	10, // 30: telesrv.coreexec.v1.CoreExecService.DispatchAdmitted:output_type -> telesrv.coreexec.v1.DispatchResponse
-	15, // 31: telesrv.coreexec.v1.CoreExecService.PrepareAdmittedReplay:output_type -> telesrv.coreexec.v1.PrepareReplayResponse
-	17, // 32: telesrv.coreexec.v1.CoreExecService.CommitAdmittedReplay:output_type -> telesrv.coreexec.v1.CommitReplayResponse
-	19, // 33: telesrv.coreexec.v1.CoreExecService.CommitPostResponseActions:output_type -> telesrv.coreexec.v1.CommitPostResponseActionsResponse
-	25, // 34: telesrv.coreexec.v1.CoreExecService.ResolveNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.ResolveSessionLayerResponse
-	26, // 35: telesrv.coreexec.v1.CoreExecService.ResolveInheritedAuthKeyLayer:output_type -> telesrv.coreexec.v1.ResolveInheritedLayerResponse
-	27, // 36: telesrv.coreexec.v1.CoreExecService.AdvanceNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.AdvanceSessionLayerResponse
-	28, // 37: telesrv.coreexec.v1.CoreExecService.DeleteNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.DeleteSessionLayerResponse
-	30, // 38: telesrv.coreexec.v1.CoreExecService.PublishLayerEvidence:output_type -> telesrv.coreexec.v1.ErrorResponse
-	30, // 39: telesrv.coreexec.v1.CoreExecService.ObserveInitConnection:output_type -> telesrv.coreexec.v1.ErrorResponse
-	30, // 40: telesrv.coreexec.v1.CoreExecService.SaveAuthKey:output_type -> telesrv.coreexec.v1.ErrorResponse
-	22, // 41: telesrv.coreexec.v1.CoreExecService.GetAuthKey:output_type -> telesrv.coreexec.v1.GetAuthKeyResponse
-	30, // 42: telesrv.coreexec.v1.CoreExecService.UpdateAuthKeyClientInfo:output_type -> telesrv.coreexec.v1.ErrorResponse
-	30, // 43: telesrv.coreexec.v1.CoreExecService.DeleteAuthKey:output_type -> telesrv.coreexec.v1.ErrorResponse
-	29, // [29:44] is the sub-list for method output_type
-	14, // [14:29] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	20, // 13: telesrv.coreexec.v1.SessionOfflineBatchRequest.events:type_name -> telesrv.coreexec.v1.SessionOfflineEvent
+	23, // 14: telesrv.coreexec.v1.GetAuthKeyResponse.auth_key:type_name -> telesrv.coreexec.v1.AuthKeyRecord
+	2,  // 15: telesrv.coreexec.v1.CoreExecService.GetInfo:input_type -> telesrv.coreexec.v1.CoreExecInfoRequest
+	9,  // 16: telesrv.coreexec.v1.CoreExecService.DispatchAdmitted:input_type -> telesrv.coreexec.v1.DispatchRequest
+	9,  // 17: telesrv.coreexec.v1.CoreExecService.PrepareAdmittedReplay:input_type -> telesrv.coreexec.v1.DispatchRequest
+	16, // 18: telesrv.coreexec.v1.CoreExecService.CommitAdmittedReplay:input_type -> telesrv.coreexec.v1.CommitReplayRequest
+	18, // 19: telesrv.coreexec.v1.CoreExecService.CommitPostResponseActions:input_type -> telesrv.coreexec.v1.CommitPostResponseActionsRequest
+	21, // 20: telesrv.coreexec.v1.CoreExecService.ReportSessionOffline:input_type -> telesrv.coreexec.v1.SessionOfflineBatchRequest
+	22, // 21: telesrv.coreexec.v1.CoreExecService.ResolveNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	22, // 22: telesrv.coreexec.v1.CoreExecService.ResolveInheritedAuthKeyLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	22, // 23: telesrv.coreexec.v1.CoreExecService.AdvanceNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	22, // 24: telesrv.coreexec.v1.CoreExecService.DeleteNegotiatedSessionLayer:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	26, // 25: telesrv.coreexec.v1.CoreExecService.PublishLayerEvidence:input_type -> telesrv.coreexec.v1.PublishLayerEvidenceRequest
+	31, // 26: telesrv.coreexec.v1.CoreExecService.ObserveInitConnection:input_type -> telesrv.coreexec.v1.ObserveInitConnectionRequest
+	23, // 27: telesrv.coreexec.v1.CoreExecService.SaveAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRecord
+	22, // 28: telesrv.coreexec.v1.CoreExecService.GetAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	25, // 29: telesrv.coreexec.v1.CoreExecService.UpdateAuthKeyClientInfo:input_type -> telesrv.coreexec.v1.AuthKeyClientInfoRequest
+	22, // 30: telesrv.coreexec.v1.CoreExecService.DeleteAuthKey:input_type -> telesrv.coreexec.v1.AuthKeyRequest
+	3,  // 31: telesrv.coreexec.v1.CoreExecService.GetInfo:output_type -> telesrv.coreexec.v1.CoreExecInfoResponse
+	10, // 32: telesrv.coreexec.v1.CoreExecService.DispatchAdmitted:output_type -> telesrv.coreexec.v1.DispatchResponse
+	15, // 33: telesrv.coreexec.v1.CoreExecService.PrepareAdmittedReplay:output_type -> telesrv.coreexec.v1.PrepareReplayResponse
+	17, // 34: telesrv.coreexec.v1.CoreExecService.CommitAdmittedReplay:output_type -> telesrv.coreexec.v1.CommitReplayResponse
+	19, // 35: telesrv.coreexec.v1.CoreExecService.CommitPostResponseActions:output_type -> telesrv.coreexec.v1.CommitPostResponseActionsResponse
+	32, // 36: telesrv.coreexec.v1.CoreExecService.ReportSessionOffline:output_type -> telesrv.coreexec.v1.ErrorResponse
+	27, // 37: telesrv.coreexec.v1.CoreExecService.ResolveNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.ResolveSessionLayerResponse
+	28, // 38: telesrv.coreexec.v1.CoreExecService.ResolveInheritedAuthKeyLayer:output_type -> telesrv.coreexec.v1.ResolveInheritedLayerResponse
+	29, // 39: telesrv.coreexec.v1.CoreExecService.AdvanceNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.AdvanceSessionLayerResponse
+	30, // 40: telesrv.coreexec.v1.CoreExecService.DeleteNegotiatedSessionLayer:output_type -> telesrv.coreexec.v1.DeleteSessionLayerResponse
+	32, // 41: telesrv.coreexec.v1.CoreExecService.PublishLayerEvidence:output_type -> telesrv.coreexec.v1.ErrorResponse
+	32, // 42: telesrv.coreexec.v1.CoreExecService.ObserveInitConnection:output_type -> telesrv.coreexec.v1.ErrorResponse
+	32, // 43: telesrv.coreexec.v1.CoreExecService.SaveAuthKey:output_type -> telesrv.coreexec.v1.ErrorResponse
+	24, // 44: telesrv.coreexec.v1.CoreExecService.GetAuthKey:output_type -> telesrv.coreexec.v1.GetAuthKeyResponse
+	32, // 45: telesrv.coreexec.v1.CoreExecService.UpdateAuthKeyClientInfo:output_type -> telesrv.coreexec.v1.ErrorResponse
+	32, // 46: telesrv.coreexec.v1.CoreExecService.DeleteAuthKey:output_type -> telesrv.coreexec.v1.ErrorResponse
+	31, // [31:47] is the sub-list for method output_type
+	15, // [15:31] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_internal_coreexec_coreexecpb_coreexec_proto_init() }
@@ -2642,7 +2777,7 @@ func file_internal_coreexec_coreexecpb_coreexec_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc), len(file_internal_coreexec_coreexecpb_coreexec_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   29,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

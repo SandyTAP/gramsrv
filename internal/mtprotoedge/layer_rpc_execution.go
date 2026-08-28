@@ -224,7 +224,7 @@ func (s *Server) handleAdmittedLayerRPC(
 	dur := s.clock.Now().Sub(start)
 	s.metrics.RPCHandled(effectiveMethod, dur, err)
 	dbSnapshot := dbStats.Snapshot()
-	if databaseMetrics, ok := s.metrics.(RPCDatabaseMetrics); ok {
+	if databaseMetrics, ok := s.metrics.(RPCDatabaseMetrics); ok && !dbSnapshot.Empty() {
 		databaseMetrics.RPCDatabase(effectiveMethod, dbSnapshot.Queries, dbSnapshot.Duration, dbSnapshot.Errors)
 	}
 	fields := []zap.Field{

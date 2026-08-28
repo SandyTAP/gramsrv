@@ -19,6 +19,7 @@ var (
 	_ mtprotoedge.LogicalOutboxMetrics    = (*Registry)(nil)
 	_ mtprotoedge.ConnectionIntakeMetrics = (*Registry)(nil)
 	_ coreexec.Metrics                    = (*Registry)(nil)
+	_ coreexec.RPCDatabaseMetrics         = (*Registry)(nil)
 	_ rpc.Metrics                         = (*Registry)(nil)
 )
 

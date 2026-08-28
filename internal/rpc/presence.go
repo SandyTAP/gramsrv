@@ -258,7 +258,7 @@ func (r *Router) announceSessionOnline(ctx context.Context, userID int64) {
 	// last_seen。bot 登录（importBotAuthorization）经此路径，必须整体短路——否则
 	// 与 bot 有私聊的用户会收到协议中不存在的 bot 在线/离线广播，bot 也不登记
 	// presence 条目，sweeper 因此天然不会遇到 bot。
-	if r.userIsBot(ctx, userID) {
+	if bot, known := r.userBotStatus(ctx, userID); !known || bot {
 		return
 	}
 	status, notify := r.setPresenceFromContext(ctx, userID, false, presencePersistAsync)
@@ -274,28 +274,50 @@ func (r *Router) announceSessionOnline(ctx context.Context, userID int64) {
 // userIsBot 报告 userID 是否为 bot 账号（presence 广播豁免用）。仅在连接生命周期
 // 事件（登录/断线/登出）调用，频率低；命中 redis UserCache。
 func (r *Router) userIsBot(ctx context.Context, userID int64) bool {
+	bot, known := r.userBotStatus(ctx, userID)
+	return known && bot
+}
+
+type botStatusResult struct {
+	bot   bool
+	known bool
+}
+
+func (r *Router) userBotStatus(ctx context.Context, userID int64) (bool, bool) {
 	if userID == 0 || r.deps.Users == nil {
-		return false
+		return false, false
 	}
 	// bot 标志不可变 → 永久 in-process 缓存，避免 announceSessionOnline 每 RPC 都发一次重投影
 	// Users.ByID。仅缓存已存在的用户结果。命中后纯内存。
 	if v, ok := r.botStatus.Load(userID); ok {
-		return v.(bool)
+		return v.(bool), true
 	}
 	// 冷启动洪峰下用 singleflight 合并并发首查：~50 个并发首帧只打 1 次 PG（其余共享），
 	// 避免 Users.ByID 重投影 herd（曾让首帧 user_resolve 飙到 ~1.1s）。
-	v, _, _ := r.authUserSF.Do("bot:"+strconv.FormatInt(userID, 10), func() (any, error) {
+	v, err, _ := r.authUserSF.Do("bot:"+strconv.FormatInt(userID, 10), func() (any, error) {
 		if cached, ok := r.botStatus.Load(userID); ok {
-			return cached.(bool), nil
+			return botStatusResult{bot: cached.(bool), known: true}, nil
+		}
+		if provider, ok := r.deps.Users.(BaseUserBotStatusProvider); ok {
+			bot, found, err := provider.BotStatus(ctx, userID)
+			if err != nil || !found {
+				return botStatusResult{}, err
+			}
+			r.botStatus.Store(userID, bot)
+			return botStatusResult{bot: bot, known: true}, nil
 		}
 		u, found, err := r.deps.Users.ByID(ctx, userID, userID)
 		if err != nil || !found {
-			return false, nil
+			return botStatusResult{}, err
 		}
 		r.botStatus.Store(userID, u.Bot)
-		return u.Bot, nil
+		return botStatusResult{bot: u.Bot, known: true}, nil
 	})
-	return v.(bool)
+	if err != nil {
+		return false, false
+	}
+	result := v.(botStatusResult)
+	return result.bot, result.known
 }
 
 func (r *Router) userPresenceStatus(userID int64) domain.UserStatus {
@@ -481,6 +503,14 @@ func (r *Router) presenceBackgroundContext(ctx context.Context, timeout time.Dur
 // 去抖宽限后在后台带超时执行——连接关闭发生在 serveConn 退出路径上，同步做
 // DB 写与逐 peer 查询会在断连风暴时放大 DB 压力并拖住 goroutine 退出。
 func (r *Router) SessionOffline(rawAuthKeyID [8]byte, sessionID, userID int64, lastForUser bool) {
+	r.SessionOfflineAt(rawAuthKeyID, sessionID, userID, lastForUser, int(r.clock.Now().Unix()))
+}
+
+// SessionOfflineAt applies a physical-session departure observed by Edge while
+// preserving the original disconnect timestamp across the batched CoreExec
+// lifecycle boundary. Duplicate reports are safe: session cleanup is
+// idempotent and the per-user offline timer is replaced by the newest event.
+func (r *Router) SessionOfflineAt(rawAuthKeyID [8]byte, sessionID, userID int64, lastForUser bool, disconnectedAt int) {
 	r.forgetClientSessionInfo(rawAuthKeyID, sessionID)
 	if userID == 0 {
 		return
@@ -490,7 +520,9 @@ func (r *Router) SessionOffline(rawAuthKeyID [8]byte, sessionID, userID int64, l
 	if !lastForUser {
 		return
 	}
-	disconnectedAt := int(r.clock.Now().Unix())
+	if disconnectedAt <= 0 {
+		disconnectedAt = int(r.clock.Now().Unix())
+	}
 	// 用可跟踪的定时器，重新上线时能取消（见 cancelOfflineTimer），避免断连风暴堆积。
 	r.presence.armOfflineTimer(userID, offlineAnnounceGrace, func() {
 		r.announceUserOfflineIfStillGone(rawAuthKeyID, sessionID, userID, disconnectedAt)
@@ -512,7 +544,7 @@ func (r *Router) announceUserOfflineIfStillGone(rawAuthKeyID [8]byte, sessionID,
 	defer cancel()
 	ctx = WithSessionID(WithRawAuthKeyID(ctx, rawAuthKeyID), sessionID)
 	// bot 不广播 offline、不写 last_seen（与 announceSessionOnline 对称）。
-	if r.userIsBot(ctx, userID) {
+	if bot, known := r.userBotStatus(ctx, userID); !known || bot {
 		return
 	}
 	status := domain.UserStatus{Kind: domain.UserStatusOffline, WasOnline: disconnectedAt}

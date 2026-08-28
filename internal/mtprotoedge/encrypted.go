@@ -787,7 +787,7 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, method str
 	dur := s.clock.Now().Sub(start)
 	s.metrics.RPCHandled(effectiveMethod, dur, dispatchErr)
 	dbSnapshot := dbStats.Snapshot()
-	if databaseMetrics, ok := s.metrics.(RPCDatabaseMetrics); ok {
+	if databaseMetrics, ok := s.metrics.(RPCDatabaseMetrics); ok && !dbSnapshot.Empty() {
 		databaseMetrics.RPCDatabase(effectiveMethod, dbSnapshot.Queries, dbSnapshot.Duration, dbSnapshot.Errors)
 	}
 	// 刷新本连接由 invokeWithLayer 证明并冻结的 exact-session layer。ok=false

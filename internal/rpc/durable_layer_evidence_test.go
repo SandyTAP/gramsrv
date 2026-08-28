@@ -40,12 +40,65 @@ func TestDurableSessionLayerSurvivesRestartAndRejectsOldSelectorRollback(t *test
 		t.Fatalf("restart restore = (%d,%d,%v,%v)", layer, msgID, found, err)
 	}
 	layer, msgID, publish, err := restarted.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 10, 225, olderID)
-	if err != nil || layer != 227 || msgID != newerID || !publish {
+	if err != nil || layer != 227 || msgID != newerID || publish {
 		t.Fatalf("old selector after restart = (%d,%d,%v,%v)", layer, msgID, publish, err)
 	}
 	key, found, err := keys.Get(ctx, authKeyID)
 	if err != nil || !found || key.Layer != 227 {
 		t.Fatalf("durable default rolled back: key=%+v found=%v err=%v", key, found, err)
+	}
+}
+
+func TestDurableSessionLayerSameProfileAdvancesWatermarkWithoutRepublishing(t *testing.T) {
+	ctx := context.Background()
+	keys := memory.NewAuthKeyStore()
+	authKeyID := [8]byte{1, 0x7a}
+	if err := keys.Save(ctx, store.AuthKeyData{ID: authKeyID}); err != nil {
+		t.Fatal(err)
+	}
+	msgIDs := proto.NewMessageIDGen(time.Now).New
+	firstMsgID := msgIDs(proto.MessageFromClient)
+	secondMsgID := msgIDs(proto.MessageFromClient)
+	thirdMsgID := msgIDs(proto.MessageFromClient)
+	r := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	if _, _, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 70, 227, firstMsgID); err != nil || !publish {
+		t.Fatalf("first generation publish=%v err=%v", publish, err)
+	}
+	if err := r.PublishAdmittedLayerProfileEvidence(ctx, authKeyID, 70, firstMsgID, 1, 1, 227); err != nil {
+		t.Fatalf("publish first generation: %v", err)
+	}
+	if layer, msgID, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 70, 227, secondMsgID); err != nil || layer != 227 || msgID != secondMsgID || publish {
+		t.Fatalf("same Layer advance=(%d,%d,%v,%v)", layer, msgID, publish, err)
+	}
+	if layer, msgID, publish, err := r.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 70, 228, thirdMsgID); err != nil || layer != 228 || msgID != thirdMsgID || !publish {
+		t.Fatalf("changed Layer advance=(%d,%d,%v,%v)", layer, msgID, publish, err)
+	}
+}
+
+func TestDurableSessionLayerRestartRepublishesSameProfileForLocalSeed(t *testing.T) {
+	ctx := context.Background()
+	keys := memory.NewAuthKeyStore()
+	authKeyID := [8]byte{1, 0x7b}
+	if err := keys.Save(ctx, store.AuthKeyData{ID: authKeyID}); err != nil {
+		t.Fatal(err)
+	}
+	msgIDs := proto.NewMessageIDGen(time.Now).New
+	firstMsgID := msgIDs(proto.MessageFromClient)
+	secondMsgID := msgIDs(proto.MessageFromClient)
+	first := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	if _, _, publish, err := first.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 71, 227, firstMsgID); err != nil || !publish {
+		t.Fatalf("first advance publish=%v err=%v", publish, err)
+	}
+	if err := first.PublishAdmittedLayerProfileEvidence(ctx, authKeyID, 71, firstMsgID, 1, 1, 227); err != nil {
+		t.Fatalf("first publication: %v", err)
+	}
+
+	restarted := New(Config{}, Deps{AuthKeySessionLayers: keys}, zaptest.NewLogger(t), clock.System)
+	if layer, msgID, found, err := restarted.ResolveNegotiatedSessionLayerEvidence(ctx, authKeyID, 71); err != nil || !found || layer != 227 || msgID != firstMsgID {
+		t.Fatalf("restart resolve=(%d,%d,%v,%v)", layer, msgID, found, err)
+	}
+	if layer, msgID, publish, err := restarted.AdvanceNegotiatedSessionLayerEvidence(ctx, authKeyID, 71, 227, secondMsgID); err != nil || layer != 227 || msgID != secondMsgID || !publish {
+		t.Fatalf("restart same Layer advance=(%d,%d,%v,%v)", layer, msgID, publish, err)
 	}
 }
 

@@ -49,6 +49,7 @@ import (
 	"telesrv/internal/domain"
 	"telesrv/internal/edgecontrol"
 	"telesrv/internal/mtprotoedge"
+	"telesrv/internal/observability/dbtrace"
 	"telesrv/internal/postresponse"
 	"telesrv/internal/rpc"
 	"telesrv/internal/store"
@@ -59,6 +60,27 @@ var grpcTestPhoneSequence atomic.Uint32
 
 type floodWaitDispatchHandler struct {
 	Handler
+}
+
+type databaseTraceDispatchHandler struct {
+	Handler
+}
+
+func (h *databaseTraceDispatchHandler) DispatchAdmitted(
+	ctx context.Context,
+	authKeyID [8]byte,
+	sessionID int64,
+	msgID int64,
+	admissionSeq uint64,
+	request tlprofile.Admission,
+) (tlprofile.Result, string, error) {
+	stats, ok := dbtrace.FromContext(ctx)
+	if !ok {
+		return nil, "", errors.New("CoreExec database trace missing")
+	}
+	stats.Add(2*time.Millisecond, nil)
+	stats.Add(3*time.Millisecond, nil)
+	return h.Handler.DispatchAdmitted(ctx, authKeyID, sessionID, msgID, admissionSeq, request)
 }
 
 func (h *floodWaitDispatchHandler) DispatchAdmitted(
@@ -474,6 +496,24 @@ func TestGRPCRemoteMetricsObserveClientCalls(t *testing.T) {
 	}
 }
 
+func TestCoreExecDispatchExportsCoreDatabaseWork(t *testing.T) {
+	coreRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	edgeRouter := rpc.New(rpc.Config{DC: 2, IP: "127.0.0.1", Port: 2398}, rpc.Deps{}, zaptest.NewLogger(t), clock.System)
+	metrics := &captureCoreExecMetrics{}
+	server := newCoreExecGRPCServerWithRuntime(
+		&databaseTraceDispatchHandler{Handler: coreRouter}, "core-db", nil, nil, metrics,
+	)
+	remote, cleanup := newBufGRPCRemoteWithServer(t, server, edgeRouter, "secret", "secret")
+	defer cleanup()
+	if err := dispatchHelpGetConfig(t, context.Background(), remote, 701); err != nil {
+		t.Fatal(err)
+	}
+	queries, duration, databaseErrors, found := metrics.database("help.getConfig")
+	if !found || queries != 2 || duration != 5*time.Millisecond || databaseErrors != 0 {
+		t.Fatalf("database metrics = queries:%d duration:%s errors:%d found:%v", queries, duration, databaseErrors, found)
+	}
+}
+
 func TestGRPCMetricsUnaryServerInterceptorObservesStatus(t *testing.T) {
 	metrics := &captureCoreExecMetrics{}
 	interceptor := grpcMetricsUnaryServerInterceptor(metrics)
@@ -706,8 +746,7 @@ func TestGRPCRemoteAppliesRequestTimeoutToProfileRPC(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, _, err := remote.ResolveInheritedAuthKeyLayer(context.Background(), [8]byte{1, 2, 3})
-		errCh <- err
+		errCh <- remote.PrimeAuthKeyLayerIdentity(context.Background(), [8]byte{1, 2, 3})
 	}()
 	select {
 	case got := <-core.deadlineCh:
@@ -2597,8 +2636,16 @@ type coreExecMetricEvent struct {
 }
 
 type captureCoreExecMetrics struct {
-	mu     sync.Mutex
-	events []coreExecMetricEvent
+	mu             sync.Mutex
+	events         []coreExecMetricEvent
+	databaseEvents []coreExecDatabaseMetricEvent
+}
+
+type coreExecDatabaseMetricEvent struct {
+	method   string
+	queries  int64
+	duration time.Duration
+	errors   int64
 }
 
 func (m *captureCoreExecMetrics) CoreExecGRPCCall(side, operation, outcome string, _ time.Duration) {
@@ -2611,6 +2658,25 @@ func (m *captureCoreExecMetrics) CoreExecPendingAdmissionRejected(transport, rea
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, coreExecMetricEvent{operation: "pending_admission_rejected", transport: transport, reason: reason})
+}
+
+func (m *captureCoreExecMetrics) RPCDatabase(method string, queries int64, duration time.Duration, databaseErrors int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.databaseEvents = append(m.databaseEvents, coreExecDatabaseMetricEvent{
+		method: method, queries: queries, duration: duration, errors: databaseErrors,
+	})
+}
+
+func (m *captureCoreExecMetrics) database(method string) (int64, time.Duration, int64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, event := range m.databaseEvents {
+		if event.method == method {
+			return event.queries, event.duration, event.errors, true
+		}
+	}
+	return 0, 0, 0, false
 }
 
 func (m *captureCoreExecMetrics) has(side, operation, outcome string) bool {

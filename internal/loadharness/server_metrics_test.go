@@ -36,6 +36,7 @@ func TestServerMetricsScrapeSelectsBoundedCapacitySignals(t *testing.T) {
 		fmt.Fprintln(w, `telesrv_bootstrap_ready_selectors_total{outcome="miss"} 800`)
 		fmt.Fprintln(w, `telesrv_bootstrap_ready_selectors_total{outcome="error"} 3`)
 		fmt.Fprintln(w, `telesrv_bootstrap_ready_pending 1`)
+		fmt.Fprintln(w, `telesrv_coreexec_grpc_calls_total{side="server",operation="report_session_offline",outcome="ok"} 12`)
 		fmt.Fprintln(w, `unrelated_high_cardinality{user_id="secret"} 1`)
 	}))
 	defer server.Close()
@@ -75,7 +76,11 @@ func TestServerMetricsScrapeSelectsBoundedCapacitySignals(t *testing.T) {
 		values["telesrv_bootstrap_ready_pending"] != 1 {
 		t.Fatalf("bootstrap readiness values = %#v", values)
 	}
-	if len(values) != 285 || client.successes() != 1 || client.failures() != 0 {
+	if values[`telesrv_coreexec_grpc_calls_total{side="server",operation="report_session_offline",outcome="ok"}`] != 12 ||
+		values["telesrv_coreexec_grpc_calls_total"] != 12 {
+		t.Fatalf("CoreExec operation values = %#v", values)
+	}
+	if len(values) != 287 || client.successes() != 1 || client.failures() != 0 {
 		t.Fatalf("bounded values/scrapes = %#v, %d/%d", values, client.successes(), client.failures())
 	}
 }

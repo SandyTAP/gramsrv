@@ -10,6 +10,13 @@ type Metrics interface {
 	CoreExecPendingAdmissionRejected(transport, reason string)
 }
 
+// RPCDatabaseMetrics is implemented by the shared metrics registry. CoreExec
+// observes it on the Core process because remote database work is not present
+// in the Edge request context.
+type RPCDatabaseMetrics interface {
+	RPCDatabase(method string, queries int64, duration time.Duration, errors int64)
+}
+
 // NopMetrics is the zero-cost CoreExec metrics implementation.
 type NopMetrics struct{}
 

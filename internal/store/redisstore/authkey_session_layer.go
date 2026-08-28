@@ -344,17 +344,11 @@ func (s *RedisAuthKeySessionLayerStore) ResolveCachedAuthKeyLayerIdentity(
 		return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeySessionLayerInvalid
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		values, err := getAuthKeyLayerIdentityScript.Run(ctx, s.c,
-			[]string{authKeyLayerIdentityKey(rawAuthKeyID)}).Slice()
-		if err != nil {
-			return store.AuthKeyLayerIdentity{}, false, fmt.Errorf("redis get auth key Layer identity: %w", err)
-		}
-		status, err := redisLayerStatus(values)
+		identity, found, err := ReadInstalledAuthKeyLayerIdentity(ctx, s.c, rawAuthKeyID)
 		if err != nil {
 			return store.AuthKeyLayerIdentity{}, false, err
 		}
-		switch status {
-		case "identity_missing":
+		if !found {
 			if attempt != 0 {
 				return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyNotFound
 			}
@@ -362,34 +356,65 @@ func (s *RedisAuthKeySessionLayerStore) ResolveCachedAuthKeyLayerIdentity(
 				return store.AuthKeyLayerIdentity{}, false, err
 			}
 			continue
-		case "ok":
-			effectiveHex, err := redisLayerStringAt(values, 1)
-			if err != nil {
-				return store.AuthKeyLayerIdentity{}, false, err
-			}
-			effectiveBytes, err := hex.DecodeString(effectiveHex)
-			if err != nil || len(effectiveBytes) != len(rawAuthKeyID) {
-				return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyBindingInvalid
-			}
-			var effective [8]byte
-			copy(effective[:], effectiveBytes)
-			ttlMillis, err := redisLayerInt64(values, 2)
-			if err != nil || ttlMillis == 0 || ttlMillis < -1 {
-				return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyBindingInvalid
-			}
-			rawExpiresAt := 0
-			if ttlMillis > 0 {
-				rawExpiresAt = int(time.Now().Add(time.Duration(ttlMillis) * time.Millisecond).Unix())
-			}
-			return store.AuthKeyLayerIdentity{
-				EffectiveAuthKeyID: effective,
-				RawExpiresAt:       rawExpiresAt,
-			}, true, nil
-		default:
-			return store.AuthKeyLayerIdentity{}, false, fmt.Errorf("redis get auth key Layer identity: %s state", status)
 		}
+		return identity, true, nil
 	}
 	return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyNotFound
+}
+
+// ReadInstalledAuthKeyLayerIdentity reads only the Redis raw-to-canonical
+// mapping. It never invokes a cold source and is therefore safe for Edge to use
+// after Core has explicitly primed a temporary-key identity. A missing mapping
+// is returned as found=false; Redis and structural errors remain fail-closed.
+func ReadInstalledAuthKeyLayerIdentity(
+	ctx context.Context,
+	c redis.UniversalClient,
+	rawAuthKeyID [8]byte,
+) (store.AuthKeyLayerIdentity, bool, error) {
+	if c == nil {
+		return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeySessionLayerStoreRequired
+	}
+	if rawAuthKeyID == ([8]byte{}) {
+		return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeySessionLayerInvalid
+	}
+	values, err := getAuthKeyLayerIdentityScript.Run(ctx, c,
+		[]string{authKeyLayerIdentityKey(rawAuthKeyID)}).Slice()
+	if err != nil {
+		return store.AuthKeyLayerIdentity{}, false, fmt.Errorf("redis get auth key Layer identity: %w", err)
+	}
+	status, err := redisLayerStatus(values)
+	if err != nil {
+		return store.AuthKeyLayerIdentity{}, false, err
+	}
+	switch status {
+	case "identity_missing":
+		return store.AuthKeyLayerIdentity{}, false, nil
+	case "ok":
+		effectiveHex, err := redisLayerStringAt(values, 1)
+		if err != nil {
+			return store.AuthKeyLayerIdentity{}, false, err
+		}
+		effectiveBytes, err := hex.DecodeString(effectiveHex)
+		if err != nil || len(effectiveBytes) != len(rawAuthKeyID) {
+			return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyBindingInvalid
+		}
+		var effective [8]byte
+		copy(effective[:], effectiveBytes)
+		ttlMillis, err := redisLayerInt64(values, 2)
+		if err != nil || ttlMillis == 0 || ttlMillis < -1 {
+			return store.AuthKeyLayerIdentity{}, false, store.ErrAuthKeyBindingInvalid
+		}
+		rawExpiresAt := 0
+		if ttlMillis > 0 {
+			rawExpiresAt = int(time.Now().Add(time.Duration(ttlMillis) * time.Millisecond).Unix())
+		}
+		return store.AuthKeyLayerIdentity{
+			EffectiveAuthKeyID: effective,
+			RawExpiresAt:       rawExpiresAt,
+		}, true, nil
+	default:
+		return store.AuthKeyLayerIdentity{}, false, fmt.Errorf("redis get auth key Layer identity: %s state", status)
+	}
 }
 
 func (s *RedisAuthKeySessionLayerStore) DeleteSessionLayer(

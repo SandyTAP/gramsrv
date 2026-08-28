@@ -11,6 +11,7 @@ service CoreExecService {
   rpc PrepareAdmittedReplay(DispatchRequest) returns (PrepareReplayResponse);
   rpc CommitAdmittedReplay(CommitReplayRequest) returns (CommitReplayResponse);
   rpc CommitPostResponseActions(CommitPostResponseActionsRequest) returns (CommitPostResponseActionsResponse);
+  rpc ReportSessionOffline(SessionOfflineBatchRequest) returns (ErrorResponse);
 
   rpc ResolveNegotiatedSessionLayer(AuthKeyRequest) returns (ResolveSessionLayerResponse);
   rpc ResolveInheritedAuthKeyLayer(AuthKeyRequest) returns (ResolveInheritedLayerResponse);
@@ -177,6 +178,18 @@ message CommitPostResponseActionsRequest {
 
 message CommitPostResponseActionsResponse {
   string error = 1;
+}
+
+message SessionOfflineEvent {
+  bytes raw_auth_key_id = 1;
+  int64 session_id = 2;
+  int64 user_id = 3;
+  bool last_for_user = 4;
+  int32 disconnected_at = 5;
+}
+
+message SessionOfflineBatchRequest {
+  repeated SessionOfflineEvent events = 1;
 }
 
 message AuthKeyRequest {

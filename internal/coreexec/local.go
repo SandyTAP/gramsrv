@@ -36,6 +36,7 @@ type Handler interface {
 	mtprotoedge.LayerRPCAdmissionProfilePublisher
 	mtprotoedge.RPCInitConnectionObserver
 	postresponse.ActionExecutor
+	SessionOfflineAt(rawAuthKeyID [8]byte, sessionID, userID int64, lastForUser bool, disconnectedAt int)
 }
 
 // Local adapts a Core router to the CoreExec server contract. Edge processes use
@@ -210,4 +211,11 @@ func (l *Local) RunPostResponseActions(ctx context.Context, actions []postrespon
 		return ErrNilHandler
 	}
 	return l.handler.RunPostResponseActions(ctx, actions)
+}
+
+func (l *Local) SessionOfflineAt(rawAuthKeyID [8]byte, sessionID, userID int64, lastForUser bool, disconnectedAt int) {
+	if l == nil || l.handler == nil {
+		return
+	}
+	l.handler.SessionOfflineAt(rawAuthKeyID, sessionID, userID, lastForUser, disconnectedAt)
 }

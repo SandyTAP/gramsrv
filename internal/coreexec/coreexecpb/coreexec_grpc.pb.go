@@ -24,6 +24,7 @@ const (
 	CoreExecService_PrepareAdmittedReplay_FullMethodName         = "/telesrv.coreexec.v1.CoreExecService/PrepareAdmittedReplay"
 	CoreExecService_CommitAdmittedReplay_FullMethodName          = "/telesrv.coreexec.v1.CoreExecService/CommitAdmittedReplay"
 	CoreExecService_CommitPostResponseActions_FullMethodName     = "/telesrv.coreexec.v1.CoreExecService/CommitPostResponseActions"
+	CoreExecService_ReportSessionOffline_FullMethodName          = "/telesrv.coreexec.v1.CoreExecService/ReportSessionOffline"
 	CoreExecService_ResolveNegotiatedSessionLayer_FullMethodName = "/telesrv.coreexec.v1.CoreExecService/ResolveNegotiatedSessionLayer"
 	CoreExecService_ResolveInheritedAuthKeyLayer_FullMethodName  = "/telesrv.coreexec.v1.CoreExecService/ResolveInheritedAuthKeyLayer"
 	CoreExecService_AdvanceNegotiatedSessionLayer_FullMethodName = "/telesrv.coreexec.v1.CoreExecService/AdvanceNegotiatedSessionLayer"
@@ -45,6 +46,7 @@ type CoreExecServiceClient interface {
 	PrepareAdmittedReplay(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (*PrepareReplayResponse, error)
 	CommitAdmittedReplay(ctx context.Context, in *CommitReplayRequest, opts ...grpc.CallOption) (*CommitReplayResponse, error)
 	CommitPostResponseActions(ctx context.Context, in *CommitPostResponseActionsRequest, opts ...grpc.CallOption) (*CommitPostResponseActionsResponse, error)
+	ReportSessionOffline(ctx context.Context, in *SessionOfflineBatchRequest, opts ...grpc.CallOption) (*ErrorResponse, error)
 	ResolveNegotiatedSessionLayer(ctx context.Context, in *AuthKeyRequest, opts ...grpc.CallOption) (*ResolveSessionLayerResponse, error)
 	ResolveInheritedAuthKeyLayer(ctx context.Context, in *AuthKeyRequest, opts ...grpc.CallOption) (*ResolveInheritedLayerResponse, error)
 	AdvanceNegotiatedSessionLayer(ctx context.Context, in *AuthKeyRequest, opts ...grpc.CallOption) (*AdvanceSessionLayerResponse, error)
@@ -109,6 +111,16 @@ func (c *coreExecServiceClient) CommitPostResponseActions(ctx context.Context, i
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitPostResponseActionsResponse)
 	err := c.cc.Invoke(ctx, CoreExecService_CommitPostResponseActions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coreExecServiceClient) ReportSessionOffline(ctx context.Context, in *SessionOfflineBatchRequest, opts ...grpc.CallOption) (*ErrorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ErrorResponse)
+	err := c.cc.Invoke(ctx, CoreExecService_ReportSessionOffline_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +236,7 @@ type CoreExecServiceServer interface {
 	PrepareAdmittedReplay(context.Context, *DispatchRequest) (*PrepareReplayResponse, error)
 	CommitAdmittedReplay(context.Context, *CommitReplayRequest) (*CommitReplayResponse, error)
 	CommitPostResponseActions(context.Context, *CommitPostResponseActionsRequest) (*CommitPostResponseActionsResponse, error)
+	ReportSessionOffline(context.Context, *SessionOfflineBatchRequest) (*ErrorResponse, error)
 	ResolveNegotiatedSessionLayer(context.Context, *AuthKeyRequest) (*ResolveSessionLayerResponse, error)
 	ResolveInheritedAuthKeyLayer(context.Context, *AuthKeyRequest) (*ResolveInheritedLayerResponse, error)
 	AdvanceNegotiatedSessionLayer(context.Context, *AuthKeyRequest) (*AdvanceSessionLayerResponse, error)
@@ -258,6 +271,9 @@ func (UnimplementedCoreExecServiceServer) CommitAdmittedReplay(context.Context, 
 }
 func (UnimplementedCoreExecServiceServer) CommitPostResponseActions(context.Context, *CommitPostResponseActionsRequest) (*CommitPostResponseActionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CommitPostResponseActions not implemented")
+}
+func (UnimplementedCoreExecServiceServer) ReportSessionOffline(context.Context, *SessionOfflineBatchRequest) (*ErrorResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportSessionOffline not implemented")
 }
 func (UnimplementedCoreExecServiceServer) ResolveNegotiatedSessionLayer(context.Context, *AuthKeyRequest) (*ResolveSessionLayerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResolveNegotiatedSessionLayer not implemented")
@@ -396,6 +412,24 @@ func _CoreExecService_CommitPostResponseActions_Handler(srv interface{}, ctx con
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(CoreExecServiceServer).CommitPostResponseActions(ctx, req.(*CommitPostResponseActionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoreExecService_ReportSessionOffline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SessionOfflineBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoreExecServiceServer).ReportSessionOffline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoreExecService_ReportSessionOffline_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoreExecServiceServer).ReportSessionOffline(ctx, req.(*SessionOfflineBatchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -606,6 +640,10 @@ var CoreExecService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CommitPostResponseActions",
 			Handler:    _CoreExecService_CommitPostResponseActions_Handler,
+		},
+		{
+			MethodName: "ReportSessionOffline",
+			Handler:    _CoreExecService_ReportSessionOffline_Handler,
 		},
 		{
 			MethodName: "ResolveNegotiatedSessionLayer",

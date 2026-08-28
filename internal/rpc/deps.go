@@ -110,6 +110,13 @@ type UsersService interface {
 	UpdatePersonalChannelWithDelivery(ctx context.Context, userID int64, channelID int64, effects store.DeliveryEffectsBuilder[store.UserDeliverySnapshot]) (domain.User, error)
 }
 
+// BaseUserBotStatusProvider exposes the immutable, viewer-independent bot bit
+// without constructing a full user projection. Production users.Service
+// implements it through the shared base-user Redis read model.
+type BaseUserBotStatusProvider interface {
+	BotStatus(ctx context.Context, userID int64) (bot bool, found bool, err error)
+}
+
 type CollectiblePhoneService interface {
 	CollectiblePhone(ctx context.Context, phone string) (domain.CollectiblePhone, error)
 }

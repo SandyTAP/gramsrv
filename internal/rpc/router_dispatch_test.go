@@ -1103,6 +1103,7 @@ func TestDispatchAnnouncesPresenceWhenSessionIdentityRestored(t *testing.T) {
 		Auth:     auth,
 		Dialogs:  appdialogs.NewService(dialogs),
 		Sessions: sessions,
+		Users:    staticUsersService{user: bob},
 	}, zaptest.NewLogger(t), clock.System)
 	req := &tg.HelpGetConfigRequest{}
 
@@ -1155,6 +1156,7 @@ func TestDispatchPushesOnlinePeerStatusesToRestoredSession(t *testing.T) {
 		Auth:     auth,
 		Dialogs:  appdialogs.NewService(dialogs),
 		Sessions: sessions,
+		Users:    mapUsersService{users: map[int64]domain.User{alice.ID: alice, bob.ID: bob}},
 	}, zaptest.NewLogger(t), clock.System)
 	if ok, err := r.onAccountUpdateStatus(WithSessionID(WithUserID(ctx, bob.ID), 22), false); err != nil || !ok {
 		t.Fatalf("bob account.updateStatus online = %v, %v", ok, err)

@@ -8,6 +8,28 @@ import (
 )
 
 func (r *GRPCRemote) ResolveNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (layer int, msgID int64, found bool, err error) {
+	if local := r.edgeAdmitter(); local != nil {
+		return local.ResolveNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
+	}
+	return 0, 0, false, ErrNilHandler
+}
+
+func (r *GRPCRemote) ResolveInheritedAuthKeyLayer(ctx context.Context, rawAuthKeyID [8]byte) (layer int, found bool, err error) {
+	if local := r.edgeAdmitter(); local != nil {
+		return local.ResolveInheritedAuthKeyLayer(ctx, rawAuthKeyID)
+	}
+	return 0, false, ErrNilHandler
+}
+
+// PrimeAuthKeyLayerIdentity asks Core to run the authoritative cold identity
+// loader. Production Edge uses this only for a temporary raw key whose Redis
+// mapping is absent; per-selector profile evidence never traverses CoreExec.
+func (r *GRPCRemote) PrimeAuthKeyLayerIdentity(ctx context.Context, rawAuthKeyID [8]byte) error {
+	_, _, err := r.resolveInheritedAuthKeyLayerRemote(ctx, rawAuthKeyID)
+	return err
+}
+
+func (r *GRPCRemote) resolveNegotiatedSessionLayerEvidenceRemote(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (layer int, msgID int64, found bool, err error) {
 	callCtx, cancel := r.withRequestTimeout(ctx)
 	defer cancel()
 	start := time.Now()
@@ -28,7 +50,7 @@ func (r *GRPCRemote) ResolveNegotiatedSessionLayerEvidence(ctx context.Context, 
 	return int(res.GetLayer()), res.GetMsgId(), res.GetFound(), nil
 }
 
-func (r *GRPCRemote) ResolveInheritedAuthKeyLayer(ctx context.Context, rawAuthKeyID [8]byte) (layer int, found bool, err error) {
+func (r *GRPCRemote) resolveInheritedAuthKeyLayerRemote(ctx context.Context, rawAuthKeyID [8]byte) (layer int, found bool, err error) {
 	callCtx, cancel := r.withRequestTimeout(ctx)
 	defer cancel()
 	start := time.Now()
@@ -49,69 +71,26 @@ func (r *GRPCRemote) ResolveInheritedAuthKeyLayer(ctx context.Context, rawAuthKe
 }
 
 func (r *GRPCRemote) AdvanceNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, layer int, msgID int64) (currentLayer int, currentMsgID int64, publishShared bool, err error) {
-	callCtx, cancel := r.withRequestTimeout(ctx)
-	defer cancel()
-	start := time.Now()
-	res, err := r.client.AdvanceNegotiatedSessionLayer(callCtx, &coreexecpb.AuthKeyRequest{
-		RawAuthKeyId: append([]byte(nil), rawAuthKeyID[:]...),
-		SessionId:    sessionID,
-		Layer:        int32(layer),
-		MsgId:        msgID,
-	})
-	if err != nil {
-		callErr := grpcRemoteCallError("advance_negotiated_session_layer", err)
-		observeCoreExecGRPCCall(r.metrics, "client", "advance_negotiated_session_layer", start, grpcRemoteCallOutcome(callErr))
-		return 0, 0, false, callErr
+	if local := r.edgeAdmitter(); local != nil {
+		return local.AdvanceNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID, layer, msgID)
 	}
-	if err := errorFromResponse(res.GetError()); err != nil {
-		observeCoreExecGRPCCall(r.metrics, "client", "advance_negotiated_session_layer", start, grpcRemoteCallOutcome(err))
-		return 0, 0, false, err
-	}
-	observeCoreExecGRPCCall(r.metrics, "client", "advance_negotiated_session_layer", start, "ok")
-	return int(res.GetCurrentLayer()), res.GetCurrentMsgId(), res.GetPublishShared(), nil
+	return 0, 0, false, ErrNilHandler
 }
 
 func (r *GRPCRemote) DeleteNegotiatedSessionLayerEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64) (deleted bool, err error) {
-	callCtx, cancel := r.withRequestTimeout(ctx)
-	defer cancel()
-	start := time.Now()
-	res, err := r.client.DeleteNegotiatedSessionLayer(callCtx, &coreexecpb.AuthKeyRequest{
-		RawAuthKeyId: append([]byte(nil), rawAuthKeyID[:]...),
-		SessionId:    sessionID,
-	})
-	if err != nil {
-		callErr := grpcRemoteCallError("delete_negotiated_session_layer", err)
-		observeCoreExecGRPCCall(r.metrics, "client", "delete_negotiated_session_layer", start, grpcRemoteCallOutcome(callErr))
-		return false, callErr
+	if local := r.edgeAdmitter(); local != nil {
+		return local.DeleteNegotiatedSessionLayerEvidence(ctx, rawAuthKeyID, sessionID)
 	}
-	if err := errorFromResponse(res.GetError()); err != nil {
-		observeCoreExecGRPCCall(r.metrics, "client", "delete_negotiated_session_layer", start, grpcRemoteCallOutcome(err))
-		return false, err
-	}
-	observeCoreExecGRPCCall(r.metrics, "client", "delete_negotiated_session_layer", start, "ok")
-	return res.GetDeleted(), nil
+	return false, ErrNilHandler
 }
 
 func (r *GRPCRemote) PublishAdmittedLayerProfileEvidence(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, msgID int64, admissionSeq uint64, safeFloor uint64, layer int) error {
-	callCtx, cancel := r.withRequestTimeout(ctx)
-	defer cancel()
-	start := time.Now()
-	res, err := r.client.PublishLayerEvidence(callCtx, &coreexecpb.PublishLayerEvidenceRequest{
-		RawAuthKeyId: append([]byte(nil), rawAuthKeyID[:]...),
-		SessionId:    sessionID,
-		MsgId:        msgID,
-		AdmissionSeq: admissionSeq,
-		SafeFloor:    safeFloor,
-		Layer:        int32(layer),
-	})
-	if err != nil {
-		callErr := grpcRemoteCallError("publish_layer_evidence", err)
-		observeCoreExecGRPCCall(r.metrics, "client", "publish_layer_evidence", start, grpcRemoteCallOutcome(callErr))
-		return callErr
+	if local := r.edgeAdmitter(); local != nil {
+		return local.PublishAdmittedLayerProfileEvidence(
+			ctx, rawAuthKeyID, sessionID, msgID, admissionSeq, safeFloor, layer,
+		)
 	}
-	callErr := errorFromResponse(res.GetError())
-	observeCoreExecGRPCCall(r.metrics, "client", "publish_layer_evidence", start, grpcRemoteCallOutcome(callErr))
-	return callErr
+	return ErrNilHandler
 }
 
 func (r *GRPCRemote) ObserveInitConnection(ctx context.Context, authKeyID [8]byte, sessionID int64, layer, apiID int, deviceModel, systemVersion, appVersion, systemLangCode, langPack, langCode string) error {
