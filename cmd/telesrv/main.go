@@ -756,6 +756,17 @@ func run(logger *zap.Logger) error {
 	}
 	defer authKeySessionLayerStore.Close()
 	userStore := postgres.NewUserStore(pool)
+	// The official system account (777000) is seeded with the default product
+	// username; align it with the active branding so it resolves in search and
+	// cannot be hijacked. UpdateUsername writes both users.username and the
+	// peer_usernames registry, so the change is idempotent against the DB row.
+	if cur, _, err := userStore.ByID(ctx, domain.OfficialSystemUserID); err == nil {
+		if want := branding.ProductUsername(); cur.Username != want {
+			if _, err := userStore.UpdateUsername(ctx, domain.OfficialSystemUserID, want); err != nil {
+				logger.Warn("sync system account username", zap.Error(err))
+			}
+		}
+	}
 	authzStore := postgres.NewAuthorizationStore(pool)
 	adminStore := postgres.NewAdminStore(pool)
 	updateStateStore := postgres.NewUpdateStateStore(pool)
