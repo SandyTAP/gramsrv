@@ -100,19 +100,20 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Generate isolated environment
-        shell: pwsh
-        run: ./scripts/new-docker-env.ps1 -AdvertiseIP 127.0.0.1
+        run: ./scripts/new-docker-env.sh --advertise-ip 127.0.0.1
 
       - name: Validate deployment inputs
         run: |
           docker compose version
+          sh -n scripts/new-docker-env.sh
+          bash -n scripts/start-docker.sh
           sh -n deploy/docker/docker-entrypoint.sh
           docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml config --quiet
 
       - name: Build role images
         run: |
           compose=(docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
-          for role in migrate file core egress sfu edge; do
+          for role in migrate file core egress sfu admin edge; do
             echo "Building ${role} image"
             "${compose[@]}" build --pull "$role"
           done
@@ -126,7 +127,7 @@ jobs:
           migrate_id="$("${compose[@]}" ps --all --quiet migrate)"
           test -n "$migrate_id"
           test "$(docker inspect --format '{{.State.ExitCode}}' "$migrate_id")" = "0"
-          for service in migrate file core egress sfu edge; do
+          for service in migrate file core egress sfu admin edge; do
             container_id="$("${compose[@]}" ps --all --quiet "$service")"
             test -n "$container_id"
             test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
@@ -140,6 +141,9 @@ jobs:
           test -n "$(docker port "$core_id" 12400/udp)"
           test -n "$(docker port "$core_id" 12500/udp)"
           test -n "$(docker port "$core_id" 12999/udp)"
+          admin_id="$("${compose[@]}" ps --quiet admin)"
+          test -n "$(docker port "$admin_id" 2600/tcp)"
+          curl --fail --silent --show-error http://127.0.0.1:2600/ >/dev/null
           timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2400'
           "${compose[@]}" logs --no-color core | grep -q 'turn listening'
           "${compose[@]}" logs --no-color core | grep -q 'live stream rtmp ingest listening'
@@ -150,20 +154,28 @@ jobs:
           compose=(docker compose -p telesrv-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
           "${compose[@]}" stop core
           edge_failed_closed=false
+          admin_failed_closed=false
           for attempt in $(seq 1 45); do
             if test "$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet edge)")" = "unhealthy"; then
               edge_failed_closed=true
+            fi
+            if test "$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet admin)")" = "unhealthy"; then
+              admin_failed_closed=true
+            fi
+            if test "$edge_failed_closed" = "true" && test "$admin_failed_closed" = "true"; then
               break
             fi
             sleep 2
           done
           test "$edge_failed_closed" = "true"
+          test "$admin_failed_closed" = "true"
           "${compose[@]}" start core
           stack_recovered=false
           for attempt in $(seq 1 60); do
             core_health="$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet core)")"
             edge_health="$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet edge)")"
-            if test "$core_health" = "healthy" && test "$edge_health" = "healthy"; then
+            admin_health="$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps --quiet admin)")"
+            if test "$core_health" = "healthy" && test "$edge_health" = "healthy" && test "$admin_health" = "healthy"; then
               stack_recovered=true
               break
             fi

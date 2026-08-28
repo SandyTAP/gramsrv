@@ -14,21 +14,22 @@ Telegram-like interface.
   <img src="docs/assets/gramsrv-android.png" width="23%" alt="gramsrv running on Android">
 </p>
 
-## Quick start on Windows (v2)
+## Quick start on macOS/Linux (v2)
 
-Install Git and Docker Desktop, switch Docker Desktop to Linux containers, and
-start it. Then open PowerShell 5.1 or later and run:
+Install Git and Docker Desktop (or Docker Engine with Compose v2), start Docker,
+then run:
 
-```powershell
+```bash
 git clone --branch v2 --single-branch https://github.com/iamxvbaba/gramsrv.git
-Set-Location gramsrv
-.\scripts\start-docker.ps1
+cd gramsrv
+./scripts/start-docker.sh
 ```
 
 That is all a local first run needs. The script creates `deploy/docker/.env`,
-anonymously pulls the six ready-to-run `v2` images from
+anonymously pulls the seven ready-to-run `v2` images from
 `ghcr.io/iamxvbaba/gramsrv`, starts PostgreSQL, Redis, Migrate, File, Core,
-Egress, SFU, and Edge in dependency order, and waits until the stack is ready.
+Egress, SFU, Admin, and Edge in dependency order, and waits until the stack is
+ready.
 No local Go toolchain, PostgreSQL, Redis, image build, or `docker login` is
 required.
 
@@ -45,32 +46,24 @@ required.
 - Accounts, database state, media, Redis state, and the RSA identity are stored
   in Docker named volumes and survive container recreation and a normal Compose
   shutdown. Do not use Compose `down -v` unless you intend to erase them.
-- Run without `-Build` to use the published images. `-Build` is only for
+- Run without `--build` to use the published images. `--build` is only for
   validating local source changes.
 
-If Windows blocks PowerShell scripts, allow them for the current PowerShell
-window and retry:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\start-docker.ps1
-```
-
-For a temporary LAN experience, replace the example address with the Windows
+For a temporary LAN experience, replace the example address with the Docker
 host's LAN address:
 
-```powershell
-.\scripts\start-docker.ps1 `
-  -AdvertiseIP 192.168.1.20 `
-  -PublicBaseURL http://192.168.1.20:2401 `
-  -PublicWebBaseURL http://192.168.1.20:2401 `
-  -AllowInsecureDevelopmentAuth
+```bash
+./scripts/start-docker.sh \
+  --advertise-ip 192.168.1.20 \
+  --public-base-url http://192.168.1.20:2401 \
+  --public-web-base-url http://192.168.1.20:2401 \
+  --allow-insecure-development-auth
 ```
 
 Stock Telegram clients cannot connect without an endpoint and RSA-key patch;
 use a compatible client from the [project website](https://telesrv.net). See
-the [Docker deployment runbook](docs/docker-deployment.en.md) for Linux/macOS,
-firewall, backup, upgrade, remote access, and production guidance.
+the [Docker deployment runbook](docs/docker-deployment.en.md) for firewall,
+backup, upgrade, remote access, and production guidance.
 
 ## Why gramsrv
 

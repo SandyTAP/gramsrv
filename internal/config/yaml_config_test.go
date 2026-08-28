@@ -573,6 +573,10 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_EGRESS_DELIVERY_TOKEN", "egress-secret")
 	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "group-call-secret")
 	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
+	t.Setenv("TELESRV_ADMIN_API_TOKEN", "admin-api-secret")
+	t.Setenv("TELESRV_ADMIN_UI_PASSWORD", "admin-password")
+	t.Setenv("TELESRV_ADMIN_UI_TOKEN", "")
+	t.Setenv("TELESRV_ADMIN_SESSION_KEY", "admin-session-secret")
 	t.Setenv("TELESRV_DEV_AUTH_CODE", "918274")
 	t.Setenv("TELESRV_PHONE_CODE_DELIVERY_PROVIDER", "development")
 	t.Setenv("TELESRV_OTP_WEBHOOK_URL", "https://otp.example.test/v1/deliveries")
@@ -622,8 +626,15 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 		}},
 		{name: "core", file: "core.yaml", load: func() error {
 			cfg, err := LoadCore()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCAddr != "0.0.0.0:2440" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.LangPackSeedDir != "/usr/share/telesrv/langpack" || cfg.OTPWebhookURL != "https://otp.example.test/v1/deliveries" || cfg.OTPWebhookSecret != "otp-secret" || cfg.OTPWebhookTimeout != 4*time.Second || cfg.Branding.ProductName != "Docker Chat" || cfg.Branding.StarsName != "Docker Credits") {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.CoreExecGRPCAddr != "0.0.0.0:2440" || cfg.FileGRPCTargets != "file:2520" || cfg.FileGRPCResolver != "dns" || cfg.AdminAPIAddr != "0.0.0.0:2599" || cfg.AdminAPIToken != "admin-api-secret" || cfg.LangPackSeedDir != "/usr/share/telesrv/langpack" || cfg.OTPWebhookURL != "https://otp.example.test/v1/deliveries" || cfg.OTPWebhookSecret != "otp-secret" || cfg.OTPWebhookTimeout != 4*time.Second || cfg.Branding.ProductName != "Docker Chat" || cfg.Branding.StarsName != "Docker Credits") {
 				return fmt.Errorf("unexpected Docker core identity, listeners, or seed path")
+			}
+			return err
+		}},
+		{name: "admin", file: "admin.yaml", load: func() error {
+			cfg, err := LoadAdmin()
+			if err == nil && (cfg.Addr != "0.0.0.0:2600" || cfg.PostgresDSN != "postgres://telesrv:secret@postgres:5432/telesrv_v2?sslmode=disable" || cfg.AdminAPIAddr != "core:2599" || cfg.AdminAPIToken != "admin-api-secret" || cfg.Password != "admin-password" || cfg.SessionKey != "admin-session-secret" || cfg.DiskStatsPath != "/var/lib/telesrv-file/blob-staging") {
+				return fmt.Errorf("unexpected Docker admin listener, credentials, or storage path")
 			}
 			return err
 		}},
@@ -676,7 +687,7 @@ func TestDockerRoleConfigVariablesAreInjectedByMatchingService(t *testing.T) {
 
 	variablePattern := regexp.MustCompile(`\$\{([A-Z][A-Z0-9_]*)\}`)
 	referencedByRole := make(map[string]map[string]struct{})
-	for _, role := range []string{"edge", "core", "egress", "file", "sfu"} {
+	for _, role := range []string{"edge", "core", "egress", "file", "sfu", "admin"} {
 		configData, err := os.ReadFile(filepath.Join(dockerDir, "config", role+".yaml"))
 		if err != nil {
 			t.Fatalf("read %s config: %v", role, err)
@@ -708,6 +719,7 @@ func TestDockerRoleConfigVariablesAreInjectedByMatchingService(t *testing.T) {
 		"egress": {"TELESRV_LOG_LEVEL": {}},
 		"file":   {"TELESRV_LOG_LEVEL": {}},
 		"sfu":    {"TELESRV_LOG_LEVEL": {}},
+		"admin":  {},
 	}
 	for role, referenced := range referencedByRole {
 		for name := range compose.Services[role].Environment {
@@ -726,7 +738,8 @@ func TestDockerRoleConfigVariablesAreInjectedByMatchingService(t *testing.T) {
 	for serviceName, service := range compose.Services {
 		for name := range service.Environment {
 			fileOwned := name == "TELESRV_BLOB_BACKEND" || strings.HasPrefix(name, "TELESRV_BLOB_") || strings.HasPrefix(name, "TELESRV_S3_") || strings.HasPrefix(name, "TELESRV_STORAGE_")
-			if fileOwned && serviceName != "file" {
+			adminStorageSelector := serviceName == "admin" && name == "TELESRV_BLOB_BACKEND"
+			if fileOwned && serviceName != "file" && !adminStorageSelector {
 				t.Errorf("File-owned setting %s is injected into Compose service %s", name, serviceName)
 			}
 		}

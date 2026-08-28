@@ -30,6 +30,8 @@ jobs:
             target: egress
           - role: sfu
             target: sfu
+          - role: admin
+            target: admin
           - role: edge
             target: edge-test
 

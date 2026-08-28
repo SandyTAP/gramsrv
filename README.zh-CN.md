@@ -13,20 +13,21 @@
   <img src="docs/assets/gramsrv-android.png" width="23%" alt="Android 客户端正在连接 gramsrv">
 </p>
 
-## Windows 一键体验（v2）
+## macOS/Linux 一键体验（v2）
 
-先安装 Git 和 Docker Desktop，把 Docker Desktop 切换到 Linux containers 并启动，
-然后在 PowerShell 5.1 或更高版本中执行：
+先安装 Git 和 Docker Desktop（或带 Compose v2 的 Docker Engine）并启动 Docker，
+然后执行：
 
-```powershell
+```bash
 git clone --branch v2 --single-branch https://github.com/iamxvbaba/gramsrv.git
-Set-Location gramsrv
-.\scripts\start-docker.ps1
+cd gramsrv
+./scripts/start-docker.sh
 ```
 
 本机首次体验只需要这些命令。脚本会自动创建 `deploy/docker/.env`，无需登录即可从
-`ghcr.io/iamxvbaba/gramsrv` 拉取六个已经构建好的 `v2` 镜像，按照依赖顺序启动
-PostgreSQL、Redis、Migrate、File、Core、Egress、SFU 和 Edge，并等待全部服务就绪。
+`ghcr.io/iamxvbaba/gramsrv` 拉取七个已经构建好的 `v2` 镜像，按照依赖顺序启动
+PostgreSQL、Redis、Migrate、File、Core、Egress、SFU、Admin 和 Edge，并等待全部
+服务就绪。
 用户不需要安装 Go、PostgreSQL 或 Redis，也不需要本地构建镜像或执行
 `docker login`。
 
@@ -40,27 +41,20 @@ PostgreSQL、Redis、Migrate、File、Core、Egress、SFU 和 Edge，并等待�
 - 账号、数据库、媒体、Redis 状态和 RSA 身份保存在 Docker named volumes 中，
   重建容器或正常执行 Compose 停止后仍会保留。除非明确要清空数据，否则不要使用
   Compose `down -v`。
-- 不带 `-Build` 会直接使用发布镜像；`-Build` 仅用于验证本地源码修改。
+- 不带 `--build` 会直接使用发布镜像；`--build` 仅用于验证本地源码修改。
 
-如果 Windows 提示禁止运行 PowerShell 脚本，只为当前 PowerShell 窗口临时放行后重试：
+局域网临时体验时，把示例地址替换为 Docker 宿主机的局域网地址：
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\start-docker.ps1
-```
-
-局域网临时体验时，把示例地址替换为 Windows 宿主机的局域网地址：
-
-```powershell
-.\scripts\start-docker.ps1 `
-  -AdvertiseIP 192.168.1.20 `
-  -PublicBaseURL http://192.168.1.20:2401 `
-  -PublicWebBaseURL http://192.168.1.20:2401 `
-  -AllowInsecureDevelopmentAuth
+```bash
+./scripts/start-docker.sh \
+  --advertise-ip 192.168.1.20 \
+  --public-base-url http://192.168.1.20:2401 \
+  --public-web-base-url http://192.168.1.20:2401 \
+  --allow-insecure-development-auth
 ```
 
 官方 Telegram 客户端需要修改服务器 endpoint 和 RSA key 才能连接；请从
-[项目官网](https://telesrv.net)获取兼容客户端。Linux/macOS、端口与防火墙、备份、升级、
+[项目官网](https://telesrv.net)获取兼容客户端。端口与防火墙、备份、升级、
 远程访问和正式环境说明见 [Docker 部署手册](docs/docker-deployment.md)。
 
 ## 为什么选择 gramsrv

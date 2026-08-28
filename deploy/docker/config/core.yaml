@@ -93,7 +93,8 @@ translation:
 
 http:
   bot_api_addr: ""
-  admin_api_addr: ""
+  admin_api_addr: 0.0.0.0:2599
+  admin_api_token: ${TELESRV_ADMIN_API_TOKEN}
   public_link_web_addr: 0.0.0.0:2401
 
 outbox:

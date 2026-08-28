@@ -161,6 +161,7 @@ case "$command_name" in
     require_secret TELESRV_FILE_TOKEN
     require_secret TELESRV_GROUPCALL_CONTROL_TOKEN
     require_secret TELESRV_SFU_CONTROL_TOKEN
+    require_secret TELESRV_ADMIN_API_TOKEN
     turn_enable="$(printf '%s' "${TELESRV_TURN_ENABLE:-false}" | tr '[:upper:]' '[:lower:]')"
     case "$turn_enable" in
       true)
@@ -233,6 +234,21 @@ case "$command_name" in
     require_secret TELESRV_REDIS_PASSWORD
     require_secret TELESRV_GROUPCALL_CONTROL_TOKEN
     require_secret TELESRV_SFU_CONTROL_TOKEN
+    ;;
+  telesrv-admin)
+    require_dsn
+    require_secret TELESRV_ADMIN_API_TOKEN
+    require_secret TELESRV_ADMIN_SESSION_KEY
+    admin_password="$(printenv TELESRV_ADMIN_UI_PASSWORD 2>/dev/null || true)"
+    admin_token="$(printenv TELESRV_ADMIN_UI_TOKEN 2>/dev/null || true)"
+    if [ -n "$admin_password" ]; then
+      require_secret TELESRV_ADMIN_UI_PASSWORD
+    elif [ -n "$admin_token" ]; then
+      require_secret TELESRV_ADMIN_UI_TOKEN
+    else
+      echo "telesrv: TELESRV_ADMIN_UI_PASSWORD or TELESRV_ADMIN_UI_TOKEN is required" >&2
+      exit 64
+    fi
     ;;
 esac
 

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/start-docker.sh [options]
+
+Options used only when deploy/docker/.env does not exist:
+  --advertise-ip IP
+  --public-base-url URL
+  --public-web-base-url URL
+  --allow-insecure-development-auth
+
+Other options:
+  --build    Build local role images instead of pulling published images.
+  --help
+EOF
+}
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+docker_dir="$repo_root/deploy/docker"
+compose_path="$docker_dir/compose.yaml"
+env_path="$docker_dir/.env"
+generator_path="$script_dir/new-docker-env.sh"
+
+advertise_ip=
+public_base_url=
+public_web_base_url=
+allow_insecure=false
+build=false
+initialization_options=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --advertise-ip)
+      [[ $# -ge 2 ]] || { printf '%s\n' "$1 requires a value" >&2; exit 1; }
+      advertise_ip=$2
+      initialization_options=true
+      shift 2
+      ;;
+    --public-base-url)
+      [[ $# -ge 2 ]] || { printf '%s\n' "$1 requires a value" >&2; exit 1; }
+      public_base_url=$2
+      initialization_options=true
+      shift 2
+      ;;
+    --public-web-base-url)
+      [[ $# -ge 2 ]] || { printf '%s\n' "$1 requires a value" >&2; exit 1; }
+      public_web_base_url=$2
+      initialization_options=true
+      shift 2
+      ;;
+    --allow-insecure-development-auth)
+      allow_insecure=true
+      initialization_options=true
+      shift
+      ;;
+    --build)
+      build=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *) printf 'start-docker: unknown argument: %s\n' "$1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$env_path" ]]; then
+  [[ -n "$advertise_ip" ]] || advertise_ip=127.0.0.1
+  generator_args=(--advertise-ip "$advertise_ip")
+  [[ -z "$public_base_url" ]] || generator_args+=(--public-base-url "$public_base_url")
+  [[ -z "$public_web_base_url" ]] || generator_args+=(--public-web-base-url "$public_web_base_url")
+  [[ "$allow_insecure" = false ]] || generator_args+=(--allow-insecure-development-auth)
+  "$generator_path" "${generator_args[@]}"
+elif [[ "$initialization_options" = true ]]; then
+  printf 'start-docker: deploy/docker/.env already exists; initialization options were ignored to preserve credentials and deployment identity.\n' >&2
+fi
+
+compose=(docker compose --project-directory "$docker_dir" --env-file "$env_path" --file "$compose_path")
+"${compose[@]}" version >/dev/null
+"${compose[@]}" config --quiet
+
+if [[ "$build" = true ]]; then
+  "${compose[@]}" build --pull
+else
+  "${compose[@]}" pull
+fi
+
+if ! "${compose[@]}" up --detach --no-build --wait --wait-timeout 600; then
+  "${compose[@]}" logs --no-color --tail 120 || true
+  exit 1
+fi
+
+"${compose[@]}" ps --all
+printf 'telesrv Docker stack is ready. Configuration: %s\n' "$env_path"
+
+env_value() {
+  awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2); exit }' "$env_path"
+}
+
+phone_provider=$(env_value TELESRV_PHONE_CODE_DELIVERY_PROVIDER)
+dev_code=$(env_value TELESRV_DEV_AUTH_CODE)
+if [[ "$phone_provider" = development && "$dev_code" =~ ^[0-9]{5,6}$ ]]; then
+  printf 'Development login code: %s\n' "$dev_code"
+fi
+if [[ "$(env_value TELESRV_TURN_ENABLE)" = true ]]; then
+  printf 'TURN/STUN: udp://%s:%s\n' "$(env_value TELESRV_TURN_ADVERTISE_IP)" "$(env_value TELESRV_TURN_UDP_PORT)"
+  printf 'TURN relay UDP range: %s-%s\n' "$(env_value TELESRV_TURN_RELAY_MIN_PORT)" "$(env_value TELESRV_TURN_RELAY_MAX_PORT)"
+fi
+if [[ "$(env_value TELESRV_LIVESTREAM_ENABLE)" = true ]]; then
+  printf 'RTMP ingest: %s (stream key is provided by the client)\n' "$(env_value TELESRV_LIVESTREAM_RTMP_URL)"
+fi
+
+admin_bind_ip=$(env_value TELESRV_ADMIN_BIND_IP)
+admin_port=$(env_value TELESRV_ADMIN_PORT)
+[[ -n "$admin_bind_ip" ]] || admin_bind_ip=127.0.0.1
+[[ -n "$admin_port" ]] || admin_port=2600
+admin_url_host=$admin_bind_ip
+[[ "$admin_url_host" != *:* ]] || admin_url_host="[$admin_url_host]"
+printf 'Admin UI: http://%s:%s (login password is stored in %s)\n' "$admin_url_host" "$admin_port" "$env_path"

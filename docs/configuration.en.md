@@ -115,7 +115,7 @@ Retained typed graphs remain charged to the RPC scheduler budget above.
 |---|---|---|
 | `TELESRV_DEBUG_ADDR` | nullable address / `127.0.0.1:6060` | pprof/debug listener. Empty disables it. Keep loopback-only; use an SSH tunnel for production profiling. |
 | `TELESRV_BOT_API_ADDR` | nullable address / empty | Minimal HTTP Bot API listener. Empty disables it. It shares MTProto app/store facts. `setWebhook` accepts any valid `http://` or `https://` host/IP and port in `1..65535`. |
-| `TELESRV_ADMIN_API_ADDR` | nullable address / empty | In-process Admin write API listener. Empty disables it; production should bind loopback. |
+| `TELESRV_ADMIN_API_ADDR` | nullable address / empty | Core Admin write API listener. Empty disables it. Host-native production should bind loopback; a Docker multi-container deployment may bind a protected internal network, but must not publish it to the host or Internet. |
 | `TELESRV_ADMIN_API_TOKEN` | secret string / empty | Admin API bearer token. Required when the Admin API is enabled and must match the Admin UI token configuration. |
 | `TELESRV_ADMIN_UI_ADDR` | address / `127.0.0.1:2600` | Standalone `cmd/telesrv-admin` listen address. |
 | `TELESRV_ADMIN_UI_PASSWORD` | secret string / empty | Admin UI login password. Configure this or `TELESRV_ADMIN_UI_TOKEN`. |

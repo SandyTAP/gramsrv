@@ -173,6 +173,7 @@ services:
       TELESRV_FILE_TOKEN: ${TELESRV_FILE_TOKEN:?set TELESRV_FILE_TOKEN in deploy/docker/.env}
       TELESRV_GROUPCALL_CONTROL_TOKEN: ${TELESRV_GROUPCALL_CONTROL_TOKEN:?set TELESRV_GROUPCALL_CONTROL_TOKEN in deploy/docker/.env}
       TELESRV_SFU_CONTROL_TOKEN: ${TELESRV_SFU_CONTROL_TOKEN:?set TELESRV_SFU_CONTROL_TOKEN in deploy/docker/.env}
+      TELESRV_ADMIN_API_TOKEN: ${TELESRV_ADMIN_API_TOKEN:?set TELESRV_ADMIN_API_TOKEN in deploy/docker/.env}
       TELESRV_DEV_AUTH_CODE: ${TELESRV_DEV_AUTH_CODE:?set TELESRV_DEV_AUTH_CODE in deploy/docker/.env}
       TELESRV_PHONE_CODE_DELIVERY_PROVIDER: ${TELESRV_PHONE_CODE_DELIVERY_PROVIDER:-development}
       TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH: ${TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH:-false}
@@ -223,6 +224,7 @@ services:
     expose:
       - "2420"
       - "2440"
+      - "2599"
     ports:
       - name: public-links
         target: 2401
@@ -249,6 +251,8 @@ services:
         - 127.0.0.1:2401
         - --tcp
         - 127.0.0.1:2420
+        - --tcp
+        - 127.0.0.1:2599
         - --grpc
         - 127.0.0.1:2440,telesrv.coreexec.v1.CoreExecService,TELESRV_CORE_EXEC_TOKEN
         - --grpc
@@ -267,6 +271,57 @@ services:
       - data
       - control
       - outbound
+
+  admin:
+    <<: *app
+    image: ${TELESRV_IMAGE_PREFIX:-ghcr.io/iamxvbaba/gramsrv}/admin:${TELESRV_IMAGE_TAG:-v2}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: admin
+      args: *build-args
+    environment:
+      TELESRV_POSTGRES_DSN: ${TELESRV_POSTGRES_DSN:?set TELESRV_POSTGRES_DSN in deploy/docker/.env}
+      TELESRV_ADMIN_API_TOKEN: ${TELESRV_ADMIN_API_TOKEN:?set TELESRV_ADMIN_API_TOKEN in deploy/docker/.env}
+      TELESRV_ADMIN_UI_PASSWORD: ${TELESRV_ADMIN_UI_PASSWORD:-}
+      TELESRV_ADMIN_UI_TOKEN: ${TELESRV_ADMIN_UI_TOKEN:-}
+      TELESRV_ADMIN_SESSION_KEY: ${TELESRV_ADMIN_SESSION_KEY:?set TELESRV_ADMIN_SESSION_KEY in deploy/docker/.env}
+      TELESRV_BLOB_BACKEND: ${TELESRV_BLOB_BACKEND:-localfs}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      core:
+        condition: service_healthy
+    volumes:
+      - file_data:/var/lib/telesrv-file:ro
+    ports:
+      - name: admin-ui
+        target: 2600
+        published: "${TELESRV_ADMIN_PORT:-2600}"
+        host_ip: ${TELESRV_ADMIN_BIND_IP:-127.0.0.1}
+        protocol: tcp
+    healthcheck:
+      test:
+        - CMD
+        - telesrv-healthcheck
+        - all
+        - --tcp
+        - 127.0.0.1:2600
+        - --tcp
+        - core:2599
+        - --postgres-dsn-env
+        - TELESRV_POSTGRES_DSN
+        - --timeout
+        - 3s
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks:
+      - data
+      - control
 
   egress:
     <<: *app

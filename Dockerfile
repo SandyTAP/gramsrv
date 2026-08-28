@@ -93,6 +93,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X main.gitCommit=${VCS_REF} -X main.gitBranch=${VCS_BRANCH} -X main.gitTreeState=${VCS_TREE_STATE} -X main.buildTime=${BUILD_DATE}" \
       -o /out/telesrv-sfu ./cmd/telesrv-sfu
 
+FROM build-base AS build-admin
+RUN apk add --no-cache nodejs npm
+WORKDIR /src/cmd/telesrv-admin/web
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci && npm run build
+WORKDIR /src
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/telesrv-admin ./cmd/telesrv-admin
+
 FROM ${ALPINE_IMAGE} AS runtime-base
 
 ARG VCS_REF=unknown
@@ -166,6 +177,12 @@ COPY --from=build-sfu /out/telesrv-sfu /usr/local/bin/telesrv-sfu
 COPY --chown=telesrv:telesrv deploy/docker/config/sfu.yaml /etc/telesrv/sfu.yaml
 EXPOSE 2450 12399/udp
 CMD ["telesrv-sfu", "--config", "/etc/telesrv/sfu.yaml"]
+
+FROM runtime-base AS admin
+COPY --from=build-admin /out/telesrv-admin /usr/local/bin/telesrv-admin
+COPY --chown=telesrv:telesrv deploy/docker/config/admin.yaml /etc/telesrv/admin.yaml
+EXPOSE 2600
+CMD ["telesrv-admin", "--config", "/etc/telesrv/admin.yaml"]
 
 FROM runtime-base AS edge
 USER root

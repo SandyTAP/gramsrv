@@ -103,3 +103,16 @@ if ($deployment['TELESRV_TURN_ENABLE'] -eq 'true') {
 if ($deployment['TELESRV_LIVESTREAM_ENABLE'] -eq 'true') {
     Write-Host "RTMP ingest: $($deployment['TELESRV_LIVESTREAM_RTMP_URL']) (stream key is provided by the client)"
 }
+$adminBindIP = $deployment['TELESRV_ADMIN_BIND_IP']
+$adminPort = $deployment['TELESRV_ADMIN_PORT']
+if ([string]::IsNullOrWhiteSpace($adminBindIP)) {
+    $adminBindIP = "127.0.0.1"
+}
+if ([string]::IsNullOrWhiteSpace($adminPort)) {
+    $adminPort = "2600"
+}
+$adminURLHost = $adminBindIP
+if ($adminURLHost.Contains(":")) {
+    $adminURLHost = "[${adminURLHost}]"
+}
+Write-Host "Admin UI: http://${adminURLHost}:${adminPort} (login password is stored in $envPath)"
