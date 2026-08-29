@@ -2160,9 +2160,6 @@ func (s *Service) SetAccountAvatar(ctx context.Context, req SetAccountAvatarRequ
 	if req.UserID <= 0 {
 		return CommandResult{}, fmt.Errorf("user_id is required")
 	}
-	if domain.IsSystemUserID(req.UserID) {
-		return CommandResult{}, fmt.Errorf("system user avatar cannot be changed")
-	}
 	if s == nil || s.users == nil || s.photos == nil {
 		return CommandResult{}, fmt.Errorf("admin avatar dependencies are not configured")
 	}
