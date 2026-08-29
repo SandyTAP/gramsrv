@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"telesrv/internal/rpc"
 )
 
 // ErrInboundRPCQueueFull 表示 inbound RPC 已触达单连接或进程级预算。
@@ -940,6 +942,10 @@ func (c *Conn) runInboundRPC(task inboundRPC) {
 
 	c.metrics.InboundRPCStarted(task.method, now.Sub(task.enqueuedAt))
 	ctx := task.ctx
+	// 把连接对端 IP 注入 RPC 上下文，绑定设备授权时写入 authorizations.ip。
+	if ip := c.clientIP(); ip != "" {
+		ctx = rpc.WithClientIP(ctx, ip)
+	}
 	if task.run != nil {
 		_ = task.run(ctx)
 	}

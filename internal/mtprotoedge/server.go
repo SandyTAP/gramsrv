@@ -1132,7 +1132,7 @@ func (s *Server) serveConn(ctx context.Context, raw transport.Conn, remote, loca
 			fetchedKey = &d
 		}
 
-		current, err = s.handleEncrypted(ctx, conn, cs, current, fetchedKey, &b, &plain)
+		current, err = s.handleEncrypted(ctx, conn, cs, current, remote, fetchedKey, &b, &plain)
 		if errors.Is(err, errActivationAuthKeyRejected) {
 			// handleEncrypted writes -404 while its activation claim still owns the
 			// physical writer, then its deferred abort removes/closes the claim.

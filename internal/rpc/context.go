@@ -16,6 +16,7 @@ type ctxKey int
 const (
 	layerKey ctxKey = iota
 	clientInfoKey
+	clientIPKey
 	rawAuthKeyIDKey
 	authKeyIDKey
 	sessionIDKey
@@ -96,6 +97,21 @@ func WithClientInfo(ctx context.Context, info ClientInfo) context.Context {
 func ClientInfoFrom(ctx context.Context) (ClientInfo, bool) {
 	v, ok := ctx.Value(clientInfoKey).(ClientInfo)
 	return v, ok
+}
+
+// WithClientIP 在 ctx 注入客户端连接的对端 IP（来自 MTProto 连接的 RemoteAddr）。
+// 仅在需要时（绑定设备授权）由 edge 写入，其余 RPC 不依赖它。
+func WithClientIP(ctx context.Context, ip string) context.Context {
+	if ip == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientIPKey, ip)
+}
+
+// ClientIPFrom 返回 ctx 中的客户端对端 IP，未设置时 ok=false。
+func ClientIPFrom(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(clientIPKey).(string)
+	return v, ok && v != ""
 }
 
 func clientSessionMetadataFromContext(ctx context.Context) domain.ClientSessionMetadata {
