@@ -88,6 +88,11 @@ services:
     networks:
       - data
       - control
+      # A host-network container cannot join the internal control network.
+      # This dedicated return path makes the loopback-only 16379 publication
+      # reachable by SFU on Linux and Docker Desktop without exposing Redis to
+      # any other application container network.
+      - sfu_host_access
 
   migrate:
     <<: *app
@@ -327,6 +332,10 @@ services:
     networks:
       - data
       - control
+      # Keep the published Admin port functional even though its data/control
+      # networks are intentionally internal. No other service joins this
+      # return-path network.
+      - admin_host_access
 
   egress:
     <<: *app
@@ -502,6 +511,8 @@ networks:
     internal: true
   control:
     internal: true
+  admin_host_access:
+  sfu_host_access:
   outbound:
 
 volumes:

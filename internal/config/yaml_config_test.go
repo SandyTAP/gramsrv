@@ -769,11 +769,15 @@ func TestDockerComposeDefaultsTURNToSFUHostNetwork(t *testing.T) {
 		Services map[string]struct {
 			Environment map[string]any `yaml:"environment"`
 			Ports       []any          `yaml:"ports"`
+			Networks    []string       `yaml:"networks"`
 			NetworkMode string         `yaml:"network_mode"`
 			Healthcheck struct {
 				StartPeriod string `yaml:"start_period"`
 			} `yaml:"healthcheck"`
 		} `yaml:"services"`
+		Networks map[string]struct {
+			Internal bool `yaml:"internal"`
+		} `yaml:"networks"`
 	}
 	if err := yaml.Unmarshal(composeData, &compose); err != nil {
 		t.Fatalf("parse compose.yaml: %v", err)
@@ -804,6 +808,48 @@ func TestDockerComposeDefaultsTURNToSFUHostNetwork(t *testing.T) {
 	}
 	if len(sfu.Ports) != 0 {
 		t.Errorf("host-network sfu must not publish Docker ports: %v", sfu.Ports)
+	}
+	redis, ok := compose.Services["redis"]
+	if !ok {
+		t.Fatal("compose redis service is missing")
+	}
+	hasHostAccess := false
+	for _, network := range redis.Networks {
+		if network == "sfu_host_access" {
+			hasHostAccess = true
+			break
+		}
+	}
+	if !hasHostAccess {
+		t.Error("redis must join the dedicated SFU host-access return network")
+	}
+	hostAccess, ok := compose.Networks["sfu_host_access"]
+	if !ok {
+		t.Fatal("compose sfu_host_access network is missing")
+	}
+	if hostAccess.Internal {
+		t.Error("sfu_host_access must provide a return path for the loopback Redis publication")
+	}
+	admin, ok := compose.Services["admin"]
+	if !ok {
+		t.Fatal("compose admin service is missing")
+	}
+	hasAdminHostAccess := false
+	for _, network := range admin.Networks {
+		if network == "admin_host_access" {
+			hasAdminHostAccess = true
+			break
+		}
+	}
+	if !hasAdminHostAccess {
+		t.Error("admin must join its dedicated host-access return network")
+	}
+	adminHostAccess, ok := compose.Networks["admin_host_access"]
+	if !ok {
+		t.Fatal("compose admin_host_access network is missing")
+	}
+	if adminHostAccess.Internal {
+		t.Error("admin_host_access must provide a return path for the published Admin port")
 	}
 	if core.Healthcheck.StartPeriod != "60s" {
 		t.Errorf("core healthcheck start_period = %q, want 60s", core.Healthcheck.StartPeriod)
