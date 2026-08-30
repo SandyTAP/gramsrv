@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	telegramloginapp "telesrv/internal/app/telegramlogin"
 	"telesrv/internal/config"
@@ -33,6 +34,10 @@ func TestValidateCoreConfigRequiresStandaloneSFUControlAuth(t *testing.T) {
 		FileGRPCTargets:       "127.0.0.1:2460",
 		FileGRPCResolver:      "static",
 		FileToken:             "file-secret",
+		TURNEnable:            true,
+		TURNUDPPort:           12400,
+		TURNSecret:            "turn-secret",
+		CallTURNCredentialTTL: 6 * time.Hour,
 	}
 	if err := validateCoreConfig(base); err != nil {
 		t.Fatalf("base config rejected: %v", err)
@@ -49,6 +54,7 @@ func TestValidateCoreConfigRequiresStandaloneSFUControlAuth(t *testing.T) {
 		{name: "groupcall control addr", mutate: func(cfg *config.CoreConfig) { cfg.GroupCallControlAddr = " " }, wantErr: "TELESRV_GROUPCALL_CONTROL_ADDR"},
 		{name: "groupcall control token", mutate: func(cfg *config.CoreConfig) { cfg.GroupCallControlToken = " " }, wantErr: "TELESRV_GROUPCALL_CONTROL_TOKEN"},
 		{name: "sfu control token", mutate: func(cfg *config.CoreConfig) { cfg.SFUControlToken = " " }, wantErr: "TELESRV_SFU_CONTROL_TOKEN"},
+		{name: "turn secret", mutate: func(cfg *config.CoreConfig) { cfg.TURNSecret = " " }, wantErr: "TELESRV_TURN_SECRET"},
 	}
 
 	for _, tt := range tests {

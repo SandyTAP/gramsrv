@@ -21,7 +21,7 @@ type CoreConfigYAML struct {
 	Media         MediaYAML         `yaml:"media"`
 	Seeds         SeedsYAML         `yaml:"seeds"`
 	Auth          AuthYAML          `yaml:"auth"`
-	TURN          TURNYAML          `yaml:"turn"`
+	TURN          CoreTURNYAML      `yaml:"turn"`
 	LiveStream    LiveStreamYAML    `yaml:"livestream"`
 	Outbox        OutboxYAML        `yaml:"outbox"`
 	Cache         CoreCacheYAML     `yaml:"cache"`
@@ -217,13 +217,13 @@ type TranslationYAML struct {
 	RateWindow string   `yaml:"rate_window"`
 }
 
-type TURNYAML struct {
+// CoreTURNYAML contains signaling-only TURN settings. The standalone SFU role
+// owns relay allocation ports and the UDP listener lifecycle.
+type CoreTURNYAML struct {
 	Enabled       *bool  `yaml:"enabled"`
 	UDPPort       *int   `yaml:"udp_port"`
 	AdvertiseIP   string `yaml:"advertise_ip"`
 	Secret        string `yaml:"secret"`
-	RelayMinPort  *int   `yaml:"relay_min_port"`
-	RelayMaxPort  *int   `yaml:"relay_max_port"`
 	CredentialTTL string `yaml:"credential_ttl"`
 	ForceRelay    *bool  `yaml:"force_relay"`
 }
@@ -502,8 +502,6 @@ type CoreConfig struct {
 	TURNUDPPort                        int
 	TURNAdvertiseIP                    string
 	TURNSecret                         string
-	TURNRelayMinPort                   int
-	TURNRelayMaxPort                   int
 	CallTURNCredentialTTL              time.Duration
 	CallForceRelay                     bool
 	LiveStreamEnable                   bool
@@ -811,8 +809,6 @@ func coreConfigFromConfig(c Config) CoreConfig {
 		TURNUDPPort:                        c.TURNUDPPort,
 		TURNAdvertiseIP:                    c.TURNAdvertiseIP,
 		TURNSecret:                         c.TURNSecret,
-		TURNRelayMinPort:                   c.TURNRelayMinPort,
-		TURNRelayMaxPort:                   c.TURNRelayMaxPort,
 		CallTURNCredentialTTL:              c.CallTURNCredentialTTL,
 		CallForceRelay:                     c.CallForceRelay,
 		LiveStreamEnable:                   c.LiveStreamEnable,
@@ -870,7 +866,7 @@ func LoadCore() (CoreConfig, error) {
 		if err := applyAuthYAML(b, y.Auth); err != nil {
 			return err
 		}
-		if err := applyTURNYAML(b, y.TURN); err != nil {
+		if err := applyCoreTURNYAML(b, y.TURN); err != nil {
 			return err
 		}
 		if err := applyLiveStreamYAML(b, y.LiveStream); err != nil {
@@ -1155,13 +1151,11 @@ func applyTranslationYAML(b *envBuilder, y TranslationYAML) error {
 	return b.setDuration("TELESRV_TRANSLATION_RATE_WINDOW", y.RateWindow)
 }
 
-func applyTURNYAML(b *envBuilder, y TURNYAML) error {
+func applyCoreTURNYAML(b *envBuilder, y CoreTURNYAML) error {
 	b.setBool("TELESRV_TURN_ENABLE", y.Enabled)
 	b.setInt("TELESRV_TURN_UDP_PORT", y.UDPPort)
 	b.setString("TELESRV_TURN_ADVERTISE_IP", y.AdvertiseIP)
 	b.setString("TELESRV_TURN_SECRET", y.Secret)
-	b.setInt("TELESRV_TURN_RELAY_MIN_PORT", y.RelayMinPort)
-	b.setInt("TELESRV_TURN_RELAY_MAX_PORT", y.RelayMaxPort)
 	if err := b.setDuration("TELESRV_CALL_TURN_CREDENTIAL_TTL", y.CredentialTTL); err != nil {
 		return err
 	}

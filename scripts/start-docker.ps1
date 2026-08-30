@@ -10,6 +10,15 @@ param(
     [string]$PublicWebBaseURL = "",
 
     [Parameter()]
+    [string]$AdminBindIP = "",
+
+    [Parameter()]
+    [switch]$SFUHostNetwork,
+
+    [Parameter()]
+    [switch]$SFUBridgeNetwork,
+
+    [Parameter()]
     [switch]$AllowInsecureDevelopmentAuth,
 
     [Parameter()]
@@ -17,6 +26,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($SFUHostNetwork -and $SFUBridgeNetwork) {
+    throw "SFUHostNetwork and SFUBridgeNetwork are mutually exclusive."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $dockerDir = Join-Path $repoRoot "deploy\docker"
@@ -37,6 +50,15 @@ if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
     if (-not [string]::IsNullOrWhiteSpace($PublicWebBaseURL)) {
         $generatorArguments.PublicWebBaseURL = $PublicWebBaseURL
     }
+    if (-not [string]::IsNullOrWhiteSpace($AdminBindIP)) {
+        $generatorArguments.AdminBindIP = $AdminBindIP
+    }
+    if ($SFUHostNetwork) {
+        $generatorArguments.SFUHostNetwork = $true
+    }
+    if ($SFUBridgeNetwork) {
+        $generatorArguments.SFUBridgeNetwork = $true
+    }
     if ($AllowInsecureDevelopmentAuth) {
         $generatorArguments.AllowInsecureDevelopmentAuth = $true
     }
@@ -45,8 +67,18 @@ if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
 elseif ($PSBoundParameters.ContainsKey("AdvertiseIP") -or
         $PSBoundParameters.ContainsKey("PublicBaseURL") -or
         $PSBoundParameters.ContainsKey("PublicWebBaseURL") -or
+        $PSBoundParameters.ContainsKey("AdminBindIP") -or
+        $PSBoundParameters.ContainsKey("SFUHostNetwork") -or
+        $PSBoundParameters.ContainsKey("SFUBridgeNetwork") -or
         $PSBoundParameters.ContainsKey("AllowInsecureDevelopmentAuth")) {
     Write-Warning "deploy/docker/.env already exists; address parameters are ignored so existing credentials and deployment identity stay unchanged."
+}
+
+$deployment = @{}
+foreach ($line in Get-Content -LiteralPath $envPath) {
+    if ($line -match '^([A-Z0-9_]+)=(.*)$') {
+        $deployment[$Matches[1]] = $Matches[2]
+    }
 }
 
 $composeBase = @(
@@ -55,6 +87,15 @@ $composeBase = @(
     "--env-file", $envPath,
     "--file", $composePath
 )
+$sfuHostNetworkValue = $deployment['TELESRV_SFU_HOST_NETWORK']
+if (-not [string]::IsNullOrWhiteSpace($sfuHostNetworkValue) -and
+    $sfuHostNetworkValue -ne 'true' -and $sfuHostNetworkValue -ne 'false') {
+    throw "TELESRV_SFU_HOST_NETWORK must be true or false."
+}
+if ($deployment.ContainsKey('TELESRV_SFU_HOST_NETWORK') -and
+    $deployment['TELESRV_SFU_HOST_NETWORK'] -eq 'false') {
+    $composeBase += @("--file", (Join-Path $dockerDir "compose.sfu-bridge-network.yaml"))
+}
 
 function Invoke-Compose {
     param([string[]]$Arguments)
@@ -85,13 +126,6 @@ catch {
 Invoke-Compose -Arguments @("ps", "--all")
 Write-Host "telesrv Docker stack is ready. Configuration: $envPath"
 
-$deployment = @{}
-foreach ($line in Get-Content -LiteralPath $envPath) {
-    if ($line -match '^([A-Z0-9_]+)=(.*)$') {
-        $deployment[$Matches[1]] = $Matches[2]
-    }
-}
-
 if ($deployment['TELESRV_PHONE_CODE_DELIVERY_PROVIDER'] -eq 'development' -and
     $deployment['TELESRV_DEV_AUTH_CODE'] -match '^[0-9]{5,6}$') {
     Write-Host "Development login code: $($deployment['TELESRV_DEV_AUTH_CODE'])"
@@ -112,6 +146,9 @@ if ([string]::IsNullOrWhiteSpace($adminPort)) {
     $adminPort = "2600"
 }
 $adminURLHost = $adminBindIP
+if ($adminURLHost -eq "0.0.0.0" -or $adminURLHost -eq "::") {
+    $adminURLHost = $deployment['TELESRV_ADVERTISE_IP']
+}
 if ($adminURLHost.Contains(":")) {
     $adminURLHost = "[${adminURLHost}]"
 }

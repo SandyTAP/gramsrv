@@ -162,8 +162,7 @@ COPY --chown=telesrv:telesrv data/langpack/ /usr/share/telesrv/langpack/
 COPY --chown=telesrv:telesrv deploy/docker/assets/seed-manifest.json /usr/share/telesrv/seed-manifest.json
 COPY --chown=telesrv:telesrv deploy/docker/config/core.yaml /etc/telesrv/core.yaml
 USER 10001:10001
-# TURN relay ports 12500-12999/udp are published by Compose as a 1:1 range.
-EXPOSE 2400 2401 2420 2440 12400/udp
+EXPOSE 2400 2401 2420 2440
 CMD ["telesrv-core", "--config", "/etc/telesrv/core.yaml"]
 
 FROM runtime-base AS egress
@@ -175,7 +174,9 @@ CMD ["telesrv-egress", "--config", "/etc/telesrv/egress.yaml"]
 FROM runtime-base AS sfu
 COPY --from=build-sfu /out/telesrv-sfu /usr/local/bin/telesrv-sfu
 COPY --chown=telesrv:telesrv deploy/docker/config/sfu.yaml /etc/telesrv/sfu.yaml
-EXPOSE 2450 12399/udp
+# Host-network SFU binds relay ports directly; the bridge fallback publishes a
+# bounded configurable 1:1 range.
+EXPOSE 2450 12399/udp 12400/udp
 CMD ["telesrv-sfu", "--config", "/etc/telesrv/sfu.yaml"]
 
 FROM runtime-base AS admin

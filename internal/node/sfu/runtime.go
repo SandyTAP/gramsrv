@@ -4,6 +4,7 @@ package sfu
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"telesrv/internal/node/common"
 	mediasfu "telesrv/internal/sfu"
 	"telesrv/internal/store/redisstore"
+	"telesrv/internal/turnsrv"
 )
 
 // Run starts the standalone SFU media process.
@@ -49,8 +51,30 @@ func runWithConfig(ctx context.Context, cfg config.SFUConfig, logger *zap.Logger
 	}
 	defer func() { _ = rdb.Close() }()
 
+	turnAdvertise := cfg.TURNAdvertiseIP
+	if turnAdvertise == "" {
+		turnAdvertise = cfg.AdvertiseIP
+	}
+	turnService := turnsrv.Service(turnsrv.Disabled())
+	if cfg.TURNEnable {
+		turnService, err = turnsrv.New(turnsrv.Config{
+			UDPPort:      cfg.TURNUDPPort,
+			BindIP:       cfg.TURNBindIP,
+			AdvertiseIP:  turnAdvertise,
+			SharedSecret: cfg.TURNSecret,
+			RelayMinPort: cfg.TURNRelayMinPort,
+			RelayMaxPort: cfg.TURNRelayMaxPort,
+			Logger:       logger.Named("turn"),
+		})
+		if err != nil {
+			return fmt.Errorf("init turn media listener: %w", err)
+		}
+		defer func() { _ = turnService.Close() }()
+	}
+
 	pionSFU, err := mediasfu.NewPion(mediasfu.PionConfig{
 		UDPPort:     cfg.SFUUDPPort,
+		BindIP:      cfg.SFUBindIP,
 		AdvertiseIP: sfuAdvertise,
 		Logger:      logger.Named("sfu"),
 		Touch: func(callID, userID int64) {
@@ -92,6 +116,8 @@ func runWithConfig(ctx context.Context, cfg config.SFUConfig, logger *zap.Logger
 		zap.String("core_groupcall_control_url", cfg.GroupCallControlURL),
 		zap.Int("udp_port", cfg.SFUUDPPort),
 		zap.String("advertise_ip", sfuAdvertise),
+		zap.Bool("turn_enabled", turnService.Enabled()),
+		zap.Int("turn_udp_port", turnService.Port()),
 	)
 	<-ctx.Done()
 	return nil
@@ -139,6 +165,26 @@ func validateConfig(cfg *config.SFUConfig) error {
 	}
 	if strings.TrimSpace(cfg.GroupCallControlToken) == "" {
 		return fmt.Errorf("TELESRV_GROUPCALL_CONTROL_TOKEN is required for telesrv-sfu")
+	}
+	if ip := net.ParseIP(strings.TrimSpace(cfg.SFUBindIP)); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("TELESRV_SFU_BIND_IP must be an IPv4 address")
+	}
+	if cfg.TURNEnable {
+		if strings.TrimSpace(cfg.TURNSecret) == "" {
+			return fmt.Errorf("TELESRV_TURN_SECRET is required for SFU-owned TURN")
+		}
+		if cfg.TURNUDPPort <= 0 {
+			return fmt.Errorf("TELESRV_TURN_UDP_PORT must be positive")
+		}
+		if ip := net.ParseIP(strings.TrimSpace(cfg.TURNBindIP)); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("TELESRV_TURN_BIND_IP must be an IPv4 address")
+		}
+		if cfg.TURNUDPPort == cfg.SFUUDPPort {
+			return fmt.Errorf("TELESRV_TURN_UDP_PORT must differ from TELESRV_SFU_UDP_PORT")
+		}
+		if cfg.TURNRelayMinPort <= 0 || cfg.TURNRelayMaxPort < cfg.TURNRelayMinPort {
+			return fmt.Errorf("TELESRV_TURN_RELAY_MIN_PORT/TELESRV_TURN_RELAY_MAX_PORT define an invalid range")
+		}
 	}
 	return nil
 }

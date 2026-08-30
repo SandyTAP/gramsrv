@@ -11,10 +11,23 @@ param(
     [string]$PublicWebBaseURL = "",
 
     [Parameter()]
+    [string]$AdminBindIP = "127.0.0.1",
+
+    [Parameter()]
+    [switch]$SFUHostNetwork,
+
+    [Parameter()]
+    [switch]$SFUBridgeNetwork,
+
+    [Parameter()]
     [switch]$AllowInsecureDevelopmentAuth
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($SFUHostNetwork -and $SFUBridgeNetwork) {
+    throw "SFUHostNetwork and SFUBridgeNetwork are mutually exclusive."
+}
 
 $parsedIP = $null
 if (-not [System.Net.IPAddress]::TryParse($AdvertiseIP, [ref]$parsedIP)) {
@@ -22,6 +35,11 @@ if (-not [System.Net.IPAddress]::TryParse($AdvertiseIP, [ref]$parsedIP)) {
 }
 $isLoopback = [System.Net.IPAddress]::IsLoopback($parsedIP)
 $isIPv6 = $parsedIP.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6
+
+$parsedAdminBindIP = $null
+if (-not [System.Net.IPAddress]::TryParse($AdminBindIP, [ref]$parsedAdminBindIP)) {
+    throw "AdminBindIP must be an IPv4 or IPv6 address."
+}
 
 if ([string]::IsNullOrWhiteSpace($PublicBaseURL)) {
     if (-not $isLoopback) {
@@ -138,7 +156,7 @@ elseif (([Uri]$PublicBaseURL).Scheme -eq "http") {
     }
 }
 
-# The embedded TURN listener is udp4. Keep IPv6-only deployments usable by
+# The SFU-owned TURN listener is udp4. Keep IPv6-only deployments usable by
 # disabling TURN there while leaving RTMP and the rest of the stack enabled.
 $turnEnabled = (-not $isIPv6).ToString().ToLowerInvariant()
 $turnAdvertiseIP = "127.0.0.1"
@@ -182,9 +200,12 @@ $values = [ordered]@{
     TELESRV_TURN_ENABLE                      = $turnEnabled
     TELESRV_TURN_ADVERTISE_IP                = $turnAdvertiseIP
     TELESRV_TURN_BIND_IP                     = $turnBindIP
+    TELESRV_SFU_BIND_IP                      = $turnBindIP
     TELESRV_LIVESTREAM_RTMP_URL              = $rtmpURL
     TELESRV_PUBLIC_BIND_IP                  = $publicBindIP
     TELESRV_LOCAL_BIND_IP                   = $localBindIP
+    TELESRV_ADMIN_BIND_IP                   = $parsedAdminBindIP.ToString()
+    TELESRV_SFU_HOST_NETWORK                = (-not $SFUBridgeNetwork.IsPresent).ToString().ToLowerInvariant()
 }
 
 $content = [IO.File]::ReadAllText($templatePath)
@@ -242,5 +263,10 @@ if ($PSCmdlet.ShouldProcess($outputPath, "write owner-only Docker deployment env
     }
     Write-Host "Created $outputPath with restricted permissions."
     Write-Host "Review public URLs and authentication delivery settings before startup."
-    Write-Host "Next: docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml config --quiet"
+    if (-not $SFUBridgeNetwork) {
+        Write-Host "Next: docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml config --quiet"
+    }
+    else {
+        Write-Host "Next: docker compose --project-directory deploy/docker -f deploy/docker/compose.yaml -f deploy/docker/compose.sfu-bridge-network.yaml config --quiet"
+    }
 }

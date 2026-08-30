@@ -708,16 +708,19 @@ type Config struct {
 	// GroupCallMaxParticipants 是单房间参与者上限（演示规模）。
 	GroupCallMaxParticipants int
 
-	// TURNEnable 为 false 时私聊通话不下发中继（退回 P1 的 LAN 直连模式）。
+	// TURNEnable 为 false 时 Core 不下发中继且 SFU 不启动 TURN media listener。
 	TURNEnable bool
-	// TURNUDPPort 是内嵌 TURN/STUN 的监听端口（独立于 SFU 端口，两者都要独占
-	// 消费各自 socket 的 STUN 流量）。Windows 防火墙需放行。
+	// TURNUDPPort 是 SFU role 持有的 TURN/STUN 监听端口；Core 只把该地址下发
+	// 给客户端。它与群通话 SFU 端口不能共用。
 	TURNUDPPort int
+	// TURNBindIP 是 SFU role 实际绑定 TURN listener 和 relay sockets 的 IPv4
+	// 地址。bridge 发布模式通常为 0.0.0.0；host network 模式必须由应用自身遵守。
+	TURNBindIP string
 	// TURNAdvertiseIP 是写进 phoneConnectionWebrtc 与 relay 分配的客户端可达
 	// 地址，默认回落 SFUAdvertiseIP → AdvertiseIP。
 	TURNAdvertiseIP string
-	// TURNSecret 是 TURN REST 凭据 HMAC 密钥；为空则进程级随机（单实例自洽，
-	// 多实例/外部 coturn 必须显式配置同一值）。
+	// TURNSecret 是 Core credential issuer 与 SFU TURN listener 共享的 REST HMAC
+	// 密钥；split runtime 启用 TURN 时必须显式配置稳定值。
 	TURNSecret string
 	// TURNRelayMinPort/TURNRelayMaxPort 限定 relay 分配端口段（防火墙放行范围）。
 	TURNRelayMinPort int
@@ -742,6 +745,8 @@ type Config struct {
 
 	// SFUUDPPort 是独立 SFU 的单 UDP 端口（pion ICE UDPMux）。Windows 防火墙需放行。
 	SFUUDPPort int
+	// SFUBindIP 是 standalone SFU 媒体 socket 的本地 IPv4 绑定地址。
+	SFUBindIP string
 	// SFUAdvertiseIP 是写进下行 candidate 的客户端可达地址，默认回落 AdvertiseIP。
 	// ⚠ 127.0.0.1 会让真机 ICE 永远连不上且无任何 RPC 错误（纯媒体面静默失败）。
 	SFUAdvertiseIP string
@@ -1271,6 +1276,7 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 
 		TURNEnable:            envBoolOr("TELESRV_TURN_ENABLE", true),
 		TURNUDPPort:           envIntOr("TELESRV_TURN_UDP_PORT", 12400),
+		TURNBindIP:            envOr("TELESRV_TURN_BIND_IP", "0.0.0.0"),
 		TURNAdvertiseIP:       envOr("TELESRV_TURN_ADVERTISE_IP", ""),
 		TURNSecret:            envOr("TELESRV_TURN_SECRET", ""),
 		TURNRelayMinPort:      envIntOr("TELESRV_TURN_RELAY_MIN_PORT", 12500),
@@ -1279,6 +1285,7 @@ func loadFromEnv(fileEnv envSource) (Config, error) {
 		CallForceRelay:        envBoolOr("TELESRV_CALL_FORCE_RELAY", false),
 
 		SFUUDPPort:                   envIntOr("TELESRV_SFU_UDP_PORT", 12399),
+		SFUBindIP:                    envOr("TELESRV_SFU_BIND_IP", "0.0.0.0"),
 		SFUAdvertiseIP:               envOr("TELESRV_SFU_ADVERTISE_IP", ""),
 		SFUOwnerTTL:                  envDurationOr("TELESRV_SFU_OWNER_TTL", 2*time.Minute),
 		SFUOwnerHeartbeatInterval:    envDurationOr("TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL", 30*time.Second),

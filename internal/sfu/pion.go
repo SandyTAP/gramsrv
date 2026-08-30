@@ -24,6 +24,9 @@ import (
 type PionConfig struct {
 	// UDPPort 是单 UDP 监听端口（pion ICE UDPMux，全部 endpoint 复用）。
 	UDPPort int
+	// BindIP 是媒体 socket 的本地 IPv4 绑定。host networking 下 Docker 不再
+	// 提供 host_ip 边界，因此本字段必须由应用直接遵守。
+	BindIP string
 	// AdvertiseIP 是写进下行 candidate 的客户端可达地址。⚠ 127.0.0.1 会让
 	// 真机 ICE 永远连不上且无任何 RPC 错误（纯媒体面静默失败）。
 	AdvertiseIP string
@@ -141,6 +144,13 @@ func NewPion(cfg PionConfig) (Service, error) {
 	if cfg.AdvertiseIP == "" {
 		cfg.AdvertiseIP = "127.0.0.1"
 	}
+	if cfg.BindIP == "" {
+		cfg.BindIP = "0.0.0.0"
+	}
+	bindIP := net.ParseIP(cfg.BindIP)
+	if bindIP == nil || bindIP.To4() == nil {
+		return nil, fmt.Errorf("sfu: invalid IPv4 bind ip %q", cfg.BindIP)
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = zap.NewNop()
 	}
@@ -150,7 +160,7 @@ func NewPion(cfg PionConfig) (Service, error) {
 	if cfg.ActivityWindow <= 0 {
 		cfg.ActivityWindow = 25 * time.Second
 	}
-	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: cfg.UDPPort})
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP, Port: cfg.UDPPort})
 	if err != nil {
 		return nil, fmt.Errorf("sfu: listen udp %d: %w", cfg.UDPPort, err)
 	}
@@ -173,6 +183,7 @@ func NewPion(cfg PionConfig) (Service, error) {
 	go s.livenessLoop(ctx)
 	s.log.Info("sfu listening",
 		zap.Int("udp_port", cfg.UDPPort),
+		zap.String("bind_ip", cfg.BindIP),
 		zap.String("advertise_ip", cfg.AdvertiseIP))
 	if cfg.AdvertiseIP == "127.0.0.1" {
 		s.log.Warn("TELESRV_SFU_ADVERTISE_IP 为 127.0.0.1：真机 ICE 将无法连接（纯媒体面静默失败），多设备联调必须设为宿主机 LAN IP")

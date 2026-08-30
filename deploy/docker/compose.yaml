@@ -70,6 +70,12 @@ services:
       - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDIS_PASSWORD"
     volumes:
       - redis_data:/data
+    ports:
+      - name: sfu-host-redis
+        target: 6379
+        published: "${TELESRV_SFU_REDIS_HOST_PORT:-16379}"
+        host_ip: 127.0.0.1
+        protocol: tcp
     healthcheck:
       test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -qx PONG"]
       interval: 5s
@@ -202,8 +208,6 @@ services:
       TELESRV_TURN_UDP_PORT: ${TELESRV_TURN_UDP_PORT:-12400}
       TELESRV_TURN_ADVERTISE_IP: ${TELESRV_TURN_ADVERTISE_IP:?set the client-reachable TELESRV_TURN_ADVERTISE_IP in deploy/docker/.env}
       TELESRV_TURN_SECRET: ${TELESRV_TURN_SECRET:?set TELESRV_TURN_SECRET in deploy/docker/.env}
-      TELESRV_TURN_RELAY_MIN_PORT: ${TELESRV_TURN_RELAY_MIN_PORT:-12500}
-      TELESRV_TURN_RELAY_MAX_PORT: ${TELESRV_TURN_RELAY_MAX_PORT:-12999}
       TELESRV_CALL_TURN_CREDENTIAL_TTL: ${TELESRV_CALL_TURN_CREDENTIAL_TTL:-6h}
       TELESRV_CALL_FORCE_RELAY: ${TELESRV_CALL_FORCE_RELAY:-false}
       TELESRV_LIVESTREAM_ENABLE: ${TELESRV_LIVESTREAM_ENABLE:-true}
@@ -236,12 +240,13 @@ services:
         published: "${TELESRV_LIVESTREAM_RTMP_PORT:-2400}"
         host_ip: ${TELESRV_PUBLIC_BIND_IP:-0.0.0.0}
         protocol: tcp
-      - name: turn
-        target: ${TELESRV_TURN_UDP_PORT:-12400}
-        published: "${TELESRV_TURN_UDP_PORT:-12400}"
-        host_ip: ${TELESRV_TURN_BIND_IP:-127.0.0.1}
-        protocol: udp
-      - "${TELESRV_TURN_BIND_IP:-127.0.0.1}:${TELESRV_TURN_RELAY_MIN_PORT:-12500}-${TELESRV_TURN_RELAY_MAX_PORT:-12999}:${TELESRV_TURN_RELAY_MIN_PORT:-12500}-${TELESRV_TURN_RELAY_MAX_PORT:-12999}/udp"
+      - name: sfu-host-groupcall-control
+        target: 2420
+        published: "${TELESRV_GROUPCALL_CONTROL_HOST_PORT:-12420}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test:
         - CMD
@@ -266,7 +271,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 6
-      start_period: 240s
+      start_period: 60s
     networks:
       - data
       - control
@@ -384,24 +389,31 @@ services:
     environment:
       TELESRV_INSTANCE_ID: ${TELESRV_SFU_INSTANCE_ID:-sfu-1}
       TELESRV_LOG_LEVEL: ${TELESRV_LOG_LEVEL:-info}
+      TELESRV_REDIS_ADDR: 127.0.0.1:${TELESRV_SFU_REDIS_HOST_PORT:-16379}
       TELESRV_REDIS_PASSWORD: ${TELESRV_REDIS_PASSWORD:?set TELESRV_REDIS_PASSWORD in deploy/docker/.env}
+      TELESRV_GROUPCALL_CONTROL_URL: http://127.0.0.1:${TELESRV_GROUPCALL_CONTROL_HOST_PORT:-12420}
       TELESRV_GROUPCALL_CONTROL_TOKEN: ${TELESRV_GROUPCALL_CONTROL_TOKEN:?set TELESRV_GROUPCALL_CONTROL_TOKEN in deploy/docker/.env}
       TELESRV_SFU_CONTROL_TOKEN: ${TELESRV_SFU_CONTROL_TOKEN:?set TELESRV_SFU_CONTROL_TOKEN in deploy/docker/.env}
+      TELESRV_SFU_CONTROL_GRPC_URL: grpc://host.docker.internal:2450
       TELESRV_ADVERTISE_IP: ${TELESRV_ADVERTISE_IP:?set TELESRV_ADVERTISE_IP in deploy/docker/.env}
       TELESRV_SFU_UDP_PORT: ${TELESRV_SFU_UDP_PORT:-12399}
+      TELESRV_SFU_BIND_IP: ${TELESRV_SFU_BIND_IP:-127.0.0.1}
+      TELESRV_TURN_ENABLE: ${TELESRV_TURN_ENABLE:-true}
+      TELESRV_TURN_UDP_PORT: ${TELESRV_TURN_UDP_PORT:-12400}
+      TELESRV_TURN_BIND_IP: ${TELESRV_TURN_BIND_IP:-127.0.0.1}
+      TELESRV_TURN_ADVERTISE_IP: ${TELESRV_TURN_ADVERTISE_IP:?set the client-reachable TELESRV_TURN_ADVERTISE_IP in deploy/docker/.env}
+      TELESRV_TURN_SECRET: ${TELESRV_TURN_SECRET:?set TELESRV_TURN_SECRET in deploy/docker/.env}
+      TELESRV_TURN_RELAY_MIN_PORT: ${TELESRV_TURN_RELAY_MIN_PORT:-12500}
+      TELESRV_TURN_RELAY_MAX_PORT: ${TELESRV_TURN_RELAY_MAX_PORT:-12999}
     depends_on:
       redis:
         condition: service_healthy
       core:
         condition: service_healthy
-    expose:
-      - "2450"
-    ports:
-      - name: sfu-media
-        target: ${TELESRV_SFU_UDP_PORT:-12399}
-        published: "${TELESRV_SFU_UDP_PORT:-12399}"
-        host_ip: ${TELESRV_PUBLIC_BIND_IP:-0.0.0.0}
-        protocol: udp
+    # Media sockets bind the host directly. This avoids one Docker forwarding
+    # object per TURN relay port. Use compose.sfu-bridge-network.yaml only on
+    # hosts that cannot provide host networking.
+    network_mode: host
     healthcheck:
       test:
         - CMD
@@ -410,20 +422,15 @@ services:
         - --grpc
         - 127.0.0.1:2450,telesrv.sfu.v1.SFUControlService,TELESRV_SFU_CONTROL_TOKEN
         - --tcp
-        - core:2420
+        - 127.0.0.1:${TELESRV_GROUPCALL_CONTROL_HOST_PORT:-12420}
         - --redis
-        - redis:6379,TELESRV_REDIS_PASSWORD,0
+        - 127.0.0.1:${TELESRV_SFU_REDIS_HOST_PORT:-16379},TELESRV_REDIS_PASSWORD,0
         - --timeout
         - 3s
       interval: 5s
       timeout: 5s
       retries: 6
       start_period: 15s
-    networks:
-      control:
-        aliases:
-          - ${TELESRV_SFU_INSTANCE_ID:-sfu-1}
-      outbound: {}
 
   edge:
     <<: *app

@@ -499,6 +499,17 @@ func validateCoreConfig(cfg config.CoreConfig) error {
 	if strings.TrimSpace(cfg.FileToken) == "" {
 		return fmt.Errorf("TELESRV_FILE_TOKEN is required by cmd/telesrv-core and cmd/telesrv-file")
 	}
+	if cfg.TURNEnable {
+		if strings.TrimSpace(cfg.TURNSecret) == "" {
+			return fmt.Errorf("TELESRV_TURN_SECRET is required by Core credential issuer and SFU media listener")
+		}
+		if cfg.TURNUDPPort <= 0 {
+			return fmt.Errorf("TELESRV_TURN_UDP_PORT must be positive")
+		}
+		if cfg.CallTURNCredentialTTL <= 0 {
+			return fmt.Errorf("TELESRV_CALL_TURN_CREDENTIAL_TTL must be positive")
+		}
+	}
 	return nil
 }
 
@@ -1138,8 +1149,9 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		}
 		defer liveStreamService.Close()
 	}
-	// 私聊通话中继（P3）：内嵌 TURN/STUN，phoneCall.connections 经 phoneConnectionWebrtc
-	// 下发。未启用时退回 P1 的纯信令 LAN 直连。
+	// 私聊通话中继（P3）：Core 只签发 phoneCall.connections 的 TURN REST
+	// credentials；UDP listener 和 relay allocations 固定由 standalone SFU role
+	// 持有。未启用时退回 P1 的纯信令 LAN/P2P 路径。
 	turnService := turnsrv.Service(turnsrv.Disabled())
 	if cfg.TURNEnable {
 		turnAdvertise := cfg.TURNAdvertiseIP
@@ -1149,20 +1161,19 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		if turnAdvertise == "" {
 			turnAdvertise = cfg.AdvertiseIP
 		}
-		t, err := turnsrv.New(turnsrv.Config{
+		issuer, err := turnsrv.NewCredentialIssuer(turnsrv.Config{
 			UDPPort:       cfg.TURNUDPPort,
 			AdvertiseIP:   turnAdvertise,
 			SharedSecret:  cfg.TURNSecret,
-			RelayMinPort:  cfg.TURNRelayMinPort,
-			RelayMaxPort:  cfg.TURNRelayMaxPort,
 			CredentialTTL: cfg.CallTURNCredentialTTL,
-			Logger:        logger.Named("turn"),
 		})
 		if err != nil {
-			return fmt.Errorf("init turn: %w", err)
+			return fmt.Errorf("init turn credential issuer: %w", err)
 		}
-		defer t.Close()
-		turnService = t
+		turnService = issuer
+		logger.Info("turn credential issuer ready",
+			zap.String("advertise_ip", issuer.IP()),
+			zap.Int("udp_port", issuer.Port()))
 	}
 	logger.Info("standalone sfu: skip startup group call participant reset", zap.String("instance_id", instanceID))
 	phoneService, err := phoneapp.NewService(phoneapp.Config{

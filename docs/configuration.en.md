@@ -862,15 +862,19 @@ that cannot do what it says fails startup instead of being silently unreachable.
 | `TELESRV_GROUPCALL_CHECK_TTL` | duration / `45s` | Participant liveness watermark expiry. Clients and the SFU reporter refresh it. |
 | `TELESRV_GROUPCALL_SWEEP_INTERVAL` | duration / `10s` | Ghost-participant sweep interval. |
 | `TELESRV_GROUPCALL_MAX_PARTICIPANTS` | int / `32` | Per-room participant cap for the current small-scale implementation. |
-| `TELESRV_TURN_ENABLE` | bool / `true` | Enables embedded TURN/STUN relay data in private calls. False falls back to LAN/P2P-only behavior. |
-| `TELESRV_TURN_UDP_PORT` | int / `12400` | Embedded TURN/STUN UDP listen port; must differ from the SFU port and be allowed through the firewall. |
+| `TELESRV_TURN_ENABLE` | bool / `true` | Enables private-call relay credentials in Core and the TURN/STUN media listener in SFU. False falls back to LAN/P2P-only behavior. |
+| `TELESRV_TURN_UDP_PORT` | int / `12400` | SFU-owned TURN/STUN UDP listen port; must differ from the group-call SFU port and be allowed through the firewall. |
+| `TELESRV_TURN_BIND_IP` | IPv4 / `0.0.0.0` | Address used by SFU for the TURN listener and relay sockets; application binding is authoritative in host-network mode. |
 | `TELESRV_TURN_ADVERTISE_IP` | string / empty | Client-reachable relay address. Empty falls back to SFU advertise IP, then general advertise IP. |
-| `TELESRV_TURN_SECRET` | secret string / empty | HMAC secret for TURN REST credentials. Empty creates a process-random secret; multi-instance/external coturn deployments must configure one stable shared secret. |
+| `TELESRV_TURN_SECRET` | secret string / empty | Stable TURN REST HMAC secret shared by the Core credential issuer and SFU listener. Split runtime fails fast when TURN is enabled and this is empty. |
 | `TELESRV_TURN_RELAY_MIN_PORT` | int / `12500` | Inclusive relay allocation port minimum. |
-| `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | Inclusive relay allocation port maximum; must not be below the minimum. Open the whole range in the firewall. |
+| `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | Inclusive host-network relay allocation maximum; must not be below the minimum. Open the whole range in the firewall. |
+| `TELESRV_TURN_BRIDGE_RELAY_MAX_PORT` | int / `12563` | Separate Docker bridge-fallback maximum that bounds per-port publishing. |
+| `TELESRV_SFU_HOST_NETWORK` | bool / Docker default `true` | Runs Docker SFU directly on the host network to avoid per-relay-port mappings; `false` selects the explicit bridge fallback. |
 | `TELESRV_CALL_TURN_CREDENTIAL_TTL` | duration / `6h` | Per-call TURN credential lifetime. |
 | `TELESRV_CALL_FORCE_RELAY` | bool / `false` | Forces `p2p_allowed=false` to test TURN relay paths. |
 | `TELESRV_SFU_UDP_PORT` | int / `12399` | Pion ICE UDPMux port; allow it through the firewall. |
+| `TELESRV_SFU_BIND_IP` | IPv4 / `0.0.0.0` | Local bind for the standalone SFU media socket; directly controls the host interface in Docker host-network mode. |
 | `TELESRV_SFU_ADVERTISE_IP` | string / empty | Client-reachable ICE candidate IP. Empty falls back to `TELESRV_ADVERTISE_IP`; loopback silently breaks real-device media. |
 | `TELESRV_SFU_OWNER_TTL` | duration / `2m` | TTL for the `callID -> sfu instance` owner lease; one call must stick to one owner in multi-SFU mode. |
 | `TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL` | duration / `30s` | Refresh interval for active standalone SFU owner leases; must be lower than the owner TTL. |

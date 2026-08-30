@@ -166,10 +166,9 @@ case "$command_name" in
     case "$turn_enable" in
       true)
         require_value TELESRV_TURN_UDP_PORT
+        require_value TELESRV_TURN_BIND_IP
         require_value TELESRV_TURN_ADVERTISE_IP
         require_secret TELESRV_TURN_SECRET
-        require_value TELESRV_TURN_RELAY_MIN_PORT
-        require_value TELESRV_TURN_RELAY_MAX_PORT
         ;;
       false) ;;
       *)
@@ -231,9 +230,25 @@ case "$command_name" in
     ;;
   telesrv-sfu)
     require_value TELESRV_ADVERTISE_IP
+    require_value TELESRV_SFU_BIND_IP
     require_secret TELESRV_REDIS_PASSWORD
     require_secret TELESRV_GROUPCALL_CONTROL_TOKEN
     require_secret TELESRV_SFU_CONTROL_TOKEN
+    turn_enable="$(printf '%s' "${TELESRV_TURN_ENABLE:-false}" | tr '[:upper:]' '[:lower:]')"
+    case "$turn_enable" in
+      true)
+        require_value TELESRV_TURN_UDP_PORT
+        require_value TELESRV_TURN_ADVERTISE_IP
+        require_secret TELESRV_TURN_SECRET
+        require_value TELESRV_TURN_RELAY_MIN_PORT
+        require_value TELESRV_TURN_RELAY_MAX_PORT
+        ;;
+      false) ;;
+      *)
+        echo "telesrv: TELESRV_TURN_ENABLE must be true or false" >&2
+        exit 64
+        ;;
+    esac
     ;;
   telesrv-admin)
     require_dsn

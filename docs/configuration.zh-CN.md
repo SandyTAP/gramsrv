@@ -766,15 +766,19 @@ Core 的 `star_gifts.export.ton` 仅在 `mode: ton` 时启用正式链路：
 | `TELESRV_GROUPCALL_CHECK_TTL` | duration / `45s` | 群通话参与者 liveness 水位过期阈值，客户端与 SFU reporter 都会刷新。 |
 | `TELESRV_GROUPCALL_SWEEP_INTERVAL` | duration / `10s` | 幽灵参与者 sweep 周期。 |
 | `TELESRV_GROUPCALL_MAX_PARTICIPANTS` | int / `32` | 当前小规模实现的单房间参与者上限。 |
-| `TELESRV_TURN_ENABLE` | bool / `true` | 启用内嵌 TURN/STUN 与私聊通话 relay 下发；false 回退 LAN/P2P-only。 |
-| `TELESRV_TURN_UDP_PORT` | int / `12400` | 内嵌 TURN/STUN UDP 监听端口；必须与 SFU 端口不同并放行防火墙。 |
+| `TELESRV_TURN_ENABLE` | bool / `true` | Core 启用私聊 relay 凭据下发，同时 SFU 启用 TURN/STUN 媒体 listener；false 回退 LAN/P2P-only。 |
+| `TELESRV_TURN_UDP_PORT` | int / `12400` | SFU-owned TURN/STUN UDP 监听端口；必须与群通话 SFU 端口不同并放行防火墙。 |
+| `TELESRV_TURN_BIND_IP` | IPv4 / `0.0.0.0` | SFU 实际绑定 TURN listener 与 relay sockets 的地址；host-network 模式由应用直接遵守。 |
 | `TELESRV_TURN_ADVERTISE_IP` | string / 空 | 客户端可达 relay IP；空值依次回退 SFU advertise IP、通用 advertise IP。 |
-| `TELESRV_TURN_SECRET` | secret string / 空 | TURN REST credential HMAC secret；空值生成进程级随机值，多实例/外部 coturn 必须显式共享稳定值。 |
+| `TELESRV_TURN_SECRET` | secret string / 空 | Core credential issuer 与 SFU listener 共享的 TURN REST HMAC secret；split runtime 启用 TURN 时必须显式配置稳定值，空值 fail fast。 |
 | `TELESRV_TURN_RELAY_MIN_PORT` | int / `12500` | relay 分配端口范围下界（含）。 |
-| `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | relay 分配端口范围上界（含），不得小于下界，防火墙需放行整个范围。 |
+| `TELESRV_TURN_RELAY_MAX_PORT` | int / `12999` | host-network relay 分配端口范围上界（含），不得小于下界，防火墙需放行整个范围。 |
+| `TELESRV_TURN_BRIDGE_RELAY_MAX_PORT` | int / `12563` | Docker bridge fallback 的独立上界，限制逐端口 publishing 数量。 |
+| `TELESRV_SFU_HOST_NETWORK` | bool / Docker 默认 `true` | Docker 部署让 SFU 直接使用宿主网络，避免逐 relay 端口映射；`false` 是显式 bridge 兼容模式。 |
 | `TELESRV_CALL_TURN_CREDENTIAL_TTL` | duration / `6h` | 按通话签发的 TURN credential 有效期。 |
 | `TELESRV_CALL_FORCE_RELAY` | bool / `false` | 强制 `p2p_allowed=false`，用于验证 TURN relay 路径。 |
 | `TELESRV_SFU_UDP_PORT` | int / `12399` | Pion ICE UDPMux 端口，必须放行防火墙。 |
+| `TELESRV_SFU_BIND_IP` | IPv4 / `0.0.0.0` | standalone SFU 媒体 socket 的本地绑定；Docker host network 下直接决定宿主监听接口。 |
 | `TELESRV_SFU_ADVERTISE_IP` | string / 空 | 下发给客户端的 ICE candidate IP；空值回退 `TELESRV_ADVERTISE_IP`，loopback 会静默破坏真机媒体。 |
 | `TELESRV_SFU_OWNER_TTL` | duration / `2m` | `callID -> sfu instance` owner 租约 TTL；多 SFU 下同一 call 必须粘同一 owner。 |
 | `TELESRV_SFU_OWNER_HEARTBEAT_INTERVAL` | duration / `30s` | 独立 SFU active room 刷新 owner 租约的周期，必须小于 owner TTL。 |

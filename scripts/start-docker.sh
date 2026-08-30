@@ -9,6 +9,9 @@ Options used only when deploy/docker/.env does not exist:
   --advertise-ip IP
   --public-base-url URL
   --public-web-base-url URL
+  --admin-bind-ip IP
+  --sfu-host-network       Use direct host networking for SFU (default).
+  --sfu-bridge-network     Use Docker UDP publishing as a compatibility fallback.
   --allow-insecure-development-auth
 
 Other options:
@@ -27,6 +30,8 @@ generator_path="$script_dir/new-docker-env.sh"
 advertise_ip=
 public_base_url=
 public_web_base_url=
+admin_bind_ip=
+sfu_network_mode=
 allow_insecure=false
 build=false
 initialization_options=false
@@ -51,6 +56,22 @@ while [[ $# -gt 0 ]]; do
       initialization_options=true
       shift 2
       ;;
+    --admin-bind-ip)
+      [[ $# -ge 2 ]] || { printf '%s\n' "$1 requires a value" >&2; exit 1; }
+      admin_bind_ip=$2
+      initialization_options=true
+      shift 2
+      ;;
+    --sfu-host-network)
+      sfu_network_mode=host
+      initialization_options=true
+      shift
+      ;;
+    --sfu-bridge-network)
+      sfu_network_mode=bridge
+      initialization_options=true
+      shift
+      ;;
     --allow-insecure-development-auth)
       allow_insecure=true
       initialization_options=true
@@ -73,13 +94,25 @@ if [[ ! -f "$env_path" ]]; then
   generator_args=(--advertise-ip "$advertise_ip")
   [[ -z "$public_base_url" ]] || generator_args+=(--public-base-url "$public_base_url")
   [[ -z "$public_web_base_url" ]] || generator_args+=(--public-web-base-url "$public_web_base_url")
+  [[ -z "$admin_bind_ip" ]] || generator_args+=(--admin-bind-ip "$admin_bind_ip")
+  [[ "$sfu_network_mode" != host ]] || generator_args+=(--sfu-host-network)
+  [[ "$sfu_network_mode" != bridge ]] || generator_args+=(--sfu-bridge-network)
   [[ "$allow_insecure" = false ]] || generator_args+=(--allow-insecure-development-auth)
   "$generator_path" "${generator_args[@]}"
 elif [[ "$initialization_options" = true ]]; then
   printf 'start-docker: deploy/docker/.env already exists; initialization options were ignored to preserve credentials and deployment identity.\n' >&2
 fi
 
+configured_sfu_host_network=$(awk -F= '$1 == "TELESRV_SFU_HOST_NETWORK" { print substr($0, length($1) + 2); exit }' "$env_path")
+[[ -n "$configured_sfu_host_network" ]] || configured_sfu_host_network=true
+case "$configured_sfu_host_network" in
+  true|false) ;;
+  *) printf 'start-docker: TELESRV_SFU_HOST_NETWORK must be true or false\n' >&2; exit 1 ;;
+esac
 compose=(docker compose --project-directory "$docker_dir" --env-file "$env_path" --file "$compose_path")
+if [[ "$configured_sfu_host_network" = false ]]; then
+  compose+=(--file "$docker_dir/compose.sfu-bridge-network.yaml")
+fi
 "${compose[@]}" version >/dev/null
 "${compose[@]}" config --quiet
 
@@ -119,5 +152,8 @@ admin_port=$(env_value TELESRV_ADMIN_PORT)
 [[ -n "$admin_bind_ip" ]] || admin_bind_ip=127.0.0.1
 [[ -n "$admin_port" ]] || admin_port=2600
 admin_url_host=$admin_bind_ip
+if [[ "$admin_url_host" = 0.0.0.0 || "$admin_url_host" = :: ]]; then
+  admin_url_host=$(env_value TELESRV_ADVERTISE_IP)
+fi
 [[ "$admin_url_host" != *:* ]] || admin_url_host="[$admin_url_host]"
 printf 'Admin UI: http://%s:%s (login password is stored in %s)\n' "$admin_url_host" "$admin_port" "$env_path"

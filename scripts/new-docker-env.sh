@@ -9,6 +9,9 @@ Usage: ./scripts/new-docker-env.sh --advertise-ip IP [options]
 Options:
   --public-base-url URL
   --public-web-base-url URL
+  --admin-bind-ip IP
+  --sfu-host-network       Use direct host networking for SFU (default).
+  --sfu-bridge-network     Use Docker UDP publishing as a compatibility fallback.
   --allow-insecure-development-auth
   --output PATH
   --help
@@ -96,6 +99,8 @@ output_path="$repo_root/deploy/docker/.env"
 advertise_ip=
 public_base_url=
 public_web_base_url=
+admin_bind_ip=127.0.0.1
+sfu_host_network=true
 allow_insecure=false
 
 while [ "$#" -gt 0 ]; do
@@ -114,6 +119,19 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "$1 requires a value"
       public_web_base_url=$2
       shift 2
+      ;;
+    --admin-bind-ip)
+      [ "$#" -ge 2 ] || die "$1 requires a value"
+      admin_bind_ip=$2
+      shift 2
+      ;;
+    --sfu-host-network)
+      sfu_host_network=true
+      shift
+      ;;
+    --sfu-bridge-network)
+      sfu_host_network=false
+      shift
       ;;
     --allow-insecure-development-auth)
       allow_insecure=true
@@ -144,6 +162,11 @@ case "$advertise_ip" in
     is_ipv6=true
     ;;
   *) validate_ipv4 "$advertise_ip" || die "--advertise-ip is not a valid IPv4 address" ;;
+esac
+
+case "$admin_bind_ip" in
+  *:*) validate_ipv6 "$admin_bind_ip" || die "--admin-bind-ip is not a valid IPv6 address" ;;
+  *) validate_ipv4 "$admin_bind_ip" || die "--admin-bind-ip is not a valid IPv4 address" ;;
 esac
 
 is_loopback=false
@@ -231,19 +254,23 @@ TELESRV_PUBLIC_WEB_BASE_URL=$public_web_base_url
 TELESRV_TURN_ENABLE=$turn_enable
 TELESRV_TURN_ADVERTISE_IP=$turn_advertise_ip
 TELESRV_TURN_BIND_IP=$turn_bind_ip
+TELESRV_SFU_BIND_IP=$turn_bind_ip
 TELESRV_LIVESTREAM_RTMP_URL=$rtmp_url
 TELESRV_PUBLIC_BIND_IP=$public_bind_ip
 TELESRV_LOCAL_BIND_IP=$local_bind_ip
+TELESRV_ADMIN_BIND_IP=$admin_bind_ip
+TELESRV_SFU_HOST_NETWORK=$sfu_host_network
 
-replacement_keys='TELESRV_BUILD_COMMIT TELESRV_BUILD_BRANCH TELESRV_BUILD_TREE_STATE TELESRV_BUILD_DATE POSTGRES_PASSWORD TELESRV_POSTGRES_DSN TELESRV_REDIS_PASSWORD TELESRV_CORE_EXEC_TOKEN TELESRV_FILE_TOKEN TELESRV_EGRESS_DELIVERY_TOKEN TELESRV_GROUPCALL_CONTROL_TOKEN TELESRV_SFU_CONTROL_TOKEN TELESRV_ADMIN_API_TOKEN TELESRV_ADMIN_UI_PASSWORD TELESRV_ADMIN_SESSION_KEY TELESRV_TURN_SECRET TELESRV_OTP_WEBHOOK_SECRET TELESRV_DEV_AUTH_CODE TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH TELESRV_ADVERTISE_IP TELESRV_PUBLIC_BASE_URL TELESRV_PUBLIC_WEB_BASE_URL TELESRV_TURN_ENABLE TELESRV_TURN_ADVERTISE_IP TELESRV_TURN_BIND_IP TELESRV_LIVESTREAM_RTMP_URL TELESRV_PUBLIC_BIND_IP TELESRV_LOCAL_BIND_IP'
+replacement_keys='TELESRV_BUILD_COMMIT TELESRV_BUILD_BRANCH TELESRV_BUILD_TREE_STATE TELESRV_BUILD_DATE POSTGRES_PASSWORD TELESRV_POSTGRES_DSN TELESRV_REDIS_PASSWORD TELESRV_CORE_EXEC_TOKEN TELESRV_FILE_TOKEN TELESRV_EGRESS_DELIVERY_TOKEN TELESRV_GROUPCALL_CONTROL_TOKEN TELESRV_SFU_CONTROL_TOKEN TELESRV_ADMIN_API_TOKEN TELESRV_ADMIN_UI_PASSWORD TELESRV_ADMIN_SESSION_KEY TELESRV_TURN_SECRET TELESRV_OTP_WEBHOOK_SECRET TELESRV_DEV_AUTH_CODE TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH TELESRV_ADVERTISE_IP TELESRV_PUBLIC_BASE_URL TELESRV_PUBLIC_WEB_BASE_URL TELESRV_TURN_ENABLE TELESRV_TURN_ADVERTISE_IP TELESRV_TURN_BIND_IP TELESRV_SFU_BIND_IP TELESRV_LIVESTREAM_RTMP_URL TELESRV_PUBLIC_BIND_IP TELESRV_LOCAL_BIND_IP TELESRV_ADMIN_BIND_IP TELESRV_SFU_HOST_NETWORK'
 export POSTGRES_PASSWORD TELESRV_BUILD_COMMIT TELESRV_BUILD_BRANCH TELESRV_BUILD_TREE_STATE TELESRV_BUILD_DATE
 export TELESRV_POSTGRES_DSN TELESRV_REDIS_PASSWORD TELESRV_CORE_EXEC_TOKEN TELESRV_FILE_TOKEN
 export TELESRV_EGRESS_DELIVERY_TOKEN TELESRV_GROUPCALL_CONTROL_TOKEN TELESRV_SFU_CONTROL_TOKEN
 export TELESRV_ADMIN_API_TOKEN TELESRV_ADMIN_UI_PASSWORD TELESRV_ADMIN_SESSION_KEY TELESRV_TURN_SECRET
 export TELESRV_OTP_WEBHOOK_SECRET TELESRV_DEV_AUTH_CODE TELESRV_ALLOW_INSECURE_DEVELOPMENT_AUTH
 export TELESRV_ADVERTISE_IP TELESRV_PUBLIC_BASE_URL TELESRV_PUBLIC_WEB_BASE_URL TELESRV_TURN_ENABLE
-export TELESRV_TURN_ADVERTISE_IP TELESRV_TURN_BIND_IP TELESRV_LIVESTREAM_RTMP_URL
-export TELESRV_PUBLIC_BIND_IP TELESRV_LOCAL_BIND_IP
+export TELESRV_TURN_ADVERTISE_IP TELESRV_TURN_BIND_IP TELESRV_SFU_BIND_IP TELESRV_LIVESTREAM_RTMP_URL
+export TELESRV_PUBLIC_BIND_IP TELESRV_LOCAL_BIND_IP TELESRV_ADMIN_BIND_IP
+export TELESRV_SFU_HOST_NETWORK
 
 output_dir=$(dirname -- "$output_path")
 [ -d "$output_dir" ] || die "output directory does not exist: $output_dir"
@@ -290,4 +317,8 @@ unlink "$temporary_path"
 trap - EXIT HUP INT TERM
 printf 'Created %s with mode 0600.\n' "$output_path"
 printf 'Review public URLs and authentication delivery settings before startup.\n'
-printf 'Next: docker compose --project-directory deploy/docker --env-file %s -f deploy/docker/compose.yaml config --quiet\n' "$output_path"
+if [ "$sfu_host_network" = true ]; then
+  printf 'Next: docker compose --project-directory deploy/docker --env-file %s -f deploy/docker/compose.yaml config --quiet\n' "$output_path"
+else
+  printf 'Next: docker compose --project-directory deploy/docker --env-file %s -f deploy/docker/compose.yaml -f deploy/docker/compose.sfu-bridge-network.yaml config --quiet\n' "$output_path"
+fi

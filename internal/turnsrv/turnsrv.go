@@ -1,8 +1,8 @@
-// Package turnsrv 是私聊通话 P3 的内嵌 TURN/STUN 服务（pion/turn/v5）。
+// Package turnsrv 是私聊通话 P3 的 TURN/STUN 媒体与信令边界（pion/turn/v5）。
 //
 // 角色：私聊媒体面是客户端间 P2P（tgcalls/WebRTC），服务端只在 NAT 穿透失败时
-// 充当中继。本包对外只暴露三件事：服务可达地址（写进 phoneCall.connections 的
-// phoneConnectionWebrtc 条目）、按通话签发的临时凭据、运行开关。
+// 充当中继。SFU role 持有 UDP listener/relay allocations，Core role 只使用同一
+// shared secret 签发 phoneCall.connections 的临时凭据，不持有媒体 socket。
 //
 // 凭据采用 TURN REST 规范（draft-uberti-behave-turn-rest-00，coturn 同款）：
 // username = "<unix 过期时间>:<标识>"，password = base64(HMAC-SHA1(secret, username))。
@@ -21,11 +21,15 @@ import (
 	"go.uber.org/zap"
 )
 
-// Config 是内嵌 TURN 的运行参数。
+// Config 是 TURN credential/listener 边界的运行参数。
 type Config struct {
 	// UDPPort 是 TURN/STUN 监听端口（独立于 SFU 端口：两者都要独占消费各自
 	// socket 上的 STUN 流量，不能共用）。Windows 防火墙需放行。
 	UDPPort int
+	// BindIP is the local IPv4 address used by both the TURN listener and relay
+	// allocation sockets. It matters with host networking because Docker no
+	// longer applies a host_ip publishing boundary.
+	BindIP string
 	// AdvertiseIP 是写进 phoneConnectionWebrtc 与 relay 分配地址的客户端可达
 	// 地址。⚠ 127.0.0.1 时真机拿到的 relay candidate 不可达（媒体面静默失败）。
 	AdvertiseIP string
@@ -71,33 +75,40 @@ func (disabled) Port() int    { return 0 }
 func (disabled) Close() error { return nil }
 
 type pionTURN struct {
-	cfg    Config
+	*credentialIssuer
 	server *turn.Server
 }
 
-// New 启动内嵌 TURN：绑定 UDP 端口、装配 REST 凭据校验与 relay 端口段。
-func New(cfg Config) (Service, error) {
-	if cfg.UDPPort <= 0 {
-		return nil, fmt.Errorf("turnsrv: invalid udp port %d", cfg.UDPPort)
+type credentialIssuer struct {
+	cfg Config
+}
+
+// NewCredentialIssuer creates the Core-side signaling projection without
+// opening a TURN listener. A stable shared secret is mandatory because the SFU
+// role validates these credentials in a different process.
+func NewCredentialIssuer(cfg Config) (Service, error) {
+	if cfg.SharedSecret == "" {
+		return nil, fmt.Errorf("turnsrv: shared secret is required for split credential issuer")
 	}
-	if cfg.AdvertiseIP == "" {
-		cfg.AdvertiseIP = "127.0.0.1"
+	normalized, err := normalizeCredentialConfig(cfg, false)
+	if err != nil {
+		return nil, err
+	}
+	return &credentialIssuer{cfg: normalized}, nil
+}
+
+// New starts the SFU-owned TURN media listener and relay allocator.
+func New(cfg Config) (Service, error) {
+	var err error
+	cfg, err = normalizeCredentialConfig(cfg, true)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Realm == "" {
 		cfg.Realm = "telesrv"
 	}
-	if cfg.SharedSecret == "" {
-		secret, err := randomSecret()
-		if err != nil {
-			return nil, err
-		}
-		cfg.SharedSecret = secret
-	}
 	if cfg.RelayMinPort <= 0 || cfg.RelayMaxPort < cfg.RelayMinPort {
 		return nil, fmt.Errorf("turnsrv: invalid relay port range [%d,%d]", cfg.RelayMinPort, cfg.RelayMaxPort)
-	}
-	if cfg.CredentialTTL <= 0 {
-		cfg.CredentialTTL = 24 * time.Hour
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = zap.NewNop()
@@ -106,7 +117,7 @@ func New(cfg Config) (Service, error) {
 	if relayIP == nil {
 		return nil, fmt.Errorf("turnsrv: invalid advertise ip %q", cfg.AdvertiseIP)
 	}
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", cfg.UDPPort))
+	conn, err := net.ListenPacket("udp4", net.JoinHostPort(cfg.BindIP, fmt.Sprint(cfg.UDPPort)))
 	if err != nil {
 		return nil, fmt.Errorf("turnsrv: listen udp %d: %w", cfg.UDPPort, err)
 	}
@@ -121,7 +132,7 @@ func New(cfg Config) (Service, error) {
 				RelayAddress: relayIP,
 				MinPort:      uint16(cfg.RelayMinPort),
 				MaxPort:      uint16(cfg.RelayMaxPort),
-				Address:      "0.0.0.0",
+				Address:      cfg.BindIP,
 			},
 		}},
 	})
@@ -131,18 +142,52 @@ func New(cfg Config) (Service, error) {
 	}
 	cfg.Logger.Info("turn listening",
 		zap.Int("udp_port", cfg.UDPPort),
+		zap.String("bind_ip", cfg.BindIP),
 		zap.String("advertise_ip", cfg.AdvertiseIP),
 		zap.Int("relay_min_port", cfg.RelayMinPort),
 		zap.Int("relay_max_port", cfg.RelayMaxPort))
 	if cfg.AdvertiseIP == "127.0.0.1" {
 		cfg.Logger.Warn("TELESRV_TURN_ADVERTISE_IP 为 127.0.0.1：真机拿到的 relay candidate 不可达（跨网媒体面静默失败），跨设备通话必须设为客户端可达 IP")
 	}
-	return &pionTURN{cfg: cfg, server: server}, nil
+	return &pionTURN{credentialIssuer: &credentialIssuer{cfg: cfg}, server: server}, nil
 }
 
-func (t *pionTURN) Enabled() bool { return true }
+func normalizeCredentialConfig(cfg Config, allowRandomSecret bool) (Config, error) {
+	if cfg.UDPPort <= 0 {
+		return Config{}, fmt.Errorf("turnsrv: invalid udp port %d", cfg.UDPPort)
+	}
+	if cfg.AdvertiseIP == "" {
+		cfg.AdvertiseIP = "127.0.0.1"
+	}
+	if net.ParseIP(cfg.AdvertiseIP) == nil {
+		return Config{}, fmt.Errorf("turnsrv: invalid advertise ip %q", cfg.AdvertiseIP)
+	}
+	if cfg.BindIP == "" {
+		cfg.BindIP = "0.0.0.0"
+	}
+	bindIP := net.ParseIP(cfg.BindIP)
+	if bindIP == nil || bindIP.To4() == nil {
+		return Config{}, fmt.Errorf("turnsrv: invalid IPv4 bind ip %q", cfg.BindIP)
+	}
+	if cfg.SharedSecret == "" {
+		if !allowRandomSecret {
+			return Config{}, fmt.Errorf("turnsrv: shared secret is required")
+		}
+		secret, err := randomSecret()
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SharedSecret = secret
+	}
+	if cfg.CredentialTTL <= 0 {
+		cfg.CredentialTTL = 24 * time.Hour
+	}
+	return cfg, nil
+}
 
-func (t *pionTURN) Credentials(user string) (string, string, error) {
+func (t *credentialIssuer) Enabled() bool { return true }
+
+func (t *credentialIssuer) Credentials(user string) (string, string, error) {
 	username, password, err := turn.GenerateLongTermTURNRESTCredentials(t.cfg.SharedSecret, user, t.cfg.CredentialTTL)
 	if err != nil {
 		return "", "", fmt.Errorf("turnsrv: generate credentials: %w", err)
@@ -150,8 +195,10 @@ func (t *pionTURN) Credentials(user string) (string, string, error) {
 	return username, password, nil
 }
 
-func (t *pionTURN) IP() string   { return t.cfg.AdvertiseIP }
-func (t *pionTURN) Port() int    { return t.cfg.UDPPort }
+func (t *credentialIssuer) IP() string   { return t.cfg.AdvertiseIP }
+func (t *credentialIssuer) Port() int    { return t.cfg.UDPPort }
+func (t *credentialIssuer) Close() error { return nil }
+
 func (t *pionTURN) Close() error { return t.server.Close() }
 
 func randomSecret() (string, error) {

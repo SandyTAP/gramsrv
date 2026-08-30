@@ -568,11 +568,14 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_INSTANCE_ID", "compose-test-1")
 	t.Setenv("TELESRV_POSTGRES_DSN", "postgres://telesrv:secret@postgres:5432/telesrv_v2?sslmode=disable")
 	t.Setenv("TELESRV_REDIS_PASSWORD", "redis-secret")
+	t.Setenv("TELESRV_REDIS_ADDR", "redis:6379")
 	t.Setenv("TELESRV_CORE_EXEC_TOKEN", "core-secret")
 	t.Setenv("TELESRV_FILE_TOKEN", "file-secret")
 	t.Setenv("TELESRV_EGRESS_DELIVERY_TOKEN", "egress-secret")
 	t.Setenv("TELESRV_GROUPCALL_CONTROL_TOKEN", "group-call-secret")
 	t.Setenv("TELESRV_SFU_CONTROL_TOKEN", "sfu-secret")
+	t.Setenv("TELESRV_SFU_CONTROL_GRPC_URL", "grpc://sfu-1:2450")
+	t.Setenv("TELESRV_GROUPCALL_CONTROL_URL", "http://core:2420")
 	t.Setenv("TELESRV_ADMIN_API_TOKEN", "admin-api-secret")
 	t.Setenv("TELESRV_ADMIN_UI_PASSWORD", "admin-password")
 	t.Setenv("TELESRV_ADMIN_UI_TOKEN", "")
@@ -585,6 +588,16 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 	t.Setenv("TELESRV_ADVERTISE_IP", "203.0.113.10")
 	t.Setenv("TELESRV_ADVERTISE_PORT", "2398")
 	t.Setenv("TELESRV_SFU_UDP_PORT", "12399")
+	t.Setenv("TELESRV_SFU_BIND_IP", "0.0.0.0")
+	t.Setenv("TELESRV_TURN_ENABLE", "true")
+	t.Setenv("TELESRV_TURN_UDP_PORT", "12400")
+	t.Setenv("TELESRV_TURN_BIND_IP", "0.0.0.0")
+	t.Setenv("TELESRV_TURN_ADVERTISE_IP", "203.0.113.10")
+	t.Setenv("TELESRV_TURN_SECRET", "turn-secret")
+	t.Setenv("TELESRV_TURN_RELAY_MIN_PORT", "12500")
+	t.Setenv("TELESRV_TURN_RELAY_MAX_PORT", "12563")
+	t.Setenv("TELESRV_CALL_TURN_CREDENTIAL_TTL", "6h")
+	t.Setenv("TELESRV_CALL_FORCE_RELAY", "false")
 	t.Setenv("TELESRV_DEFAULT_COUNTRY_CODE", "CN")
 	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://example.test")
 	t.Setenv("TELESRV_PUBLIC_APP_SCHEME", "telesrv")
@@ -654,7 +667,7 @@ func TestLoadDockerRoleYAMLFiles(t *testing.T) {
 		}},
 		{name: "sfu", file: "sfu.yaml", load: func() error {
 			cfg, err := LoadSFU()
-			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.SFUControlGRPCAddr != "0.0.0.0:2450" || cfg.SFUControlGRPCURL != "grpc://compose-test-1:2450" || cfg.GroupCallControlURL != "http://core:2420") {
+			if err == nil && (cfg.InstanceID != "compose-test-1" || cfg.SFUControlGRPCAddr != "0.0.0.0:2450" || cfg.SFUControlGRPCURL != "grpc://sfu-1:2450" || cfg.GroupCallControlURL != "http://core:2420" || cfg.SFUBindIP != "0.0.0.0" || !cfg.TURNEnable || cfg.TURNUDPPort != 12400 || cfg.TURNBindIP != "0.0.0.0" || cfg.TURNAdvertiseIP != "203.0.113.10" || cfg.TURNSecret != "turn-secret" || cfg.TURNRelayMinPort != 12500 || cfg.TURNRelayMaxPort != 12563) {
 				return fmt.Errorf("unexpected Docker SFU identity or control endpoint")
 			}
 			return err
@@ -742,6 +755,80 @@ func TestDockerRoleConfigVariablesAreInjectedByMatchingService(t *testing.T) {
 			if fileOwned && serviceName != "file" && !adminStorageSelector {
 				t.Errorf("File-owned setting %s is injected into Compose service %s", name, serviceName)
 			}
+		}
+	}
+}
+
+func TestDockerComposeDefaultsTURNToSFUHostNetwork(t *testing.T) {
+	dockerDir := filepath.Join("..", "..", "deploy", "docker")
+	composeData, err := os.ReadFile(filepath.Join(dockerDir, "compose.yaml"))
+	if err != nil {
+		t.Fatalf("read compose.yaml: %v", err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]any `yaml:"environment"`
+			Ports       []any          `yaml:"ports"`
+			NetworkMode string         `yaml:"network_mode"`
+			Healthcheck struct {
+				StartPeriod string `yaml:"start_period"`
+			} `yaml:"healthcheck"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(composeData, &compose); err != nil {
+		t.Fatalf("parse compose.yaml: %v", err)
+	}
+
+	core, ok := compose.Services["core"]
+	if !ok {
+		t.Fatal("compose core service is missing")
+	}
+	sfu, ok := compose.Services["sfu"]
+	if !ok {
+		t.Fatal("compose sfu service is missing")
+	}
+	for _, name := range []string{"TELESRV_TURN_RELAY_MIN_PORT", "TELESRV_TURN_RELAY_MAX_PORT"} {
+		if _, ok := core.Environment[name]; ok {
+			t.Errorf("core must not receive media-owned setting %s", name)
+		}
+		if _, ok := sfu.Environment[name]; !ok {
+			t.Errorf("sfu must receive media-owned setting %s", name)
+		}
+	}
+	corePorts := fmt.Sprint(core.Ports)
+	if strings.Contains(corePorts, "TELESRV_TURN_") {
+		t.Errorf("core publishes TURN media ports: %s", corePorts)
+	}
+	if sfu.NetworkMode != "host" {
+		t.Errorf("sfu network_mode = %q, want host", sfu.NetworkMode)
+	}
+	if len(sfu.Ports) != 0 {
+		t.Errorf("host-network sfu must not publish Docker ports: %v", sfu.Ports)
+	}
+	if core.Healthcheck.StartPeriod != "60s" {
+		t.Errorf("core healthcheck start_period = %q, want 60s", core.Healthcheck.StartPeriod)
+	}
+
+	envExample, err := os.ReadFile(filepath.Join(dockerDir, ".env.example"))
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	if !strings.Contains(string(envExample), "TELESRV_TURN_RELAY_MAX_PORT=12999") {
+		t.Error("host-network SFU must retain the full TURN relay range")
+	}
+	if !strings.Contains(string(envExample), "TELESRV_TURN_BRIDGE_RELAY_MAX_PORT=12563") {
+		t.Error("Docker bridge fallback must remain bounded at 64 relay ports")
+	}
+	if !strings.Contains(string(envExample), "TELESRV_SFU_HOST_NETWORK=true") {
+		t.Error("Docker must default SFU to direct host networking")
+	}
+	bridgeOverride, err := os.ReadFile(filepath.Join(dockerDir, "compose.sfu-bridge-network.yaml"))
+	if err != nil {
+		t.Fatalf("read compose.sfu-bridge-network.yaml: %v", err)
+	}
+	for _, required := range []string{"network_mode: !reset null", "TELESRV_TURN_UDP_PORT", "TELESRV_TURN_RELAY_MIN_PORT", "TELESRV_TURN_RELAY_MAX_PORT"} {
+		if !strings.Contains(string(bridgeOverride), required) {
+			t.Errorf("bridge fallback is missing %q", required)
 		}
 	}
 }
