@@ -80,7 +80,9 @@ if ($deployment['TELESRV_PHONE_CODE_DELIVERY_PROVIDER'] -eq 'development') { Wri
 Write-Host "MTProto: $($deployment['TELESRV_ADVERTISE_IP']):$($deployment['TELESRV_SERVER_PORT'])"
 if ($deployment['TELESRV_TURN_ENABLE'] -eq 'true') {
     Write-Host "TURN/STUN: udp://$($deployment['TELESRV_TURN_ADVERTISE_IP']):$($deployment['TELESRV_TURN_UDP_PORT'])"
-    Write-Host "TURN relay UDP range: $($deployment['TELESRV_TURN_RELAY_MIN_PORT'])-$($deployment['TELESRV_TURN_RELAY_MAX_PORT'])"
+    $turnRelayMaxPort = $deployment['TELESRV_TURN_RELAY_MAX_PORT']
+    if ($hostNetworkValue -eq 'false') { $turnRelayMaxPort = $deployment['TELESRV_TURN_BRIDGE_RELAY_MAX_PORT'] }
+    Write-Host "TURN relay UDP range: $($deployment['TELESRV_TURN_RELAY_MIN_PORT'])-$turnRelayMaxPort"
 }
 $adminHost = $deployment['TELESRV_ADMIN_BIND_IP']
 if ($adminHost -eq "0.0.0.0" -or $adminHost -eq "::") { $adminHost = $deployment['TELESRV_ADVERTISE_IP'] }

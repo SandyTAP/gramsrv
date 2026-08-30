@@ -93,7 +93,9 @@ if [[ "$(env_value TELESRV_PHONE_CODE_DELIVERY_PROVIDER)" = development ]]; then
 printf 'MTProto: %s:%s\n' "$(env_value TELESRV_ADVERTISE_IP)" "$(env_value TELESRV_SERVER_PORT)"
 if [[ "$(env_value TELESRV_TURN_ENABLE)" = true ]]; then
   printf 'TURN/STUN: udp://%s:%s\n' "$(env_value TELESRV_TURN_ADVERTISE_IP)" "$(env_value TELESRV_TURN_UDP_PORT)"
-  printf 'TURN relay UDP range: %s-%s\n' "$(env_value TELESRV_TURN_RELAY_MIN_PORT)" "$(env_value TELESRV_TURN_RELAY_MAX_PORT)"
+  turn_relay_max_port=$(env_value TELESRV_TURN_RELAY_MAX_PORT)
+  if [[ "$configured_host_network" = false ]]; then turn_relay_max_port=$(env_value TELESRV_TURN_BRIDGE_RELAY_MAX_PORT); fi
+  printf 'TURN relay UDP range: %s-%s\n' "$(env_value TELESRV_TURN_RELAY_MIN_PORT)" "$turn_relay_max_port"
 fi
 admin_host=$(env_value TELESRV_ADMIN_BIND_IP)
 if [[ "$admin_host" = 0.0.0.0 || "$admin_host" = :: ]]; then admin_host=$(env_value TELESRV_ADVERTISE_IP); fi
