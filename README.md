@@ -14,30 +14,32 @@ Telegram-like interface.
   <img src="docs/assets/gramsrv-android.png" width="23%" alt="gramsrv running on Android">
 </p>
 
-## Quick start with Docker (v2)
+## Quick start with Docker
 
-The one-click Docker deployment lives on the [`v2`](../../tree/v2) branch;
-the `main` branch is the monolithic development line and does not contain the
-Docker startup scripts. Install Git and Docker Desktop, switch Docker Desktop
-to Linux containers, start it, and run in PowerShell 5.1 or later:
+Both [`main`](../../tree/main) and [`v2`](../../tree/v2) now provide the same
+one-command Docker entry point. `main` runs the monolithic server plus Admin;
+`v2` runs the split Edge/Core/Egress/File/SFU topology. Install Git and Docker
+Desktop, switch Docker Desktop to Linux containers, start it, and run in
+PowerShell 5.1 or later:
 
 ```powershell
-git clone --branch v2 --single-branch https://github.com/iamxvbaba/gramsrv.git
+git clone --branch main --single-branch https://github.com/iamxvbaba/gramsrv.git
 Set-Location gramsrv
 .\scripts\start-docker.ps1
 ```
 
 That is all a local first run needs. The script creates the deployment
-environment, anonymously pulls the six ready-to-run `v2` images from GHCR,
-starts PostgreSQL, Redis, Migrate, File, Core, Egress, SFU, and Edge in
-dependency order, and waits until the stack is ready. No local Go toolchain,
-PostgreSQL, Redis, image build, or `docker login` is required.
+environment, anonymously pulls the ready-to-run images from GHCR, starts every
+service in dependency order, and waits until the stack is ready. No local Go
+toolchain, PostgreSQL, Redis, image build, or `docker login` is required. Clone
+`v2` instead of `main` in the command above when you want the microservice
+deployment.
 
 - The development login code is **`12345`**.
 - Zero-argument startup listens only on `127.0.0.1` for a client on the same
   computer.
-- The matching [public test key](../../blob/v2/deploy/docker/assets/test-server-rsa.pub)
-  is included on `v2` for compatible clients.
+- The matching [public test key](deploy/docker/assets/test-server-rsa.pub) is
+  included on both branches for compatible test clients.
 - Accounts, database state, media, Redis state, and the RSA identity use Docker
   named volumes and survive container recreation and normal Compose shutdown.
 - Run without `-Build` to use the published images; `-Build` is only for local
@@ -63,9 +65,10 @@ host's LAN address:
 ```
 
 Stock Telegram clients require an endpoint and RSA-key patch. Use a compatible
-client from the [project website](https://telesrv.net), and see the
-[`v2` Docker deployment runbook](../../blob/v2/docs/docker-deployment.en.md) for
-Linux/macOS, firewall, backup, upgrade, remote access, and production guidance.
+client from the [project website](https://telesrv.net). On `main`, the monolith
+uses host networking by default for SFU/TURN; pass `-BridgeNetwork` only when
+host networking is unavailable. The [`v2` Docker deployment runbook](../../blob/v2/docs/docker-deployment.en.md)
+covers the split topology, firewall, backup, upgrade, and remote access.
 
 ## Why gramsrv
 
