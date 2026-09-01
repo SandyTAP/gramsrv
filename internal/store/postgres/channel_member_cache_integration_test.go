@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // TestChannelMemberCacheInvalidatesOnReadModelNotify 验证：channel_members 触发器(0120)
@@ -339,7 +340,7 @@ WHERE model = 'contact_account' AND owner_user_id = $1 AND peer_type = 'user' AN
 	if hashAfterLastSeen != hashBeforeLastSeen {
 		t.Fatalf("last_seen update refreshed contact_account hash: before=%d after=%d", hashBeforeLastSeen, hashAfterLastSeen)
 	}
-	if _, err := contacts.Block(ctx, owner.ID, target.ID, 1700003000); err != nil {
+	if _, err := contacts.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistBlock, OwnerUserID: owner.ID, PeerIDs: []int64{target.ID}, Date: 1700003000}, store.BlocklistDeliveryEffects); err != nil {
 		t.Fatalf("block contact: %v", err)
 	}
 	if !waitUntil(3*time.Second, func() bool {

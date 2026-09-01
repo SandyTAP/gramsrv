@@ -12,14 +12,22 @@ import (
 	"telesrv/internal/store/memory"
 )
 
+const contactMutationTestDate = 1_700_000_000
+
 type serviceCountingContactStore struct {
 	store.ContactStore
-	listCalls int
+	listCalls    int
+	blockedCalls int
 }
 
 func (s *serviceCountingContactStore) ListByUser(ctx context.Context, userID int64) (domain.ContactList, error) {
 	s.listCalls++
 	return s.ContactStore.ListByUser(ctx, userID)
+}
+
+func (s *serviceCountingContactStore) IsBlocked(ctx context.Context, userID, blockedUserID int64) (bool, error) {
+	s.blockedCalls++
+	return s.ContactStore.IsBlocked(ctx, userID, blockedUserID)
 }
 
 type serviceCountingUserStore struct {
@@ -74,6 +82,49 @@ func TestGetContactsReturnsNotModifiedFromReadModelHashWithoutLoadingList(t *tes
 	}
 	if counting.listCalls != 0 {
 		t.Fatalf("ListByUser calls = %d, want 0 on hash hit", counting.listCalls)
+	}
+}
+
+func TestIsBlockedUsesBoundedCacheAndOwnerInvalidation(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	users := memory.NewUserStore()
+	owner, err := users.Create(ctx, domain.User{FirstName: "Owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := users.Create(ctx, domain.User{FirstName: "Peer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.AttachBlocklistStores(memory.NewStoryStore(), memory.NewPrivacyStore(), users, memory.NewChannelStore())
+	if _, err := base.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistBlock, OwnerUserID: owner.ID, PeerIDs: []int64{peer.ID}, Date: contactMutationTestDate}, store.BlocklistDeliveryEffects); err != nil {
+		t.Fatal(err)
+	}
+	counting := &serviceCountingContactStore{ContactStore: base}
+	svc := NewService(counting)
+	for i := 0; i < 2; i++ {
+		blocked, err := svc.IsBlocked(ctx, owner.ID, peer.ID)
+		if err != nil || !blocked {
+			t.Fatalf("IsBlocked[%d]=%v err=%v", i, blocked, err)
+		}
+	}
+	if counting.blockedCalls != 1 {
+		t.Fatalf("blocked reads=%d want one", counting.blockedCalls)
+	}
+	if _, err := base.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistUnblock, OwnerUserID: owner.ID, PeerIDs: []int64{peer.ID}, Date: contactMutationTestDate}, store.BlocklistDeliveryEffects); err != nil {
+		t.Fatal(err)
+	}
+	if blocked, _ := svc.IsBlocked(ctx, owner.ID, peer.ID); !blocked {
+		t.Fatal("backing change crossed cache before read-model invalidation")
+	}
+	svc.InvalidateViewers(owner.ID)
+	blocked, err := svc.IsBlocked(ctx, owner.ID, peer.ID)
+	if err != nil || blocked {
+		t.Fatalf("IsBlocked after invalidation=%v err=%v", blocked, err)
+	}
+	if counting.blockedCalls != 2 {
+		t.Fatalf("blocked reads=%d want exact reload", counting.blockedCalls)
 	}
 }
 

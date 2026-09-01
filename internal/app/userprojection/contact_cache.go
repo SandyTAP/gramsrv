@@ -602,20 +602,20 @@ func (c *CachedContactStore) Delete(ctx context.Context, userID int64, contactUs
 	return count, err
 }
 
-func (c *CachedContactStore) Block(ctx context.Context, userID, blockedUserID int64, date int) (bool, error) {
-	changed, err := c.inner.Block(ctx, userID, blockedUserID, date)
-	if err == nil {
-		c.InvalidateViewers(userID, blockedUserID)
-	}
-	return changed, err
+func (c *CachedContactStore) ReadBlocklistIDs(ctx context.Context, owner int64) ([]int64, error) {
+	return c.inner.ReadBlocklistIDs(ctx, owner)
 }
 
-func (c *CachedContactStore) Unblock(ctx context.Context, userID, blockedUserID int64) (bool, error) {
-	changed, err := c.inner.Unblock(ctx, userID, blockedUserID)
-	if err == nil {
-		c.InvalidateViewers(userID, blockedUserID)
+func (c *CachedContactStore) MutateBlocklist(ctx context.Context, m store.BlocklistMutation, build store.DeliveryEffectsBuilder[store.BlocklistMutationSnapshot]) (store.BlocklistMutationSnapshot, error) {
+	result, err := c.inner.MutateBlocklist(ctx, m, build)
+	if err == nil && len(result.Changes) > 0 {
+		ids := []int64{m.OwnerUserID}
+		for _, change := range result.Changes {
+			ids = append(ids, change.PeerUserID)
+		}
+		c.InvalidateViewers(ids...)
 	}
-	return changed, err
+	return result, err
 }
 
 func (c *CachedContactStore) IsBlocked(ctx context.Context, userID, blockedUserID int64) (bool, error) {

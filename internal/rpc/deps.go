@@ -589,8 +589,7 @@ type ContactsService interface {
 	ClearPersonalPhoto(ctx context.Context, userID, contactUserID int64, date int) (domain.Contact, error)
 	PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error)
 	GetPeerSettings(ctx context.Context, userID int64, peer domain.Peer) (domain.PeerSettings, error)
-	BlockContact(ctx context.Context, userID, peerUserID int64, date int) (bool, error)
-	UnblockContact(ctx context.Context, userID, peerUserID int64) (bool, error)
+	MutateBlocklist(ctx context.Context, mutation store.BlocklistMutation, effects store.DeliveryEffectsBuilder[store.BlocklistMutationSnapshot]) (store.BlocklistMutationSnapshot, error)
 	IsBlocked(ctx context.Context, userID, peerUserID int64) (bool, error)
 	GetBlocked(ctx context.Context, userID int64, offset, limit int) (domain.BlockedContactList, error)
 }

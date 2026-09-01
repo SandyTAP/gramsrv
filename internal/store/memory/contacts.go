@@ -11,16 +11,34 @@ import (
 
 // ContactStore 是 store.ContactStore 的内存实现。
 type ContactStore struct {
-	mu     sync.RWMutex
-	m      map[int64]domain.ContactList
-	blocks map[int64]map[int64]domain.BlockedContact
+	mu                sync.RWMutex
+	m                 map[int64]domain.ContactList
+	blocks            map[int64]map[int64]domain.BlockedContact
+	updateEvents      *UpdateEventStore
+	privacy           *PrivacyStore
+	blocklistStories  *StoryStore
+	blocklistUsers    *UserStore
+	blocklistChannels *ChannelStore
+}
+
+func (s *ContactStore) AttachUpdateEventStore(events *UpdateEventStore) {
+	s.mu.Lock()
+	s.updateEvents = events
+	s.mu.Unlock()
+}
+
+func (s *ContactStore) AttachPrivacyStore(privacy *PrivacyStore) {
+	s.mu.Lock()
+	s.privacy = privacy
+	s.mu.Unlock()
 }
 
 // NewContactStore 创建内存 ContactStore。
 func NewContactStore() *ContactStore {
 	return &ContactStore{
-		m:      make(map[int64]domain.ContactList),
-		blocks: make(map[int64]map[int64]domain.BlockedContact),
+		m:            make(map[int64]domain.ContactList),
+		blocks:       make(map[int64]map[int64]domain.BlockedContact),
+		updateEvents: NewUpdateEventStore(),
 	}
 }
 
@@ -423,34 +441,6 @@ func (s *ContactStore) Delete(_ context.Context, userID int64, contactUserIDs []
 	list.Hash = contactListHash(list.Contacts)
 	s.m[userID] = list
 	return deleted, nil
-}
-
-func (s *ContactStore) Block(_ context.Context, userID, blockedUserID int64, date int) (bool, error) {
-	if userID == 0 || blockedUserID == 0 || userID == blockedUserID {
-		return false, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blocks[userID] == nil {
-		s.blocks[userID] = make(map[int64]domain.BlockedContact)
-	}
-	_, existed := s.blocks[userID][blockedUserID]
-	s.blocks[userID][blockedUserID] = domain.BlockedContact{
-		User: domain.User{ID: blockedUserID},
-		Date: date,
-	}
-	return !existed, nil
-}
-
-func (s *ContactStore) Unblock(_ context.Context, userID, blockedUserID int64) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blocks[userID] == nil {
-		return false, nil
-	}
-	_, existed := s.blocks[userID][blockedUserID]
-	delete(s.blocks[userID], blockedUserID)
-	return existed, nil
 }
 
 func (s *ContactStore) IsBlocked(_ context.Context, userID, blockedUserID int64) (bool, error) {

@@ -252,3 +252,8 @@ func limitIDs(ids []int64, limit int) []int64 {
 	}
 	return out
 }
+
+func rpcTestBlocklistStores(contacts *memory.ContactStore, users *memory.UserStore, stories *memory.StoryStore, events *memory.UpdateEventStore) {
+	contacts.AttachBlocklistStores(stories, memory.NewPrivacyStore(), users, memory.NewChannelStore())
+	contacts.AttachUpdateEventStore(events)
+}

@@ -97,7 +97,7 @@ func (s *Service) ListOwnerActiveStories(ctx context.Context, userID int64, owne
 		return domain.StoryList{}, err
 	}
 	if s == nil || s.stories == nil {
-		return domain.StoryList{}, nil
+		return domain.StoryList{}, store.ErrBlocklistRequired
 	}
 	return s.stories.ListOwnerActiveStories(ctx, owner, now, clampStoryLimit(limit))
 }

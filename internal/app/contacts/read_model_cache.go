@@ -94,17 +94,36 @@ func (s *Service) loadContactListReadModel(ctx context.Context, userID int64, cu
 }
 
 func (s *Service) InvalidateViewers(ids ...int64) {
-	if s == nil || s.cache == nil {
+	if s == nil {
 		return
 	}
-	s.cache.invalidate(ids...)
+	if s.cache != nil {
+		s.cache.invalidate(ids...)
+	}
+	if s.blocks != nil && len(ids) > 0 {
+		owners := make(map[int64]struct{}, len(ids))
+		for _, id := range ids {
+			if id > 0 {
+				owners[id] = struct{}{}
+			}
+		}
+		s.blocks.InvalidateWhere(func(key blockRelationshipKey) bool {
+			_, ok := owners[key.ownerUserID]
+			return ok
+		})
+	}
 }
 
 func (s *Service) FlushReadModelCache() {
-	if s == nil || s.cache == nil {
+	if s == nil {
 		return
 	}
-	s.cache.flush()
+	if s.cache != nil {
+		s.cache.flush()
+	}
+	if s.blocks != nil {
+		s.blocks.Flush()
+	}
 }
 
 func cloneContactList(in domain.ContactList) domain.ContactList {

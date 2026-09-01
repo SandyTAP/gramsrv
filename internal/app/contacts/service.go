@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
+	"telesrv/internal/readmodelcache"
 	"telesrv/internal/store"
 )
 
@@ -19,6 +21,16 @@ var (
 
 const maxSearchLimit = 50
 const maxCloseFriendsCount = 5000
+
+const (
+	blockRelationshipCacheSize = 1 << 18
+	blockRelationshipCacheTTL  = 5 * time.Minute
+)
+
+type blockRelationshipKey struct {
+	ownerUserID   int64
+	blockedUserID int64
+}
 
 type phonePrivacyService interface {
 	userprojection.PrivacyEvaluator
@@ -37,6 +49,7 @@ type Service struct {
 	projector *userprojection.Projector
 	versions  store.ReadModelVersionStore
 	cache     *contactListReadModelCache
+	blocks    *readmodelcache.Cache[blockRelationshipKey, bool]
 }
 
 // Option adjusts optional contacts service dependencies.
@@ -67,7 +80,14 @@ func WithReadModelVersions(v store.ReadModelVersionStore) Option {
 
 // NewService 创建 contacts 服务。
 func NewService(contacts store.ContactStore, users ...store.UserStore) *Service {
-	s := &Service{contacts: contacts, cache: newContactListReadModelCache(defaultContactListReadModelTTL)}
+	s := &Service{
+		contacts: contacts,
+		cache:    newContactListReadModelCache(defaultContactListReadModelTTL),
+		blocks: readmodelcache.New(readmodelcache.Config[blockRelationshipKey, bool]{
+			MaxEntries: blockRelationshipCacheSize,
+			TTL:        blockRelationshipCacheTTL,
+		}),
+	}
 	if len(users) > 0 {
 		s.users = users[0]
 	}
@@ -537,35 +557,39 @@ func (s *Service) peerCanSeeCurrentUserPhone(ctx context.Context, ownerUserID, v
 	return found && contact.Phone != "", nil
 }
 
-// BlockContact adds peer to the current user's blocklist.
-func (s *Service) BlockContact(ctx context.Context, userID, peerUserID int64, date int) (bool, error) {
-	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 || peerUserID == userID {
-		return false, ErrContactIDInvalid
+// MutateBlocklist executes the complete state/delivery aggregate once. All
+// projection reads inside the aggregate use immutable transactional facts.
+func (s *Service) MutateBlocklist(ctx context.Context, m store.BlocklistMutation, build store.DeliveryEffectsBuilder[store.BlocklistMutationSnapshot]) (store.BlocklistMutationSnapshot, error) {
+	if s == nil || s.contacts == nil || s.users == nil || build == nil {
+		return store.BlocklistMutationSnapshot{}, store.ErrBlocklistRequired
 	}
-	if s.users != nil {
-		if _, found, err := s.users.ByID(ctx, peerUserID); err != nil {
-			return false, err
-		} else if !found {
-			return false, ErrContactIDInvalid
+	var err error
+	m, err = m.Prepare()
+	if err != nil {
+		return store.BlocklistMutationSnapshot{}, err
+	}
+	peers, err := s.users.ByIDs(ctx, m.PeerIDs)
+	if err != nil {
+		return store.BlocklistMutationSnapshot{}, err
+	}
+	if len(peers) != len(m.PeerIDs) {
+		return store.BlocklistMutationSnapshot{}, ErrContactIDInvalid
+	}
+	if m.Kind == store.BlocklistReplace {
+		m.ExpectedIDs, err = s.contacts.ReadBlocklistIDs(ctx, m.OwnerUserID)
+		if err != nil {
+			return store.BlocklistMutationSnapshot{}, err
 		}
 	}
-	changed, err := s.contacts.Block(ctx, userID, peerUserID, date)
-	if err == nil {
-		s.InvalidateViewers(userID, peerUserID)
+	result, err := s.contacts.MutateBlocklist(ctx, m, build)
+	if err == nil && len(result.Changes) > 0 {
+		ids := []int64{m.OwnerUserID}
+		for _, c := range result.Changes {
+			ids = append(ids, c.PeerUserID)
+		}
+		s.InvalidateViewers(ids...)
 	}
-	return changed, err
-}
-
-// UnblockContact removes peer from the current user's blocklist.
-func (s *Service) UnblockContact(ctx context.Context, userID, peerUserID int64) (bool, error) {
-	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 || peerUserID == userID {
-		return false, ErrContactIDInvalid
-	}
-	changed, err := s.contacts.Unblock(ctx, userID, peerUserID)
-	if err == nil {
-		s.InvalidateViewers(userID, peerUserID)
-	}
-	return changed, err
+	return result, err
 }
 
 // IsBlocked reports whether owner has blocked peer.
@@ -573,7 +597,10 @@ func (s *Service) IsBlocked(ctx context.Context, userID, peerUserID int64) (bool
 	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 {
 		return false, nil
 	}
-	return s.contacts.IsBlocked(ctx, userID, peerUserID)
+	key := blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID}
+	return s.blocks.GetOrLoad(ctx, key, func() (bool, error) {
+		return s.contacts.IsBlocked(ctx, userID, peerUserID)
+	})
 }
 
 // GetBlocked returns a bounded blocked contact page.

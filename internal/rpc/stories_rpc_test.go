@@ -20,6 +20,7 @@ import (
 	appupdates "telesrv/internal/app/updates"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -8358,12 +8359,13 @@ func TestStoriesEditPrivacyDoesNotFanoutToStoryBlockedViewer(t *testing.T) {
 	if _, err := contactStore.Upsert(ctx, author.ID, domain.ContactInput{ContactUserID: blocked.ID, FirstName: "Blocked"}); err != nil {
 		t.Fatalf("upsert contact: %v", err)
 	}
-	contactsSvc := appcontacts.NewService(contactStore, userStore)
-	if _, err := contactsSvc.BlockContact(ctx, author.ID, blocked.ID, 1700001000); err != nil {
-		t.Fatalf("block story viewer: %v", err)
-	}
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contactStore, userStore, storyStore, updateStore)
+	contactsSvc := appcontacts.NewService(contactStore, userStore)
+	if _, err := contactsSvc.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistBlock, OwnerUserID: author.ID, PeerIDs: []int64{blocked.ID}, Date: 1700001000}, store.BlocklistDeliveryEffects); err != nil {
+		t.Fatalf("block story viewer: %v", err)
+	}
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: author.ID}
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
 		Owner:            ownerPeer,

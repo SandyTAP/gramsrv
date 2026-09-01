@@ -1143,36 +1143,6 @@ func scanContactProjectionRows(row contactScanner) (int64, domain.Contact, error
 	return viewerUserID, contact, nil
 }
 
-func (s *ContactStore) Block(ctx context.Context, userID, blockedUserID int64, date int) (bool, error) {
-	if userID == 0 || blockedUserID == 0 || userID == blockedUserID {
-		return false, nil
-	}
-	tag, err := s.db.Exec(ctx, `
-INSERT INTO contact_blocks (owner_user_id, blocked_user_id, date)
-VALUES ($1, $2, $3)
-ON CONFLICT (owner_user_id, blocked_user_id) DO UPDATE SET
-  date = EXCLUDED.date,
-  created_at = contact_blocks.created_at`, userID, blockedUserID, date)
-	if err != nil {
-		return false, fmt.Errorf("block contact: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-func (s *ContactStore) Unblock(ctx context.Context, userID, blockedUserID int64) (bool, error) {
-	if userID == 0 || blockedUserID == 0 {
-		return false, nil
-	}
-	tag, err := s.db.Exec(ctx, `
-DELETE FROM contact_blocks
-WHERE owner_user_id = $1
-  AND blocked_user_id = $2`, userID, blockedUserID)
-	if err != nil {
-		return false, fmt.Errorf("unblock contact: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
 func (s *ContactStore) IsBlocked(ctx context.Context, userID, blockedUserID int64) (bool, error) {
 	if userID == 0 || blockedUserID == 0 {
 		return false, nil

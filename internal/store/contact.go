@@ -20,8 +20,8 @@ type ContactStore interface {
 	SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error)
 	PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error)
 	Delete(ctx context.Context, userID int64, contactUserIDs []int64) (int, error)
-	Block(ctx context.Context, userID, blockedUserID int64, date int) (bool, error)
-	Unblock(ctx context.Context, userID, blockedUserID int64) (bool, error)
+	ReadBlocklistIDs(ctx context.Context, ownerUserID int64) ([]int64, error)
+	MutateBlocklist(ctx context.Context, mutation BlocklistMutation, effects DeliveryEffectsBuilder[BlocklistMutationSnapshot]) (BlocklistMutationSnapshot, error)
 	IsBlocked(ctx context.Context, userID, blockedUserID int64) (bool, error)
 	ListBlocked(ctx context.Context, userID int64, offset, limit int) (domain.BlockedContactList, error)
 }
