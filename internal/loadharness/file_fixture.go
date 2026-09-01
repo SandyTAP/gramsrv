@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,20 @@ const (
 	fileFixtureVersion    = 1
 	fixturePatternVersion = 1
 )
+
+type FilePreparationReport struct {
+	ConnectionAttempts    uint64    `json:"connection_attempts"`
+	PartCalls             uint64    `json:"part_calls"`
+	PartResponsesOK       uint64    `json:"part_responses_ok"`
+	AcknowledgedPartBytes uint64    `json:"acknowledged_part_bytes"`
+	AssembleCalls         uint64    `json:"assemble_calls"`
+	Enabled               bool      `json:"enabled"`
+	StartedAt             time.Time `json:"started_at"`
+	FinishedAt            time.Time `json:"finished_at"`
+	Stage                 string    `json:"stage"`
+	Disposition           string    `json:"disposition,omitempty"`
+	ErrorClass            string    `json:"error_class,omitempty"`
+}
 
 // persistedFileFixture keeps only the stable location of a synthetic load-test
 // document. It contains no auth key or login secret and is owner-readable so a
@@ -45,7 +60,7 @@ func (f *persistedFileFixture) validate(endpoint Endpoint, size int) error {
 	if f.SizeBytes != size || f.SizeBytes <= 0 {
 		return fmt.Errorf("file fixture size %d does not match requested %d", f.SizeBytes, size)
 	}
-	if f.DocumentID == 0 || f.AccessHash == 0 || len(f.FileReference) == 0 {
+	if f.DocumentID <= 0 || f.AccessHash == 0 || len(f.FileReference) == 0 || len(f.FileReference) > 4096 {
 		return errors.New("file fixture has an incomplete document location")
 	}
 	return nil
@@ -83,15 +98,28 @@ func resolveFileFixturePath(manifestPath, configured string) string {
 }
 
 func loadPersistedFileFixture(path string, endpoint Endpoint, size, chunk int) (*downloadFixture, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 || st.Size() > 64<<10 {
+		return nil, errors.New("file fixture must be a private bounded regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 64<<10+1))
+	if err != nil || len(data) > 64<<10 || !unchangedEnvironmentFile(path, st) {
+		return nil, errors.New("file fixture read failed or source changed")
 	}
 	var fixture persistedFileFixture
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&fixture); err != nil {
 		return nil, fmt.Errorf("decode file fixture: %w", err)
+	}
+	var extra any
+	if decoder.Decode(&extra) != io.EOF {
+		return nil, errors.New("file fixture has trailing data")
 	}
 	if err := fixture.validate(endpoint, size); err != nil {
 		return nil, err
@@ -108,5 +136,5 @@ func writePersistedFileFixture(path string, endpoint Endpoint, fixture *download
 	if err != nil {
 		return fmt.Errorf("encode file fixture: %w", err)
 	}
-	return writeFileAtomic(path, append(data, '\n'), 0o600)
+	return writeNewEvidenceReport(path, append(data, '\n'))
 }

@@ -27,22 +27,25 @@ type ClientUpdateState struct {
 }
 
 type ClientDialogState struct {
-	PeerType        string `json:"peer_type"`
-	PeerID          int64  `json:"peer_id"`
-	AccessHash      int64  `json:"access_hash"`
-	TopMessage      int    `json:"top_message"`
-	TopMessageDate  int    `json:"top_message_date"`
-	Pts             int    `json:"pts,omitempty"`
-	HasPts          bool   `json:"has_pts,omitempty"`
-	ReadInboxMaxID  int    `json:"read_inbox_max_id"`
-	ReadOutboxMaxID int    `json:"read_outbox_max_id"`
-	UnreadCount     int    `json:"unread_count"`
-	UnreadMentions  int    `json:"unread_mentions"`
-	UnreadReactions int    `json:"unread_reactions"`
-	Pinned          bool   `json:"pinned,omitempty"`
-	HasDraft        bool   `json:"has_draft,omitempty"`
-	DraftText       string `json:"draft_text,omitempty"`
-	DatasetExpected bool   `json:"dataset_expected,omitempty"`
+	// Runtime-only digest of the actual top-message payload. Old immutable
+	// cursor snapshots are not rewritten or used as a source for this value.
+	topMessageDigest [32]byte
+	PeerType         string `json:"peer_type"`
+	PeerID           int64  `json:"peer_id"`
+	AccessHash       int64  `json:"access_hash"`
+	TopMessage       int    `json:"top_message"`
+	TopMessageDate   int    `json:"top_message_date"`
+	Pts              int    `json:"pts,omitempty"`
+	HasPts           bool   `json:"has_pts,omitempty"`
+	ReadInboxMaxID   int    `json:"read_inbox_max_id"`
+	ReadOutboxMaxID  int    `json:"read_outbox_max_id"`
+	UnreadCount      int    `json:"unread_count"`
+	UnreadMentions   int    `json:"unread_mentions"`
+	UnreadReactions  int    `json:"unread_reactions"`
+	Pinned           bool   `json:"pinned,omitempty"`
+	HasDraft         bool   `json:"has_draft,omitempty"`
+	DraftText        string `json:"draft_text,omitempty"`
+	DatasetExpected  bool   `json:"dataset_expected,omitempty"`
 }
 
 type ClientAccountState struct {
@@ -293,7 +296,7 @@ func snapshotDialogsObserved(
 		return nil, counts, fmt.Errorf("messages.getPinnedDialogs: %w", err)
 	}
 	if _, err := mergeDialogPage(dialogsByPeer, pinned.Dialogs, pinned.Messages, pinned.Chats, pinned.Users, true); err != nil {
-		return nil, counts, err
+		return nil, counts, invariantError("dialogs_payload", "%w", err)
 	}
 	pinnedPeers := make(map[clientPeerKey]struct{}, len(dialogsByPeer))
 	for peer := range dialogsByPeer {
@@ -338,14 +341,14 @@ func snapshotDialogsObserved(
 			counts.Slice++
 			pageDialogs, messages, chats, users = value.Dialogs, value.Messages, value.Chats, value.Users
 		case *tg.MessagesDialogsNotModified:
-			return nil, counts, errors.New("messages.getDialogs with hash=0 returned dialogsNotModified")
+			return nil, counts, invariantError("dialogs_pagination", "messages.getDialogs with hash=0 returned dialogsNotModified")
 		default:
-			return nil, counts, fmt.Errorf("messages.getDialogs returned %T", response)
+			return nil, counts, invariantError("dialogs_pagination", "messages.getDialogs returned %T", response)
 		}
 		last, overlap, err := mergeDialogPageKnownOverlap(dialogsByPeer, pageDialogs, messages, chats, users, false, pinnedPeers)
 		counts.PinnedOverlap += overlap
 		if err != nil {
-			return nil, counts, fmt.Errorf("messages.getDialogs page %d: %w", page+1, err)
+			return nil, counts, invariantError("dialogs_payload", "messages.getDialogs page %d: %w", page+1, err)
 		}
 		// A dialogsSlice is explicitly non-final. The server may enforce a
 		// smaller per-page cap than the client-requested limit (TDesktop asks
@@ -356,16 +359,16 @@ func snapshotDialogsObserved(
 			break
 		}
 		if last.TopMessage <= 0 || last.TopMessageDate <= 0 {
-			return nil, counts, fmt.Errorf("messages.getDialogs page %d has no usable offset", page+1)
+			return nil, counts, invariantError("dialogs_pagination", "messages.getDialogs page %d has no usable offset", page+1)
 		}
 		request.OffsetDate = last.TopMessageDate
 		request.OffsetID = last.TopMessage
 		request.OffsetPeer = clientDialogInputPeer(last)
 		if request.OffsetPeer == nil {
-			return nil, counts, fmt.Errorf("messages.getDialogs page %d has invalid offset peer", page+1)
+			return nil, counts, invariantError("dialogs_pagination", "messages.getDialogs page %d has invalid offset peer", page+1)
 		}
 		if page == 99 {
-			return nil, counts, errors.New("messages.getDialogs exceeded 100 pages")
+			return nil, counts, invariantError("dialogs_pagination", "messages.getDialogs exceeded 100 pages")
 		}
 	}
 	result := make([]ClientDialogState, 0, len(dialogsByPeer))
@@ -429,6 +432,7 @@ func mergeDialogPageKnownOverlap(
 		}
 	}
 	messageDates := make(map[string]int, len(messages))
+	messageDigests := make(map[string][32]byte, len(messages))
 	for _, messageClass := range messages {
 		message, ok := messageClass.AsNotEmpty()
 		if !ok {
@@ -439,6 +443,9 @@ func mergeDialogPageKnownOverlap(
 			continue
 		}
 		messageDates[clientMessageKey(peer, message.GetID())] = message.GetDate()
+		if full, ok := messageClass.(*tg.Message); ok {
+			messageDigests[clientMessageKey(peer, message.GetID())] = sha256.Sum256([]byte(full.Message))
+		}
 	}
 	var last ClientDialogState
 	overlaps := 0
@@ -464,7 +471,8 @@ func mergeDialogPageKnownOverlap(
 			return ClientDialogState{}, overlaps, fmt.Errorf("dialog %s:%d omitted top message payload", peer.typ, peer.id)
 		}
 		state := ClientDialogState{
-			PeerType: peer.typ, PeerID: peer.id, AccessHash: hash,
+			topMessageDigest: messageDigests[clientMessageKey(peer, dialog.TopMessage)],
+			PeerType:         peer.typ, PeerID: peer.id, AccessHash: hash,
 			TopMessage: dialog.TopMessage, TopMessageDate: date, Pts: pts, HasPts: hasPts,
 			ReadInboxMaxID: dialog.ReadInboxMaxID, ReadOutboxMaxID: dialog.ReadOutboxMaxID,
 			UnreadCount: dialog.UnreadCount, UnreadMentions: dialog.UnreadMentionsCount,

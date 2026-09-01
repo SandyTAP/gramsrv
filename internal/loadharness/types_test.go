@@ -59,7 +59,7 @@ func TestExplicitZeroExtraDevicesAndRecoveryAreValid(t *testing.T) {
 		t.Fatalf("zero extra devices: %v", err)
 	}
 	run := RunConfig{
-		ManifestPath: "manifest.json", SessionKeyPath: "key", ReportPath: "report.json",
+		ManifestPath: "manifest.json", SessionKeyPath: "key", ReportPath: "report.json", EventsPath: "events.ndjson",
 		Duration: time.Second, RecoveryDuration: 0, RampDuration: 0,
 		RPCInterval: time.Millisecond, MessageInterval: -1, SampleInterval: time.Millisecond,
 		OperationTimeout: time.Second, MinimumReadyRatio: 1,

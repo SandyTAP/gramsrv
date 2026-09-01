@@ -1,6 +1,7 @@
 package loadharness
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"slices"
@@ -101,9 +102,16 @@ func TestValidateStartupDialogsRequiresCurrentDirtyChannelPts(t *testing.T) {
 		Channels:          []OfflineMutationChannelState{{LatestPts: 50}},
 	}
 	expected := expectedDatasetPeers(dataset, seedState, targets, 0)
+	expected[clientPeerKey{typ: "user", id: targets[dataset.Config.Accounts-1].UserID}] = struct{}{}
 	dialogs := make([]ClientDialogState, 0, len(expected))
 	for peer := range expected {
 		dialog := ClientDialogState{PeerType: peer.typ, PeerID: peer.id, AccessHash: 1, TopMessage: 1, TopMessageDate: 1}
+		if peer.typ == "user" && peer.id == targets[1].UserID {
+			dialog.topMessageDigest = sha256.Sum256([]byte(offlinePrivateMarker(dataset, 0, 1)))
+		}
+		if peer.typ == "user" && peer.id == targets[dataset.Config.Accounts-1].UserID {
+			dialog.topMessageDigest = sha256.Sum256([]byte(offlinePrivateMarker(dataset, dataset.Config.Accounts-1, 0)))
+		}
 		if peer.typ == "channel" {
 			dialog.HasPts, dialog.Pts = true, 50
 		}

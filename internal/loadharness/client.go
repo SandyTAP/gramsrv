@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gotd/log"
 	"github.com/iamxvbaba/td/exchange"
 	"github.com/iamxvbaba/td/mtproto"
 	"github.com/iamxvbaba/td/proto"
@@ -29,6 +30,8 @@ type clientHooks struct {
 	ConnectionState func(telegram.ConnectionState)
 	Dead            func(error)
 	Device          *telegram.DeviceConfig
+	Dial            dcs.DialFunc
+	Logger          log.Logger
 }
 
 // loadMessageIDSource keeps the load generator on the same MTProto message-id
@@ -77,7 +80,7 @@ func newClient(endpoint Endpoint, publicKey *rsa.PublicKey, storage telegram.Ses
 	if endpoint.Obfuscated {
 		protocol = transport.Abridged
 	}
-	resolver := dcs.Plain(dcs.PlainOptions{Protocol: protocol, Obfuscated: endpoint.Obfuscated})
+	resolver := dcs.Plain(dcs.PlainOptions{Protocol: protocol, Obfuscated: endpoint.Obfuscated, Dial: hooks.Dial})
 	updateHandler := hooks.Update
 	if updateHandler == nil {
 		updateHandler = telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error { return nil })
@@ -101,6 +104,7 @@ func newClient(endpoint Endpoint, publicKey *rsa.PublicKey, storage telegram.Ses
 		MessageID:         newLoadMessageIDSource(time.Now),
 		OnConnectionState: hooks.ConnectionState,
 		OnDead:            hooks.Dead,
+		Logger:            hooks.Logger,
 	}), nil
 }
 

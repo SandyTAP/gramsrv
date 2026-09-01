@@ -2,6 +2,7 @@ package loadharness
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,8 +15,10 @@ import (
 )
 
 const maxServerMetricsBytes = 4 << 20
+const maxServerMetricSeries = 8192
 
 var selectedServerMetrics = map[string]struct{}{
+	"telesrv_process_start_time_seconds":                       {},
 	"telesrv_mtproto_raw_connections":                          {},
 	"telesrv_mtproto_connections_active":                       {},
 	"telesrv_mtproto_sessions":                                 {},
@@ -55,6 +58,9 @@ var selectedServerMetrics = map[string]struct{}{
 	"telesrv_go_scheduler_busy_seconds":                        {},
 	"telesrv_go_gc_cycles":                                     {},
 	"telesrv_go_gc_pause_seconds":                              {},
+	"telesrv_go_total_alloc_bytes":                             {},
+	"telesrv_go_total_mallocs":                                 {},
+	"telesrv_go_total_frees":                                   {},
 	"telesrv_go_heap_alloc_bytes":                              {},
 	"telesrv_go_heap_inuse_bytes":                              {},
 	"telesrv_go_heap_objects":                                  {},
@@ -102,17 +108,18 @@ var selectedServerMetrics = map[string]struct{}{
 }
 
 type serverMetricsClient struct {
-	url     string
-	client  *http.Client
-	success atomic.Uint64
-	errors  atomic.Uint64
+	url      string
+	client   *http.Client
+	success  atomic.Uint64
+	errors   atomic.Uint64
+	counters map[string]bool
 }
 
 func newServerMetricsClient(url string) *serverMetricsClient {
 	if strings.TrimSpace(url) == "" {
 		return nil
 	}
-	return &serverMetricsClient{url: url, client: &http.Client{Timeout: 5 * time.Second}}
+	return &serverMetricsClient{url: url, client: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, error) {
@@ -134,11 +141,29 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 		c.errors.Add(1)
 		return nil, fmt.Errorf("metrics HTTP status %d", response.StatusCode)
 	}
-	reader := bufio.NewScanner(io.LimitReader(response.Body, maxServerMetricsBytes))
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxServerMetricsBytes+1))
+	if err != nil || len(body) > maxServerMetricsBytes {
+		c.errors.Add(1)
+		return nil, fmt.Errorf("metrics body unavailable or exceeds byte budget")
+	}
+	reader := bufio.NewScanner(bytes.NewReader(body))
 	reader.Buffer(make([]byte, 64<<10), 1<<20)
 	values := make(map[string]float64, len(selectedServerMetrics))
+	types := make(map[string]string)
+	c.counters = make(map[string]bool)
 	for reader.Scan() {
 		line := strings.TrimSpace(reader.Text())
+		if strings.HasPrefix(line, "# TYPE ") {
+			parts := strings.Fields(line)
+			if len(parts) == 4 && (selectedMetric(parts[2]) || selectedMetric(parts[2]+"_count")) {
+				types[parts[2]] = parts[3]
+				if len(types) > maxServerMetricSeries {
+					c.errors.Add(1)
+					return nil, fmt.Errorf("metrics type budget exceeded")
+				}
+			}
+			continue
+		}
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -150,12 +175,13 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 		if idx := strings.IndexByte(name, '{'); idx >= 0 {
 			name = name[:idx]
 		}
-		if _, ok := selectedServerMetrics[name]; !ok {
+		if !selectedMetric(name) {
 			continue
 		}
 		value, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-			continue
+			c.errors.Add(1)
+			return nil, fmt.Errorf("selected metric has invalid value")
 		}
 		// Reports need bounded, comparable capacity signals, not an unbounded copy
 		// of Prometheus label series. Aggregate every selected family into one
@@ -163,33 +189,57 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 		// code-owned method label; bounded pool/session families retain their state
 		// label. This supports attribution without copying auth/session/user
 		// cardinality.
-		values[name] += value
+		counter := metricIsCounter(name, types)
+		add := func(key string) {
+			values[key] += value
+			if counter {
+				c.counters[key] = true
+			}
+		}
+		if !strings.HasSuffix(name, "_bucket") {
+			add(name)
+		}
 		if isCoreExecOperationOutcomeServerMetric(name) {
 			side, sideOK := prometheusLabelValue(fields[0], "side")
 			operation, operationOK := prometheusLabelValue(fields[0], "operation")
 			outcome, outcomeOK := prometheusLabelValue(fields[0], "outcome")
 			if sideOK && operationOK && outcomeOK {
-				values[name+`{side="`+side+`",operation="`+operation+`",outcome="`+outcome+`"}`] += value
+				add(name + `{side="` + side + `",operation="` + operation + `",outcome="` + outcome + `"}`)
 			}
 		} else if isPerMethodOutcomeServerMetric(name) {
 			method, methodOK := prometheusLabelValue(fields[0], "method")
 			outcome, outcomeOK := prometheusLabelValue(fields[0], "outcome")
 			if methodOK && outcomeOK {
-				values[name+`{method="`+method+`",outcome="`+outcome+`"}`] += value
+				add(name + `{method="` + method + `",outcome="` + outcome + `"}`)
 			}
 		} else if isPerMethodServerMetric(name) {
 			if method, ok := prometheusLabelValue(fields[0], "method"); ok {
-				values[name+`{method="`+method+`"}`] += value
+				add(name + `{method="` + method + `"}`)
 			}
 		} else if isOutcomeServerMetric(name) {
 			if outcome, ok := prometheusLabelValue(fields[0], "outcome"); ok {
-				values[name+`{outcome="`+outcome+`"}`] += value
+				add(name + `{outcome="` + outcome + `"}`)
+			}
+		} else if extendedMetric(name) && !isStateServerMetric(name) {
+			// Only exporter-owned dimensions survive. Never retain arbitrary raw labels.
+			labels := make([]string, 0, 4)
+			for _, label := range []string{"side", "operation", "queue", "stage", "method", "outcome", "state", "transport", "reason", "kind", "phase", "le"} {
+				if value, ok := prometheusLabelValue(fields[0], label); ok && safeMetricLabel(value) {
+					labels = append(labels, label+"="+strconv.Quote(value))
+				}
+			}
+			if len(labels) > 0 {
+				add(name + "{" + strings.Join(labels, ",") + "}")
 			}
 		}
 		if isStateServerMetric(name) {
 			if state, ok := prometheusLabelValue(fields[0], "state"); ok {
-				values[name+`{state="`+state+`"}`] += value
+				add(name + `{state="` + state + `"}`)
 			}
+		}
+		if len(values) > maxServerMetricSeries {
+			c.errors.Add(1)
+			return nil, fmt.Errorf("metrics series budget exceeded")
 		}
 	}
 	if err := reader.Err(); err != nil {
@@ -200,52 +250,56 @@ func (c *serverMetricsClient) scrape(ctx context.Context) (map[string]float64, e
 	return values, nil
 }
 
-func isCoreExecOperationOutcomeServerMetric(name string) bool {
-	return name == "telesrv_coreexec_grpc_calls_total"
+func selectedMetric(name string) bool {
+	_, ok := selectedServerMetrics[name]
+	return ok || extendedMetric(name)
 }
 
-// waitForPresenceLastSeenSettlement waits until every expected lifecycle event
-// has reached the server-owned batch queue and all accepted work has drained.
-// It is report-only synchronization: it does not participate in RPC success or
-// alter the server's presence semantics.
-func (c *serverMetricsClient) waitForPresenceLastSeenSettlement(
-	ctx context.Context,
-	baselineSubmitted float64,
-	expectedSubmitted uint64,
-	timeout time.Duration,
-) (map[string]float64, error) {
-	if c == nil {
-		return nil, nil
-	}
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	poll := time.NewTicker(100 * time.Millisecond)
-	defer poll.Stop()
-	var last map[string]float64
-	for {
-		sample, err := c.scrape(ctx)
-		if err != nil {
-			return last, err
-		}
-		last = sample
-		submitted := metricValue(sample, "telesrv_presence_last_seen_submitted_total") - baselineSubmitted
-		pending := metricValue(sample, "telesrv_presence_last_seen_pending")
-		bootstrapPending := metricValue(sample, "telesrv_bootstrap_ready_pending")
-		activeChannelIDsPending := metricValue(sample, "telesrv_active_channel_ids_pending")
-		if submitted >= float64(expectedSubmitted) && pending == 0 && bootstrapPending == 0 && activeChannelIDsPending == 0 {
-			return sample, nil
-		}
-		select {
-		case <-ctx.Done():
-			return last, ctx.Err()
-		case <-deadline.C:
-			return last, fmt.Errorf("startup settlement timeout: presence submitted=%.0f expected=%d pending=%.0f bootstrap_pending=%.0f active_channel_ids_pending=%.0f", submitted, expectedSubmitted, pending, bootstrapPending, activeChannelIDsPending)
-		case <-poll.C:
+func extendedMetric(name string) bool {
+	for _, prefix := range []string{"telesrv_egress_", "telesrv_coreexec_", "telesrv_filedata_", "telesrv_sfu_",
+		"telesrv_mtproto_", "telesrv_rpc_", "telesrv_core_", "telesrv_presence_", "telesrv_bootstrap_", "telesrv_active_channel_"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
 		}
 	}
+	return false
+}
+
+func safeMetricLabel(value string) bool {
+	if len(value) == 0 || len(value) > 96 {
+		return false
+	}
+	for _, ch := range value {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("._-+", ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+func metricIsCounter(name string, types map[string]string) bool {
+	if types[name] == "counter" || strings.HasSuffix(name, "_total") {
+		return true
+	}
+	for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+		if strings.HasSuffix(name, suffix) && types[strings.TrimSuffix(name, suffix)] == "histogram" {
+			return true
+		}
+	}
+	// These cumulative runtime/pool values are exported by gauge providers.
+	switch name {
+	case "telesrv_process_cpu_seconds", "telesrv_go_scheduler_busy_seconds", "telesrv_go_gc_cycles", "telesrv_go_gc_pause_seconds",
+		"telesrv_go_total_alloc_bytes", "telesrv_go_total_mallocs", "telesrv_go_total_frees",
+		"telesrv_postgres_pool_acquire_count", "telesrv_postgres_pool_acquire_wait_seconds", "telesrv_postgres_pool_empty_acquire_count", "telesrv_postgres_pool_canceled_acquire_count",
+		"telesrv_redis_pool_hits", "telesrv_redis_pool_misses", "telesrv_redis_pool_timeouts", "telesrv_redis_pool_wait_count", "telesrv_redis_pool_wait_seconds",
+		"telesrv_channel_difference_cache_hits", "telesrv_channel_difference_cache_misses", "telesrv_channel_difference_cache_loads", "telesrv_channel_difference_cache_load_errors":
+		return true
+	}
+	return false
+}
+
+func isCoreExecOperationOutcomeServerMetric(name string) bool {
+	return name == "telesrv_coreexec_grpc_calls_total"
 }
 
 func isOutcomeServerMetric(name string) bool {
@@ -296,14 +350,15 @@ func isStateServerMetric(name string) bool {
 func prometheusLabelValue(series, label string) (string, bool) {
 	needle := label + `="`
 	start := strings.Index(series, needle)
-	if start < 0 {
+	if start < 1 || (series[start-1] != '{' && series[start-1] != ',') {
 		return "", false
 	}
 	start += len(needle)
 	end := start
 	for end < len(series) {
 		if series[end] == '"' && (end == start || series[end-1] != '\\') {
-			return series[start:end], true
+			value := series[start:end]
+			return value, safeMetricLabel(value)
 		}
 		end++
 	}

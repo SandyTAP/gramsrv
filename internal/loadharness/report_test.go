@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -102,7 +103,9 @@ func TestEvaluateReportRequiresReclamationAndNoFloodWait(t *testing.T) {
 			"telesrv_mtproto_logical_outbox_bytes": 4,
 		},
 	}
-	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsURL: "http://metrics"})
+	targets := MetricsTargets{{Role: "edge", Instance: "one", URL: "http://metrics"}}
+	report.ServerMetricsTargets = map[string]MetricsTargetReport{"edge/one": {Baseline: report.BaselineServerMetrics, Final: report.FinalServerMetrics, Scrapes: report.ServerMetricsScrapes, ContinuityComplete: true}}
+	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsTargets: targets})
 	if report.Pass || len(report.Failures) != 1 {
 		t.Fatalf("report = %#v", report)
 	}
@@ -129,7 +132,9 @@ func TestEvaluateReportAcceptsReturnToNonZeroSharedServerBaseline(t *testing.T) 
 			"telesrv_mtproto_logical_outbox_bytes": 1024,
 		},
 	}
-	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsURL: "http://metrics"})
+	targets := MetricsTargets{{Role: "edge", Instance: "one", URL: "http://metrics"}}
+	report.ServerMetricsTargets = map[string]MetricsTargetReport{"edge/one": {Baseline: report.BaselineServerMetrics, Final: report.FinalServerMetrics, Scrapes: report.ServerMetricsScrapes, ContinuityComplete: true}}
+	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, RecoveryDuration: time.Minute, ServerMetricsTargets: targets})
 	if !report.Pass || len(report.Failures) != 0 {
 		t.Fatalf("report = %#v", report)
 	}
@@ -146,5 +151,25 @@ func TestEvaluateReportRejectsFixedRateDeliveryLoss(t *testing.T) {
 	evaluateReport(report, RunConfig{MinimumReadyRatio: 1, MessageRate: 1})
 	if report.Pass {
 		t.Fatal("fixed-rate report with a missing recipient delivery passed")
+	}
+}
+
+func TestEventWriteFailureCannotProducePassingReport(t *testing.T) {
+	writer, err := newEventWriter(filepath.Join(t.TempDir(), "events.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer.write(map[string]any{"type": "sample"})
+	written, dropped := writer.counts()
+	if written != 0 || dropped != 1 {
+		t.Fatalf("failed write counted as evidence: %d/%d", written, dropped)
+	}
+	report := &RunReport{ExpectedSessions: 1, PeakReadySessions: 1, SteadySamples: 1, SteadyReadyRatio: 1, EventsDropped: dropped}
+	evaluateReport(report, RunConfig{MinimumReadyRatio: 1})
+	if report.Pass {
+		t.Fatal("lost events accepted")
 	}
 }

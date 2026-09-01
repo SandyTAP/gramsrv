@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -32,7 +30,10 @@ type operationMetrics struct {
 }
 
 func (m *operationMetrics) observe(start time.Time, err error) {
-	d := time.Since(start)
+	m.observeDuration(time.Since(start), err)
+}
+
+func (m *operationMetrics) observeDuration(d time.Duration, err error) {
 	if d < 0 {
 		d = 0
 	}
@@ -103,7 +104,9 @@ func (m *operationMetrics) quantile(count uint64, q float64) time.Duration {
 			return bound
 		}
 	}
-	return latencyBounds[len(latencyBounds)-1]
+	// The overflow bucket has no finite bound. Do not understate a 90-second
+	// p99 as <=30 seconds: the observed maximum is a conservative upper bound.
+	return time.Duration(m.maxNS.Load())
 }
 
 func durationMS(d time.Duration) float64 {
@@ -111,9 +114,10 @@ func durationMS(d time.Duration) float64 {
 }
 
 type metricSet struct {
-	mu     sync.RWMutex
-	ops    map[string]*operationMetrics
-	frozen bool
+	mu         sync.RWMutex
+	ops        map[string]*operationMetrics
+	frozen     bool
+	onBusiness func(string, time.Time, error)
 }
 
 func newMetricSet(names ...string) *metricSet {
@@ -134,6 +138,9 @@ func (m *metricSet) observe(name string, start time.Time, err error) {
 	if op != nil {
 		debugOperationError(name, err)
 		op.observe(start, err)
+		if m.onBusiness != nil {
+			m.onBusiness(name, time.Now(), err)
+		}
 		m.mu.RUnlock()
 		return
 	}
@@ -154,6 +161,9 @@ func (m *metricSet) observe(name string, start time.Time, err error) {
 		if op != nil {
 			debugOperationError(name, err)
 			op.observe(start, err)
+			if m.onBusiness != nil {
+				m.onBusiness(name, time.Now(), err)
+			}
 		}
 	}
 }
@@ -182,7 +192,16 @@ func (m *metricSet) reportLocked() map[string]OperationReport {
 	return out
 }
 
+type MessageTimingReport struct {
+	SchedulerLag    OperationReport `json:"scheduler_lag"`
+	SenderQueueWait OperationReport `json:"sender_queue_wait"`
+	PlannedToSend   OperationReport `json:"planned_to_send"`
+}
+
 type RunReport struct {
+	Lifecycle                RunLifecycleReport              `json:"lifecycle"`
+	WorkloadStarted          bool                            `json:"workload_started"`
+	Preparation              FilePreparationReport           `json:"preparation"`
 	Version                  int                             `json:"version"`
 	StartOrder               string                          `json:"start_order,omitempty"`
 	StartOrderSeed           int64                           `json:"start_order_seed,omitempty"`
@@ -209,6 +228,9 @@ type RunReport struct {
 	MessageCompleted         uint64                          `json:"message_completed"`
 	MessageQueueFull         uint64                          `json:"message_queue_full"`
 	MessageNotReady          uint64                          `json:"message_not_ready"`
+	MessageReadiness         OperationReport                 `json:"message_readiness"`
+	MessageReadyAt           time.Time                       `json:"message_ready_at"`
+	MessageTiming            MessageTimingReport             `json:"message_timing"`
 	Delivery                 DeliveryReport                  `json:"delivery"`
 	Operations               map[string]OperationReport      `json:"operations"`
 	ResponseBytes            map[string]StartupResponseBytes `json:"response_bytes,omitempty"`
@@ -217,10 +239,18 @@ type RunReport struct {
 	BaselineServerMetrics    map[string]float64              `json:"baseline_server_metrics,omitempty"`
 	WorkloadEndServerMetrics map[string]float64              `json:"workload_end_server_metrics,omitempty"`
 	FinalServerMetrics       map[string]float64              `json:"final_server_metrics,omitempty"`
+	ServerMetricsTargets     map[string]MetricsTargetReport  `json:"server_metrics_targets,omitempty"`
 	ServerMetricsScrapes     uint64                          `json:"server_metrics_scrapes"`
 	ServerMetricsErrors      uint64                          `json:"server_metrics_errors"`
 	EventsWritten            uint64                          `json:"events_written"`
 	EventsDropped            uint64                          `json:"events_dropped"`
+	EventEvidence            EventEvidenceReport             `json:"event_evidence"`
+	SafetyStop               SafetyStopReport                `json:"safety_stop"`
+	Resources                ResourceGuardReport             `json:"resources"`
+	Environment              EnvironmentReport               `json:"environment"`
+	BusinessGuard            BusinessGuardReport             `json:"business_guard"`
+	MessageIntentLimit       uint64                          `json:"message_intent_limit"`
+	MessageIntentAdmissions  uint64                          `json:"message_intent_admissions"`
 	Pass                     bool                            `json:"pass"`
 	Failures                 []string                        `json:"failures,omitempty"`
 }
@@ -230,82 +260,7 @@ func WriteReport(path string, report *RunReport) error {
 	if err != nil {
 		return fmt.Errorf("encode report: %w", err)
 	}
-	return writeFileAtomic(path, append(data, '\n'), 0o600)
-}
-
-type eventWriter struct {
-	mu                    sync.Mutex
-	f                     *os.File
-	written               uint64
-	dropped               uint64
-	connectionDeadWritten uint64
-}
-
-const (
-	maxEventLines               = 100000
-	maxConnectionDeadEventLines = 5000
-)
-
-func newEventWriter(path string) (*eventWriter, error) {
-	if path == "" {
-		return &eventWriter{}, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	return &eventWriter{f: f}, nil
-}
-
-func (w *eventWriter) write(value any) {
-	if w == nil || w.f == nil {
-		return
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return
-	}
-	w.mu.Lock()
-	if event, ok := value.(map[string]any); ok && event["type"] == "connection_dead" {
-		if w.connectionDeadWritten >= maxConnectionDeadEventLines {
-			w.dropped++
-			w.mu.Unlock()
-			return
-		}
-		w.connectionDeadWritten++
-	}
-	if w.written >= maxEventLines {
-		w.dropped++
-		w.mu.Unlock()
-		return
-	}
-	_, _ = w.f.Write(append(data, '\n'))
-	w.written++
-	w.mu.Unlock()
-}
-
-func (w *eventWriter) counts() (written, dropped uint64) {
-	if w == nil {
-		return 0, 0
-	}
-	w.mu.Lock()
-	written, dropped = w.written, w.dropped
-	w.mu.Unlock()
-	return written, dropped
-}
-
-func (w *eventWriter) close() error {
-	if w == nil || w.f == nil {
-		return nil
-	}
-	w.mu.Lock()
-	err := w.f.Close()
-	w.f = nil
-	w.mu.Unlock()
-	return err
+	return writeNewEvidenceReport(path, append(data, '\n'))
 }
 
 func sortedOperationNames(ops map[string]OperationReport) []string {

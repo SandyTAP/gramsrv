@@ -98,6 +98,9 @@ func TestPrometheusLabelValue(t *testing.T) {
 func TestServerMetricsWaitsForPresenceLastSeenSettlement(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, `telesrv_process_start_time_seconds 100`)
+		fmt.Fprintln(w, `telesrv_go_goroutines 2`)
+		fmt.Fprintln(w, `telesrv_active_channel_ids_pending 0`)
 		call := calls.Add(1)
 		if call < 3 {
 			fmt.Fprintln(w, `telesrv_presence_last_seen_submitted_total 1`)
@@ -110,7 +113,7 @@ func TestServerMetricsWaitsForPresenceLastSeenSettlement(t *testing.T) {
 		fmt.Fprintln(w, `telesrv_bootstrap_ready_pending 0`)
 	}))
 	defer server.Close()
-	client := newServerMetricsClient(server.URL)
+	client := newServerMetricsCollector(MetricsTargets{{Role: "core", Instance: "one", URL: server.URL}})
 	values, err := client.waitForPresenceLastSeenSettlement(context.Background(), 0, 2, time.Second)
 	if err != nil {
 		t.Fatalf("wait: %v", err)

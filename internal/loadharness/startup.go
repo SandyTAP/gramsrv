@@ -3,10 +3,13 @@ package loadharness
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -17,7 +20,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 )
 
-const StartupReportVersion = 3
+const StartupReportVersion = 8
 
 const (
 	StartupOrderShuffled     = "shuffled"
@@ -25,23 +28,30 @@ const (
 )
 
 type StartupRunConfig struct {
-	ManifestPath      string
-	SessionKeyPath    string
-	RSAKeyOverride    string
-	DatasetPath       string
-	SeedStatePath     string
-	ClientStatePath   string
-	MutationStatePath string
-	ReportPath        string
-	EventsPath        string
-	ServerMetricsURL  string
-	Profile           string
-	StartOrder        string
-	StartOrderSeed    int64
-	AccountLimit      int
-	RampDuration      time.Duration
-	OperationTimeout  time.Duration
-	SampleInterval    time.Duration
+	safety               *loadSafety
+	wrapInvoker          func(SessionRecord, tg.Invoker) tg.Invoker
+	observeEvents        func(*eventWriter)
+	events               *eventWriter
+	ManifestPath         string
+	SessionKeyPath       string
+	RSAKeyOverride       string
+	DatasetPath          string
+	SeedStatePath        string
+	ClientStatePath      string
+	MutationStatePath    string
+	ReportPath           string
+	EventsPath           string
+	EventLimits          EventLimits
+	ResourceLimits       ResourceLimits
+	EnvironmentPath      string
+	ServerMetricsTargets MetricsTargets
+	Profile              string
+	StartOrder           string
+	StartOrderSeed       int64
+	AccountLimit         int
+	RampDuration         time.Duration
+	OperationTimeout     time.Duration
+	SampleInterval       time.Duration
 }
 
 type StartupDifferenceCounts struct {
@@ -97,10 +107,16 @@ type StartupRunReport struct {
 	BaselineServerMetrics map[string]float64              `json:"baseline_server_metrics,omitempty"`
 	FinalServerMetrics    map[string]float64              `json:"final_server_metrics,omitempty"`
 	PeakServerMetrics     map[string]float64              `json:"peak_server_metrics,omitempty"`
+	ServerMetricsTargets  map[string]MetricsTargetReport  `json:"server_metrics_targets,omitempty"`
 	ServerMetricsScrapes  uint64                          `json:"server_metrics_scrapes"`
 	ServerMetricsErrors   uint64                          `json:"server_metrics_errors"`
 	EventsWritten         uint64                          `json:"events_written"`
 	EventsDropped         uint64                          `json:"events_dropped"`
+	EventEvidence         EventEvidenceReport             `json:"event_evidence"`
+	SafetyStop            SafetyStopReport                `json:"safety_stop"`
+	Resources             ResourceGuardReport             `json:"resources"`
+	Environment           EnvironmentReport               `json:"environment"`
+	BusinessGuard         BusinessGuardReport             `json:"business_guard"`
 	Pass                  bool                            `json:"pass"`
 	Failures              []string                        `json:"failures,omitempty"`
 }
@@ -117,6 +133,21 @@ type startupAccountResult struct {
 }
 
 func (c StartupRunConfig) validate() error {
+	if err := c.ResourceLimits.validate(); err != nil {
+		return err
+	}
+	if err := c.EventLimits.validate(); err != nil {
+		return err
+	}
+	if c.EventsPath == "" {
+		return errors.New("startup-run requires an event evidence path")
+	}
+	if err := validateEvidencePaths(c.ReportPath, c.EventsPath); err != nil {
+		return err
+	}
+	if err := c.ServerMetricsTargets.validate(); err != nil {
+		return err
+	}
 	if c.ManifestPath == "" || c.SessionKeyPath == "" || c.DatasetPath == "" || c.SeedStatePath == "" || c.ClientStatePath == "" || c.MutationStatePath == "" || c.ReportPath == "" {
 		return errors.New("startup-run requires all input artifact paths and a report path")
 	}
@@ -137,6 +168,9 @@ func (c StartupRunConfig) validate() error {
 // dirty channel cursors. Socket readiness alone never counts as business ready.
 func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, error) {
 	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	if err := requireNewReport(cfg.ReportPath); err != nil {
 		return nil, err
 	}
 	profile, _ := resolveStartupProfile(cfg.Profile)
@@ -203,22 +237,52 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 		"messages.getPinnedDialogs", "messages.getDialogs", "messages.getDialogs.first", "messages.getDialogs.next", "messages.getDialogs.full", "messages.getDialogs.slice",
 		"updates.getChannelDifference", "updates.getChannelDifference.small", "updates.getChannelDifference.boundary", "updates.getChannelDifference.too_long", "updates.getChannelDifference.empty",
 	)
-	events, err := newEventWriter(cfg.EventsPath)
+	events, err := newBoundedEventWriter(cfg.EventsPath, cfg.EventLimits)
 	if err != nil {
 		return nil, err
 	}
 	defer events.close()
-	serverMetrics := newServerMetricsClient(cfg.ServerMetricsURL)
+	workCtx, safety := newLoadSafety(ctx)
+	defer safety.cancel()
+	events.onFailure = safety.eventsFailure
+	cfg.safety = safety
+	cfg.events = events
+	business := &businessGuard{}
+	metrics.onBusiness = business.observe
+	if err := os.MkdirAll(filepath.Dir(cfg.ReportPath), 0o700); err != nil {
+		return nil, err
+	}
+	resources, resourceErr := newResourceGuard(ctx, cfg.ResourceLimits, cfg.ReportPath, cfg.EventsPath, cfg.ManifestPath, safety, events, business)
+	defer resources.close()
+	if resourceErr != nil {
+		return nil, resourceErr
+	}
+	environment, environmentErr := newEnvironmentGuard(ctx, cfg.EnvironmentPath, cfg.ServerMetricsTargets, safety, events)
+	defer environment.close()
+	if environmentErr != nil {
+		return nil, environmentErr
+	}
+	serverMetrics := newServerMetricsCollector(cfg.ServerMetricsTargets)
+	if serverMetrics != nil {
+		serverMetrics.onIssue = safety.metricsFailure
+	}
 	var baselineServerMetrics map[string]float64
 	peakServerMetrics := make(map[string]float64)
 	if serverMetrics != nil {
 		if sample, scrapeErr := serverMetrics.scrape(ctx); scrapeErr == nil {
 			baselineServerMetrics = sample
 			updateMetricPeaks(peakServerMetrics, sample)
-			events.write(map[string]any{"type": "startup_server_baseline", "at": time.Now().UTC(), "server_metrics": sample})
+			events.write(map[string]any{"type": "startup_server_baseline", "at": time.Now().UTC(), "server_metrics": sample, "metrics_targets": serverMetrics.samples()})
 		} else {
-			events.write(map[string]any{"type": "startup_server_baseline_error", "at": time.Now().UTC(), "class": classifyError(scrapeErr)})
+			events.write(map[string]any{"type": "startup_server_baseline_error", "at": time.Now().UTC(), "class": classifyError(scrapeErr), "metrics_targets": serverMetrics.samples()})
+			return nil, fmt.Errorf("metrics preflight failed before startup load; see events for target evidence")
 		}
+	}
+	if failure := events.report().Error; failure != "" {
+		return nil, fmt.Errorf("event preflight failed: %s", failure)
+	}
+	if cfg.observeEvents != nil {
+		cfg.observeEvents(events)
 	}
 	startedAt := time.Now().UTC()
 	results := make(chan startupAccountResult, accounts)
@@ -232,16 +296,16 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 			if delay > 0 {
 				timer := time.NewTimer(delay)
 				select {
-				case <-ctx.Done():
+				case <-workCtx.Done():
 					if !timer.Stop() {
 						<-timer.C
 					}
-					results <- startupAccountResult{account: account, stage: "ramp", err: ctx.Err()}
+					results <- startupAccountResult{account: account, stage: "ramp", err: workCtx.Err()}
 					return
 				case <-timer.C:
 				}
 			}
-			results <- runStartupAccount(ctx, cfg, profile, manifest, dataset, seedState, clientState, mutationPlan, mutationState, targets, key, publicKey, metrics, account)
+			results <- runStartupAccount(workCtx, cfg, profile, manifest, dataset, seedState, clientState, mutationPlan, mutationState, targets, key, publicKey, metrics, account)
 		}()
 	}
 	go func() {
@@ -255,6 +319,7 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 		BaselineServerMetrics: baselineServerMetrics,
 	}
 	consumeResult := func(result startupAccountResult) {
+		events.write(map[string]any{"type": "startup_account_result", "at": time.Now().UTC(), "account_index": result.account, "stage": result.stage, "class": classifyError(result.err), "business_ready": result.err == nil})
 		if result.err == nil {
 			report.BusinessReady++
 		} else if len(report.Failures) < 100 {
@@ -285,17 +350,17 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 		case sampledAt := <-sampleC:
 			sample, scrapeErr := serverMetrics.scrape(ctx)
 			if scrapeErr != nil {
-				events.write(map[string]any{"type": "startup_sample_error", "at": sampledAt.UTC(), "class": classifyError(scrapeErr)})
+				events.write(map[string]any{"type": "startup_sample_error", "at": sampledAt.UTC(), "class": classifyError(scrapeErr), "metrics_targets": serverMetrics.samples()})
 				continue
 			}
 			updateMetricPeaks(peakServerMetrics, sample)
 			events.write(map[string]any{
 				"type": "startup_sample", "at": sampledAt.UTC(), "business_ready": report.BusinessReady,
-				"expected_accounts": accounts, "operations": metrics.report(), "server_metrics": sample,
+				"expected_accounts": accounts, "operations": metrics.report(), "server_metrics": sample, "metrics_targets": serverMetrics.samples(),
 			})
 		}
 	}
-	report.FinishedAt = time.Now().UTC()
+	safety.workersStopped()
 	report.Operations = metrics.report()
 	if serverMetrics != nil {
 		baselineSubmitted := metricValue(report.BaselineServerMetrics, "telesrv_presence_last_seen_submitted_total")
@@ -307,10 +372,10 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 			updateMetricPeaks(peakServerMetrics, sample)
 		}
 		if settleErr == nil {
-			events.write(map[string]any{"type": "startup_server_final", "at": time.Now().UTC(), "server_metrics": sample})
+			events.write(map[string]any{"type": "startup_server_final", "at": time.Now().UTC(), "server_metrics": sample, "metrics_targets": serverMetrics.samples()})
 		} else {
 			report.Failures = append(report.Failures, "presence last-seen batch did not settle before final metrics")
-			events.write(map[string]any{"type": "startup_server_final_error", "at": time.Now().UTC(), "class": classifyError(settleErr)})
+			events.write(map[string]any{"type": "startup_server_final_error", "at": time.Now().UTC(), "class": classifyError(settleErr), "metrics_targets": serverMetrics.samples()})
 		}
 		report.ServerMetricsScrapes = serverMetrics.successes()
 		report.ServerMetricsErrors = serverMetrics.failures()
@@ -321,11 +386,33 @@ func StartupRun(ctx context.Context, cfg StartupRunConfig) (*StartupRunReport, e
 			report.Failures = append(report.Failures, "final startup server metrics scrape failed")
 		}
 	}
+	report.ServerMetricsTargets = serverMetrics.reports()
+	report.Failures = append(report.Failures, metricsEvidenceFailures(cfg.ServerMetricsTargets, report.ServerMetricsTargets)...)
 	report.PeakServerMetrics = peakServerMetrics
 	report.ResponseBytes = startupResponseBytes(report.BaselineServerMetrics, report.FinalServerMetrics)
 	report.RPCDeliveryOutcomes = startupRPCDeliveryOutcomes(report.BaselineServerMetrics, report.FinalServerMetrics)
 	report.DatabaseWork = startupDatabaseWork(report.BaselineServerMetrics, report.FinalServerMetrics)
+	environment.finish(ctx)
+	resources.finish(ctx)
+	_ = events.finalize(ctx)
+	report.FinishedAt = time.Now().UTC()
 	report.EventsWritten, report.EventsDropped = events.counts()
+	report.EventEvidence, report.SafetyStop = events.report(), safety.report()
+	report.Resources, report.BusinessGuard = resources.report(), business.report()
+	report.Environment = environment.report()
+	if report.Environment.Version != environmentVersion || (report.Environment.Enabled && (report.Environment.Samples == 0 || report.Environment.Errors > 0)) {
+		report.Failures = append(report.Failures, "external environment evidence incomplete")
+	}
+	if report.Resources.Version != 1 || report.Resources.Samples == 0 || report.Resources.Errors != 0 {
+		report.Failures = append(report.Failures, "client resource evidence incomplete")
+	}
+	report.Failures = append(report.Failures, eventEvidenceFailures(report.EventEvidence, report.EventsWritten, report.EventsDropped)...)
+	if report.SafetyStop.Source != "" {
+		report.Failures = append(report.Failures, "startup stopped by safety boundary: "+report.SafetyStop.Source+"/"+report.SafetyStop.Class)
+	}
+	if report.EventsDropped > 0 {
+		report.Failures = append(report.Failures, "startup evidence events were dropped")
+	}
 	methods := make([]string, 0, len(report.RPCDeliveryOutcomes))
 	for method := range report.RPCDeliveryOutcomes {
 		methods = append(methods, method)
@@ -436,7 +523,12 @@ func runStartupAccount(
 	account int,
 ) startupAccountResult {
 	result := startupAccountResult{account: account}
+	if ctx.Err() != nil {
+		result.stage, result.err = "before_connect", ctx.Err()
+		return result
+	}
 	connectStart := time.Now()
+	cfg.events.write(map[string]any{"type": "startup_account_connect", "at": connectStart.UTC(), "account_index": account})
 	var ready atomic.Bool
 	var businessReady atomic.Bool
 	var readyOnce sync.Once
@@ -458,7 +550,12 @@ func runStartupAccount(
 		metrics.observe("lifecycle.transport_ready", connectStart, err)
 		return result
 	}
-	err = client.Run(ctx, func(ctx context.Context) error {
+	err = client.Run(ctx, func(ctx context.Context) (returnErr error) {
+		defer func() {
+			if class := invariantClass(returnErr); class != "" && cfg.safety != nil {
+				cfg.safety.trip("startup_invariant", class, time.Now().UTC())
+			}
+		}()
 		statusStart := time.Now()
 		statusCtx, cancel := context.WithTimeout(ctx, cfg.OperationTimeout)
 		status, err := client.Auth().Status(statusCtx)
@@ -469,10 +566,13 @@ func runStartupAccount(
 			return err
 		}
 		if !status.Authorized || status.User == nil || status.User.ID != targets[account].UserID {
+			if cfg.safety != nil {
+				cfg.safety.trip("identity", "manifest_authorization_mismatch", time.Now().UTC())
+			}
 			result.stage = "auth"
 			return errors.New("session is not authorized as the manifest user")
 		}
-		raw := tg.NewClient(client)
+		raw := tg.NewClient(workloadInvoker(targets[account], client, cfg.wrapInvoker))
 		accountState := clientState.Accounts[account].State
 		if profile.GetStateBeforeDifference {
 			stateStart := time.Now()
@@ -486,7 +586,7 @@ func runStartupAccount(
 			}
 			if current.Pts < clientState.Accounts[account].State.Pts || current.Qts < clientState.Accounts[account].State.Qts {
 				result.stage = "state"
-				return errors.New("updates.getState moved behind the persisted startup cursor")
+				return invariantError("account_cursor_backwards", "updates.getState moved behind the persisted startup cursor")
 			}
 			accountState = clientUpdateState(*current)
 		}
@@ -513,7 +613,7 @@ func runStartupAccount(
 		}
 		if err := validateStartupDialogs(dataset, seedState, mutationPlan, mutationState, targets, account, dialogs); err != nil {
 			result.stage = "dialogs"
-			return err
+			return invariantError("dialogs_state", "%w", err)
 		}
 		metrics.observe("lifecycle.dialogs_ready", connectStart, nil)
 		channelCounts, err := startupChannelDifferences(ctx, cfg.OperationTimeout, raw, dataset, seedState, clientState.Accounts[account], mutationPlan, mutationState, account, profile.ForceChannelDifference, metrics)
@@ -523,6 +623,10 @@ func runStartupAccount(
 			return err
 		}
 		_ = accountState // retained separately from immutable baseline for future steady polling.
+		if err := ctx.Err(); err != nil {
+			result.stage = "before_business_ready"
+			return err
+		}
 		metrics.observe("lifecycle.difference_converged", connectStart, nil)
 		metrics.observe("lifecycle.business_ready", connectStart, nil)
 		businessReady.Store(true)
@@ -574,6 +678,9 @@ func startupAccountDifference(
 			state.Date, state.Seq = value.Date, value.Seq
 			finished = true
 		case *tg.UpdatesDifference:
+			if value.State.Pts < state.Pts || value.State.Qts < state.Qts {
+				return state, counts, invariantError("account_cursor_backwards", "account difference moved cursor backwards")
+			}
 			metrics.observe("updates.getDifference.full", start, nil)
 			counts.Full++
 			counts.Events += len(value.NewMessages) + len(value.NewEncryptedMessages) + len(value.OtherUpdates)
@@ -581,6 +688,9 @@ func startupAccountDifference(
 			state = clientUpdateState(value.State)
 			finished = true
 		case *tg.UpdatesDifferenceSlice:
+			if value.IntermediateState.Pts < state.Pts || value.IntermediateState.Qts < state.Qts {
+				return state, counts, invariantError("account_cursor_backwards", "account difference slice moved cursor backwards")
+			}
 			metrics.observe("updates.getDifference.slice", start, nil)
 			counts.Slice++
 			counts.Events += len(value.NewMessages) + len(value.NewEncryptedMessages) + len(value.OtherUpdates)
@@ -590,15 +700,15 @@ func startupAccountDifference(
 			metrics.observe("updates.getDifference.too_long", start, nil)
 			counts.TooLong++
 			state.Pts = value.Pts
-			return state, counts, errors.New("account difference returned updates.differenceTooLong")
+			return state, counts, invariantError("account_difference_too_long", "account difference returned updates.differenceTooLong")
 		default:
-			return state, counts, fmt.Errorf("updates.getDifference returned %T", difference)
+			return state, counts, invariantError("account_difference_type", "updates.getDifference returned %T", difference)
 		}
 		if finished {
 			break
 		}
 		if page == 255 {
-			return state, counts, errors.New("updates.getDifference exceeded 256 pages")
+			return state, counts, invariantError("account_difference_pages", "updates.getDifference exceeded 256 pages")
 		}
 	}
 	account := baseline.AccountIndex
@@ -607,7 +717,7 @@ func startupAccountDifference(
 		offlinePrivateMarker(dataset, (account-1+dataset.Config.Accounts)%dataset.Config.Accounts, account),
 	}
 	if err := requireExactMarkers(markers, expected); err != nil {
-		return state, counts, fmt.Errorf("account private markers: %w", err)
+		return state, counts, invariantError("account_difference_markers", "account private markers: %w", err)
 	}
 	// A non-slice updates.difference is final for the cursor used by this
 	// request. Do not require a second account-level call to be empty: binding
@@ -679,10 +789,8 @@ func validateStartupDialogs(
 	if err := validateSeededRichDialogs(dataset, seedState, targets, account, dialogs, false); err != nil {
 		return fmt.Errorf("rich dialog state: %w", err)
 	}
-	offlinePeer := clientPeerKey{typ: "user", id: targets[(account+1)%dataset.Config.Accounts].UserID}
-	offlineDialog, ok := byPeer[offlinePeer]
-	if !ok || mutationState.PrivateMessageIDs[account] <= 0 || offlineDialog.TopMessage != mutationState.PrivateMessageIDs[account] {
-		return errors.New("current dialogs omitted the account's exact offline private top message")
+	if err := validateOfflinePrivateTops(dataset, mutationState, targets, account, byPeer); err != nil {
+		return err
 	}
 	for planPosition, channelPlan := range mutationPlan {
 		group := dataset.Groups[channelPlan.GroupPosition]
@@ -693,6 +801,42 @@ func validateStartupDialogs(
 		dialog, ok := byPeer[clientPeerKey{typ: "channel", id: channelID}]
 		if !ok || !dialog.HasPts || dialog.Pts < mutationState.Channels[planPosition].LatestPts {
 			return fmt.Errorf("dirty channel group %d dialog pts is stale", group.Index)
+		}
+	}
+	return nil
+}
+
+func validateOfflinePrivateTops(dataset *Dataset, mutation *OfflineMutationState, targets []SessionRecord, account int, dialogs map[clientPeerKey]ClientDialogState) error {
+	next := (account + 1) % dataset.Config.Accounts
+	previous := (account - 1 + dataset.Config.Accounts) % dataset.Config.Accounts
+	// Group both directed mutations by this owner's peer. Two-way traffic can
+	// share a dialog; IDs from another owner's journal are never comparable.
+	wanted := map[clientPeerKey]map[[32]byte]bool{}
+	for _, edge := range [][2]int{{account, next}, {previous, account}} {
+		peerAccount := edge[1]
+		if peerAccount == account {
+			peerAccount = edge[0]
+		}
+		peer := clientPeerKey{typ: "user", id: targets[peerAccount].UserID}
+		if wanted[peer] == nil {
+			wanted[peer] = map[[32]byte]bool{}
+		}
+		wanted[peer][sha256.Sum256([]byte(offlinePrivateMarker(dataset, edge[0], edge[1])))] = edge[0] == account
+	}
+	if mutation.PrivateMessageIDs[account] <= 0 {
+		return errors.New("missing own offline send identity")
+	}
+	for peer, candidates := range wanted {
+		d, ok := dialogs[peer]
+		outgoing, known := candidates[d.topMessageDigest]
+		if !ok || d.TopMessage <= 0 || !known {
+			return errors.New("private dialog top payload is not an expected offline mutation")
+		}
+		if outgoing && d.TopMessage != mutation.PrivateMessageIDs[account] {
+			return errors.New("outgoing private top ID does not match this owner's send")
+		}
+		if !outgoing && peer.id == targets[next].UserID && d.TopMessage <= mutation.PrivateMessageIDs[account] {
+			return errors.New("incoming top did not follow this owner's outgoing mutation")
 		}
 	}
 	return nil
@@ -778,10 +922,10 @@ func catchUpStartupChannel(
 		case *tg.UpdatesChannelDifferenceEmpty:
 			counts.Empty++
 			if page == 0 {
-				return counts, errors.New("dirty channel returned empty difference")
+				return counts, invariantError("channel_difference_state", "dirty channel returned empty difference")
 			}
 			if value.Pts < pts {
-				return counts, errors.New("channel empty difference moved pts backwards")
+				return counts, invariantError("channel_difference_state", "channel empty difference moved pts backwards")
 			}
 			pts = value.Pts
 		case *tg.UpdatesChannelDifference:
@@ -794,7 +938,7 @@ func catchUpStartupChannel(
 			counts.Events += len(value.NewMessages) + len(value.OtherUpdates)
 			collectChannelMarkers(markers, value.NewMessages, value.OtherUpdates, dataset.RunID)
 			if value.Pts <= pts {
-				return counts, errors.New("channel full difference did not advance pts")
+				return counts, invariantError("channel_difference_state", "channel full difference did not advance pts")
 			}
 			pts = value.Pts
 			if !value.Final {
@@ -807,33 +951,33 @@ func catchUpStartupChannel(
 			collectChannelMarkers(markers, value.Messages, nil, dataset.RunID)
 			dialog, ok := value.Dialog.(*tg.Dialog)
 			if !ok {
-				return counts, fmt.Errorf("channelDifferenceTooLong dialog is %T", value.Dialog)
+				return counts, invariantError("channel_difference_state", "channelDifferenceTooLong dialog is %T", value.Dialog)
 			}
 			current, ok := dialog.GetPts()
 			if !ok || current <= pts || !value.Final {
-				return counts, errors.New("channelDifferenceTooLong has invalid final pts")
+				return counts, invariantError("channel_difference_state", "channelDifferenceTooLong has invalid final pts")
 			}
 			pts = current
 			tooLongSnapshot = true
 		default:
-			return counts, fmt.Errorf("updates.getChannelDifference returned %T", difference)
+			return counts, invariantError("channel_difference_state", "updates.getChannelDifference returned %T", difference)
 		}
 		break
 	}
 	if pts < state.LatestPts {
-		return counts, fmt.Errorf("channel converged pts %d below observed %d", pts, state.LatestPts)
+		return counts, invariantError("channel_difference_state", "channel converged pts %d below observed %d", pts, state.LatestPts)
 	}
 	if expectTooLong != tooLongSnapshot {
-		return counts, fmt.Errorf("tooLong=%v want=%v", tooLongSnapshot, expectTooLong)
+		return counts, invariantError("channel_difference_state", "tooLong=%v want=%v", tooLongSnapshot, expectTooLong)
 	}
 	if tooLongSnapshot {
 		latest := offlineChannelMarker(dataset, group, plan.Messages-1)
 		if markers[latest] != 1 {
-			return counts, errors.New("tooLong snapshot omitted latest mutation marker")
+			return counts, invariantError("channel_difference_state", "tooLong snapshot omitted latest mutation marker")
 		}
 		deleted := offlineChannelMarker(dataset, group, plan.Messages-2)
 		if markers[deleted] != 0 {
-			return counts, errors.New("tooLong snapshot retained deleted mutation marker")
+			return counts, invariantError("channel_difference_state", "tooLong snapshot retained deleted mutation marker")
 		}
 	} else {
 		expected := make([]string, 0, plan.Messages)
@@ -841,7 +985,7 @@ func catchUpStartupChannel(
 			expected = append(expected, offlineChannelMarker(dataset, group, message))
 		}
 		if err := requireExactMarkers(markers, expected); err != nil {
-			return counts, fmt.Errorf("channel markers: %w", err)
+			return counts, invariantError("channel_difference_state", "channel markers: %w", err)
 		}
 	}
 	start := time.Now()
@@ -858,7 +1002,7 @@ func catchUpStartupChannel(
 	}
 	emptyDifference, ok := empty.(*tg.UpdatesChannelDifferenceEmpty)
 	if !ok || !emptyDifference.Final || emptyDifference.Pts != pts {
-		return counts, fmt.Errorf("repeat channel difference returned %T at unexpected pts", empty)
+		return counts, invariantError("channel_difference_state", "repeat channel difference returned %T at unexpected pts", empty)
 	}
 	counts.Empty++
 	return counts, nil
@@ -1033,5 +1177,5 @@ func WriteStartupReport(path string, report *StartupRunReport) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, append(data, '\n'), 0o600)
+	return writeNewEvidenceReport(path, append(data, '\n'))
 }

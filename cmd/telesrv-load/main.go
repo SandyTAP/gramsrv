@@ -243,7 +243,11 @@ func runStartup(ctx context.Context, args []string) error {
 	mutationState := flags.String("mutation-state", filepath.FromSlash("data/loadtest/offline-mutation-state.json"), "completed offline mutation journal")
 	report := flags.String("report", filepath.FromSlash("data/loadtest/startup-report.json"), "startup correctness and latency report")
 	events := flags.String("events", filepath.FromSlash("data/loadtest/startup-events.ndjson"), "periodic owner-only startup and server metric evidence")
-	serverMetrics := flags.String("server-metrics", "http://127.0.0.1:6060/metrics", "server metrics URL; empty disables")
+	eventLimits := eventLimitFlags(flags)
+	resourceLimits := resourceLimitFlags(flags)
+	environment := flags.String("environment", "", "private local process/Docker environment evidence config; empty explicitly leaves external resources uncovered")
+	var serverMetrics loadharness.MetricsTargets
+	flags.Var(&serverMetrics, "server-metrics", "repeatable role/instance=http(s)://host/metrics; omit to disable")
 	profile := flags.String("profile", loadharness.StartupProfileTDesktopReturningV1, "startup workload: tdesktop-cold-returning-v1 or tdlib-returning-v1")
 	startOrder := flags.String("start-order", loadharness.StartupOrderShuffled, "account launch order: shuffled or account-index")
 	startOrderSeed := flags.Int64("start-order-seed", 0, "deterministic shuffled launch seed; 0 uses the dataset seed")
@@ -260,7 +264,9 @@ func runStartup(ctx context.Context, args []string) error {
 	result, err := loadharness.StartupRun(ctx, loadharness.StartupRunConfig{
 		ManifestPath: *manifest, SessionKeyPath: *sessionKey, RSAKeyOverride: *rsaOverride,
 		DatasetPath: *dataset, SeedStatePath: *seedState, ClientStatePath: *clientState,
-		MutationStatePath: *mutationState, ReportPath: *report, EventsPath: *events, ServerMetricsURL: *serverMetrics,
+		MutationStatePath: *mutationState, ReportPath: *report, EventsPath: *events, ServerMetricsTargets: serverMetrics,
+		EventLimits:    *eventLimits,
+		ResourceLimits: *resourceLimits, EnvironmentPath: *environment,
 		Profile: *profile, StartOrder: *startOrder, StartOrderSeed: *startOrderSeed,
 		AccountLimit: *accounts, RampDuration: *ramp, OperationTimeout: *operationTimeout,
 		SampleInterval: *sampleInterval,
@@ -355,6 +361,23 @@ func runProvision(ctx context.Context, args []string) error {
 	return nil
 }
 
+func eventLimitFlags(flags *flag.FlagSet) *loadharness.EventLimits {
+	limits := &loadharness.EventLimits{}
+	flags.Int64Var(&limits.LineBytes, "event-line-bytes", 8<<20, "per-event conservative encoding budget and hard NDJSON byte limit")
+	flags.Int64Var(&limits.SegmentBytes, "event-segment-bytes", 64<<20, "event segment size; earlier segments are retained")
+	flags.Int64Var(&limits.TotalBytes, "event-total-bytes", 4<<30, "total event bytes across all segments; exhaustion stops load")
+	return limits
+}
+
+func resourceLimitFlags(flags *flag.FlagSet) *loadharness.ResourceLimits {
+	l := &loadharness.ResourceLimits{}
+	flags.Uint64Var(&l.HeapBytes, "load-heap-budget", 2<<30, "load-process heap budget; stops at 85 percent")
+	flags.Uint64Var(&l.RSSBytes, "load-rss-budget", 4<<30, "load-process current RSS budget; stops at 85 percent")
+	flags.Uint64Var(&l.OpenFiles, "load-open-file-budget", 65536, "load descriptor budget, also bounded by soft OS limit; stops at 85 percent")
+	flags.Uint64Var(&l.MinDiskFreeBytes, "min-disk-free-bytes", 20<<30, "local artifact volume floor, at least 20GiB and 15 percent")
+	return l
+}
+
 func runLoad(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	manifest := flags.String("manifest", filepath.FromSlash("data/loadtest/manifest.json"), "provisioned manifest")
@@ -362,8 +385,13 @@ func runLoad(ctx context.Context, args []string) error {
 	rsaOverride := flags.String("rsa-key", "", "optional RSA public/private PEM override")
 	report := flags.String("report", filepath.FromSlash("data/loadtest/report.json"), "final JSON report")
 	events := flags.String("events", filepath.FromSlash("data/loadtest/events.ndjson"), "periodic NDJSON evidence")
+	eventLimits := eventLimitFlags(flags)
+	resourceLimits := resourceLimitFlags(flags)
+	maxIntents := flags.Uint64("max-message-intents", 100000000, "maximum private-message intentions, including rejected/uncertain intentions")
+	environment := flags.String("environment", "", "private local process/Docker environment evidence config; empty explicitly leaves external resources uncovered")
 	fileFixture := flags.String("file-fixture", "", "reusable fixture JSON; empty stores beside manifest")
-	serverMetrics := flags.String("server-metrics", "http://127.0.0.1:6060/metrics", "server metrics URL; empty disables")
+	var serverMetrics loadharness.MetricsTargets
+	flags.Var(&serverMetrics, "server-metrics", "repeatable role/instance=http(s)://host/metrics; omit to disable")
 	startOrder := flags.String("start-order", loadharness.StartupOrderShuffled, "session launch order: shuffled or account-index")
 	startOrderSeed := flags.Int64("start-order-seed", 20260827, "deterministic shuffled launch seed")
 	sessions := flags.Int("sessions", 0, "limit selected sessions; 0 uses all")
@@ -372,16 +400,18 @@ func runLoad(ctx context.Context, args []string) error {
 	ramp := flags.Duration("ramp", 2*time.Minute, "connection ramp duration")
 	rpcInterval := flags.Duration("rpc-interval", 5*time.Second, "per-session background RPC interval")
 	messageInterval := flags.Duration("message-interval", 30*time.Second, "per-primary-session message interval; negative disables")
-	messageRate := flags.Float64("message-rate", 0, "aggregate fixed arrival rate in messages/second; use with message-interval=-1")
+	messageRate := flags.Float64("message-rate", 0, "aggregate fixed arrival rate in messages/second; use with message-interval=-1s")
 	messageQueue := flags.Int("message-queue", 8, "bounded pending sends per primary session for fixed-rate workload")
 	deliverySettle := flags.Duration("delivery-settle", 10*time.Second, "maximum live-delivery settle time before final updates.getDifference reconciliation")
+	deliveryCache := flags.Int("delivery-cache-records", 4096, "maximum cached delivery records (also capped at 32MiB); evicted records stay on disk")
+	deliveryBytes := flags.Int64("delivery-ledger-bytes", 32<<30, "maximum delivery record file address space; workload over quota fails before clients start")
 	fileInterval := flags.Duration("file-interval", time.Minute, "per-session upload.getFile interval")
 	fileSize := flags.Int("file-size", 4<<20, "generated shared download fixture bytes; 0 disables")
 	fileChunk := flags.Int("file-chunk", 1<<20, "upload.getFile bytes per request (max 1MiB)")
 	setupTimeout := flags.Duration("setup-timeout", 90*time.Second, "maximum first-time file fixture setup duration")
 	operationTimeout := flags.Duration("operation-timeout", 30*time.Second, "maximum duration of one workload RPC")
 	sampleInterval := flags.Duration("sample-interval", 10*time.Second, "evidence and server scrape interval")
-	offlineFraction := flags.Float64("offline-fraction", 0.20, "fraction disconnected during offline window; 0 disables")
+	offlineFraction := flags.Float64("offline-fraction", 0.20, "fraction of secondary devices disconnected during offline window; senders remain online; 0 disables")
 	offlineAt := flags.Duration("offline-at", 10*time.Minute, "offline window start from run start")
 	offlineFor := flags.Duration("offline-for", 2*time.Minute, "offline window duration")
 	readyRatio := flags.Float64("min-ready-ratio", 0.98, "minimum peak ready ratio")
@@ -394,11 +424,14 @@ func runLoad(ctx context.Context, args []string) error {
 	}
 	result, err := loadharness.Run(ctx, loadharness.RunConfig{
 		ManifestPath: *manifest, SessionKeyPath: *sessionKey, RSAKeyOverride: *rsaOverride,
-		ReportPath: *report, EventsPath: *events, FileFixturePath: *fileFixture, ServerMetricsURL: *serverMetrics,
+		ReportPath: *report, EventsPath: *events, FileFixturePath: *fileFixture, ServerMetricsTargets: serverMetrics,
+		EventLimits:    *eventLimits,
+		ResourceLimits: *resourceLimits, MaxMessageIntents: *maxIntents, EnvironmentPath: *environment,
 		StartOrder: *startOrder, StartOrderSeed: *startOrderSeed,
 		SessionLimit: *sessions, Duration: *duration, RecoveryDuration: *recovery, RampDuration: *ramp,
 		RPCInterval: *rpcInterval, MessageInterval: *messageInterval, MessageRate: *messageRate,
 		MessageQueueDepth: *messageQueue, DeliverySettle: *deliverySettle, SampleInterval: *sampleInterval,
+		DeliveryCacheRecords: *deliveryCache, DeliveryLedgerBytes: *deliveryBytes,
 		FileInterval: *fileInterval, FileSizeBytes: *fileSize, FileChunkBytes: *fileChunk, SetupTimeout: *setupTimeout,
 		OperationTimeout: *operationTimeout,
 		OfflineFraction:  *offlineFraction, OfflineAt: *offlineAt, OfflineFor: *offlineFor,
