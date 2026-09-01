@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -416,7 +416,9 @@ func (r *Registry) BootstrapReadyBatch(inputs int, matched int, d time.Duration,
 
 // BootstrapReadyPending implements postgres.BootstrapReadyBatchMetrics.
 func (r *Registry) BootstrapReadyPending(delta int) {
-	r.addGauge("telesrv_bootstrap_ready_pending", int64(delta))
+	if r != nil {
+		r.gauge(newSeriesKey("telesrv_bootstrap_ready_pending")).value.Add(int64(delta))
+	}
 }
 
 // ActiveChannelIDsCache implements channels.ActiveChannelIDsReadModelMetrics.
@@ -437,7 +439,9 @@ func (r *Registry) ActiveChannelIDsBatch(selectors int, rows int, d time.Duratio
 
 // ActiveChannelIDsPending implements postgres.ActiveChannelIDsBatchMetrics.
 func (r *Registry) ActiveChannelIDsPending(delta int) {
-	r.addGauge("telesrv_active_channel_ids_pending", int64(delta))
+	if r != nil {
+		r.gauge(newSeriesKey("telesrv_active_channel_ids_pending")).value.Add(int64(delta))
+	}
 }
 
 // PresenceLastSeenBatch implements rpc.Metrics.
@@ -455,7 +459,9 @@ func (r *Registry) PresenceLastSeenSubmitted() {
 
 // PresenceLastSeenPending implements rpc.Metrics.
 func (r *Registry) PresenceLastSeenPending(delta int) {
-	r.addGauge("telesrv_presence_last_seen_pending", int64(delta))
+	if r != nil {
+		r.gauge(newSeriesKey("telesrv_presence_last_seen_pending")).value.Add(int64(delta))
+	}
 }
 
 // PresenceLastSeenOverflow implements rpc.Metrics.
@@ -468,7 +474,8 @@ func (r *Registry) PresenceLastSeenDrainDropped(count int) {
 	r.add("telesrv_presence_last_seen_drain_dropped_total", uint64(max(count, 0)))
 }
 
-// ServeHTTP writes Prometheus text format.
+// ServeHTTP streams through a request-owned buffer. Nothing is pooled or retained
+// across requests, and provider-owned samples are only read, never sanitized in place.
 func (r *Registry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	var counters []*counterSeries
@@ -476,9 +483,10 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		counters = append(counters, value.(*counterSeries))
 		return true
 	})
-	var gauges []*gaugeSeries
+	gauges := r.providerSamples()
 	r.gauges.Range(func(_, value any) bool {
-		gauges = append(gauges, value.(*gaugeSeries))
+		item := value.(*gaugeSeries)
+		gauges = append(gauges, GaugeSample{Name: item.key.name, Labels: keyLabels(item.key), Value: float64(item.value.Load())})
 		return true
 	})
 	var histograms []*histogramSeries
@@ -486,25 +494,71 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		histograms = append(histograms, value.(*histogramSeries))
 		return true
 	})
-
-	providerSamples := r.providerSamples()
-	sort.Slice(counters, func(i, j int) bool { return lessSeries(counters[i].key, counters[j].key) })
-	sort.Slice(gauges, func(i, j int) bool { return lessSeries(gauges[i].key, gauges[j].key) })
-	sort.Slice(histograms, func(i, j int) bool { return lessSeries(histograms[i].key, histograms[j].key) })
-	sort.Slice(providerSamples, func(i, j int) bool {
-		if providerSamples[i].Name != providerSamples[j].Name {
-			return providerSamples[i].Name < providerSamples[j].Name
+	slices.SortFunc(counters, func(a, b *counterSeries) int { return compareSeries(a.key, b.key) })
+	slices.SortFunc(histograms, func(a, b *histogramSeries) int { return compareSeries(a.key, b.key) })
+	slices.SortFunc(gauges, func(a, b GaugeSample) int {
+		if order := strings.Compare(a.Name, b.Name); order != 0 {
+			return order
 		}
-		return labelsString(providerSamples[i].Labels) < labelsString(providerSamples[j].Labels)
+		return compareLabels(a.Labels, b.Labels)
 	})
+	out := expositionWriter{response: w, buf: make([]byte, 0, min(expositionChunkSize, expositionCapacity(counters, gauges, histograms)))}
+	out.buf = append(out.buf, "# TYPE telesrv_metrics_dropped_observations_total counter\ntelesrv_metrics_dropped_observations_total "...)
+	out.buf = strconv.AppendUint(out.buf, r.dropped.Load(), 10)
+	out.buf = append(out.buf, '\n')
+	if !out.writeCounterSeries(counters) || !out.writeGaugeSeries(gauges) || !out.writeHistogramSeries(histograms) {
+		return
+	}
+	out.flush()
+}
 
-	var out strings.Builder
-	fmt.Fprintln(&out, "# TYPE telesrv_metrics_dropped_observations_total counter")
-	fmt.Fprintf(&out, "telesrv_metrics_dropped_observations_total %d\n", r.dropped.Load())
-	writeCounterSeries(&out, counters)
-	writeGaugeSeries(&out, gauges, providerSamples)
-	writeHistogramSeries(&out, histograms)
-	_, _ = w.Write([]byte(out.String()))
+const expositionChunkSize = 16 << 10
+
+type expositionWriter struct {
+	response http.ResponseWriter
+	buf      []byte
+}
+
+func (w *expositionWriter) flush() bool {
+	if len(w.buf) == 0 {
+		return true
+	}
+	n, err := w.response.Write(w.buf)
+	ok := err == nil && n == len(w.buf)
+	w.buf = w.buf[:0]
+	return ok
+}
+
+// Reserve before appending so ordinary lines never grow the chunk buffer.
+// An individual oversized metric remains intact; only this request owns its
+// larger buffer. A failed or short write terminates the entire scrape.
+func (w *expositionWriter) reserve(size int) bool {
+	if size <= cap(w.buf)-len(w.buf) {
+		return true
+	}
+	if !w.flush() {
+		return false
+	}
+	if size > cap(w.buf) {
+		w.buf = make([]byte, 0, size)
+	}
+	return true
+}
+
+func (w *expositionWriter) metricType(name, kind string) bool {
+	if !w.reserve(len(name) + len(kind) + 9) {
+		return false
+	}
+	w.buf = appendMetricType(w.buf, name, kind)
+	return true
+}
+
+func (w *expositionWriter) sample(name, suffix string, labels []Label, value float64, size int) bool {
+	if !w.reserve(size) {
+		return false
+	}
+	w.buf = writeSample(w.buf, name, suffix, labels, value)
+	return true
 }
 
 func (r *Registry) providerSamples() (samples []GaugeSample) {
@@ -520,12 +574,12 @@ func (r *Registry) providerSamples() (samples []GaugeSample) {
 					return
 				}
 				sample.Name = sanitizeMetricName(sample.Name)
-				if len(sample.Labels) > 3 {
-					sample.Labels = sample.Labels[:3]
-				}
-				for i := range sample.Labels {
-					sample.Labels[i].Name = sanitizeLabelName(sample.Labels[i].Name)
-					sample.Labels[i].Value = sanitizeLabelValue(sample.Labels[i].Value)
+				if n := min(len(sample.Labels), 3); n > 0 {
+					labels := make([]Label, n)
+					for i := range labels {
+						labels[i] = Label{Name: sanitizeLabelName(sample.Labels[i].Name), Value: sanitizeLabelValue(sample.Labels[i].Value)}
+					}
+					sample.Labels = labels
 				}
 				samples = append(samples, sample)
 			}
@@ -534,86 +588,164 @@ func (r *Registry) providerSamples() (samples []GaugeSample) {
 	return samples
 }
 
-func writeCounterSeries(out *strings.Builder, series []*counterSeries) {
+// These bounds are fixed by durationBuckets. Formatting once avoids a numeric
+// string and label-slice allocation for every bucket on every scrape.
+var durationBucketText = func() [len(durationBuckets)]string {
+	var result [len(durationBuckets)]string
+	for i, bound := range durationBuckets {
+		result[i] = strconv.FormatFloat(bound.Seconds(), 'g', -1, 64)
+	}
+	return result
+}()
+
+// Capacity includes the longest float64 text and escaping expansion. It is an
+// upper bound for this snapshot, not a retained high-water buffer or a new cap.
+func expositionCapacity(counters []*counterSeries, gauges []GaugeSample, histograms []*histogramSeries) int {
+	size := 128
+	var scratch [3]Label
+	for _, item := range counters {
+		size += len(item.key.name)*2 + encodedLabelsSize(item.key.appendLabels(scratch[:0])) + 46
+	}
+	for _, item := range gauges {
+		size += len(item.Name)*2 + encodedLabelsSize(item.Labels) + 46
+	}
+	for _, item := range histograms {
+		base := len(item.key.name) + encodedLabelsSize(item.key.appendLabels(scratch[:0])) + 26
+		size += len(item.key.name) + 20 + (len(durationBuckets)+1)*(base+19) + (base + 4) + (base + 6)
+	}
+	return size
+}
+
+func encodedLabelsSize(labels []Label) int {
+	if len(labels) == 0 {
+		return 0
+	}
+	size := 1
+	for _, label := range labels {
+		size += len(label.Name) + len(label.Value) + 4
+		for i := 0; i < len(label.Value); i++ {
+			switch label.Value[i] {
+			case '\\', '\n', '"':
+				size++
+			}
+		}
+	}
+	return size
+}
+
+func appendMetricType(out []byte, name, kind string) []byte {
+	out = append(out, "# TYPE "...)
+	out = append(out, name...)
+	out = append(out, ' ')
+	out = append(out, kind...)
+	return append(out, '\n')
+}
+
+func (w *expositionWriter) writeCounterSeries(series []*counterSeries) bool {
 	last := ""
+	var scratch [3]Label
 	for _, item := range series {
 		if item.key.name != last {
-			fmt.Fprintf(out, "# TYPE %s counter\n", item.key.name)
+			if !w.metricType(item.key.name, "counter") {
+				return false
+			}
 			last = item.key.name
 		}
-		writeSample(out, item.key.name, keyLabels(item.key), float64(item.value.Load()))
+		labels := item.key.appendLabels(scratch[:0])
+		if !w.sample(item.key.name, "", labels, float64(item.value.Load()), sampleCapacity(item.key.name, labels)) {
+			return false
+		}
 	}
+	return true
 }
 
-func writeGaugeSeries(out *strings.Builder, series []*gaugeSeries, provider []GaugeSample) {
-	type sample struct {
-		name   string
-		labels []Label
-		value  float64
-	}
-	all := make([]sample, 0, len(series)+len(provider))
+func (w *expositionWriter) writeGaugeSeries(series []GaugeSample) bool {
+	last := ""
 	for _, item := range series {
-		all = append(all, sample{name: item.key.name, labels: keyLabels(item.key), value: float64(item.value.Load())})
-	}
-	for _, item := range provider {
-		all = append(all, sample{name: item.Name, labels: item.Labels, value: item.Value})
-	}
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].name != all[j].name {
-			return all[i].name < all[j].name
+		if item.Name != last {
+			if !w.metricType(item.Name, "gauge") {
+				return false
+			}
+			last = item.Name
 		}
-		return labelsString(all[i].labels) < labelsString(all[j].labels)
-	})
-	last := ""
-	for _, item := range all {
-		if item.name != last {
-			fmt.Fprintf(out, "# TYPE %s gauge\n", item.name)
-			last = item.name
+		if !w.sample(item.Name, "", item.Labels, item.Value, sampleCapacity(item.Name, item.Labels)) {
+			return false
 		}
-		writeSample(out, item.name, item.labels, item.value)
 	}
+	return true
 }
 
-func writeHistogramSeries(out *strings.Builder, series []*histogramSeries) {
+func (w *expositionWriter) writeHistogramSeries(series []*histogramSeries) bool {
+	// An unlabelled bucket adds {le="value"}; existing labels need one byte less.
+	maxBucketLabels := len(`{le="+Inf"}`)
+	for _, bound := range durationBucketText {
+		maxBucketLabels = max(maxBucketLabels, len(bound)+7)
+	}
 	last := ""
+	var scratch [4]Label
 	for _, item := range series {
 		if item.key.name != last {
-			fmt.Fprintf(out, "# TYPE %s histogram\n", item.key.name)
+			if !w.metricType(item.key.name, "histogram") {
+				return false
+			}
 			last = item.key.name
 		}
-		labels := keyLabels(item.key)
-		for i, bound := range durationBuckets {
-			bucketLabels := append(append([]Label(nil), labels...), Label{Name: "le", Value: strconv.FormatFloat(bound.Seconds(), 'g', -1, 64)})
-			writeSample(out, item.key.name+"_bucket", bucketLabels, float64(item.buckets[i].Load()))
+		labels := item.key.appendLabels(scratch[:0])
+		lineSize := sampleCapacity(item.key.name, labels)
+		bucketSize := lineSize + len("_bucket") + maxBucketLabels
+		buckets := append(labels, Label{Name: "le"})
+		for i, boundary := range durationBucketText {
+			buckets[len(labels)].Value = boundary
+			if !w.sample(item.key.name, "_bucket", buckets, float64(item.buckets[i].Load()), bucketSize) {
+				return false
+			}
 		}
-		writeSample(out, item.key.name+"_bucket", append(append([]Label(nil), labels...), Label{Name: "le", Value: "+Inf"}), float64(item.count.Load()))
-		writeSample(out, item.key.name+"_sum", labels, time.Duration(item.sumNS.Load()).Seconds())
-		writeSample(out, item.key.name+"_count", labels, float64(item.count.Load()))
+		buckets[len(labels)].Value = "+Inf"
+		if !w.sample(item.key.name, "_bucket", buckets, float64(item.count.Load()), bucketSize) ||
+			!w.sample(item.key.name, "_sum", labels, time.Duration(item.sumNS.Load()).Seconds(), lineSize+len("_sum")) ||
+			!w.sample(item.key.name, "_count", labels, float64(item.count.Load()), lineSize+len("_count")) {
+			return false
+		}
 	}
+	return true
 }
 
-func writeSample(out *strings.Builder, name string, labels []Label, value float64) {
-	out.WriteString(name)
+// 24 bytes cover any float64 representation; two more cover space/newline.
+func sampleCapacity(name string, labels []Label) int {
+	return len(name) + encodedLabelsSize(labels) + 26
+}
+
+func writeSample(out []byte, name, suffix string, labels []Label, value float64) []byte {
+	out = append(out, name...)
+	out = append(out, suffix...)
 	if len(labels) > 0 {
-		out.WriteByte('{')
+		out = append(out, '{')
 		for i, label := range labels {
 			if i > 0 {
-				out.WriteByte(',')
+				out = append(out, ',')
 			}
-			out.WriteString(label.Name)
-			out.WriteString("=\"")
-			out.WriteString(escapeLabel(label.Value))
-			out.WriteByte('"')
+			out = append(out, label.Name...)
+			out = append(out, '=', '"')
+			for j := 0; j < len(label.Value); j++ {
+				switch c := label.Value[j]; c {
+				case '\\', '"':
+					out = append(out, '\\', c)
+				case '\n':
+					out = append(out, '\\', 'n')
+				default:
+					out = append(out, c)
+				}
+			}
+			out = append(out, '"')
 		}
-		out.WriteByte('}')
+		out = append(out, '}')
 	}
-	out.WriteByte(' ')
-	out.WriteString(strconv.FormatFloat(value, 'g', -1, 64))
-	out.WriteByte('\n')
+	out = append(out, ' ')
+	out = strconv.AppendFloat(out, value, 'g', -1, 64)
+	return append(out, '\n')
 }
 
-func keyLabels(key seriesKey) []Label {
-	labels := make([]Label, 0, 3)
+func (key seriesKey) appendLabels(labels []Label) []Label {
 	if key.k1 != "" {
 		labels = append(labels, Label{Name: key.k1, Value: key.v1})
 	}
@@ -626,22 +758,53 @@ func keyLabels(key seriesKey) []Label {
 	return labels
 }
 
-func lessSeries(a, b seriesKey) bool {
-	if a.name != b.name {
-		return a.name < b.name
+func keyLabels(key seriesKey) []Label {
+	if key.k1 == "" && key.k2 == "" && key.k3 == "" {
+		return nil
 	}
-	return a.k1+a.v1+a.k2+a.v2+a.k3+a.v3 < b.k1+b.v1+b.k2+b.v2+b.k3+b.v3
+	return key.appendLabels(make([]Label, 0, 3))
 }
 
-func labelsString(labels []Label) string {
-	var b strings.Builder
-	for _, label := range labels {
-		b.WriteString(label.Name)
-		b.WriteByte('=')
-		b.WriteString(label.Value)
-		b.WriteByte(',')
+func compareSeries(a, b seriesKey) int {
+	if order := strings.Compare(a.name, b.name); order != 0 {
+		return order
 	}
-	return b.String()
+	left := [...]string{a.k1, a.v1, a.k2, a.v2, a.k3, a.v3}
+	right := [...]string{b.k1, b.v1, b.k2, b.v2, b.k3, b.v3}
+	return compareStringParts(left[:], right[:])
+}
+
+func compareLabels(a, b []Label) int {
+	// All call sites use seriesKey labels or already bounded provider labels.
+	var left, right [12]string
+	for i, label := range a {
+		left[i*4], left[i*4+1], left[i*4+2], left[i*4+3] = label.Name, "=", label.Value, ","
+	}
+	for i, label := range b {
+		right[i*4], right[i*4+1], right[i*4+2], right[i*4+3] = label.Name, "=", label.Value, ","
+	}
+	return compareStringParts(left[:len(a)*4], right[:len(b)*4])
+}
+
+// Compare exactly as concatenation would, without allocating temporary keys.
+func compareStringParts(a, b []string) int {
+	var left, right string
+	for {
+		for left == "" && len(a) > 0 {
+			left, a = a[0], a[1:]
+		}
+		for right == "" && len(b) > 0 {
+			right, b = b[0], b[1:]
+		}
+		if left == "" || right == "" {
+			return strings.Compare(left, right)
+		}
+		n := min(len(left), len(right))
+		if order := strings.Compare(left[:n], right[:n]); order != 0 {
+			return order
+		}
+		left, right = left[n:], right[n:]
+	}
 }
 
 func errorOutcome(err error) string {
@@ -666,6 +829,9 @@ func errorOutcome(err error) string {
 }
 
 func sanitizeMetricName(value string) string {
+	if validMetricName(value) {
+		return value
+	}
 	if value == "" {
 		return "telesrv_invalid_metric"
 	}
@@ -681,6 +847,19 @@ func sanitizeMetricName(value string) string {
 	return b.String()
 }
 
+func validMetricName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !(c == '_' || c == ':' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || i > 0 && c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
 func sanitizeLabelName(value string) string {
 	return strings.ReplaceAll(sanitizeMetricName(value), ":", "_")
 }
@@ -693,10 +872,4 @@ func sanitizeLabelValue(value string) string {
 		return value[:maxLabelBytes]
 	}
 	return value
-}
-
-func escapeLabel(value string) string {
-	value = strings.ReplaceAll(value, "\\", "\\\\")
-	value = strings.ReplaceAll(value, "\n", "\\n")
-	return strings.ReplaceAll(value, "\"", "\\\"")
 }
