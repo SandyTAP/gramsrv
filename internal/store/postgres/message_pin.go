@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
@@ -20,8 +21,7 @@ import (
 //   - unpin：无 oneside 形态，双侧清除（对端行未置顶时自然跳过）；
 //   - 状态已是目标值：幂等 no-op，不烧 pts、不发事件。
 //
-// messageActionPinMessage 服务消息不在此生成（走 SendPrivateText 服务
-// 消息通道，置顶状态本身是真值源，服务消息仅为时间线装饰）。
+// 共享 pin 的服务消息、pin 状态、PTS 与 outbox 在同一事务提交。
 func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPrivateMessageRequest) (res domain.PinPrivateMessageResult, err error) {
 	res = domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}
 	if req.OwnerUserID == 0 || req.Peer.Type != domain.PeerTypeUser || req.Peer.ID == 0 {
@@ -33,6 +33,37 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 	if req.Date == 0 {
 		req.Date = int(time.Now().Unix())
 	}
+	if req.Pinned && !req.PmOneside && req.Peer.ID != req.OwnerUserID {
+		sendReq, err := store.PrivatePinServiceRequest(req)
+		if err != nil {
+			return res, err
+		}
+		sent, err := s.sendPrivateTextWithHooks(ctx, sendReq, privateSendTxHooks{
+			before: func(ctx context.Context, tx pgx.Tx, _ *domain.SendPrivateTextRequest) error {
+				var err error
+				// The send path already holds the ordered user locks and append fences.
+				res, err = s.pinPrivateMessageTx(ctx, tx, req)
+				if err != nil {
+					return err
+				}
+				if !res.Changed() {
+					return errPrivatePinNoop
+				}
+				return nil
+			},
+		})
+		if errors.Is(err, errPrivatePinNoop) {
+			return domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}, nil
+		}
+		if errors.Is(err, domain.ErrReplyMessageIDInvalid) {
+			err = domain.ErrMessageIDInvalid
+		}
+		if err != nil {
+			return domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}, err
+		}
+		res.ServiceMessage = sent
+		return res, nil
+	}
 	beginner, ok := s.db.(txBeginner)
 	if !ok {
 		return res, fmt.Errorf("pin private message: db does not support transactions")
@@ -41,7 +72,6 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 	if err != nil {
 		return res, fmt.Errorf("begin pin message tx: %w", err)
 	}
-	qtx := sqlcgen.New(tx)
 	committed := false
 	defer func() {
 		if committed {
@@ -56,6 +86,22 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 	if err := lockDispatchOutboxAppendFences(ctx, tx, []int64{req.OwnerUserID, req.Peer.ID}); err != nil {
 		return res, fmt.Errorf("lock pin dispatch append fences: %w", err)
 	}
+	res, err = s.pinPrivateMessageTx(ctx, tx, req)
+	if err != nil {
+		return domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}, fmt.Errorf("commit pin message tx: %w", err)
+	}
+	committed = true
+	return res, nil
+}
+
+var errPrivatePinNoop = errors.New("private pin no-op")
+
+func (s *MessageStore) pinPrivateMessageTx(ctx context.Context, tx pgx.Tx, req domain.PinPrivateMessageRequest) (domain.PinPrivateMessageResult, error) {
+	res := domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}
+	qtx := sqlcgen.New(tx)
 	owned, err := qtx.GetMessageBoxForPin(ctx, sqlcgen.GetMessageBoxForPinParams{
 		OwnerUserID: req.OwnerUserID,
 		PeerType:    string(req.Peer.Type),
@@ -68,20 +114,12 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 		}
 		return res, fmt.Errorf("get message for pin: %w", err)
 	}
-	// 服务消息不可置顶（官方 canPin 排除 isService）。
-	if media, mediaErr := decodeMessageMedia(owned.MediaJson); mediaErr == nil &&
-		media != nil && media.Kind == domain.MessageMediaKindService {
-		return res, domain.ErrMessageIDInvalid
+	media, mediaErr := decodeMessageMedia(owned.MediaJson)
+	if mediaErr != nil {
+		return res, fmt.Errorf("decode pin target media: %w", mediaErr)
 	}
-	if owned.Pinned == req.Pinned && (!req.Pinned || req.PmOneside) {
-		// 幂等：本侧已是目标状态。unpin 与 oneside pin 到此即 no-op；
-		// 共享 pin 不在此短路——本侧已置顶（如此前 oneside）时仍需向
-		// 对端传播补置顶与服务消息。
-		if err := tx.Commit(ctx); err != nil {
-			return res, fmt.Errorf("commit pin message tx: %w", err)
-		}
-		committed = true
-		return res, nil
+	if media != nil && media.Kind == domain.MessageMediaKindService {
+		return res, domain.ErrMessageIDInvalid
 	}
 
 	type pinSide struct {
@@ -161,10 +199,6 @@ func (s *MessageStore) PinPrivateMessage(ctx context.Context, req domain.PinPriv
 			Event:      event,
 		})
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return res, fmt.Errorf("commit pin message tx: %w", err)
-	}
-	committed = true
 	return res, nil
 }
 

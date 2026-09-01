@@ -1,10 +1,13 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 
 	"telesrv/internal/domain"
 )
+
+var ErrDeliveryOutboxRequired = errors.New("durable delivery boundary required")
 
 // DeliveryEffect is the account-scoped durable update intent built from an
 // immutable aggregate snapshot. Main persists it into user_update_events and

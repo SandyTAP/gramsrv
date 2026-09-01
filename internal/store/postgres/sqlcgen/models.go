@@ -1282,6 +1282,7 @@ type MessageBox struct {
 	ReplyToStoryID       int32
 	Effect               int64
 	HideEdited           bool
+	ReplyExternal        []byte
 }
 
 type MessageBoxMedium struct {
@@ -1452,6 +1453,7 @@ type PrivateMessage struct {
 	SenderDeletePtsCount   int32
 	SenderDeleteDate       int32
 	SenderDeleteMessageIds []byte
+	ReplyExternal          []byte
 }
 
 type PrivateMessageReaction struct {

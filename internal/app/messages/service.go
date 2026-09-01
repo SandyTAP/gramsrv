@@ -546,7 +546,34 @@ func (s *Service) PinPrivateMessage(ctx context.Context, userID int64, req domai
 	if req.OwnerUserID != userID {
 		return domain.PinPrivateMessageResult{OwnerUserID: userID}, domain.ErrMessageIDInvalid
 	}
-	return s.messages.PinPrivateMessage(ctx, req)
+	var serviceReq domain.SendPrivateTextRequest
+	var automation businessAutomationContext
+	var automationOK bool
+	if req.Pinned && !req.PmOneside && req.Peer.ID != userID {
+		if err := s.ensureCanSend(ctx, userID); err != nil {
+			return domain.PinPrivateMessageResult{OwnerUserID: userID}, err
+		}
+		serviceReq = domain.SendPrivateTextRequest{
+			SenderUserID: userID, RecipientUserID: req.Peer.ID, Date: req.Date, Silent: req.Silent,
+			RecipientBlocked: req.RecipientBlocked, OriginAuthKeyID: req.OriginAuthKeyID, OriginSessionID: req.OriginSessionID,
+			Media:   &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: &domain.MessageServiceAction{Kind: domain.MessageServiceActionPinMessage}},
+			ReplyTo: &domain.MessageReply{MessageID: req.MessageID, Peer: req.Peer},
+		}
+		automation, automationOK = s.prepareBusinessAutomation(ctx, serviceReq)
+	}
+	res, err := s.messages.PinPrivateMessage(ctx, req)
+	// Preserve normal private-send observers, only after the combined commit.
+	if err == nil && res.ServiceMessage.SenderMessage.ID != 0 {
+		serviceReq.RandomID = res.ServiceMessage.SenderMessage.RandomID
+		serviceReq.Date = res.ServiceMessage.SenderMessage.Date
+		if automationOK {
+			s.runBusinessAutomation(ctx, serviceReq, res.ServiceMessage, automation)
+		}
+		if s.botResponder != nil && s.botResponder.HandlesBot(req.Peer.ID) {
+			s.botResponder.OnPrivateMessage(ctx, req.Peer.ID, res.ServiceMessage.RecipientMessage, domain.ClientSessionMetadata{})
+		}
+	}
+	return res, err
 }
 
 // UnpinAllPrivateMessages 清空当前账号与某私聊 peer 的全部置顶。

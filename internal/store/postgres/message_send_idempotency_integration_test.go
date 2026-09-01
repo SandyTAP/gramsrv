@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -246,27 +248,120 @@ func TestMessageStorePrivateRandomIDReplayUsesCurrentSnapshotAndDurableDelete(t 
 	}
 }
 
-// beginHookDB lets the test commit a competing send exactly after the outer
-// fast-path lookup and before its transaction starts. With MaxConns=1, a
+type observedBeginDB struct {
+	*pgxpool.Pool
+	beginCount  atomic.Int32
+	secondBegin chan struct{}
+}
+
+func (db *observedBeginDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	if db.beginCount.Add(1) == 2 {
+		close(db.secondBegin)
+	}
+	return db.Pool.Begin(ctx)
+}
+
+func TestMessageStoreConcurrentPrivateHookReplayRunsHookOnce(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	users := NewUserStore(pool)
+	sender := createTestUser(t, ctx, users, "+1885"+suffix+"01", "HookSender", "")
+	recipient := createTestUser(t, ctx, users, "+1885"+suffix+"02", "HookRecipient", "")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
+	})
+
+	db := &observedBeginDB{Pool: pool, secondBegin: make(chan struct{})}
+	messages := newTestMessageStore(db)
+	req := domain.SendPrivateTextRequest{
+		SenderUserID: sender.ID, RecipientUserID: recipient.ID, RandomID: 775001,
+		Message: "concurrent hook replay", Date: 1700001400,
+	}
+	firstHook := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hookCalls atomic.Int32
+	hooks := privateSendTxHooks{before: func(context.Context, pgx.Tx, *domain.SendPrivateTextRequest) error {
+		if hookCalls.Add(1) == 1 {
+			close(firstHook)
+			<-releaseFirst
+		}
+		return nil
+	}}
+	type sendResult struct {
+		result domain.SendPrivateTextResult
+		err    error
+	}
+	results := make(chan sendResult, 2)
+	send := func() {
+		result, err := messages.sendPrivateTextWithHooks(ctx, req, hooks)
+		results <- sendResult{result: result, err: err}
+	}
+	go send()
+	<-firstHook
+	go send()
+	select {
+	case <-db.secondBegin:
+	case <-time.After(3 * time.Second):
+		close(releaseFirst)
+		t.Fatal("second concurrent send did not begin")
+	}
+	close(releaseFirst)
+
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent sends failed: first=%v second=%v", first.err, second.err)
+	}
+	if hookCalls.Load() != 1 {
+		t.Fatalf("aggregate hook calls = %d, want 1", hookCalls.Load())
+	}
+	if first.result.Duplicate == second.result.Duplicate ||
+		first.result.SenderMessage.ID != second.result.SenderMessage.ID ||
+		first.result.RecipientMessage.ID != second.result.RecipientMessage.ID {
+		t.Fatalf("concurrent replay results = %+v / %+v", first.result, second.result)
+	}
+}
+
+// privatePreflightHookDB commits a competing send after the fast-path lookup
+// releases its connection but before account admission. Running it in Begin
+// would nest a send inside the same process's already-held account lease.
+// With MaxConns=1, a
 // duplicate fallback that queries the pool while holding the transaction would
 // wait until the context deadline; reading through qtx completes immediately.
-type beginHookDB struct {
+type privatePreflightHookDB struct {
 	*pgxpool.Pool
 	once      sync.Once
 	before    func(context.Context) error
 	beforeErr error
+	committed bool
 }
 
-func (db *beginHookDB) Begin(ctx context.Context) (pgx.Tx, error) {
-	db.once.Do(func() {
-		if db.before != nil {
-			db.beforeErr = db.before(ctx)
-		}
-	})
-	if db.beforeErr != nil {
-		return nil, db.beforeErr
+type privatePreflightRow struct {
+	pgx.Row
+	ctx context.Context
+	db  *privatePreflightHookDB
+}
+
+func (db *privatePreflightHookDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	row := db.Pool.QueryRow(ctx, query, args...)
+	if strings.HasPrefix(query, "-- name: GetPrivateMessageByRandomID :one") {
+		return privatePreflightRow{Row: row, ctx: ctx, db: db}
 	}
-	return db.Pool.Begin(ctx)
+	return row
+}
+
+func (row privatePreflightRow) Scan(dest ...any) error {
+	err := row.Row.Scan(dest...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		row.db.once.Do(func() {
+			row.db.beforeErr = row.db.before(row.ctx)
+			row.db.committed = row.db.beforeErr == nil
+		})
+		if row.db.beforeErr != nil {
+			return row.db.beforeErr
+		}
+	}
+	return err
 }
 
 func TestMessageStorePrivateRandomIDConflictFallbackUsesTransactionConnection(t *testing.T) {
@@ -302,7 +397,7 @@ func TestMessageStorePrivateRandomIDConflictFallbackUsesTransactionConnection(t 
 		Message: "commit between preflight and insert", Date: 1700001200,
 	}
 	boxIDs := &perUserCounterAllocator{}
-	db := &beginHookDB{Pool: pool}
+	db := &privatePreflightHookDB{Pool: pool}
 	db.before = func(ctx context.Context) error {
 		remote := NewMessageStore(pool, WithMessageAllocators(boxIDs))
 		// A separate actor represents another server process. Cross-process
@@ -321,5 +416,8 @@ func TestMessageStorePrivateRandomIDConflictFallbackUsesTransactionConnection(t 
 	}
 	if !got.Duplicate || got.SenderMessage.ID == 0 || got.RecipientMessage.ID == 0 {
 		t.Fatalf("conflict fallback result = %+v, want committed duplicate boxes", got)
+	}
+	if !db.committed {
+		t.Fatal("competing send did not commit after the preflight miss")
 	}
 }

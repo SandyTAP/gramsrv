@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"telesrv/internal/domain"
@@ -74,11 +75,14 @@ func TestMessageStorePinPrivateMessageSharedAndOneside(t *testing.T) {
 		t.Fatalf("bob pinned event = %+v, want pinned_messages with own box id and alice peer", events[0])
 	}
 
+	if res.ServiceMessage.SenderEvent.Pts != self.Event.Pts+1 || res.ServiceMessage.RecipientEvent.Pts != bobSide.Event.Pts+1 || len(events) != 2 || events[1].Type != domain.UpdateEventNewMessage {
+		t.Fatalf("pin and service must form contiguous durable events: result=%+v events=%+v", res, events)
+	}
 	// message.pinned 回填到历史读取。
 	bobList, err := messages.ListByUser(ctx, bob.ID, domain.MessageFilter{
 		HasPeer: true, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: alice.ID}, Limit: 10,
 	})
-	if err != nil || len(bobList.Messages) != 1 || !bobList.Messages[0].Pinned {
+	if err != nil || len(bobList.Messages) != 2 || bobList.Messages[0].ID != res.ServiceMessage.RecipientMessage.ID || !bobList.Messages[1].Pinned {
 		t.Fatalf("bob list = %+v err %v, want pinned message", bobList.Messages, err)
 	}
 	pinnedOnly, err := messages.ListByUser(ctx, alice.ID, domain.MessageFilter{
@@ -142,6 +146,46 @@ WHERE owner_user_id = ANY($1::bigint[]) AND pinned AND NOT deleted
 	if err != nil || len(bobPinned.Messages) != 0 {
 		t.Fatalf("bob pinned after oneside = %+v err %v, want empty", bobPinned.Messages, err)
 	}
+	clear, err := messages.PinPrivateMessage(ctx, domain.PinPrivateMessageRequest{OwnerUserID: bob.ID,
+		Peer: domain.Peer{Type: domain.PeerTypeUser, ID: alice.ID}, MessageID: sent.RecipientMessage.ID, Date: 1700000604})
+	if err != nil || len(clear.Updated) != 1 || clear.Updated[0].UserID != alice.ID {
+		t.Fatalf("peer-only unpin: %+v %v", clear, err)
+	}
+	req := domain.PinPrivateMessageRequest{OwnerUserID: alice.ID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: bob.ID}, MessageID: sent.SenderMessage.ID, Pinned: true, Date: 1700000601}
+	var wg sync.WaitGroup
+	results := make(chan domain.PinPrivateMessageResult, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, e := messages.PinPrivateMessage(ctx, req)
+			if e != nil {
+				t.Errorf("concurrent pin: %v", e)
+			}
+			results <- r
+		}()
+	}
+	wg.Wait()
+	close(results)
+	changed := 0
+	for r := range results {
+		if r.Changed() {
+			changed++
+			if r.ServiceMessage.SenderMessage.UID == res.ServiceMessage.SenderMessage.UID || r.ServiceMessage.SenderMessage.ID == 0 {
+				t.Errorf("repin receipt not fresh: %+v", r)
+			}
+		} else if r.ServiceMessage.SenderMessage.ID != 0 {
+			t.Errorf("no-op created service: %+v", r)
+		}
+	}
+	if changed != 1 {
+		t.Fatalf("concurrent committed pins=%d want1", changed)
+	}
+	var serviceCount int
+	if e := pool.QueryRow(ctx, `SELECT count(*) FROM private_messages WHERE sender_user_id=$1 AND media->>'kind'='service'`, alice.ID).Scan(&serviceCount); e != nil || serviceCount != 2 {
+		t.Fatalf("service count=%d err=%v want2 including first pin", serviceCount, e)
+	}
+
 }
 
 func TestMessageStoreUnpinAllPrivateMessagesSweepsBothSides(t *testing.T) {

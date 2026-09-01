@@ -764,10 +764,13 @@ func tgGlobalSearchMessages(viewerUserID int64, limit int, private domain.Messag
 	return &tg.MessagesMessages{Messages: messages, Chats: chats, Users: users}
 }
 
-func (r *Router) messageFilterFromHistoryRequest(userID int64, req *tg.MessagesGetHistoryRequest) (domain.MessageFilter, bool) {
-	peer, ok := r.domainPeerFromInputPeer(userID, req.Peer)
-	if !ok {
-		return domain.MessageFilter{}, false
+func (r *Router) messageFilterFromHistoryRequest(ctx context.Context, userID int64, req *tg.MessagesGetHistoryRequest) (domain.MessageFilter, error) {
+	if err := validateMessageReadBounds(req.Limit, req.OffsetID, req.MaxID, req.MinID); err != nil {
+		return domain.MessageFilter{}, err
+	}
+	peer, err := r.checkedMessageReadPeer(ctx, userID, req.Peer, false)
+	if err != nil {
+		return domain.MessageFilter{}, err
 	}
 	limit := req.Limit
 	if limit > 50 {
@@ -783,10 +786,13 @@ func (r *Router) messageFilterFromHistoryRequest(userID int64, req *tg.MessagesG
 		MaxID:      req.MaxID,
 		MinID:      req.MinID,
 		Hash:       req.Hash,
-	}, true
+	}, nil
 }
 
 func (r *Router) messageFilterFromSearchRequest(ctx context.Context, userID int64, req *tg.MessagesSearchRequest) (domain.MessageFilter, error) {
+	if err := validateMessageReadBounds(req.Limit, req.OffsetID, req.MaxID, req.MinID); err != nil {
+		return domain.MessageFilter{}, err
+	}
 	limit := req.Limit
 	if limit > 500 {
 		limit = 500
@@ -798,6 +804,7 @@ func (r *Router) messageFilterFromSearchRequest(ctx context.Context, userID int6
 		MaxDate:        req.MaxDate,
 		AddOffset:      domain.ClampMessageHistoryAddOffset(req.AddOffset),
 		Limit:          limit,
+		CountOnly:      req.Limit == 0,
 		MaxID:          req.MaxID,
 		MinID:          req.MinID,
 		Hash:           req.Hash,
@@ -808,9 +815,21 @@ func (r *Router) messageFilterFromSearchRequest(ctx context.Context, userID int6
 		filter.PhoneCallsOnly = true
 		filter.MissedPhoneCallsOnly = phoneCalls.Missed
 	}
-	if peer, ok := r.domainPeerFromInputPeer(userID, req.Peer); ok {
+	if empty, ok := req.Peer.(*tg.InputPeerEmpty); !ok || empty == nil {
+		peer, err := r.checkedMessageReadPeer(ctx, userID, req.Peer, false)
+		if err != nil {
+			return domain.MessageFilter{}, err
+		}
 		filter.HasPeer = true
 		filter.Peer = peer
+	}
+	_, hasFrom := req.GetFromID()
+	if req.FromID != nil || hasFrom {
+		from, err := r.checkedMessageReadPeer(ctx, userID, req.FromID, true)
+		if err != nil {
+			return domain.MessageFilter{}, err
+		}
+		filter.SenderUserID = from.ID
 	}
 	savedReactions, hasSavedReactions := req.GetSavedReaction()
 	// An empty optional vector carries no reaction-filtering semantics. Some TL
@@ -829,7 +848,7 @@ func (r *Router) messageFilterFromSearchRequest(ctx context.Context, userID int6
 		if savedPeerInput == nil {
 			return domain.MessageFilter{}, peerIDInvalidErr()
 		}
-		savedPeer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, savedPeerInput)
+		savedPeer, err := r.checkedMessageReadPeer(ctx, userID, savedPeerInput, false)
 		if err != nil {
 			return domain.MessageFilter{}, err
 		}
