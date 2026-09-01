@@ -8,6 +8,7 @@ require (
 	github.com/go-faster/errors v0.7.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/gotd/ige v0.3.0
+	github.com/gotd/log v0.1.0
 	github.com/gotd/log/logzap v0.1.1
 	github.com/iamxvbaba/td v1.3.2
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
@@ -57,7 +58,6 @@ require (
 	github.com/go-faster/yaml v0.4.6 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gotd/log v0.1.0 // indirect
 	github.com/gotd/neo v0.1.5 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.0 // indirect
