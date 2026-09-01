@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+
+	"telesrv/internal/store/redisstore"
 )
 
 const defaultProbeTimeout = 5 * time.Second
@@ -356,11 +357,11 @@ func checkRedis(parent context.Context, opts redisOptions, getenv func(string) s
 	}
 	ctx, cancel := context.WithTimeout(parent, opts.timeout)
 	defer cancel()
-	client := redis.NewClient(&redis.Options{Addr: opts.address, Password: password, DB: opts.db})
-	defer client.Close()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("redis ping %s: %w", opts.address, err)
+	client, err := redisstore.Open(ctx, opts.address, password, opts.db)
+	if err != nil {
+		return err
 	}
+	defer client.Close()
 	return nil
 }
 

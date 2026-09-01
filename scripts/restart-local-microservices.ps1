@@ -128,9 +128,18 @@ function Assert-Alive([System.Diagnostics.Process]$proc, [string]$name) {
     }
 }
 
-function Wait-Port([string]$hostName, [int]$port, [int]$timeoutSec = 20) {
+function Wait-Port(
+    [string]$hostName,
+    [int]$port,
+    [int]$timeoutSec = 20,
+    [System.Diagnostics.Process]$proc = $null,
+    [string]$roleName = 'service'
+) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
+        if ($null -ne $proc -and $proc.HasExited) {
+            throw "$roleName exited with code $($proc.ExitCode) while waiting for $hostName`:$port"
+        }
         try {
             $client = [System.Net.Sockets.TcpClient]::new()
             $async = $client.BeginConnect($hostName, $port, $null, $null)
@@ -295,7 +304,7 @@ media:
 $fileEnv['TELESRV_CONFIG'] = $fileConfig
 $fileProc = Start-Role 'file' (Join-Path $runDir 'telesrv-file.exe') $fileEnv $stamp
 Assert-Alive $fileProc 'file'
-Wait-Port '127.0.0.1' (Get-ListenPort $FileGRPCAddr) 30
+Wait-Port '127.0.0.1' (Get-ListenPort $FileGRPCAddr) 30 $fileProc 'file'
 
 $coreEnv = Copy-Env $commonEnv
 $coreConfig = Write-RoleConfig (Join-Path $configDir "core-$stamp.yaml") @"
@@ -365,8 +374,8 @@ storage:
 $coreEnv['TELESRV_CONFIG'] = $coreConfig
 $coreProc = Start-Role 'core' (Join-Path $runDir 'telesrv-core.exe') $coreEnv $stamp
 Assert-Alive $coreProc 'core'
-Wait-Port '127.0.0.1' (Get-ListenPort $CoreExecGRPCAddr) 45
-Wait-Port '127.0.0.1' (Get-ListenPort $GroupCallControlAddr) 30
+Wait-Port '127.0.0.1' (Get-ListenPort $CoreExecGRPCAddr) 45 $coreProc 'core'
+Wait-Port '127.0.0.1' (Get-ListenPort $GroupCallControlAddr) 30 $coreProc 'core'
 
 $egressEnv = Copy-Env $commonEnv
 $egressConfig = Write-RoleConfig (Join-Path $configDir "egress-$stamp.yaml") @"
@@ -402,7 +411,7 @@ egress:
 $egressEnv['TELESRV_CONFIG'] = $egressConfig
 $egressProc = Start-Role 'egress' (Join-Path $runDir 'telesrv-egress.exe') $egressEnv $stamp
 Assert-Alive $egressProc 'egress'
-Wait-Port '127.0.0.1' (Get-ListenPort $EgressDeliveryGRPCAddr) 30
+Wait-Port '127.0.0.1' (Get-ListenPort $EgressDeliveryGRPCAddr) 30 $egressProc 'egress'
 
 $sfuEnv = Copy-Env $commonEnv
 $sfuConfig = Write-RoleConfig (Join-Path $configDir "sfu-$stamp.yaml") @"
@@ -436,7 +445,7 @@ group_call:
 $sfuEnv['TELESRV_CONFIG'] = $sfuConfig
 $sfuProc = Start-Role 'sfu' (Join-Path $runDir 'telesrv-sfu.exe') $sfuEnv $stamp
 Assert-Alive $sfuProc 'sfu'
-Wait-Port '127.0.0.1' (Get-ListenPort $SFUControlGRPCAddr) 30
+Wait-Port '127.0.0.1' (Get-ListenPort $SFUControlGRPCAddr) 30 $sfuProc 'sfu'
 
 $edgeEnv = Copy-Env $commonEnv
 $edgeConfig = Write-RoleConfig (Join-Path $configDir "edge-$stamp.yaml") @"
@@ -499,8 +508,8 @@ $edgeEnv['TELESRV_CONFIG'] = $edgeConfig
 $edgeProc = Start-Role 'edge' (Join-Path $runDir 'telesrv-edge.exe') $edgeEnv $stamp
 Assert-Alive $edgeProc 'edge'
 $edgePort = Get-ListenPort $EdgeListen
-Wait-Port $AdvertiseIP $edgePort 45
-Wait-Port '127.0.0.1' $edgePort 45
+Wait-Port $AdvertiseIP $edgePort 45 $edgeProc 'edge'
+Wait-Port '127.0.0.1' $edgePort 45 $edgeProc 'edge'
 
 Start-Sleep -Seconds 2
 $ports = @()
