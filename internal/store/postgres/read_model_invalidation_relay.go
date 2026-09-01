@@ -114,7 +114,7 @@ ORDER BY owner_user_id, peer_type, peer_id`, readModelRelayBatch, r.owner, durat
 	if err != nil {
 		return nil, fmt.Errorf("query claim: %w", err)
 	}
-	items := make([]store.ReadModelInvalidation, 0, readModelRelayBatch)
+	var items []store.ReadModelInvalidation
 	for rows.Next() {
 		var item store.ReadModelInvalidation
 		var peerType string
@@ -123,6 +123,10 @@ ORDER BY owner_user_id, peer_type, peer_id`, readModelRelayBatch, r.owner, durat
 			return nil, fmt.Errorf("scan claim: %w", err)
 		}
 		item.Key.PeerType = domain.PeerType(peerType)
+		if items == nil {
+			// Empty polls still commit the claim transaction, but need no batch.
+			items = make([]store.ReadModelInvalidation, 0, readModelRelayBatch)
+		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {

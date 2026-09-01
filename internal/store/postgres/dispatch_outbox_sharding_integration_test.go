@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +11,96 @@ import (
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
+
+func TestDispatchOutboxFinalizeBatchesIndependentLanesIntoBoundedTransactionsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	const laneCount = outboxFinalizeTransactionLanes + 1
+	userIDs := make([]int64, 0, laneCount)
+	users := NewUserStore(pool)
+	events := NewUpdateEventStore(pool)
+	for i := 0; i < laneCount; i++ {
+		user := createTestUser(t, ctx, users, fmt.Sprintf("+1883%s%02d", randomSuffix(t), i), "DispatchFinalizeBatch", "")
+		userIDs = append(userIDs, user.ID)
+		cleanupDispatchUser(t, pool, user.ID)
+		for eventIndex := 0; eventIndex < 2; eventIndex++ {
+			if _, err := events.AppendAllocatedWithDispatch(ctx, user.ID, domain.UpdateEvent{
+				Type: domain.UpdateEventDialogPinned, PtsCount: 1, Date: 1700001900 + eventIndex,
+				Peer: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}, Bool: eventIndex == 0,
+			}, [8]byte{}, 0); err != nil {
+				t.Fatalf("append user %d event %d: %v", user.ID, eventIndex, err)
+			}
+		}
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		for _, userID := range userIDs {
+			cleanupDispatchUser(t, pool, userID)
+		}
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = ANY($1::bigint[])`, userIDs)
+	})
+
+	countingDB := &countingBeginDB{Pool: pool}
+	outbox := NewDispatchOutboxStore(countingDB, WithLeaseTimeout(time.Minute))
+	windows, err := outbox.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueDispatchPTS, Owner: "egress-dispatch-finalize-batch",
+		LaneLimit: laneCount, WindowSize: 1, WindowByteLimit: ptsEventByteEstimate,
+		LeaseDuration: time.Minute, PhysicalDuration: 10 * time.Second, ClockSkewAllowance: time.Second,
+	})
+	if err != nil || len(windows) != laneCount {
+		t.Fatalf("claim lanes = %d err=%v, want %d", len(windows), err, laneCount)
+	}
+	sets := make([]store.OutboxAttemptTargetSet, 0, laneCount)
+	evidence := make([]store.OutboxAttemptEvidence, 0, laneCount)
+	finalize := make([]store.OutboxFinalizeRequest, 0, laneCount)
+	for _, window := range windows {
+		if len(window.Items) != 1 || window.Items[0].Ref.Sequence != 1 {
+			t.Fatalf("lane %d items=%+v, want one PTS=1 item", window.StreamID, window.Items)
+		}
+		ref := window.Items[0].Ref
+		sets = append(sets, store.OutboxAttemptTargetSet{
+			Ref: ref, SourceInstanceID: "egress-dispatch-finalize-batch-source", Targets: []store.OutboxAttemptTarget{},
+		})
+		evidence = append(evidence, store.OutboxAttemptEvidence{
+			Ref: ref, Kind: store.OutboxEvidenceAuthoritativeNoTargets,
+			SourceInstanceID: "egress-dispatch-finalize-batch-source", ObservedAt: time.Now(),
+		})
+		finalize = append(finalize, store.OutboxFinalizeRequest{Ref: ref})
+	}
+	if bound, err := outbox.BindAttemptTargets(ctx, sets); err != nil || len(bound) != laneCount {
+		t.Fatalf("bind lanes = %d err=%v", len(bound), err)
+	}
+	if recorded, err := outbox.RecordAttemptEvidenceBatch(ctx, evidence); err != nil || len(recorded) != laneCount {
+		t.Fatalf("record evidence = %d err=%v", len(recorded), err)
+	}
+
+	countingDB.resetBeginCount()
+	countingDB.resetQueryCount()
+	batch, err := outbox.FinalizeAttempts(ctx, finalize)
+	if err != nil || len(batch.Results) != laneCount {
+		t.Fatalf("finalize lanes = %d err=%v", len(batch.Results), err)
+	}
+	for i, result := range batch.Results {
+		if result.Outcome != store.OutboxFinalizeApplied {
+			t.Fatalf("finalize result %d = %+v", i, result)
+		}
+	}
+	if got := countingDB.begins(); got != 2 {
+		t.Fatalf("finalize begin count=%d want=2 for %d lanes", got, laneCount)
+	}
+	if got := countingDB.queries(); got != 6 {
+		t.Fatalf("finalize transaction query count=%d want=6 (lock/window/mutation per group)", got)
+	}
+	for _, userID := range userIDs {
+		var headPTS int64
+		if err := pool.QueryRow(ctx, `SELECT head_sequence FROM dispatch_outbox_lanes WHERE stream_id = $1`, userID).Scan(&headPTS); err != nil {
+			t.Fatal(err)
+		}
+		if headPTS != 2 {
+			t.Fatalf("user %d head pts=%d want=2", userID, headPTS)
+		}
+	}
+}
 
 func TestDispatchOutboxPTSWindowIsStrictlyContiguousPostgres(t *testing.T) {
 	pool := testPool(t)

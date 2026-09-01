@@ -1,6 +1,7 @@
 package common
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -12,6 +13,43 @@ import (
 
 type processGlobalsTestConfig struct {
 	globals config.ProcessGlobals
+}
+
+func TestRuntimeMetricProcessEpochIsStable(t *testing.T) {
+	var first float64
+	cumulative := []string{"telesrv_go_total_alloc_bytes", "telesrv_go_total_mallocs", "telesrv_go_total_frees"}
+	previous := make(map[string]float64, len(cumulative))
+	for range 2 {
+		found := false
+		values := make(map[string]float64)
+		for _, sample := range goRuntimeGaugeSamples() {
+			values[sample.Name] = sample.Value
+			if sample.Name != "telesrv_process_start_time_seconds" {
+				continue
+			}
+			found = true
+			if sample.Value <= 0 || sample.Value > float64(time.Now().UnixNano())/1e9 {
+				t.Fatalf("invalid process epoch %v", sample.Value)
+			}
+			if first != 0 && sample.Value != first {
+				t.Fatal("process epoch changed between scrapes")
+			}
+			first = sample.Value
+		}
+		if !found {
+			t.Fatal("process epoch missing")
+		}
+		for _, name := range cumulative {
+			value, ok := values[name]
+			if !ok || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				t.Fatalf("cumulative allocation metric %s missing or invalid: %v", name, value)
+			}
+			if before, seen := previous[name]; seen && value < before {
+				t.Fatalf("cumulative allocation metric %s decreased: %v -> %v", name, before, value)
+			}
+			previous[name] = value
+		}
+	}
 }
 
 func (c processGlobalsTestConfig) ProcessGlobals() config.ProcessGlobals { return c.globals }

@@ -227,9 +227,8 @@ func (a *ptsProjectionActor) next(ctx context.Context, carry **ptsProjectionRequ
 
 type ptsProjectionWindow struct {
 	batchIndex int
-	events     []domain.UpdateEvent
-	requests   []OutboxUpdateRequest
 	start      int
+	length     int
 }
 
 type ptsProjectionCursor struct {
@@ -238,22 +237,30 @@ type ptsProjectionCursor struct {
 }
 
 func (a *ptsProjectionActor) projectBatch(runCtx context.Context, batch []ptsProjectionRequest) {
+	cursorCapacity := 0
+	for _, request := range batch {
+		if len(request.window.Items) > a.maxItems-cursorCapacity {
+			cursorCapacity = a.maxItems
+			break
+		}
+		cursorCapacity += len(request.window.Items)
+	}
 	results := make([]ptsProjectionResult, len(batch))
 	valid := make([]ptsProjectionWindow, 0, len(batch))
-	cursors := make([]store.EventCursor, 0, a.maxItems)
+	cursors := make([]store.EventCursor, 0, cursorCapacity)
 	earliest, hasDeadline := time.Time{}, false
 	for i, request := range batch {
 		if err := request.ctx.Err(); err != nil {
 			results[i].err = err
 			continue
 		}
-		windowCursors, err := ptsWindowCursors(request.window)
+		var err error
+		cursors, err = appendPTSWindowCursors(cursors, request.window)
 		if err != nil {
 			results[i].err = err
 			continue
 		}
 		valid = append(valid, ptsProjectionWindow{batchIndex: i})
-		cursors = append(cursors, windowCursors...)
 		if deadline, ok := request.ctx.Deadline(); ok && (!hasDeadline || deadline.Before(earliest)) {
 			earliest, hasDeadline = deadline, true
 		}
@@ -281,14 +288,13 @@ func (a *ptsProjectionActor) projectBatch(runCtx context.Context, batch []ptsPro
 	for _, event := range events {
 		byCursor[ptsProjectionCursor{userID: event.UserID, pts: event.Pts}] = event
 	}
+	flattenedEvents := make([]domain.UpdateEvent, 0, len(cursors))
 	flattened := make([]OutboxUpdateRequest, 0, len(cursors))
 	projectable := valid[:0]
 	for _, window := range valid {
 		request := batch[window.batchIndex]
-		window.events = make([]domain.UpdateEvent, len(request.window.Items))
-		window.requests = make([]OutboxUpdateRequest, len(request.window.Items))
 		window.start = len(flattened)
-		for i, item := range request.window.Items {
+		for _, item := range request.window.Items {
 			event, ok := byCursor[ptsProjectionCursor{userID: request.window.StreamID, pts: int(item.Ref.Sequence)}]
 			if !ok {
 				results[window.batchIndex].err = fmt.Errorf("%w user=%d pts=%d", errMissingOutboxEvent, request.window.StreamID, item.Ref.Sequence)
@@ -299,13 +305,15 @@ func (a *ptsProjectionActor) projectBatch(runCtx context.Context, batch []ptsPro
 				results[window.batchIndex].err = fmt.Errorf("egress: durable event identity mismatch item=%d", item.Ref.ItemID)
 				break
 			}
-			window.events[i] = event
-			window.requests[i] = OutboxUpdateRequest{TargetUserID: request.window.StreamID, Event: event}
+			flattenedEvents = append(flattenedEvents, event)
+			flattened = append(flattened, OutboxUpdateRequest{TargetUserID: request.window.StreamID, Event: event})
 		}
 		if results[window.batchIndex].err != nil {
+			flattenedEvents = flattenedEvents[:window.start]
+			flattened = flattened[:window.start]
 			continue
 		}
-		flattened = append(flattened, window.requests...)
+		window.length = len(flattened) - window.start
 		projectable = append(projectable, window)
 	}
 	if len(projectable) == 0 {
@@ -331,10 +339,11 @@ func (a *ptsProjectionActor) projectBatch(runCtx context.Context, batch []ptsPro
 	}
 	for _, window := range projectable {
 		request := batch[window.batchIndex]
-		projected := make([]projectedOutboxItem, len(request.window.Items))
-		for i, item := range request.window.Items {
+		projected := make([]projectedOutboxItem, window.length)
+		for i := 0; i < window.length; i++ {
+			item := request.window.Items[i]
 			payload := built[window.start+i]
-			if len(payload) == 0 && window.events[i].Type != domain.UpdateEventNoop {
+			if len(payload) == 0 && flattenedEvents[window.start+i].Type != domain.UpdateEventNoop {
 				results[window.batchIndex].err = fmt.Errorf("%w item=%d", errOutboxUpdateBuilderEmpty, item.Ref.ItemID)
 				break
 			}
@@ -347,17 +356,17 @@ func (a *ptsProjectionActor) projectBatch(runCtx context.Context, batch []ptsPro
 	completePTSProjectionBatch(batch, results)
 }
 
-func ptsWindowCursors(window store.OutboxClaimWindow) ([]store.EventCursor, error) {
+func appendPTSWindowCursors(cursors []store.EventCursor, window store.OutboxClaimWindow) ([]store.EventCursor, error) {
 	if window.QueueKind != store.OutboxQueueDispatchPTS || window.StreamID <= 0 || len(window.Items) == 0 || len(window.Items) > edgecontrol.MaxDeliveryBatchItems {
-		return nil, errors.New("egress: invalid account PTS projection window")
+		return cursors, errors.New("egress: invalid account PTS projection window")
 	}
-	cursors := make([]store.EventCursor, len(window.Items))
-	for i, item := range window.Items {
+	start := len(cursors)
+	for _, item := range window.Items {
 		if item.Ref.QueueKind != store.OutboxQueueDispatchPTS || item.Ref.StreamID != window.StreamID ||
 			item.Ref.Sequence <= 0 || item.Ref.Sequence > int64(^uint32(0)>>1) {
-			return nil, fmt.Errorf("egress: invalid account PTS %d", item.Ref.Sequence)
+			return cursors[:start], fmt.Errorf("egress: invalid account PTS %d", item.Ref.Sequence)
 		}
-		cursors[i] = store.EventCursor{UserID: window.StreamID, Pts: int(item.Ref.Sequence)}
+		cursors = append(cursors, store.EventCursor{UserID: window.StreamID, Pts: int(item.Ref.Sequence)})
 	}
 	return cursors, nil
 }

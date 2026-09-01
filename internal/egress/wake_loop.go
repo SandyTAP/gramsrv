@@ -36,19 +36,15 @@ func runWakeScheduledDispatchLoop(
 	// latency hints after startup; they must never be required to discover the
 	// first durable head or crash-recovery deadline.
 	timer := time.NewTimer(0)
-	var timerC <-chan time.Time = timer.C
+	// This goroutine exclusively owns the timer. Reuse it across every rearm
+	// path instead of allocating a timer and channel on each idle probe.
 	stopTimer := func() {
-		if timer == nil {
-			return
-		}
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
 			default:
 			}
 		}
-		timer = nil
-		timerC = nil
 	}
 	defer stopTimer()
 
@@ -63,7 +59,7 @@ func runWakeScheduledDispatchLoop(
 				return
 			}
 			idleProbe = outboxActiveProbeInterval
-		case <-timerC:
+		case <-timer.C:
 		}
 		stopTimer()
 
@@ -77,8 +73,7 @@ func runWakeScheduledDispatchLoop(
 				if onScheduleError != nil {
 					onScheduleError(err)
 				}
-				timer = time.NewTimer(errorBackoff)
-				timerC = timer.C
+				timer.Reset(errorBackoff)
 				if errorBackoff < maxOutboxScheduleBackoff {
 					errorBackoff *= 2
 					if errorBackoff > maxOutboxScheduleBackoff {
@@ -89,8 +84,7 @@ func runWakeScheduledDispatchLoop(
 			}
 			errorBackoff = outboxScheduleErrorBackoff
 			if !ok {
-				timer = time.NewTimer(idleProbe)
-				timerC = timer.C
+				timer.Reset(idleProbe)
 				idleProbe *= 2
 				if idleProbe > maximumOutboxIdleProbe {
 					idleProbe = maximumOutboxIdleProbe
@@ -106,8 +100,7 @@ func runWakeScheduledDispatchLoop(
 				if delay > maximumOutboxIdleProbe {
 					delay = maximumOutboxIdleProbe
 				}
-				timer = time.NewTimer(delay)
-				timerC = timer.C
+				timer.Reset(delay)
 				break
 			}
 			if next.Kind != store.OutboxReadyClaim && next.Kind != store.OutboxReadyRecoverLease {
@@ -117,8 +110,7 @@ func runWakeScheduledDispatchLoop(
 				return
 			}
 			if !dispatch(ctx, next.Kind == store.OutboxReadyRecoverLease) {
-				timer = time.NewTimer(minimumOutboxScheduleDelay)
-				timerC = timer.C
+				timer.Reset(minimumOutboxScheduleDelay)
 				break
 			}
 		}

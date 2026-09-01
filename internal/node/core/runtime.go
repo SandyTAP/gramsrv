@@ -1606,6 +1606,7 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 		Inline:                     inlineRegistryStore,
 		Limiter:                    rateLimiter,
 	}, logger.Named("rpc"), clock.System)
+	registerPresenceWorkMetrics(metricRegistry, router)
 	verificationVerifier.userDelivery = router.UserAudienceDeliveryEffects
 	usernamesService.SetUserAudienceDelivery(router.UsernameAudienceDeliveryEffects)
 	botVerificationService.SetUserAudienceDelivery(router.UserAudienceDeliveryEffects)

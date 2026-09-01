@@ -36,6 +36,8 @@ type BuildMetadata struct {
 	GoVersion string
 }
 
+var processStartedAt = time.Now()
+
 func BuildMetadataFromValues(commit, branch, treeState, buildTime string) BuildMetadata {
 	meta := BuildMetadata{
 		Commit:    valueOrUnknown(commit),
@@ -150,8 +152,12 @@ func goRuntimeGaugeSamples() []obsmetrics.GaugeSample {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	samples := []obsmetrics.GaugeSample{
+		{Name: "telesrv_process_start_time_seconds", Value: float64(processStartedAt.UnixNano()) / 1e9},
 		{Name: "telesrv_go_goroutines", Value: float64(runtime.NumGoroutine())},
 		{Name: "telesrv_go_scheduler_busy_seconds", Value: goSchedulerBusySeconds()},
+		{Name: "telesrv_go_total_alloc_bytes", Value: float64(mem.TotalAlloc)},
+		{Name: "telesrv_go_total_mallocs", Value: float64(mem.Mallocs)},
+		{Name: "telesrv_go_total_frees", Value: float64(mem.Frees)},
 		{Name: "telesrv_go_heap_alloc_bytes", Value: float64(mem.HeapAlloc)},
 		{Name: "telesrv_go_heap_inuse_bytes", Value: float64(mem.HeapInuse)},
 		{Name: "telesrv_go_heap_objects", Value: float64(mem.HeapObjects)},
