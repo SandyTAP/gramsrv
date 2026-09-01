@@ -23,6 +23,7 @@ import (
 	"telesrv/internal/app/userprojection"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
 
@@ -258,6 +259,7 @@ func TestContactsBlockUnblockFanoutsStoryVisibilityChanges(t *testing.T) {
 	contactsStore := memory.NewContactStore()
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contactsStore, users, storyStore, updateStore)
 	owner, err := users.Create(ctx, domain.User{AccessHash: 31, Phone: "15550003001", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
@@ -445,6 +447,7 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 	contactsStore := memory.NewContactStore()
 	storyStore := memory.NewStoryStore()
 	updateStore := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contactsStore, users, storyStore, updateStore)
 	owner, err := users.Create(ctx, domain.User{AccessHash: 41, Phone: "15550004001", FirstName: "Owner"})
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
@@ -462,7 +465,7 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 			t.Fatalf("upsert contact %d: %v", viewer.ID, err)
 		}
 	}
-	if _, err := contactsStore.Block(ctx, owner.ID, oldViewer.ID, 1700000000); err != nil {
+	if _, err := contactsStore.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistBlock, OwnerUserID: owner.ID, PeerIDs: []int64{oldViewer.ID}, Date: 1700000000}, store.BlocklistDeliveryEffects); err != nil {
 		t.Fatalf("pre-block old viewer: %v", err)
 	}
 	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
@@ -510,7 +513,7 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 		t.Fatalf("blocked peer = %#v, want new viewer", blocked.Blocked[0].PeerID)
 	}
 
-	ownerDiff, err := r.onUpdatesGetDifference(WithAuthKeyID(WithUserID(ctx, owner.ID), [8]byte{8, 8, 2}), &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	ownerDiff, err := r.onUpdatesGetDifference(WithAuthKeyID(WithUserID(ctx, owner.ID), [8]byte{8, 8, 2}), &tg.UpdatesGetDifferenceRequest{Pts: 2})
 	if err != nil {
 		t.Fatalf("owner difference: %v", err)
 	}
@@ -518,17 +521,17 @@ func TestContactsSetBlockedReplacesStoryBlocklistFanouts(t *testing.T) {
 	if !ok {
 		t.Fatalf("owner difference = %T, want *tg.UpdatesDifference", ownerDiff)
 	}
-	if ownerUpdates.State.Pts != 4 || len(ownerUpdates.OtherUpdates) != 4 {
-		t.Fatalf("owner difference pts/updates = %d/%d, want 4/4", ownerUpdates.State.Pts, len(ownerUpdates.OtherUpdates))
+	if ownerUpdates.State.Pts != 6 || len(ownerUpdates.OtherUpdates) != 4 {
+		t.Fatalf("owner difference pts/updates = %d/%d, want 6/4", ownerUpdates.State.Pts, len(ownerUpdates.OtherUpdates))
 	}
-	blockedUpdate, ok := ownerUpdates.OtherUpdates[0].(*tg.UpdatePeerBlocked)
+	blockedUpdate, ok := ownerUpdates.OtherUpdates[2].(*tg.UpdatePeerBlocked)
 	if !ok || !blockedUpdate.Blocked || !blockedUpdate.BlockedMyStoriesFrom {
 		t.Fatalf("owner update[0] = %+v (%T), want new viewer story block", ownerUpdates.OtherUpdates[0], ownerUpdates.OtherUpdates[0])
 	}
 	if peer, ok := blockedUpdate.PeerID.(*tg.PeerUser); !ok || peer.UserID != newViewer.ID {
 		t.Fatalf("owner block peer = %#v, want new viewer", blockedUpdate.PeerID)
 	}
-	unblockedUpdate, ok := ownerUpdates.OtherUpdates[2].(*tg.UpdatePeerBlocked)
+	unblockedUpdate, ok := ownerUpdates.OtherUpdates[0].(*tg.UpdatePeerBlocked)
 	if !ok || unblockedUpdate.Blocked || !unblockedUpdate.BlockedMyStoriesFrom {
 		t.Fatalf("owner update[2] = %+v (%T), want old viewer story unblock", ownerUpdates.OtherUpdates[2], ownerUpdates.OtherUpdates[2])
 	}
@@ -1574,6 +1577,39 @@ func TestAccountUpdateStatusKeepsUserOnlineUntilAllSessionsOffline(t *testing.T)
 	}
 }
 
+func TestContactsBlockMissingStoryBoundaryDoesNotWrite(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	owner, err := users.Create(ctx, domain.User{AccessHash: 1, FirstName: "Owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := users.Create(ctx, domain.User{AccessHash: 2, FirstName: "Peer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contacts := memory.NewContactStore()
+	stories := memory.NewStoryStore()
+	events := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contacts, users, stories, events)
+	r := New(Config{}, Deps{Users: appusers.NewService(users), Contacts: appcontacts.NewService(contacts, users)}, zaptest.NewLogger(t), clock.System)
+	ctx = WithUserID(ctx, owner.ID)
+	input := &tg.InputPeerUser{UserID: peer.ID, AccessHash: peer.AccessHash}
+	for _, kind := range []store.BlocklistMutationKind{store.BlocklistBlock, store.BlocklistUnblock, store.BlocklistReplace} {
+		if ok, err := r.mutateContactBlocklist(ctx, kind, []tg.InputPeerClass{input}); err == nil || ok {
+			t.Fatal("missing read dependency returned success", kind, err)
+		}
+	}
+	ids, err := contacts.ReadBlocklistIDs(ctx, owner.ID)
+	if err != nil || len(ids) != 0 {
+		t.Fatal(ids, err)
+	}
+	ev, err := events.ListAfter(ctx, owner.ID, 0, 100)
+	if err != nil || len(ev) != 0 {
+		t.Fatal(ev, err)
+	}
+}
+
 func TestContactsBlockGetBlockedAndUnblockRPC(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
@@ -1585,9 +1621,15 @@ func TestContactsBlockGetBlockedAndUnblockRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
+	contactsStore := memory.NewContactStore()
+	storyStore := memory.NewStoryStore()
+	updateStore := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contactsStore, userStore, storyStore, updateStore)
 	r := New(Config{}, Deps{
 		Users:    appusers.NewService(userStore),
-		Contacts: appcontacts.NewService(memory.NewContactStore(), userStore),
+		Contacts: appcontacts.NewService(contactsStore, userStore),
+		Stories:  appstories.NewService(storyStore),
+		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
 	}, zaptest.NewLogger(t), clock.System)
 	bobCtx := WithUserID(ctx, bob.ID)
 	userFull, err := r.onUsersGetFullUser(bobCtx, &tg.InputUser{UserID: alice.ID, AccessHash: alice.AccessHash})
@@ -1676,9 +1718,15 @@ func TestContactsBlockGetBlockedAndUnblockAcrossExactProfiles(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create bob: %v", err)
 			}
+			contactsStore := memory.NewContactStore()
+			storyStore := memory.NewStoryStore()
+			updateStore := memory.NewUpdateEventStore()
+			rpcTestBlocklistStores(contactsStore, userStore, storyStore, updateStore)
 			r := New(Config{}, Deps{
 				Users:    appusers.NewService(userStore),
-				Contacts: appcontacts.NewService(memory.NewContactStore(), userStore),
+				Contacts: appcontacts.NewService(contactsStore, userStore),
+				Stories:  appstories.NewService(storyStore),
+				Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
 			}, zaptest.NewLogger(t), clock.System)
 			ownerCtx := WithUserID(ctx, bob.ID)
 			peer := &tg.InputPeerUser{UserID: alice.ID, AccessHash: alice.AccessHash}

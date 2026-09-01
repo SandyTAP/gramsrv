@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -26,7 +25,7 @@ const (
 	maxContactSearchQLen  = 256
 	maxContactSearchLimit = 50
 	maxCloseFriendsCount  = 5000
-	maxContactSetBlocked  = 5000
+	maxContactSetBlocked  = store.MaxDeliveryTargets
 )
 
 // registerContacts 注册 contacts.* RPC handler。
@@ -202,42 +201,6 @@ func (r *Router) storyBlockedFactsForUsers(ctx context.Context, ownerID int64, u
 	return out, nil
 }
 
-func (r *Router) fanoutStoryBlocklistChange(ctx context.Context, ownerID, viewerID int64, blocked bool) error {
-	if ownerID == 0 || viewerID == 0 || ownerID == viewerID || r.deps.Stories == nil || r.deps.Updates == nil {
-		return nil
-	}
-	facts, err := r.storyViewerFactsForOwner(ctx, ownerID, viewerID)
-	if err != nil {
-		return err
-	}
-	owner := domain.Peer{Type: domain.PeerTypeUser, ID: ownerID}
-	now := int(r.clock.Now().Unix())
-	list, err := r.deps.Stories.ListOwnerActiveStories(ctx, ownerID, owner, now, domain.MaxStoryListLimit)
-	if err != nil {
-		return storyErr(err)
-	}
-	for _, story := range list.Stories {
-		if !story.Active(now) {
-			continue
-		}
-		beforeVisible := story.VisibleToWithStoryFacts(viewerID, facts.isContact, facts.closeFriend, !blocked)
-		afterVisible := story.VisibleToWithStoryFacts(viewerID, facts.isContact, facts.closeFriend, blocked)
-		switch {
-		case afterVisible && !beforeVisible:
-			if err := r.recordStoryFanout(ctx, viewerID, storyFanoutSnapshot(story)); err != nil {
-				return err
-			}
-		case beforeVisible && !afterVisible:
-			deleted := storyFanoutSnapshot(story)
-			deleted.Deleted = true
-			if err := r.recordStoryFanout(ctx, viewerID, deleted); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func (r *Router) storyViewerFactsForOwner(ctx context.Context, ownerID, viewerID int64) (storyPrivacyFanoutFacts, error) {
 	if ownerID == 0 || viewerID == 0 || r.deps.Contacts == nil {
 		return storyPrivacyFanoutFacts{}, nil
@@ -276,180 +239,52 @@ func storyFanoutSnapshot(story domain.Story) domain.Story {
 }
 
 func (r *Router) onContactsBlock(ctx context.Context, req *tg.ContactsBlockRequest) (bool, error) {
-	userID, _, err := r.currentUserID(ctx)
-	if err != nil {
-		return false, internalErr()
-	}
-	peer, ok := r.domainPeerFromInputPeer(userID, req.ID)
-	if !ok || peer.Type != domain.PeerTypeUser || peer.ID == 0 || peer.ID == userID {
+	if req == nil {
 		return false, userIDInvalidErr()
 	}
-	if r.deps.Contacts == nil {
-		return true, nil
-	}
-	wasBlocked, err := r.deps.Contacts.IsBlocked(ctx, userID, peer.ID)
-	if err != nil {
-		return false, contactErr(err)
-	}
-	if _, err := r.deps.Contacts.BlockContact(ctx, userID, peer.ID, int(r.clock.Now().Unix())); err != nil {
-		return false, contactErr(err)
-	}
-	if !wasBlocked {
-		if err := r.recordPeerStoryBlocked(ctx, userID, peer, true); err != nil {
-			return false, internalErr()
-		}
-		if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, true); err != nil {
-			return false, err
-		}
-	}
-	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-		_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
-	}
-	r.invalidateRPCProjectionForViewer(userID)
-	return true, nil
+	return r.mutateContactBlocklist(ctx, store.BlocklistBlock, []tg.InputPeerClass{req.ID})
 }
-
 func (r *Router) onContactsUnblock(ctx context.Context, req *tg.ContactsUnblockRequest) (bool, error) {
-	userID, _, err := r.currentUserID(ctx)
-	if err != nil {
-		return false, internalErr()
-	}
-	peer, ok := r.domainPeerFromInputPeer(userID, req.ID)
-	if !ok || peer.Type != domain.PeerTypeUser || peer.ID == 0 || peer.ID == userID {
+	if req == nil {
 		return false, userIDInvalidErr()
 	}
-	if r.deps.Contacts == nil {
-		return true, nil
-	}
-	wasBlocked, err := r.deps.Contacts.IsBlocked(ctx, userID, peer.ID)
-	if err != nil {
-		return false, contactErr(err)
-	}
-	if _, err := r.deps.Contacts.UnblockContact(ctx, userID, peer.ID); err != nil {
-		return false, contactErr(err)
-	}
-	if wasBlocked {
-		if err := r.recordPeerStoryBlocked(ctx, userID, peer, false); err != nil {
-			return false, internalErr()
-		}
-		if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, false); err != nil {
-			return false, err
-		}
-	}
-	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-		_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
-	}
-	r.invalidateRPCProjectionForViewer(userID)
-	return true, nil
+	return r.mutateContactBlocklist(ctx, store.BlocklistUnblock, []tg.InputPeerClass{req.ID})
 }
-
 func (r *Router) onContactsSetBlocked(ctx context.Context, req *tg.ContactsSetBlockedRequest) (bool, error) {
-	userID, _, err := r.currentUserID(ctx)
-	if err != nil {
-		return false, internalErr()
-	}
-	if len(req.ID) > maxContactSetBlocked || req.Limit < 0 || req.Limit > maxContactSetBlocked {
+	if req == nil || len(req.ID) > maxContactSetBlocked || req.Limit < 0 || req.Limit > maxContactSetBlocked {
 		return false, limitInvalidErr()
 	}
-	if r.deps.Contacts == nil {
-		return true, nil
+	return r.mutateContactBlocklist(ctx, store.BlocklistReplace, req.ID)
+}
+func (r *Router) mutateContactBlocklist(ctx context.Context, kind store.BlocklistMutationKind, inputs []tg.InputPeerClass) (bool, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return false, internalErr()
 	}
-	desired := make(map[int64]domain.Peer, len(req.ID))
-	desiredOrder := make([]domain.Peer, 0, len(req.ID))
-	for _, input := range req.ID {
+	ids := make([]int64, 0, len(inputs))
+	for _, input := range inputs {
 		peer, ok := r.domainPeerFromInputPeer(userID, input)
 		if !ok || peer.Type != domain.PeerTypeUser || peer.ID == 0 || peer.ID == userID {
 			return false, userIDInvalidErr()
 		}
-		if _, ok := desired[peer.ID]; ok {
-			continue
-		}
-		desired[peer.ID] = peer
-		desiredOrder = append(desiredOrder, peer)
+		ids = append(ids, peer.ID)
 	}
-	current, err := r.currentBlockedUserIDs(ctx, userID)
-	if err != nil {
-		return false, err
+	if r.deps.Contacts == nil || r.deps.Stories == nil {
+		return false, internalErr()
 	}
 	now := int(r.clock.Now().Unix())
-	for _, peer := range desiredOrder {
-		if current[peer.ID] {
-			continue
-		}
-		changed, err := r.deps.Contacts.BlockContact(ctx, userID, peer.ID, now)
-		if err != nil {
-			return false, contactErr(err)
-		}
-		if changed {
-			if err := r.applyContactBlocklistChange(ctx, userID, peer, true); err != nil {
-				return false, err
-			}
-		}
+	stories, err := r.deps.Stories.ListOwnerActiveStories(ctx, userID, domain.Peer{Type: domain.PeerTypeUser, ID: userID}, now, domain.MaxStoryListLimit)
+	if err != nil {
+		return false, internalErr()
 	}
-	removeIDs := make([]int64, 0, len(current))
-	for id := range current {
-		if _, ok := desired[id]; ok {
-			continue
-		}
-		removeIDs = append(removeIDs, id)
+	result, err := r.deps.Contacts.MutateBlocklist(ctx, store.BlocklistMutation{Kind: kind, OwnerUserID: userID, PeerIDs: ids, Date: now, Stories: stories.Stories}, store.BlocklistDeliveryEffects)
+	if err != nil {
+		return false, contactErr(err)
 	}
-	sort.Slice(removeIDs, func(i, j int) bool { return removeIDs[i] < removeIDs[j] })
-	for _, id := range removeIDs {
-		peer := domain.Peer{Type: domain.PeerTypeUser, ID: id}
-		changed, err := r.deps.Contacts.UnblockContact(ctx, userID, id)
-		if err != nil {
-			return false, contactErr(err)
-		}
-		if changed {
-			if err := r.applyContactBlocklistChange(ctx, userID, peer, false); err != nil {
-				return false, err
-			}
-		}
+	if len(result.Changes) > 0 {
+		r.invalidateRPCProjectionForViewer(userID)
 	}
-	r.invalidateRPCProjectionForViewer(userID)
 	return true, nil
-}
-
-func (r *Router) currentBlockedUserIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
-	out := make(map[int64]bool)
-	if r.deps.Contacts == nil || userID == 0 {
-		return out, nil
-	}
-	offset := 0
-	for {
-		list, err := r.deps.Contacts.GetBlocked(ctx, userID, offset, 100)
-		if err != nil {
-			return nil, internalErr()
-		}
-		if list.Count > maxContactSetBlocked {
-			return nil, limitInvalidErr()
-		}
-		for _, item := range list.Blocked {
-			if item.User.ID != 0 {
-				out[item.User.ID] = true
-			}
-		}
-		offset += len(list.Blocked)
-		if len(list.Blocked) == 0 || offset >= list.Count {
-			break
-		}
-	}
-	return out, nil
-}
-
-func (r *Router) applyContactBlocklistChange(ctx context.Context, userID int64, peer domain.Peer, blocked bool) error {
-	if err := r.recordPeerStoryBlocked(ctx, userID, peer, blocked); err != nil {
-		return internalErr()
-	}
-	if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, blocked); err != nil {
-		return err
-	}
-	if r.deps.Contacts != nil {
-		if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
-			_ = r.recordBlockPeerSettings(ctx, userID, peer, settings)
-		}
-	}
-	return nil
 }
 
 func (r *Router) onContactsGetBlocked(ctx context.Context, req *tg.ContactsGetBlockedRequest) (tg.ContactsBlockedClass, error) {
@@ -1085,26 +920,6 @@ func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, p
 	return out
 }
 
-// recordBlockPeerSettings is retained only for the separately scoped blocklist
-// aggregate; contact relationship mutations never call this RPC-side recorder.
-func (r *Router) recordBlockPeerSettings(ctx context.Context, userID int64, peer domain.Peer, settings domain.PeerSettings) error {
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	if r.deps.Updates == nil || userID == 0 {
-		return nil
-	}
-	_, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, [8]byte{}, 0)
-	return err
-}
-
-func (r *Router) recordPeerStoryBlocked(ctx context.Context, userID int64, peer domain.Peer, blocked bool) error {
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	if r.deps.Updates == nil || userID == 0 {
-		return nil
-	}
-	_, _, err := r.deps.Updates.RecordPeerStoryBlocked(ctx, authKeyID, userID, peer, blocked, [8]byte{}, 0)
-	return err
-}
-
 // requireReliableDispatchForUserUpdate keeps Core/RPC fail-closed: durable user
 // updates must flow through transactional outbox + independent Egress, never a
 // Core-owned session delivery side channel.
@@ -1147,6 +962,10 @@ func tgPeerSettings(settings domain.PeerSettings) tg.PeerSettings {
 
 func contactErr(err error) error {
 	switch {
+	case errors.Is(err, store.ErrBlocklistLimit), errors.Is(err, store.ErrActiveChannelMemberPairsLimit):
+		return limitInvalidErr()
+	case errors.Is(err, store.ErrBlocklistInvalid):
+		return contactIDInvalidErr()
 	case errors.Is(err, contacts.ErrContactNameEmpty):
 		return contactNameEmptyErr()
 	case errors.Is(err, contacts.ErrContactIDInvalid):

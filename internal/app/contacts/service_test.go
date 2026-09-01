@@ -101,13 +101,23 @@ func TestGetContactsReturnsNotModifiedFromReadModelHashWithoutLoadingList(t *tes
 func TestIsBlockedUsesBoundedCacheAndOwnerInvalidation(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewContactStore()
-	if _, err := base.Block(ctx, 2, 1, contactMutationTestDate); err != nil {
+	users := memory.NewUserStore()
+	owner, err := users.Create(ctx, domain.User{FirstName: "Owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := users.Create(ctx, domain.User{FirstName: "Peer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.AttachBlocklistStores(memory.NewStoryStore(), memory.NewPrivacyStore(), users, memory.NewChannelStore())
+	if _, err := base.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistBlock, OwnerUserID: owner.ID, PeerIDs: []int64{peer.ID}, Date: contactMutationTestDate}, store.BlocklistDeliveryEffects); err != nil {
 		t.Fatal(err)
 	}
 	counting := &serviceCountingContactStore{ContactStore: base}
 	svc := NewService(counting)
 	for i := 0; i < 2; i++ {
-		blocked, err := svc.IsBlocked(ctx, 2, 1)
+		blocked, err := svc.IsBlocked(ctx, owner.ID, peer.ID)
 		if err != nil || !blocked {
 			t.Fatalf("IsBlocked[%d]=%v err=%v", i, blocked, err)
 		}
@@ -115,14 +125,14 @@ func TestIsBlockedUsesBoundedCacheAndOwnerInvalidation(t *testing.T) {
 	if counting.blockedCalls != 1 {
 		t.Fatalf("blocked reads=%d want one", counting.blockedCalls)
 	}
-	if _, err := base.Unblock(ctx, 2, 1); err != nil {
+	if _, err := base.MutateBlocklist(ctx, store.BlocklistMutation{Kind: store.BlocklistUnblock, OwnerUserID: owner.ID, PeerIDs: []int64{peer.ID}, Date: contactMutationTestDate}, store.BlocklistDeliveryEffects); err != nil {
 		t.Fatal(err)
 	}
-	if blocked, _ := svc.IsBlocked(ctx, 2, 1); !blocked {
+	if blocked, _ := svc.IsBlocked(ctx, owner.ID, peer.ID); !blocked {
 		t.Fatal("backing change crossed cache before read-model invalidation")
 	}
-	svc.InvalidateViewers(2)
-	blocked, err := svc.IsBlocked(ctx, 2, 1)
+	svc.InvalidateViewers(owner.ID)
+	blocked, err := svc.IsBlocked(ctx, owner.ID, peer.ID)
 	if err != nil || blocked {
 		t.Fatalf("IsBlocked after invalidation=%v err=%v", blocked, err)
 	}

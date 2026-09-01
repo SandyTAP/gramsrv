@@ -9,6 +9,8 @@ import (
 	appcontacts "telesrv/internal/app/contacts"
 	appdialogs "telesrv/internal/app/dialogs"
 	appmessages "telesrv/internal/app/messages"
+	appstories "telesrv/internal/app/stories"
+	appupdates "telesrv/internal/app/updates"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
@@ -50,11 +52,16 @@ func TestMessagesPrivateBlockPreventsRecipientInboxAndRevokeRPC(t *testing.T) {
 	dialogs := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogs)
 	contactStore := memory.NewContactStore()
+	storyStore := memory.NewStoryStore()
+	updateStore := memory.NewUpdateEventStore()
+	rpcTestBlocklistStores(contactStore, userStore, storyStore, updateStore)
 	r := New(Config{}, Deps{
 		Users:    appusers.NewService(userStore),
 		Contacts: appcontacts.NewService(contactStore, userStore),
 		Messages: appmessages.NewService(messageStore, dialogs),
 		Dialogs:  appdialogs.NewService(dialogs),
+		Stories:  appstories.NewService(storyStore),
+		Updates:  appupdates.NewService(memory.NewUpdateStateStore(), updateStore),
 	}, zaptest.NewLogger(t), clock.System)
 
 	delivered, err := r.onMessagesSendMessage(WithUserID(ctx, alice.ID), &tg.MessagesSendMessageRequest{

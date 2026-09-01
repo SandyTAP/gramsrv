@@ -747,37 +747,39 @@ func (s *Service) peerCanSeeCurrentUserPhone(ctx context.Context, ownerUserID, v
 	return found && contact.Phone != "", nil
 }
 
-// BlockContact adds peer to the current user's blocklist.
-func (s *Service) BlockContact(ctx context.Context, userID, peerUserID int64, date int) (bool, error) {
-	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 || peerUserID == userID {
-		return false, ErrContactIDInvalid
+// MutateBlocklist executes the complete state/delivery aggregate once. All
+// projection reads inside the aggregate use immutable transactional facts.
+func (s *Service) MutateBlocklist(ctx context.Context, m store.BlocklistMutation, build store.DeliveryEffectsBuilder[store.BlocklistMutationSnapshot]) (store.BlocklistMutationSnapshot, error) {
+	if s == nil || s.contacts == nil || s.users == nil || build == nil {
+		return store.BlocklistMutationSnapshot{}, store.ErrBlocklistRequired
 	}
-	if s.users != nil {
-		if _, found, err := s.users.ByID(ctx, peerUserID); err != nil {
-			return false, err
-		} else if !found {
-			return false, ErrContactIDInvalid
+	var err error
+	m, err = m.Prepare()
+	if err != nil {
+		return store.BlocklistMutationSnapshot{}, err
+	}
+	peers, err := s.users.ByIDs(ctx, m.PeerIDs)
+	if err != nil {
+		return store.BlocklistMutationSnapshot{}, err
+	}
+	if len(peers) != len(m.PeerIDs) {
+		return store.BlocklistMutationSnapshot{}, ErrContactIDInvalid
+	}
+	if m.Kind == store.BlocklistReplace {
+		m.ExpectedIDs, err = s.contacts.ReadBlocklistIDs(ctx, m.OwnerUserID)
+		if err != nil {
+			return store.BlocklistMutationSnapshot{}, err
 		}
 	}
-	changed, err := s.contacts.Block(ctx, userID, peerUserID, date)
-	if err == nil {
-		s.blocks.Invalidate(blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID})
-		s.InvalidateViewers(userID, peerUserID)
+	result, err := s.contacts.MutateBlocklist(ctx, m, build)
+	if err == nil && len(result.Changes) > 0 {
+		ids := []int64{m.OwnerUserID}
+		for _, c := range result.Changes {
+			ids = append(ids, c.PeerUserID)
+		}
+		s.InvalidateViewers(ids...)
 	}
-	return changed, err
-}
-
-// UnblockContact removes peer from the current user's blocklist.
-func (s *Service) UnblockContact(ctx context.Context, userID, peerUserID int64) (bool, error) {
-	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 || peerUserID == userID {
-		return false, ErrContactIDInvalid
-	}
-	changed, err := s.contacts.Unblock(ctx, userID, peerUserID)
-	if err == nil {
-		s.blocks.Invalidate(blockRelationshipKey{ownerUserID: userID, blockedUserID: peerUserID})
-		s.InvalidateViewers(userID, peerUserID)
-	}
-	return changed, err
+	return result, err
 }
 
 // IsBlocked reports whether owner has blocked peer.

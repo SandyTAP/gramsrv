@@ -116,3 +116,8 @@ func requireDeliveryItemForUser(t *testing.T, items []store.DeliveryOutboxItem, 
 	t.Fatalf("durable deliveries = %+v, want target user %d", items, userID)
 	return store.DeliveryOutboxItem{}
 }
+
+func rpcTestBlocklistStores(contacts *memory.ContactStore, users *memory.UserStore, stories *memory.StoryStore, events *memory.UpdateEventStore) {
+	contacts.AttachBlocklistStores(stories, memory.NewPrivacyStore(), users, memory.NewChannelStore())
+	contacts.AttachUpdateEventStore(events)
+}

@@ -13,12 +13,15 @@ import (
 
 // ContactStore 是 store.ContactStore 的内存实现。
 type ContactStore struct {
-	mu             sync.RWMutex
-	m              map[int64]domain.ContactList
-	blocks         map[int64]map[int64]domain.BlockedContact
-	deliveryOutbox *DeliveryOutboxStore
-	updateEvents   *UpdateEventStore
-	privacy        *PrivacyStore
+	mu                sync.RWMutex
+	m                 map[int64]domain.ContactList
+	blocks            map[int64]map[int64]domain.BlockedContact
+	deliveryOutbox    *DeliveryOutboxStore
+	updateEvents      *UpdateEventStore
+	privacy           *PrivacyStore
+	blocklistStories  *StoryStore
+	blocklistUsers    *UserStore
+	blocklistChannels *ChannelStore
 }
 
 func (s *ContactStore) AttachDeliveryOutbox(outbox *DeliveryOutboxStore) {
@@ -472,34 +475,6 @@ func (s *ContactStore) Delete(_ context.Context, userID int64, contactUserIDs []
 	list.Hash = contactListHash(list.Contacts)
 	s.m[userID] = list
 	return deleted, nil
-}
-
-func (s *ContactStore) Block(_ context.Context, userID, blockedUserID int64, date int) (bool, error) {
-	if userID == 0 || blockedUserID == 0 || userID == blockedUserID {
-		return false, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blocks[userID] == nil {
-		s.blocks[userID] = make(map[int64]domain.BlockedContact)
-	}
-	_, existed := s.blocks[userID][blockedUserID]
-	s.blocks[userID][blockedUserID] = domain.BlockedContact{
-		User: domain.User{ID: blockedUserID},
-		Date: date,
-	}
-	return !existed, nil
-}
-
-func (s *ContactStore) Unblock(_ context.Context, userID, blockedUserID int64) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blocks[userID] == nil {
-		return false, nil
-	}
-	_, existed := s.blocks[userID][blockedUserID]
-	delete(s.blocks[userID], blockedUserID)
-	return existed, nil
 }
 
 func (s *ContactStore) IsBlocked(_ context.Context, userID, blockedUserID int64) (bool, error) {
