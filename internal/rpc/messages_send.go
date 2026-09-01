@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 
 	"telesrv/internal/domain"
 )
@@ -269,6 +270,10 @@ func messageSendErr(err error) error {
 		return balanceTooLowErr()
 	case errors.Is(err, domain.ErrUserFrozen):
 		return frozenMethodInvalidErr()
+	case errors.Is(err, domain.ErrChatForwardsRestricted):
+		return chatForwardsRestrictedErr()
+	case errors.Is(err, domain.ErrQuoteTextInvalid):
+		return quoteTextInvalidErr()
 	case errors.Is(err, domain.ErrReplyMessageIDInvalid):
 		return replyMessageIDInvalidErr()
 	case errors.Is(err, domain.ErrMessageRandomIDDuplicate):
@@ -332,8 +337,11 @@ func (r *Router) messageReplyFromInput(ctx context.Context, userID int64, peer d
 	}
 	replyPeer := peer
 	if inputPeer, ok := reply.GetReplyToPeerID(); ok {
-		parsed, err := r.checkedDomainPeerFromInputPeer(ctx, userID, inputPeer)
+		parsed, err := r.checkedMessageReadPeer(ctx, userID, inputPeer, false)
 		if err != nil {
+			if e, ok := tgerr.As(err); ok && e.Code >= 500 {
+				return nil, err
+			}
 			return nil, replyMessageIDInvalidErr()
 		}
 		replyPeer = parsed

@@ -2,10 +2,12 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // PinPrivateMessage 与 PG 实现同语义：非 pm_oneside 的 pin 双侧置位，
@@ -37,11 +39,6 @@ func (s *MessageStore) PinPrivateMessage(_ context.Context, req domain.PinPrivat
 	if owned.Media != nil && owned.Media.Kind == domain.MessageMediaKindService {
 		return res, domain.ErrMessageIDInvalid
 	}
-	if owned.Pinned == req.Pinned && (!req.Pinned || req.PmOneside) {
-		// 与 PG 同语义：unpin/oneside pin 幂等短路；共享 pin 仍需检查
-		// 对端传播。
-		return res, nil
-	}
 	type pinSide struct {
 		userID int64
 		peer   domain.Peer
@@ -60,29 +57,61 @@ func (s *MessageStore) PinPrivateMessage(_ context.Context, req domain.PinPrivat
 			}
 		}
 	}
+	changes := make([]pinSide, 0, len(sides))
+	var pinEvents []domain.UpdateEvent
 	for _, side := range sides {
 		if s.m[side.userID][side.idx].Pinned == req.Pinned {
 			continue
 		}
-		s.m[side.userID][side.idx].Pinned = req.Pinned
-		boxID := s.m[side.userID][side.idx].ID
-		res.Updated = append(res.Updated, domain.PinnedMessagesForUser{
-			UserID:     side.userID,
-			Peer:       side.peer,
-			MessageIDs: []int{boxID},
-			Pinned:     req.Pinned,
-			Event: domain.UpdateEvent{
-				UserID:     side.userID,
-				Type:       domain.UpdateEventPinnedMessages,
-				Pts:        s.nextPtsLocked(side.userID),
-				PtsCount:   1,
-				Date:       req.Date,
-				Peer:       side.peer,
-				Bool:       req.Pinned,
-				MessageIDs: []int{boxID},
-			},
-		})
+		changes = append(changes, side)
+		pinEvents = append(pinEvents, domain.UpdateEvent{UserID: side.userID, Type: domain.UpdateEventPinnedMessages,
+			PtsCount: 1, Date: req.Date, Peer: side.peer, Bool: req.Pinned, MessageIDs: []int{s.m[side.userID][side.idx].ID}})
 	}
+	if len(changes) == 0 {
+		return res, nil
+	}
+	apply := func(events []domain.UpdateEvent) {
+		for i, side := range changes {
+			s.m[side.userID][side.idx].Pinned = req.Pinned
+			res.Updated = append(res.Updated, domain.PinnedMessagesForUser{UserID: side.userID, Peer: side.peer,
+				MessageIDs: events[i].MessageIDs, Pinned: req.Pinned, Event: events[i]})
+		}
+	}
+	if req.Pinned && !req.PmOneside && req.Peer.ID != req.OwnerUserID {
+		sendReq, err := store.PrivatePinServiceRequest(req)
+		if err != nil {
+			return res, err
+		}
+		fingerprint, err := store.PrivateSendFingerprint(sendReq)
+		if err != nil {
+			return res, err
+		}
+		sent, err := s.sendPrivateTextLocked(sendReq, fingerprint, &memoryPrivateSendPrefix{events: pinEvents, apply: apply})
+		if errors.Is(err, domain.ErrReplyMessageIDInvalid) {
+			err = domain.ErrMessageIDInvalid
+		}
+		if err != nil {
+			return domain.PinPrivateMessageResult{OwnerUserID: req.OwnerUserID}, err
+		}
+		res.ServiceMessage = sent
+		return res, nil
+	}
+	events := s.updateEvents
+	if events == nil {
+		return res, store.ErrDeliveryOutboxRequired
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for i := range pinEvents {
+		event := &pinEvents[i]
+		event.Pts = s.nextPtsWithEventsLocked(events, event.UserID)
+		auth, session := [8]byte{}, int64(0)
+		if event.UserID == req.OwnerUserID {
+			auth, session = req.OriginAuthKeyID, req.OriginSessionID
+		}
+		appendMemorySendEventLocked(events, event.UserID, *event, auth, session)
+	}
+	apply(pinEvents)
 	return res, nil
 }
 
@@ -98,6 +127,12 @@ func (s *MessageStore) UnpinAllPrivateMessages(_ context.Context, req domain.Unp
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	events := s.updateEvents
+	if events == nil {
+		return res, store.ErrDeliveryOutboxRequired
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
 	// 与 PG 同语义：按 box_id 降序取一批清除，剩余批次以 Offset=1 续清。
 	pinnedIdx := make([]int, 0)
 	for i, msg := range s.m[req.OwnerUserID] {
@@ -131,7 +166,7 @@ func (s *MessageStore) UnpinAllPrivateMessages(_ context.Context, req domain.Unp
 			Event: domain.UpdateEvent{
 				UserID:     userID,
 				Type:       domain.UpdateEventPinnedMessages,
-				Pts:        s.nextPtsLocked(userID),
+				Pts:        s.nextPtsWithEventsLocked(events, userID),
 				PtsCount:   1,
 				Date:       req.Date,
 				Peer:       peer,
@@ -139,6 +174,12 @@ func (s *MessageStore) UnpinAllPrivateMessages(_ context.Context, req domain.Unp
 				MessageIDs: ids,
 			},
 		})
+		event := res.Updated[len(res.Updated)-1].Event
+		auth, session := [8]byte{}, int64(0)
+		if userID == req.OwnerUserID {
+			auth, session = req.OriginAuthKeyID, req.OriginSessionID
+		}
+		appendMemorySendEventLocked(events, userID, event, auth, session)
 	}
 	appendSide(req.OwnerUserID, req.Peer, ownIDs)
 	if req.Peer.ID != req.OwnerUserID {

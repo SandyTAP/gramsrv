@@ -62,6 +62,8 @@ func peersListEmptyErr() error { return tgerr.New(400, "PEERS_LIST_EMPTY") }
 // peerIDInvalidErr 表示目标 peer 不存在或当前阶段不支持。
 func peerIDInvalidErr() error { return tgerr.New(400, "PEER_ID_INVALID") }
 
+func fromPeerInvalidErr() error { return tgerr.New(400, "FROM_PEER_INVALID") }
+
 func parentPeerInvalidErr() error { return tgerr.New(400, "PARENT_PEER_INVALID") }
 
 func sendAsPeerInvalidErr() error { return tgerr.New(400, "SEND_AS_PEER_INVALID") }
@@ -518,3 +520,5 @@ func bindTempAuthKeyErr(err error) error {
 		return internalErr()
 	}
 }
+
+func quoteTextInvalidErr() error { return tgerr.New(400, "QUOTE_TEXT_INVALID") }

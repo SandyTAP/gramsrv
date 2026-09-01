@@ -134,7 +134,10 @@ SELECT EXISTS (
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create broadcast recipient box: %w", err)
 	}
-	msg := messageFromBoxRow(boxRow)
+	msg, err := messageFromBoxRow(boxRow)
+	if err != nil {
+		return domain.Message{}, err
+	}
 	if err := qtx.UpsertInboxDialog(ctx, sqlcgen.UpsertInboxDialogParams{
 		UserID:         userID,
 		PeerType:       string(domain.PeerTypeUser),

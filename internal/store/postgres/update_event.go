@@ -441,6 +441,7 @@ type updateEventPayloadColumns struct {
 	quoteText            string
 	quoteEntities        string
 	quoteOffset          int32
+	replyExternal        string
 	fwdFromPeerType      string
 	fwdFromPeerID        int64
 	fwdFromName          string
@@ -501,7 +502,7 @@ func decodeUpdateEventPayload(eventType domain.UpdateEventType, columns updateEv
 			columns.silent, columns.noforwards,
 			columns.replyToMsgID, columns.replyToPeerType, columns.replyToPeerID,
 			columns.replyToTopID, columns.replyToStoryID,
-			columns.quoteText, columns.quoteEntities, columns.quoteOffset,
+			columns.quoteText, columns.quoteEntities, columns.quoteOffset, columns.replyExternal,
 			columns.fwdFromPeerType, columns.fwdFromPeerID, columns.fwdFromName, columns.fwdDate,
 			columns.fwdSavedFromPeerType, columns.fwdSavedFromPeerID, columns.fwdSavedFromMsgID,
 		)
@@ -595,7 +596,7 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 			silent:          row.Silent, noforwards: row.Noforwards,
 			replyToMsgID: row.ReplyToMsgID, replyToPeerType: row.ReplyToPeerType, replyToPeerID: row.ReplyToPeerID,
 			replyToTopID: row.ReplyToTopID, replyToStoryID: row.ReplyToStoryID,
-			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset,
+			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset, replyExternal: row.ReplyExternalJson,
 			fwdFromPeerType: row.FwdFromPeerType, fwdFromPeerID: row.FwdFromPeerID, fwdFromName: row.FwdFromName, fwdDate: row.FwdDate,
 			fwdSavedFromPeerType: row.FwdSavedFromPeerType, fwdSavedFromPeerID: row.FwdSavedFromPeerID, fwdSavedFromMsgID: row.FwdSavedFromMsgID,
 			eventPeers: row.EventPeersJson, peerSettings: row.PeerSettingsJson, messageIDs: row.MessageIdsJson,
@@ -739,7 +740,7 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 			silent:          row.Silent, noforwards: row.Noforwards,
 			replyToMsgID: row.ReplyToMsgID, replyToPeerType: row.ReplyToPeerType, replyToPeerID: row.ReplyToPeerID,
 			replyToTopID: row.ReplyToTopID, replyToStoryID: row.ReplyToStoryID,
-			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset,
+			quoteText: row.QuoteText, quoteEntities: row.QuoteEntitiesJson, quoteOffset: row.QuoteOffset, replyExternal: row.ReplyExternalJson,
 			fwdFromPeerType: row.FwdFromPeerType, fwdFromPeerID: row.FwdFromPeerID, fwdFromName: row.FwdFromName, fwdDate: row.FwdDate,
 			fwdSavedFromPeerType: row.FwdSavedFromPeerType, fwdSavedFromPeerID: row.FwdSavedFromPeerID, fwdSavedFromMsgID: row.FwdSavedFromMsgID,
 			eventPeers: row.EventPeersJson, peerSettings: row.PeerSettingsJson, messageIDs: row.MessageIdsJson,

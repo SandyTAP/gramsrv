@@ -456,6 +456,16 @@ type BotEmojiStatusPermission struct {
 	UpdatedAt pgtype.Timestamptz
 }
 
+type BotInfoLocalization struct {
+	BotUserID   int64
+	LangCode    string
+	Name        *string
+	About       *string
+	Description *string
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
 type BotLoginAllowedUrl struct {
 	ID            int64
 	BotUserID     int64
@@ -726,8 +736,6 @@ type ChannelDeliveryAttempt struct {
 	ResolutionError          *string
 	RetryAt                  pgtype.Timestamptz
 	ResolvedAt               pgtype.Timestamptz
-	FinalizedAt              pgtype.Timestamptz
-	FinalOutcome             *string
 }
 
 type ChannelDeliveryAttemptTarget struct {
@@ -741,12 +749,8 @@ type ChannelDeliveryAttemptTarget struct {
 	AdmittedSessions         int32
 	WrittenSessions          int32
 	PhysicalFirstServerMsgID int64
-	ClientAckAuthKeyID       []byte
-	ClientAckSessionID       *int64
-	ClientAckServerMsgID     *int64
 	EvidenceAt               pgtype.Timestamptz
 	EvidenceKind             *string
-	ClientAckAt              pgtype.Timestamptz
 	LastError                *string
 	UpdatedAt                pgtype.Timestamptz
 }
@@ -1420,13 +1424,15 @@ type DialogFilterSetting struct {
 }
 
 type DispatchOutbox struct {
-	ID               int64
-	TargetUserID     int64
-	Pts              int32
-	EventType        string
-	ExcludeSessionID int64
-	ExcludeAuthKeyID []byte
-	CreatedAt        pgtype.Timestamptz
+	ID                int64
+	TargetUserID      int64
+	Pts               int32
+	EventType         string
+	ExcludeSessionID  int64
+	ExcludeAuthKeyID  []byte
+	CreatedAt         pgtype.Timestamptz
+	ReadModelPeerType string
+	ReadModelPeerID   int64
 }
 
 type DispatchOutboxAttempt struct {
@@ -1449,8 +1455,6 @@ type DispatchOutboxAttempt struct {
 	Resolution               *string
 	RetryAt                  pgtype.Timestamptz
 	LastError                string
-	FinalizedAt              pgtype.Timestamptz
-	FinalizationOutcome      *string
 }
 
 type DispatchOutboxAttemptTarget struct {
@@ -1465,10 +1469,6 @@ type DispatchOutboxAttemptTarget struct {
 	EligibleSessions         int32
 	WrittenSessions          int32
 	PhysicalFirstServerMsgID int64
-	ClientAckAt              pgtype.Timestamptz
-	ClientAckAuthKeyID       []byte
-	ClientAckSessionID       int64
-	ClientAckServerMsgID     int64
 }
 
 type DispatchOutboxLane struct {
@@ -1486,6 +1486,7 @@ type DispatchOutboxLane struct {
 	LastError         string
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
+	HeadAttempt       int32
 }
 
 type Document struct {
@@ -1531,8 +1532,6 @@ type EdgeDeliveryOutboxAttempt struct {
 	Resolution               *string
 	RetryAt                  pgtype.Timestamptz
 	LastError                string
-	FinalizedAt              pgtype.Timestamptz
-	FinalizationOutcome      *string
 }
 
 type EdgeDeliveryOutboxAttemptTarget struct {
@@ -1547,10 +1546,6 @@ type EdgeDeliveryOutboxAttemptTarget struct {
 	EligibleSessions         int32
 	WrittenSessions          int32
 	PhysicalFirstServerMsgID int64
-	ClientAckAt              pgtype.Timestamptz
-	ClientAckAuthKeyID       []byte
-	ClientAckSessionID       int64
-	ClientAckServerMsgID     int64
 }
 
 type EdgeDeliveryOutboxLane struct {
@@ -1568,6 +1563,7 @@ type EdgeDeliveryOutboxLane struct {
 	LastError         string
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
+	HeadAttempt       int32
 }
 
 type EncryptedFile struct {
@@ -1824,6 +1820,7 @@ type MessageBox struct {
 	ReplyToStoryID       int32
 	Effect               int64
 	HideEdited           bool
+	ReplyExternal        []byte
 }
 
 type MessageBoxMedium struct {
@@ -2009,6 +2006,7 @@ type PeerStarGift struct {
 	DropOriginalDetailsStars int64
 	CanCraftAt               int32
 	MessageEntities          []byte
+	PaidStars                int64
 }
 
 type PeerTranslationSetting struct {
@@ -2198,6 +2196,7 @@ type PrivateMessage struct {
 	SenderDeletePtsCount   int32
 	SenderDeleteDate       int32
 	SenderDeleteMessageIds []byte
+	ReplyExternal          []byte
 }
 
 type PrivateMessageReaction struct {
@@ -2264,13 +2263,16 @@ type QuickReplyMessage struct {
 }
 
 type ReadModelVersion struct {
-	Model       string
-	OwnerUserID int64
-	PeerType    string
-	PeerID      int64
-	Version     int64
-	UpdatedAt   pgtype.Timestamptz
-	Hash        int64
+	Model             string
+	OwnerUserID       int64
+	PeerType          string
+	PeerID            int64
+	Version           int64
+	UpdatedAt         pgtype.Timestamptz
+	Hash              int64
+	PublishedVersion  int64
+	PublishOwner      string
+	PublishLeaseUntil pgtype.Timestamptz
 }
 
 type SavedDialogPin struct {
@@ -2517,6 +2519,7 @@ type StarGiftCatalogRevision struct {
 	BackgroundCenterColor *int32
 	BackgroundEdgeColor   *int32
 	BackgroundTextColor   *int32
+	AuctionRoundDuration  int32
 }
 
 // Purchase-time snapshot of per-admin channel gift notification intents; delivery uses deterministic private-message replay.

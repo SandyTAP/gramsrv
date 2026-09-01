@@ -18,29 +18,35 @@ func (r *Router) updatePrivatePinnedMessage(ctx context.Context, userID int64, p
 	if r.deps.Messages == nil {
 		return nil, notImplementedErr()
 	}
+	recipientBlocked := false
+	if !req.Unpin && !req.PmOneside && peer.ID != userID {
+		var err error
+		recipientBlocked, err = r.peerBlocksUser(ctx, userID, peer.ID)
+		if err != nil {
+			return nil, internalErr()
+		}
+	}
 	sessionID, _ := SessionIDFrom(ctx)
 	res, err := r.deps.Messages.PinPrivateMessage(ctx, userID, domain.PinPrivateMessageRequest{
-		OwnerUserID:     userID,
-		Peer:            peer,
-		MessageID:       req.ID,
-		Pinned:          !req.Unpin,
-		PmOneside:       req.PmOneside,
-		Silent:          req.Silent,
-		Date:            int(r.clock.Now().Unix()),
-		OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
-		OriginSessionID: sessionID,
+		OwnerUserID:      userID,
+		Peer:             peer,
+		MessageID:        req.ID,
+		Pinned:           !req.Unpin,
+		PmOneside:        req.PmOneside,
+		Silent:           req.Silent,
+		RecipientBlocked: recipientBlocked,
+		Date:             int(r.clock.Now().Unix()),
+		OriginAuthKeyID:  rawAuthKeyIDForOrigin(ctx),
+		OriginSessionID:  sessionID,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrMessageIDInvalid) {
 			return nil, messageIDInvalidErr()
 		}
-		return nil, internalErr()
+		return nil, messageSendErr(err)
 	}
-	if res.Changed() {
-		r.invalidateRPCProjectionForPeer(userID, peer)
-		if !req.PmOneside && peer.ID != userID {
-			r.invalidateRPCProjectionForPeer(peer.ID, domain.Peer{Type: domain.PeerTypeUser, ID: userID})
-		}
+	for _, changed := range res.Updated {
+		r.invalidateRPCProjectionForPeer(changed.UserID, changed.Peer)
 	}
 	self := res.Self()
 	updates := []tg.UpdateClass(nil)
@@ -48,20 +54,11 @@ func (r *Router) updatePrivatePinnedMessage(ctx context.Context, userID int64, p
 		updates = append(updates, update)
 	}
 	users := []tg.UserClass{}
-	if res.Changed() && !req.Unpin && !req.PmOneside && peer.ID != userID {
-		// 服务消息独立于置顶状态事务：置顶状态是真值源，服务消息失败
-		// 不回滚置顶（与官方时间线装饰语义一致）。req.ID 即 owner 视角
-		// box id（store 已校验存在），共享升级场景 Self() 可能为空仍需发。
-		if sent, sendErr := r.sendPinServiceMessage(ctx, userID, peer.ID, req.ID, req.Silent); sendErr == nil && sent.SenderMessage.ID != 0 {
-			if msg := tgMessage(sent.SenderMessage); msg != nil {
-				updates = append(updates, &tg.UpdateNewMessage{
-					Message:  msg,
-					Pts:      sent.SenderEvent.Pts,
-					PtsCount: sent.SenderEvent.PtsCount,
-				})
-			}
-			users = r.usersForMessageUpdate(ctx, userID, sent.SenderMessage)
+	if sent := res.ServiceMessage; sent.SenderMessage.ID != 0 {
+		if msg := tgMessage(sent.SenderMessage); msg != nil {
+			updates = append(updates, &tg.UpdateNewMessage{Message: msg, Pts: sent.SenderEvent.Pts, PtsCount: sent.SenderEvent.PtsCount})
 		}
+		users = r.usersForMessageUpdate(ctx, userID, sent.SenderMessage)
 	}
 	if len(updates) == 0 {
 		return tgEmptyUpdates(int(r.clock.Now().Unix())), nil
@@ -75,44 +72,11 @@ func (r *Router) updatePrivatePinnedMessage(ctx context.Context, userID int64, p
 	}, nil
 }
 
-func (r *Router) sendPinServiceMessage(ctx context.Context, userID, peerUserID int64, pinnedBoxID int, silent bool) (domain.SendPrivateTextResult, error) {
-	recipientBlocked, err := r.peerBlocksUser(ctx, userID, peerUserID)
-	if err != nil {
-		return domain.SendPrivateTextResult{}, err
-	}
-	sessionID, _ := SessionIDFrom(ctx)
-	return r.deps.Messages.SendPrivateText(ctx, userID, domain.SendPrivateTextRequest{
-		SenderUserID:    userID,
-		RecipientUserID: peerUserID,
-		RandomID:        pinServiceMessageRandomID(userID, peerUserID, pinnedBoxID, r.clock.Now().UnixNano()),
-		Media: &domain.MessageMedia{
-			Kind:          domain.MessageMediaKindService,
-			ServiceAction: &domain.MessageServiceAction{Kind: domain.MessageServiceActionPinMessage},
-		},
-		Silent: silent,
-		// reply_to 指向被置顶消息（owner 视角 box id），发送路径自动
-		// 翻译为对端视角；客户端凭此渲染"X 置顶了「…」"预览。
-		ReplyTo:          &domain.MessageReply{MessageID: pinnedBoxID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: peerUserID}},
-		Date:             int(r.clock.Now().Unix()),
-		OriginAuthKeyID:  rawAuthKeyIDForOrigin(ctx),
-		OriginSessionID:  sessionID,
-		RecipientBlocked: recipientBlocked,
-	})
-}
-
-func pinServiceMessageRandomID(userID, peerUserID int64, pinnedBoxID int, nowNano int64) int64 {
-	id := nowNano ^ (userID << 23) ^ (peerUserID << 11) ^ int64(pinnedBoxID)
-	if id == 0 {
-		return int64(pinnedBoxID) | 1
-	}
-	return id
-}
-
 // unpinAllPrivateMessages 处理 messages.unpinAllMessages 的私聊分支。
 func (r *Router) unpinAllPrivateMessages(ctx context.Context, userID int64, peer domain.Peer) (*tg.MessagesAffectedHistory, error) {
 	authKeyID, _ := AuthKeyIDFrom(ctx)
 	if r.deps.Messages == nil {
-		return r.affectedHistory(ctx, authKeyID, userID, 0)
+		return nil, notImplementedErr()
 	}
 	sessionID, _ := SessionIDFrom(ctx)
 	res, err := r.deps.Messages.UnpinAllPrivateMessages(ctx, userID, domain.UnpinAllPrivateMessagesRequest{

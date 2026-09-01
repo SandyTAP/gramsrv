@@ -110,6 +110,7 @@ func (r *Router) mediaSearchRequestFromMessagesSearch(
 	out := domain.MediaSearchRequest{
 		Categories:     mediaCategoriesForFilter(req.Filter),
 		Query:          req.Q,
+		SenderUserID:   filter.SenderUserID,
 		MinDate:        req.MinDate,
 		MaxDate:        req.MaxDate,
 		SavedPeer:      filter.SavedPeer,
@@ -119,19 +120,6 @@ func (r *Router) mediaSearchRequestFromMessagesSearch(
 		Limit:          req.Limit,
 		MaxID:          req.MaxID,
 		MinID:          req.MinID,
-	}
-	if fromInput, present := req.GetFromID(); present {
-		if fromInput == nil {
-			return domain.MediaSearchRequest{}, peerIDInvalidErr()
-		}
-		from, err := r.checkedDomainPeerFromInputPeer(ctx, userID, fromInput)
-		if err != nil {
-			return domain.MediaSearchRequest{}, err
-		}
-		if from.Type != domain.PeerTypeUser || from.ID == 0 {
-			return domain.MediaSearchRequest{}, peerIDInvalidErr()
-		}
-		out.SenderUserID = from.ID
 	}
 	if topMsgID, present := req.GetTopMsgID(); present {
 		if topMsgID <= 0 || topMsgID > domain.MaxMessageBoxID {
