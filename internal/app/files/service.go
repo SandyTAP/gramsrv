@@ -315,6 +315,7 @@ type blobMetaResult struct {
 type blobBytesResult struct {
 	data        []byte
 	total       int64
+	rangeSHA256 [sha256.Size]byte
 	cacheable   bool
 	cacheHit    bool
 	cacheFilled bool
@@ -383,7 +384,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		if data, ok := s.byteCache.get(blob.ObjectKey); ok {
 			cacheLog.byteCacheHit = true
 			cacheLog.source = "byte_cache"
-			return immutableFileChunk(blob, sliceBlobBytes(data, req.Offset, int64(req.Limit)), int64(len(data)), req.Offset), true, nil
+			return immutableFileChunk(blob, viewBlobBytes(data, req.Offset, int64(req.Limit)), int64(len(data)), req.Offset), true, nil
 		}
 		// 同一 object_key 的小 blob 并发首访合并成一次 backend 全量读 + 一次 byteCache 填充。
 		v, err, shared := s.blobBytesSF.Do(blob.ObjectKey, func() (any, error) {
@@ -404,7 +405,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		if err != nil {
 			return domain.FileChunk{}, false, fmt.Errorf("read blob %q: %w", blob.LocationKey, err)
 		}
-		// res.data 在并发 caller 间只读共享，sliceBlobBytes 各自拷贝出自己的分片，安全。
+		// byte cache entry 在发布后 immutable；caller 只借用请求 range 的只读 view。
 		if res := v.(blobBytesResult); res.cacheable {
 			cacheLog.byteCacheHit = res.cacheHit
 			cacheLog.byteCacheFilled = res.cacheFilled
@@ -414,7 +415,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 			} else {
 				cacheLog.source = "backend_fill_byte_cache"
 			}
-			return immutableFileChunk(blob, sliceBlobBytes(res.data, req.Offset, int64(req.Limit)), res.total, req.Offset), true, nil
+			return immutableFileChunk(blob, viewBlobBytes(res.data, req.Offset, int64(req.Limit)), res.total, req.Offset), true, nil
 		}
 		// 大小不符/超限：落到下面的按需 range 读(与原行为一致)。
 		cacheLog.source = "backend_range_uncacheable"
@@ -429,21 +430,21 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		if err != nil {
 			return blobBytesResult{}, err
 		}
-		return blobBytesResult{data: data, total: total}, nil
+		return blobBytesResult{data: data, total: total, rangeSHA256: sha256.Sum256(data)}, nil
 	})
 	cacheLog.rangeSingleflight = shared
 	if err != nil {
 		return domain.FileChunk{}, false, fmt.Errorf("read blob %q: %w", blob.LocationKey, err)
 	}
 	res := v.(blobBytesResult)
-	data := res.data
-	if shared {
-		data = append([]byte(nil), data...)
-	}
-	return immutableFileChunk(blob, data, res.total, req.Offset), true, nil
+	return immutableFileChunkWithDigest(blob, res.data, res.total, req.Offset, res.rangeSHA256), true, nil
 }
 
 func immutableFileChunk(blob domain.FileBlob, data []byte, total, offset int64) domain.FileChunk {
+	return immutableFileChunkWithDigest(blob, data, total, offset, sha256.Sum256(data))
+}
+
+func immutableFileChunkWithDigest(blob domain.FileBlob, data []byte, total, offset int64, digest [sha256.Size]byte) domain.FileChunk {
 	if offset < 0 {
 		offset = 0
 	}
@@ -458,7 +459,7 @@ func immutableFileChunk(blob domain.FileBlob, data []byte, total, offset int64) 
 			Length:      len(data),
 			Total:       total,
 			MimeType:    blob.MimeType,
-			RangeSHA256: sha256.Sum256(data),
+			RangeSHA256: digest,
 		},
 	}
 }
@@ -527,7 +528,7 @@ func (s *Service) logGetFileCache(req domain.FileDownloadRequest, blob domain.Fi
 	s.log.Debug("upload.getFile cache", fields...)
 }
 
-func sliceBlobBytes(data []byte, offset, limit int64) []byte {
+func viewBlobBytes(data []byte, offset, limit int64) []byte {
 	total := int64(len(data))
 	if offset < 0 {
 		offset = 0
@@ -539,7 +540,10 @@ func sliceBlobBytes(data []byte, offset, limit int64) []byte {
 	if limit > 0 && offset+limit < end {
 		end = offset + limit
 	}
-	return append([]byte(nil), data[offset:end]...)
+	// Clip capacity at end so an accidental append cannot overwrite a neighboring
+	// range in the immutable cache entry. Element mutation remains forbidden by the
+	// FileChunk contract and is covered by ownership tests at every consumer boundary.
+	return data[offset:end:end]
 }
 
 // ---- 资源读取（reaction / sticker / document）----

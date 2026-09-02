@@ -85,8 +85,9 @@ const (
 	// Large responses are scheduled separately so a startup prefetch cannot sit
 	// ahead of an already-prepared session convergence result. The threshold is
 	// applied after layer conversion and adaptive gzip.
-	bulkOutboundThreshold = 64 << 10
-	maxOrdinaryBeforeBulk = 16
+	bulkOutboundThreshold     = 64 << 10
+	maxOrdinaryBeforeBulk     = 16
+	defaultOutboundOpPoolSize = 4096
 )
 
 type outboundOp struct {
@@ -109,6 +110,64 @@ type outboundOp struct {
 	// terminal is owned by the outbound actor after successful queue admission.
 	// It resolves detached RPC-result ownership on every physical terminal path.
 	terminal func(error)
+}
+
+// outboundOpPool makes the wide tagged operation object demand-allocated while
+// per-Conn channels retain only one pointer per ring slot. The pool is bounded
+// and Server-owned: an idle connection therefore pays 8 bytes rather than the
+// complete outboundOp size per queue slot, while a past burst cannot pin an
+// unbounded number of operation graphs or their referenced payloads.
+type outboundOpPool struct {
+	idle chan *outboundOp
+}
+
+func newOutboundOpPool(maxIdle int) *outboundOpPool {
+	if maxIdle <= 0 {
+		maxIdle = 1
+	}
+	return &outboundOpPool{idle: make(chan *outboundOp, maxIdle)}
+}
+
+func (p *outboundOpPool) acquire() *outboundOp {
+	if p != nil {
+		select {
+		case op := <-p.idle:
+			return op
+		default:
+		}
+	}
+	return &outboundOp{}
+}
+
+func (p *outboundOpPool) release(op *outboundOp) {
+	if op == nil {
+		return
+	}
+	*op = outboundOp{}
+	if p == nil {
+		return
+	}
+	select {
+	case p.idle <- op:
+	default:
+	}
+}
+
+var fallbackOutboundOpPool = newOutboundOpPool(defaultOutboundOpPoolSize)
+
+func (c *Conn) operationPool() *outboundOpPool {
+	if c != nil && c.outboundOpPool != nil {
+		return c.outboundOpPool
+	}
+	return fallbackOutboundOpPool
+}
+
+func (c *Conn) acquireOutboundOp() *outboundOp {
+	return c.operationPool().acquire()
+}
+
+func (c *Conn) releaseOutboundOp(op *outboundOp) {
+	c.operationPool().release(op)
 }
 
 // outboundBodyReservation bridges the only gap between producing an immutable
@@ -149,23 +208,22 @@ func (r *outboundBodyReservation) release() {
 	budget.release(bytes)
 }
 
-func (r *outboundBodyReservation) take(encoded *encodedOutboundMessage) (outboundOp, error) {
+func (r *outboundBodyReservation) take(encoded *encodedOutboundMessage, pool *outboundOpPool) (*outboundOp, error) {
 	if r == nil {
-		return outboundOp{}, errors.New("invalid outbound body reservation")
+		return nil, errors.New("invalid outbound body reservation")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.budget == nil || r.bytes <= 0 || r.taken || r.releaseRequested || encoded == nil || len(encoded.body) != r.bytes {
-		return outboundOp{}, errors.New("invalid outbound body reservation")
+		return nil, errors.New("invalid outbound body reservation")
 	}
-	op := outboundOp{
-		kind:              outboundSend,
-		msgType:           proto.MessageServerResponse,
-		encoded:           encoded,
-		priority:          classifyOutboundPriority(encoded, false),
-		reservedBytes:     r.bytes,
-		reservationBudget: r.budget,
-	}
+	op := pool.acquire()
+	op.kind = outboundSend
+	op.msgType = proto.MessageServerResponse
+	op.encoded = encoded
+	op.priority = classifyOutboundPriority(encoded, false)
+	op.reservedBytes = r.bytes
+	op.reservationBudget = r.budget
 	r.bytes = 0
 	r.budget = nil
 	r.taken = true
@@ -244,8 +302,16 @@ func (m *encodedOutboundMessage) wireSize() int {
 }
 
 func (m *encodedOutboundMessage) materializeRPCResultBody(ctx context.Context, reqMsgID int64) ([]byte, error) {
+	body, _, err := m.materializeRPCResultBodyInto(ctx, reqMsgID, nil)
+	return body, err
+}
+
+// materializeRPCResultBodyInto rebuilds a descriptor-backed rpc_result directly
+// into scratch. It avoids the former inner allocation followed by a second
+// envelope allocation/copy. usedScratch is true only while body aliases scratch.
+func (m *encodedOutboundMessage) materializeRPCResultBodyInto(ctx context.Context, reqMsgID int64, scratch []byte) (body []byte, usedScratch bool, err error) {
 	if m == nil || m.typeID != proto.ResultTypeID || reqMsgID == 0 {
-		return nil, errors.New("invalid rpc_result materialization")
+		return nil, false, errors.New("invalid rpc_result materialization")
 	}
 	if len(m.body) >= 12 {
 		body := m.body
@@ -253,31 +319,31 @@ func (m *encodedOutboundMessage) materializeRPCResultBody(ctx context.Context, r
 			body = append([]byte(nil), body...)
 			binary.LittleEndian.PutUint64(body[4:12], uint64(reqMsgID))
 		}
-		return body, nil
+		return body, false, nil
 	}
 	if m.replaySource == nil || m.compressed {
-		return nil, errors.New("rpc_result body is not materializable")
+		return nil, false, errors.New("rpc_result body is not materializable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var inner bin.Buffer
-	if err := m.replaySource.EncodeInner(ctx, &inner); err != nil {
-		return nil, fmt.Errorf("materialize immutable rpc_result: %w", err)
-	}
-	innerBytes := inner.Raw()
-	if len(innerBytes) != m.uncompressedBytes || sha256.Sum256(innerBytes) != m.innerDigest {
-		return nil, errors.New("immutable rpc_result inner digest mismatch")
-	}
 	var envelope bin.Buffer
+	envelope.Buf = scratch[:0]
 	envelope.PutID(proto.ResultTypeID)
 	envelope.PutLong(reqMsgID)
-	envelope.Put(innerBytes)
-	body := envelope.Raw()
-	if m.logicalBytes > 0 && len(body) != m.logicalBytes {
-		return nil, errors.New("immutable rpc_result body length mismatch")
+	if err := m.replaySource.EncodeInner(ctx, &envelope); err != nil {
+		return nil, false, fmt.Errorf("materialize immutable rpc_result: %w", err)
 	}
-	return body, nil
+	body = envelope.Raw()
+	innerBytes := body[12:]
+	if len(innerBytes) != m.uncompressedBytes || sha256.Sum256(innerBytes) != m.innerDigest {
+		return nil, false, errors.New("immutable rpc_result inner digest mismatch")
+	}
+	if m.logicalBytes > 0 && len(body) != m.logicalBytes {
+		return nil, false, errors.New("immutable rpc_result body length mismatch")
+	}
+	usedScratch = len(scratch) == 0 && cap(scratch) > 0 && len(body) > 0 && &body[0] == &scratch[:cap(scratch)][0]
+	return body, usedScratch, nil
 }
 
 type rpcResultDeliveryState uint32
@@ -907,12 +973,12 @@ func (f *outboundFrame) logicalSize() int {
 	return len(f.body)
 }
 
-func (f *outboundFrame) materialized(ctx context.Context) (*outboundFrame, error) {
+func (f *outboundFrame) materialized(ctx context.Context, scratch []byte) (*outboundFrame, bool, error) {
 	if f == nil {
-		return nil, errors.New("nil outbound replay frame")
+		return nil, false, errors.New("nil outbound replay frame")
 	}
 	if len(f.body) > 0 {
-		return f, nil
+		return f, false, nil
 	}
 	encoded := &encodedOutboundMessage{
 		typeID:            f.typeID,
@@ -923,26 +989,27 @@ func (f *outboundFrame) materialized(ctx context.Context) (*outboundFrame, error
 		innerDigest:       f.innerDigest,
 		logicalBytes:      f.logicalBytes,
 	}
-	body, err := encoded.materializeRPCResultBody(ctx, f.reqMsgID)
+	body, usedScratch, err := encoded.materializeRPCResultBodyInto(ctx, f.reqMsgID, scratch)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	copyFrame := *f
 	copyFrame.body = body
-	return &copyFrame, nil
+	return &copyFrame, usedScratch, nil
 }
 
 type outboundState struct {
-	mu          sync.Mutex
-	pending     map[int64]*outboundFrame
-	order       []int64
-	byRequest   map[int64]int64
-	acked       map[int64]struct{}
-	ackOrder    []int64
-	totalBytes  int
-	maxMessages int
-	maxBytes    int
-	budget      *outboundTrackedBudget
+	mu           sync.Mutex
+	pending      map[int64]*outboundFrame
+	order        []int64
+	byRequest    map[int64]int64
+	acked        map[int64]struct{}
+	ackOrder     []int64
+	ackOrderHead int
+	totalBytes   int
+	maxMessages  int
+	maxBytes     int
+	budget       *outboundTrackedBudget
 	// sentContentMessages is logical-session state, not physical-connection
 	// state. Reserving a new content frame advances it before the first write so
 	// a failed write can be replayed with the same seq_no after reconnect.
@@ -1301,10 +1368,10 @@ func (c *Conn) startOutbound() {
 	criticalSize := min(defaultOutboundCriticalQueueSize, max(1, c.outboundQueueSize/8))
 	bulkSize := min(defaultOutboundBulkQueueSize, max(1, c.outboundQueueSize/8))
 	normalSize := c.outboundQueueSize - criticalSize - bulkSize
-	c.outbound = make(chan outboundOp, normalSize)
-	c.outboundControl = make(chan outboundOp, c.outboundControlQueueSize)
-	c.outboundCritical = make(chan outboundOp, criticalSize)
-	c.outboundBulk = make(chan outboundOp, bulkSize)
+	c.outbound = make(chan *outboundOp, normalSize)
+	c.outboundControl = make(chan *outboundOp, c.outboundControlQueueSize)
+	c.outboundCritical = make(chan *outboundOp, criticalSize)
+	c.outboundBulk = make(chan *outboundOp, bulkSize)
 	c.outboundStop = make(chan struct{})
 	c.outboundDone = make(chan struct{})
 	// Publish the actor state before starting its goroutine. The pointer remains
@@ -1521,6 +1588,7 @@ func (c *Conn) sendBestEffort(ctx context.Context, t proto.MessageType, msg bin.
 	}
 	if !c.beginOutboundEnqueue() {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ErrConnClosed
 	}
 	defer c.endOutboundEnqueue()
@@ -1534,11 +1602,13 @@ func (c *Conn) sendBestEffort(ctx context.Context, t proto.MessageType, msg bin.
 		return nil
 	case <-c.outboundStop:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ErrConnClosed
 	default:
 	}
 	if timeout == 0 {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		c.metrics.OutboundDropped("push_queue_full")
 		return ErrOutboundQueueFull
 	}
@@ -1557,13 +1627,16 @@ func (c *Conn) sendBestEffort(ctx context.Context, t proto.MessageType, msg bin.
 		return nil
 	case <-timeoutC:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		c.metrics.OutboundDropped("push_queue_timeout")
 		return ErrOutboundQueueFull
 	case <-ctx.Done():
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ctx.Err()
 	case <-c.outboundStop:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ErrConnClosed
 	}
 }
@@ -1622,12 +1695,12 @@ func (c *Conn) enqueueEncodedDeliveryReserved(
 			return err
 		}
 	}
-	var op outboundOp
+	var op *outboundOp
 	var err error
 	if reserved == nil {
 		op, err = c.newOutboundSendOp(ctx, t, nil, encoded, false)
 	} else {
-		op, err = reserved.take(encoded)
+		op, err = reserved.take(encoded, c.operationPool())
 		if err == nil {
 			op.msgType = t
 		}
@@ -1641,9 +1714,10 @@ func (c *Conn) enqueueEncodedDeliveryReserved(
 		return err
 	}
 	if !c.beginOutboundEnqueue() {
-		if reserved == nil || !reserved.reclaim(&op) {
+		if reserved == nil || !reserved.reclaim(op) {
 			op.releaseReservation(c.outboundTrackedBudget)
 		}
+		c.releaseOutboundOp(op)
 		if encoded != nil {
 			encoded.markReplayable()
 			encoded.releaseBulkCredit()
@@ -1655,9 +1729,10 @@ func (c *Conn) enqueueEncodedDeliveryReserved(
 	op.enqueuedAt = time.Now()
 	op.terminal = terminal
 	if err := c.enqueueOutboundRegistered(ctx, op); err != nil {
-		if reserved == nil || !reserved.reclaim(&op) {
+		if reserved == nil || !reserved.reclaim(op) {
 			op.releaseReservation(c.outboundTrackedBudget)
 		}
+		c.releaseOutboundOp(op)
 		c.endOutboundEnqueue()
 		if encoded != nil {
 			encoded.markReplayable()
@@ -1716,12 +1791,12 @@ func (c *Conn) sendOutboundWithTerminalReserved(
 		}
 		return ErrConnClosed
 	}
-	var op outboundOp
+	var op *outboundOp
 	var err error
 	if reserved == nil {
 		op, err = c.newOutboundSendOp(ctx, t, msg, encoded, control)
 	} else {
-		op, err = reserved.take(encoded)
+		op, err = reserved.take(encoded, c.operationPool())
 		if err == nil {
 			op.msgType = t
 			op.msg = msg
@@ -1736,9 +1811,10 @@ func (c *Conn) sendOutboundWithTerminalReserved(
 		return err
 	}
 	if !c.beginOutboundEnqueue() {
-		if reserved == nil || !reserved.reclaim(&op) {
+		if reserved == nil || !reserved.reclaim(op) {
 			op.releaseReservation(c.outboundTrackedBudget)
 		}
+		c.releaseOutboundOp(op)
 		if terminal != nil {
 			terminal(ErrConnClosed)
 		}
@@ -1747,12 +1823,14 @@ func (c *Conn) sendOutboundWithTerminalReserved(
 	op.control = control
 	op.ctx = ctx
 	op.enqueuedAt = time.Now()
-	op.done = make(chan outboundResult, 1)
+	done := make(chan outboundResult, 1)
+	op.done = done
 	op.terminal = terminal
 	if err := c.enqueueOutboundRegistered(ctx, op); err != nil {
-		if reserved == nil || !reserved.reclaim(&op) {
+		if reserved == nil || !reserved.reclaim(op) {
 			op.releaseReservation(c.outboundTrackedBudget)
 		}
+		c.releaseOutboundOp(op)
 		c.endOutboundEnqueue()
 		if terminal != nil {
 			terminal(err)
@@ -1761,21 +1839,21 @@ func (c *Conn) sendOutboundWithTerminalReserved(
 	}
 	c.endOutboundEnqueue()
 	select {
-	case res := <-op.done:
+	case res := <-done:
 		return res.err
 	case <-ctx.Done():
 		// A physical write can complete at the same instant as the caller's
 		// deadline. Prefer the actor's terminal result when it is already
 		// available so required-control callers do not poison a healthy Conn.
 		select {
-		case res := <-op.done:
+		case res := <-done:
 			return res.err
 		default:
 		}
 		return ctx.Err()
 	case <-c.outboundStop:
 		select {
-		case res := <-op.done:
+		case res := <-done:
 			return res.err
 		default:
 		}
@@ -1802,6 +1880,7 @@ func (c *Conn) SendAsync(ctx context.Context, t proto.MessageType, msg bin.Encod
 	}
 	if !c.beginOutboundEnqueue() {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ErrConnClosed
 	}
 	defer c.endOutboundEnqueue()
@@ -1814,9 +1893,11 @@ func (c *Conn) SendAsync(ctx context.Context, t proto.MessageType, msg bin.Encod
 		return nil
 	case <-c.outboundStop:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return ErrConnClosed
 	default:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		c.metrics.OutboundDropped("control_queue_full")
 		return nil
 	}
@@ -1834,6 +1915,7 @@ func (c *Conn) AckServerMessages(ids []int64) {
 	}
 	if !c.beginOutboundEnqueue() {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return
 	}
 	defer c.endOutboundEnqueue()
@@ -1841,8 +1923,10 @@ func (c *Conn) AckServerMessages(ids []int64) {
 	case c.outboundControl <- op:
 	case <-c.outboundStop:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 	default:
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		c.metrics.OutboundDropped("ack_queue_full")
 	}
 }
@@ -1859,13 +1943,15 @@ func (c *Conn) OutgoingStateInfo(ctx context.Context, ids []int64) ([]byte, erro
 		return nil, err
 	}
 	op.ctx = ctx
-	op.done = make(chan outboundResult, 1)
+	done := make(chan outboundResult, 1)
+	op.done = done
 	if err := c.enqueueOutbound(ctx, op); err != nil {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return nil, err
 	}
 	select {
-	case res := <-op.done:
+	case res := <-done:
 		return res.info, res.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1885,13 +1971,15 @@ func (c *Conn) ResendMessages(ctx context.Context, ids []int64) ([]byte, error) 
 		return nil, err
 	}
 	op.ctx = ctx
-	op.done = make(chan outboundResult, 1)
+	done := make(chan outboundResult, 1)
+	op.done = done
 	if err := c.enqueueOutbound(ctx, op); err != nil {
 		op.releaseReservation(c.outboundTrackedBudget)
+		c.releaseOutboundOp(op)
 		return nil, err
 	}
 	select {
-	case res := <-op.done:
+	case res := <-done:
 		return res.info, res.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1905,18 +1993,19 @@ func (c *Conn) ResendByRequest(ctx context.Context, reqMsgID int64) (bool, error
 	if c.outbound == nil {
 		return false, ErrConnClosed
 	}
-	op := outboundOp{
-		kind:     outboundResendByRequest,
-		control:  true,
-		ctx:      ctx,
-		reqMsgID: reqMsgID,
-		done:     make(chan outboundResult, 1),
-	}
+	op := c.acquireOutboundOp()
+	done := make(chan outboundResult, 1)
+	op.kind = outboundResendByRequest
+	op.control = true
+	op.ctx = ctx
+	op.reqMsgID = reqMsgID
+	op.done = done
 	if err := c.enqueueOutbound(ctx, op); err != nil {
+		c.releaseOutboundOp(op)
 		return false, err
 	}
 	select {
-	case res := <-op.done:
+	case res := <-done:
 		return res.resent, res.err
 	case <-ctx.Done():
 		return false, ctx.Err()
@@ -1925,7 +2014,7 @@ func (c *Conn) ResendByRequest(ctx context.Context, reqMsgID int64) (bool, error
 	}
 }
 
-func (c *Conn) enqueueOutbound(ctx context.Context, op outboundOp) error {
+func (c *Conn) enqueueOutbound(ctx context.Context, op *outboundOp) error {
 	if !c.beginOutboundEnqueue() {
 		return ErrConnClosed
 	}
@@ -1933,7 +2022,7 @@ func (c *Conn) enqueueOutbound(ctx context.Context, op outboundOp) error {
 	return c.enqueueOutboundRegistered(ctx, op)
 }
 
-func (c *Conn) enqueueOutboundRegistered(ctx context.Context, op outboundOp) error {
+func (c *Conn) enqueueOutboundRegistered(ctx context.Context, op *outboundOp) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1961,7 +2050,7 @@ func (c *Conn) enqueueOutboundRegistered(ctx context.Context, op outboundOp) err
 	}
 }
 
-func (c *Conn) outboundQueue(op outboundOp) chan outboundOp {
+func (c *Conn) outboundQueue(op *outboundOp) chan *outboundOp {
 	if op.control || op.priority == outboundPriorityControl {
 		return c.outboundControl
 	}
@@ -2021,11 +2110,13 @@ func (c *Conn) outboundLoop() {
 		if c.isRetired() {
 			op.finish(outboundResult{err: ErrConnClosed})
 			op.releaseReservation(c.outboundTrackedBudget)
+			c.releaseOutboundOp(op)
 			c.signalOutboundStop()
 			c.drainOutbound()
 			return
 		}
 		c.handleOutboundOp(state, op)
+		c.releaseOutboundOp(op)
 		if c.isRetired() {
 			c.signalOutboundStop()
 			c.drainOutbound()
@@ -2037,13 +2128,13 @@ func (c *Conn) outboundLoop() {
 // nextOutboundOp applies the connection-wide egress policy without introducing
 // another writer. Required protocol controls stay strict, convergence RPCs pass
 // ordinary/bulk work, and a bounded ordinary burst guarantees bulk progress.
-func (c *Conn) nextOutboundOp(ordinarySinceBulk *int) (outboundOp, bool) {
-	try := func(q <-chan outboundOp) (outboundOp, bool) {
+func (c *Conn) nextOutboundOp(ordinarySinceBulk *int) (*outboundOp, bool) {
+	try := func(q <-chan *outboundOp) (*outboundOp, bool) {
 		select {
 		case op := <-q:
 			return op, true
 		default:
-			return outboundOp{}, false
+			return nil, false
 		}
 	}
 	if op, ok := try(c.outboundControl); ok {
@@ -2069,7 +2160,7 @@ func (c *Conn) nextOutboundOp(ordinarySinceBulk *int) (outboundOp, bool) {
 
 	select {
 	case <-c.outboundStop:
-		return outboundOp{}, false
+		return nil, false
 	case op := <-c.outboundControl:
 		return op, true
 	case op := <-c.outboundCritical:
@@ -2093,22 +2184,29 @@ func (c *Conn) drainOutbound() {
 		case op := <-c.outboundControl:
 			op.finish(outboundResult{err: ErrConnClosed})
 			op.releaseReservation(c.outboundTrackedBudget)
+			c.releaseOutboundOp(op)
 		case op := <-c.outboundCritical:
 			op.finish(outboundResult{err: ErrConnClosed})
 			op.releaseReservation(c.outboundTrackedBudget)
+			c.releaseOutboundOp(op)
 		case op := <-c.outbound:
 			op.finish(outboundResult{err: ErrConnClosed})
 			op.releaseReservation(c.outboundTrackedBudget)
+			c.releaseOutboundOp(op)
 		case op := <-c.outboundBulk:
 			op.finish(outboundResult{err: ErrConnClosed})
 			op.releaseReservation(c.outboundTrackedBudget)
+			c.releaseOutboundOp(op)
 		default:
 			return
 		}
 	}
 }
 
-func (c *Conn) handleOutboundOp(state *outboundState, op outboundOp) {
+func (c *Conn) handleOutboundOp(state *outboundState, op *outboundOp) {
+	if op == nil {
+		return
+	}
 	// An operation can sit in a bounded queue across the protocol expiry instant.
 	// It must be failed and released without touching the wire.
 	if c.authKeyProtocolUnavailableNow() {
@@ -2159,7 +2257,7 @@ func (c *Conn) handleOutboundOp(state *outboundState, op outboundOp) {
 	op.finish(result)
 }
 
-func (c *Conn) handleOutboundSend(state *outboundState, op outboundOp) error {
+func (c *Conn) handleOutboundSend(state *outboundState, op *outboundOp) error {
 	var binding *outboundLayerBinding
 	if op.encoded != nil {
 		binding = op.encoded.layer
@@ -2316,7 +2414,7 @@ func (c *Conn) handleOutboundResend(state *outboundState, ctx context.Context, i
 			}
 			return info, err
 		}
-		physical, reservation, materializeErr := c.materializeFrameForWrite(ctx, frame)
+		physical, reservation, bodyLease, materializeErr := c.materializeFrameForWrite(ctx, frame)
 		if materializeErr != nil {
 			if lockedLayer {
 				c.layerProfileMu.RUnlock()
@@ -2326,6 +2424,7 @@ func (c *Conn) handleOutboundResend(state *outboundState, ctx context.Context, i
 		}
 		err := c.writeFrame(ctx, physical)
 		reservation.release()
+		bodyLease.release()
 		if err != nil {
 			if lockedLayer {
 				c.layerProfileMu.RUnlock()
@@ -2353,13 +2452,14 @@ func (c *Conn) handleOutboundResendByRequest(state *outboundState, ctx context.C
 	if !ok {
 		return false, nil
 	}
-	physical, reservation, err := c.materializeFrameForWrite(ctx, frame)
+	physical, reservation, bodyLease, err := c.materializeFrameForWrite(ctx, frame)
 	if err != nil {
 		c.metrics.OutboundResend(0, err)
 		return false, err
 	}
 	err = c.writeFrame(ctx, physical)
 	reservation.release()
+	bodyLease.release()
 	if err != nil {
 		c.metrics.OutboundResend(0, err)
 		return false, err
@@ -2370,22 +2470,33 @@ func (c *Conn) handleOutboundResendByRequest(state *outboundState, ctx context.C
 	return true, nil
 }
 
-func (c *Conn) materializeFrameForWrite(ctx context.Context, frame *outboundFrame) (*outboundFrame, *outboundBodyReservation, error) {
+func (c *Conn) materializeFrameForWrite(ctx context.Context, frame *outboundFrame) (*outboundFrame, *outboundBodyReservation, outboundReplayBodyLease, error) {
 	if frame == nil || len(frame.body) > 0 {
-		return frame, nil, nil
+		return frame, nil, outboundReplayBodyLease{}, nil
 	}
 	var (
-		physical *outboundFrame
-		reserved *outboundBodyReservation
+		physical  *outboundFrame
+		reserved  *outboundBodyReservation
+		bodyLease outboundReplayBodyLease
 	)
 	err := withOutboundEncodeSlot(ctx, c.outboundStop, func() error {
+		pool := c.replayBodyPool()
+		scratch, class := pool.acquire(frame.logicalSize())
 		var err error
-		physical, err = frame.materialized(ctx)
+		var usedScratch bool
+		physical, usedScratch, err = frame.materialized(ctx, scratch)
 		if err != nil {
+			pool.release(class, scratch)
 			return err
+		}
+		if usedScratch {
+			bodyLease = outboundReplayBodyLease{pool: pool, class: class, buf: physical.body}
+		} else {
+			pool.release(class, scratch)
 		}
 		budget := c.outboundMessageBudgetForPriority(frame.typeID, frame.priority, false)
 		if !budget.reserve(len(physical.body)) {
+			bodyLease.release()
 			physical = nil
 			return ErrOutboundTrackedBudget
 		}
@@ -2393,12 +2504,15 @@ func (c *Conn) materializeFrameForWrite(ctx context.Context, frame *outboundFram
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, outboundReplayBodyLease{}, err
 	}
-	return physical, reserved, nil
+	return physical, reserved, bodyLease, nil
 }
 
-func (op outboundOp) finish(res outboundResult) {
+func (op *outboundOp) finish(res outboundResult) {
+	if op == nil {
+		return
+	}
 	if op.terminal != nil {
 		op.terminal(res.err)
 	}
@@ -2431,22 +2545,22 @@ func (op *outboundOp) releaseReservation(budget *outboundTrackedBudget) {
 	budget.release(bytes)
 }
 
-func (c *Conn) newOutboundVectorOp(kind outboundOpKind, ids []int64) (outboundOp, error) {
+func (c *Conn) newOutboundVectorOp(kind outboundOpKind, ids []int64) (*outboundOp, error) {
 	bytes := len(ids) * 8
 	budget := c.ensureOutboundControlTrackedBudget()
 	if !budget.reserve(bytes) {
-		return outboundOp{}, ErrOutboundTrackedBudget
+		return nil, ErrOutboundTrackedBudget
 	}
-	return outboundOp{
-		kind:              kind,
-		control:           true,
-		ids:               append([]int64(nil), ids...),
-		reservedBytes:     bytes,
-		reservationBudget: budget,
-	}, nil
+	op := c.acquireOutboundOp()
+	op.kind = kind
+	op.control = true
+	op.ids = append([]int64(nil), ids...)
+	op.reservedBytes = bytes
+	op.reservationBudget = budget
+	return op, nil
 }
 
-func (c *Conn) newOutboundSendOp(ctx context.Context, t proto.MessageType, msg bin.Encoder, encoded *encodedOutboundMessage, priorityControl bool) (outboundOp, error) {
+func (c *Conn) newOutboundSendOp(ctx context.Context, t proto.MessageType, msg bin.Encoder, encoded *encodedOutboundMessage, priorityControl bool) (*outboundOp, error) {
 	var budget *outboundTrackedBudget
 	if encoded == nil {
 		var bytes int
@@ -2474,41 +2588,41 @@ func (c *Conn) newOutboundSendOp(ctx context.Context, t proto.MessageType, msg b
 			return nil
 		})
 		if err != nil {
-			return outboundOp{}, err
+			return nil, err
 		}
-		return outboundOp{
-			kind:              outboundSend,
-			msgType:           t,
-			encoded:           encoded,
-			priority:          classifyOutboundPriority(encoded, priorityControl),
-			reservedBytes:     bytes,
-			reservationBudget: budget,
-		}, nil
+		op := c.acquireOutboundOp()
+		op.kind = outboundSend
+		op.msgType = t
+		op.encoded = encoded
+		op.priority = classifyOutboundPriority(encoded, priorityControl)
+		op.reservedBytes = bytes
+		op.reservationBudget = budget
+		return op, nil
 	}
 	if encoded == nil {
-		return outboundOp{}, errors.New("nil encoded outbound message")
+		return nil, errors.New("nil encoded outbound message")
 	}
 	// Catch correction-before-enqueue synchronously. The actor repeats the same
 	// validation immediately before framing to close the bounded queue race.
 	if err := validateOutboundLayerBinding(c, encoded); err != nil {
-		return outboundOp{}, err
+		return nil, err
 	}
 	bytes := len(encoded.body)
 	if bytes > maxOutboundBodyBytes {
-		return outboundOp{}, fmt.Errorf("%w: body=%d limit=%d", ErrOutboundMessageTooLarge, bytes, maxOutboundBodyBytes)
+		return nil, fmt.Errorf("%w: body=%d limit=%d", ErrOutboundMessageTooLarge, bytes, maxOutboundBodyBytes)
 	}
 	budget = c.outboundMessageBudgetForPriority(encoded.typeID, encoded.priority, priorityControl)
 	if !budget.reserve(bytes) {
-		return outboundOp{}, ErrOutboundTrackedBudget
+		return nil, ErrOutboundTrackedBudget
 	}
-	return outboundOp{
-		kind:              outboundSend,
-		msgType:           t,
-		encoded:           encoded,
-		priority:          classifyOutboundPriority(encoded, priorityControl),
-		reservedBytes:     bytes,
-		reservationBudget: budget,
-	}, nil
+	op := c.acquireOutboundOp()
+	op.kind = outboundSend
+	op.msgType = t
+	op.encoded = encoded
+	op.priority = classifyOutboundPriority(encoded, priorityControl)
+	op.reservedBytes = bytes
+	op.reservationBudget = budget
+	return op, nil
 }
 
 func classifyOutboundPriority(encoded *encodedOutboundMessage, control bool) outboundPriority {
@@ -3143,12 +3257,14 @@ func (s *outboundState) markAcked(id int64) {
 		s.acked = make(map[int64]struct{})
 	}
 	s.acked[id] = struct{}{}
-	s.ackOrder = append(s.ackOrder, id)
-	for len(s.ackOrder) > maxTrackedAckedMsgIDs {
-		oldest := s.ackOrder[0]
-		s.ackOrder = s.ackOrder[1:]
-		delete(s.acked, oldest)
+	if len(s.ackOrder) < maxTrackedAckedMsgIDs {
+		s.ackOrder = append(s.ackOrder, id)
+		return
 	}
+	oldest := s.ackOrder[s.ackOrderHead]
+	s.ackOrder[s.ackOrderHead] = id
+	s.ackOrderHead = (s.ackOrderHead + 1) % len(s.ackOrder)
+	delete(s.acked, oldest)
 }
 
 // shrinkPending remains only for focused legacy state tests. Production
@@ -3206,6 +3322,9 @@ func (s *outboundState) releaseAll() {
 	s.pending = nil
 	s.order = nil
 	s.byRequest = nil
+	s.acked = nil
+	s.ackOrder = nil
+	s.ackOrderHead = 0
 	s.totalBytes = 0
 }
 

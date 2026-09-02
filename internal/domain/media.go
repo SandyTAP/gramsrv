@@ -124,7 +124,10 @@ type FileDownloadRequest struct {
 	Limit       int
 }
 
-// FileChunk 是 upload.getFile 返回的一段内容。
+// FileChunk 是 upload.getFile 返回的一段内容。Bytes 是只读借用：调用方可以在
+// FileChunk 的生命周期内读取或编码，但不得修改内容、不得把 append 结果写回原
+// backing。文件服务可让 cache/singleflight 的并发 caller 共享 immutable backing，
+// 以避免热门 range 按下载者复制一份 payload。
 type FileChunk struct {
 	Bytes    []byte
 	MimeType string
