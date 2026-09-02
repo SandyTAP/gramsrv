@@ -1174,8 +1174,6 @@ func run(logger *zap.Logger) error {
 			logger.Warn("sync bot branding", zap.Int64("bot", botID), zap.Error(err))
 		}
 	}
-	// Assign embedded avatars to the built-in system account and bots (idempotent).
-	botavatars.Seed(ctx, filesService, logger, time.Now().Unix())
 	groupCallStore := postgres.NewGroupCallStore(pool)
 	groupCallsService := groupcallsapp.NewService(groupCallStore, groupcallsapp.WithPublicBaseURL(cfg.PublicBaseURL))
 	// 群通话媒体面：内嵌 pion SFU（M1+）。SFU 的 liveness reporter 把媒体面存活
@@ -1269,6 +1267,10 @@ func run(logger *zap.Logger) error {
 	if err := premiumStore.EnsurePremiumBotIdentity(ctx, cfg.PremiumBotUsername); err != nil {
 		return fmt.Errorf("configure Premium bot: %w", err)
 	}
+	// Assign embedded avatars to the built-in system account and bots (idempotent).
+	// Runs after EnsurePremiumBotIdentity so the configured Premium bot ID exists
+	// before the avatar is attached to it.
+	botavatars.Seed(ctx, filesService, logger, time.Now().Unix())
 	premiumService := premiumapp.NewService(premiumStore, premiumapp.Config{
 		BotUserID: cfg.PremiumBotUserID,
 		Username:  cfg.PremiumBotUsername,

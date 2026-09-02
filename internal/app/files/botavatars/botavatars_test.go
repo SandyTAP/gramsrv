@@ -84,7 +84,7 @@ func (f *fakeAvatarSetter) BeginTx(_ context.Context) (AvatarSetter, func(error)
 func TestSeedSkipsExistingAvatars(t *testing.T) {
 	av := newFakeAvatarSetter()
 	// Pre-populate ALL peers with existing avatars.
-	for peerID := range fileForPeer {
+	for peerID := range peersForSeed() {
 		av.currentPhotos[peerID] = int64(peerID)
 	}
 
@@ -229,7 +229,39 @@ func TestSeedCreatesAllBots(t *testing.T) {
 			t.Errorf("peer %d was not seeded", peer)
 		}
 	}
-	if len(av.created) != len(fileForPeer) {
-		t.Errorf("expected %d photos created, got %d", len(fileForPeer), len(av.created))
+	if len(av.created) != len(peersForSeed()) {
+		t.Errorf("expected %d photos created, got %d", len(peersForSeed()), len(av.created))
+	}
+}
+
+func TestSeedUsesConfiguredPremiumBotID(t *testing.T) {
+	const customPremiumID = int64(900000001)
+	prev := domain.PremiumBotConfiguredUserID()
+	if !domain.ConfigurePremiumBotUserID(customPremiumID) {
+		t.Fatalf("failed to configure custom premium bot ID")
+	}
+	t.Cleanup(func() {
+		domain.ConfigurePremiumBotUserID(prev)
+	})
+
+	av := newFakeAvatarSetter()
+	Seed(context.Background(), av, zap.NewNop(), 1000)
+
+	av.mu.Lock()
+	defer av.mu.Unlock()
+	var foundCustom, foundDefault bool
+	for _, sc := range av.setCalls {
+		if sc.peerID == customPremiumID {
+			foundCustom = true
+		}
+		if sc.peerID == domain.PremiumBotUserID {
+			foundDefault = true
+		}
+	}
+	if !foundCustom {
+		t.Errorf("configured premium bot ID %d was not seeded", customPremiumID)
+	}
+	if foundDefault {
+		t.Errorf("default premium bot ID %d should not be seeded when configured", domain.PremiumBotUserID)
 	}
 }

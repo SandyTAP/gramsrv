@@ -13,6 +13,8 @@ import (
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 
+	"telesrv/internal/app/files/botavatars"
+
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -191,23 +193,19 @@ type txMediaStore interface {
 // calls across instances), begins a database transaction, and returns a
 // transaction-scoped AvatarSetter. The returned release function MUST be
 // called (via defer) to commit/rollback and release the advisory lock.
-func (s *Service) BeginTx(ctx context.Context) (txAv interface {
-	CurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (domain.Photo, bool, error)
-	CreateAvatarFromBytes(ctx context.Context, data []byte) (domain.Photo, error)
-	CreateAvatarVideoFromBytes(ctx context.Context, data []byte, videoStartTs float64) (domain.Photo, error)
-	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error)
-}, release func(err error), retErr error) {
+func (s *Service) BeginTx(ctx context.Context) (botavatars.AvatarSetter, func(err error), error) {
 	txMs, ok := s.media.(txMediaStore)
 	if !ok {
-		retErr = fmt.Errorf("bot avatar: media store does not support transactions")
+		retErr := fmt.Errorf("bot avatar: media store does not support transactions")
 		return nil, nil, retErr
 	}
 	var txService *Service
 	released := make(chan struct{})
-	release = func(err error) {
+	release := func(err error) {
 		close(released)
 	}
-	retErr = txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
+	var txAv botavatars.AvatarSetter
+	retErr := txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
 		txService = &Service{
 			media:              txMedia,
 			blobs:              s.blobs,
@@ -219,10 +217,11 @@ func (s *Service) BeginTx(ctx context.Context) (txAv interface {
 			stickerSetNegCache: s.stickerSetNegCache,
 			uploadQuota:        s.uploadQuota,
 		}
+		txAv = txService
 		<-released
 		return nil
 	})
-	return txService, release, retErr
+	return txAv, release, retErr
 }
 
 // SaveFilePart 累积一个 small file 分片。

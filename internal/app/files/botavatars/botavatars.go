@@ -17,15 +17,18 @@ var assets embed.FS
 // bot-avatar seeding across concurrent instances.
 const advisoryLockKey = int64(0x626f746176617461) // "botavata"
 
-// fileForPeer maps a built-in system peer to its embedded avatar file.
-// 777000 uses telegram.jpg (the system account); the rest are the branded bot icons.
-var fileForPeer = map[int64]string{
-	domain.OfficialSystemUserID: "telegram.jpg",
-	domain.BotFatherUserID:      "botfather.jpg",
-	domain.StickersBotUserID:    "stickers.jpg",
-	domain.VerifyBotUserID:      "verifybot.jpg",
-	domain.GifBotUserID:         "gif.jpg",
-	domain.PremiumBotUserID:     "premiumbot.mp4",
+// peersForSeed returns the peer→avatar mapping, using the configured
+// Premium bot ID instead of the compile-time constant so that deployments
+// with TELESRV_PREMIUM_BOT_USER_ID get the avatar on the right identity.
+func peersForSeed() map[int64]string {
+	return map[int64]string{
+		domain.OfficialSystemUserID:         "telegram.jpg",
+		domain.BotFatherUserID:              "botfather.jpg",
+		domain.StickersBotUserID:            "stickers.jpg",
+		domain.VerifyBotUserID:              "verifybot.jpg",
+		domain.GifBotUserID:                 "gif.jpg",
+		domain.PremiumBotConfiguredUserID(): "premiumbot.mp4",
+	}
 }
 
 // AvatarSetter is the subset of the files service used to assign avatars.
@@ -52,7 +55,7 @@ func Seed(ctx context.Context, av AvatarSetter, logger *zap.Logger, now int64) {
 	}
 	defer release(nil)
 
-	for peerID, fname := range fileForPeer {
+	for peerID, fname := range peersForSeed() {
 		if _, ok, err := txAv.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, peerID, domain.ProfilePhotoKindProfile); err != nil {
 			logger.Warn("bot avatar: read current", zap.Int64("peer", peerID), zap.Error(err))
 			continue
