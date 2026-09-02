@@ -104,6 +104,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-admin ./cmd/telesrv-admin
 
+FROM ${ALPINE_IMAGE} AS langpack-bundle
+WORKDIR /usr/share/telesrv/langpack
+COPY data/langpack/ ./
+RUN set -eu; \
+    find . -type f -name '*.strings' -print | LC_ALL=C sort > /tmp/langpack-files; \
+    test -s /tmp/langpack-files; \
+    while IFS= read -r file; do sha256sum "$file"; done < /tmp/langpack-files \
+      | sha256sum | cut -d ' ' -f 1 > .seed-fingerprint; \
+    grep -Eq '^[0-9a-f]{64}$' .seed-fingerprint
+
 FROM ${ALPINE_IMAGE} AS runtime-base
 
 ARG VCS_REF=unknown
@@ -158,7 +168,7 @@ RUN install -d -o telesrv -g telesrv -m 0750 \
       /var/lib/telesrv-core/telegram-login \
       /var/tmp/telesrv-core
 COPY --from=build-core /out/telesrv-core /usr/local/bin/telesrv-core
-COPY --chown=telesrv:telesrv data/langpack/ /usr/share/telesrv/langpack/
+COPY --from=langpack-bundle --chown=telesrv:telesrv /usr/share/telesrv/langpack/ /usr/share/telesrv/langpack/
 COPY --chown=telesrv:telesrv deploy/docker/assets/seed-manifest.json /usr/share/telesrv/seed-manifest.json
 COPY --chown=telesrv:telesrv deploy/docker/config/core.yaml /etc/telesrv/core.yaml
 USER 10001:10001

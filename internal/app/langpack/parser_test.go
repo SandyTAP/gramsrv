@@ -117,6 +117,56 @@ func TestSeedDirectoryWalksClientSubdirs(t *testing.T) {
 	}
 }
 
+func TestSeedDirectorySkipsReconcileForMatchingImageFingerprint(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	packDir := filepath.Join(root, "tdesktop")
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatalf("mkdir pack dir: %v", err)
+	}
+	writeLangPackFixture(t, filepath.Join(packDir, "tdesktop_en_v1.strings"), `"lng_language_name" = "English";`)
+	fingerprintPath := filepath.Join(root, seedFingerprintFilename)
+	fingerprint := strings.Repeat("a", 64)
+	if err := os.WriteFile(fingerprintPath, []byte(fingerprint+"\n"), 0o600); err != nil {
+		t.Fatalf("write fingerprint: %v", err)
+	}
+
+	store := &fingerprintCountingLangPackStore{LangPackStore: memory.NewLangPackStore()}
+	service := NewService(store)
+	if seeded, err := service.SeedDirectory(ctx, root); err != nil || seeded != 1 {
+		t.Fatalf("first seed = %d, %v", seeded, err)
+	}
+	if store.reconciles != 1 {
+		t.Fatalf("first reconcile count = %d, want 1", store.reconciles)
+	}
+	if seeded, err := service.SeedDirectory(ctx, root); err != nil || seeded != 0 {
+		t.Fatalf("matching fingerprint seed = %d, %v", seeded, err)
+	}
+	if store.reconciles != 1 {
+		t.Fatalf("matching fingerprint reconciled again: count = %d", store.reconciles)
+	}
+
+	if err := os.WriteFile(fingerprintPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("update fingerprint: %v", err)
+	}
+	if seeded, err := service.SeedDirectory(ctx, root); err != nil || seeded != 0 {
+		t.Fatalf("changed fingerprint seed = %d, %v", seeded, err)
+	}
+	if store.reconciles != 2 {
+		t.Fatalf("changed fingerprint reconcile count = %d, want 2", store.reconciles)
+	}
+}
+
+func TestSeedDirectoryRejectsInvalidImageFingerprint(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, seedFingerprintFilename), []byte("not-a-sha256\n"), 0o600); err != nil {
+		t.Fatalf("write fingerprint: %v", err)
+	}
+	if _, err := NewService(memory.NewLangPackStore()).SeedDirectory(context.Background(), root); err == nil || !strings.Contains(err.Error(), "invalid langpack seed fingerprint") {
+		t.Fatalf("invalid fingerprint error = %v", err)
+	}
+}
+
 func TestBundledAndroidPersianLangPackParses(t *testing.T) {
 	root := filepath.Join("..", "..", "..", "data", "langpack", "android")
 	candidates, _, err := scanSeedCandidates(root)
@@ -264,4 +314,14 @@ func writeLangPackFixture(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write langpack fixture %q: %v", path, err)
 	}
+}
+
+type fingerprintCountingLangPackStore struct {
+	*memory.LangPackStore
+	reconciles int
+}
+
+func (s *fingerprintCountingLangPackStore) ReconcileSeed(ctx context.Context, seed domain.LangPackSeed) (int, error) {
+	s.reconciles++
+	return s.LangPackStore.ReconcileSeed(ctx, seed)
 }

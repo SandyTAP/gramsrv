@@ -51,6 +51,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
+      start_interval: 1s
       timeout: 3s
       retries: 20
       start_period: 10s
@@ -79,6 +80,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -qx PONG"]
       interval: 5s
+      start_interval: 1s
       timeout: 3s
       retries: 20
       start_period: 5s
@@ -158,6 +160,7 @@ services:
         - --timeout
         - 3s
       interval: 5s
+      start_interval: 1s
       timeout: 5s
       retries: 6
       start_period: 20s
@@ -274,6 +277,7 @@ services:
         - --timeout
         - 3s
       interval: 5s
+      start_interval: 1s
       timeout: 5s
       retries: 6
       start_period: 60s
@@ -326,6 +330,7 @@ services:
         - --timeout
         - 3s
       interval: 5s
+      start_interval: 1s
       timeout: 5s
       retries: 6
       start_period: 15s
@@ -380,6 +385,7 @@ services:
         - --timeout
         - 3s
       interval: 5s
+      start_interval: 1s
       timeout: 5s
       retries: 6
       start_period: 20s
@@ -437,6 +443,7 @@ services:
         - --timeout
         - 3s
       interval: 5s
+      start_interval: 1s
       timeout: 5s
       retries: 6
       start_period: 15s
@@ -499,6 +506,7 @@ services:
         - --timeout
         - 3s
       interval: 10s
+      start_interval: 1s
       timeout: 5s
       retries: 3
       start_period: 15s

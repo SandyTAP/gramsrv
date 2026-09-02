@@ -219,9 +219,10 @@ func validateSeedEntry(entry domain.LangPackSeedEntry) error {
 
 func seedCatalogSnapshot(seed domain.LangPackSeed) domain.LangPackSeedCatalog {
 	state := domain.LangPackSeedCatalog{
-		Catalog: seed.Catalog,
-		Scopes:  append([]string(nil), seed.Scopes...),
-		Packs:   make([]domain.LangPackSeedCatalogEntry, 0, len(seed.Packs)),
+		Catalog:           seed.Catalog,
+		SourceFingerprint: seed.SourceFingerprint,
+		Scopes:            append([]string(nil), seed.Scopes...),
+		Packs:             make([]domain.LangPackSeedCatalogEntry, 0, len(seed.Packs)),
 	}
 	for _, entry := range seed.Packs {
 		state.Packs = append(state.Packs, domain.LangPackSeedCatalogEntry{

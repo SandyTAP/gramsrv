@@ -16,7 +16,9 @@
     {
       "name": "language-packs",
       "source": "data/langpack",
-      "image_path": "/usr/share/telesrv/langpack"
+      "image_path": "/usr/share/telesrv/langpack",
+      "version_marker": "/usr/share/telesrv/langpack/.seed-fingerprint",
+      "startup_policy": "reconcile only on first import or fingerprint change"
     }
   ],
   "not_included": [

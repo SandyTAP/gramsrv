@@ -23,8 +23,9 @@ func TestLangPackSeedReconciliationPostgres(t *testing.T) {
 	})
 
 	seedV1 := domain.LangPackSeed{
-		Catalog: packName,
-		Scopes:  []string{packName},
+		Catalog:           packName,
+		SourceFingerprint: strings.Repeat("a", 64),
+		Scopes:            []string{packName},
 		Packs: []domain.LangPackSeedEntry{{
 			SourceHash:    "source-v1",
 			ContentHash:   "hash-v1",
@@ -53,7 +54,7 @@ func TestLangPackSeedReconciliationPostgres(t *testing.T) {
 		t.Fatalf("reconcile unchanged v1 = %d, %v", written, err)
 	}
 	catalog, err := store.GetSeedCatalog(ctx, packName)
-	if err != nil || len(catalog.Packs) != 1 || catalog.Packs[0].SourceHash != "source-v1" {
+	if err != nil || catalog.SourceFingerprint != seedV1.SourceFingerprint || len(catalog.Packs) != 1 || catalog.Packs[0].SourceHash != "source-v1" {
 		t.Fatalf("seed catalog = %+v, %v", catalog, err)
 	}
 

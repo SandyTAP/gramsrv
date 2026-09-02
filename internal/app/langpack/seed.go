@@ -1,6 +1,7 @@
 package langpack
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,8 @@ import (
 
 	"telesrv/internal/domain"
 )
+
+const seedFingerprintFilename = ".seed-fingerprint"
 
 type seedCandidate struct {
 	path string
@@ -35,6 +38,23 @@ func (s *Service) SeedDirectory(ctx context.Context, root string) (int, error) {
 		}
 		return 0, fmt.Errorf("stat langpack seed dir: %w", err)
 	}
+	catalog := seedCatalogID(dir)
+	sourceFingerprint, err := readSeedFingerprint(dir)
+	if err != nil {
+		return 0, err
+	}
+	previous, err := s.packs.GetSeedCatalog(ctx, catalog)
+	if err != nil {
+		return 0, fmt.Errorf("get previous langpack seed catalog: %w", err)
+	}
+	// Container images pair their immutable language files with a build-time
+	// content fingerprint. A matching durable catalog proves that this exact
+	// bundle was already reconciled, so normal restarts do no file I/O or DB
+	// transaction for the 100+ MiB seed. Direct source directories without the
+	// marker retain the strict per-file hash verification below.
+	if sourceFingerprint != "" && previous.SourceFingerprint == sourceFingerprint {
+		return 0, nil
+	}
 
 	candidates, scopes, err := scanSeedCandidates(dir)
 	if err != nil {
@@ -47,13 +67,10 @@ func (s *Service) SeedDirectory(ctx context.Context, root string) (int, error) {
 	sort.Strings(keys)
 
 	seed := domain.LangPackSeed{
-		Catalog: seedCatalogID(dir),
-		Scopes:  scopes,
-		Packs:   make([]domain.LangPackSeedEntry, 0, len(keys)),
-	}
-	previous, err := s.packs.GetSeedCatalog(ctx, seed.Catalog)
-	if err != nil {
-		return 0, fmt.Errorf("get previous langpack seed catalog: %w", err)
+		Catalog:           catalog,
+		SourceFingerprint: sourceFingerprint,
+		Scopes:            scopes,
+		Packs:             make([]domain.LangPackSeedEntry, 0, len(keys)),
 	}
 	previousByKey := make(map[string]domain.LangPackSeedCatalogEntry, len(previous.Packs))
 	for _, entry := range previous.Packs {
@@ -105,6 +122,22 @@ func (s *Service) SeedDirectory(ctx context.Context, root string) (int, error) {
 	}
 	s.flushCaches()
 	return seeded, nil
+}
+
+func readSeedFingerprint(root string) (string, error) {
+	encoded, err := os.ReadFile(filepath.Join(root, seedFingerprintFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read langpack seed fingerprint: %w", err)
+	}
+	fingerprint := strings.ToLower(string(bytes.TrimSpace(encoded)))
+	decoded, err := hex.DecodeString(fingerprint)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", fmt.Errorf("invalid langpack seed fingerprint %q", fingerprint)
+	}
+	return fingerprint, nil
 }
 
 func fileSHA256(path string) (string, error) {
