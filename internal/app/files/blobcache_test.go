@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"sync"
 	"testing"
+	"time"
 
 	"telesrv/internal/domain"
 
@@ -239,8 +240,13 @@ func TestGetFileSingleflightSharesImmutableRangeBacking(t *testing.T) {
 	const callers = 16
 	results := make(chan domain.FileChunk, callers)
 	errs := make(chan error, callers)
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(callers)
 	for range callers {
 		go func() {
+			ready.Done()
+			<-start
 			chunk, found, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-range", Offset: 17, Limit: 128 << 10})
 			if err == nil && !found {
 				err = context.Canceled
@@ -252,7 +258,13 @@ func TestGetFileSingleflightSharesImmutableRangeBacking(t *testing.T) {
 			results <- chunk
 		}()
 	}
+	ready.Wait()
+	close(start)
 	<-backend.entered
+	// Keep the leader blocked long enough for every simultaneously released caller
+	// to join the same flight. Releasing as soon as the leader enters makes this a
+	// scheduler test: late callers correctly start a new flight and own new backing.
+	time.Sleep(25 * time.Millisecond)
 	close(backend.release)
 
 	var first domain.FileChunk
