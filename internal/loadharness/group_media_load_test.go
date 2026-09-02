@@ -27,8 +27,10 @@ import (
 
 // TestGroupMediaDownloadLoad exercises the complete real-wire group media path:
 // authenticated members come online, multiple senders concurrently upload and
-// send photo/video/audio/voice/document messages, every member observes the
-// channel fan-out, and then every member downloads every resulting file.
+// send photo/video/audio/voice/document messages, every member treats the live
+// channel delivery signal (or a too-long nudge) only as a reason to call
+// getChannelDifference, and then downloads each file from the location in its
+// own difference result.
 //
 // The test is deliberately opt-in because it requires an owner-only account
 // bundle and a pre-seeded exact-membership supergroup. It never imports server
@@ -126,6 +128,8 @@ type groupMediaLoadReport struct {
 	Reconnects            uint64                     `json:"reconnects"`
 	Disconnects           uint64                     `json:"disconnects"`
 	FatalClients          uint64                     `json:"fatal_clients"`
+	ChannelNudges         uint64                     `json:"channel_nudges"`
+	ChannelLiveUpdates    uint64                     `json:"channel_live_updates"`
 	UploadDurationMS      float64                    `json:"upload_duration_ms"`
 	FanoutSettleMS        float64                    `json:"fanout_settle_ms"`
 	DownloadDurationMS    float64                    `json:"download_duration_ms"`
@@ -149,16 +153,24 @@ type groupMediaCounters struct {
 	reconnects         atomic.Uint64
 	disconnects        atomic.Uint64
 	fatalClients       atomic.Uint64
+	channelNudges      atomic.Uint64
+	channelLiveUpdates atomic.Uint64
+	differenceFailures atomic.Uint64
 	ready              atomic.Int64
 	peakReady          atomic.Int64
 }
 
 type groupMediaClient struct {
-	record SessionRecord
-	raw    atomic.Pointer[tg.Client]
-	cancel context.CancelFunc
-	done   chan error
-	ready  atomic.Bool
+	record              SessionRecord
+	raw                 atomic.Pointer[tg.Client]
+	cancel              context.CancelFunc
+	done                chan error
+	ready               atomic.Bool
+	channelPts          atomic.Int64
+	differenceTargetPts atomic.Int64
+	differenceRequested atomic.Bool
+	differenceForce     atomic.Bool
+	differenceWake      chan struct{}
 }
 
 type groupMediaFanoutTracker struct {
@@ -173,6 +185,7 @@ type groupMediaFanoutTracker struct {
 type groupMediaObservation struct {
 	first  time.Time
 	repeat int64
+	target groupMediaTarget
 }
 
 type groupMediaSampler struct {
@@ -258,7 +271,7 @@ func groupMediaEnvDuration(t *testing.T, name string, fallback time.Duration) ti
 }
 
 func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(string, ...any)) (*groupMediaLoadReport, error) {
-	report := &groupMediaLoadReport{Version: 1, StartedAt: time.Now().UTC(), Accounts: cfg.Accounts}
+	report := &groupMediaLoadReport{Version: 2, StartedAt: time.Now().UTC(), Accounts: cfg.Accounts}
 	if cfg.Accounts < 2 || cfg.Copies < 1 || cfg.Copies > 20 || cfg.ChunkBytes <= 0 || cfg.ChunkBytes > 1<<20 ||
 		cfg.RampDuration < 0 || cfg.ReadyTimeout <= 0 || cfg.OperationTimeout <= 0 || cfg.FanoutTimeout <= 0 || cfg.DownloadTimeout <= 0 || cfg.RecoveryDuration < 0 {
 		return report, errors.New("invalid group media load configuration")
@@ -300,7 +313,7 @@ func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(stri
 	if err != nil {
 		return report, err
 	}
-	metrics := newMetricSet("auth.status", "updates.getState", "upload.saveFilePart", "messages.sendMedia", "upload.getFile.canonical", "upload.getFile")
+	metrics := newMetricSet("auth.status", "updates.getState", "channels.getFullChannel", "updates.getChannelDifference", "upload.saveFilePart", "messages.sendMedia", "upload.getFile.canonical", "upload.getFile")
 	serverMetrics := newServerMetricsClient(cfg.ServerMetricsURL)
 	baseline, err := serverMetrics.scrape(ctx)
 	if err != nil {
@@ -322,7 +335,7 @@ func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(stri
 		expected: make(map[string]time.Time), committed: make(map[string]bool), observations: make(map[string]map[int64]groupMediaObservation),
 	}
 	counters := &groupMediaCounters{}
-	clients, err := startGroupMediaClients(ctx, cfg, manifest.Endpoint, cfg.ManifestPath, records, key, publicKey, metrics, fanout, counters, logf)
+	clients, err := startGroupMediaClients(ctx, cfg, manifest.Endpoint, cfg.ManifestPath, records, key, publicKey, groupState, metrics, fanout, counters, logf)
 	if err != nil {
 		stopGroupMediaClients(clients)
 		return report, err
@@ -357,11 +370,17 @@ func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(stri
 	if report.Fanout.Missing != 0 {
 		report.Failures = append(report.Failures, fmt.Sprintf("group fanout missing %d/%d observations", report.Fanout.Missing, report.Fanout.Expected))
 	}
+	if report.Fanout.Duplicate != 0 {
+		report.Failures = append(report.Failures, fmt.Sprintf("group difference repeated %d marker observations", report.Fanout.Duplicate))
+	}
 
 	downloadStarted := time.Now()
 	downloadCtx, cancelDownload := context.WithTimeout(ctx, cfg.DownloadTimeout)
-	downloaded, downloadErrs := runGroupMediaDownloads(downloadCtx, clients, targets, cfg, report.Media, metrics)
+	downloaded, downloadErrs, targetErr := runGroupMediaDownloads(downloadCtx, clients, targets, cfg, report.Media, fanout, metrics)
 	cancelDownload()
+	if targetErr != nil {
+		report.Failures = append(report.Failures, targetErr.Error())
+	}
 	report.DownloadDurationMS = durationMS(time.Since(downloadStarted))
 	report.DownloadedBytes = downloaded
 	if elapsed := time.Since(downloadStarted).Seconds(); elapsed > 0 {
@@ -369,6 +388,14 @@ func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(stri
 	}
 	if downloadErrs > 0 {
 		report.Failures = append(report.Failures, fmt.Sprintf("group downloads failed %d files", downloadErrs))
+	}
+	for _, media := range report.Media {
+		if media.MessagesSent != media.MessagesExpected {
+			report.Failures = append(report.Failures, fmt.Sprintf("%s messages sent=%d want=%d", media.Kind, media.MessagesSent, media.MessagesExpected))
+		}
+		if media.DownloadsComplete != int64(media.DownloadsExpected) {
+			report.Failures = append(report.Failures, fmt.Sprintf("%s downloads complete=%d want=%d", media.Kind, media.DownloadsComplete, media.DownloadsExpected))
+		}
 	}
 	report.LoadEndedAt = time.Now().UTC()
 	loadEnd, scrapeErr := serverMetrics.scrape(ctx)
@@ -381,11 +408,16 @@ func runGroupMediaLoad(ctx context.Context, cfg groupMediaConfig, logf func(stri
 	report.Reconnects = counters.reconnects.Load()
 	report.Disconnects = counters.disconnects.Load()
 	report.FatalClients = counters.fatalClients.Load()
+	report.ChannelNudges = counters.channelNudges.Load()
+	report.ChannelLiveUpdates = counters.channelLiveUpdates.Load()
 	if report.PeakReady != int64(cfg.Accounts) || report.FinalReady != int64(cfg.Accounts) {
 		report.Failures = append(report.Failures, fmt.Sprintf("ready sessions peak/final=%d/%d want=%d", report.PeakReady, report.FinalReady, cfg.Accounts))
 	}
 	if report.FatalClients != 0 || report.Disconnects != 0 {
 		report.Failures = append(report.Failures, fmt.Sprintf("client fatal/disconnect=%d/%d", report.FatalClients, report.Disconnects))
+	}
+	if failures := counters.differenceFailures.Load(); failures != 0 {
+		report.Failures = append(report.Failures, fmt.Sprintf("channel difference failures=%d", failures))
 	}
 	for name, operation := range report.Operations {
 		if operation.Errors != 0 || operation.FloodWaits != 0 || operation.Timeouts != 0 || operation.ConnectionErrors != 0 {
@@ -438,6 +470,7 @@ func startGroupMediaClients(
 	records []SessionRecord,
 	key [32]byte,
 	publicKey *rsa.PublicKey,
+	group DatasetSeedGroupState,
 	metrics *metricSet,
 	fanout *groupMediaFanoutTracker,
 	counters *groupMediaCounters,
@@ -457,12 +490,24 @@ func startGroupMediaClients(
 			}
 		}
 		clientCtx, cancel := context.WithCancel(ctx)
-		holder := &groupMediaClient{record: record, cancel: cancel, done: make(chan error, 1)}
+		holder := &groupMediaClient{
+			record: record, cancel: cancel, done: make(chan error, 1), differenceWake: make(chan struct{}, 1),
+		}
 		clients[i] = holder
 		var everReady atomic.Bool
 		client, err := newClient(endpoint, publicKey, &EncryptedFileStorage{Path: resolveSessionPath(manifestPath, record), Key: key}, clientHooks{
 			Update: telegram.UpdateHandlerFunc(func(_ context.Context, updates tg.UpdatesClass) error {
-				fanout.observeUpdates(record.UserID, updates)
+				nudgePTS, nudged := groupMediaChannelNudge(updates, group.ChannelID)
+				livePTS, live := groupMediaChannelLiveUpdate(updates, group.ChannelID)
+				if nudged {
+					counters.channelNudges.Add(1)
+				}
+				if live > 0 {
+					counters.channelLiveUpdates.Add(uint64(live))
+				}
+				if nudged || live > 0 {
+					holder.requestChannelDifference(max(nudgePTS, livePTS))
+				}
 				return nil
 			}),
 			ConnectionState: func(state telegram.ConnectionState) {
@@ -505,6 +550,22 @@ func startGroupMediaClients(
 				if stateErr != nil {
 					return stateErr
 				}
+				started = time.Now()
+				opCtx, stop = context.WithTimeout(runCtx, cfg.OperationTimeout)
+				full, fullErr := raw.ChannelsGetFullChannel(opCtx, &tg.InputChannel{ChannelID: group.ChannelID, AccessHash: group.AccessHash})
+				stop()
+				metrics.observe("channels.getFullChannel", started, fullErr)
+				if fullErr != nil {
+					return fullErr
+				}
+				channel, ok := full.FullChat.(*tg.ChannelFull)
+				if !ok {
+					return fmt.Errorf("channels.getFullChannel returned %T", full.FullChat)
+				}
+				if channel.Pts <= 0 {
+					return fmt.Errorf("channels.getFullChannel returned invalid pts=%d", channel.Pts)
+				}
+				holder.channelPts.Store(int64(channel.Pts))
 				holder.raw.Store(raw)
 				holder.ready.Store(true)
 				ready := counters.ready.Add(1)
@@ -514,10 +575,21 @@ func startGroupMediaClients(
 						break
 					}
 				}
-				<-runCtx.Done()
-				holder.ready.Store(false)
-				counters.ready.Add(-1)
-				return runCtx.Err()
+				for {
+					select {
+					case <-runCtx.Done():
+						holder.ready.Store(false)
+						counters.ready.Add(-1)
+						return runCtx.Err()
+					case <-holder.differenceWake:
+						for holder.differenceRequested.Swap(false) {
+							if err := holder.catchUpChannelDifference(runCtx, raw, group, cfg.OperationTimeout, fanout, metrics); err != nil {
+								counters.differenceFailures.Add(1)
+								break
+							}
+						}
+					}
+				}
 			})
 			if runErr != nil && !errors.Is(runErr, context.Canceled) {
 				counters.fatalClients.Add(1)
@@ -539,6 +611,174 @@ func startGroupMediaClients(
 		}
 	}
 	return clients, nil
+}
+
+func (c *groupMediaClient) requestChannelDifference(pts int) {
+	if c == nil {
+		return
+	}
+	for pts > 0 {
+		current := c.differenceTargetPts.Load()
+		if int64(pts) <= current || c.differenceTargetPts.CompareAndSwap(current, int64(pts)) {
+			break
+		}
+	}
+	if pts <= 0 {
+		c.differenceForce.Store(true)
+	}
+	c.differenceRequested.Store(true)
+	select {
+	case c.differenceWake <- struct{}{}:
+	default:
+	}
+}
+
+func groupMediaChannelNudge(updates tg.UpdatesClass, channelID int64) (int, bool) {
+	maxPTS := 0
+	found := false
+	for _, update := range groupMediaUpdateClasses(updates) {
+		nudge, ok := update.(*tg.UpdateChannelTooLong)
+		if !ok || nudge.ChannelID != channelID {
+			continue
+		}
+		found = true
+		if pts, ok := nudge.GetPts(); ok && pts > maxPTS {
+			maxPTS = pts
+		}
+	}
+	return maxPTS, found
+}
+
+func groupMediaChannelLiveUpdate(updates tg.UpdatesClass, channelID int64) (int, int) {
+	maxPTS := 0
+	count := 0
+	for _, update := range groupMediaUpdateClasses(updates) {
+		live, ok := update.(*tg.UpdateNewChannelMessage)
+		if !ok {
+			continue
+		}
+		message, ok := live.Message.(*tg.Message)
+		if !ok {
+			continue
+		}
+		peer, ok := message.PeerID.(*tg.PeerChannel)
+		if !ok || peer.ChannelID != channelID {
+			continue
+		}
+		count++
+		if live.Pts > maxPTS {
+			maxPTS = live.Pts
+		}
+	}
+	return maxPTS, count
+}
+
+func groupMediaUpdateClasses(updates tg.UpdatesClass) []tg.UpdateClass {
+	switch value := updates.(type) {
+	case *tg.Updates:
+		return value.Updates
+	case *tg.UpdatesCombined:
+		return value.Updates
+	case *tg.UpdateShort:
+		return []tg.UpdateClass{value.Update}
+	default:
+		return nil
+	}
+}
+
+func (c *groupMediaClient) catchUpChannelDifference(
+	ctx context.Context,
+	raw *tg.Client,
+	group DatasetSeedGroupState,
+	timeout time.Duration,
+	fanout *groupMediaFanoutTracker,
+	metrics *metricSet,
+) error {
+	if c == nil || raw == nil {
+		return errors.New("channel difference client is not ready")
+	}
+	pts := int(c.channelPts.Load())
+	if pts <= 0 {
+		return errors.New("channel difference has no baseline pts")
+	}
+	targetPTS := int(c.differenceTargetPts.Load())
+	force := c.differenceForce.Swap(false)
+	if !force && targetPTS > 0 && pts >= targetPTS {
+		return nil
+	}
+	for page := 0; page < 256; page++ {
+		started := time.Now()
+		opCtx, cancel := context.WithTimeout(ctx, timeout)
+		difference, err := raw.UpdatesGetChannelDifference(opCtx, &tg.UpdatesGetChannelDifferenceRequest{
+			Channel: &tg.InputChannel{ChannelID: group.ChannelID, AccessHash: group.AccessHash},
+			Filter:  &tg.ChannelMessagesFilterEmpty{}, Pts: pts, Limit: 100,
+		})
+		cancel()
+		metrics.observe("updates.getChannelDifference", started, err)
+		if err != nil {
+			return err
+		}
+
+		var final bool
+		var messages []tg.MessageClass
+		var updates []tg.UpdateClass
+		pts, final, messages, updates, err = groupMediaDifferencePage(pts, difference)
+		if err != nil {
+			return err
+		}
+		fanout.observeDifference(c.record.UserID, messages, updates)
+		c.channelPts.Store(int64(pts))
+		if !final {
+			continue
+		}
+		latestTarget := int(c.differenceTargetPts.Load())
+		if latestTarget > pts {
+			return fmt.Errorf("channel difference stopped at pts=%d before nudge pts=%d", pts, latestTarget)
+		}
+		return nil
+	}
+	return errors.New("channel difference exceeded 256 pages")
+}
+
+func groupMediaDifferencePage(previous int, difference tg.UpdatesChannelDifferenceClass) (int, bool, []tg.MessageClass, []tg.UpdateClass, error) {
+	pts := previous
+	final := true
+	var messages []tg.MessageClass
+	var updates []tg.UpdateClass
+	switch value := difference.(type) {
+	case *tg.UpdatesChannelDifferenceEmpty:
+		if !value.Final {
+			return 0, false, nil, nil, errors.New("channelDifferenceEmpty is not final")
+		}
+		pts = value.Pts
+		final = value.Final
+	case *tg.UpdatesChannelDifference:
+		pts = value.Pts
+		final = value.Final
+		messages = value.NewMessages
+		updates = value.OtherUpdates
+	case *tg.UpdatesChannelDifferenceTooLong:
+		if !value.Final {
+			return 0, false, nil, nil, errors.New("channelDifferenceTooLong is not final")
+		}
+		dialog, ok := value.Dialog.(*tg.Dialog)
+		if !ok {
+			return 0, false, nil, nil, fmt.Errorf("channelDifferenceTooLong dialog is %T", value.Dialog)
+		}
+		current, ok := dialog.GetPts()
+		if !ok {
+			return 0, false, nil, nil, errors.New("channelDifferenceTooLong omitted pts")
+		}
+		pts = current
+		final = value.Final
+		messages = value.Messages
+	default:
+		return 0, false, nil, nil, fmt.Errorf("updates.getChannelDifference returned %T", difference)
+	}
+	if pts < previous || (!final && pts == previous) {
+		return 0, false, nil, nil, fmt.Errorf("channel difference pts did not advance: previous=%d current=%d final=%t", previous, pts, final)
+	}
+	return pts, final, messages, updates, nil
 }
 
 func stopGroupMediaClients(clients []*groupMediaClient) {
@@ -596,7 +836,7 @@ func uploadGroupMedia(
 		go func() {
 			defer wg.Done()
 			marker := fmt.Sprintf("telesrv-group-media/%s/%s/%d", runID, upload.source.Kind, upload.copy+1)
-			target, err := uploadAndSendGroupMedia(ctx, upload.client.raw.Load(), upload.client.record.UserID, upload.source, marker, group, cfg.OperationTimeout, fanout, metrics)
+			target, err := uploadAndSendGroupMedia(ctx, upload.client, upload.source, marker, group, cfg.OperationTimeout, fanout, metrics)
 			results <- struct {
 				target groupMediaTarget
 				err    error
@@ -623,8 +863,7 @@ func uploadGroupMedia(
 
 func uploadAndSendGroupMedia(
 	ctx context.Context,
-	raw *tg.Client,
-	senderUserID int64,
+	client *groupMediaClient,
 	source groupMediaSource,
 	marker string,
 	group DatasetSeedGroupState,
@@ -632,6 +871,10 @@ func uploadAndSendGroupMedia(
 	fanout *groupMediaFanoutTracker,
 	metrics *metricSet,
 ) (groupMediaTarget, error) {
+	if client == nil {
+		return groupMediaTarget{}, errors.New("sender is not ready")
+	}
+	raw := client.raw.Load()
 	if raw == nil {
 		return groupMediaTarget{}, errors.New("sender is not ready")
 	}
@@ -683,14 +926,14 @@ func uploadAndSendGroupMedia(
 		fanout.finish(marker, false)
 		return groupMediaTarget{}, fmt.Errorf("%s sendMedia: %w", source.Kind, err)
 	}
-	// The RPC result contains the sender's authoritative update but does not pass
-	// through gotd's unsolicited UpdateHandler, so count it explicitly.
-	fanout.observeUpdates(senderUserID, updates)
 	fanout.finish(marker, true)
 	target, err := groupMediaTargetFromUpdates(source.Kind, marker, updates)
 	if err != nil {
 		return groupMediaTarget{}, err
 	}
+	nudgePTS, _ := groupMediaChannelNudge(updates, group.ChannelID)
+	livePTS, _ := groupMediaChannelLiveUpdate(updates, group.ChannelID)
+	client.requestChannelDifference(max(nudgePTS, livePTS))
 	return target, nil
 }
 
@@ -743,39 +986,46 @@ func groupMediaTargetFromUpdates(kind, marker string, updates tg.UpdatesClass) (
 		if !ok || full.Message != marker {
 			continue
 		}
-		media, ok := full.GetMedia()
-		if !ok {
-			return groupMediaTarget{}, fmt.Errorf("%s message omitted media", kind)
-		}
-		switch value := media.(type) {
-		case *tg.MessageMediaPhoto:
-			photoClass, ok := value.GetPhoto()
-			photo, okPhoto := photoClass.(*tg.Photo)
-			if !ok || !okPhoto {
-				return groupMediaTarget{}, fmt.Errorf("photo message returned %T", photoClass)
-			}
-			var best *tg.PhotoSize
-			for _, sizeClass := range photo.Sizes {
-				if size, ok := sizeClass.(*tg.PhotoSize); ok && (best == nil || size.Size > best.Size) {
-					best = size
-				}
-			}
-			if best == nil || best.Size <= 0 {
-				return groupMediaTarget{}, errors.New("photo message has no downloadable size")
-			}
-			return groupMediaTarget{Kind: kind, Marker: marker, Size: int64(best.Size), Location: photo.AsInputPhotoFileLocation(best.Type)}, nil
-		case *tg.MessageMediaDocument:
-			documentClass, ok := value.GetDocument()
-			document, okDocument := documentClass.(*tg.Document)
-			if !ok || !okDocument || document.Size <= 0 {
-				return groupMediaTarget{}, fmt.Errorf("%s message returned %T", kind, documentClass)
-			}
-			return groupMediaTarget{Kind: kind, Marker: marker, Size: document.Size, Location: document.AsInputDocumentFileLocation("")}, nil
-		default:
-			return groupMediaTarget{}, fmt.Errorf("%s message media is %T", kind, media)
-		}
+		return groupMediaTargetFromMessage(kind, marker, full)
 	}
 	return groupMediaTarget{}, fmt.Errorf("%s sendMedia response omitted marker", kind)
+}
+
+func groupMediaTargetFromMessage(kind, marker string, message *tg.Message) (groupMediaTarget, error) {
+	if message == nil || message.Message != marker {
+		return groupMediaTarget{}, errors.New("group media marker does not match message")
+	}
+	media, ok := message.GetMedia()
+	if !ok {
+		return groupMediaTarget{}, fmt.Errorf("%s message omitted media", kind)
+	}
+	switch value := media.(type) {
+	case *tg.MessageMediaPhoto:
+		photoClass, ok := value.GetPhoto()
+		photo, okPhoto := photoClass.(*tg.Photo)
+		if !ok || !okPhoto {
+			return groupMediaTarget{}, fmt.Errorf("photo message returned %T", photoClass)
+		}
+		var best *tg.PhotoSize
+		for _, sizeClass := range photo.Sizes {
+			if size, ok := sizeClass.(*tg.PhotoSize); ok && (best == nil || size.Size > best.Size) {
+				best = size
+			}
+		}
+		if best == nil || best.Size <= 0 {
+			return groupMediaTarget{}, errors.New("photo message has no downloadable size")
+		}
+		return groupMediaTarget{Kind: kind, Marker: marker, Size: int64(best.Size), Location: photo.AsInputPhotoFileLocation(best.Type)}, nil
+	case *tg.MessageMediaDocument:
+		documentClass, ok := value.GetDocument()
+		document, okDocument := documentClass.(*tg.Document)
+		if !ok || !okDocument || document.Size <= 0 {
+			return groupMediaTarget{}, fmt.Errorf("%s message returned %T", kind, documentClass)
+		}
+		return groupMediaTarget{Kind: kind, Marker: marker, Size: document.Size, Location: document.AsInputDocumentFileLocation("")}, nil
+	default:
+		return groupMediaTarget{}, fmt.Errorf("%s message media is %T", kind, media)
+	}
 }
 
 func randomGroupMediaID() int64 {
@@ -796,11 +1046,12 @@ func randomGroupMediaID() int64 {
 func runGroupMediaDownloads(
 	ctx context.Context,
 	clients []*groupMediaClient,
-	targets []groupMediaTarget,
+	canonicalTargets []groupMediaTarget,
 	cfg groupMediaConfig,
 	reports []groupMediaTypeReport,
+	fanout *groupMediaFanoutTracker,
 	metrics *metricSet,
-) (int64, int64) {
+) (int64, int64, error) {
 	byKind := make(map[string]int, len(reports))
 	for i := range reports {
 		byKind[reports[i].Kind] = i
@@ -811,10 +1062,22 @@ func runGroupMediaDownloads(
 		errors   atomic.Int64
 	}
 	typeCounters := make([]counters, len(reports))
+	clientTargets := make([][]groupMediaTarget, len(clients))
+	for i, client := range clients {
+		if client == nil {
+			return 0, int64(len(clients) * len(canonicalTargets)), errors.New("nil group media download client")
+		}
+		targets, err := fanout.targetsForUser(client.record.UserID, canonicalTargets)
+		if err != nil {
+			return 0, int64(len(clients) * len(canonicalTargets)), fmt.Errorf("member %d difference targets: %w", client.record.UserID, err)
+		}
+		clientTargets[i] = targets
+	}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for clientIndex, client := range clients {
 		clientIndex, client := clientIndex, client
+		targets := clientTargets[clientIndex]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -842,7 +1105,7 @@ func runGroupMediaDownloads(
 		totalBytes += reports[i].DownloadedBytes
 		totalErrors += reports[i].DownloadErrors
 	}
-	return totalBytes, totalErrors
+	return totalBytes, totalErrors, nil
 }
 
 func downloadGroupMediaFile(
@@ -907,39 +1170,44 @@ func (t *groupMediaFanoutTracker) finish(marker string, success bool) {
 	t.mu.Unlock()
 }
 
-func (t *groupMediaFanoutTracker) observeUpdates(userID int64, updates tg.UpdatesClass) {
-	var classes []tg.UpdateClass
-	switch value := updates.(type) {
-	case *tg.Updates:
-		classes = value.Updates
-	case *tg.UpdatesCombined:
-		classes = value.Updates
-	case *tg.UpdateShort:
-		classes = []tg.UpdateClass{value.Update}
-	default:
-		return
+func (t *groupMediaFanoutTracker) observeDifference(userID int64, messages []tg.MessageClass, updates []tg.UpdateClass) {
+	for _, message := range messages {
+		if full, ok := message.(*tg.Message); ok {
+			t.observeMessage(full, userID)
+		}
 	}
-	for _, update := range classes {
+	for _, update := range updates {
 		var message tg.MessageClass
 		switch value := update.(type) {
 		case *tg.UpdateNewChannelMessage:
-			message = value.Message
-		case *tg.UpdateNewMessage:
 			message = value.Message
 		default:
 			continue
 		}
 		if full, ok := message.(*tg.Message); ok {
-			t.observe(full.Message, userID)
+			t.observeMessage(full, userID)
 		}
 	}
 }
 
-func (t *groupMediaFanoutTracker) observe(marker string, userID int64) {
+func (t *groupMediaFanoutTracker) observeMessage(message *tg.Message, userID int64) {
+	if message == nil {
+		return
+	}
+	marker := message.Message
 	if !strings.HasPrefix(marker, t.prefix) {
 		return
 	}
 	if _, ok := t.members[userID]; !ok {
+		return
+	}
+	remainder := strings.TrimPrefix(marker, t.prefix)
+	kind, _, ok := strings.Cut(remainder, "/")
+	if !ok || kind == "" {
+		return
+	}
+	target, err := groupMediaTargetFromMessage(kind, marker, message)
+	if err != nil {
 		return
 	}
 	t.mu.Lock()
@@ -955,11 +1223,42 @@ func (t *groupMediaFanoutTracker) observe(marker string, userID int64) {
 	observation := byUser[userID]
 	if observation.first.IsZero() {
 		observation.first = time.Now()
+		observation.target = target
 	} else {
 		observation.repeat++
 	}
 	byUser[userID] = observation
 	t.mu.Unlock()
+}
+
+func (t *groupMediaFanoutTracker) targetsForUser(userID int64, canonical []groupMediaTarget) ([]groupMediaTarget, error) {
+	if t == nil {
+		return nil, errors.New("nil group media fanout tracker")
+	}
+	canonicalByMarker := make(map[string]groupMediaTarget, len(canonical))
+	for _, target := range canonical {
+		canonicalByMarker[target.Marker] = target
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	result := make([]groupMediaTarget, 0, len(canonical))
+	for marker, expected := range canonicalByMarker {
+		observation, ok := t.observations[marker][userID]
+		if !ok || observation.first.IsZero() || observation.target.Location == nil {
+			return nil, fmt.Errorf("marker %q was not recovered through channel difference", marker)
+		}
+		if observation.target.Kind != expected.Kind || observation.target.Size != expected.Size {
+			return nil, fmt.Errorf("marker %q target identity differs from sender result", marker)
+		}
+		target := observation.target
+		target.SHA256 = expected.SHA256
+		result = append(result, target)
+	}
+	if len(result) != len(canonical) {
+		return nil, fmt.Errorf("recovered %d targets, want %d", len(result), len(canonical))
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Marker < result[j].Marker })
+	return result, nil
 }
 
 func (t *groupMediaFanoutTracker) wait(timeout time.Duration) {
