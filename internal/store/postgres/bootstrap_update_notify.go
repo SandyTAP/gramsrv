@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
@@ -44,7 +43,7 @@ func (l *BootstrapUpdateReadyListener) Run(ctx context.Context, wake func()) {
 }
 
 func (l *BootstrapUpdateReadyListener) listenAndConsume(ctx context.Context, wake func()) error {
-	conn, err := pgx.Connect(ctx, l.dsn)
+	conn, err := connectPostgresAdmitted(ctx, l.dsn)
 	if err != nil {
 		return err
 	}

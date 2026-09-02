@@ -305,50 +305,59 @@ func (s *ChannelDeliveryStore) NextReadyAt(ctx context.Context, kind store.Outbo
 	if scoped && len(shards) == 0 {
 		return store.OutboxNextReady{}, false, nil
 	}
+	var streamID int64
 	var observed, readyAt time.Time
-	var recoverLease bool
+	var recoverLease, invalidState bool
 	err = s.db.QueryRow(ctx, `
 WITH db_clock AS MATERIALIZED (
     SELECT clock_timestamp() AS observed
 ), candidates AS MATERIALIZED (
-    SELECT c.observed,
-           CASE l.state
-             WHEN 'ready' THEN l.ready_at
-             WHEN 'leased' THEN CASE WHEN NOT EXISTS (
-               SELECT 1
-               FROM channel_delivery_attempts pending_finalize
-               WHERE pending_finalize.channel_id = l.channel_id
-                 AND pending_finalize.lease_fence = l.lease_fence
-                 AND pending_finalize.item_id = l.head_item_id
-                 AND pending_finalize.resolution <> 'pending'
-                 AND (pending_finalize.retry_at IS NULL OR pending_finalize.retry_at <= c.observed)
-             ) THEN LEAST(l.lease_until, COALESCE((
-               SELECT CASE
-                 WHEN head_attempt.resolution = 'pending' THEN head_attempt.evidence_deadline
-                 ELSE head_attempt.retry_at
-               END
-               FROM channel_delivery_attempts head_attempt
-               WHERE head_attempt.channel_id = l.channel_id
-                 AND head_attempt.item_id = l.head_item_id
-                 AND head_attempt.lease_fence = l.lease_fence
-             ), l.lease_until)) END
+    SELECT l.channel_id, c.observed,
+           CASE
+             WHEN live.present IS NOT NULL THEN c.observed
+             WHEN head.item_id IS NOT NULL THEN CASE
+               WHEN head.resolution = 'pending' THEN head.evidence_deadline
+               ELSE COALESCE(head.retry_at, c.observed)
+             END
+             WHEN l.state = 'ready' THEN l.ready_at
+             WHEN l.state = 'leased' THEN l.lease_until
            END AS ready_at,
-           l.state = 'leased' AS recover_lease
+           l.state = 'leased' AS recover_lease,
+           live.present IS NOT NULL AS invalid_state
     FROM channel_delivery_lanes l
     CROSS JOIN db_clock c
+    LEFT JOIN LATERAL (
+      SELECT a.item_id, a.resolution, a.retry_at, a.evidence_deadline
+      FROM channel_delivery_attempts a
+      WHERE a.channel_id = l.channel_id
+        AND a.item_id = l.head_item_id
+        AND a.lease_fence = l.lease_fence
+      LIMIT 1
+    ) head ON true
+    LEFT JOIN LATERAL (
+      SELECT true AS present
+      FROM channel_delivery_attempts invalid
+      WHERE l.state = 'ready'
+        AND invalid.channel_id = l.channel_id
+        AND invalid.lease_fence = l.lease_fence
+      LIMIT 1
+    ) live ON true
     WHERE ($1::boolean = false OR l.logical_shard = ANY($2::smallint[]))
       AND l.state IN ('ready', 'leased')
 )
-SELECT observed, ready_at, recover_lease
+SELECT channel_id, observed, ready_at, recover_lease, invalid_state
 FROM candidates
 WHERE ready_at IS NOT NULL
-ORDER BY ready_at, recover_lease DESC
-LIMIT 1`, scoped, shards).Scan(&observed, &readyAt, &recoverLease)
+ORDER BY invalid_state DESC, ready_at, recover_lease DESC
+LIMIT 1`, scoped, shards).Scan(&streamID, &observed, &readyAt, &recoverLease, &invalidState)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.OutboxNextReady{}, false, nil
 	}
 	if err != nil {
 		return store.OutboxNextReady{}, false, fmt.Errorf("next channel delivery ready at: %w", err)
+	}
+	if invalidState {
+		return store.OutboxNextReady{}, false, fmt.Errorf("next channel delivery ready at: channel %d has forbidden ready lane with live fence attempts", streamID)
 	}
 	readyKind := store.OutboxReadyClaim
 	if recoverLease {

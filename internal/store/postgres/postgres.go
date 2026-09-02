@@ -81,6 +81,9 @@ func Open(ctx context.Context, dsn string, opts ...PoolOption) (*pgxpool.Pool, e
 		}
 	}
 	cfg.ConnConfig.Tracer = queryStatsTracer{}
+	if err := installPostgresConnectionAdmission(ctx, cfg, dsn); err != nil {
+		return nil, fmt.Errorf("initialize PostgreSQL connection admission: %w", err)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgxpool new: %w", err)

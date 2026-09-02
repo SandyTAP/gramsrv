@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -484,6 +485,131 @@ func lateChannelPhysicalEvidence(ref store.OutboxAttemptRef, source, target stri
 	}
 }
 
+func TestChannelDeliveryFinalizeKeepsPendingWindowSuccessorLeasedPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := channelDeliveryRandomSuffix(t)
+	owner, err := NewUserStore(pool).Create(ctx, domain.User{
+		AccessHash: 6141, Phone: "+1777601" + suffix, FirstName: "PendingSuccessorOwner",
+	})
+	if err != nil {
+		t.Fatalf("create pending-successor owner: %v", err)
+	}
+	created, err := newTestChannelStore(pool).CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: owner.ID, Title: "channel-pending-successor-" + suffix,
+		Megagroup: true, Date: 1700140000,
+	})
+	if err != nil {
+		t.Fatalf("create pending-successor channel: %v", err)
+	}
+	channelID := created.Channel.ID
+	if _, err := appendChannelDeliveryTestEvent(ctx, pool, channelID, 1700140001, 0); err != nil {
+		t.Fatalf("append pending-successor event: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_delivery_attempt_targets t
+USING channel_delivery_attempts a
+WHERE t.item_id = a.item_id AND t.lease_fence = a.lease_fence AND a.channel_id = $1`, channelID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_delivery_attempts WHERE channel_id = $1`, channelID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channels WHERE id = $1`, channelID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, owner.ID)
+	})
+
+	delivery := NewChannelDeliveryStore(pool)
+	windows, err := delivery.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, WindowSize: 8,
+		WindowByteLimit: 1 << 20, LeaseDuration: time.Second, Owner: "channel-pending-successor-egress",
+		PhysicalDuration: 100 * time.Millisecond, ClockSkewAllowance: 100 * time.Millisecond,
+	})
+	if err != nil || len(windows) != 1 || len(windows[0].Items) != 2 {
+		t.Fatalf("claim pending-successor window = %+v, %v", windows, err)
+	}
+	firstBatch, firstCommand := [16]byte{41}, [16]byte{42}
+	secondBatch, secondCommand := [16]byte{43}, [16]byte{44}
+	bound, err := delivery.BindAttemptTargets(ctx, []store.OutboxAttemptTargetSet{
+		{Ref: windows[0].Items[0].Ref, SourceInstanceID: "channel-pending-source", Targets: []store.OutboxAttemptTarget{{TargetInstanceID: "edge-pending", BatchID: firstBatch, CommandID: firstCommand}}},
+		{Ref: windows[0].Items[1].Ref, SourceInstanceID: "channel-pending-source", Targets: []store.OutboxAttemptTarget{{TargetInstanceID: "edge-pending", BatchID: secondBatch, CommandID: secondCommand}}},
+	})
+	if err != nil || len(bound) != 2 || bound[0].Outcome != store.OutboxBindTargetBound || bound[1].Outcome != store.OutboxBindTargetBound {
+		t.Fatalf("bind pending-successor targets = %+v, %v", bound, err)
+	}
+	evidence, err := delivery.RecordAttemptEvidenceBatch(ctx, []store.OutboxAttemptEvidence{{
+		Ref: windows[0].Items[0].Ref, Kind: store.OutboxEvidenceEdgeWritten,
+		SourceInstanceID: "channel-pending-source", TargetInstanceID: "edge-pending",
+		BatchID: firstBatch, CommandID: firstCommand, EligibleSessions: 1, WrittenSessions: 1,
+		ServerMsgID: 4100, ObservedAt: time.Now(),
+	}})
+	if err != nil || len(evidence) != 1 || evidence[0].Outcome != store.OutboxEvidenceRecorded {
+		t.Fatalf("record first pending-successor evidence = %+v, %v", evidence, err)
+	}
+	finalized, err := delivery.FinalizeAttempts(ctx, []store.OutboxFinalizeRequest{{Ref: windows[0].Items[0].Ref}})
+	if err != nil || len(finalized.Results) != 1 || finalized.Results[0].Outcome != store.OutboxFinalizeApplied {
+		t.Fatalf("finalize first pending-successor item = %+v, %v", finalized, err)
+	}
+	var laneState string
+	var headItemID int64
+	if err := pool.QueryRow(ctx, `SELECT state, head_item_id FROM channel_delivery_lanes WHERE channel_id = $1`, channelID).Scan(&laneState, &headItemID); err != nil {
+		t.Fatalf("load pending-successor lane: %v", err)
+	}
+	if laneState != "leased" || headItemID != windows[0].Items[1].Ref.ItemID {
+		t.Fatalf("pending successor lane state/head = %s/%d, want leased/%d", laneState, headItemID, windows[0].Items[1].Ref.ItemID)
+	}
+	next, ok, err := delivery.NextReadyAt(ctx, store.OutboxQueueChannelPTS, 0, nil)
+	if err != nil || !ok || next.Kind != store.OutboxReadyRecoverLease || !next.ReadyAt.Equal(windows[0].Items[1].EvidenceDeadline) {
+		t.Fatalf("pending successor durable wake = %+v ok=%v err=%v", next, ok, err)
+	}
+
+	// A forbidden ready+attempt row must fail closed instead of being normalized
+	// on read or advertised as immediate claim work.
+	if _, err := pool.Exec(ctx, `
+UPDATE channel_delivery_lanes
+SET state = 'ready', ready_at = clock_timestamp() - interval '1 second',
+    lease_owner = NULL, lease_until = NULL,
+    window_tail_item_id = NULL, window_tail_sequence = NULL
+WHERE channel_id = $1`, channelID); err != nil {
+		t.Fatalf("create forbidden ready+bound state: %v", err)
+	}
+	next, ok, err = delivery.NextReadyAt(ctx, store.OutboxQueueChannelPTS, 0, nil)
+	if err == nil || ok || !strings.Contains(err.Error(), "forbidden ready lane") {
+		t.Fatalf("forbidden ready+bound state did not fail closed: next=%+v ok=%v err=%v", next, ok, err)
+	}
+	claimed, err := delivery.ClaimWindows(ctx, store.OutboxClaimRequest{
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, WindowSize: 8,
+		WindowByteLimit: 1 << 20, LeaseDuration: time.Second, Owner: "must-not-spin-claim",
+		PhysicalDuration: 100 * time.Millisecond, ClockSkewAllowance: 100 * time.Millisecond,
+	})
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("forbidden ready+bound state was claimed = %+v, %v", claimed, err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE channel_delivery_lanes
+SET state = 'leased', lease_owner = $2, lease_until = $3,
+    window_tail_item_id = $4, window_tail_sequence = $5
+WHERE channel_id = $1`, channelID, windows[0].Owner, windows[0].LeaseUntil,
+		windows[0].Items[1].Ref.ItemID, windows[0].Items[1].Ref.Sequence); err != nil {
+		t.Fatalf("restore canonical pending-successor lane: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE channel_delivery_attempts
+SET issued_at = clock_timestamp() - interval '3 seconds',
+    command_not_after = clock_timestamp() - interval '2 seconds',
+    evidence_deadline = clock_timestamp() - interval '1 second'
+WHERE item_id = $1 AND lease_fence = $2`, windows[0].Items[1].Ref.ItemID, int64(windows[0].LeaseFence)); err != nil {
+		t.Fatalf("expire pending successor: %v", err)
+	}
+	expired, err := delivery.ExpireEvidenceDeadlines(ctx, store.OutboxEvidenceExpiryRequest{
+		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, MaxAttempts: 5,
+	})
+	if err != nil || len(expired) != 1 || expired[0].Ref != windows[0].Items[1].Ref {
+		t.Fatalf("expire pending successor = %+v, %v", expired, err)
+	}
+	retried, err := delivery.FinalizeAttempts(ctx, expired)
+	if err != nil || len(retried.Results) != 1 || retried.Results[0].Outcome != store.OutboxFinalizeScheduledRetry {
+		t.Fatalf("finalize pending-successor retry = %+v, %v", retried, err)
+	}
+}
+
 func TestChannelDeliveryRecoveryNeverReplaysExpiredChannelCommandsPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -615,8 +741,8 @@ WHERE channel_id = $1 AND lease_fence = $2`,
 	if err != nil || len(expired) != 1 || expired[0].Ref != windows[0].Items[0].Ref {
 		t.Fatalf("expired recovery did not resolve exact head = %+v, %v", expired, err)
 	}
-	if next, ok, err := delivery.NextReadyAt(ctx, store.OutboxQueueChannelPTS, 0, nil); err != nil || ok {
-		t.Fatalf("pending finalization leaked into NextReadyAt: next=%+v ok=%v err=%v", next, ok, err)
+	if next, ok, err := delivery.NextReadyAt(ctx, store.OutboxQueueChannelPTS, 0, nil); err != nil || !ok || next.Kind != store.OutboxReadyRecoverLease || next.Delay() > 0 {
+		t.Fatalf("resolved attempt did not arm durable finalization: next=%+v ok=%v err=%v", next, ok, err)
 	}
 	finalizable, err := delivery.RecoverFinalizableAttempts(ctx, store.OutboxRecoverFinalizableRequest{
 		QueueKind: store.OutboxQueueChannelPTS, LaneLimit: 1, AttemptLimit: store.MaxDeliveryBatchItems,

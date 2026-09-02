@@ -207,11 +207,12 @@ WHERE item_id = $1 AND lease_fence = $2`, successorID, lane.leaseFence).Scan(&su
 			}
 			completed[successorID] = "scheduled_retry"
 		case err == nil:
-			if !requests[indices[0]].RetainLease {
-				if err := releaseChannelLane(ctx, tx, streamID); err != nil {
-					return err
-				}
-			}
+			// The successor belongs to the already-issued window and therefore to
+			// this exact fence.  Releasing the lane here would create a forbidden
+			// ready+bound-attempt state: ClaimWindows must reject that attempt while
+			// NextReadyAt would otherwise advertise immediate claim work forever.
+			// Keep the lease until the successor's evidence/finalization state
+			// advances; its persisted deadline is the durable scheduler authority.
 		case errors.Is(err, pgx.ErrNoRows):
 			if _, err := tx.Exec(ctx, `
 UPDATE channel_delivery_lanes
