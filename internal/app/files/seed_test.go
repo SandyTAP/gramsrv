@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // fakeMediaStore 是 store.MediaStore 的内存替身，用于在无 PG 时验证 seed 导入器。
@@ -420,6 +421,9 @@ func (f *fakeMediaStore) DeleteProfilePhotos(_ context.Context, _ domain.PeerTyp
 }
 func (f *fakeMediaStore) DeleteProfilePhotosKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _ []int64) ([]int64, error) {
 	return nil, nil
+}
+func (f *fakeMediaStore) WithTx(_ context.Context, fn func(ctx context.Context, txMedia store.MediaStore) error) error {
+	return fn(context.Background(), f)
 }
 
 func TestSeedMediaRepairsPartialReactionBlobs(t *testing.T) {

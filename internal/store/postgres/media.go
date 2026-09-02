@@ -1513,6 +1513,27 @@ WHERE owner_peer_type = $1
 	return maxOrder, err
 }
 
+// WithTx runs fn inside a database transaction with a transaction-scoped
+// MediaStore. If fn returns nil the transaction is committed; otherwise it
+// is rolled back.
+func (s *MediaStore) WithTx(ctx context.Context, fn func(ctx context.Context, txMedia store.MediaStore) error) error {
+	return withTx(ctx, s.db, "media.WithTx", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_lock($1)`, botAvatarsLockKey); err != nil {
+			return fmt.Errorf("acquire bot avatar lock: %w", err)
+		}
+		txStore := &MediaStore{db: tx, q: s.q.WithTx(tx), documents: newDocumentMetaCache(documentMetaCacheCapacity)}
+		if err := fn(ctx, txStore); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_unlock($1)`, botAvatarsLockKey); err != nil {
+			return fmt.Errorf("release bot avatar lock: %w", err)
+		}
+		return nil
+	})
+}
+
+const botAvatarsLockKey = int64(0x626f746176617461) // "botavata"
+
 func normalizeProfilePhotoKind(kind domain.ProfilePhotoKind) domain.ProfilePhotoKind {
 	if kind == domain.ProfilePhotoKindFallback {
 		return kind

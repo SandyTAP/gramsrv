@@ -181,6 +181,50 @@ func NewService(media store.MediaStore, blobs BlobBackend, dc int, opts ...Optio
 	return s
 }
 
+// txMediaStore is a subset of store.MediaStore that supports transactions.
+type txMediaStore interface {
+	store.MediaStore
+	WithTx(ctx context.Context, fn func(ctx context.Context, txMedia store.MediaStore) error) error
+}
+
+// BeginTx acquires a PostgreSQL advisory lock (serialising concurrent Seed
+// calls across instances), begins a database transaction, and returns a
+// transaction-scoped AvatarSetter. The returned release function MUST be
+// called (via defer) to commit/rollback and release the advisory lock.
+func (s *Service) BeginTx(ctx context.Context) (txAv interface {
+	CurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (domain.Photo, bool, error)
+	CreateAvatarFromBytes(ctx context.Context, data []byte) (domain.Photo, error)
+	CreateAvatarVideoFromBytes(ctx context.Context, data []byte, videoStartTs float64) (domain.Photo, error)
+	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error)
+}, release func(err error), retErr error) {
+	txMs, ok := s.media.(txMediaStore)
+	if !ok {
+		retErr = fmt.Errorf("bot avatar: media store does not support transactions")
+		return nil, nil, retErr
+	}
+	var txService *Service
+	released := make(chan struct{})
+	release = func(err error) {
+		close(released)
+	}
+	retErr = txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
+		txService = &Service{
+			media:              txMedia,
+			blobs:              s.blobs,
+			dc:                 s.dc,
+			log:                s.log,
+			blobCache:          s.blobCache,
+			byteCache:          s.byteCache,
+			stickerSetCache:    s.stickerSetCache,
+			stickerSetNegCache: s.stickerSetNegCache,
+			uploadQuota:        s.uploadQuota,
+		}
+		<-released
+		return nil
+	})
+	return txService, release, retErr
+}
+
 // SaveFilePart 累积一个 small file 分片。
 func (s *Service) SaveFilePart(ctx context.Context, ownerUserID, fileID int64, part int, bytes []byte) (bool, error) {
 	if err := validatePart(part, len(bytes)); err != nil {
