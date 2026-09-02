@@ -83,8 +83,6 @@ github.com/hashicorp/errwrap v1.1.0 h1:OxrOeh75EUXMY8TBjag2fzXGZ40LB6IKw45YeGUDY
 github.com/hashicorp/errwrap v1.1.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
 github.com/hashicorp/go-multierror v1.1.0 h1:B9UzwGQJehnUY1yNrnwREHc3fGbC2xefo8g4TbElacI=
 github.com/hashicorp/go-multierror v1.1.0/go.mod h1:spPvp8C1qA32ftKqdAHm4hHTbPw+vmowP0z+KUhOZdA=
-github.com/iamxvbaba/td v1.3.2 h1:/EwvDU0oiArAof16WDDGfUXg/w02m2MqzDskCnXakZA=
-github.com/iamxvbaba/td v1.3.2/go.mod h1:INkZJi18XbXtVOrldDnPtmQCJvIXhgDZdbo9MV/NY7M=
 github.com/iamxvbaba/td v1.3.3 h1:etBRuZWwtFQY9ehIL9VS2UhqZ+gupgVlPjfYajFGYVE=
 github.com/iamxvbaba/td v1.3.3/go.mod h1:INkZJi18XbXtVOrldDnPtmQCJvIXhgDZdbo9MV/NY7M=
 github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa h1:s+4MhCQ6YrzisK6hFJUX53drDT4UsSW3DEhKn0ifuHw=
