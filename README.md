@@ -96,6 +96,28 @@ current Telegram Desktop wire behavior.
 | [`main`](../../tree/main) | Monolith | A straightforward single-process server for development, evaluation, and smaller deployments. |
 | [`v2`](../../tree/v2) | Microservices | A split runtime with independent service boundaries for scaling, reliability, and production-oriented operation. |
 
+## Validated performance
+
+Recent optimization work has focused on bounded concurrency, durable delivery,
+and descriptor-backed file transfer. The latest successful real-client load
+tests produced the following results:
+
+| Scenario | Validated result | Server-side metrics |
+|---|---|---|
+| `main` sustained concurrency | 10,000 online sessions; 309,349 successful operations; no reconnects or fatal errors | 1.64 GB peak heap; 30,528 peak goroutines; 48/50 peak PostgreSQL connections |
+| `main` account startup | 1,000/1,000 accounts ready; 314 ms average readiness | 904.5 MB peak heap; 509 peak goroutines; 8/50 peak PostgreSQL connections |
+| `v2` private messaging | 1,000 accounts at 1,000 messages/s; 59,211/59,211 delivered live; no loss or duplication | 1.75 s end-to-end p99; durable delivery queues returned to zero |
+| `main` 2,000-member mixed-file test | 20,000/20,000 downloads; 1,226.85 MiB/s | 516.9 MB peak heap, 17.1% below the previous validated run |
+| `v2` 2,000-member mixed-file test | 20,000/20,000 downloads; 840.92 MiB/s | 552.4 MB Edge peak heap allocation; 894,928 KiB peak RSS; 14.9% lower RSS; zero PostgreSQL connection rejections |
+
+After the validation recovery windows, sessions, tracked buffers, receipts,
+delivery queues, and durable delivery state returned to zero. The file-specific
+optimizations do not change normal text-message protocol or delivery behavior.
+
+These are single-host development-environment capacity results, not production
+multi-host service-level guarantees. In particular, the 10,000-session result
+applies to `main`; higher-scale `v2` account tests remain in progress.
+
 ## v2 at a glance
 
 ```mermaid
