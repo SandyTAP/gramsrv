@@ -4,233 +4,258 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
-
-	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 )
 
-type fakeAvatarSetter struct {
-	mu sync.Mutex
+// txFakeAvatarSetter models a storage boundary whose SeedTx wraps fn in a
+// transaction with serialising semantics: fn may observe the current state,
+// and only when it returns nil are the created photos and bindings committed.
+// If fn returns an error the transaction aborts and nothing is persisted, so a
+// photo created and then abandoned is rolled back (never orphaned).
+type txFakeAvatarSetter struct {
+	// serialMu models the storage advisory lock: it serialises whole SeedTx
+	// transactions across concurrent instances.
+	serialMu sync.Mutex
+	mu       sync.Mutex
 
-	// currentPhotos maps (peerID) -> photoID; simulates existing avatars.
-	currentPhotos map[int64]int64
-	// readErrors contains peer IDs for which CurrentProfilePhotoKind returns an error.
-	readErrors map[int64]error
-	// created tracks all photos created via CreateAvatar*.
-	created []domain.Photo
-	// setCalls tracks SetCurrentProfilePhotoKind calls.
-	setCalls []setCall
-
-	beginTxErr error
+	// current maps peerID -> photoID (the persisted active avatar).
+	current map[int64]int64
+	// createdPhotos counts photos created and committed to the backend.
+	createdPhotos map[int64]bool
+	// committed counts how many transactions committed successfully.
+	committed int
+	// seedTxErr, when set, makes SeedTx fail before running fn.
+	seedTxErr error
+	// readErr, when set, makes CurrentProfilePhotoKind fail.
+	readErr error
+	// createErr, when set, makes CreateAvatar* fail.
+	createErr error
 }
 
-type setCall struct {
-	peerID int64
-	photoID int64
-}
-
-func newFakeAvatarSetter() *fakeAvatarSetter {
-	return &fakeAvatarSetter{
-		currentPhotos: make(map[int64]int64),
-		readErrors:    make(map[int64]error),
+func newTxFakeAvatarSetter() *txFakeAvatarSetter {
+	return &txFakeAvatarSetter{
+		current:       make(map[int64]int64),
+		createdPhotos: make(map[int64]bool),
 	}
 }
 
-func (f *fakeAvatarSetter) CurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind) (domain.Photo, bool, error) {
+func (f *txFakeAvatarSetter) CurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind) (domain.Photo, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err, ok := f.readErrors[peerID]; ok {
-		return domain.Photo{}, false, err
+	if f.readErr != nil {
+		return domain.Photo{}, false, f.readErr
 	}
-	if id, ok := f.currentPhotos[peerID]; ok {
+	if id, ok := f.current[peerID]; ok {
 		return domain.Photo{ID: id}, true, nil
 	}
 	return domain.Photo{}, false, nil
 }
 
-func (f *fakeAvatarSetter) CreateAvatarFromBytes(_ context.Context, data []byte) (domain.Photo, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	photo := domain.Photo{ID: int64(len(f.created) + 1)}
-	f.created = append(f.created, photo)
-	return photo, nil
+func (f *txFakeAvatarSetter) CreateAvatarFromBytes(_ context.Context, _ []byte) (domain.Photo, error) {
+	return f.create()
 }
 
-func (f *fakeAvatarSetter) CreateAvatarVideoFromBytes(_ context.Context, _ []byte, _ float64) (domain.Photo, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	photo := domain.Photo{ID: int64(len(f.created) + 1)}
-	f.created = append(f.created, photo)
-	return photo, nil
+func (f *txFakeAvatarSetter) CreateAvatarVideoFromBytes(_ context.Context, _ []byte, _ float64) (domain.Photo, error) {
+	return f.create()
 }
 
-func (f *fakeAvatarSetter) SetCurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind, photoID int64, _ int) (domain.Photo, bool, error) {
+func (f *txFakeAvatarSetter) create() (domain.Photo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.setCalls = append(f.setCalls, setCall{peerID: peerID, photoID: photoID})
+	if f.createErr != nil {
+		return domain.Photo{}, f.createErr
+	}
+	// Tentatively allocate an ID; only persisted if the tx commits.
+	id := int64(len(f.createdPhotos) + 1)
+	return domain.Photo{ID: id}, nil
+}
+
+func (f *txFakeAvatarSetter) SetCurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind, photoID int64, _ int) (domain.Photo, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.current[peerID] > 0 {
+		// Simulate the storage invariant: an active avatar already exists.
+		return domain.Photo{}, false, nil
+	}
+	f.current[peerID] = photoID
+	f.createdPhotos[photoID] = true
 	return domain.Photo{ID: photoID}, true, nil
 }
 
-func (f *fakeAvatarSetter) BeginTx(_ context.Context) (AvatarSetter, func(error), error) {
-	if f.beginTxErr != nil {
-		return nil, nil, f.beginTxErr
+func (f *txFakeAvatarSetter) SeedTx(ctx context.Context, fn func(ctx context.Context, tx AvatarSetter) error) error {
+	// Serialise the whole transaction (models the storage advisory lock).
+	f.serialMu.Lock()
+	defer f.serialMu.Unlock()
+
+	f.mu.Lock()
+	if f.seedTxErr != nil {
+		e := f.seedTxErr
+		f.mu.Unlock()
+		return e
 	}
-	return f, func(error) {}, nil
+	f.mu.Unlock()
+
+	// Snapshot the pre-transaction state so we can roll back on error.
+	f.mu.Lock()
+	prevCurrent := make(map[int64]int64, len(f.current))
+	for k, v := range f.current {
+		prevCurrent[k] = v
+	}
+	prevCreated := make(map[int64]bool, len(f.createdPhotos))
+	for k, v := range f.createdPhotos {
+		prevCreated[k] = v
+	}
+	f.mu.Unlock()
+
+	if err := fn(ctx, f); err != nil {
+		// Roll back: restore the committed state (media created and bindings
+		// are discarded, leaving no orphan photos), and propagate the error so
+		// Seed fails rather than pretending nothing happened.
+		f.mu.Lock()
+		f.current = prevCurrent
+		f.createdPhotos = prevCreated
+		f.mu.Unlock()
+		return err
+	}
+	f.mu.Lock()
+	f.committed++
+	f.mu.Unlock()
+	return nil
 }
 
 func TestSeedSkipsExistingAvatars(t *testing.T) {
-	av := newFakeAvatarSetter()
-	// Pre-populate ALL peers with existing avatars.
+	av := newTxFakeAvatarSetter()
 	for peerID := range peersForSeed() {
-		av.currentPhotos[peerID] = int64(peerID)
+		av.current[peerID] = int64(peerID)
 	}
 
-	Seed(context.Background(), av, zap.NewNop(), 1000)
+	if err := Seed(context.Background(), av, 1000); err != nil {
+		t.Fatalf("Seed returned error: %v", err)
+	}
 
 	av.mu.Lock()
 	defer av.mu.Unlock()
-	if len(av.created) != 0 {
-		t.Fatalf("expected 0 photos created, got %d", len(av.created))
+	for peerID, id := range av.current {
+		if id != int64(peerID) {
+			t.Fatalf("existing avatar for peer %d changed to %d", peerID, id)
+		}
 	}
-	if len(av.setCalls) != 0 {
-		t.Fatalf("expected 0 set calls, got %d", len(av.setCalls))
+	if len(av.createdPhotos) != 0 {
+		t.Fatalf("expected no new photos, got %d", len(av.createdPhotos))
 	}
 }
 
-func TestSeedHandlesCurrentProfilePhotoKindError(t *testing.T) {
-	av := newFakeAvatarSetter()
-	av.readErrors[domain.OfficialSystemUserID] = errors.New("db connection lost")
+func TestSeedReadErrorFailsWithoutWriting(t *testing.T) {
+	av := newTxFakeAvatarSetter()
+	av.readErr = errors.New("db connection lost")
 
-	Seed(context.Background(), av, zap.NewNop(), 1000)
+	// A read error must fail the seed rather than seeding as if no avatar
+	// existed. The transaction is aborted, so nothing is written.
+	if err := Seed(context.Background(), av, 1000); err == nil {
+		t.Fatalf("expected Seed to fail on read error")
+	}
 
 	av.mu.Lock()
 	defer av.mu.Unlock()
-	// OfficialSystemUserID should have been skipped due to read error.
-	// Other peers should have been created.
-	createdIDs := make(map[int64]bool)
-	for _, p := range av.created {
-		createdIDs[p.ID] = true
+	if len(av.createdPhotos) != 0 {
+		t.Fatalf("no photos should be persisted after a read error, got %d", len(av.createdPhotos))
 	}
-	for _, sc := range av.setCalls {
-		if sc.peerID == domain.OfficialSystemUserID {
-			t.Fatal("should not have set avatar for peer with read error")
-		}
-		if !createdIDs[sc.photoID] {
-			t.Fatalf("set call references unknown photo %d", sc.photoID)
-		}
+	if len(av.current) != 0 {
+		t.Fatalf("no avatars should be bound after a read error, got %d", len(av.current))
 	}
 }
 
-func TestSeedConcurrentInstances(t *testing.T) {
-	// Simulate two concurrent Seed calls with independent fakes sharing
-	// the same "database" (a shared map protected by mutex).
-	var mu sync.Mutex
-	shared := make(map[int64]int64) // peerID -> photoID
+func TestSeedCreateErrorRollsBackTransaction(t *testing.T) {
+	av := newTxFakeAvatarSetter()
+	av.createErr = errors.New("blob write failed")
+
+	if err := Seed(context.Background(), av, 1000); err == nil {
+		t.Fatalf("expected Seed to fail on create error")
+	}
+
+	av.mu.Lock()
+	defer av.mu.Unlock()
+	if len(av.current) != 0 {
+		t.Fatalf("no avatars should be bound after a create error, got %d", len(av.current))
+	}
+}
+
+func TestSeedConcurrentInstancesExactlyOneAvatarNoOrphan(t *testing.T) {
+	// Two Seed calls share one backend (two server instances). Storage-level
+	// serialisation means the first writes everything, the second observes an
+	// existing avatar and writes nothing.
+	av := newTxFakeAvatarSetter()
 
 	var wg sync.WaitGroup
-	var createdCount atomic.Int64
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			av := &concurrentFake{
-				mu:      &mu,
-				shared:  shared,
-				created: &createdCount,
+			if err := Seed(context.Background(), av, 1000); err != nil {
+				t.Errorf("Seed failed: %v", err)
 			}
-			Seed(context.Background(), av, zap.NewNop(), 1000)
 		}()
 	}
 	wg.Wait()
 
-	mu.Lock()
-	defer mu.Unlock()
-	// Each peer should have at most 1 photo in shared state.
-	for _, id := range shared {
+	av.mu.Lock()
+	defer av.mu.Unlock()
+	// Exactly one active avatar per peer, and every photo it references exists.
+	for peerID, id := range av.current {
 		if id == 0 {
-			t.Fatal("shared map contains zero photo ID")
+			t.Fatalf("peer %d has a zero photo id", peerID)
+		}
+		if !av.createdPhotos[id] {
+			t.Fatalf("peer %d references photo %d which was not created", peerID, id)
 		}
 	}
-}
-
-// concurrentFake wraps fakeAvatarSetter with shared-state methods
-// to simulate concurrent access to the same database.
-type concurrentFake struct {
-	mu      *sync.Mutex
-	shared  map[int64]int64
-	created *atomic.Int64
-}
-
-func (f *concurrentFake) CurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind) (domain.Photo, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if id, ok := f.shared[peerID]; ok {
-		return domain.Photo{ID: id}, true, nil
+	// Every committed avatar must be the current one (no orphan bindings that
+	// lost a race): committed photos == bound photos.
+	if len(av.createdPhotos) != len(peersForSeed()) {
+		t.Fatalf("expected exactly %d photos total, got %d", len(peersForSeed()), len(av.createdPhotos))
 	}
-	return domain.Photo{}, false, nil
+	if len(av.current) != len(peersForSeed()) {
+		t.Fatalf("expected %d avatars, got %d", len(peersForSeed()), len(av.current))
+	}
 }
 
-func (f *concurrentFake) CreateAvatarFromBytes(_ context.Context, _ []byte) (domain.Photo, error) {
-	id := f.created.Add(1)
-	return domain.Photo{ID: id}, nil
-}
+func TestSeedSeedTxFailure(t *testing.T) {
+	av := newTxFakeAvatarSetter()
+	av.seedTxErr = errors.New("advisory lock timeout")
 
-func (f *concurrentFake) CreateAvatarVideoFromBytes(_ context.Context, _ []byte, _ float64) (domain.Photo, error) {
-	id := f.created.Add(1)
-	return domain.Photo{ID: id}, nil
-}
-
-func (f *concurrentFake) SetCurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, peerID int64, _ domain.ProfilePhotoKind, photoID int64, _ int) (domain.Photo, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.shared[peerID] = photoID
-	return domain.Photo{ID: photoID}, true, nil
-}
-
-func (f *concurrentFake) BeginTx(_ context.Context) (AvatarSetter, func(error), error) {
-	return f, func(error) {}, nil
-}
-
-func TestSeedBeginTxFailure(t *testing.T) {
-	av := newFakeAvatarSetter()
-	av.beginTxErr = errors.New("advisory lock timeout")
-
-	// Seed should fatal on BeginTx error. We can't easily test Fatal,
-	// so we verify the error is returned from BeginTx.
-	_, _, err := av.BeginTx(context.Background())
-	if err == nil {
-		t.Fatal("expected error from BeginTx")
+	if err := Seed(context.Background(), av, 1000); err == nil {
+		t.Fatalf("expected Seed to fail when SeedTx fails")
 	}
 }
 
 func TestSeedCreatesAllBots(t *testing.T) {
-	av := newFakeAvatarSetter()
+	av := newTxFakeAvatarSetter()
 
-	Seed(context.Background(), av, zap.NewNop(), 1000)
+	if err := Seed(context.Background(), av, 1000); err != nil {
+		t.Fatalf("Seed failed: %v", err)
+	}
 
 	av.mu.Lock()
 	defer av.mu.Unlock()
-	expectedPeers := map[int64]bool{
-		domain.OfficialSystemUserID: false,
-		domain.BotFatherUserID:      false,
-		domain.StickersBotUserID:    false,
-		domain.VerifyBotUserID:      false,
-		domain.GifBotUserID:         false,
-		domain.PremiumBotUserID:     false,
+	expectedPeers := map[int64]bool{}
+	for peerID := range peersForSeed() {
+		expectedPeers[peerID] = false
 	}
-	for _, sc := range av.setCalls {
-		expectedPeers[sc.peerID] = true
+	for peerID, id := range av.current {
+		if id == 0 {
+			t.Errorf("peer %d has a zero photo id", peerID)
+		}
+		expectedPeers[peerID] = true
 	}
 	for peer, found := range expectedPeers {
 		if !found {
 			t.Errorf("peer %d was not seeded", peer)
 		}
 	}
-	if len(av.created) != len(peersForSeed()) {
-		t.Errorf("expected %d photos created, got %d", len(peersForSeed()), len(av.created))
+	if len(av.createdPhotos) != len(peersForSeed()) {
+		t.Errorf("expected %d photos created, got %d", len(peersForSeed()), len(av.createdPhotos))
 	}
 }
 
@@ -244,17 +269,19 @@ func TestSeedUsesConfiguredPremiumBotID(t *testing.T) {
 		domain.ConfigurePremiumBotUserID(prev)
 	})
 
-	av := newFakeAvatarSetter()
-	Seed(context.Background(), av, zap.NewNop(), 1000)
+	av := newTxFakeAvatarSetter()
+	if err := Seed(context.Background(), av, 1000); err != nil {
+		t.Fatalf("Seed failed: %v", err)
+	}
 
 	av.mu.Lock()
 	defer av.mu.Unlock()
 	var foundCustom, foundDefault bool
-	for _, sc := range av.setCalls {
-		if sc.peerID == customPremiumID {
+	for peerID := range av.current {
+		if peerID == customPremiumID {
 			foundCustom = true
 		}
-		if sc.peerID == domain.PremiumBotUserID {
+		if peerID == domain.PremiumBotUserID {
 			foundDefault = true
 		}
 	}

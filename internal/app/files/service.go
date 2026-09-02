@@ -189,24 +189,18 @@ type txMediaStore interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context, txMedia store.MediaStore) error) error
 }
 
-// BeginTx acquires a PostgreSQL advisory lock (serialising concurrent Seed
-// calls across instances), begins a database transaction, and returns a
-// transaction-scoped AvatarSetter. The returned release function MUST be
-// called (via defer) to commit/rollback and release the advisory lock.
-func (s *Service) BeginTx(ctx context.Context) (botavatars.AvatarSetter, func(err error), error) {
+// SeedTx implements botavatars.AvatarSetter. It runs fn inside a single
+// transaction holding the PostgreSQL advisory lock that serialises bot-avatar
+// seeding across instances. If fn returns an error the transaction is rolled
+// back (including any media created inside), otherwise it is committed. This
+// makes the check+create+bind sequence atomic and orphan-free.
+func (s *Service) SeedTx(ctx context.Context, fn func(ctx context.Context, tx botavatars.AvatarSetter) error) error {
 	txMs, ok := s.media.(txMediaStore)
 	if !ok {
-		retErr := fmt.Errorf("bot avatar: media store does not support transactions")
-		return nil, nil, retErr
+		return fmt.Errorf("bot avatar: media store does not support transactions")
 	}
-	var txService *Service
-	released := make(chan struct{})
-	release := func(err error) {
-		close(released)
-	}
-	var txAv botavatars.AvatarSetter
-	retErr := txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
-		txService = &Service{
+	return txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
+		txService := &Service{
 			media:              txMedia,
 			blobs:              s.blobs,
 			dc:                 s.dc,
@@ -217,11 +211,8 @@ func (s *Service) BeginTx(ctx context.Context) (botavatars.AvatarSetter, func(er
 			stickerSetNegCache: s.stickerSetNegCache,
 			uploadQuota:        s.uploadQuota,
 		}
-		txAv = txService
-		<-released
-		return nil
+		return fn(ctx, txService)
 	})
-	return txAv, release, retErr
 }
 
 // SaveFilePart 累积一个 small file 分片。

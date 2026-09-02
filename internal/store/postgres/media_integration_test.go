@@ -3,12 +3,14 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // TestMediaStoreRoundTrip 验证 MediaStore 各表的写读往返（含 nil bytea 归一、JSONB attributes/sizes、
@@ -457,5 +459,72 @@ func cleanupProfilePhotoDetailsRows(t *testing.T, ctx context.Context, pool *pgx
 	}
 	if _, err := pool.Exec(ctx, "DELETE FROM photos WHERE id = ANY($1::bigint[])", photoIDs); err != nil {
 		t.Fatalf("cleanup profile photo details photos: %v", err)
+	}
+}
+
+// TestMediaStoreAvatarSeedConcurrencySerialized proves the storage-boundary
+// serialisation that bot-avatar seeding relies on: two concurrent
+// check-then-bind "seed" transactions for the same owner (each inside WithTx,
+// which holds the advisory lock) cannot interleave. Exactly one current avatar
+// row survives and the losing transaction leaves no bound orphan row. Requires
+// TELESRV_TEST_POSTGRES_DSN.
+func TestMediaStoreAvatarSeedConcurrencySerialized(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	s := NewMediaStore(pool)
+
+	const ownerID = int64(9100000000000000700)
+	const photoA = int64(9100000000000000701)
+	const photoB = int64(9100000000000000702)
+	photoIDs := []int64{photoA, photoB}
+	t.Cleanup(func() { cleanupProfilePhotoDetailsRows(t, context.Background(), pool, ownerID, photoIDs) })
+
+	for _, id := range photoIDs {
+		if err := s.PutPhoto(ctx, domain.Photo{ID: id, AccessHash: id, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 800, H: 600, Size: 4096}}}); err != nil {
+			t.Fatalf("put photo %d: %v", id, err)
+		}
+	}
+
+	// SeedOne models one instance's check-then-bind inside the locked tx.
+	seedOne := func(photoID int64) error {
+		return s.WithTx(ctx, func(ctx context.Context, tx store.MediaStore) error {
+			if _, ok, err := tx.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, ownerID, domain.ProfilePhotoKindProfile); err != nil {
+				return err
+			} else if ok {
+				return nil
+			}
+			return tx.AddProfilePhotoKind(ctx, domain.PeerTypeUser, ownerID, domain.ProfilePhotoKindProfile, photoID, 1700000000)
+		})
+	}
+
+	var wg sync.WaitGroup
+	var errs [2]error
+	for i, photo := range photoIDs {
+		wg.Add(1)
+		go func(photo int64, idx int) {
+			defer wg.Done()
+			errs[idx] = seedOne(photo)
+		}(photo, i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("seed %d failed: %v", i, err)
+		}
+	}
+
+	// Exactly one active current row, and no orphan bound row for the loser.
+	var activeCount, totalRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM profile_photos WHERE owner_peer_type='user' AND owner_peer_id=$1 AND active`, ownerID).Scan(&activeCount); err != nil {
+		t.Fatalf("count active: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM profile_photos WHERE owner_peer_type='user' AND owner_peer_id=$1`, ownerID).Scan(&totalRows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if activeCount != 1 {
+		t.Fatalf("expected exactly 1 active current avatar, got %d", activeCount)
+	}
+	if totalRows != 1 {
+		t.Fatalf("expected exactly 1 bound profile_photos row (no orphan), got %d", totalRows)
 	}
 }

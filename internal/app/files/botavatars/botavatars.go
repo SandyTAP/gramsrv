@@ -3,19 +3,14 @@ package botavatars
 import (
 	"context"
 	"embed"
+	"fmt"
 	"io/fs"
-
-	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 )
 
 //go:embed *.jpg *.mp4
 var assets embed.FS
-
-// advisoryLockKey is a PostgreSQL advisory-lock key used to serialise
-// bot-avatar seeding across concurrent instances.
-const advisoryLockKey = int64(0x626f746176617461) // "botavata"
 
 // peersForSeed returns the peer→avatar mapping, using the configured
 // Premium bot ID instead of the compile-time constant so that deployments
@@ -37,50 +32,49 @@ type AvatarSetter interface {
 	CreateAvatarFromBytes(ctx context.Context, data []byte) (domain.Photo, error)
 	CreateAvatarVideoFromBytes(ctx context.Context, data []byte, videoStartTs float64) (domain.Photo, error)
 	SetCurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) (domain.Photo, bool, error)
-	// BeginTx acquires a PostgreSQL advisory lock (serialising concurrent
-	// Seed calls across instances) and returns a transaction-scoped
-	// AvatarSetter. The returned release function MUST be called (deferred)
-	// to unlock and rollback/commit the transaction.
-	BeginTx(ctx context.Context) (txAv AvatarSetter, release func(error), err error)
+	// SeedTx runs fn inside a single transaction that holds a serialising
+	// advisory lock. If fn returns an error the whole transaction (including
+	// any media created inside) is rolled back; otherwise it is committed.
+	// This makes the check+create+bind sequence atomic and orphan-free across
+	// concurrent or multi-instance startup. The tx AvatarSetter passed to fn
+	// must route its calls through the same transaction and lock.
+	SeedTx(ctx context.Context, fn func(ctx context.Context, tx AvatarSetter) error) error
 }
 
 // Seed assigns embedded avatars to the built-in system account and bots.
-// It is idempotent: peers that already have a profile photo are skipped.
-// The advisory lock guarantees that at most one instance seeds at a time,
-// preventing orphan media from concurrent creates.
-func Seed(ctx context.Context, av AvatarSetter, logger *zap.Logger, now int64) {
-	txAv, release, err := av.BeginTx(ctx)
-	if err != nil {
-		logger.Fatal("bot avatar: begin tx", zap.Error(err))
-	}
-	defer release(nil)
-
-	for peerID, fname := range peersForSeed() {
-		if _, ok, err := txAv.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, peerID, domain.ProfilePhotoKindProfile); err != nil {
-			logger.Warn("bot avatar: read current", zap.Int64("peer", peerID), zap.Error(err))
-			continue
-		} else if ok {
-			continue
+// It is idempotent: peers that already have a profile photo are skipped, and
+// the whole run is atomic inside the advisory-locked SeedTx transaction. Any
+// error fails the seed and aborts the transaction, so a partially written
+// avatar photo is rolled back rather than orphaned.
+func Seed(ctx context.Context, av AvatarSetter, now int64) error {
+	return av.SeedTx(ctx, func(ctx context.Context, txAv AvatarSetter) error {
+		for peerID, fname := range peersForSeed() {
+			if _, ok, err := txAv.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, peerID, domain.ProfilePhotoKindProfile); err != nil {
+				return fmt.Errorf("bot avatar: read current photo for peer %d: %w", peerID, err)
+			} else if ok {
+				continue
+			}
+			data, err := fs.ReadFile(assets, fname)
+			if err != nil {
+				return fmt.Errorf("bot avatar: read embedded asset %q: %w", fname, err)
+			}
+			var photo domain.Photo
+			if isVideo(fname) {
+				photo, err = txAv.CreateAvatarVideoFromBytes(ctx, data, 0)
+			} else {
+				photo, err = txAv.CreateAvatarFromBytes(ctx, data)
+			}
+			if err != nil {
+				return fmt.Errorf("bot avatar: create avatar for peer %d: %w", peerID, err)
+			}
+			if _, found, err := txAv.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, peerID, domain.ProfilePhotoKindProfile, photo.ID, int(now)); err != nil {
+				return fmt.Errorf("bot avatar: set current photo for peer %d: %w", peerID, err)
+			} else if !found {
+				return fmt.Errorf("bot avatar: bind current photo for peer %d: not found", peerID)
+			}
 		}
-		data, err := fs.ReadFile(assets, fname)
-		if err != nil {
-			logger.Warn("bot avatar: read embedded asset", zap.Int64("peer", peerID), zap.String("file", fname), zap.Error(err))
-			continue
-		}
-		var photo domain.Photo
-		if isVideo(fname) {
-			photo, err = txAv.CreateAvatarVideoFromBytes(ctx, data, 0)
-		} else {
-			photo, err = txAv.CreateAvatarFromBytes(ctx, data)
-		}
-		if err != nil {
-			logger.Warn("bot avatar: create", zap.Int64("peer", peerID), zap.String("file", fname), zap.Error(err))
-			continue
-		}
-		if _, found, err := txAv.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, peerID, domain.ProfilePhotoKindProfile, photo.ID, int(now)); err != nil || !found {
-			logger.Warn("bot avatar: set current", zap.Int64("peer", peerID), zap.Error(err))
-		}
-	}
+		return nil
+	})
 }
 
 func isVideo(name string) bool {
