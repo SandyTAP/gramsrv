@@ -17,7 +17,7 @@ import (
 	"telesrv/internal/filedata/filedatapb"
 )
 
-func TestGRPCServerTransfersOwnedPayloads(t *testing.T) {
+func TestGRPCServerBorrowsReadOnlyPayloads(t *testing.T) {
 	for _, size := range []int{64 << 10, 1 << 20} {
 		t.Run(payloadSizeName(size), func(t *testing.T) {
 			store := &serverTransferStore{benchmarkPayloadStore: &benchmarkPayloadStore{payload: benchmarkPayload(size)}}
@@ -26,26 +26,22 @@ func TestGRPCServerTransfersOwnedPayloads(t *testing.T) {
 			fileBytes := benchmarkPayload(size)
 			store.next = fileBytes
 			file, err := server.GetFile(context.Background(), &filedatapb.GetFileRequest{LocationKey: "doc:1", Limit: int32(size)})
-			if err != nil || !sameBacking(file.Data, fileBytes) {
-				t.Fatalf("GetFile did not transfer service-owned bytes: err=%v", err)
-			}
-			file.Data[0] ^= 0xff
-			if fileBytes[0] != file.Data[0] {
-				t.Fatal("GetFile response mutation did not reach transferred buffer")
+			if err != nil || !sameBacking(file.Data, fileBytes) || cap(file.Data) != len(file.Data) {
+				t.Fatalf("GetFile did not borrow a capacity-clipped service payload: err=%v", err)
 			}
 
 			rangeBytes := benchmarkPayload(size)
 			store.next = rangeBytes
 			blobRange, err := server.GetBlobRange(context.Background(), &filedatapb.GetBlobRangeRequest{ObjectKey: "blob", Limit: int64(size)})
-			if err != nil || !sameBacking(blobRange.Data, rangeBytes) {
-				t.Fatalf("GetBlobRange did not transfer backend-owned bytes: err=%v", err)
+			if err != nil || !sameBacking(blobRange.Data, rangeBytes) || cap(blobRange.Data) != len(blobRange.Data) {
+				t.Fatalf("GetBlobRange did not borrow a capacity-clipped backend payload: err=%v", err)
 			}
 
 			partBytes := benchmarkPayload(size)
 			store.next = partBytes
 			part, err := server.GetUploadPart(context.Background(), &filedatapb.GetUploadPartRequest{ObjectKey: "part"})
-			if err != nil || !sameBacking(part.Data, partBytes) {
-				t.Fatalf("GetUploadPart did not transfer backend-owned bytes: err=%v", err)
+			if err != nil || !sameBacking(part.Data, partBytes) || cap(part.Data) != len(part.Data) {
+				t.Fatalf("GetUploadPart did not borrow a capacity-clipped backend payload: err=%v", err)
 			}
 		})
 	}
@@ -59,7 +55,7 @@ func TestGRPCRemoteTransfersResponsesAndBorrowsRequests(t *testing.T) {
 			client := &captureFileDataClient{getFileResponse: fileResponse}
 			remote := testGRPCRemote(client)
 			chunk, found, err := remote.GetFile(context.Background(), domain.FileDownloadRequest{LocationKey: "doc:1", Limit: size})
-			if err != nil || !found || !sameBacking(chunk.Bytes, payload) || fileResponse.Data != nil {
+			if err != nil || !found || !sameBacking(chunk.Bytes, payload) || cap(chunk.Bytes) != len(chunk.Bytes) || fileResponse.Data != nil {
 				t.Fatalf("GetFile ownership: found=%v err=%v response_retained=%v", found, err, fileResponse.Data != nil)
 			}
 
@@ -67,7 +63,7 @@ func TestGRPCRemoteTransfersResponsesAndBorrowsRequests(t *testing.T) {
 			rangeResponse := &filedatapb.GetBlobRangeResponse{Data: rangePayload, Total: int64(size)}
 			client.getRangeResponse = rangeResponse
 			gotRange, _, err := remote.GetRange(context.Background(), "blob", 0, int64(size))
-			if err != nil || !sameBacking(gotRange, rangePayload) || rangeResponse.Data != nil {
+			if err != nil || !sameBacking(gotRange, rangePayload) || cap(gotRange) != len(gotRange) || rangeResponse.Data != nil {
 				t.Fatalf("GetRange ownership: err=%v response_retained=%v", err, rangeResponse.Data != nil)
 			}
 
@@ -75,7 +71,7 @@ func TestGRPCRemoteTransfersResponsesAndBorrowsRequests(t *testing.T) {
 			partResponse := &filedatapb.GetUploadPartResponse{Data: partPayload}
 			client.getUploadPartResponse = partResponse
 			gotPart, err := remote.GetUploadPart(context.Background(), "part")
-			if err != nil || !sameBacking(gotPart, partPayload) || partResponse.Data != nil {
+			if err != nil || !sameBacking(gotPart, partPayload) || cap(gotPart) != len(gotPart) || partResponse.Data != nil {
 				t.Fatalf("GetUploadPart ownership: err=%v response_retained=%v", err, partResponse.Data != nil)
 			}
 
@@ -127,27 +123,24 @@ func TestBufconnPayloadMutationIsolation(t *testing.T) {
 			if err != nil || !found {
 				t.Fatalf("GetFile: found=%v err=%v", found, err)
 			}
-			chunk.Bytes[0] ^= 0xff
-			if !bytes.Equal(store.payload, original) {
-				t.Fatal("mutating GetFile result changed backend bytes")
+			if sameBacking(chunk.Bytes, store.payload) {
+				t.Fatal("gRPC GetFile response still aliases File backend storage")
 			}
 
 			blobRange, _, err := remote.GetRange(context.Background(), "blob", 0, int64(size))
 			if err != nil {
 				t.Fatal(err)
 			}
-			blobRange[0] ^= 0xff
-			if !bytes.Equal(store.payload, original) {
-				t.Fatal("mutating GetRange result changed backend bytes")
+			if sameBacking(blobRange, store.payload) {
+				t.Fatal("gRPC GetRange response still aliases File backend storage")
 			}
 
 			part, err := remote.GetUploadPart(context.Background(), "part")
 			if err != nil {
 				t.Fatal(err)
 			}
-			part[0] ^= 0xff
-			if !bytes.Equal(store.payload, original) {
-				t.Fatal("mutating GetUploadPart result changed backend bytes")
+			if sameBacking(part, store.payload) {
+				t.Fatal("gRPC GetUploadPart response still aliases File backend storage")
 			}
 
 			if _, err := remote.Put(context.Background(), payload); err != nil {

@@ -83,12 +83,12 @@ type Conn struct {
 	salt             int64
 	key              crypto.AuthKey
 
-	outbound        chan outboundOp
-	outboundControl chan outboundOp
+	outbound        chan *outboundOp
+	outboundControl chan *outboundOp
 	// Critical RPC results (session/difference convergence) and large bulk
 	// responses have independent bounded lanes. The actor remains the sole writer.
-	outboundCritical chan outboundOp
-	outboundBulk     chan outboundOp
+	outboundCritical chan *outboundOp
+	outboundBulk     chan *outboundOp
 	outboundStop     chan struct{}
 	outboundDone     chan struct{}
 	outboundClose    sync.Once
@@ -112,6 +112,8 @@ type Conn struct {
 	outboundCriticalBudgetOnce    sync.Once
 	outboundScratchPool           *outboundScratchPool
 	outboundScratchOnce           sync.Once
+	outboundOpPool                *outboundOpPool
+	outboundReplayBodyPool        *outboundReplayBodyPool
 	// outboundState outlives this physical Conn generation. A replacement
 	// physical connection for the same auth key/session reuses it.
 	outboundState *outboundState

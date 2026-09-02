@@ -41,6 +41,7 @@ type connState struct {
 	createdFloor int64
 	seen         map[int64]clientMsgRecord // 已处理的 client msg_id，用于幂等和 msgs_state_req
 	order        []int64
+	orderHead    int
 	minSeen      int64
 	maxSeen      int64
 	// maxContentMsgID/maxContentSeqNo 是已接受 content 消息的 msg_id / seq_no 高水位，
@@ -1669,18 +1670,23 @@ func (cs *connState) trackInbound(msgID int64, seqNo int32, content, service boo
 			cs.maxContentSeqNo = seqNo
 		}
 	}
-	cs.order = append(cs.order, msgID)
+	var evicted int64
+	if len(cs.order) < maxTrackedClientMsgIDs {
+		cs.order = append(cs.order, msgID)
+	} else {
+		evicted = cs.order[cs.orderHead]
+		cs.order[cs.orderHead] = msgID
+		cs.orderHead = (cs.orderHead + 1) % len(cs.order)
+	}
 	if msgID < cs.minSeen {
 		cs.minSeen = msgID
 	}
 	if msgID > cs.maxSeen {
 		cs.maxSeen = msgID
 	}
-	if len(cs.order) > maxTrackedClientMsgIDs {
-		oldest := cs.order[0]
-		cs.order = cs.order[1:]
-		delete(cs.seen, oldest)
-		if oldest == cs.minSeen || oldest == cs.maxSeen {
+	if evicted != 0 {
+		delete(cs.seen, evicted)
+		if evicted == cs.minSeen || evicted == cs.maxSeen {
 			cs.recomputeRange()
 		}
 	}

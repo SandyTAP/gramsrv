@@ -177,9 +177,8 @@ func (c *blobBytesCache) getShared(key string) ([]byte, bool) {
 	if el, ok := c.m[key]; ok {
 		c.ll.MoveToFront(el)
 		entry := el.Value.(*blobBytesEntry)
-		// Cache entries are immutable after publication. GetFile copies only the
-		// requested range before returning it, so copying the whole cached blob on
-		// every hit would add an avoidable second full-size allocation.
+		// Cache entries are immutable after publication. GetFile returns a
+		// capacity-clipped read-only view of the requested range.
 		return entry.bytes, true
 	}
 	return nil, false

@@ -139,7 +139,7 @@ func (s *grpcServer) GetFile(ctx context.Context, req *filedatapb.GetFileRequest
 	}
 	res := &filedatapb.GetFileResponse{
 		Found:    found,
-		Data:     chunk.Bytes,
+		Data:     readOnlyPBBytes(chunk.Bytes),
 		MimeType: chunk.MimeType,
 		Total:    chunk.Total,
 	}
@@ -231,7 +231,7 @@ func (s *grpcServer) GetBlobRange(ctx context.Context, req *filedatapb.GetBlobRa
 	if err != nil {
 		return &filedatapb.GetBlobRangeResponse{Error: err.Error(), ErrorKind: errorKind(err)}, nil
 	}
-	return &filedatapb.GetBlobRangeResponse{Data: data, Total: total}, nil
+	return &filedatapb.GetBlobRangeResponse{Data: readOnlyPBBytes(data), Total: total}, nil
 }
 
 func (s *grpcServer) PutUploadPart(ctx context.Context, req *filedatapb.PutUploadPartRequest) (*filedatapb.UploadPartObjectResponse, error) {
@@ -258,7 +258,14 @@ func (s *grpcServer) GetUploadPart(ctx context.Context, req *filedatapb.GetUploa
 	if err != nil {
 		return &filedatapb.GetUploadPartResponse{Error: err.Error(), ErrorKind: errorKind(err)}, nil
 	}
-	return &filedatapb.GetUploadPartResponse{Data: data}, nil
+	return &filedatapb.GetUploadPartResponse{Data: readOnlyPBBytes(data)}, nil
+}
+
+// readOnlyPBBytes lets the gRPC marshaler borrow immutable service/backend
+// storage without a full payload copy. The response must never mutate it, and
+// capacity clipping prevents accidental append into an unexposed shared tail.
+func readOnlyPBBytes(data []byte) []byte {
+	return data[:len(data):len(data)]
 }
 
 func (s *grpcServer) DeleteUploadPart(ctx context.Context, req *filedatapb.DeleteUploadPartRequest) (*filedatapb.ErrorResponse, error) {

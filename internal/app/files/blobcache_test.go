@@ -33,7 +33,7 @@ func TestBlobMetaCacheGetPutEvict(t *testing.T) {
 	}
 }
 
-func TestBlobBytesCacheConcurrentSharedRangeOwnership(t *testing.T) {
+func TestBlobBytesCacheConcurrentSharedReadOnlyRanges(t *testing.T) {
 	cache := newBlobBytesCache(2 << 20)
 	cache.putOwned("blob", bytes.Repeat([]byte{'a'}, 64<<10))
 	var wg sync.WaitGroup
@@ -47,11 +47,13 @@ func TestBlobBytesCacheConcurrentSharedRangeOwnership(t *testing.T) {
 					t.Errorf("shared cache read: ok=%v size=%d", ok, len(shared))
 					return
 				}
-				before := shared[0]
-				owned := sliceBlobBytes(shared, 0, int64(len(shared)))
-				owned[0] ^= 0xff
-				if shared[0] != before {
-					t.Error("owned range mutation changed immutable cache entry")
+				view := viewBlobBytes(shared, 0, int64(len(shared)))
+				if len(view) == 0 || &view[0] != &shared[0] {
+					t.Error("range view copied immutable cache backing")
+					return
+				}
+				if cap(view) != len(view) {
+					t.Error("range view permits append into immutable cache backing")
 					return
 				}
 			}
@@ -138,12 +140,6 @@ func TestGetFileCachesMetadataAndSmallBlobBytes(t *testing.T) {
 	if blobs.getRangeCalls != 1 {
 		t.Errorf("getRangeCalls = %d, want 1", blobs.getRangeCalls)
 	}
-	c1.Bytes[0] = 'x'
-	c1Again, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:42", Offset: 0, Limit: 5})
-	if err != nil || !ok || string(c1Again.Bytes) != "01234" {
-		t.Fatalf("mutating returned chunk changed byte cache: chunk=%q ok=%v err=%v", c1Again.Bytes, ok, err)
-	}
-
 	// 后续请求：同 location 命中元数据与字节缓存；[5,10) 直接从内存切片。
 	c2, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:42", Offset: 5, Limit: 5})
 	if err != nil || !ok {
@@ -157,6 +153,143 @@ func TestGetFileCachesMetadataAndSmallBlobBytes(t *testing.T) {
 	}
 	if blobs.getRangeCalls != 1 {
 		t.Errorf("getRangeCalls = %d, want 1 (byte cache hit)", blobs.getRangeCalls)
+	}
+}
+
+func TestGetFileByteCacheReturnsSharedReadOnlyViews(t *testing.T) {
+	ctx := context.Background()
+	local, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectKey, err := local.Put(ctx, []byte("0123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := newFakeMediaStore()
+	if err := media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: "doc:shared-small", Backend: domain.MediaBackendLocalFS,
+		ObjectKey: objectKey, Size: 10, MimeType: "application/octet-stream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(media, local, 2)
+	if _, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-small", Offset: 2, Limit: 4}); err != nil || !ok {
+		t.Fatalf("warm cache ok=%v err=%v", ok, err)
+	}
+	first, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-small", Offset: 2, Limit: 4})
+	if err != nil || !ok {
+		t.Fatalf("first cache hit ok=%v err=%v", ok, err)
+	}
+	second, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-small", Offset: 2, Limit: 4})
+	if err != nil || !ok {
+		t.Fatalf("second cache hit ok=%v err=%v", ok, err)
+	}
+	if len(first.Bytes) == 0 || &first.Bytes[0] != &second.Bytes[0] {
+		t.Fatal("identical byte-cache ranges did not share immutable backing")
+	}
+	if cap(first.Bytes) != len(first.Bytes) || cap(second.Bytes) != len(second.Bytes) {
+		t.Fatalf("range capacity was not clipped: first=%d/%d second=%d/%d", len(first.Bytes), cap(first.Bytes), len(second.Bytes), cap(second.Bytes))
+	}
+}
+
+type blockingRangeBackend struct {
+	BlobBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func (b *blockingRangeBackend) GetRange(ctx context.Context, objectKey string, offset, limit int64) ([]byte, int64, error) {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.entered) })
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+	return b.BlobBackend.GetRange(ctx, objectKey, offset, limit)
+}
+
+func TestGetFileSingleflightSharesImmutableRangeBacking(t *testing.T) {
+	ctx := context.Background()
+	local, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("r"), blobBytesCacheMaxEntryBytes+1024)
+	objectKey, err := local.Put(ctx, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := newFakeMediaStore()
+	if err := media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: "doc:shared-range", Backend: domain.MediaBackendLocalFS,
+		ObjectKey: objectKey, Size: int64(len(payload)), MimeType: "application/octet-stream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &blockingRangeBackend{BlobBackend: local, entered: make(chan struct{}), release: make(chan struct{})}
+	svc := NewService(media, backend, 2)
+
+	const callers = 16
+	results := make(chan domain.FileChunk, callers)
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			chunk, found, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-range", Offset: 17, Limit: 128 << 10})
+			if err == nil && !found {
+				err = context.Canceled
+			}
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- chunk
+		}()
+	}
+	<-backend.entered
+	close(backend.release)
+
+	var first domain.FileChunk
+	for i := 0; i < callers; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case chunk := <-results:
+			if i == 0 {
+				first = chunk
+				continue
+			}
+			if len(chunk.Bytes) == 0 || &chunk.Bytes[0] != &first.Bytes[0] {
+				t.Fatal("singleflight callers did not share immutable range backing")
+			}
+			if chunk.ImmutableRange == nil || chunk.ImmutableRange.RangeSHA256 != first.ImmutableRange.RangeSHA256 {
+				t.Fatal("singleflight callers did not share exact range digest")
+			}
+		}
+	}
+	backend.mu.Lock()
+	calls := backend.calls
+	backend.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("backend range calls = %d, want 1", calls)
+	}
+}
+
+func BenchmarkViewBlobBytes(b *testing.B) {
+	data := bytes.Repeat([]byte("x"), 128<<10)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		view := viewBlobBytes(data, 0, int64(len(data)))
+		if len(view) != len(data) {
+			b.Fatal(len(view))
+		}
 	}
 }
 

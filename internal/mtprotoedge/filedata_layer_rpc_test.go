@@ -157,7 +157,7 @@ func TestFileDataLayerRPCPublishesImmutableReplaySource(t *testing.T) {
 	}
 }
 
-func TestFileDataLayerRPCTransfersGetFilePayloadToTG(t *testing.T) {
+func TestFileDataLayerRPCSharesReadOnlyGetFilePayloadWithTG(t *testing.T) {
 	for _, size := range []int{64 << 10, 1 << 20} {
 		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
 			payload := make([]byte, size)
@@ -176,11 +176,7 @@ func TestFileDataLayerRPCTransfersGetFilePayloadToTG(t *testing.T) {
 			}
 			file, ok := result.CanonicalValue().(*tg.UploadFile)
 			if !ok || len(file.Bytes) != size || &file.Bytes[0] != &payload[0] {
-				t.Fatal("upload.getFile copied the FileData-owned payload before tg.UploadFile")
-			}
-			file.Bytes[0] ^= 0xff
-			if payload[0] != file.Bytes[0] {
-				t.Fatal("tg.UploadFile does not own the transferred FileData payload")
+				t.Fatal("upload.getFile copied the FileData read-only payload before tg.UploadFile")
 			}
 		})
 	}

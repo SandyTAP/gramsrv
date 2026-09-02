@@ -34,8 +34,9 @@ func BenchmarkGRPCPayloadFlow(b *testing.B) {
 				if err != nil || !found || len(chunk.Bytes) != size {
 					b.Fatalf("GetFile: size=%d found=%v err=%v", len(chunk.Bytes), found, err)
 				}
-				// This is the Edge tail: FileData's owned chunk moves directly into
-				// tg.UploadFile; TL encoding is the next and only required wire copy.
+				// This is the Edge tail: FileData's request-owned storage is published
+				// read-only and moves directly into tg.UploadFile. TL encoding is the
+				// next and only required wire copy.
 				uploadFile := tg.UploadFile{Bytes: chunk.Bytes}
 				if !sameBacking(uploadFile.Bytes, chunk.Bytes) {
 					b.Fatal("tg.UploadFile payload was copied")

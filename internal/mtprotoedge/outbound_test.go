@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/crypto"
@@ -482,6 +484,9 @@ func newOutboundTestConn(t *testing.T, tr transport.Conn, budget *outboundTracke
 }
 
 func TestOutboundQueueBackingUsesSmallConfigurableBounds(t *testing.T) {
+	if slot, wide := unsafe.Sizeof((*outboundOp)(nil)), unsafe.Sizeof(outboundOp{}); slot >= wide {
+		t.Fatalf("indirect queue slot = %d bytes, wide outbound op = %d bytes", slot, wide)
+	}
 	t.Run("defaults", func(t *testing.T) {
 		c := &Conn{metrics: NopMetrics{}}
 		c.startOutbound()
@@ -509,6 +514,64 @@ func TestOutboundQueueBackingUsesSmallConfigurableBounds(t *testing.T) {
 			t.Fatalf("control queue cap = %d, want 3", got)
 		}
 	})
+}
+
+func TestOutboundOpPoolClearsReferencesAndBoundsIdle(t *testing.T) {
+	pool := newOutboundOpPool(1)
+	op := pool.acquire()
+	op.ctx = context.Background()
+	op.msg = &mt.PingRequest{PingID: 1}
+	op.encoded = &encodedOutboundMessage{body: []byte("payload")}
+	op.ids = []int64{1, 2, 3}
+	op.done = make(chan outboundResult, 1)
+	op.terminal = func(error) {}
+	pool.release(op)
+
+	reused := pool.acquire()
+	if reused != op {
+		t.Fatal("idle outbound op was not reused")
+	}
+	if reused.ctx != nil || reused.msg != nil || reused.encoded != nil || reused.ids != nil || reused.done != nil || reused.terminal != nil {
+		t.Fatalf("reused outbound op retained references: %+v", reused)
+	}
+	pool.release(reused)
+	pool.release(&outboundOp{})
+	if got := len(pool.idle); got != 1 {
+		t.Fatalf("idle outbound op count = %d, want bounded 1", got)
+	}
+}
+
+func BenchmarkOutboundOpPool(b *testing.B) {
+	pool := newOutboundOpPool(1)
+	b.ReportAllocs()
+	for b.Loop() {
+		op := pool.acquire()
+		op.kind = outboundSend
+		pool.release(op)
+	}
+}
+
+func TestOutboundAckHistoryUsesStableCircularBacking(t *testing.T) {
+	state := newOutboundState(newOutboundTrackedBudget(1 << 20))
+	for id := int64(1); id <= maxTrackedAckedMsgIDs; id++ {
+		state.markAcked(id)
+	}
+	if len(state.ackOrder) != maxTrackedAckedMsgIDs || len(state.acked) != maxTrackedAckedMsgIDs {
+		t.Fatalf("initial ack history = order:%d map:%d", len(state.ackOrder), len(state.acked))
+	}
+	backing := &state.ackOrder[0]
+	for id := int64(maxTrackedAckedMsgIDs + 1); id <= 4*maxTrackedAckedMsgIDs; id++ {
+		state.markAcked(id)
+	}
+	if &state.ackOrder[0] != backing {
+		t.Fatal("full ack history replaced its circular backing")
+	}
+	if len(state.ackOrder) != maxTrackedAckedMsgIDs || len(state.acked) != maxTrackedAckedMsgIDs {
+		t.Fatalf("steady ack history = order:%d map:%d", len(state.ackOrder), len(state.acked))
+	}
+	if state.isKnown(1) || !state.isKnown(4*maxTrackedAckedMsgIDs) {
+		t.Fatal("ack history did not evict oldest and retain newest IDs")
+	}
 }
 
 func TestOutboundOptionsDefaults(t *testing.T) {
@@ -1007,6 +1070,81 @@ func TestOutboundStateCompactsImmutableRPCResultAndReplaysExactBody(t *testing.T
 	}
 }
 
+func TestImmutableRPCResultMaterializesDirectlyIntoScratch(t *testing.T) {
+	inner := bytes.Repeat([]byte{0x6b}, 1<<20)
+	logicalBytes := 12 + len(inner)
+	replay := &encodedOutboundMessage{
+		typeID:            proto.ResultTypeID,
+		reqMsgID:          7101,
+		replaySource:      &staticRPCReplaySource{inner: inner},
+		innerDigest:       sha256.Sum256(inner),
+		uncompressedBytes: len(inner),
+		logicalBytes:      logicalBytes,
+	}
+	pool := newOutboundReplayBodyPool([]outboundReplayBodyClassSpec{{size: logicalBytes, maxIdle: 1}})
+	scratch, class := pool.acquire(logicalBytes)
+	body, usedScratch, err := replay.materializeRPCResultBodyInto(context.Background(), replay.reqMsgID, scratch)
+	if err != nil {
+		t.Fatalf("materialize replay: %v", err)
+	}
+	if !usedScratch {
+		t.Fatal("descriptor replay did not use the supplied scratch buffer")
+	}
+	if len(body) != logicalBytes || &body[0] != &scratch[:cap(scratch)][0] {
+		t.Fatal("materialized body does not alias the supplied scratch buffer")
+	}
+	if got := int64(binary.LittleEndian.Uint64(body[4:12])); got != replay.reqMsgID {
+		t.Fatalf("materialized req_msg_id = %d, want %d", got, replay.reqMsgID)
+	}
+	pool.release(class, body)
+	if got := len(pool.classes[class].idle); got != 1 {
+		t.Fatalf("idle pooled bodies = %d, want 1", got)
+	}
+}
+
+func TestOutboundReplayBodyPoolBoundsIdleBuffers(t *testing.T) {
+	pool := newOutboundReplayBodyPool([]outboundReplayBodyClassSpec{{size: 4096, maxIdle: 1}})
+	first, firstClass := pool.acquire(4000)
+	second, secondClass := pool.acquire(4000)
+	if firstClass != 0 || secondClass != 0 || cap(first) != 4096 || cap(second) != 4096 {
+		t.Fatalf("acquired classes/capacities = (%d,%d) (%d,%d)", firstClass, cap(first), secondClass, cap(second))
+	}
+	pool.release(firstClass, first)
+	pool.release(secondClass, second)
+	if got := len(pool.classes[0].idle); got != 1 {
+		t.Fatalf("idle pooled bodies = %d, want bounded at 1", got)
+	}
+	oversized, class := pool.acquire(4097)
+	if oversized != nil || class != -1 {
+		t.Fatalf("oversized acquisition = len:%d class:%d, want GC-owned nil/-1", len(oversized), class)
+	}
+}
+
+func BenchmarkImmutableRPCResultMaterializePooled(b *testing.B) {
+	inner := bytes.Repeat([]byte{0x6b}, 1<<20)
+	logicalBytes := 12 + len(inner)
+	replay := &encodedOutboundMessage{
+		typeID:            proto.ResultTypeID,
+		reqMsgID:          7101,
+		replaySource:      &staticRPCReplaySource{inner: inner},
+		innerDigest:       sha256.Sum256(inner),
+		uncompressedBytes: len(inner),
+		logicalBytes:      logicalBytes,
+	}
+	pool := newOutboundReplayBodyPool([]outboundReplayBodyClassSpec{{size: logicalBytes, maxIdle: 1}})
+	b.ReportAllocs()
+	b.SetBytes(int64(logicalBytes))
+	b.ResetTimer()
+	for range b.N {
+		scratch, class := pool.acquire(logicalBytes)
+		body, usedScratch, err := replay.materializeRPCResultBodyInto(context.Background(), replay.reqMsgID, scratch)
+		if err != nil || !usedScratch {
+			b.Fatalf("materialize replay: used=%v err=%v", usedScratch, err)
+		}
+		pool.release(class, body)
+	}
+}
+
 func TestOutboundBulkACKWindowWakesNextWaiter(t *testing.T) {
 	state := newOutboundStateWithLimits(newOutboundTrackedBudget(1<<20), 128, 1<<20)
 	leasing := make([]*outboundBulkCreditLease, 0, defaultBulkACKWindow+1)
@@ -1116,11 +1254,11 @@ func TestOutboundStateReleasesMixedBodyAndControlBudgets(t *testing.T) {
 
 func TestSendBestEffortQueueFullBehavior(t *testing.T) {
 	c := &Conn{metrics: NopMetrics{}, outboundTrackedBudget: newOutboundTrackedBudget(1 << 20)}
-	c.outbound = make(chan outboundOp, 1)
-	c.outboundControl = make(chan outboundOp, 1)
+	c.outbound = make(chan *outboundOp, 1)
+	c.outboundControl = make(chan *outboundOp, 1)
 	c.outboundStop = make(chan struct{})
 	// 占满普通队列，模拟出站拥塞。
-	c.outbound <- outboundOp{}
+	c.outbound <- &outboundOp{}
 
 	if err := c.SendBestEffort(context.Background(), proto.MessageFromServer, &mt.MsgsAck{}, 0); err != ErrOutboundQueueFull {
 		t.Fatalf("timeout=0 on full queue: err = %v, want ErrOutboundQueueFull", err)
@@ -1152,10 +1290,10 @@ func TestSendBestEffortQueueFullBehavior(t *testing.T) {
 
 func TestSendAsyncControlQueueBoundary(t *testing.T) {
 	c := &Conn{metrics: NopMetrics{}, outboundTrackedBudget: newOutboundTrackedBudget(1 << 20)}
-	c.outbound = make(chan outboundOp, 1)
-	c.outboundControl = make(chan outboundOp, 1)
+	c.outbound = make(chan *outboundOp, 1)
+	c.outboundControl = make(chan *outboundOp, 1)
 	c.outboundStop = make(chan struct{})
-	c.outboundControl <- outboundOp{kind: outboundAck}
+	c.outboundControl <- &outboundOp{kind: outboundAck}
 
 	if err := c.SendAsync(context.Background(), proto.MessageFromServer, &mt.MsgsAck{}); err != nil {
 		t.Fatalf("SendAsync on full control queue: %v", err)

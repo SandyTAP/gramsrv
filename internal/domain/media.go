@@ -130,7 +130,10 @@ type FileHashRequest struct {
 	Offset      int64
 }
 
-// FileChunk 是 upload.getFile 返回的一段内容；Bytes 归当前持有者独占，可向 wire 响应移交。
+// FileChunk 是 upload.getFile 返回的一段内容。Bytes 的内容不可变：其 backing
+// 可能由当前请求独占，也可能由 cache/singleflight 的并发 caller 共享。调用方只能
+// 读取或编码，不得修改内容，也不得把 append 结果写回原 backing。具体传输层可以
+// 转移 slice storage ownership，但不能因此放宽这个 domain 合同。
 type FileChunk struct {
 	Bytes    []byte
 	MimeType string

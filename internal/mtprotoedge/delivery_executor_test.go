@@ -24,7 +24,7 @@ func TestDeliveryFinalSocketGuardRejectsReboundAndReplacedSnapshot(t *testing.T)
 	key := sessionKey{authKeyID: [8]byte{7}, sessionID: 91}
 	conn := &Conn{
 		authKeyID: key.authKeyID, sessionID: key.sessionID,
-		outbound: make(chan outboundOp, 1), outboundControl: make(chan outboundOp, 1),
+		outbound: make(chan *outboundOp, 1), outboundControl: make(chan *outboundOp, 1),
 	}
 	conn.lifecycle.Store(uint32(connLifecycleActive))
 	conn.userID.Store(42)
@@ -443,8 +443,8 @@ func TestDeliveryExecutorCommandNotAfterBoundsMissingSocketReceipt(t *testing.T)
 	key := sessionKey{authKeyID: [8]byte{8}, sessionID: 92}
 	conn := &Conn{
 		authKeyID: key.authKeyID, sessionID: key.sessionID,
-		outbound: make(chan outboundOp, 1), outboundControl: make(chan outboundOp, 1),
-		outboundCritical: make(chan outboundOp, 1), outboundBulk: make(chan outboundOp, 1),
+		outbound: make(chan *outboundOp, 1), outboundControl: make(chan *outboundOp, 1),
+		outboundCritical: make(chan *outboundOp, 1), outboundBulk: make(chan *outboundOp, 1),
 		outboundStop: make(chan struct{}),
 	}
 	conn.lifecycle.Store(uint32(connLifecycleActive))
@@ -496,7 +496,7 @@ func TestChannelDeliverySnapshotMergesLocalPresenceAndFreezesIdentity(t *testing
 		key := sessionKey{authKeyID: [8]byte{auth}, sessionID: sessionID}
 		conn := &Conn{
 			authKeyID: key.authKeyID, sessionID: sessionID,
-			outbound: make(chan outboundOp, 1), outboundControl: make(chan outboundOp, 1),
+			outbound: make(chan *outboundOp, 1), outboundControl: make(chan *outboundOp, 1),
 		}
 		conn.lifecycle.Store(uint32(connLifecycleActive))
 		conn.userID.Store(userID)
@@ -554,7 +554,7 @@ func TestMonoforumFrozenAudienceExpandsOnlyExplicitLocalSessions(t *testing.T) {
 		key := sessionKey{authKeyID: [8]byte{auth}, sessionID: sessionID}
 		conn := &Conn{
 			authKeyID: key.authKeyID, sessionID: sessionID,
-			outbound: make(chan outboundOp, 1), outboundControl: make(chan outboundOp, 1),
+			outbound: make(chan *outboundOp, 1), outboundControl: make(chan *outboundOp, 1),
 		}
 		conn.lifecycle.Store(uint32(connLifecycleActive))
 		conn.userID.Store(userID)

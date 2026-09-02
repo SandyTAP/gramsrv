@@ -549,6 +549,8 @@ type Server struct {
 	outboundControlBudget    *outboundTrackedBudget
 	outboundCriticalBudget   *outboundTrackedBudget
 	outboundScratchPool      *outboundScratchPool
+	outboundOpPool           *outboundOpPool
+	outboundReplayBodyPool   *outboundReplayBodyPool
 
 	dc                  int
 	strictDC            bool
@@ -607,6 +609,8 @@ func New(opts Options) *Server {
 		outboundControlBudget:    newOutboundTrackedBudget(defaultOutboundControlMaxBytes),
 		outboundCriticalBudget:   newOutboundTrackedBudget(opts.OutboundCriticalGlobalMaxBytes),
 		outboundScratchPool:      newOutboundScratchPool(opts.OutboundWriteGlobalMaxBytes),
+		outboundOpPool:           newOutboundOpPool(defaultOutboundOpPoolSize),
+		outboundReplayBodyPool:   newOutboundReplayBodyPool(defaultOutboundReplayBodyClasses),
 		dc:                       opts.DC,
 		strictDC:                 opts.StrictDC,
 		key:                      exchange.PrivateKey{RSA: opts.RSAKey},
@@ -702,6 +706,8 @@ func (s *Server) buildConn(tc transport.Conn, lease *physicalTransportLease, key
 		outboundControlTrackedBudget:  s.outboundControlBudget,
 		outboundCriticalTrackedBudget: s.outboundCriticalBudget,
 		outboundScratchPool:           s.outboundScratchPool,
+		outboundOpPool:                s.outboundOpPool,
+		outboundReplayBodyPool:        s.outboundReplayBodyPool,
 		rpcDeliveryHooks:              s.rpcDeliveryHooks,
 		rpcResultAcked: func(conn *Conn, reqMsgID int64) {
 			// The sole outbound actor invokes this only after resolving a client

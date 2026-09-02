@@ -461,11 +461,13 @@ func (r *GRPCRemote) GetFileHashes(ctx context.Context, req domain.FileHashReque
 }
 
 // takePBBytes moves a protobuf byte field into the domain result. Unary/client-
-// stream completion gives this client exclusive ownership of the response.
+// stream completion gives this client exclusive storage ownership of the
+// decoded response; the domain publishes that storage as immutable. Clipping
+// capacity prevents an append from writing into an unexposed protobuf tail.
 func takePBBytes(field *[]byte) []byte {
 	data := *field
 	*field = nil
-	return data
+	return data[:len(data):len(data)]
 }
 
 func (r *GRPCRemote) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
