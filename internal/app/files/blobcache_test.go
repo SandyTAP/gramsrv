@@ -520,20 +520,8 @@ func TestGetFileRejectsStoredBackendMismatch(t *testing.T) {
 	}
 }
 
-func TestWarmCachesPreloadsStickerSetAndSmallBlobs(t *testing.T) {
+func TestResolveStickerSetCachesOnFirstUse(t *testing.T) {
 	ctx := context.Background()
-	local, err := NewLocalFS(t.TempDir())
-	if err != nil {
-		t.Fatalf("local fs: %v", err)
-	}
-	mainKey, err := local.Put(ctx, []byte("sticker"))
-	if err != nil {
-		t.Fatalf("put main: %v", err)
-	}
-	thumbKey, err := local.Put(ctx, []byte("thumb"))
-	if err != nil {
-		t.Fatalf("put thumb: %v", err)
-	}
 	media := newFakeMediaStore()
 	doc := domain.Document{
 		ID:         100,
@@ -547,12 +535,6 @@ func TestWarmCachesPreloadsStickerSetAndSmallBlobs(t *testing.T) {
 	}
 	if err := media.PutDocument(ctx, doc); err != nil {
 		t.Fatalf("put doc: %v", err)
-	}
-	if err := media.PutFileBlob(ctx, domain.FileBlob{LocationKey: "doc:100", Backend: domain.MediaBackendLocalFS, ObjectKey: mainKey, Size: 7, MimeType: doc.MimeType}); err != nil {
-		t.Fatalf("put main blob: %v", err)
-	}
-	if err := media.PutFileBlob(ctx, domain.FileBlob{LocationKey: "doc:100:m", Backend: domain.MediaBackendLocalFS, ObjectKey: thumbKey, Size: 5, MimeType: "image/jpeg"}); err != nil {
-		t.Fatalf("put thumb blob: %v", err)
 	}
 	set := domain.StickerSet{
 		ID:         200,
@@ -569,27 +551,7 @@ func TestWarmCachesPreloadsStickerSetAndSmallBlobs(t *testing.T) {
 		t.Fatalf("put set: %v", err)
 	}
 	counting := &countingMediaStore{fakeMediaStore: media}
-	blobs := &countingBlobBackend{BlobBackend: local}
-	svc := NewService(counting, blobs, 2)
-
-	stats, err := svc.WarmCaches(ctx)
-	if err != nil {
-		t.Fatalf("warm caches: %v", err)
-	}
-	if stats.StickerSets != 1 || stats.Documents != 1 || stats.Blobs != 2 {
-		t.Fatalf("warm stats = %+v, want 1 set, 1 doc, 2 blobs", stats)
-	}
-	blobs.getRangeCalls = 0
-	chunk, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:100", Offset: 0, Limit: 7})
-	if err != nil || !ok {
-		t.Fatalf("getfile ok=%v err=%v", ok, err)
-	}
-	if string(chunk.Bytes) != "sticker" {
-		t.Fatalf("chunk = %q, want sticker", chunk.Bytes)
-	}
-	if blobs.getRangeCalls != 0 {
-		t.Fatalf("prewarmed blob should be served from byte cache, GetRange calls = %d", blobs.getRangeCalls)
-	}
+	svc := NewService(counting, nil, 2)
 
 	gotSet, docs, found, err := svc.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID})
 	if err != nil || !found {
@@ -598,12 +560,15 @@ func TestWarmCachesPreloadsStickerSetAndSmallBlobs(t *testing.T) {
 	if gotSet.ID != set.ID || len(docs) != 1 || docs[0].ID != doc.ID {
 		t.Fatalf("resolve = set %+v docs %+v", gotSet, docs)
 	}
-	if counting.getSetByIDCalls != 0 {
-		t.Fatalf("ResolveStickerSet should hit full-set cache, GetStickerSetByID calls = %d", counting.getSetByIDCalls)
+	if counting.getSetByIDCalls != 1 {
+		t.Fatalf("first ResolveStickerSet calls = %d, want one lazy store load", counting.getSetByIDCalls)
 	}
 	docs[0].ID = 999
 	_, docsAgain, found, err := svc.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: set.ID})
 	if err != nil || !found || docsAgain[0].ID != doc.ID {
 		t.Fatalf("cached docs were mutated: found=%v err=%v docs=%+v", found, err, docsAgain)
+	}
+	if counting.getSetByIDCalls != 1 {
+		t.Fatalf("second ResolveStickerSet calls = %d, want cache hit", counting.getSetByIDCalls)
 	}
 }

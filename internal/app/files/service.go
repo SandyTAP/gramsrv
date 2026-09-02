@@ -669,8 +669,8 @@ func (s *Service) ResolveStickerSet(ctx context.Context, ref domain.StickerSetRe
 	if set, docs, ok := s.stickerSetCache.get(ref); ok {
 		return set, docs, true, nil
 	}
-	// 负缓存：已 seed 集启动即进正缓存（WarmCaches），能走到这里的 miss 多是「未 seed 的 short_name」
-	// 被客户端反复请求。TTL 内直接当 not-found 短路，避免每次都打 PG GetStickerSetByShortName。
+	// 负缓存：首次按需查询未找到的 ref 在 TTL 内直接短路，避免客户端
+	// 反复请求不存在的 short_name 时每次都访问 PG。
 	if s.stickerSetNegCache != nil && s.stickerSetNegCache.has(ref) {
 		return domain.StickerSet{}, nil, false, nil
 	}

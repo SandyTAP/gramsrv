@@ -936,15 +936,6 @@ func runWithConfig(logger *zap.Logger, cfg config.CoreConfig, buildMeta common.B
 			zap.Int("blobs", stats.Blobs),
 		)
 	}
-	if stats, err := filesService.WarmCaches(ctx); err != nil {
-		logger.Warn("媒体资源缓存预热失败", zap.Error(err))
-	} else if stats.StickerSets > 0 || stats.Documents > 0 || stats.Blobs > 0 {
-		logger.Info("媒体资源缓存预热完成",
-			zap.Int("sticker_sets", stats.StickerSets),
-			zap.Int("documents", stats.Documents),
-			zap.Int("blobs", stats.Blobs),
-		)
-	}
 	// 默认 emoji status 系统集：从 animated_emoji 精选合成（幂等，已 seed 的存量
 	// 库重启后自动补上）；缺失时 premium 用户的 status 选择器会是空的。
 	if count, created, err := filesService.EnsureDefaultEmojiStatusSet(ctx); err != nil {
