@@ -35,7 +35,7 @@ var (
 	ErrGRPCProtocolMismatch = errors.New("filedata grpc: protocol version mismatch")
 	ErrMissingDependency    = errors.New("filedata grpc: missing dependency")
 	ErrBackendMissing       = errors.New("filedata grpc: backend is empty")
-	grpcCapabilities        = []string{"blob-range", "upload-parts", "materialize-upload-blob", "file-hashes"}
+	grpcCapabilities        = []string{"blob-range", "upload-parts", "materialize-upload-blob", "file-hashes", "immutable-file-range"}
 )
 
 type DataService interface {

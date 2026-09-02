@@ -2,6 +2,7 @@ package mtprotoedge
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	filesapp "telesrv/internal/app/files"
 	"telesrv/internal/domain"
 	"telesrv/internal/postresponse"
+	"telesrv/internal/rpcresult"
 )
 
 const fileDataMaxUploadGetFileChunkLimit = 1 << 20
@@ -30,6 +32,75 @@ type FileDataDataPlane interface {
 	SaveBigFilePart(ctx context.Context, ownerUserID, fileID int64, part, totalParts int, data []byte) (bool, error)
 	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
 	GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error)
+}
+
+type immutableFileDataRangeReader interface {
+	ReadImmutableFileRange(context.Context, domain.ImmutableFileRange) ([]byte, error)
+}
+
+type immutableFileDataValueSource struct {
+	reader immutableFileDataRangeReader
+	range_ domain.ImmutableFileRange
+}
+
+func (s *immutableFileDataValueSource) Value(ctx context.Context) (any, error) {
+	if s == nil || s.reader == nil {
+		return nil, fmt.Errorf("immutable filedata source is unavailable")
+	}
+	data, err := s.reader.ReadImmutableFileRange(ctx, s.range_)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != s.range_.Length || sha256.Sum256(data) != s.range_.RangeSHA256 {
+		return nil, fmt.Errorf("immutable filedata source changed")
+	}
+	return &tg.UploadFile{
+		Type:  fileDataStorageFileType(s.range_.MimeType, data),
+		Mtime: 0,
+		Bytes: data,
+	}, nil
+}
+
+func (s *immutableFileDataValueSource) RetainedBytes() int {
+	if s == nil {
+		return 0
+	}
+	return 384 + len(s.range_.ObjectKey) + len(s.range_.MimeType)
+}
+
+type immutableFileDataReplaySource struct {
+	call   tlprofile.Call
+	source rpcresult.ValueSource
+}
+
+func (s *immutableFileDataReplaySource) EncodeInner(ctx context.Context, out *bin.Buffer) error {
+	if s == nil || s.source == nil {
+		return fmt.Errorf("immutable filedata replay source is unavailable")
+	}
+	value, err := s.source.Value(ctx)
+	if err != nil {
+		return err
+	}
+	return s.call.EncodeResult(value, out)
+}
+
+func (s *immutableFileDataReplaySource) RetainedBytes() int {
+	if s == nil || s.source == nil {
+		return 0
+	}
+	return s.source.RetainedBytes() + 128
+}
+
+type immutableFileDataResult struct {
+	tlprofile.Result
+	source rpcresult.ReplaySource
+}
+
+func (r *immutableFileDataResult) ExactReplaySource() rpcresult.ReplaySource {
+	if r == nil {
+		return nil
+	}
+	return r.source
 }
 
 // FileDataLayerRPCBase owns only non-FileData RPCs and shared session/profile
@@ -133,11 +204,17 @@ func newFileDataDispatcher(files FileDataDataPlane) *tlprofile.Dispatcher {
 		if !found {
 			return nil, tgerr.New(400, "LOCATION_INVALID")
 		}
-		return &tg.UploadFile{
+		result := &tg.UploadFile{
 			Type:  fileDataStorageFileType(chunk.MimeType, chunk.Bytes),
 			Mtime: 0,
 			Bytes: chunk.Bytes,
-		}, nil
+		}
+		if chunk.ImmutableRange != nil {
+			if reader, ok := files.(immutableFileDataRangeReader); ok {
+				rpcresult.Publish(ctx, &immutableFileDataValueSource{reader: reader, range_: *chunk.ImmutableRange})
+			}
+		}
+		return result, nil
 	})
 	mustRegisterFileDataRPC[*tg.UploadGetFileHashesRequest](d, tlprofile.SemanticMethodUploadGetFileHashes, func(ctx context.Context, req *tg.UploadGetFileHashesRequest) (any, error) {
 		if files == nil {
@@ -360,7 +437,16 @@ func (r *FileDataLayerRPC) DispatchAdmitted(ctx context.Context, authKeyID [8]by
 		tlprofile.SemanticMethodUploadSaveBigFilePart,
 		tlprofile.SemanticMethodUploadGetFile,
 		tlprofile.SemanticMethodUploadGetFileHashes:
-		result, err := r.dispatcher.Dispatch(ctx, request)
+		dispatchCtx, capture := rpcresult.WithCapture(ctx)
+		result, err := r.dispatcher.Dispatch(dispatchCtx, request)
+		if err == nil && result != nil {
+			if valueSource := capture.Take(); valueSource != nil {
+				result = &immutableFileDataResult{
+					Result: result,
+					source: &immutableFileDataReplaySource{call: request.Call(), source: valueSource},
+				}
+			}
+		}
 		return result, fileDataMethodName(request.Call().Method()), err
 	}
 	return r.base.DispatchAdmitted(ctx, authKeyID, sessionID, msgID, admissionSeq, request)

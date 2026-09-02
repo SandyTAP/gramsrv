@@ -48,6 +48,7 @@ type MTProtoYAML struct {
 	OutboundQueueSize           *int   `yaml:"outbound_queue_size"`
 	OutboundControlQueueSize    *int   `yaml:"outbound_control_queue_size"`
 	OutboundTrackedGlobalBytes  *int64 `yaml:"outbound_tracked_global_max_bytes"`
+	OutboundCriticalGlobalBytes *int64 `yaml:"outbound_critical_global_max_bytes"`
 	OutboundWriteGlobalBytes    *int64 `yaml:"outbound_write_global_max_bytes"`
 }
 
@@ -97,6 +98,7 @@ func LoadEdge() (EdgeConfig, error) {
 		b.setInt("TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE", y.Edge.MTProto.OutboundQueueSize)
 		b.setInt("TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE", y.Edge.MTProto.OutboundControlQueueSize)
 		b.setInt64("TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES", y.Edge.MTProto.OutboundTrackedGlobalBytes)
+		b.setInt64("TELESRV_MTPROTO_OUTBOUND_CRITICAL_GLOBAL_MAX_BYTES", y.Edge.MTProto.OutboundCriticalGlobalBytes)
 		b.setInt64("TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES", y.Edge.MTProto.OutboundWriteGlobalBytes)
 		if err := b.setDuration("TELESRV_EDGE_LOCATION_TTL", y.Edge.Location.TTL); err != nil {
 			return err
@@ -133,35 +135,36 @@ type EdgeConfig struct {
 	PremiumBotUsername string
 	PremiumBotUserID   int64
 
-	ListenAddr                           string
-	WebSocketEnable                      bool
-	WebSocketAllowedOrigins              []string
-	AdvertiseIP                          string
-	AdvertisePort                        int
-	RSAKeyPath                           string
-	DC                                   int
-	DefaultCountryCode                   string
-	StrictDCCheck                        bool
-	MTProtoMaxConnections                int
-	MTProtoMaxConnectionsPerIP           int
-	MTProtoMaxConcurrentHandshakes       int
-	MTProtoRPCMaxInflight                int
-	MTProtoRPCQueueSize                  int
-	MTProtoRPCTimeout                    time.Duration
-	MTProtoRPCGlobalWorkers              int
-	MTProtoRPCGlobalMaxTasks             int
-	MTProtoRPCGlobalMaxBytes             int64
-	MTProtoRPCDeliveryHookWorkers        int
-	MTProtoRPCDeliveryHookMaxPending     int
-	MTProtoRPCExecutionMaxEntries        int
-	MTProtoRPCExecutionAuthMaxEntries    int
-	MTProtoRPCExecutionSessionMaxEntries int
-	MTProtoRPCExecutionPendingPerAuth    int
-	MTProtoInboundFrameGlobalMaxBytes    int64
-	MTProtoOutboundQueueSize             int
-	MTProtoOutboundControlQueueSize      int
-	MTProtoOutboundTrackedGlobalMaxBytes int64
-	MTProtoOutboundWriteGlobalMaxBytes   int64
+	ListenAddr                            string
+	WebSocketEnable                       bool
+	WebSocketAllowedOrigins               []string
+	AdvertiseIP                           string
+	AdvertisePort                         int
+	RSAKeyPath                            string
+	DC                                    int
+	DefaultCountryCode                    string
+	StrictDCCheck                         bool
+	MTProtoMaxConnections                 int
+	MTProtoMaxConnectionsPerIP            int
+	MTProtoMaxConcurrentHandshakes        int
+	MTProtoRPCMaxInflight                 int
+	MTProtoRPCQueueSize                   int
+	MTProtoRPCTimeout                     time.Duration
+	MTProtoRPCGlobalWorkers               int
+	MTProtoRPCGlobalMaxTasks              int
+	MTProtoRPCGlobalMaxBytes              int64
+	MTProtoRPCDeliveryHookWorkers         int
+	MTProtoRPCDeliveryHookMaxPending      int
+	MTProtoRPCExecutionMaxEntries         int
+	MTProtoRPCExecutionAuthMaxEntries     int
+	MTProtoRPCExecutionSessionMaxEntries  int
+	MTProtoRPCExecutionPendingPerAuth     int
+	MTProtoInboundFrameGlobalMaxBytes     int64
+	MTProtoOutboundQueueSize              int
+	MTProtoOutboundControlQueueSize       int
+	MTProtoOutboundTrackedGlobalMaxBytes  int64
+	MTProtoOutboundCriticalGlobalMaxBytes int64
+	MTProtoOutboundWriteGlobalMaxBytes    int64
 
 	RedisAddr                     string
 	RedisPassword                 string
@@ -230,8 +233,8 @@ func edgeConfigFromConfig(c Config) EdgeConfig {
 		MTProtoRPCExecutionSessionMaxEntries: c.MTProtoRPCExecutionSessionMaxEntries, MTProtoRPCExecutionPendingPerAuth: c.MTProtoRPCExecutionPendingPerAuth,
 		MTProtoInboundFrameGlobalMaxBytes: c.MTProtoInboundFrameGlobalMaxBytes, MTProtoOutboundQueueSize: c.MTProtoOutboundQueueSize,
 		MTProtoOutboundControlQueueSize: c.MTProtoOutboundControlQueueSize, MTProtoOutboundTrackedGlobalMaxBytes: c.MTProtoOutboundTrackedGlobalMaxBytes,
-		MTProtoOutboundWriteGlobalMaxBytes: c.MTProtoOutboundWriteGlobalMaxBytes,
-		RedisAddr:                          c.RedisAddr, RedisPassword: c.RedisPassword, RedisDB: c.RedisDB, InstanceID: c.InstanceID,
+		MTProtoOutboundCriticalGlobalMaxBytes: c.MTProtoOutboundCriticalGlobalMaxBytes, MTProtoOutboundWriteGlobalMaxBytes: c.MTProtoOutboundWriteGlobalMaxBytes,
+		RedisAddr: c.RedisAddr, RedisPassword: c.RedisPassword, RedisDB: c.RedisDB, InstanceID: c.InstanceID,
 		EdgeLocationTTL: c.EdgeLocationTTL, EdgeLocationHeartbeatInterval: c.EdgeLocationHeartbeatInterval,
 		CoreExecGRPCResolver: c.CoreExecGRPCResolver, CoreExecGRPCTargets: c.CoreExecGRPCTargets, CoreExecGRPCRequestTimeout: c.CoreExecGRPCRequestTimeout,
 		CoreExecGRPCTLSCAFile: c.CoreExecGRPCTLSCAFile, CoreExecGRPCTLSServerName: c.CoreExecGRPCTLSServerName,

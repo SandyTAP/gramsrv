@@ -75,6 +75,11 @@ message GetFileResponse {
   int64 total = 4;
   string error = 5;
   ErrorKind error_kind = 6;
+  string immutable_backend = 7;
+  string immutable_object_key = 8;
+  int64 immutable_offset = 9;
+  int32 immutable_length = 10;
+  bytes immutable_range_sha256 = 11;
 }
 
 message GetFileHashesRequest {

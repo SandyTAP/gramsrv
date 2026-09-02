@@ -354,6 +354,9 @@ type Options struct {
 	// 阻断连接维持消息。可靠响应无法 tracking 时终止该连接，durable best-effort update
 	// 则只丢在线加速并由 difference 恢复。
 	OutboundTrackedGlobalMaxBytes int64
+	// OutboundCriticalGlobalMaxBytes is an independent retained-body reserve for
+	// bootstrap/convergence RPC results. Bulk traffic cannot consume it.
+	OutboundCriticalGlobalMaxBytes int64
 	// OutboundWriteGlobalMaxBytes bounds concurrent encrypted wire/codec/obfuscation scratch.
 	// Scratch is shared and pooled across connections; default 512 MiB.
 	OutboundWriteGlobalMaxBytes int64
@@ -474,6 +477,9 @@ func (o *Options) setDefaults() {
 	if o.OutboundTrackedGlobalMaxBytes <= 0 {
 		o.OutboundTrackedGlobalMaxBytes = defaultOutboundTrackedMaxBytes
 	}
+	if o.OutboundCriticalGlobalMaxBytes <= 0 {
+		o.OutboundCriticalGlobalMaxBytes = defaultOutboundCriticalMaxBytes
+	}
 	if o.OutboundWriteGlobalMaxBytes <= 0 {
 		o.OutboundWriteGlobalMaxBytes = defaultOutboundWriteMaxBytes
 	}
@@ -534,12 +540,14 @@ type Server struct {
 	rpcQueueSize             int
 	rpcTimeout               time.Duration
 	rpcScheduler             *inboundRPCScheduler
+	bulkRPCScheduler         *bulkRPCScheduler
 	rpcDeliveryHooks         *rpcDeliveryHookExecutor
 	frameBudget              *inboundFrameBudget
 	outboundQueueSize        int
 	outboundControlQueueSize int
 	outboundTrackedBudget    *outboundTrackedBudget
 	outboundControlBudget    *outboundTrackedBudget
+	outboundCriticalBudget   *outboundTrackedBudget
 	outboundScratchPool      *outboundScratchPool
 
 	dc                  int
@@ -590,12 +598,14 @@ func New(opts Options) *Server {
 		rpcQueueSize:             opts.RPCQueueSize,
 		rpcTimeout:               opts.RPCTimeout,
 		rpcScheduler:             newInboundRPCScheduler(opts.RPCGlobalWorkers, opts.RPCGlobalMaxTasks, opts.RPCGlobalMaxBytes),
+		bulkRPCScheduler:         newBulkRPCScheduler(max(1, opts.RPCGlobalWorkers/2)),
 		rpcDeliveryHooks:         newRPCDeliveryHookExecutor(opts.RPCDeliveryHookWorkers, opts.RPCDeliveryHookMaxPending),
 		frameBudget:              newInboundFrameBudget(opts.InboundFrameGlobalMaxBytes),
 		outboundQueueSize:        opts.OutboundQueueSize,
 		outboundControlQueueSize: opts.OutboundControlQueueSize,
 		outboundTrackedBudget:    newOutboundTrackedBudget(opts.OutboundTrackedGlobalMaxBytes),
 		outboundControlBudget:    newOutboundTrackedBudget(defaultOutboundControlMaxBytes),
+		outboundCriticalBudget:   newOutboundTrackedBudget(opts.OutboundCriticalGlobalMaxBytes),
 		outboundScratchPool:      newOutboundScratchPool(opts.OutboundWriteGlobalMaxBytes),
 		dc:                       opts.DC,
 		strictDC:                 opts.StrictDC,
@@ -672,26 +682,27 @@ func (s *Server) newConnWithLease(lease *physicalTransportLease, key crypto.Auth
 
 func (s *Server) buildConn(tc transport.Conn, lease *physicalTransportLease, key crypto.AuthKey, sessionID, salt int64) *Conn {
 	c := &Conn{
-		transport:                    tc,
-		transportLease:               lease,
-		writer:                       tc,
-		cipher:                       s.cipher,
-		msgID:                        proto.NewMessageIDGen(s.clock.Now),
-		writeTimeout:                 s.writeTimeout,
-		metrics:                      s.metrics,
-		now:                          s.clock.Now,
-		authKeyID:                    key.ID,
-		authKeyHex:                   hex.EncodeToString(key.ID[:]),
-		sessionID:                    sessionID,
-		salt:                         salt,
-		key:                          key,
-		createdAt:                    s.clock.Now(),
-		outboundQueueSize:            s.outboundQueueSize,
-		outboundControlQueueSize:     s.outboundControlQueueSize,
-		outboundTrackedBudget:        s.outboundTrackedBudget,
-		outboundControlTrackedBudget: s.outboundControlBudget,
-		outboundScratchPool:          s.outboundScratchPool,
-		rpcDeliveryHooks:             s.rpcDeliveryHooks,
+		transport:                     tc,
+		transportLease:                lease,
+		writer:                        tc,
+		cipher:                        s.cipher,
+		msgID:                         proto.NewMessageIDGen(s.clock.Now),
+		writeTimeout:                  s.writeTimeout,
+		metrics:                       s.metrics,
+		now:                           s.clock.Now,
+		authKeyID:                     key.ID,
+		authKeyHex:                    hex.EncodeToString(key.ID[:]),
+		sessionID:                     sessionID,
+		salt:                          salt,
+		key:                           key,
+		createdAt:                     s.clock.Now(),
+		outboundQueueSize:             s.outboundQueueSize,
+		outboundControlQueueSize:      s.outboundControlQueueSize,
+		outboundTrackedBudget:         s.outboundTrackedBudget,
+		outboundControlTrackedBudget:  s.outboundControlBudget,
+		outboundCriticalTrackedBudget: s.outboundCriticalBudget,
+		outboundScratchPool:           s.outboundScratchPool,
+		rpcDeliveryHooks:              s.rpcDeliveryHooks,
 		rpcResultAcked: func(conn *Conn, reqMsgID int64) {
 			// The sole outbound actor invokes this only after resolving a client
 			// msgs_ack server msg_id through its tracked resend frame. The actor has
@@ -730,6 +741,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer s.rpcDeliveryHooks.stop(rpcCloseWaitTimeout)
 	defer s.conns.releaseAllLogicalSessions()
 	defer s.rpcScheduler.stop(rpcCloseWaitTimeout)
+	defer s.bulkRPCScheduler.close()
 	// 只在最外层 listener 包一次，确保 same-port mux 的 sniff/HTTP upgrade 也计入
 	// raw admission，而不是等连接已经分流后才计数。
 	ln = s.observeRawAccepts(s.admission.wrapListener(ln))

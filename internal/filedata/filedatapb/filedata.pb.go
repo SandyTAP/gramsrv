@@ -442,15 +442,20 @@ func (x *GetFileRequest) GetLimit() int32 {
 }
 
 type GetFileResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Found         bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
-	Data          []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
-	MimeType      string                 `protobuf:"bytes,3,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
-	Total         int64                  `protobuf:"varint,4,opt,name=total,proto3" json:"total,omitempty"`
-	Error         string                 `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
-	ErrorKind     ErrorKind              `protobuf:"varint,6,opt,name=error_kind,json=errorKind,proto3,enum=telesrv.filedata.v1.ErrorKind" json:"error_kind,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Found                bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Data                 []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	MimeType             string                 `protobuf:"bytes,3,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
+	Total                int64                  `protobuf:"varint,4,opt,name=total,proto3" json:"total,omitempty"`
+	Error                string                 `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	ErrorKind            ErrorKind              `protobuf:"varint,6,opt,name=error_kind,json=errorKind,proto3,enum=telesrv.filedata.v1.ErrorKind" json:"error_kind,omitempty"`
+	ImmutableBackend     string                 `protobuf:"bytes,7,opt,name=immutable_backend,json=immutableBackend,proto3" json:"immutable_backend,omitempty"`
+	ImmutableObjectKey   string                 `protobuf:"bytes,8,opt,name=immutable_object_key,json=immutableObjectKey,proto3" json:"immutable_object_key,omitempty"`
+	ImmutableOffset      int64                  `protobuf:"varint,9,opt,name=immutable_offset,json=immutableOffset,proto3" json:"immutable_offset,omitempty"`
+	ImmutableLength      int32                  `protobuf:"varint,10,opt,name=immutable_length,json=immutableLength,proto3" json:"immutable_length,omitempty"`
+	ImmutableRangeSha256 []byte                 `protobuf:"bytes,11,opt,name=immutable_range_sha256,json=immutableRangeSha256,proto3" json:"immutable_range_sha256,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *GetFileResponse) Reset() {
@@ -523,6 +528,41 @@ func (x *GetFileResponse) GetErrorKind() ErrorKind {
 		return x.ErrorKind
 	}
 	return ErrorKind_ERROR_KIND_NONE
+}
+
+func (x *GetFileResponse) GetImmutableBackend() string {
+	if x != nil {
+		return x.ImmutableBackend
+	}
+	return ""
+}
+
+func (x *GetFileResponse) GetImmutableObjectKey() string {
+	if x != nil {
+		return x.ImmutableObjectKey
+	}
+	return ""
+}
+
+func (x *GetFileResponse) GetImmutableOffset() int64 {
+	if x != nil {
+		return x.ImmutableOffset
+	}
+	return 0
+}
+
+func (x *GetFileResponse) GetImmutableLength() int32 {
+	if x != nil {
+		return x.ImmutableLength
+	}
+	return 0
+}
+
+func (x *GetFileResponse) GetImmutableRangeSha256() []byte {
+	if x != nil {
+		return x.ImmutableRangeSha256
+	}
+	return nil
 }
 
 type GetFileHashesRequest struct {
@@ -1586,7 +1626,7 @@ const file_internal_filedata_filedatapb_filedata_proto_rawDesc = "" +
 	"\x0eGetFileRequest\x12!\n" +
 	"\flocation_key\x18\x01 \x01(\tR\vlocationKey\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x03R\x06offset\x12\x14\n" +
-	"\x05limit\x18\x03 \x01(\x05R\x05limit\"\xc3\x01\n" +
+	"\x05limit\x18\x03 \x01(\x05R\x05limit\"\xae\x03\n" +
 	"\x0fGetFileResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x1b\n" +
@@ -1594,7 +1634,13 @@ const file_internal_filedata_filedatapb_filedata_proto_rawDesc = "" +
 	"\x05total\x18\x04 \x01(\x03R\x05total\x12\x14\n" +
 	"\x05error\x18\x05 \x01(\tR\x05error\x12=\n" +
 	"\n" +
-	"error_kind\x18\x06 \x01(\x0e2\x1e.telesrv.filedata.v1.ErrorKindR\terrorKind\"Q\n" +
+	"error_kind\x18\x06 \x01(\x0e2\x1e.telesrv.filedata.v1.ErrorKindR\terrorKind\x12+\n" +
+	"\x11immutable_backend\x18\a \x01(\tR\x10immutableBackend\x120\n" +
+	"\x14immutable_object_key\x18\b \x01(\tR\x12immutableObjectKey\x12)\n" +
+	"\x10immutable_offset\x18\t \x01(\x03R\x0fimmutableOffset\x12)\n" +
+	"\x10immutable_length\x18\n" +
+	" \x01(\x05R\x0fimmutableLength\x124\n" +
+	"\x16immutable_range_sha256\x18\v \x01(\fR\x14immutableRangeSha256\"Q\n" +
 	"\x14GetFileHashesRequest\x12!\n" +
 	"\flocation_key\x18\x01 \x01(\tR\vlocationKey\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x03R\x06offset\"L\n" +

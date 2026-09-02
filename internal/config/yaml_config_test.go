@@ -32,6 +32,8 @@ edge:
     enabled: false
     allowed_origins:
       - http://localhost:1234
+  mtproto:
+    outbound_critical_global_max_bytes: 7654321
   location:
     ttl: 2m
     heartbeat_interval: 30s
@@ -75,6 +77,9 @@ egress:
 	}
 	if cfg.WebSocketEnable {
 		t.Fatalf("WebSocketEnable = true, want false from YAML")
+	}
+	if cfg.MTProtoOutboundCriticalGlobalMaxBytes != 7654321 {
+		t.Fatalf("critical outbound bytes = %d, want 7654321", cfg.MTProtoOutboundCriticalGlobalMaxBytes)
 	}
 }
 

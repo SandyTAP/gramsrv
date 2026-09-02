@@ -1,7 +1,9 @@
 package mtprotoedge
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"testing"
 
@@ -13,6 +15,7 @@ import (
 
 	"telesrv/internal/domain"
 	"telesrv/internal/postresponse"
+	"telesrv/internal/rpcresult"
 )
 
 func TestFileDataLayerRPCDispatchesUploadPartAtEdge(t *testing.T) {
@@ -106,6 +109,51 @@ func TestFileDataLayerRPCDispatchesStaticGetFileAtEdge(t *testing.T) {
 	file, ok := result.CanonicalValue().(*tg.UploadFile)
 	if !ok || string(file.Bytes) != "file" {
 		t.Fatalf("result = %#v, want filedata upload file", result.CanonicalValue())
+	}
+}
+
+func TestFileDataLayerRPCPublishesImmutableReplaySource(t *testing.T) {
+	payload := []byte("immutable-file-range")
+	source := &domain.ImmutableFileRange{
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   "sha256/object",
+		Offset:      128,
+		Length:      len(payload),
+		Total:       4096,
+		MimeType:    "application/octet-stream",
+		RangeSHA256: sha256.Sum256(payload),
+	}
+	files := &fakeFileDataPlane{
+		fileBytes:   append([]byte(nil), payload...),
+		immutable:   source,
+		replayBytes: append([]byte(nil), payload...),
+	}
+	layer := NewFileDataLayerRPC(newFileDataTestBase(), files, nil)
+	admitted := admitFileDataTestRPC(t, layer, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: 77},
+		Offset:   source.Offset,
+		Limit:    source.Length,
+	})
+	result, _, err := layer.DispatchAdmitted(context.Background(), [8]byte{1}, 2, 3, 4, admitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier, ok := result.(rpcresult.Carrier)
+	if !ok || carrier.ExactReplaySource() == nil {
+		t.Fatalf("result %T has no immutable replay source", result)
+	}
+	var fresh, replayed bin.Buffer
+	if err := result.Encode(&fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := carrier.ExactReplaySource().EncodeInner(context.Background(), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fresh.Raw(), replayed.Raw()) {
+		t.Fatal("immutable replay did not reproduce the exact admitted-layer result")
+	}
+	if files.immutableReads != 1 {
+		t.Fatalf("immutable reads = %d, want 1", files.immutableReads)
 	}
 }
 
@@ -559,6 +607,9 @@ type fakeFileDataPlane struct {
 	lastHashRequest domain.FileHashRequest
 	hashes          []domain.FileHash
 	fileBytes       []byte
+	immutable       *domain.ImmutableFileRange
+	replayBytes     []byte
+	immutableReads  int
 }
 
 func (f *fakeFileDataPlane) SaveFilePart(_ context.Context, ownerUserID, fileID int64, part int, _ []byte) (bool, error) {
@@ -576,9 +627,14 @@ func (f *fakeFileDataPlane) SaveBigFilePart(context.Context, int64, int64, int, 
 func (f *fakeFileDataPlane) GetFile(context.Context, domain.FileDownloadRequest) (domain.FileChunk, bool, error) {
 	f.getFiles++
 	if f.fileBytes != nil {
-		return domain.FileChunk{Bytes: f.fileBytes}, true, nil
+		return domain.FileChunk{Bytes: f.fileBytes, MimeType: "application/octet-stream", ImmutableRange: f.immutable}, true, nil
 	}
 	return domain.FileChunk{Bytes: []byte("file")}, true, nil
+}
+
+func (f *fakeFileDataPlane) ReadImmutableFileRange(context.Context, domain.ImmutableFileRange) ([]byte, error) {
+	f.immutableReads++
+	return append([]byte(nil), f.replayBytes...), nil
 }
 
 func (f *fakeFileDataPlane) GetFileHashes(_ context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error) {

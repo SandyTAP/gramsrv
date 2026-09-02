@@ -3,6 +3,7 @@ package filedata
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"strings"
@@ -382,11 +383,54 @@ func (r *GRPCRemote) GetFile(ctx context.Context, req domain.FileDownloadRequest
 	if err := errorFromPB(res.GetErrorKind(), res.GetError()); err != nil {
 		return domain.FileChunk{}, false, err
 	}
-	return domain.FileChunk{
+	chunk := domain.FileChunk{
 		Bytes:    takePBBytes(&res.Data),
 		MimeType: res.GetMimeType(),
 		Total:    res.GetTotal(),
-	}, res.GetFound(), nil
+	}
+	immutablePresent := res.GetImmutableBackend() != "" || res.GetImmutableObjectKey() != "" ||
+		res.GetImmutableOffset() != 0 || res.GetImmutableLength() != 0 || len(res.GetImmutableRangeSha256()) != 0
+	if immutablePresent {
+		digest := res.GetImmutableRangeSha256()
+		if res.GetImmutableBackend() == "" || res.GetImmutableObjectKey() == "" ||
+			res.GetImmutableOffset() < 0 || res.GetImmutableLength() < 0 || len(digest) != sha256.Size {
+			return domain.FileChunk{}, false, fmt.Errorf("filedata grpc get_file: invalid immutable range descriptor")
+		}
+		source := &domain.ImmutableFileRange{
+			Backend:   domain.MediaBackend(res.GetImmutableBackend()),
+			ObjectKey: res.GetImmutableObjectKey(),
+			Offset:    res.GetImmutableOffset(),
+			Length:    int(res.GetImmutableLength()),
+			Total:     res.GetTotal(),
+			MimeType:  res.GetMimeType(),
+		}
+		copy(source.RangeSHA256[:], digest)
+		chunk.ImmutableRange = source
+	}
+	return chunk, res.GetFound(), nil
+}
+
+// ReadImmutableFileRange is the Edge replay path. It bypasses mutable location
+// metadata and reads the already-authorized content-addressed object directly
+// through the File service's range API.
+func (r *GRPCRemote) ReadImmutableFileRange(ctx context.Context, source domain.ImmutableFileRange) ([]byte, error) {
+	if r == nil || source.ObjectKey == "" || source.Offset < 0 || source.Length < 0 || source.Total < 0 {
+		return nil, fmt.Errorf("filedata grpc immutable range: invalid descriptor")
+	}
+	if source.Backend != domain.MediaBackend(r.Name()) {
+		return nil, fmt.Errorf("filedata grpc immutable range: backend mismatch source=%q configured=%q", source.Backend, r.Name())
+	}
+	data, total, err := r.GetRange(ctx, source.ObjectKey, source.Offset, int64(source.Length))
+	if err != nil {
+		return nil, err
+	}
+	if total != source.Total || len(data) != source.Length {
+		return nil, fmt.Errorf("filedata grpc immutable range changed: total=%d/%d length=%d/%d", total, source.Total, len(data), source.Length)
+	}
+	if digest := sha256.Sum256(data); digest != source.RangeSHA256 {
+		return nil, fmt.Errorf("filedata grpc immutable range digest mismatch")
+	}
+	return data, nil
 }
 
 func (r *GRPCRemote) GetFileHashes(ctx context.Context, req domain.FileHashRequest) ([]domain.FileHash, bool, error) {

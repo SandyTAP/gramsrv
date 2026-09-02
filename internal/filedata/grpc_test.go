@@ -3,6 +3,7 @@ package filedata
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"sync"
@@ -69,6 +70,54 @@ func TestGRPCRemoteUploadPartMaterializeAndRange(t *testing.T) {
 	}
 	if len(hashes) != 1 || hashes[0].Limit != 11 || string(hashes[0].Hash) != "hello-world-sha" {
 		t.Fatalf("hashes = %+v", hashes)
+	}
+}
+
+func TestGRPCRemoteTransfersAndReadsImmutableFileRange(t *testing.T) {
+	ctx := context.Background()
+	backend, err := filesapp.NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalFS: %v", err)
+	}
+	payload := []byte("immutable-filedata-grpc-range")
+	objectKey, err := backend.Put(ctx, payload)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	source := &domain.ImmutableFileRange{
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   objectKey,
+		Offset:      0,
+		Length:      len(payload),
+		Total:       int64(len(payload)),
+		MimeType:    "application/octet-stream",
+		RangeSHA256: sha256.Sum256(payload),
+	}
+	service := &grpcTestDataService{
+		blobs:       backend,
+		uploadParts: backend,
+		parts:       make(map[string]filesapp.UploadPartObject),
+		fileChunk: domain.FileChunk{
+			Bytes: append([]byte(nil), payload...), MimeType: source.MimeType,
+			Total: source.Total, ImmutableRange: source,
+		},
+	}
+	remote, cleanup := startBufconnFileData(t, "test-token", service, backend, backend)
+	defer cleanup()
+
+	chunk, found, err := remote.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:7", Limit: len(payload)})
+	if err != nil || !found {
+		t.Fatalf("GetFile found=%v err=%v", found, err)
+	}
+	if chunk.ImmutableRange == nil || *chunk.ImmutableRange != *source || !bytes.Equal(chunk.Bytes, payload) {
+		t.Fatalf("GetFile chunk = %+v", chunk)
+	}
+	replayed, err := remote.ReadImmutableFileRange(ctx, *chunk.ImmutableRange)
+	if err != nil {
+		t.Fatalf("ReadImmutableFileRange: %v", err)
+	}
+	if !bytes.Equal(replayed, payload) {
+		t.Fatalf("replayed = %q, want %q", replayed, payload)
 	}
 }
 
@@ -160,9 +209,10 @@ type grpcTestDataService struct {
 	blobs       filesapp.BlobBackend
 	uploadParts filesapp.UploadPartBackend
 
-	mu     sync.Mutex
-	parts  map[string]filesapp.UploadPartObject
-	hashes map[string][]domain.FileHash
+	mu        sync.Mutex
+	parts     map[string]filesapp.UploadPartObject
+	hashes    map[string][]domain.FileHash
+	fileChunk domain.FileChunk
 }
 
 func (s *grpcTestDataService) SaveFilePart(ctx context.Context, ownerUserID, fileID int64, part int, data []byte) (bool, error) {
@@ -177,6 +227,9 @@ func (s *grpcTestDataService) SaveBigFilePart(ctx context.Context, ownerUserID, 
 }
 
 func (s *grpcTestDataService) GetFile(context.Context, domain.FileDownloadRequest) (domain.FileChunk, bool, error) {
+	if s.fileChunk.Bytes != nil {
+		return s.fileChunk, true, nil
+	}
 	return domain.FileChunk{}, false, nil
 }
 

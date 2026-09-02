@@ -30,6 +30,8 @@ edge:
     allowed_origins:
       - http://localhost:1234
       - http://127.0.0.1:1234
+  mtproto:
+    outbound_critical_global_max_bytes: 67108864
   location:
     ttl: 90s
     heartbeat_interval: 30s

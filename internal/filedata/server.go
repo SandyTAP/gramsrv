@@ -137,12 +137,20 @@ func (s *grpcServer) GetFile(ctx context.Context, req *filedatapb.GetFileRequest
 	if err != nil {
 		return &filedatapb.GetFileResponse{Error: err.Error(), ErrorKind: errorKind(err)}, nil
 	}
-	return &filedatapb.GetFileResponse{
+	res := &filedatapb.GetFileResponse{
 		Found:    found,
 		Data:     chunk.Bytes,
 		MimeType: chunk.MimeType,
 		Total:    chunk.Total,
-	}, nil
+	}
+	if source := chunk.ImmutableRange; source != nil {
+		res.ImmutableBackend = string(source.Backend)
+		res.ImmutableObjectKey = source.ObjectKey
+		res.ImmutableOffset = source.Offset
+		res.ImmutableLength = int32(source.Length)
+		res.ImmutableRangeSha256 = append([]byte(nil), source.RangeSHA256[:]...)
+	}
+	return res, nil
 }
 
 func (s *grpcServer) GetFileHashes(ctx context.Context, req *filedatapb.GetFileHashesRequest) (*filedatapb.GetFileHashesResponse, error) {

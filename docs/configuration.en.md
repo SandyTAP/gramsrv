@@ -99,7 +99,8 @@ dashboard; it does not configure or initialize the object-store backend.
 | `TELESRV_MTPROTO_INBOUND_FRAME_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | Process-wide reservation for transport wire bytes, maximum decrypted plaintext, and every live outer/nested gzip expansion, acquired before the corresponding payload allocation. |
 | `TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE` | int / `128` | Per-connection normal outbound mailbox capacity. |
 | `TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE` | int / `32` | Per-connection control-message mailbox capacity. |
-| `TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | Sole global budget for unacknowledged logical-session bodies. Reconnects reuse the same `msg_id/seq_no/body`; ACK, destroy, or six minutes offline releases it, with no second RPC cache/spool copy. |
+| `TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | Process-wide hard cap for retained ordinary exact bodies, not file-download flow control. Immutable `upload.getFile` frames retain only their descriptor charge after the first write; per-session ACK windows govern logical file bytes. |
+| `TELESRV_MTPROTO_OUTBOUND_CRITICAL_GLOBAL_MAX_BYTES` | int64 bytes / `67108864` | Independent retained reserve for bootstrap/convergence RPC results. File bulk cannot consume it, so `auth.bindTempAuthKey`, `help.getConfig`, `users.getUsers`, and difference/state remain admissible. |
 | `TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | Global budget for concurrent encrypted wire/codec/obfuscation scratch. |
 
 Nested gzip admission adds no environment setting. Code-enforced ceilings are
