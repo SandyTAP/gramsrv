@@ -87,6 +87,19 @@ func TestGetFileCachesMetadataAndSmallBlobBytes(t *testing.T) {
 	if c1.Total != 10 {
 		t.Errorf("total = %d, want 10", c1.Total)
 	}
+	if c1.ImmutableRange == nil || c1.ImmutableRange.ObjectKey != objectKey || c1.ImmutableRange.Offset != 0 || c1.ImmutableRange.Length != 5 {
+		t.Fatalf("immutable range = %+v, want exact first chunk descriptor", c1.ImmutableRange)
+	}
+	replaySvc := NewService(media, local, 2)
+	replayed, err := replaySvc.ReadImmutableFileRange(ctx, *c1.ImmutableRange)
+	if err != nil || string(replayed) != "01234" {
+		t.Fatalf("immutable replay = %q err=%v, want 01234", replayed, err)
+	}
+	corrupt := *c1.ImmutableRange
+	corrupt.RangeSHA256[0] ^= 0xff
+	if _, err := replaySvc.ReadImmutableFileRange(ctx, corrupt); err == nil {
+		t.Fatal("corrupt immutable range digest was accepted")
+	}
 	if counting.getBlobCalls != 1 {
 		t.Errorf("getBlobCalls = %d, want 1", counting.getBlobCalls)
 	}
@@ -125,7 +138,7 @@ func TestGetFileLogsCacheHitMiss(t *testing.T) {
 		t.Fatalf("put blob: %v", err)
 	}
 	blobs := &countingBlobBackend{BlobBackend: local}
-	core, logs := observer.New(zap.InfoLevel)
+	core, logs := observer.New(zap.DebugLevel)
 	svc := NewService(media, blobs, 2, WithLogger(zap.New(core)))
 
 	if _, ok, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:log", Offset: 0, Limit: 5}); err != nil || !ok {

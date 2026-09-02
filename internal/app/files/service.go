@@ -62,6 +62,7 @@ type Service struct {
 	// 一发 PG GetFileBlob + backend GetRange(热门贴纸/reaction/头像被大量用户同时拉时尤甚)。
 	blobMetaSF         singleflight.Group
 	blobBytesSF        singleflight.Group
+	blobRangeSF        singleflight.Group
 	stickerSetCache    *stickerSetFullCache
 	stickerSetNegCache *stickerSetNegativeCache
 	uploadQuota        domain.UploadPartQuota
@@ -328,6 +329,7 @@ type getFileCacheLog struct {
 	byteCacheHit      bool
 	byteCacheFilled   bool
 	byteSingleflight  bool
+	rangeSingleflight bool
 	backendRead       bool
 	source            string
 }
@@ -381,11 +383,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 		if data, ok := s.byteCache.get(blob.ObjectKey); ok {
 			cacheLog.byteCacheHit = true
 			cacheLog.source = "byte_cache"
-			return domain.FileChunk{
-				Bytes:    sliceBlobBytes(data, req.Offset, int64(req.Limit)),
-				MimeType: blob.MimeType,
-				Total:    int64(len(data)),
-			}, true, nil
+			return immutableFileChunk(blob, sliceBlobBytes(data, req.Offset, int64(req.Limit)), int64(len(data)), req.Offset), true, nil
 		}
 		// 同一 object_key 的小 blob 并发首访合并成一次 backend 全量读 + 一次 byteCache 填充。
 		v, err, shared := s.blobBytesSF.Do(blob.ObjectKey, func() (any, error) {
@@ -416,11 +414,7 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 			} else {
 				cacheLog.source = "backend_fill_byte_cache"
 			}
-			return domain.FileChunk{
-				Bytes:    sliceBlobBytes(res.data, req.Offset, int64(req.Limit)),
-				MimeType: blob.MimeType,
-				Total:    res.total,
-			}, true, nil
+			return immutableFileChunk(blob, sliceBlobBytes(res.data, req.Offset, int64(req.Limit)), res.total, req.Offset), true, nil
 		}
 		// 大小不符/超限：落到下面的按需 range 读(与原行为一致)。
 		cacheLog.source = "backend_range_uncacheable"
@@ -429,15 +423,71 @@ func (s *Service) GetFile(ctx context.Context, req domain.FileDownloadRequest) (
 	if cacheLog.source == "unknown" {
 		cacheLog.source = "backend_range"
 	}
-	data, total, err := s.blobs.GetRange(ctx, blob.ObjectKey, req.Offset, int64(req.Limit))
+	rangeKey := fmt.Sprintf("%s:%d:%d", blob.ObjectKey, req.Offset, req.Limit)
+	v, err, shared := s.blobRangeSF.Do(rangeKey, func() (any, error) {
+		data, total, err := s.blobs.GetRange(ctx, blob.ObjectKey, req.Offset, int64(req.Limit))
+		if err != nil {
+			return blobBytesResult{}, err
+		}
+		return blobBytesResult{data: data, total: total}, nil
+	})
+	cacheLog.rangeSingleflight = shared
 	if err != nil {
 		return domain.FileChunk{}, false, fmt.Errorf("read blob %q: %w", blob.LocationKey, err)
+	}
+	res := v.(blobBytesResult)
+	data := res.data
+	if shared {
+		data = append([]byte(nil), data...)
+	}
+	return immutableFileChunk(blob, data, res.total, req.Offset), true, nil
+}
+
+func immutableFileChunk(blob domain.FileBlob, data []byte, total, offset int64) domain.FileChunk {
+	if offset < 0 {
+		offset = 0
 	}
 	return domain.FileChunk{
 		Bytes:    data,
 		MimeType: blob.MimeType,
 		Total:    total,
-	}, true, nil
+		ImmutableRange: &domain.ImmutableFileRange{
+			Backend:     blob.Backend,
+			ObjectKey:   blob.ObjectKey,
+			Offset:      offset,
+			Length:      len(data),
+			Total:       total,
+			MimeType:    blob.MimeType,
+			RangeSHA256: sha256.Sum256(data),
+		},
+	}
+}
+
+// ReadImmutableFileRange is the replay-only byte path. It intentionally skips
+// location metadata and authorization: those facts were resolved by the fresh
+// RPC execution, while this capability names one immutable content-addressed
+// object and one digest-protected range.
+func (s *Service) ReadImmutableFileRange(ctx context.Context, source domain.ImmutableFileRange) ([]byte, error) {
+	if s == nil || s.blobs == nil {
+		return nil, fmt.Errorf("immutable blob backend is unavailable")
+	}
+	if source.ObjectKey == "" || source.Offset < 0 || source.Length < 0 || source.Total < 0 {
+		return nil, fmt.Errorf("invalid immutable file range")
+	}
+	if source.Backend != domain.MediaBackend(s.blobs.Name()) {
+		return nil, fmt.Errorf("immutable blob backend mismatch: source=%q configured=%q", source.Backend, s.blobs.Name())
+	}
+	data, total, err := s.blobs.GetRange(ctx, source.ObjectKey, source.Offset, int64(source.Length))
+	if err != nil {
+		return nil, fmt.Errorf("read immutable blob range: %w", err)
+	}
+	if total != source.Total || len(data) != source.Length {
+		return nil, fmt.Errorf("immutable blob range changed: total=%d/%d length=%d/%d", total, source.Total, len(data), source.Length)
+	}
+	if digest := sha256.Sum256(data); digest != source.RangeSHA256 {
+		return nil, fmt.Errorf("immutable blob range digest mismatch")
+	}
+	return data, nil
 }
 
 func (s *Service) logGetFileCache(req domain.FileDownloadRequest, blob domain.FileBlob, found bool, chunk domain.FileChunk, cacheLog getFileCacheLog, err error) {
@@ -454,6 +504,7 @@ func (s *Service) logGetFileCache(req domain.FileDownloadRequest, blob domain.Fi
 		zap.Bool("byte_cache_hit", cacheLog.byteCacheHit),
 		zap.Bool("byte_cache_filled", cacheLog.byteCacheFilled),
 		zap.Bool("byte_singleflight_shared", cacheLog.byteSingleflight),
+		zap.Bool("range_singleflight_shared", cacheLog.rangeSingleflight),
 		zap.Bool("backend_read", cacheLog.backendRead),
 		zap.Int("returned_bytes", len(chunk.Bytes)),
 		zap.Int64("total_bytes", chunk.Total),
@@ -469,7 +520,11 @@ func (s *Service) logGetFileCache(req domain.FileDownloadRequest, blob domain.Fi
 	if err != nil {
 		fields = append(fields, zap.Error(err))
 	}
-	s.log.Info("upload.getFile cache", fields...)
+	if err != nil {
+		s.log.Warn("upload.getFile cache failed", fields...)
+		return
+	}
+	s.log.Debug("upload.getFile cache", fields...)
 }
 
 func sliceBlobBytes(data []byte, offset, limit int64) []byte {

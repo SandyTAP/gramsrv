@@ -175,7 +175,10 @@ func (c *blobBytesCache) get(key string) ([]byte, bool) {
 	if el, ok := c.m[key]; ok {
 		c.ll.MoveToFront(el)
 		entry := el.Value.(*blobBytesEntry)
-		return append([]byte(nil), entry.bytes...), true
+		// Cache entries are immutable after publication. GetFile copies only the
+		// requested range before returning it, so copying the whole cached blob on
+		// every hit would add an avoidable second full-size allocation.
+		return entry.bytes, true
 	}
 	return nil, false
 }

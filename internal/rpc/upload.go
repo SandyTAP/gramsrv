@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,11 +12,46 @@ import (
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/domain"
+	"telesrv/internal/rpcresult"
 )
 
 // Telegram 客户端按 chunk 调 upload.getFile；单次响应限制为 1MiB，
 // 防止异常客户端用超大/空 limit 触发整 blob 读回。
 const maxUploadGetFileChunkLimit = 1 << 20
+
+type immutableFileRangeReader interface {
+	ReadImmutableFileRange(context.Context, domain.ImmutableFileRange) ([]byte, error)
+}
+
+type immutableUploadFileSource struct {
+	reader immutableFileRangeReader
+	range_ domain.ImmutableFileRange
+}
+
+func (s *immutableUploadFileSource) Value(ctx context.Context) (any, error) {
+	if s == nil || s.reader == nil {
+		return nil, fmt.Errorf("immutable upload file source is unavailable")
+	}
+	data, err := s.reader.ReadImmutableFileRange(ctx, s.range_)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != s.range_.Length || sha256.Sum256(data) != s.range_.RangeSHA256 {
+		return nil, fmt.Errorf("immutable upload file source changed")
+	}
+	return &tg.UploadFile{
+		Type:  storageFileType(s.range_.MimeType, data),
+		Mtime: 0,
+		Bytes: data,
+	}, nil
+}
+
+func (s *immutableUploadFileSource) RetainedBytes() int {
+	if s == nil {
+		return 0
+	}
+	return 384 + len(s.range_.ObjectKey) + len(s.range_.MimeType)
+}
 
 // registerUpload 注册 upload.* RPC handler（分片上传 + 文件下载 + 地图 webfile）。
 func (r *Router) registerUpload(d *tlprofile.Dispatcher) {
@@ -104,11 +140,17 @@ func (r *Router) onUploadGetFile(ctx context.Context, req *tg.UploadGetFileReque
 		return nil, internalErr()
 	}
 	if found {
-		return &tg.UploadFile{
+		result := &tg.UploadFile{
 			Type:  storageFileType(chunk.MimeType, chunk.Bytes),
 			Mtime: 0,
 			Bytes: chunk.Bytes,
-		}, nil
+		}
+		if chunk.ImmutableRange != nil {
+			if reader, ok := r.deps.Files.(immutableFileRangeReader); ok {
+				rpcresult.Publish(ctx, &immutableUploadFileSource{reader: reader, range_: *chunk.ImmutableRange})
+			}
+		}
+		return result, nil
 	}
 	return nil, locationInvalidErr()
 }

@@ -104,10 +104,12 @@ type Conn struct {
 	// Encoded MTProto service frames and control vectors use independent headroom: pong,
 	// new_session_created, bad_msg and msgs_ack must remain admissible when the body budget is
 	// full. Content-related control frames keep this budget while pending for resend.
-	outboundControlTrackedBudget *outboundTrackedBudget
-	outboundControlBudgetOnce    sync.Once
-	outboundScratchPool          *outboundScratchPool
-	outboundScratchOnce          sync.Once
+	outboundControlTrackedBudget  *outboundTrackedBudget
+	outboundControlBudgetOnce     sync.Once
+	outboundCriticalTrackedBudget *outboundTrackedBudget
+	outboundCriticalBudgetOnce    sync.Once
+	outboundScratchPool           *outboundScratchPool
+	outboundScratchOnce           sync.Once
 	// outboundState outlives this physical Conn generation. A replacement
 	// physical connection for the same auth key/session reuses it.
 	outboundState *outboundState

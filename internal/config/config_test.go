@@ -755,6 +755,7 @@ func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
 	t.Setenv("TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE", "88")
 	t.Setenv("TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE", "22")
 	t.Setenv("TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES", "888888")
+	t.Setenv("TELESRV_MTPROTO_OUTBOUND_CRITICAL_GLOBAL_MAX_BYTES", "898989")
 	t.Setenv("TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES", "999999")
 	t.Setenv("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", "666")
 	t.Setenv("TELESRV_TEMP_KEY_CACHE_TTL", "17m")
@@ -790,8 +791,8 @@ func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
 	if cfg.MTProtoInboundFrameGlobalMaxBytes != 777777 {
 		t.Fatalf("inbound frame budget config = %d", cfg.MTProtoInboundFrameGlobalMaxBytes)
 	}
-	if cfg.MTProtoOutboundQueueSize != 88 || cfg.MTProtoOutboundControlQueueSize != 22 || cfg.MTProtoOutboundTrackedGlobalMaxBytes != 888888 || cfg.MTProtoOutboundWriteGlobalMaxBytes != 999999 {
-		t.Fatalf("outbound config = %d/%d/%d/%d", cfg.MTProtoOutboundQueueSize, cfg.MTProtoOutboundControlQueueSize, cfg.MTProtoOutboundTrackedGlobalMaxBytes, cfg.MTProtoOutboundWriteGlobalMaxBytes)
+	if cfg.MTProtoOutboundQueueSize != 88 || cfg.MTProtoOutboundControlQueueSize != 22 || cfg.MTProtoOutboundTrackedGlobalMaxBytes != 888888 || cfg.MTProtoOutboundCriticalGlobalMaxBytes != 898989 || cfg.MTProtoOutboundWriteGlobalMaxBytes != 999999 {
+		t.Fatalf("outbound config = %d/%d/%d/%d/%d", cfg.MTProtoOutboundQueueSize, cfg.MTProtoOutboundControlQueueSize, cfg.MTProtoOutboundTrackedGlobalMaxBytes, cfg.MTProtoOutboundCriticalGlobalMaxBytes, cfg.MTProtoOutboundWriteGlobalMaxBytes)
 	}
 	if cfg.TempKeyResolveCacheMaxEntries != 666 || cfg.TempKeyResolveCacheTTL != 17*time.Minute || cfg.OrphanAuthKeyRetention != 36*time.Hour {
 		t.Fatalf("auth key resource config = %d/%v/%v", cfg.TempKeyResolveCacheMaxEntries, cfg.TempKeyResolveCacheTTL, cfg.OrphanAuthKeyRetention)

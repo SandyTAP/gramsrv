@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"sync"
@@ -19,6 +20,17 @@ import (
 	"github.com/iamxvbaba/td/tlprofile"
 	"github.com/iamxvbaba/td/transport"
 )
+
+type staticRPCReplaySource struct {
+	inner []byte
+}
+
+func (s *staticRPCReplaySource) EncodeInner(_ context.Context, out *bin.Buffer) error {
+	out.Put(s.inner)
+	return nil
+}
+
+func (*staticRPCReplaySource) RetainedBytes() int { return 128 }
 
 type failAfterTransport struct {
 	failAt atomic.Int32
@@ -486,13 +498,17 @@ func TestOutboundOptionsDefaults(t *testing.T) {
 	if opts.OutboundTrackedGlobalMaxBytes != 512<<20 {
 		t.Fatalf("outbound tracked default = %d, want %d", opts.OutboundTrackedGlobalMaxBytes, 512<<20)
 	}
+	if opts.OutboundCriticalGlobalMaxBytes != 64<<20 {
+		t.Fatalf("outbound critical default = %d, want %d", opts.OutboundCriticalGlobalMaxBytes, 64<<20)
+	}
 }
 
 func TestServerNewConnectionsShareOutboundBudgetAndQueueLimits(t *testing.T) {
 	srv := New(Options{
-		OutboundQueueSize:             7,
-		OutboundControlQueueSize:      3,
-		OutboundTrackedGlobalMaxBytes: 20,
+		OutboundQueueSize:              7,
+		OutboundControlQueueSize:       3,
+		OutboundTrackedGlobalMaxBytes:  20,
+		OutboundCriticalGlobalMaxBytes: 30,
 	})
 	var rawKey crypto.Key
 	key := rawKey.WithID()
@@ -512,6 +528,12 @@ func TestServerNewConnectionsShareOutboundBudgetAndQueueLimits(t *testing.T) {
 	}
 	if got := srv.outboundTrackedBudget.maxBytes; got != 20 {
 		t.Fatalf("server outbound tracked max = %d, want 20", got)
+	}
+	if c1.outboundCriticalTrackedBudget != srv.outboundCriticalBudget || c2.outboundCriticalTrackedBudget != srv.outboundCriticalBudget {
+		t.Fatal("server connections did not receive the shared critical tracking budget")
+	}
+	if got := srv.outboundCriticalBudget.maxBytes; got != 30 {
+		t.Fatalf("server outbound critical max = %d, want 30", got)
 	}
 }
 
@@ -906,6 +928,87 @@ func TestOutboundTrackedBudgetWriteFailureReturnsReservation(t *testing.T) {
 	}
 	if got := budget.snapshot(); got != 0 {
 		t.Fatalf("tracked bytes after write failure = %d, want 0", got)
+	}
+}
+
+func TestOutboundStateCompactsImmutableRPCResultAndReplaysExactBody(t *testing.T) {
+	budget := newOutboundTrackedBudget(1 << 20)
+	state := newOutboundStateWithLimits(budget, 64, 1<<20)
+	inner := bytes.Repeat([]byte{0x5a}, 4096)
+	var body bin.Buffer
+	body.PutID(proto.ResultTypeID)
+	body.PutLong(7001)
+	body.Put(inner)
+	wire := body.Raw()
+	if !budget.reserve(len(wire)) {
+		t.Fatal("reserve first-write body")
+	}
+	frame := &outboundFrame{
+		msgID:             9001,
+		seqNo:             1,
+		typeID:            proto.ResultTypeID,
+		body:              wire,
+		reservedBytes:     len(wire),
+		reservationBudget: budget,
+		reqMsgID:          7001,
+		replaySource:      &staticRPCReplaySource{inner: append([]byte(nil), inner...)},
+		innerDigest:       sha256.Sum256(inner),
+		uncompressedBytes: len(inner),
+		logicalBytes:      len(wire),
+	}
+	if err := state.admitReserved(frame); err != nil {
+		t.Fatalf("admit frame: %v", err)
+	}
+	if !state.compactImmutableFrame(frame) {
+		t.Fatal("immutable frame was not compacted")
+	}
+	if frame.body != nil {
+		t.Fatal("compacted frame retained full body")
+	}
+	if got := budget.snapshot(); got != outboundReplayDescriptorCharge {
+		t.Fatalf("retained bytes = %d, want descriptor charge %d", got, outboundReplayDescriptorCharge)
+	}
+	replay, ok := state.rpcResult(7001)
+	if !ok || replay.replaySource == nil || len(replay.body) != 0 {
+		t.Fatalf("replay descriptor = %+v ok=%v", replay, ok)
+	}
+	materialized, err := replay.materializeRPCResultBody(context.Background(), 7001)
+	if err != nil {
+		t.Fatalf("materialize replay: %v", err)
+	}
+	if !bytes.Equal(materialized, wire) {
+		t.Fatal("materialized replay differs from first-write body")
+	}
+	state.ack([]int64{9001})
+	if got := budget.snapshot(); got != 0 {
+		t.Fatalf("retained bytes after ACK = %d, want 0", got)
+	}
+}
+
+func TestOutboundBulkACKWindowWakesNextWaiter(t *testing.T) {
+	state := newOutboundStateWithLimits(newOutboundTrackedBudget(1<<20), 128, 1<<20)
+	leasing := make([]*outboundBulkCreditLease, 0, defaultBulkACKWindow+1)
+	for range defaultBulkACKWindow + 1 {
+		leasing = append(leasing, state.reserveBulkCredit())
+	}
+	woken := make(chan bool, 1)
+	leasing[len(leasing)-1].credit.subscribe(func(success bool) { woken <- success })
+	select {
+	case <-woken:
+		t.Fatal("window overflow waiter woke before ACK credit release")
+	default:
+	}
+	leasing[0].releaseIfOwned()
+	select {
+	case success := <-woken:
+		if !success {
+			t.Fatal("window waiter was canceled instead of granted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("window waiter did not wake after credit release")
+	}
+	for _, lease := range leasing[1:] {
+		lease.releaseIfOwned()
 	}
 }
 

@@ -1,14 +1,26 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"testing"
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/rpcresult"
 )
+
+type immutableReplayFiles struct {
+	*fakeFiles
+	replay []byte
+}
+
+func (f *immutableReplayFiles) ReadImmutableFileRange(context.Context, domain.ImmutableFileRange) ([]byte, error) {
+	return append([]byte(nil), f.replay...), nil
+}
 
 func TestFileSaveErrMapsStorageCapacityWithoutFloodWait(t *testing.T) {
 	err := fileSaveErr(domain.ErrStorageFull)
@@ -54,6 +66,44 @@ func TestUploadGetFileRejectsInvalidRanges(t *testing.T) {
 				t.Fatalf("err = %v, want LIMIT_INVALID", err)
 			}
 		})
+	}
+}
+
+func TestUploadGetFilePublishesImmutableReplaySource(t *testing.T) {
+	data := []byte("immutable-file-range")
+	range_ := &domain.ImmutableFileRange{
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   "immutable-object",
+		Length:      len(data),
+		Total:       int64(len(data)),
+		MimeType:    "application/octet-stream",
+		RangeSHA256: sha256.Sum256(data),
+	}
+	files := &immutableReplayFiles{
+		fakeFiles: &fakeFiles{getFileFound: true, getFileChunk: domain.FileChunk{
+			Bytes: data, MimeType: range_.MimeType, Total: range_.Total, ImmutableRange: range_,
+		}},
+		replay: data,
+	}
+	r := &Router{deps: Deps{Files: files}}
+	ctx, capture := rpcresult.WithCapture(context.Background())
+	result, err := r.onUploadGetFile(ctx, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: 42}, Limit: len(data),
+	})
+	if err != nil || result == nil {
+		t.Fatalf("get file result=%v err=%v", result, err)
+	}
+	source := capture.Take()
+	if source == nil {
+		t.Fatal("immutable replay source was not published")
+	}
+	value, err := source.Value(context.Background())
+	if err != nil {
+		t.Fatalf("replay value: %v", err)
+	}
+	replayed, ok := value.(*tg.UploadFile)
+	if !ok || !bytes.Equal(replayed.Bytes, data) {
+		t.Fatalf("replayed value = %#v, want exact upload.file bytes", value)
 	}
 }
 

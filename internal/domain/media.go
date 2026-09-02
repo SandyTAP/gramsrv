@@ -129,6 +129,24 @@ type FileChunk struct {
 	Bytes    []byte
 	MimeType string
 	Total    int64
+	// ImmutableRange is present only when Bytes came from the exact range of a
+	// content-addressed immutable blob. MTProto may retain this descriptor instead
+	// of a second long-lived copy of Bytes until the answer is acknowledged.
+	ImmutableRange *ImmutableFileRange
+}
+
+// ImmutableFileRange is a capability for exact byte replay. ObjectKey names
+// immutable content in Backend; RangeSHA256 protects the requested slice from
+// backend corruption or an invalid implementation. It deliberately contains no
+// location key, access hash, or mutable database identifier.
+type ImmutableFileRange struct {
+	Backend     MediaBackend
+	ObjectKey   string
+	Offset      int64
+	Length      int
+	Total       int64
+	MimeType    string
+	RangeSHA256 [32]byte
 }
 
 // PhotoSizeKind 标识 PhotoSize 的 TL 变体。
