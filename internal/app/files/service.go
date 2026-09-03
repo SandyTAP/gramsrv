@@ -200,18 +200,9 @@ func (s *Service) SeedTx(ctx context.Context, fn func(ctx context.Context, tx bo
 		return fmt.Errorf("bot avatar: media store does not support transactions")
 	}
 	return txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
-		txService := &Service{
-			media:              txMedia,
-			blobs:              s.blobs,
-			dc:                 s.dc,
-			log:                s.log,
-			blobCache:          s.blobCache,
-			byteCache:          s.byteCache,
-			stickerSetCache:    s.stickerSetCache,
-			stickerSetNegCache: s.stickerSetNegCache,
-			uploadQuota:        s.uploadQuota,
-		}
-		return fn(ctx, txService)
+		txService := *s
+		txService.media = txMedia
+		return fn(ctx, &txService)
 	})
 }
 

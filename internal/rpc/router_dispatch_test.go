@@ -520,7 +520,7 @@ func TestPersistAuthKeyClientInfoCarriesClientIP(t *testing.T) {
 	)
 
 	r.persistAuthKeyClientInfo(ctx, clientSessionInfo{
-		layer:        currentClientLayer,
+		layer:         currentClientLayer,
 		hasClientInfo: true,
 		clientInfo: ClientInfo{
 			APIID: 2040, DeviceModel: "Pixel 9", SystemVersion: "SDK 36", AppVersion: "12.8.7",
