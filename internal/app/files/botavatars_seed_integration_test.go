@@ -1,30 +1,67 @@
 package files
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/png"
 	"testing"
 
 	"telesrv/internal/app/files/botavatars"
 	"telesrv/internal/domain"
 )
 
-// TestBotAvatarsSeedViaRealService 集成测试：通过真实 files.Service 与真实
-// LocalFS blob 后端调用 botavatars.Seed。Seed 内部经 SeedTx 构造的事务化
-// 服务会读取 uploadParts / thumbs 等字段——这里确保它们在事务服务上完整保留，
-// 否则 premiumbot.mp4 的 CreateAvatarVideoFromBytes 会因 upload part backend
-// 未配置而失败。
+// countingThumbnailer records whether the video thumbnailer was invoked by the
+// transaction-scoped service. If SeedTx dropped thumbs, the animated-avatar
+// still would fall back to a generated placeholder and Extract would be 0.
+// It returns a valid small PNG so the downstream avatar rendition pipeline
+// (which decodes the still) can proceed.
+type countingThumbnailer struct {
+	extractCalls int
+}
+
+func (c *countingThumbnailer) Extract(_ context.Context, _ []byte, _ string) ([]byte, error) {
+	c.extractCalls++
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// TestBotAvatarsSeedViaRealService 集成测试：通过真实 files.Service、真实
+// permanent-blob 后端与真实、分开的 upload-staging 后端调用 botavatars.Seed。
+// Seed 内部经 SeedTx 构造事务化服务——这里确保 uploadParts / thumbs 等字段在
+// 事务服务上完整保留，且 upload parts 被写入单独的 staging backend（而非主
+// blob 后端）。否则 premiumbot.mp4 的 CreateAvatarVideoFromBytes 会因 upload
+// part backend 未配置而失败，或视频静态帧回落成生成占位图。
 func TestBotAvatarsSeedViaRealService(t *testing.T) {
 	ctx := context.Background()
 
 	media := newFakeMediaStore()
 	blobs, err := NewLocalFS(t.TempDir())
 	if err != nil {
-		t.Fatalf("new local fs backend: %v", err)
+		t.Fatalf("new local fs blob backend: %v", err)
 	}
-	svc := NewService(media, blobs, 2)
+	// 独立的 upload-staging backend：与 permanent-blob 后端是分开的实例/目录。
+	staging := &countingUploadPartBackend{LocalFS: mustLocalFS(t, "staging backend")}
+	// Фейковый thumbnailer фиксирует, что SeedTx сохранил thumbs для видео-статика.
+	thumb := &countingThumbnailer{}
+	svc := NewService(media, blobs, 2, WithUploadPartBackend(staging), WithVideoThumbnailer(thumb))
 
 	if err := botavatars.Seed(ctx, svc, 1750000000); err != nil {
 		t.Fatalf("botavatars.Seed failed: %v", err)
+	}
+
+	// premiumbot.mp4 走 CreateAvatarVideoFromBytes -> SaveFilePart -> PutUploadPart。
+	// uploadParts 必须被 SeedTx 保留，且确实落到了独立的 staging backend。
+	if staging.putUploadPartCalls == 0 {
+		t.Fatalf("staging backend was never used: uploadParts not carried into SeedTx")
+	}
+	// 视频静态帧必须从真实 thumbnailer 抽取，而不是回落成生成占位图——这证明
+	// SeedTx 保留了 thumbs。
+	if thumb.extractCalls == 0 {
+		t.Fatalf("video thumbnailer never invoked: thumbs not carried into SeedTx")
 	}
 
 	// 每个系统 bot/账号都应有头像相册与当前照片。
@@ -85,6 +122,15 @@ func botavatarsPeersForSeed() map[int64]string {
 		domain.GifBotUserID:                 "gif.jpg",
 		domain.PremiumBotConfiguredUserID(): "premiumbot.mp4",
 	}
+}
+
+func mustLocalFS(t *testing.T, desc string) *LocalFS {
+	t.Helper()
+	lfs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("new local fs %s: %v", desc, err)
+	}
+	return lfs
 }
 
 func photoBlobKey(photoID int64, typ string) string {
