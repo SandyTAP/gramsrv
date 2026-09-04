@@ -158,6 +158,20 @@ func (s *Service) CreateAvatarFromBytes(ctx context.Context, data []byte) (domai
 	return s.createAvatarPhoto(ctx, data)
 }
 
+// CreateAvatarVideoFromBytes stores raw animated-profile-video bytes through the
+// same upload + s/a/c rendition pipeline used by Telegram video-avatar uploads.
+func (s *Service) CreateAvatarVideoFromBytes(ctx context.Context, data []byte, videoStartTs float64) (domain.Photo, error) {
+	if len(data) == 0 {
+		return domain.Photo{}, domain.ErrPhotoInvalid
+	}
+	fileID := randomID()
+	if _, err := s.SaveFilePart(ctx, 0, fileID, 0, data); err != nil {
+		return domain.Photo{}, err
+	}
+	ref := domain.UploadedFileRef{OwnerUserID: 0, FileID: fileID, Parts: 1, Big: true}
+	return s.createAvatarVideoFromUpload(ctx, ref, videoStartTs, nil)
+}
+
 // CreateAvatarFromUpload 把已上传文件组装成头像 Photo（'s'/'a'/'c' 尺寸，'a'/'c' 匹配
 // InputPeerPhotoFileLocation big/small 与 channelFull 下载路径），不绑定 profile_photos。用于频道 editPhoto。
 func (s *Service) CreateAvatarFromUpload(ctx context.Context, file domain.UploadedFileRef) (domain.Photo, error) {

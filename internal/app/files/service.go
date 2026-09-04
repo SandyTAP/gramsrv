@@ -13,6 +13,8 @@ import (
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 
+	"telesrv/internal/app/files/botavatars"
+
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -179,6 +181,59 @@ func NewService(media store.MediaStore, blobs BlobBackend, dc int, opts ...Optio
 		}
 	}
 	return s
+}
+
+// txMediaStore is a subset of store.MediaStore that supports transactions.
+type txMediaStore interface {
+	store.MediaStore
+	WithTx(ctx context.Context, fn func(ctx context.Context, txMedia store.MediaStore) error) error
+}
+
+// SeedTx implements botavatars.AvatarSetter. It runs fn inside a single
+// transaction holding the PostgreSQL advisory lock that serialises bot-avatar
+// seeding across instances. If fn returns an error the transaction is rolled
+// back (including any media created inside), otherwise it is committed. This
+// makes the check+create+bind sequence atomic and orphan-free.
+//
+// The avatar pipeline needs more than the media store: creating the Premium
+// bot's animated avatar stages bytes through uploadParts (SaveFilePart) and
+// derives the video still through thumbs. Both, along with every other
+// configured dependency, are carried onto the transaction-scoped service;
+// only media is swapped for its transactional view. The singleflight groups
+// and the premiumPromo mutex are deliberately re-initialised fresh because a
+// lock must never be copied after it has been used by the outer service.
+func (s *Service) SeedTx(ctx context.Context, fn func(ctx context.Context, tx botavatars.AvatarSetter) error) error {
+	txMs, ok := s.media.(txMediaStore)
+	if !ok {
+		return fmt.Errorf("bot avatar: media store does not support transactions")
+	}
+	return txMs.WithTx(ctx, func(ctx context.Context, txMedia store.MediaStore) error {
+		txService := &Service{
+			media:              txMedia,
+			gifCatalog:         s.gifCatalog,
+			blobs:              s.blobs,
+			uploadParts:        s.uploadParts,
+			dc:                 s.dc,
+			log:                s.log,
+			thumbs:             s.thumbs,
+			thumbsSet:          s.thumbsSet,
+			gifs:               s.gifs,
+			gifsSet:            s.gifsSet,
+			blobCache:          s.blobCache,
+			byteCache:          s.byteCache,
+			stickerSetCache:    s.stickerSetCache,
+			stickerSetNegCache: s.stickerSetNegCache,
+			uploadQuota:        s.uploadQuota,
+			mapTiles:           s.mapTiles,
+			externalMedia:      s.externalMedia,
+			webpage:            s.webpage,
+			effects:            s.effects,
+			effectsHash:        s.effectsHash,
+			premiumPromo:       s.premiumPromo,
+			premiumPromoReady:  s.premiumPromoReady,
+		}
+		return fn(ctx, txService)
+	})
 }
 
 // SaveFilePart 累积一个 small file 分片。

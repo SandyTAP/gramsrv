@@ -3,6 +3,7 @@ package files
 import (
 	"bytes"
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -207,8 +208,13 @@ func TestGetFileSingleflightSharesImmutableRangeBacking(t *testing.T) {
 	const callers = 16
 	results := make(chan domain.FileChunk, callers)
 	errs := make(chan error, callers)
+	start := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(callers)
 	for range callers {
 		go func() {
+			<-start
+			started.Done()
 			chunk, found, err := svc.GetFile(ctx, domain.FileDownloadRequest{LocationKey: "doc:shared-range", Offset: 17, Limit: 128 << 10})
 			if err == nil && !found {
 				err = context.Canceled
@@ -220,7 +226,17 @@ func TestGetFileSingleflightSharesImmutableRangeBacking(t *testing.T) {
 			results <- chunk
 		}()
 	}
+	// Launch all callers simultaneously, then wait for every caller to have
+	// entered GetFile while the first (leader) is confirmed blocked inside its
+	// singleflight range read. Releasing before all callers are in-flight could
+	// let a straggler start a second singleflight generation and observe its own
+	// backing (a false negative), so we settle before unblocking the leader.
+	close(start)
+	started.Wait()
 	<-backend.entered
+	for i := 0; i < 64; i++ {
+		runtime.Gosched()
+	}
 	close(backend.release)
 
 	var first domain.FileChunk

@@ -40,6 +40,7 @@ import (
 	"telesrv/internal/app/dialogs"
 	ephemeralapp "telesrv/internal/app/ephemeral"
 	filesapp "telesrv/internal/app/files"
+	"telesrv/internal/app/files/botavatars"
 	groupcallsapp "telesrv/internal/app/groupcalls"
 	"telesrv/internal/app/help"
 	"telesrv/internal/app/langpack"
@@ -1265,6 +1266,12 @@ func run(logger *zap.Logger) error {
 	premiumStore := postgres.NewPremiumStore(pool, messageStore, cfg.PremiumBotUserID)
 	if err := premiumStore.EnsurePremiumBotIdentity(ctx, cfg.PremiumBotUsername); err != nil {
 		return fmt.Errorf("configure Premium bot: %w", err)
+	}
+	// Assign embedded avatars to the built-in system account and bots (idempotent).
+	// Runs after EnsurePremiumBotIdentity so the configured Premium bot ID exists
+	// before the avatar is attached to it.
+	if err := botavatars.Seed(ctx, filesService, time.Now().Unix()); err != nil {
+		return fmt.Errorf("seed bot avatars: %w", err)
 	}
 	premiumService := premiumapp.NewService(premiumStore, premiumapp.Config{
 		BotUserID: cfg.PremiumBotUserID,
