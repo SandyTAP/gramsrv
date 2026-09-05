@@ -36,7 +36,23 @@ func (s *ChannelStore) listChannelDifferenceAttempt(ctx context.Context, req dom
 	if err != nil {
 		return domain.ChannelDifference{}, false, err
 	}
-	if req.Pts < 0 || req.Pts > channel.Pts {
+	if req.Pts < 0 {
+		return domain.ChannelDifference{}, false, domain.ErrPersistentTimestamp
+	}
+	if req.Pts > channel.Pts {
+		if s.rowCache != nil {
+			// A committed send can reach a client before LISTEN/NOTIFY has
+			// invalidated the shared channel row. Only an authoritative read
+			// can prove that this cursor is in the future. Retry through the
+			// normal viewer/event path after invalidating a lagging cache.
+			current, err := getChannelByID(ctx, s.db, req.ChannelID)
+			if err != nil {
+				return domain.ChannelDifference{}, false, err
+			}
+			if req.Pts <= current.Pts {
+				return domain.ChannelDifference{}, true, nil
+			}
+		}
 		return domain.ChannelDifference{}, false, domain.ErrPersistentTimestamp
 	}
 	if !preview && member.AvailableMinPts > req.Pts {
