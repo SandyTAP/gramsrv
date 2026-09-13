@@ -785,6 +785,7 @@ type ImportStarGiftRequest struct {
 	Stars        int64  `json:"stars"`
 	ConvertStars int64  `json:"convert_stars"`
 	Enabled      bool   `json:"enabled"`
+	SupportOnly  bool   `json:"support_only,omitempty"`
 	SortOrder    int    `json:"sort_order"`
 	FileName     string `json:"file_name"`
 	ContentSHA   string `json:"content_sha256"`
@@ -3598,7 +3599,7 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 		details := map[string]any{
 			"gift_id": strconv.FormatInt(req.GiftID, 10), "title": strings.TrimSpace(req.Title),
 			"stars": strconv.FormatInt(req.Stars, 10), "convert_stars": strconv.FormatInt(req.ConvertStars, 10),
-			"enabled": req.Enabled, "sort_order": req.SortOrder,
+			"enabled": req.Enabled, "sort_order": req.SortOrder, "support_only": req.SupportOnly,
 			"source_format": animation.SourceFormat, "source_name": animation.SourceName,
 			"sha256": req.ContentSHA, "width": animation.Width, "height": animation.Height,
 			"frame_rate": animation.FrameRate, "compressed_bytes": len(animation.TGS), "json_bytes": len(animation.JSON),
@@ -3621,7 +3622,7 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 		}
 		entry, err := s.gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
 			GiftID: req.GiftID, Title: req.Title, Stars: req.Stars, ConvertStars: req.ConvertStars,
-			Enabled: req.Enabled, SortOrder: req.SortOrder, Animation: animation,
+			Enabled: req.Enabled, SortOrder: req.SortOrder, SupportOnly: req.SupportOnly, Animation: animation,
 			Actor: req.Actor, CommandID: req.CommandID,
 			Auction: lifecycle.Auction, AuctionSlug: lifecycle.AuctionSlug, GiftsPerRound: lifecycle.GiftsPerRound,
 			AuctionStartDate: lifecycle.AuctionStartDate, AuctionRoundDuration: lifecycle.AuctionRoundDuration,

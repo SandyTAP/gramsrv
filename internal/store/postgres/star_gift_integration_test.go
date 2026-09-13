@@ -227,4 +227,26 @@ func TestStarGiftStorePostgres(t *testing.T) {
 	if err != nil || cn != 1 {
 		t.Fatalf("channel CountByOwner = %d err %v, want 1", cn, err)
 	}
+
+	// support_only 标记持久化并在 CatalogRevision 读取时还原。
+	docID3 := docID + 2
+	documentIDs = append(documentIDs, docID3)
+	locationKeys = append(locationKeys, "doc:"+fmt.Sprint(docID3))
+	supportOnlyRev, err := st.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		GiftID: entry.Gift.ID, Title: "Support Only", Stars: 120, ConvertStars: 60, Enabled: true, SupportOnly: true,
+		Document: domain.Document{
+			ID: docID3, AccessHash: docID3 + 1, MimeType: "application/x-tgsticker", Size: 4, DCID: 2,
+			Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrSticker}},
+		},
+		Blob:      postgresTestBlob("doc:"+fmt.Sprint(docID3), "test-star-gift-v3", 4, "application/x-tgsticker"),
+		Animation: domain.StarGiftAnimation{JSON: []byte(`{"v":"5.7","w":512,"h":512,"fr":30,"ip":0,"op":30,"layers":[{}]}`), SHA256: make([]byte, 32), SourceFormat: domain.StarGiftAnimationTGS, Width: 512, Height: 512},
+		Actor:     "test", CommandID: "test-star-gift-v3-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create support-only revision: %v", err)
+	}
+	supportOnly, found, err := st.CatalogRevision(ctx, supportOnlyRev.Gift.RevisionID)
+	if err != nil || !found || !supportOnly.SupportOnly {
+		t.Fatalf("support-only revision = %+v found %v err %v", supportOnly, found, err)
+	}
 }

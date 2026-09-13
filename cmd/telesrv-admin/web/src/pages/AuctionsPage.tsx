@@ -216,6 +216,7 @@ function AuthorModal({ mode, onClose, onCreated }: { mode: AuthorMode; onClose: 
   const [unlockAt, setUnlockAt] = useState(() => localInputValue(3600));
   const [reason, setReason] = useState("");
   const [enabled, setEnabled] = useState(true);
+  const [supportOnly, setSupportOnly] = useState(false);
   const [preview, setPreview] = useState<CommandResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -270,6 +271,7 @@ function AuthorModal({ mode, onClose, onCreated }: { mode: AuthorMode; onClose: 
       stars,
       convert_stars: convertStars,
       enabled,
+      support_only: supportOnly,
       sort_order: Number(sortOrder),
       ...lifecyclePayload()
     }));
@@ -340,6 +342,11 @@ function AuthorModal({ mode, onClose, onCreated }: { mode: AuthorMode; onClose: 
             <input type="checkbox" checked={enabled} onChange={(e) => edit(setEnabled)(e.target.checked)} />
             <span className="gift-switch-track" aria-hidden="true"><span /></span>
             <span>{t("auctions.enableHint")}</span>
+          </label>
+          <label className="gift-switch">
+            <input type="checkbox" checked={supportOnly} onChange={(e) => edit(setSupportOnly)(e.target.checked)} />
+            <span className="gift-switch-track" aria-hidden="true"><span /></span>
+            <span>{t("auctions.supportOnly")}</span>
           </label>
           {error && <Alert>{error}</Alert>}
           {preview && <div className="gift-validation">

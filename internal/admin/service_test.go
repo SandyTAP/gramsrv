@@ -1323,7 +1323,7 @@ func TestImportStarGiftDryRunThenConfirm(t *testing.T) {
 	gifts := &fakeGiftsService{}
 	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Gifts: gifts, Now: fixedNow})
 	base := ImportStarGiftRequest{
-		Title: "Cake", Stars: 50, ConvertStars: 25, Enabled: true, SortOrder: 3,
+		Title: "Cake", Stars: 50, ConvertStars: 25, Enabled: true, SortOrder: 3, SupportOnly: true,
 		FileName: "cake.lottie", Data: []byte(`{"v":"5.7"}`),
 	}
 	base.CommandMeta = CommandMeta{CommandID: "dry-gift", Actor: "ops", Reason: "catalog", DryRun: true}
@@ -1335,6 +1335,9 @@ func TestImportStarGiftDryRunThenConfirm(t *testing.T) {
 	result, err := svc.ImportStarGift(context.Background(), base)
 	if err != nil || gifts.createCalls != 1 || result.Details["revision_id"] != "22" {
 		t.Fatalf("result=%+v err=%v create=%d", result, err, gifts.createCalls)
+	}
+	if !gifts.lastWrite.SupportOnly {
+		t.Fatalf("imported gift SupportOnly=%v, want true", gifts.lastWrite.SupportOnly)
 	}
 }
 
@@ -1585,6 +1588,7 @@ func (f *fakeOfficialGiftsSource) Bundle(_ context.Context, giftID int64, includ
 type fakeGiftsService struct {
 	createCalls int
 	lastBundle  domain.StarGiftCatalogBundleWrite
+	lastWrite   domain.StarGiftCatalogWrite
 }
 
 func (f *fakeGiftsService) GiftByID(_ context.Context, id int64) (domain.StarGift, bool, error) {
@@ -1605,6 +1609,7 @@ func (f *fakeGiftsService) PrepareOfficialAnimation(name string, data []byte) (d
 }
 func (f *fakeGiftsService) CreateCatalogRevision(_ context.Context, write domain.StarGiftCatalogWrite) (domain.StarGiftCatalogEntry, error) {
 	f.createCalls++
+	f.lastWrite = write
 	return domain.StarGiftCatalogEntry{Gift: domain.StarGift{ID: 11, RevisionID: 22, Stars: write.Stars}, Revision: 1}, nil
 }
 func (f *fakeGiftsService) CreateCatalogBundle(_ context.Context, write domain.StarGiftCatalogBundleWrite) (domain.StarGiftCatalogBundleResult, error) {

@@ -33,6 +33,7 @@ type StarGift struct {
 	SoldOut              bool
 	Birthday             bool
 	RequirePremium       bool
+	SupportOnly          bool
 	LimitedPerUser       bool
 	PeerColorAvailable   bool
 	Auction              bool
@@ -896,6 +897,7 @@ type StarGiftCatalogWrite struct {
 	SoldOut              bool
 	Birthday             bool
 	RequirePremium       bool
+	SupportOnly          bool
 	LimitedPerUser       bool
 	PeerColorAvailable   bool
 	Auction              bool

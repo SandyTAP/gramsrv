@@ -24,7 +24,7 @@ func NewStarGiftStore(db sqlcgen.DBTX) *StarGiftStore {
 
 const starGiftCatalogSelect = `
 SELECT c.gift_id, r.id, r.stars, r.convert_stars, r.title,
-       r.limited, r.sold_out, r.birthday, r.require_premium,
+       r.limited, r.sold_out, r.birthday, r.require_premium, r.support_only,
        r.limited_per_user, r.peer_color_available, r.auction,
        c.availability_remains, r.availability_total, c.availability_resale,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
@@ -103,7 +103,7 @@ func (s *StarGiftStore) CatalogRevision(ctx context.Context, revisionID int64) (
 	}
 	gift, err := scanCatalogGift(s.db.QueryRow(ctx, `
 SELECT r.gift_id, r.id, r.stars, r.convert_stars, r.title,
-       r.limited, r.sold_out, r.birthday, r.require_premium,
+       r.limited, r.sold_out, r.birthday, r.require_premium, r.support_only,
        r.limited_per_user, r.peer_color_available, r.auction,
        c.availability_remains, r.availability_total, c.availability_resale,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
@@ -139,7 +139,7 @@ func scanCatalogGift(row rowScanner) (domain.StarGift, error) {
 	var background domain.StarGiftBackground
 	if err := row.Scan(
 		&gift.ID, &gift.RevisionID, &gift.Stars, &gift.ConvertStars, &gift.Title,
-		&gift.Limited, &gift.SoldOut, &gift.Birthday, &gift.RequirePremium,
+		&gift.Limited, &gift.SoldOut, &gift.Birthday, &gift.RequirePremium, &gift.SupportOnly,
 		&gift.LimitedPerUser, &gift.PeerColorAvailable, &gift.Auction,
 		&gift.AvailabilityRemains, &gift.AvailabilityTotal, &gift.AvailabilityResale,
 		&gift.FirstSaleDate, &gift.LastSaleDate, &gift.ResellMinStars,
@@ -260,11 +260,11 @@ INSERT INTO star_gift_catalog_revisions (
     released_by_peer_type, released_by_peer_id, per_user_total, locked_until_date,
     auction_slug, gifts_per_round, auction_start_date, upgrade_variants,
     background_center_color, background_edge_color, background_text_color,
-    auction_round_duration
+    auction_round_duration, support_only
 ) VALUES (
     $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 	NULLIF($19::bigint,0),$20,$21::jsonb,$22,$23,$24,$25,$26,$27,$28,$29,
-	$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41
+	$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42
 )`,
 			revisionID, giftID, revision, write.Title, write.Stars, write.ConvertStars, write.Document.ID,
 			string(write.Animation.JSON), write.Animation.SHA256, write.Animation.SourceName, string(write.Animation.SourceFormat),
@@ -276,7 +276,7 @@ INSERT INTO star_gift_catalog_revisions (
 			write.LockedUntilDate, write.AuctionSlug, write.GiftsPerRound, write.AuctionStartDate,
 			write.UpgradeVariants, nullableBackgroundColor(write.Background, "center"),
 			nullableBackgroundColor(write.Background, "edge"), nullableBackgroundColor(write.Background, "text"),
-			write.AuctionRoundDuration,
+			write.AuctionRoundDuration, write.SupportOnly,
 		); err != nil {
 			return fmt.Errorf("insert star gift revision: %w", err)
 		}
@@ -416,7 +416,7 @@ WHERE c.gift_id=$1`, giftID).Scan(&raw)
 func catalogEntryByID(ctx context.Context, db sqlcgen.DBTX, giftID int64) (domain.StarGiftCatalogEntry, error) {
 	row := db.QueryRow(ctx, `
 SELECT c.gift_id, r.id, r.stars, r.convert_stars, r.title,
-       r.limited, r.sold_out, r.birthday, r.require_premium,
+       r.limited, r.sold_out, r.birthday, r.require_premium, r.support_only,
        r.limited_per_user, r.peer_color_available, r.auction,
        c.availability_remains, r.availability_total, c.availability_resale,
        c.first_sale_date, c.last_sale_date, c.resell_min_stars,
@@ -445,7 +445,7 @@ WHERE c.gift_id=$1`, giftID)
 	var background domain.StarGiftBackground
 	if err := row.Scan(
 		&entry.Gift.ID, &entry.Gift.RevisionID, &entry.Gift.Stars, &entry.Gift.ConvertStars, &entry.Gift.Title,
-		&entry.Gift.Limited, &entry.Gift.SoldOut, &entry.Gift.Birthday, &entry.Gift.RequirePremium,
+		&entry.Gift.Limited, &entry.Gift.SoldOut, &entry.Gift.Birthday, &entry.Gift.RequirePremium, &entry.Gift.SupportOnly,
 		&entry.Gift.LimitedPerUser, &entry.Gift.PeerColorAvailable, &entry.Gift.Auction,
 		&entry.Gift.AvailabilityRemains, &entry.Gift.AvailabilityTotal, &entry.Gift.AvailabilityResale,
 		&entry.Gift.FirstSaleDate, &entry.Gift.LastSaleDate, &entry.Gift.ResellMinStars,

@@ -33,3 +33,19 @@ func TestStarGiftCatalogInventoryReplacementMemory(t *testing.T) {
 		t.Fatal("rejected cap change published a revision")
 	}
 }
+
+func TestStarGiftCatalogSupportOnlyPersistsInMemory(t *testing.T) {
+	ctx := context.Background()
+	s := NewStarGiftStore()
+	created, err := s.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{SupportOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBack, ok, err := s.CatalogRevision(ctx, created.Gift.RevisionID)
+	if err != nil || !ok {
+		t.Fatalf("CatalogRevision ok=%v err=%v", ok, err)
+	}
+	if !readBack.SupportOnly {
+		t.Fatalf("read back SupportOnly=%v, want true", readBack.SupportOnly)
+	}
+}

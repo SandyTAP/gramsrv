@@ -119,6 +119,7 @@ export function GiftsPage() {
   const [officialScheduled, setOfficialScheduled] = useState(false);
   const [officialUnlockAt, setOfficialUnlockAt] = useState(() => localInputValue(3600));
   const [enabled, setEnabled] = useState(true);
+  const [supportOnly, setSupportOnly] = useState(false);
   const [reason, setReason] = useState("");
   const [preview, setPreview] = useState<CommandResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -222,6 +223,7 @@ export function GiftsPage() {
 			stars,
 			convert_stars: convertStars,
       enabled,
+      support_only: supportOnly,
       sort_order: Number(sortOrder),
       ...lifecyclePayload()
     }));
@@ -460,6 +462,7 @@ export function GiftsPage() {
               </section>}
               <label className="gift-reason-field"><span>{t("gifts.reason")}</span><input value={reason} placeholder={t("gifts.reasonPlaceholder")} onChange={(e) => setReason(e.target.value)} /></label>
               <label className="gift-switch"><input type="checkbox" checked={enabled} onChange={(e) => { setEnabled(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.enableAfterImport")}</span></label>
+              {importSource === "file" && <label className="gift-switch"><input type="checkbox" checked={supportOnly} onChange={(e) => { setSupportOnly(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.supportOnly")}</span></label>}
               {importError && <Alert>{importError}</Alert>}
               {preview && <div className="gift-validation"><div className="gift-validation-head"><CheckCircle2 size={17} /><div><strong>{t("gifts.validationReady")}</strong><span>{t("gifts.validationHint")}</span></div></div><pre>{JSON.stringify(preview.details, null, 2)}</pre></div>}
             </div>
