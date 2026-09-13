@@ -1097,6 +1097,86 @@ func TestStarGiftUpgradeRPCReplaysCommittedReceiptAfterTerminalTransition(t *tes
 	}
 }
 
+// The Android client fetches the upgrade form once and, when the user toggles
+// "with my name"/"hide my name", resubmits the SAME form_id with a flipped
+// keep_original_details. The form id must therefore stay valid across the
+// toggle: only a stale quote (amount/gift change) may invalidate it, not the
+// name-visibility switch.
+func TestStarGiftUpgradeFormIDSurvivesKeepOriginalToggle(t *testing.T) {
+	r, sender, owner, gift := starGiftTestRouter(t)
+	ctx := context.Background()
+	ownerCtx := WithUserID(ctx, owner.ID)
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+	saved := domain.SavedStarGift{
+		Owner: ownerPeer, FromUserID: sender.ID, GiftID: gift.ID, RevisionID: gift.RevisionID,
+		MsgID: 105, Date: 1700000000, ConvertStars: gift.ConvertStars,
+	}
+	result := domain.StarGiftUpgradeResult{
+		Saved: saved, Unique: domain.UniqueStarGift{ID: 9200000000000004, GiftID: gift.ID, Owner: ownerPeer},
+		Balance: domain.StarsBalance{UserID: owner.ID, Balance: 975},
+		Send: domain.SendPrivateTextResult{
+			SenderMessage:    domain.Message{ID: 106, OwnerUserID: sender.ID, Peer: ownerPeer, From: ownerPeer, Date: 1700000001},
+			SenderEvent:      domain.UpdateEvent{UserID: sender.ID, Pts: 41, PtsCount: 1, Date: 1700000001},
+			RecipientMessage: domain.Message{ID: 107, OwnerUserID: owner.ID, Peer: ownerPeer, From: ownerPeer, Date: 1700000001},
+			RecipientEvent:   domain.UpdateEvent{UserID: owner.ID, Pts: 42, PtsCount: 1, Date: 1700000001},
+		},
+	}
+	service := &upgradeFormToggleRPCService{
+		GiftsService: r.deps.Gifts, saved: saved, result: result,
+		preview: domain.StarGiftUpgradePreview{UpgradeStars: 25, SupplyTotal: 10},
+	}
+	r.deps.Gifts = service
+
+	formClass, err := r.onPaymentsGetPaymentForm(ownerCtx, &tg.PaymentsGetPaymentFormRequest{Invoice: &tg.InputInvoiceStarGiftUpgrade{
+		KeepOriginalDetails: true, Stargift: &tg.InputSavedStarGiftUser{MsgID: saved.MsgID},
+	}})
+	if err != nil {
+		t.Fatalf("get upgrade form (keep_original_details=true): %v", err)
+	}
+	form, ok := formClass.(*tg.PaymentsPaymentFormStarGift)
+	if !ok || form.FormID == 0 {
+		t.Fatalf("upgrade form = %T %#v, want non-empty form_id", formClass, formClass)
+	}
+
+	if _, err := r.onPaymentsSendStarsForm(ownerCtx, &tg.PaymentsSendStarsFormRequest{
+		FormID: form.FormID, Invoice: &tg.InputInvoiceStarGiftUpgrade{
+			KeepOriginalDetails: false, Stargift: &tg.InputSavedStarGiftUser{MsgID: saved.MsgID},
+		},
+	}); err != nil {
+		t.Fatalf("send toggled upgrade form: %v", err)
+	}
+	if service.upgradeCalls != 1 || service.lastRequest.KeepOriginalDetails {
+		t.Fatalf("upgrade calls=%d req=%+v, want toggle honored (keep_original_details=false)", service.upgradeCalls, service.lastRequest)
+	}
+}
+
+type upgradeFormToggleRPCService struct {
+	GiftsService
+	saved        domain.SavedStarGift
+	result       domain.StarGiftUpgradeResult
+	preview      domain.StarGiftUpgradePreview
+	upgradeCalls int
+	lastRequest  domain.StarGiftUpgradeRequest
+}
+
+func (s *upgradeFormToggleRPCService) GetSaved(_ context.Context, _ domain.SavedStarGiftRef) (domain.SavedStarGift, bool, error) {
+	return s.saved, true, nil
+}
+
+func (s *upgradeFormToggleRPCService) UpgradeReceipt(_ context.Context, _ int64, _ string) (domain.StarGiftUpgradeReceipt, bool, error) {
+	return domain.StarGiftUpgradeReceipt{}, false, nil
+}
+
+func (s *upgradeFormToggleRPCService) CollectiblePreview(_ context.Context, _ int64) (domain.StarGiftUpgradePreview, bool, error) {
+	return s.preview, true, nil
+}
+
+func (s *upgradeFormToggleRPCService) Upgrade(_ context.Context, req domain.StarGiftUpgradeRequest) (domain.StarGiftUpgradeResult, error) {
+	s.upgradeCalls++
+	s.lastRequest = req
+	return s.result, nil
+}
+
 func TestStarGiftCollectiblePreviewUpgradeFormUniqueAndServiceProjection(t *testing.T) {
 	r, sender, owner, gift := starGiftTestRouter(t)
 	ctx := context.Background()

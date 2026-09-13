@@ -17,7 +17,7 @@ func (r *Router) starGiftUpgradePaymentForm(ctx context.Context, userID int64, i
 		return nil, err
 	}
 	return &tg.PaymentsPaymentFormStarGift{
-		FormID: starGiftUpgradeFormID(userID, saved.ID, preview.UpgradeStars, inv.KeepOriginalDetails),
+		FormID: starGiftUpgradeFormID(userID, saved.ID, preview.UpgradeStars),
 		Invoice: tg.Invoice{
 			Currency: "XTR",
 			Prices:   []tg.LabeledPrice{{Label: "Star gift upgrade", Amount: preview.UpgradeStars}},
@@ -47,7 +47,7 @@ func (r *Router) sendStarGiftUpgradeForm(ctx context.Context, userID, formID int
 		if err != nil {
 			return nil, err
 		}
-		wantFormID := starGiftUpgradeFormID(userID, saved.ID, preview.UpgradeStars, inv.KeepOriginalDetails)
+		wantFormID := starGiftUpgradeFormID(userID, saved.ID, preview.UpgradeStars)
 		if formID == 0 || formID != wantFormID {
 			return nil, starsFormAmountMismatchErr()
 		}
@@ -194,11 +194,12 @@ func (r *Router) tgStarGiftUpgradeUpdates(ctx context.Context, ownerUserID int64
 	return updates
 }
 
-func starGiftUpgradeFormID(userID, savedGiftID, stars int64, keepOriginal bool) int64 {
+// The form id binds the invoice to the buyer, gift and current upgrade price,
+// so a stale quote is rejected. keep_original_details is deliberately excluded:
+// clients toggle it ("hide my name"/"show my name") on the upgrade dialog
+// without refetching the form, and it never changes the amount.
+func starGiftUpgradeFormID(userID, savedGiftID, stars int64) int64 {
 	id := userID*0x9e3779b1 ^ savedGiftID<<11 ^ stars<<19 ^ 0x55504752414445
-	if keepOriginal {
-		id ^= 0x4b454550
-	}
 	if id < 0 {
 		id = ^id
 	}
