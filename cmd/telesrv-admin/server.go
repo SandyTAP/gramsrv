@@ -2078,6 +2078,7 @@ type importStarGiftAPIRequest struct {
 	ConvertStars int64  `json:"convert_stars,string"`
 	Enabled      bool   `json:"enabled"`
 	SortOrder    int    `json:"sort_order"`
+	SupportOnly  bool   `json:"support_only,omitempty"`
 
 	// Optional lifecycle authoring for the auction panel and the scheduled
 	// release ("отложенный дроп"). Zero values describe an ordinary gift; the
@@ -2126,6 +2127,7 @@ func (s *server) handleImportStarGiftAPI(w http.ResponseWriter, r *http.Request)
 		Stars:        body.Stars,
 		ConvertStars: body.ConvertStars,
 		Enabled:      body.Enabled,
+		SupportOnly:  body.SupportOnly,
 		SortOrder:    body.SortOrder,
 		FileName:     header.Filename,
 
