@@ -242,14 +242,15 @@ export function GiftsPage() {
       lockedUntil = toUnixSeconds(officialUnlockAt);
       if (lockedUntil <= Math.floor(Date.now() / 1000)) throw new Error(t("gifts.lifecycle.unlockRequired"));
     }
-    return {
-      command_id: commandID, reason: reason.trim(), confirm,
+return {
+		command_id: commandID, reason: reason.trim(), confirm,
 		source_gift_id: sourceGiftID, gift_id: giftID, title: title.trim(),
-		stars, convert_stars: convertStars, enabled, sort_order: Number(sortOrder),
+		stars, convert_stars: convertStars, enabled, support_only: supportOnly,
+		sort_order: Number(sortOrder),
 		include_collectible: includeCollectible, upgrade_stars: upgradeStars,
-      supply_total: includeCollectible ? Number(supplyTotal) : 0, slug_prefix: slugPrefix.trim().toLowerCase(),
-      locked_until_date: lockedUntil
-    };
+		supply_total: includeCollectible ? Number(supplyTotal) : 0, slug_prefix: slugPrefix.trim().toLowerCase(),
+		locked_until_date: lockedUntil
+	};
   }
 
   function chooseOfficial(gift: OfficialStarGiftRow) {
@@ -289,7 +290,7 @@ export function GiftsPage() {
 
   function startImport() {
 	setGiftID("0"); setTitle(""); setStars("50"); setConvertStars("50"); setSortOrder("0");
-    setEnabled(true); setReason(""); setFile(null); setPreview(null); setImportError("");
+    setEnabled(true); setSupportOnly(false); setReason(""); setFile(null); setPreview(null); setImportError("");
     setImportSource("official"); setSourceGiftID(""); setOfficialQuery(""); setOfficialCategory("all"); setImportOpen(true);
   }
 
@@ -462,7 +463,7 @@ export function GiftsPage() {
               </section>}
               <label className="gift-reason-field"><span>{t("gifts.reason")}</span><input value={reason} placeholder={t("gifts.reasonPlaceholder")} onChange={(e) => setReason(e.target.value)} /></label>
               <label className="gift-switch"><input type="checkbox" checked={enabled} onChange={(e) => { setEnabled(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.enableAfterImport")}</span></label>
-              {importSource === "file" && <label className="gift-switch"><input type="checkbox" checked={supportOnly} onChange={(e) => { setSupportOnly(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.supportOnly")}</span></label>}
+              <label className="gift-switch"><input type="checkbox" checked={supportOnly} onChange={(e) => { setSupportOnly(e.target.checked); setPreview(null); }} /><span className="gift-switch-track" aria-hidden="true"><span /></span><span>{t("gifts.supportOnly")}</span></label>
               {importError && <Alert>{importError}</Alert>}
               {preview && <div className="gift-validation"><div className="gift-validation-head"><CheckCircle2 size={17} /><div><strong>{t("gifts.validationReady")}</strong><span>{t("gifts.validationHint")}</span></div></div><pre>{JSON.stringify(preview.details, null, 2)}</pre></div>}
             </div>

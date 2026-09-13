@@ -2154,6 +2154,7 @@ type importOfficialStarGiftAPIRequest struct {
 	ConvertStars       int64  `json:"convert_stars,string"`
 	Enabled            bool   `json:"enabled"`
 	SortOrder          int    `json:"sort_order"`
+	SupportOnly        bool   `json:"support_only,omitempty"`
 	IncludeCollectible bool   `json:"include_collectible"`
 	UpgradeStars       int64  `json:"upgrade_stars,string"`
 	SupplyTotal        int    `json:"supply_total"`
@@ -2176,6 +2177,7 @@ func (s *server) handleImportOfficialStarGiftAPI(w http.ResponseWriter, r *http.
 		CommandMeta:  s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "import-official-gift"),
 		SourceGiftID: body.SourceGiftID, GiftID: body.GiftID, Title: body.Title,
 		Stars: body.Stars, ConvertStars: body.ConvertStars, Enabled: body.Enabled, SortOrder: body.SortOrder,
+		SupportOnly: body.SupportOnly,
 		IncludeCollectible: body.IncludeCollectible, UpgradeStars: body.UpgradeStars,
 		SupplyTotal: body.SupplyTotal, SlugPrefix: body.SlugPrefix,
 		LockedUntilDate: body.LockedUntilDate,

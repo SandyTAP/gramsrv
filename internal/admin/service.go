@@ -814,6 +814,7 @@ type ImportOfficialStarGiftRequest struct {
 	ConvertStars       int64  `json:"convert_stars"`
 	Enabled            bool   `json:"enabled"`
 	SortOrder          int    `json:"sort_order"`
+	SupportOnly        bool   `json:"support_only,omitempty"`
 	IncludeCollectible bool   `json:"include_collectible"`
 	UpgradeStars       int64  `json:"upgrade_stars,omitempty"`
 	SupplyTotal        int    `json:"supply_total,omitempty"`
@@ -3828,6 +3829,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		// local lifecycle writes. Existing inventory is preserved under the store lock.
 		Limited: limited, SoldOut: false, Birthday: bundle.Gift.Birthday,
 		RequirePremium: bundle.Gift.RequirePremium, LimitedPerUser: bundle.Gift.LimitedPerUser,
+		SupportOnly: req.SupportOnly,
 		PeerColorAvailable: bundle.Gift.PeerColorAvailable, Auction: bundle.Gift.Auction,
 		AvailabilityRemains: 0, AvailabilityTotal: availabilityTotal,
 		AvailabilityResale: 0, FirstSaleDate: 0,
@@ -3851,6 +3853,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 			"official_limited": bundle.Gift.Limited, "official_sold_out": bundle.Gift.SoldOut,
 			"official_auction": bundle.Gift.Auction, "official_birthday": bundle.Gift.Birthday,
 			"official_require_premium":      bundle.Gift.RequirePremium,
+			"support_only":                 req.SupportOnly,
 			"official_availability_remains": bundle.Gift.AvailabilityRemains,
 			"official_availability_total":   bundle.Gift.AvailabilityTotal,
 			"official_availability_resale":  bundle.Gift.AvailabilityResale,
