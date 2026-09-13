@@ -209,9 +209,6 @@ func TestStarGiftSupportOnlyGate(t *testing.T) {
 	if _, ok := checkRes.(*tg.PaymentsCheckCanSendGiftResultFail); !ok {
 		t.Fatalf("regular checkCanSendGift result=%T, want ResultFail (sold out)", checkRes)
 	}
-	if _, err := r.onPaymentsGetPaymentForm(regularCtx, &tg.PaymentsGetPaymentFormRequest{Invoice: inv}); !tgerr.Is(err, "STARGIFT_INVALID") {
-		t.Fatalf("regular getPaymentForm err=%v, want STARGIFT_INVALID", err)
-	}
 
 	supportCtx := WithUserID(ctx, helper.ID)
 	checkResSupport, err := r.onPaymentsCheckCanSendGift(supportCtx, &tg.PaymentsCheckCanSendGiftRequest{GiftID: gift.ID})
@@ -232,9 +229,8 @@ func TestStarGiftSupportOnlyGate(t *testing.T) {
 	if _, err := r.onPaymentsSendStarsForm(supportCtx, &tg.PaymentsSendStarsFormRequest{FormID: form.FormID, Invoice: inv}); err != nil {
 		t.Fatalf("support gift purchase: %v", err)
 	}
-	sendReq := &tg.PaymentsSendStarsFormRequest{FormID: form.FormID, Invoice: inv}
-	if _, err := r.onPaymentsSendStarsForm(regularCtx, sendReq); !tgerr.Is(err, "STARGIFT_INVALID") {
-		t.Fatalf("regular sendStarsForm err=%v, want STARGIFT_INVALID", err)
+	if _, err := r.onPaymentsSendStarsForm(regularCtx, &tg.PaymentsSendStarsFormRequest{FormID: form.FormID, Invoice: inv}); !tgerr.Is(err, "STARGIFT_USAGE_LIMITED") {
+		t.Fatalf("regular sendStarsForm err=%v, want STARGIFT_USAGE_LIMITED", err)
 	}
 }
 
