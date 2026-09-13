@@ -228,6 +228,9 @@ func (r *Router) starGiftAuctionBidTarget(ctx context.Context, userID int64, inv
 	if err != nil {
 		return domain.StarGiftAuction{}, domain.Peer{}, 0, starGiftLifecycleErr(err)
 	}
+	if state.Gift.SupportOnly && !r.viewerSupport(ctx, userID) {
+		return domain.StarGiftAuction{}, domain.Peer{}, 0, starGiftInvalidErr()
+	}
 	oldAmount := state.UserState.BidAmount
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: userID}
 	if inv.UpdateBid {
