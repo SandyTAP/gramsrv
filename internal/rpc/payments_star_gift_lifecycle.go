@@ -422,9 +422,15 @@ func (r *Router) onPaymentsCheckCanSendGift(ctx context.Context, req *tg.Payment
 	if !found {
 		return nil, starGiftInvalidErr()
 	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
 	now := int(r.clock.Now().Unix())
 	switch {
 	case gift.SoldOut || gift.Limited && gift.AvailabilityRemains <= 0:
+		return &tg.PaymentsCheckCanSendGiftResultFail{Reason: tg.TextWithEntities{Text: "This gift is sold out."}}, nil
+	case gift.SupportOnly && !r.viewerSupport(ctx, userID):
 		return &tg.PaymentsCheckCanSendGiftResultFail{Reason: tg.TextWithEntities{Text: "This gift is sold out."}}, nil
 	case gift.LockedUntilDate > now:
 		return &tg.PaymentsCheckCanSendGiftResultFail{Reason: tg.TextWithEntities{Text: "This gift is not available yet."}}, nil

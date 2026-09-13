@@ -443,7 +443,7 @@ func (r *Router) onPaymentsGetPaymentForm(ctx context.Context, req *tg.PaymentsG
 		return nil, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
 	}
 	if gift.SupportOnly && !r.viewerSupport(ctx, userID) {
-		return nil, tgerr.New(403, "NOT_TESTER")
+		return nil, starGiftInvalidErr()
 	}
 	upgradeStars := int64(0)
 	if inv.IncludeUpgrade {
@@ -639,7 +639,7 @@ func (r *Router) onPaymentsSendStarsForm(ctx context.Context, req *tg.PaymentsSe
 		return nil, tgerr400("PREMIUM_ACCOUNT_REQUIRED")
 	}
 	if gift.SupportOnly && !r.viewerSupport(ctx, userID) {
-		return nil, tgerr.New(403, "NOT_TESTER")
+		return nil, starGiftInvalidErr()
 	}
 	upgradeStars := int64(0)
 	if inv.IncludeUpgrade {

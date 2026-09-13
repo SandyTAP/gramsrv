@@ -202,11 +202,25 @@ func TestStarGiftSupportOnlyGate(t *testing.T) {
 	inv := &tg.InputInvoiceStarGift{Peer: &tg.InputPeerUser{UserID: recipient.ID, AccessHash: recipient.AccessHash}, GiftID: gift.ID}
 
 	regularCtx := WithUserID(ctx, regular.ID)
-	if _, err := r.onPaymentsGetPaymentForm(regularCtx, &tg.PaymentsGetPaymentFormRequest{Invoice: inv}); !tgerr.Is(err, "NOT_TESTER") {
-		t.Fatalf("regular getPaymentForm err=%v, want NOT_TESTER", err)
+	checkRes, err := r.onPaymentsCheckCanSendGift(regularCtx, &tg.PaymentsCheckCanSendGiftRequest{GiftID: gift.ID})
+	if err != nil {
+		t.Fatalf("regular checkCanSendGift err=%v", err)
+	}
+	if _, ok := checkRes.(*tg.PaymentsCheckCanSendGiftResultFail); !ok {
+		t.Fatalf("regular checkCanSendGift result=%T, want ResultFail (sold out)", checkRes)
+	}
+	if _, err := r.onPaymentsGetPaymentForm(regularCtx, &tg.PaymentsGetPaymentFormRequest{Invoice: inv}); !tgerr.Is(err, "STARGIFT_INVALID") {
+		t.Fatalf("regular getPaymentForm err=%v, want STARGIFT_INVALID", err)
 	}
 
 	supportCtx := WithUserID(ctx, helper.ID)
+	checkResSupport, err := r.onPaymentsCheckCanSendGift(supportCtx, &tg.PaymentsCheckCanSendGiftRequest{GiftID: gift.ID})
+	if err != nil {
+		t.Fatalf("support checkCanSendGift err=%v", err)
+	}
+	if _, ok := checkResSupport.(*tg.PaymentsCheckCanSendGiftResultOk); !ok {
+		t.Fatalf("support checkCanSendGift result=%T, want ResultOk", checkResSupport)
+	}
 	formRes, err := r.onPaymentsGetPaymentForm(supportCtx, &tg.PaymentsGetPaymentFormRequest{Invoice: inv})
 	if err != nil {
 		t.Fatalf("support getPaymentForm: %v", err)
@@ -219,8 +233,8 @@ func TestStarGiftSupportOnlyGate(t *testing.T) {
 		t.Fatalf("support gift purchase: %v", err)
 	}
 	sendReq := &tg.PaymentsSendStarsFormRequest{FormID: form.FormID, Invoice: inv}
-	if _, err := r.onPaymentsSendStarsForm(regularCtx, sendReq); !tgerr.Is(err, "NOT_TESTER") {
-		t.Fatalf("regular sendStarsForm err=%v, want NOT_TESTER", err)
+	if _, err := r.onPaymentsSendStarsForm(regularCtx, sendReq); !tgerr.Is(err, "STARGIFT_INVALID") {
+		t.Fatalf("regular sendStarsForm err=%v, want STARGIFT_INVALID", err)
 	}
 }
 
