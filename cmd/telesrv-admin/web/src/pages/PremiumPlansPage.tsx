@@ -209,6 +209,14 @@ export function PremiumPlansPage({ navigate }: { navigate: Navigate }) {
                   payload={() => ({ user_id: selectedUserID, amount: parsedStars })} />
               </div>
             </div>
+            <div className="premium-action-submit">
+              <ActionButton compact tone="warn" icon={<Coins size={14} />} label={t("premium.grantStarsAll")}
+                path="/api/actions/grant-stars-all"
+                disabled={!Number.isSafeInteger(parsedStars) || parsedStars <= 0}
+                onDone={load}
+                payload={() => ({ amount: parsedStars })} />
+              <p className="premium-store-hint">{t("premium.grantStarsAllHint")}</p>
+            </div>
           </div>
 
           <div className="premium-quick-action premium">

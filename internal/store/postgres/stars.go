@@ -188,6 +188,58 @@ LIMIT $2`, args...)
 	return page, nil
 }
 
+// CountCreditAllUsers 统计批量贷记的候选账号数（真实用户：is_bot=false 且非系统账号）。
+func (s *StarsStore) CountCreditAllUsers(ctx context.Context) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(ctx, `
+SELECT count(*)
+FROM users
+WHERE is_bot = false AND id <> ALL($1::bigint[])`, domain.SystemUserIDs()).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count stars credit-all users: %w", err)
+	}
+	return count, nil
+}
+
+// CreditAll 在单个事务内给所有真实用户批量贷记 amount（admin 的「发给所有人」）。
+// 每个受影响账号：新行建行 balance=amount、旧行余额累加，都置 granted=true——批量贷记
+// 本身就是一次授予，置 granted 避免惰性首读起始授予再叠加一份。随后每人写一条流水，
+// 余额与流水在同一个事务内原子完成。
+func (s *StarsStore) CreditAll(ctx context.Context, amount int64, reason domain.StarsTransactionReason, date int, title, desc string) (int64, error) {
+	if amount <= 0 {
+		return 0, domain.ErrStarsInvalidAmount
+	}
+	affected := int64(0)
+	err := withTx(ctx, s.db, "credit all stars", func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+WITH credited AS (
+	INSERT INTO stars_balances (user_id, balance, granted, updated_at)
+	SELECT id, $1::bigint, true, now()
+	FROM users
+	WHERE is_bot = false AND id <> ALL($2::bigint[])
+	ON CONFLICT (user_id) DO UPDATE SET
+		balance = stars_balances.balance + EXCLUDED.balance,
+		granted = true,
+		updated_at = now()
+	RETURNING user_id
+),
+ledger AS (
+	INSERT INTO stars_transactions (user_id, peer_type, peer_id, amount, reason, title, description, date)
+	SELECT user_id, '', 0, $1::bigint, $3::text, $4::text, $5::text, $6::int
+	FROM credited
+	RETURNING 1
+)
+SELECT count(*) FROM ledger`, amount, domain.SystemUserIDs(), string(reason), title, desc, date).Scan(&affected); err != nil {
+			return fmt.Errorf("credit all stars: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
 // starsTransactionQueryParts centralizes the sign predicate and keyset
 // direction for personal/channel Stars and TON ledgers. Column names are only
 // package-owned constants; client values remain bind parameters.

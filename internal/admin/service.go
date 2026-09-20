@@ -30,6 +30,7 @@ const (
 	ActionRefundPremium           = "account.refund_premium"
 	ActionUpsertPremiumPlan       = "premium.plan.upsert"
 	ActionGrantStars              = "account.grant_stars"
+	ActionGrantStarsAll           = "account.grant_stars_all"
 	ActionDebitStars              = "account.debit_stars"
 	ActionSetVerified             = "account.set_verified"
 	ActionSetUserFlags            = "account.set_flags"
@@ -254,6 +255,10 @@ type UserLookup interface {
 type StarsService interface {
 	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
+	// CountStarsAllUsers 返回批量贷记的候选真实用户数（dry-run 预览用）。
+	CountStarsAllUsers(ctx context.Context) (int64, error)
+	// GrantStarsAll 给所有真实用户批量贷记 amount，返回受影响账号数。
+	GrantStarsAll(ctx context.Context, amount int64, title, desc string) (int64, error)
 }
 
 type BroadcastService interface {
@@ -955,6 +960,13 @@ type UpsertPremiumPlanRequest struct {
 type GrantStarsRequest struct {
 	CommandMeta
 	UserID int64 `json:"user_id"`
+	Amount int64 `json:"amount"`
+}
+
+// GrantStarsAllRequest 是全量发星请求：给所有真实用户（非机器人、非系统账号）各贷记
+// Amount 颗星。无 user_id——目标由 store 层从 users 表一次性解析。
+type GrantStarsAllRequest struct {
+	CommandMeta
 	Amount int64 `json:"amount"`
 }
 
@@ -1761,6 +1773,34 @@ func (s *Service) GrantStars(ctx context.Context, req GrantStarsRequest) (Comman
 			details["notify_error"] = err.Error()
 		}
 		return CommandResult{Message: "stars granted", Details: details}, nil
+	})
+}
+
+// GrantStarsAll 给所有真实用户批量贷记 Amount 颗星。dry-run 只统计候选数不动账；
+// 真实执行在单个事务内完成余额+流水，返回受影响账号数（不逐个通知客户端，量级太大）。
+func (s *Service) GrantStarsAll(ctx context.Context, req GrantStarsAllRequest) (CommandResult, error) {
+	if req.Amount <= 0 || req.Amount > maxStarsGrant {
+		return CommandResult{}, fmt.Errorf("amount must be between 1 and %d", maxStarsGrant)
+	}
+	if s == nil || s.stars == nil {
+		return CommandResult{}, fmt.Errorf("admin stars dependencies are not configured")
+	}
+	return s.runCommand(ctx, req.CommandMeta, ActionGrantStarsAll, 0, domain.Peer{}, req, func() (CommandResult, error) {
+		details := map[string]any{"amount": req.Amount, "would_credit_all": true}
+		if req.DryRun {
+			count, err := s.stars.CountStarsAllUsers(ctx)
+			if err != nil {
+				return CommandResult{Details: details}, err
+			}
+			details["eligible_users"] = count
+			return CommandResult{Message: "dry-run completed", Details: details}, nil
+		}
+		count, err := s.stars.GrantStarsAll(ctx, req.Amount, "Admin Stars grant (all)", req.Reason)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		details["users_credited"] = count
+		return CommandResult{Message: fmt.Sprintf("stars granted to all users: %d", count), Details: details}, nil
 	})
 }
 

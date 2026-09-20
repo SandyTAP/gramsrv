@@ -456,6 +456,56 @@ func TestDebitStarsDryRunExecuteAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestGrantStarsAllDryRunExecuteAndIdempotency(t *testing.T) {
+	ctx := context.Background()
+	stars := &fakeStarsService{balances: map[int64]domain.StarsBalance{
+		1001: {UserID: 1001, Balance: 1000, Granted: true},
+	}}
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Stars: stars, Now: fixedNow})
+
+	dry, err := svc.GrantStarsAll(ctx, GrantStarsAllRequest{
+		CommandMeta: CommandMeta{CommandID: "dry-stars-all", Actor: "ops", Reason: "promo", DryRun: true},
+		Amount:      250,
+	})
+	if err != nil {
+		t.Fatalf("dry-run stars-all: %v", err)
+	}
+	if !dry.DryRun || dry.Details["eligible_users"] != int64(42) || stars.balances[1001].Balance != 1000 {
+		t.Fatalf("dry=%+v balances=%v, want dry-run with 42 eligible and no mutation", dry, stars.balances)
+	}
+
+	req := GrantStarsAllRequest{
+		CommandMeta: CommandMeta{CommandID: "exec-stars-all", Actor: "ops", Reason: "promo"},
+		Amount:      250,
+	}
+	exec, err := svc.GrantStarsAll(ctx, req)
+	if err != nil {
+		t.Fatalf("execute stars-all: %v", err)
+	}
+	if exec.Status != string(domain.AdminCommandCompleted) || exec.Details["users_credited"] != int64(42) {
+		t.Fatalf("exec=%+v, want completed with 42 users_credited", exec)
+	}
+	if stars.balances[1001].Balance != 1250 {
+		t.Fatalf("balance after airdrop = %d, want 1250", stars.balances[1001].Balance)
+	}
+
+	replay, err := svc.GrantStarsAll(ctx, req)
+	if err != nil || !replay.AlreadyExecuted || stars.balances[1001].Balance != 1250 {
+		t.Fatalf("replay=%+v balance=%d err=%v, want idempotent replay", replay, stars.balances[1001].Balance, err)
+	}
+}
+
+func TestGrantStarsAllRejectsInvalidAmount(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Stars: &fakeStarsService{}, Now: fixedNow})
+	if _, err := svc.GrantStarsAll(ctx, GrantStarsAllRequest{
+		CommandMeta: CommandMeta{CommandID: "bad-stars-all", Actor: "ops", Reason: "r"},
+		Amount:      0,
+	}); err == nil {
+		t.Fatalf("want error for amount <= 0")
+	}
+}
+
 func TestSetVerifiedDryRunExecuteAndIdempotency(t *testing.T) {
 	ctx := context.Background()
 	users := &fakeUsersService{users: map[int64]domain.User{
@@ -1260,6 +1310,25 @@ func (f *fakeStarsService) Debit(_ context.Context, userID, amount int64, reason
 	balance.Balance -= amount
 	f.balances[userID] = balance
 	return balance, nil
+}
+
+func (f *fakeStarsService) CountStarsAllUsers(context.Context) (int64, error) {
+	return 42, nil
+}
+
+func (f *fakeStarsService) GrantStarsAll(_ context.Context, amount int64, _ string, _ string) (int64, error) {
+	if amount <= 0 {
+		return 0, domain.ErrStarsInvalidAmount
+	}
+	if f.balances == nil {
+		f.balances = map[int64]domain.StarsBalance{}
+	}
+	for id, b := range f.balances {
+		b.Balance += amount
+		b.Granted = true
+		f.balances[id] = b
+	}
+	return 42, nil
 }
 
 type fakeStarsNotifier struct {

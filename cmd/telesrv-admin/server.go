@@ -126,6 +126,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("POST /api/actions/grant-premium", s.premiumManage(s.handleGrantPremiumAPI))
 	mux.Handle("POST /api/actions/upsert-premium-plan", s.premiumManage(s.handleUpsertPremiumPlanAPI))
 	mux.Handle("POST /api/actions/grant-stars", s.premiumManage(http.HandlerFunc(s.handleGrantStarsAPI)))
+	mux.Handle("POST /api/actions/grant-stars-all", s.premiumManage(http.HandlerFunc(s.handleGrantStarsAllAPI)))
 	mux.Handle("POST /api/actions/debit-stars", s.premiumManage(http.HandlerFunc(s.handleDebitStarsAPI)))
 	mux.Handle("POST /api/actions/set-verified", s.scopedRoute(permissionVerificationReview, http.HandlerFunc(s.handleSetVerifiedAPI)))
 	mux.Handle("POST /api/actions/set-account-flags", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUserFlagsAPI)))
@@ -1638,6 +1639,27 @@ func (s *server) handleGrantStarsAPI(w http.ResponseWriter, r *http.Request) {
 		Amount:      body.Amount,
 	}
 	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/grant-stars", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type grantStarsAllAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	Amount    int64  `json:"amount"`
+}
+
+// handleGrantStarsAllAPI 给所有真实用户批量发星。无 user_id——目标由上游 store 解析。
+func (s *server) handleGrantStarsAllAPI(w http.ResponseWriter, r *http.Request) {
+	var body grantStarsAllAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.GrantStarsAllRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "grant-stars-all"),
+		Amount:      body.Amount,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/grant-stars-all", req)
 	writeCommandResultAPI(w, result, err)
 }
 
