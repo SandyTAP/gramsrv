@@ -2,6 +2,8 @@ import {
   AtSign,
   BadgeCheck,
   Bot,
+  ChevronsLeft,
+  ChevronsRight,
   Database,
   LayoutDashboard,
   LogOut,
@@ -159,8 +161,13 @@ export function Shell({
     onLogout();
   }
 
+  // Mobile keeps the sidebar as an icon rail; the button at the bottom of the
+  // rail expands it into the full labeled sidebar. On desktop the toggle is
+  // hidden entirely and the sidebar is always fully expanded.
+  const [sidebarExpanded, setSidebarExpanded] = useState(false);
+
   return (
-    <div className="shell">
+    <div className={`shell${sidebarExpanded ? " sidebar-expanded" : ""}`}>
       <aside className="sidebar">
         <AppLink className="brand" href="/" navigate={navigate}>
           <span className="brand-mark"><img src={brandIconSrc} alt={brandName} onError={() => setBrandIconFailed(true)} /></span>
@@ -250,6 +257,19 @@ export function Shell({
             <NavLink icon={<Settings size={16} />} href="/server-settings" route={route} navigate={navigate}>{t("layout.serverSettings")}</NavLink>
           )}
         </nav>
+        <div className="sidebar-toggle-wrap">
+          <button
+            className="sidebar-toggle"
+            type="button"
+            aria-expanded={sidebarExpanded}
+            aria-label={sidebarExpanded ? t("layout.collapseSidebar") : t("layout.expandSidebar")}
+            title={sidebarExpanded ? t("layout.collapseSidebar") : t("layout.expandSidebar")}
+            onClick={() => setSidebarExpanded((open) => !open)}
+          >
+            {sidebarExpanded ? <ChevronsLeft size={16} /> : <ChevronsRight size={16} />}
+            <span>{sidebarExpanded ? t("layout.collapseSidebar") : t("layout.expandSidebar")}</span>
+          </button>
+        </div>
       </aside>
       <div className="workspace">
         <header className="topbar">

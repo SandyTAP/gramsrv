@@ -222,6 +222,13 @@ a {
   border-right: 1px solid var(--sidebar-line);
 }
 
+/* Desktop keeps the sidebar fully expanded, so the expand/collapse toggle is
+   only needed on the mobile rail. Hidden here, re-enabled in the responsive
+   block. */
+.sidebar-toggle-wrap {
+  display: none;
+}
+
 .brand {
   display: flex;
   align-items: center;
