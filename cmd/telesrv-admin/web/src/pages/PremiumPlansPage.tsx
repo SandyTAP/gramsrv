@@ -8,7 +8,6 @@ import {
   RefreshCw,
   Save,
   Settings2,
-  Users,
   X
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
@@ -59,13 +58,11 @@ export function PremiumPlansPage({ navigate }: { navigate: Navigate }) {
   const [draft, setDraft] = useState<PremiumPlan | null>(null);
   const [selectedUser, setSelectedUser] = useState<AccountRow | null>(null);
   const [starsAmount, setStarsAmount] = useState("1000");
-  const [massStars, setMassStars] = useState("100");
   const [premiumMonths, setPremiumMonths] = useState("1");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const parsedStars = Number(starsAmount);
-  const parsedMassStars = Number(massStars);
   const parsedMonths = Number(premiumMonths);
   const selectedUserID = selectedUser?.ID ?? 0;
   const enabledPlans = plans.filter((plan) => plan.Enabled).length;
@@ -189,23 +186,6 @@ export function PremiumPlansPage({ navigate }: { navigate: Navigate }) {
       <SectionTabs tabs={grantsTabs} active="/monetization" navigate={navigate} />
       <section className="surface premium-operations-compact">
         <SectionHead title={t("premium.operations")} text={t("premium.operationsHint")} />
-        <div className="premium-mass-grant">
-          <div className="premium-mass-grant-head">
-            <span><Users size={14} /></span><strong>{t("premium.grantStarsAllTitle")}</strong>
-          </div>
-          <div className="premium-mass-grant-control">
-            <input aria-label={t("premium.starsAmount")} type="number" min={1} value={massStars}
-              onChange={(event) => setMassStars(event.target.value)} />
-          </div>
-          <div className="premium-mass-grant-actions">
-            <ActionButton compact tone="warn" icon={<Users size={14} />} label={t("premium.grantStarsAll")}
-              path="/api/actions/grant-stars-all"
-              disabled={!Number.isSafeInteger(parsedMassStars) || parsedMassStars <= 0}
-              onDone={load}
-              payload={() => ({ amount: parsedMassStars })} />
-            <p className="premium-store-hint">{t("premium.grantStarsAllHint")}</p>
-          </div>
-        </div>
         <div className="premium-operation-bar">
           <div className="premium-account-picker">
             <UserPicker variant="dropdown" label={t("premium.userID")} value={selectedUser} onChange={setSelectedUser} />

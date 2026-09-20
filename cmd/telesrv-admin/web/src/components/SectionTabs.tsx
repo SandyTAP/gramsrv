@@ -39,6 +39,7 @@ export function SectionTabs({
 
 export const grantsTabs: SectionTab[] = [
   { path: "/monetization", labelKey: "layout.premium" },
+  { path: "/star-issue", labelKey: "layout.starIssue" },
   { path: "/give-gifts", labelKey: "layout.giveGifts" }
 ];
 
