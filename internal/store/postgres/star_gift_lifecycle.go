@@ -277,13 +277,14 @@ func (s *StarGiftLifecycleStore) UniqueStarGiftValueInfo(ctx context.Context, un
 	err := s.db.QueryRow(ctx, `
 SELECT sg.gift_date, cr.stars, u.value_currency, u.value_amount, u.last_sale_date,
        COALESCE(CASE WHEN u.last_sale_currency='XTR' THEN u.last_sale_amount END,0),
-       COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id AND l.currency='XTR'),0),
+       COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id AND l.currency='XTR'
+          AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r JOIN star_gift_catalog gc ON gc.active_revision_id=r.id WHERE gc.gift_id=lu.gift_id)),0),
        COALESCE((SELECT AVG(sa.amount)::bigint FROM star_gift_sales sa JOIN unique_star_gifts su ON su.id=sa.unique_gift_id WHERE su.gift_id=u.gift_id AND sa.currency='XTR'),0),
        (SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id)
 FROM unique_star_gifts u
 JOIN peer_star_gifts sg ON sg.id=u.source_saved_gift_id
 JOIN star_gift_catalog_revisions cr ON cr.id=sg.catalog_revision_id
-WHERE u.id=$1`, uniqueGiftID).Scan(&out.InitialSaleDate, &out.InitialSaleStars, &configuredCurrency,
+WHERE u.id=$1`, uniqueGiftID, domain.StarGiftResaleFloorMultiple).Scan(&out.InitialSaleDate, &out.InitialSaleStars, &configuredCurrency,
 		&configuredValue, &out.LastSaleDate, &out.LastSalePrice, &out.FloorPrice, &out.AveragePrice, &out.ListedCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.StarGiftValueInfo{}, domain.ErrStarGiftNotFound
@@ -342,7 +343,15 @@ func (s *StarGiftLifecycleStore) SetStarGiftListing(ctx context.Context, req dom
 			}
 			var minimum int64
 			if req.Amount.Currency == domain.StarGiftCurrencyStars {
-				if err := tx.QueryRow(ctx, `SELECT resell_min_stars FROM star_gift_catalog WHERE gift_id=$1`, unique.GiftID).Scan(&minimum); err != nil {
+				// The enforced floor is the cheapest live listing for this gift type,
+				// excluding troll listings priced far above the gift's base price.
+				// Computed from listings rather than the projected catalog column so
+				// a stale seed can never lock resale below a sane price.
+				if err := tx.QueryRow(ctx, `SELECT COALESCE((
+  SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id
+  WHERE u.gift_id=$1 AND l.currency='XTR'
+    AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r JOIN star_gift_catalog c ON c.active_revision_id=r.id WHERE c.gift_id=$1)
+ ),0)`, unique.GiftID, domain.StarGiftResaleFloorMultiple).Scan(&minimum); err != nil {
 					return err
 				}
 				if req.Amount.Amount < minimum {
@@ -1394,8 +1403,9 @@ func savedStarGiftByUniqueID(ctx context.Context, db sqlcgen.DBTX, uniqueID int6
 func updateStarGiftResaleProjection(ctx context.Context, tx pgx.Tx, giftID int64) error {
 	_, err := tx.Exec(ctx, `UPDATE star_gift_catalog c SET
  availability_resale=(SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id),
- resell_min_stars=COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id AND l.currency='XTR'),0),
- updated_at=now() WHERE c.gift_id=$1`, giftID)
+ resell_min_stars=COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id AND l.currency='XTR'
+   AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r WHERE r.id=c.active_revision_id)),0),
+ updated_at=now() WHERE c.gift_id=$1`, giftID, domain.StarGiftResaleFloorMultiple)
 	return err
 }
 
