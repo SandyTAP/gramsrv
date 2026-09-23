@@ -43,6 +43,7 @@ type Service interface {
 	SetAccountFrozen(ctx context.Context, req admin.SetAccountFrozenRequest) (admin.CommandResult, error)
 	GrantPremium(ctx context.Context, req admin.GrantPremiumRequest) (admin.CommandResult, error)
 	GrantStars(ctx context.Context, req admin.GrantStarsRequest) (admin.CommandResult, error)
+	GrantStarsAll(ctx context.Context, req admin.GrantStarsAllRequest) (admin.CommandResult, error)
 	SetVerified(ctx context.Context, req admin.SetVerifiedRequest) (admin.CommandResult, error)
 	SetUserFlags(ctx context.Context, req admin.SetUserFlagsRequest) (admin.CommandResult, error)
 	SetChannelVerified(ctx context.Context, req admin.SetChannelVerifiedRequest) (admin.CommandResult, error)
@@ -226,6 +227,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/premium/users/{id}/entitlements", s.authorized(PermissionPremiumManage, s.handlePremiumEntitlements))
 	mux.HandleFunc("GET /v1/premium/payments/{id}", s.authorized(PermissionPremiumManage, s.handlePremiumPayment))
 	mux.HandleFunc("POST /v1/accounts/grant-stars", s.authenticated(s.handleGrantStars))
+	mux.HandleFunc("POST /v1/accounts/grant-stars-all", s.authenticated(s.handleGrantStarsAll))
 	mux.HandleFunc("POST /v1/accounts/debit-stars", s.authenticated(s.handleDebitStars))
 	mux.HandleFunc("POST /v1/accounts/resolve-by-phone", s.authenticated(s.handleResolveUserByPhone))
 	mux.HandleFunc("POST /v1/accounts/set-verified", s.authenticated(s.handleSetVerified))
@@ -471,6 +473,15 @@ func (s *Server) handleGrantStars(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.svc.GrantStars(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleGrantStarsAll(w http.ResponseWriter, r *http.Request) {
+	var req admin.GrantStarsAllRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.GrantStarsAll(r.Context(), req)
 	writeCommandResult(w, result, err)
 }
 

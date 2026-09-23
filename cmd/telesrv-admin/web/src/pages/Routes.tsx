@@ -29,6 +29,7 @@ import { BotVerificationRequestPage } from "./BotVerificationRequestPage";
 import { VerificationDetailPage } from "./VerificationDetailPage";
 import { VerificationPage } from "./VerificationPage";
 import { SharedDevicesPage } from "./SharedDevicesPage";
+import { StarIssuePage } from "./StarIssuePage";
 import { StoragePage } from "./StoragePage";
 import { StickerSetsPage } from "./StickerSetsPage";
 import { StarsDetailPage } from "./StarsDetailPage";
@@ -153,6 +154,13 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
     return (
       <PermissionGate permission={permissionPremiumManage}>
         <PremiumPlansPage navigate={navigate} />
+      </PermissionGate>
+    );
+  }
+  if (route.path === "/star-issue") {
+    return (
+      <PermissionGate permission={permissionPremiumManage}>
+        <StarIssuePage navigate={navigate} />
       </PermissionGate>
     );
   }

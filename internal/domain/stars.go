@@ -243,6 +243,8 @@ var (
 	ErrStarsPurchaseFormExpired = errors.New("stars: purchase form expired")
 	// ErrStarsGiftUnavailable covers a recipient that cannot receive the gift.
 	ErrStarsGiftUnavailable = errors.New("stars: gift unavailable")
+	// ErrStarsAirdropUnsupported表示底层 store 不支持批量贷记（内存后端等）。
+	ErrStarsAirdropUnsupported = errors.New("stars: airdrop unsupported")
 )
 
 // StarsPaymentRequiredError reports the minimum paid-message authorization the
