@@ -737,6 +737,19 @@ type ChannelMessage struct {
 	Deleted    bool
 }
 
+// LinkedDiscussionRootMatches verifies the exact source-post/root pair for a
+// top-only comment reply. A normal forwarded message is not a thread root.
+func LinkedDiscussionRootMatches(group, source Channel, root, post ChannelMessage) bool {
+	return group.Megagroup && !group.Deleted && group.LinkedChatID == source.ID &&
+		source.Broadcast && !source.Deleted && source.LinkedChatID == group.ID &&
+		root.ChannelID == group.ID && root.ID > 0 && !root.Deleted && root.ReplyTo == nil &&
+		root.From == (Peer{Type: PeerTypeChannel, ID: source.ID}) &&
+		root.Forward != nil && root.Forward.From == root.From &&
+		root.Forward.ChannelPost == post.ID && post.ID > 0 && post.Post && !post.Deleted &&
+		post.ChannelID == source.ID && post.Discussion != nil &&
+		post.Discussion.ChannelID == group.ID && post.Discussion.MessageID == root.ID
+}
+
 // ProjectChannelHistoryClearMessage returns the owner-local service-message
 // projection for one channel history boundary. Identity fields from the shared
 // source are retained when available, while all user payload, media, reply,

@@ -54,10 +54,12 @@ import type {
 
 export class APIError extends Error {
   status: number;
+  result?: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, result?: unknown) {
     super(message);
     this.status = status;
+    this.result = result;
   }
 }
 
@@ -141,7 +143,7 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
     const message = data?.error || data?.Error || data?.message || response.statusText;
-    throw new APIError(response.status, message);
+    throw new APIError(response.status, message, data);
   }
   return data as T;
 }
@@ -258,6 +260,7 @@ export const api = {
 	giftCollectibles: (id: string) => request<StarGiftCollectiblePreview>(`/api/gifts/${encodeURIComponent(id)}/collectibles`),
 	giftCollectibleAnimation: (giftID: string, kind: "model" | "pattern", attributeID: string) => request<Record<string, unknown>>(`/api/gifts/${encodeURIComponent(giftID)}/collectibles/${kind}/${encodeURIComponent(attributeID)}/animation`),
 	importGift: (form: FormData) => request<CommandResult>("/api/actions/import-gift", { method: "POST", body: form }),
+	importGiftPack: (form: FormData) => request<CommandResult>("/api/actions/import-gift-pack", { method: "POST", body: form }),
 	importOfficialGift: (payload: Record<string, unknown>) => request<CommandResult>("/api/actions/import-official-gift", { method: "POST", body: JSON.stringify(payload) }),
 	publishGiftCollectibles: (giftID: string, form: FormData) => request<CommandResult>(`/api/actions/publish-gift-collectibles?gift_id=${encodeURIComponent(giftID)}`, { method: "POST", body: form }),
 	gifCatalog: () => request<GifCatalogListResponse>("/api/gif-catalog"),

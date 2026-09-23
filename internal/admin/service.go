@@ -19,7 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"telesrv/internal/app/giftpack"
 	"telesrv/internal/domain"
 	"telesrv/internal/officialgifts"
 )
@@ -53,6 +55,7 @@ const (
 	ActionDeletePrivateMessages   = "messages.delete_private_messages"
 	ActionDeletePrivateHistory    = "messages.delete_private_history"
 	ActionImportStarGift          = "gifts.import"
+	ActionImportGiftPack          = "gifts.pack.import"
 	ActionImportOfficialStarGift  = "gifts.official.import"
 	ActionPublishGiftCollectibles = "gifts.collectibles.publish"
 	ActionSetStarGiftEnabled      = "gifts.set_enabled"
@@ -70,6 +73,7 @@ const (
 	ActionCreateGifCatalogEntry   = "gif_catalog.create"
 	ActionSetGifCatalogEnabled    = "gif_catalog.set_enabled"
 	ActionSetGifCatalogSortOrder  = "gif_catalog.set_sort_order"
+	ActionSetGifCatalogCategory   = "gif_catalog.set_category"
 	ActionDeleteGifCatalogEntry   = "gif_catalog.delete"
 	ActionDeleteBot               = "bot.delete"
 	ActionExportBotToken          = "bot.export_token"
@@ -316,6 +320,7 @@ type MessagesService interface {
 }
 
 type GiftsService interface {
+	CatalogAll(ctx context.Context) ([]domain.StarGift, error)
 	GiftByID(ctx context.Context, id int64) (domain.StarGift, bool, error)
 	PrepareAnimation(fileName string, data []byte) (domain.StarGiftAnimation, error)
 	PrepareOfficialAnimation(fileName string, data []byte) (domain.StarGiftAnimation, error)
@@ -378,10 +383,11 @@ type StickerSetsService interface {
 type GifCatalogService interface {
 	ValidateGifUpload(fileName string, data []byte) (string, bool)
 	AdminUploadGifMaterial(ctx context.Context, fileName string, data []byte) (domain.Document, error)
-	AdminCreateGifCatalogEntry(ctx context.Context, title string, documentID int64) (domain.GifCatalogEntry, error)
+	AdminCreateGifCatalogEntry(ctx context.Context, title string, documentID int64, fileName string) (domain.GifCatalogEntry, error)
 	AdminListGifCatalog(ctx context.Context) ([]domain.GifCatalogEntry, error)
 	AdminSetGifCatalogEnabled(ctx context.Context, id int64, enabled bool) (bool, error)
 	AdminSetGifCatalogSortOrder(ctx context.Context, id int64, order int) (bool, error)
+	AdminSetGifCatalogCategory(ctx context.Context, id int64, category string) (bool, error)
 	AdminDeleteGifCatalogEntry(ctx context.Context, id int64) (bool, error)
 	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
 }
@@ -792,19 +798,19 @@ type CommandResult struct {
 
 type ImportStarGiftRequest struct {
 	CommandMeta
-	GiftID       int64  `json:"gift_id,omitempty"`
-	Title        string `json:"title"`
-	Limited      bool   `json:"limited,omitempty"`
-	RequirePremium bool `json:"require_premium,omitempty"`
-	Birthday     bool   `json:"birthday,omitempty"`
-	Stars        int64  `json:"stars"`
-	ConvertStars int64  `json:"convert_stars"`
-	Enabled      bool   `json:"enabled"`
-	SupportOnly  bool   `json:"support_only,omitempty"`
-	SortOrder    int    `json:"sort_order"`
-	FileName     string `json:"file_name"`
-	ContentSHA   string `json:"content_sha256"`
-	Data         []byte `json:"-"`
+	GiftID         int64  `json:"gift_id,omitempty"`
+	Title          string `json:"title"`
+	Limited        bool   `json:"limited,omitempty"`
+	RequirePremium bool   `json:"require_premium,omitempty"`
+	Birthday       bool   `json:"birthday,omitempty"`
+	Stars          int64  `json:"stars"`
+	ConvertStars   int64  `json:"convert_stars"`
+	Enabled        bool   `json:"enabled"`
+	SupportOnly    bool   `json:"support_only,omitempty"`
+	SortOrder      int    `json:"sort_order"`
+	FileName       string `json:"file_name"`
+	ContentSHA     string `json:"content_sha256"`
+	Data           []byte `json:"-"`
 
 	// ReleasedBy names the peer that originally released the gift, authored as
 	// "@username" or a numeric user ID. Empty keeps the revision without a
@@ -827,6 +833,13 @@ type ImportStarGiftRequest struct {
 	AuctionRoundDuration int    `json:"auction_round_duration,omitempty"`
 	AvailabilityTotal    int    `json:"availability_total,omitempty"`
 	LockedUntilDate      int    `json:"locked_until_date,omitempty"`
+}
+
+type ImportGiftPackRequest struct {
+	CommandMeta
+	FileName   string `json:"file_name"`
+	ContentSHA string `json:"content_sha256"`
+	Data       []byte `json:"-"`
 }
 
 type ImportOfficialStarGiftRequest struct {
@@ -1193,6 +1206,12 @@ type SetGifCatalogSortOrderRequest struct {
 	CommandMeta
 	ID        int64 `json:"id,string"`
 	SortOrder int   `json:"sort_order"`
+}
+
+type SetGifCatalogCategoryRequest struct {
+	CommandMeta
+	ID       int64  `json:"id,string"`
+	Category string `json:"category"` // empty restores title/filename classification
 }
 
 type DeleteGifCatalogEntryRequest struct {
@@ -3760,21 +3779,21 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 		if lifecycle.LockedUntilDate > 0 {
 			details["locked_until_date"] = lifecycle.LockedUntilDate
 		}
-if req.DryRun {
-		return CommandResult{Message: "star gift import validated", Details: details}, nil
-	}
-	entry, err := s.gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
-		GiftID: req.GiftID, Title: req.Title, Stars: req.Stars, ConvertStars: req.ConvertStars,
-		Enabled: req.Enabled, SortOrder: req.SortOrder, SupportOnly: req.SupportOnly, Animation: animation,
-		RequirePremium: req.RequirePremium,
-		Birthday: req.Birthday,
-		Actor: req.Actor, CommandID: req.CommandID,
-		Auction: lifecycle.Auction, AuctionSlug: lifecycle.AuctionSlug, GiftsPerRound: lifecycle.GiftsPerRound,
-		AuctionStartDate: lifecycle.AuctionStartDate, AuctionRoundDuration: lifecycle.AuctionRoundDuration,
-		AvailabilityTotal: lifecycle.AvailabilityTotal, LockedUntilDate: lifecycle.LockedUntilDate,
-		Limited: lifecycle.Limited, AvailabilityRemains: lifecycle.AvailabilityRemains,
-		ReleasedBy: releasedBy, LimitedPerUser: req.PerUserTotal > 0, PerUserTotal: req.PerUserTotal,
-	})
+		if req.DryRun {
+			return CommandResult{Message: "star gift import validated", Details: details}, nil
+		}
+		entry, err := s.gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+			GiftID: req.GiftID, Title: req.Title, Stars: req.Stars, ConvertStars: req.ConvertStars,
+			Enabled: req.Enabled, SortOrder: req.SortOrder, SupportOnly: req.SupportOnly, Animation: animation,
+			RequirePremium: req.RequirePremium,
+			Birthday:       req.Birthday,
+			Actor:          req.Actor, CommandID: req.CommandID,
+			Auction: lifecycle.Auction, AuctionSlug: lifecycle.AuctionSlug, GiftsPerRound: lifecycle.GiftsPerRound,
+			AuctionStartDate: lifecycle.AuctionStartDate, AuctionRoundDuration: lifecycle.AuctionRoundDuration,
+			AvailabilityTotal: lifecycle.AvailabilityTotal, LockedUntilDate: lifecycle.LockedUntilDate,
+			Limited: lifecycle.Limited, AvailabilityRemains: lifecycle.AvailabilityRemains,
+			ReleasedBy: releasedBy, LimitedPerUser: req.PerUserTotal > 0, PerUserTotal: req.PerUserTotal,
+		})
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
@@ -3782,6 +3801,44 @@ if req.DryRun {
 		details["revision_id"] = strconv.FormatInt(entry.Gift.RevisionID, 10)
 		details["revision"] = entry.Revision
 		return CommandResult{Message: "star gift imported", Details: details}, nil
+	})
+}
+
+// ImportGiftPack publishes portable pack.json ZIPs through the same one-gift
+// catalog and collectible transaction used by the admin gift editor.
+func (s *Service) ImportGiftPack(ctx context.Context, req ImportGiftPackRequest) (CommandResult, error) {
+	if s == nil || s.gifts == nil {
+		return CommandResult{}, fmt.Errorf("star gift service is not configured")
+	}
+	archive, err := giftpack.NewZipAssetResolver(req.Data)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	manifestBytes, err := archive.Manifest()
+	if err != nil {
+		return CommandResult{}, err
+	}
+	manifest, err := giftpack.ParseManifest(manifestBytes)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	hash := sha256.Sum256(req.Data)
+	req.ContentSHA = hex.EncodeToString(hash[:])
+	return s.runCommand(ctx, req.CommandMeta, ActionImportGiftPack, 0, domain.Peer{}, req, func() (CommandResult, error) {
+		outcome, err := giftpack.Import(ctx, s.gifts, manifest, archive, giftpack.ImportOptions{
+			DryRun: req.DryRun, Actor: req.Actor, CommandID: req.CommandID, Now: s.now,
+		})
+		result := CommandResult{Details: map[string]any{"pack_name": manifest.PackName, "content_sha256": req.ContentSHA, "gifts": outcome.Gifts}}
+		if err != nil {
+			result.Message = "gift pack import failed"
+			return result, err
+		}
+		if req.DryRun {
+			result.Message = "gift pack validated"
+		} else {
+			result.Message = "gift pack imported"
+		}
+		return result, nil
 	})
 }
 
@@ -3989,7 +4046,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		// local lifecycle writes. Existing inventory is preserved under the store lock.
 		Limited: limited, SoldOut: false, Birthday: req.Birthday || bundle.Gift.Birthday,
 		RequirePremium: req.RequirePremium || bundle.Gift.RequirePremium, LimitedPerUser: bundle.Gift.LimitedPerUser || req.PerUserTotal > 0,
-		SupportOnly: req.SupportOnly,
+		SupportOnly:        req.SupportOnly,
 		PeerColorAvailable: bundle.Gift.PeerColorAvailable, Auction: bundle.Gift.Auction,
 		AvailabilityRemains: 0, AvailabilityTotal: availabilityTotal,
 		AvailabilityResale: 0, FirstSaleDate: 0,
@@ -4016,7 +4073,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 			"official_limited": bundle.Gift.Limited, "official_sold_out": bundle.Gift.SoldOut,
 			"official_auction": bundle.Gift.Auction, "official_birthday": bundle.Gift.Birthday,
 			"official_require_premium":      bundle.Gift.RequirePremium,
-			"support_only":                 req.SupportOnly,
+			"support_only":                  req.SupportOnly,
 			"official_availability_remains": bundle.Gift.AvailabilityRemains,
 			"official_availability_total":   bundle.Gift.AvailabilityTotal,
 			"official_availability_resale":  bundle.Gift.AvailabilityResale,
@@ -4459,7 +4516,7 @@ func (s *Service) CreateGifCatalogEntry(ctx context.Context, req CreateGifCatalo
 	if s == nil || s.gifCatalog == nil {
 		return CommandResult{}, domain.ErrGifCatalogUnavailable
 	}
-	if strings.TrimSpace(req.Title) == "" {
+	if strings.TrimSpace(req.Title) == "" || utf8.RuneCountInString(req.FileName) > domain.MaxGifCatalogFileNameLen {
 		return CommandResult{}, domain.ErrGifCatalogEntryInvalid
 	}
 	mimeType, ok := s.gifCatalog.ValidateGifUpload(req.FileName, req.Data)
@@ -4484,11 +4541,12 @@ func (s *Service) CreateGifCatalogEntry(ctx context.Context, req CreateGifCatalo
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
-		entry, err := s.gifCatalog.AdminCreateGifCatalogEntry(ctx, req.Title, doc.ID)
+		entry, err := s.gifCatalog.AdminCreateGifCatalogEntry(ctx, req.Title, doc.ID, req.FileName)
 		if err != nil {
 			return CommandResult{Details: details}, err
 		}
 		details["id"], details["document_id"] = strconv.FormatInt(entry.ID, 10), strconv.FormatInt(doc.ID, 10)
+		details["category"] = domain.ClassifyGifCategory(req.Title, req.FileName)
 		return CommandResult{Message: "gif catalog entry created", Details: details}, nil
 	})
 }
@@ -4520,6 +4578,21 @@ func (s *Service) SetGifCatalogSortOrder(ctx context.Context, req SetGifCatalogS
 		changed, err := s.gifCatalog.AdminSetGifCatalogSortOrder(ctx, req.ID, req.SortOrder)
 		details["changed"] = changed
 		return CommandResult{Message: "gif catalog order updated", Details: details}, err
+	})
+}
+
+func (s *Service) SetGifCatalogCategory(ctx context.Context, req SetGifCatalogCategoryRequest) (CommandResult, error) {
+	if s == nil || s.gifCatalog == nil || req.ID <= 0 || (req.Category != "" && !domain.ValidGifCategory(req.Category)) {
+		return CommandResult{}, domain.ErrGifCatalogEntryInvalid
+	}
+	return s.runCommand(ctx, req.CommandMeta, ActionSetGifCatalogCategory, 0, domain.Peer{}, req, func() (CommandResult, error) {
+		details := map[string]any{"id": strconv.FormatInt(req.ID, 10), "category": req.Category}
+		if req.DryRun {
+			return CommandResult{Message: "gif catalog category validated", Details: details}, nil
+		}
+		changed, err := s.gifCatalog.AdminSetGifCatalogCategory(ctx, req.ID, req.Category)
+		details["changed"] = changed
+		return CommandResult{Message: "gif catalog category updated", Details: details}, err
 	})
 }
 

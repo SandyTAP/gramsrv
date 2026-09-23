@@ -43,9 +43,19 @@ LEFT JOIN star_gift_collectible_revisions cr ON cr.id = c.collectible_revision_i
 JOIN documents d ON d.id = r.document_id`
 
 func (s *StarGiftStore) Catalog(ctx context.Context) ([]domain.StarGift, error) {
-	rows, err := s.db.Query(ctx, starGiftCatalogSelect+`
-WHERE c.enabled
-ORDER BY c.sort_order, c.gift_id`)
+	return s.listCatalog(ctx, true)
+}
+
+func (s *StarGiftStore) CatalogAll(ctx context.Context) ([]domain.StarGift, error) {
+	return s.listCatalog(ctx, false)
+}
+
+func (s *StarGiftStore) listCatalog(ctx context.Context, enabledOnly bool) ([]domain.StarGift, error) {
+	query := starGiftCatalogSelect
+	if enabledOnly {
+		query += ` WHERE c.enabled`
+	}
+	rows, err := s.db.Query(ctx, query+` ORDER BY c.sort_order, c.gift_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list star gift catalog: %w", err)
 	}

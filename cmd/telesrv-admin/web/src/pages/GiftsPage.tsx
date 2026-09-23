@@ -1,4 +1,4 @@
-import { CheckCircle2, FileJson2, Gem, Loader2, Pause, Play, Plus, RefreshCw, Search, ShieldCheck, Upload, X } from "lucide-react";
+import { CheckCircle2, FileJson2, Gem, Loader2, PackagePlus, Pause, Play, Plus, RefreshCw, Search, ShieldCheck, Upload, X } from "lucide-react";
 import lottie from "lottie-web/build/player/lottie_light_canvas";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -11,6 +11,7 @@ import { formatDate, localInputValue, titleFromFilename, toUnixSeconds } from ".
 import type { Navigate } from "../routing";
 import type { CommandResult, OfficialStarGiftRow, StarGiftRow } from "../types";
 import { GiftCollectiblesModal } from "./GiftCollectiblesModal";
+import { GiftPackModal } from "./GiftPackModal";
 
 type OfficialGiftCategory = "all" | "upgrade" | "craft" | "basic";
 
@@ -93,6 +94,7 @@ export function GiftsPage({ navigate }: { navigate: Navigate }) {
   const [gifts, setGifts] = useState<StarGiftRow[]>([]);
   const [query, setQuery] = useState("");
   const [importOpen, setImportOpen] = useState(false);
+  const [packOpen, setPackOpen] = useState(false);
   const [collectibleGift, setCollectibleGift] = useState<StarGiftRow | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [importSource, setImportSource] = useState<"official" | "file">("official");
@@ -323,6 +325,7 @@ return {
   return (
     <PageFrame title={t("gifts.pageTitle")} eyebrow={t("gifts.eyebrow")} actions={<>
       <button className="btn" type="button" onClick={() => load()} disabled={busy}><RefreshCw size={15} /> {t("common.refresh")}</button>
+      <button className="btn" type="button" onClick={() => setPackOpen(true)}><PackagePlus size={15} /> {t("gifts.pack.title")}</button>
       <button className="btn primary" type="button" onClick={startImport}><Plus size={15} /> {t("gifts.add")}</button>
     </>}>
       <SectionTabs tabs={giftTabs} active="/gifts" navigate={navigate} />
@@ -502,6 +505,7 @@ return {
         document.body
       )}
       {collectibleGift && <GiftCollectiblesModal gift={collectibleGift} onClose={() => setCollectibleGift(null)} onPublished={() => void load()} />}
+      {packOpen && <GiftPackModal onClose={() => setPackOpen(false)} onImported={() => void load()} />}
     </PageFrame>
   );
 }

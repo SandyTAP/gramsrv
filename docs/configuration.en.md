@@ -480,6 +480,8 @@ objects, verified size/SHA-256, and updated `file_blobs.backend`.
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
 | `TELESRV_DEV_AUTH_CODE` | sensitive string / `12345` | Fixed code used by `PHONE_CODE_DELIVERY_PROVIDER=development`; do not expose this default publicly. |
+| `TELESRV_IDENTITY_DIR` | path / `data/identity` | Shared directory for the Admin-managed 777000 name, avatar, and login-code template. New code deliveries read the template override live. |
+| `TELESRV_LOGIN_CODE_MESSAGE_TEMPLATE` | text / built-in template | Default 777000 login-code message for existing accounts; the Admin override takes precedence. Include `{{code}}` exactly once; `{{server_name}}` is optional. Changes affect new deliveries, while retries restore the first message. |
 | `TELESRV_AUTH_CODE_TTL` | duration / `5m` | Login/registration/email verification code lifetime; must be positive. |
 | `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | int / `5` | Maximum wrong attempts for one code/hash; must be positive. |
 | `TELESRV_PHONE_CODE_LENGTH` | int / `5` | Random SMS-code length for the `webhook` phone provider; allowed range `4..10`. |

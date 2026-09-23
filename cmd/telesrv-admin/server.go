@@ -156,6 +156,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("POST /api/actions/create-gif-catalog-entry", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleCreateGifCatalogEntryAPI)))
 	mux.Handle("POST /api/actions/set-gif-catalog-enabled", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogEnabledAPI)))
 	mux.Handle("POST /api/actions/set-gif-catalog-sort-order", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogSortOrderAPI)))
+	mux.Handle("POST /api/actions/set-gif-catalog-category", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogCategoryAPI)))
 	mux.Handle("POST /api/actions/delete-gif-catalog-entry", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleDeleteGifCatalogEntryAPI)))
 	mux.Handle("POST /api/actions/delete-bot", s.scopedRoute(permissionBotsManage, http.HandlerFunc(s.handleDeleteBotAPI)))
 	mux.Handle("POST /api/actions/export-bot-token", s.scopedRoute(permissionBotTokenRead, http.HandlerFunc(s.handleExportBotTokenAPI)))
@@ -164,6 +165,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("POST /api/actions/delete-messages", s.scopedRoute(permissionMessagesManage, http.HandlerFunc(s.handleDeleteMessagesAPI)))
 	mux.Handle("POST /api/actions/delete-history", s.scopedRoute(permissionMessagesManage, http.HandlerFunc(s.handleDeleteHistoryAPI)))
 	mux.Handle("POST /api/actions/import-gift", s.scopedRoute(permissionGiftsManage, http.HandlerFunc(s.handleImportStarGiftAPI)))
+	mux.Handle("POST /api/actions/import-gift-pack", s.scopedRoute(permissionGiftsManage, http.HandlerFunc(s.handleImportGiftPackAPI)))
 	mux.Handle("POST /api/actions/import-official-gift", s.scopedRoute(permissionGiftsManage, http.HandlerFunc(s.handleImportOfficialStarGiftAPI)))
 	mux.Handle("POST /api/actions/publish-gift-collectibles", s.scopedRoute(permissionGiftsManage, http.HandlerFunc(s.handlePublishStarGiftCollectiblesAPI)))
 	mux.Handle("POST /api/actions/set-gift-enabled", s.scopedRoute(permissionGiftsManage, http.HandlerFunc(s.handleSetStarGiftEnabledAPI)))
@@ -1338,6 +1340,7 @@ type gifCatalogStateAPIRequest struct {
 	ID        int64  `json:"id,string"`
 	Enabled   bool   `json:"enabled,omitempty"`
 	SortOrder int    `json:"sort_order,omitempty"`
+	Category  string `json:"category"`
 }
 
 func (s *server) handleSetGifCatalogEnabledAPI(w http.ResponseWriter, r *http.Request) {
@@ -1357,6 +1360,16 @@ func (s *server) handleSetGifCatalogSortOrderAPI(w http.ResponseWriter, r *http.
 	}
 	req := admin.SetGifCatalogSortOrderRequest{CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-gif-sort-order"), ID: body.ID, SortOrder: body.SortOrder}
 	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/set-sort-order", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+func (s *server) handleSetGifCatalogCategoryAPI(w http.ResponseWriter, r *http.Request) {
+	var body gifCatalogStateAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetGifCatalogCategoryRequest{CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-gif-category"), ID: body.ID, Category: body.Category}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/set-category", req)
 	writeCommandResultAPI(w, result, err)
 }
 
@@ -2275,6 +2288,46 @@ func (s *server) handleImportStarGiftAPI(w http.ResponseWriter, r *http.Request)
 		LockedUntilDate:      body.LockedUntilDate,
 	}
 	result, err := s.callAdminMultipart(r.Context(), "/v1/gifts/import", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+func (s *server) handleImportGiftPackAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body struct {
+		CommandID string `json:"command_id"`
+		Reason    string `json:"reason"`
+		Confirm   bool   `json:"confirm"`
+	}
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "gift pack zip is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (32<<20)+1))
+	if err != nil || len(data) == 0 || len(data) > 32<<20 {
+		writeAPIError(w, http.StatusBadRequest, "gift pack zip is empty or too large")
+		return
+	}
+	req := admin.ImportGiftPackRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "import-gift-pack"),
+		FileName:    header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/gifts/import-pack", req, header.Filename, data)
 	writeCommandResultAPI(w, result, err)
 }
 

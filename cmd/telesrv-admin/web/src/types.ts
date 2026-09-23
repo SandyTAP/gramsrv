@@ -1103,6 +1103,9 @@ export type BroadcastListResponse = {
 export type GifCatalogRow = {
   ID: string;
   Title: string;
+  FileName: string;
+  Category: string;
+  CategoryManual: boolean;
   DocumentID: string;
   Enabled: boolean;
   SortOrder: number;

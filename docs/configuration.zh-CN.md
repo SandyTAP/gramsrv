@@ -460,6 +460,8 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
 | `TELESRV_DEV_AUTH_CODE` | sensitive string / `12345` | `PHONE_CODE_DELIVERY_PROVIDER=development` 使用的固定开发登录码；不得把默认值暴露在公网环境。 |
+| `TELESRV_IDENTITY_DIR` | path / `data/identity` | Admin 管理的 777000 名称、头像及登录码模板共用目录；新验证码投递时实时读取模板覆盖。 |
+| `TELESRV_LOGIN_CODE_MESSAGE_TEMPLATE` | text / 内置模板 | 已有账号的 777000 登录码消息默认模板；管理面板覆盖优先。必须恰好含一次 `{{code}}`，可含 `{{server_name}}`；修改仅影响新投递，幂等重试恢复首次内容。 |
 | `TELESRV_AUTH_CODE_TTL` | duration / `5m` | 登录/注册/邮箱验证码有效期，必须为正数。 |
 | `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | int / `5` | 单 code/hash 最大错误次数，必须为正数。 |
 | `TELESRV_PHONE_CODE_LENGTH` | int / `5` | `webhook` phone provider 生成的随机 SMS 验证码长度，允许 `4..10`。 |

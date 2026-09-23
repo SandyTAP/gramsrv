@@ -1454,6 +1454,13 @@ func run(logger *zap.Logger) error {
 		auth.WithLoginCodeDelivery(messageStore),
 		auth.WithLoginWelcomeMessages(identityStore, cfg.WelcomeMessagePhoneTemplate, cfg.WelcomeMessageEmailTemplate),
 		auth.WithLoginCodeMessageTemplate(identityStore, cfg.LoginCodeMessageTemplate),
+		auth.WithLoginCodeMessageTemplateResolver(func() (string, error) {
+			info, err := identityStore.Get()
+			if err != nil {
+				return "", err
+			}
+			return domain.ResolveLoginCodeMessageTemplate(info.LoginCodeMessageTemplate, cfg.LoginCodeMessageTemplate), nil
+		}),
 		auth.WithPasswords(passwordStore),
 		auth.WithBotLogin(botStore),
 		auth.WithPremiumGrant(cfg.PremiumGrantMonths),

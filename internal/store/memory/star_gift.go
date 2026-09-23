@@ -63,11 +63,19 @@ func (s *StarGiftStore) SeedCatalog(gifts []domain.StarGift) {
 }
 
 func (s *StarGiftStore) Catalog(_ context.Context) ([]domain.StarGift, error) {
+	return s.listCatalog(true), nil
+}
+
+func (s *StarGiftStore) CatalogAll(_ context.Context) ([]domain.StarGift, error) {
+	return s.listCatalog(false), nil
+}
+
+func (s *StarGiftStore) listCatalog(enabledOnly bool) []domain.StarGift {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]domain.StarGift, 0, len(s.catalog))
 	for id, gift := range s.catalog {
-		if s.enabled[id] {
+		if !enabledOnly || s.enabled[id] {
 			out = append(out, gift)
 		}
 	}
@@ -77,7 +85,7 @@ func (s *StarGiftStore) Catalog(_ context.Context) ([]domain.StarGift, error) {
 		}
 		return s.sortOrder[out[i].ID] < s.sortOrder[out[j].ID]
 	})
-	return out, nil
+	return out
 }
 
 func (s *StarGiftStore) CatalogGift(_ context.Context, giftID int64) (domain.StarGift, bool, error) {

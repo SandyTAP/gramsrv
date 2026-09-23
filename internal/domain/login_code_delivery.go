@@ -98,13 +98,31 @@ type LoginCodeDeliveryResult struct {
 // 因为模板可由管理员编辑（见 ValidateLoginCodeMessageTemplate）。模板为空或
 // 校验失败时回退到 DefaultLoginCodeMessageTemplate，绝不投递没有验证码的消息。
 func OfficialLoginCodeMessage(userID int64, template, code string, date int) (Message, error) {
-	if userID <= 0 || IsSystemUserID(userID) || strings.TrimSpace(code) == "" || len(code) > 64 || date < 0 || date > math.MaxInt32 {
-		return Message{}, fmt.Errorf("%w: user=%d code_length=%d date=%d", ErrLoginCodeDeliveryInvalid, userID, len(code), date)
-	}
+	return OfficialLoginCodeMessageWithTemplate(userID, template, code, date)
+}
+
+// SnapshotLoginCodeMessageTemplate resolves the brand and fallback at the first
+// delivery. The returned template still contains {{code}}, so a compact
+// receipt can reproduce the original body without storing the secret code.
+func SnapshotLoginCodeMessageTemplate(template string) string {
 	if strings.TrimSpace(template) == "" || ValidateLoginCodeMessageTemplate(template) != nil {
 		template = DefaultLoginCodeMessageTemplate
 	}
 	rendered := RenderWelcomeMessageTemplate(template)
+	if ValidateLoginCodeMessageTemplate(rendered) != nil {
+		rendered = RenderWelcomeMessageTemplate(DefaultLoginCodeMessageTemplate)
+		if ValidateLoginCodeMessageTemplate(rendered) != nil {
+			return strings.ReplaceAll(DefaultLoginCodeMessageTemplate, "{{server_name}}", "Telesrv")
+		}
+	}
+	return rendered
+}
+
+func OfficialLoginCodeMessageWithTemplate(userID int64, template, code string, date int) (Message, error) {
+	if userID <= 0 || IsSystemUserID(userID) || strings.TrimSpace(code) == "" || len(code) > 64 || date < 0 || date > math.MaxInt32 {
+		return Message{}, fmt.Errorf("%w: user=%d code_length=%d date=%d", ErrLoginCodeDeliveryInvalid, userID, len(code), date)
+	}
+	rendered := SnapshotLoginCodeMessageTemplate(template)
 	idx := strings.Index(rendered, loginCodeTemplateCodePlaceholder)
 	if idx < 0 {
 		// 实际不可达：模板刚被校验过（或是内置默认）保证占位符恰好一次，

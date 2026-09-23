@@ -847,8 +847,43 @@ WHERE owner_user_id=$1 AND peer_type='user' AND peer_id=$2 AND box_id=$3 AND NOT
 		return reply, nil
 	}
 	if req.ReplyTo.MessageID == 0 {
-		if req.ReplyTo.TopMessageID <= 0 || !channel.Forum {
+		if req.ReplyTo.TopMessageID <= 0 {
 			return nil, domain.ErrReplyMessageIDInvalid
+		}
+		if !channel.Forum {
+			root, err := s.getChannelMessage(ctx, db, req.ChannelID, req.ReplyTo.TopMessageID)
+			if err != nil {
+				if errors.Is(err, domain.ErrMessageIDInvalid) || errors.Is(err, pgx.ErrNoRows) {
+					return nil, domain.ErrReplyMessageIDInvalid
+				}
+				return nil, err
+			}
+			if root.ID <= member.AvailableMinID || channel.LinkedChatID == 0 {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			source, err := getChannelByID(ctx, db, channel.LinkedChatID)
+			if err != nil {
+				if errors.Is(err, domain.ErrChannelInvalid) || errors.Is(err, pgx.ErrNoRows) {
+					return nil, domain.ErrReplyMessageIDInvalid
+				}
+				return nil, err
+			}
+			if root.Forward == nil || root.Forward.ChannelPost <= 0 {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			post, err := s.getChannelMessage(ctx, db, source.ID, root.Forward.ChannelPost)
+			if err != nil {
+				if errors.Is(err, domain.ErrMessageIDInvalid) || errors.Is(err, pgx.ErrNoRows) {
+					return nil, domain.ErrReplyMessageIDInvalid
+				}
+				return nil, err
+			}
+			if !domain.LinkedDiscussionRootMatches(channel, source, root, post) {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			reply := cloneMessageReply(req.ReplyTo)
+			reply.MessageID, reply.TopMessageID, reply.Peer = root.ID, root.ID, channelPeer
+			return reply, nil
 		}
 		topic, err := s.getForumTopic(ctx, db, req.ChannelID, req.ReplyTo.TopMessageID)
 		if err != nil {

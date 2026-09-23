@@ -141,6 +141,14 @@ func (s *Service) Catalog(ctx context.Context) ([]domain.StarGift, error) {
 	return append([]domain.StarGift(nil), s.gifts...), nil
 }
 
+// CatalogAll reads a fresh catalog including disabled gifts for admin imports.
+func (s *Service) CatalogAll(ctx context.Context) ([]domain.StarGift, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("star gift store is not configured")
+	}
+	return s.store.CatalogAll(ctx)
+}
+
 func (s *Service) CatalogHash(ctx context.Context) (int, error) {
 	if err := s.ensureCatalog(ctx); err != nil {
 		return 0, err

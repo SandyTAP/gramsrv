@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -1502,6 +1503,47 @@ func TestCommandIDConflictRejectsDifferentGiftBytes(t *testing.T) {
 	}
 }
 
+func testGiftPackZIP(t *testing.T, asset string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w := zip.NewWriter(&out)
+	for name, content := range map[string]string{
+		"pack.json":   `{"pack_name":"Test","gifts":[{"title":"Cake","stars":50,"convert_stars":25,"base_animation":"cake.lottie"}]}`,
+		"cake.lottie": asset,
+	} {
+		f, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func TestImportGiftPackDryRunPublishAndContentBinding(t *testing.T) {
+	gifts := &fakeGiftsService{}
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Gifts: gifts, Now: fixedNow})
+	req := ImportGiftPackRequest{CommandMeta: CommandMeta{CommandID: "dry-pack", Actor: "ops", Reason: "catalog", DryRun: true}, FileName: "custom.zip", Data: testGiftPackZIP(t, `{"v":"5.7"}`)}
+	preview, err := svc.ImportGiftPack(context.Background(), req)
+	if err != nil || gifts.createCalls != 0 || preview.Details["content_sha256"] == "" {
+		t.Fatalf("preview=%+v err=%v writes=%d", preview, err, gifts.createCalls)
+	}
+	req.Data = testGiftPackZIP(t, `{"v":"5.8"}`)
+	if _, err := svc.ImportGiftPack(context.Background(), req); err == nil || err.Error() != "COMMAND_ID_CONFLICT" {
+		t.Fatalf("hash binding: %v", err)
+	}
+	req.CommandMeta = CommandMeta{CommandID: "exec-pack", Actor: "ops", Reason: "catalog"}
+	result, err := svc.ImportGiftPack(context.Background(), req)
+	if err != nil || gifts.createCalls != 1 || result.Status != "completed" || gifts.lastBundle.Catalog.CommandID != "exec-pack" {
+		t.Fatalf("publish=%+v err=%v writes=%d", result, err, gifts.createCalls)
+	}
+}
+
 func TestImportStarGiftReleasedByUsernameAndNumericID(t *testing.T) {
 	gifts := &fakeGiftsService{}
 	lookup := &fakeUserLookup{users: []domain.User{{ID: 1_780_243_207, Username: "durov"}}}
@@ -1888,6 +1930,10 @@ type fakeGiftsService struct {
 	createCalls int
 	lastBundle  domain.StarGiftCatalogBundleWrite
 	lastWrite   domain.StarGiftCatalogWrite
+}
+
+func (*fakeGiftsService) CatalogAll(context.Context) ([]domain.StarGift, error) {
+	return nil, nil
 }
 
 func (f *fakeGiftsService) GiftByID(_ context.Context, id int64) (domain.StarGift, bool, error) {

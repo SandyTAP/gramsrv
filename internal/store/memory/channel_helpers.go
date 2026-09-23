@@ -537,8 +537,25 @@ func (s *ChannelStore) resolveChannelReplyLocked(req domain.SendChannelMessageRe
 		return nil, domain.ErrReplyMessageIDInvalid
 	}
 	if req.ReplyTo.MessageID == 0 {
-		if req.ReplyTo.TopMessageID <= 0 || !channel.Forum {
+		if req.ReplyTo.TopMessageID <= 0 {
 			return nil, domain.ErrReplyMessageIDInvalid
+		}
+		if !channel.Forum {
+			root, ok := s.findMessageLocked(req.ChannelID, req.ReplyTo.TopMessageID)
+			if !ok || root.ID <= member.AvailableMinID || channel.LinkedChatID == 0 || root.Forward == nil {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			source, ok := s.channels[channel.LinkedChatID]
+			if !ok {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			post, ok := s.findMessageLocked(source.ID, root.Forward.ChannelPost)
+			if !ok || !domain.LinkedDiscussionRootMatches(channel, source, root, post) {
+				return nil, domain.ErrReplyMessageIDInvalid
+			}
+			reply := cloneMessageReply(req.ReplyTo)
+			reply.MessageID, reply.TopMessageID, reply.Peer = root.ID, root.ID, channelPeer
+			return reply, nil
 		}
 		topic, ok := s.topics[req.ChannelID][req.ReplyTo.TopMessageID]
 		if !ok || topic.Hidden {
