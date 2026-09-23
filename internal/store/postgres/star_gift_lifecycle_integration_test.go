@@ -1767,6 +1767,157 @@ WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID, hash); er
 	}
 }
 
+// TestStarGiftResaleFloorIgnoresTrollListingsPostgres pins the troll-proof
+// resale floor: one overpriced listing set far above the gift's base price must
+// not become the enforced minimum for everybody else. The floor stays the
+// cheapest live listing of the gift type, ignoring listings priced above
+// StarGiftResaleFloorMultiple x the active revision's base stars — so a single
+// ~600 XTR gift listed at 35000 XTR no longer locks the market, while genuine
+// premiums within the multiple still push the floor up.
+func TestStarGiftResaleFloorIgnoresTrollListingsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	troll := createTestUser(t, ctx, users, "+1884"+suffix+"01", "TrollSeller", "")
+	legit := createTestUser(t, ctx, users, "+1884"+suffix+"02", "LegitSeller", "")
+	stars := NewStarsStore(pool)
+	for _, u := range []domain.User{troll, legit} {
+		if _, _, err := stars.EnsureGrant(ctx, u.ID, 20000, now); err != nil {
+			t.Fatalf("grant: %v", err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	base := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Troll Floor " + suffix, Stars: 600, ConvertStars: 200, Enabled: true,
+		Document: collectibleTestDocument(base, "troll-floor.tgs"),
+		Blob:     collectibleTestBlob(base, "troll-floor"), Animation: collectibleTestAnimation("troll-floor.tgs"),
+		Actor: "integration", CommandID: "troll-floor-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 20, SlugPrefix: "tf-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(base+1, "tf-model.tgs"), Blob: collectibleTestBlobPtr(base+1, "tf-model"), Animation: collectibleTestAnimationPtr("tf-model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(base+4, "tf-model-two.tgs"), Blob: collectibleTestBlobPtr(base+4, "tf-model-two"), Animation: collectibleTestAnimationPtr("tf-model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(base+2, "tf-pattern.tgs"), Blob: collectibleTestBlobPtr(base+2, "tf-pattern"), Animation: collectibleTestAnimationPtr("tf-pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(base+3, "tf-pattern-two.tgs"), Blob: collectibleTestBlobPtr(base+3, "tf-pattern-two"), Animation: collectibleTestAnimationPtr("tf-pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Night", BackdropID: 77, CenterColor: 0x112233, EdgeColor: 0x223344, PatternColor: 0x334455, TextColor: 0xffffff, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Day", BackdropID: 78, CenterColor: 0xaabbcc, EdgeColor: 0x778899, PatternColor: 0xddeeff, TextColor: 0x111111, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "troll-floor-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+
+	upgradeUnique := func(user domain.User, buyerUserID int64, cmd, ref string, date int) (domain.UniqueStarGift, domain.SavedStarGiftRef) {
+		t.Helper()
+		purchase := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{
+			BuyerUserID: buyerUserID, To: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID},
+			GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "tf-purchase-" + ref + "-" + cmd, Date: date,
+		})
+		bought, err := lifecycle.PurchaseStarGift(ctx, purchase)
+		if err != nil {
+			t.Fatalf("purchase %s: %v", ref, err)
+		}
+		upgraded, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{
+			UserID: user.ID, Ref: domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}, MsgID: bought.Saved.MsgID},
+			RequirePrepaid: true, KeepOriginalDetails: true, CommandKey: "tf-upgrade-" + ref + "-" + cmd, Date: date + 1,
+		})
+		if err != nil {
+			t.Fatalf("upgrade %s: %v", ref, err)
+		}
+		ref2 := domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}, MsgID: upgraded.Saved.MsgID}
+		return upgraded.Unique, ref2
+	}
+	trollUnique, trollRef := upgradeUnique(troll, troll.ID, suffix, "troll", now)
+	legitUnique, legitRef := upgradeUnique(legit, legit.ID, suffix, "legit", now+10)
+
+	readFloor := func() int64 {
+		t.Helper()
+		var floor int64
+		if err := pool.QueryRow(ctx, `SELECT resell_min_stars FROM star_gift_catalog WHERE gift_id=$1`, entry.Gift.ID).Scan(&floor); err != nil {
+			t.Fatalf("read floor: %v", err)
+		}
+		return floor
+	}
+	readValueFloor := func(uniqueID int64) int64 {
+		t.Helper()
+		info, err := lifecycle.UniqueStarGiftValueInfo(ctx, uniqueID)
+		if err != nil {
+			t.Fatalf("value info: %v", err)
+		}
+		return info.FloorPrice
+	}
+
+	// The troll lists far above the gift's ~600 XTR base price. The listing is
+	// allowed, but it must not become the enforced floor for the gift type.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: troll.ID,
+		Ref:         trollRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 35000}, Date: now + 2,
+	}); err != nil {
+		t.Fatalf("troll listing: %v", err)
+	}
+	if floor := readFloor(); floor != 0 {
+		t.Fatalf("floor after troll listing = %d, want 0 (troll price must not count)", floor)
+	}
+	info, err := lifecycle.UniqueStarGiftValueInfo(ctx, trollUnique.ID)
+	if err != nil || info.FloorPrice != 0 {
+		t.Fatalf("value floor after troll listing = %+v err %v, want 0", info, err)
+	}
+
+	// The troll listing must not block a genuine undercut, and a genuine premium
+	// within N x base (6000) must restore the floor to its real market value.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: legit.ID,
+		Ref:         legitRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 3000}, Date: now + 12,
+	}); err != nil {
+		t.Fatalf("legit listing undercutting the troll: %v", err)
+	}
+	if floor := readFloor(); floor != 3000 {
+		t.Fatalf("floor after legit listing = %d, want 3000", floor)
+	}
+	if floor := readValueFloor(trollUnique.ID); floor != 3000 {
+		t.Fatalf("troll value floor = %d, want 3000", floor)
+	}
+	if floor := readValueFloor(legitUnique.ID); floor != 3000 {
+		t.Fatalf("legit value floor = %d, want 3000", floor)
+	}
+
+	// A listing even further from the true market still cannot undercut the real
+	// market floor — the dynamic minimum keeps protecting against crash-downs.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: legit.ID,
+		Ref:         legitRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 2500}, Date: now + 13,
+	}); err == nil || !errors.Is(err, domain.ErrStarGiftResaleUnavailable) {
+		t.Fatalf("undercut below the real floor = %v, want ErrStarGiftResaleUnavailable", err)
+	}
+}
+
 func craftedSourceEditForUserAndGift(result domain.StarGiftCraftResult, userID, uniqueGiftID int64) domain.EditedMessageForUser {
 	for _, edit := range result.SourceEdits {
 		if edit.UserID != userID {

@@ -535,8 +535,22 @@ func TestChannelsGetChannelRecommendationsRPC(t *testing.T) {
 		}
 	}
 
-	if _, err := r.onChannelsGetChannelRecommendations(WithUserID(ctx, owner.ID), recommendationsReq(group)); err == nil || !strings.Contains(err.Error(), "CHANNEL_INVALID") {
-		t.Fatalf("megagroup recommendations err = %v, want CHANNEL_INVALID", err)
+	got, err = r.onChannelsGetChannelRecommendations(WithUserID(ctx, owner.ID), recommendationsReq(group))
+	if err != nil {
+		t.Fatalf("megagroup recommendations by source err = %v, want none", err)
+	}
+	groupSlice, ok := got.(*tg.MessagesChatsSlice)
+	if !ok {
+		t.Fatalf("megagroup recommendations = %T %+v, want messages.chatsSlice", got, got)
+	}
+	for _, chat := range groupSlice.Chats {
+		channel, ok := chat.(*tg.Channel)
+		if !ok {
+			t.Fatalf("megagroup recommendation chat = %T, want channel", chat)
+		}
+		if channel.ID == group.ID {
+			t.Fatalf("megagroup recommendations include the source channel itself: %+v", channel)
+		}
 	}
 
 	globalA := createPublicBroadcast(other, "Global A", "global_recs_a", 5000)

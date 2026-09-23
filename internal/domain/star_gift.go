@@ -285,6 +285,17 @@ const (
 // that range on its own.
 const MaxStarGiftAuctionBidStars int64 = 10_000_000
 
+// StarGiftResaleFloorMultiple is the maximum magnitude a listing may exceed the
+// gift's base release price and still count toward the dynamic resale floor
+// (resell_min_stars / floor_price). The floor is computed as the cheapest active
+// listing for the gift type, but a single overpriced "troll" listing (set far
+// above the ~base price on purpose) would otherwise hijack that MIN and become
+// the enforced floor for every future listing of the same gift. Listings above
+// multiple×base are ignored by the floor projection while still remaining
+// visible and purchasable — the floor stays market-driven and per-gift, never an
+// absolute hardcoded minimum.
+const StarGiftResaleFloorMultiple int64 = 10
+
 type StarGiftAmount struct {
 	Currency StarGiftCurrency
 	Amount   int64

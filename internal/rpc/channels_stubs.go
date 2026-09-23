@@ -66,12 +66,18 @@ func (r *Router) publicRecommendationSourceChannel(ctx context.Context, userID i
 	}
 	channel, err := r.deps.Channels.GetJoinableChannel(ctx, userID, ref.ID)
 	if err != nil {
+		r.log.Debug("channels.getChannelRecommendations source not joinable",
+			append(r.contextLogFields(ctx), zap.Int64("source_channel_id", ref.ID), zap.Error(err))...)
 		return 0, channelInvalidErr(err)
 	}
 	if !inputChannelAccessHashMatches(ref, channel) {
+		r.log.Debug("channels.getChannelRecommendations source access hash mismatch",
+			append(r.contextLogFields(ctx), zap.Int64("source_channel_id", ref.ID))...)
 		return 0, channelInvalidErr(domain.ErrChannelPrivate)
 	}
-	if channel.Deleted || !channel.Broadcast || channel.Megagroup || channel.Username == "" {
+	if channel.Deleted {
+		r.log.Debug("channels.getChannelRecommendations source deleted",
+			append(r.contextLogFields(ctx), zap.Int64("source_channel_id", ref.ID))...)
 		return 0, channelInvalidErr(domain.ErrChannelInvalid)
 	}
 	return channel.ID, nil
