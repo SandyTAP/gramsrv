@@ -126,3 +126,63 @@ func TestStarsLedgerPostgres(t *testing.T) {
 		}
 	}
 }
+
+// TestStarsAirdropPostgres 回归批量贷记（admin 的「发给所有人」）：只命中真实用户
+// （is_bot=false、排除系统账号），余额与流水原子写入，新账号建行即 granted=true
+// （吸收起始授予、避免重复发放）。
+func TestStarsAirdropPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := NewStarsStore(pool)
+	users := NewUserStore(pool)
+	suffix := randomSuffix(t)
+
+	alice, err := users.Create(ctx, domain.User{AccessHash: 93, Phone: "+1666" + suffix + "01", FirstName: "StarsAirdropAlice"})
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bot, err := users.Create(ctx, domain.User{AccessHash: 93, Phone: "+1666" + suffix + "02", FirstName: "StarsAirdropBot"})
+	if err != nil {
+		t.Fatalf("create bot: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE users SET is_bot = true WHERE id = $1", bot.ID); err != nil {
+		t.Fatalf("mark bot: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_transactions WHERE user_id = ANY($1)", []int64{alice.ID, bot.ID})
+		_, _ = pool.Exec(ctx, "DELETE FROM stars_balances WHERE user_id = ANY($1)", []int64{alice.ID, bot.ID})
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1)", []int64{alice.ID, bot.ID})
+	})
+
+	if count, err := st.CountCreditAllUsers(ctx); err != nil {
+		t.Fatalf("count credit-all: %v", err)
+	} else if count < 1 {
+		t.Fatalf("count = %d, want >= 1 (alice included)", count)
+	}
+
+	affected, err := st.CreditAll(ctx, 500, domain.StarsReasonAdjust, 1700000010, "Admin Stars grant (all)", "promo")
+	if err != nil {
+		t.Fatalf("credit-all: %v", err)
+	}
+	if affected < 1 {
+		t.Fatalf("affected = %d, want >= 1", affected)
+	}
+
+	if bal, err := st.GetBalance(ctx, alice.ID); err != nil {
+		t.Fatalf("alice balance: %v", err)
+	} else if bal.Balance != 500 || !bal.Granted {
+		t.Fatalf("alice balance = %+v, want 500 granted=true", bal)
+	}
+	if bal, err := st.GetBalance(ctx, bot.ID); err != nil {
+		t.Fatalf("bot balance: %v", err)
+	} else if bal.Balance != 0 {
+		t.Fatalf("bot balance = %+v, want 0 (bots excluded)", bal)
+	}
+	page, err := st.ListTransactions(ctx, alice.ID, domain.StarsTransactionQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("alice ledger: %v", err)
+	}
+	if len(page.Transactions) != 1 || page.Transactions[0].Amount != 500 || page.Transactions[0].Reason != domain.StarsReasonAdjust {
+		t.Fatalf("alice ledger = %+v, want one +500 adjust", page.Transactions)
+	}
+}

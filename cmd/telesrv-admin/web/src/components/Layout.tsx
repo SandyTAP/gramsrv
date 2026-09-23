@@ -193,7 +193,7 @@ export function Shell({
             href={canManagePremium ? "/monetization" : "/give-gifts"}
             route={route}
             navigate={navigate}
-            activeWhen={(path) => path.startsWith("/monetization") || path.startsWith("/premium") || path.startsWith("/give-gifts")}
+            activeWhen={(path) => path.startsWith("/monetization") || path.startsWith("/premium") || path.startsWith("/give-gifts") || path.startsWith("/star-issue")}
           >
             {t("layout.grants")}
           </NavLink>

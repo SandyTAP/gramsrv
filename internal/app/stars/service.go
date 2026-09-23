@@ -84,6 +84,29 @@ func (s *Service) Debit(ctx context.Context, userID, amount int64, reason domain
 	return s.store.Debit(ctx, userID, amount, reason, peer, int(s.now().Unix()), title, desc)
 }
 
+// CountStarsAllUsers 返回批量贷记的候选真实用户数（dry-run 预览用）；
+// 底层 store 不支持时返回 domain.ErrStarsAirdropUnsupported。
+func (s *Service) CountStarsAllUsers(ctx context.Context) (int64, error) {
+	airdrop, ok := s.store.(store.StarsAirdropStore)
+	if !ok {
+		return 0, domain.ErrStarsAirdropUnsupported
+	}
+	return airdrop.CountCreditAllUsers(ctx)
+}
+
+// GrantStarsAll 批量贷记给所有真实用户（admin 的「发给所有人」）；返回受影响账号数。
+// 底层 store 不支持时返回 domain.ErrStarsAirdropUnsupported。
+func (s *Service) GrantStarsAll(ctx context.Context, amount int64, title, desc string) (int64, error) {
+	if amount <= 0 {
+		return 0, domain.ErrStarsInvalidAmount
+	}
+	airdrop, ok := s.store.(store.StarsAirdropStore)
+	if !ok {
+		return 0, domain.ErrStarsAirdropUnsupported
+	}
+	return airdrop.CreditAll(ctx, amount, domain.StarsReasonAdjust, int(s.now().Unix()), title, desc)
+}
+
 // ListTransactions 按方向与顺序做 keyset 分页，首读时惰性授予。
 func (s *Service) ListTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
 	query, err := domain.NormalizeStarsTransactionQuery(query)

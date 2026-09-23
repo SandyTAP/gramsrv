@@ -36,3 +36,14 @@ type StarsPurchaseStore interface {
 type StarsGiveawayStore interface {
 	GetStarsGiveawayInfo(context.Context, int64, int64, int, int) (domain.StarsGiveawayInfo, error)
 }
+
+// StarsAirdropStore 是批量贷记「所有真实用户」的可选能力（admin 的 GrantStarsAll）。
+// 只有 postgres 后端实现；内存后端用于快速 RPC 测试、无需模拟全量 users 表。
+type StarsAirdropStore interface {
+	// CountCreditAllUsers 返回批量贷记的候选账号数（users 表 is_bot=false、排除系统账号）。
+	CountCreditAllUsers(ctx context.Context) (int64, error)
+	// CreditAll 在单个事务内给所有真实用户贷记 amount（新账号建行 granted=true、
+	// 已有账号余额累加并同样置 granted=true 以吸收起始授予），每人写一条流水；
+	// 返回受影响账号数。
+	CreditAll(ctx context.Context, amount int64, reason domain.StarsTransactionReason, date int, title, desc string) (int64, error)
+}
