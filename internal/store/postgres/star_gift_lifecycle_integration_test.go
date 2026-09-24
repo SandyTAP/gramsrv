@@ -1035,6 +1035,72 @@ func TestStarGiftOfferRejectsDeletedOwnerPostgres(t *testing.T) {
 	}
 }
 
+func TestStarGiftPurchaseRejectsFrozenRecipientPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	buyer := createTestUser(t, ctx, users, "+1881"+suffix+"60", "FrozenGiftBuyer", "")
+	recipient := createTestUser(t, ctx, users, "+1881"+suffix+"61", "FrozenGiftRecipient", "")
+	recipientPeer := domain.Peer{Type: domain.PeerTypeUser, ID: recipient.ID}
+
+	stars := NewStarsStore(pool)
+	if _, _, err := stars.EnsureGrant(ctx, buyer.ID, 10000, now); err != nil {
+		t.Fatalf("grant buyer stars: %v", err)
+	}
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Frozen Recipient " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "frozen-recipient.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "frozen-recipient"), Animation: collectibleTestAnimation("frozen-recipient.tgs"),
+		Actor: "integration", CommandID: "frozen-recipient-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create frozen-recipient catalog: %v", err)
+	}
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	// A live recipient accepts the gift to prove the baseline flow works.
+	liveReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-live-" + suffix, Date: now, Message: "hello"})
+	live, err := lifecycle.PurchaseStarGift(ctx, liveReq)
+	if err != nil || live.Saved.MsgID <= 0 {
+		t.Fatalf("purchase to live recipient = %+v err %v", live, err)
+	}
+
+	admin := NewAdminStore(pool)
+	freeze := domain.AccountFreeze{UserID: recipient.ID, Frozen: true, Since: time.Unix(int64(now), 0),
+		Until: time.Unix(int64(now)+3600, 0), AppealURL: "https://example.test/" + suffix, Reason: "integration", Actor: "integration", CommandID: "freeze-recipient-" + suffix}
+	if _, err := admin.SetAccountFreeze(ctx, freeze); err != nil {
+		t.Fatalf("freeze recipient account: %v", err)
+	}
+	frozenReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-send-" + suffix, Date: now + 2, Message: "hello"})
+	if _, err := lifecycle.PurchaseStarGift(ctx, frozenReq); !errors.Is(err, domain.ErrStarGiftRecipientUnavailable) {
+		t.Fatalf("purchase to frozen recipient = %v, want ErrStarGiftRecipientUnavailable", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 9950 {
+		t.Fatalf("frozen-rejected purchase must not debit buyer = %+v err %v", balance, err)
+	}
+	var frozenGiftRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM peer_star_gifts WHERE owner_peer_type='user' AND owner_peer_id=$1 AND from_user_id=$2`, recipient.ID, buyer.ID).Scan(&frozenGiftRows); err != nil || frozenGiftRows != 1 {
+		t.Fatalf("frozen-rejected purchase must not add saved gifts = %d err %v", frozenGiftRows, err)
+	}
+
+	if unfrozen, err := admin.SetAccountFreeze(ctx, domain.AccountFreeze{UserID: recipient.ID, Actor: "integration", CommandID: "unfreeze-recipient-" + suffix}); err != nil || unfrozen.Frozen {
+		t.Fatalf("unfreeze recipient account = %+v err %v", unfrozen, err)
+	}
+	liveAgain, err := lifecycle.PurchaseStarGift(ctx, issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-live-again-" + suffix, Date: now + 3, Message: "hello"}))
+	if err != nil || liveAgain.Saved.MsgID <= 0 {
+		t.Fatalf("purchase after unfreeze = %+v err %v", liveAgain, err)
+	}
+}
+
 func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
