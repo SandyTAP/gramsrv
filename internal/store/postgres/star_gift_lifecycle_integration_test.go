@@ -891,6 +891,113 @@ WHERE owner_user_id=$1
 
 }
 
+func TestStarGiftOfferRejectsDeletedOwnerPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	doomed := createTestUser(t, ctx, users, "+1881"+suffix+"10", "DoomedOwner", "")
+	buyer := createTestUser(t, ctx, users, "+1881"+suffix+"11", "DeletedOfferBuyer", "")
+	doomedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: doomed.ID}
+
+	stars := NewStarsStore(pool)
+	for _, u := range []domain.User{doomed, buyer} {
+		if _, _, err := stars.EnsureGrant(ctx, u.ID, 10000, now); err != nil {
+			t.Fatalf("grant stars to %d: %v", u.ID, err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Deleted " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "deleted.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "deleted"), Animation: collectibleTestAnimation("deleted.tgs"),
+		Actor: "integration", CommandID: "deleted-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create deleted-owner catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 4, SlugPrefix: "del-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+1, "deleted-model.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+1, "deleted-model"), Animation: collectibleTestAnimationPtr("deleted-model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+3, "deleted-model-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+3, "deleted-model-two"), Animation: collectibleTestAnimationPtr("deleted-model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+2, "deleted-pattern.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+2, "deleted-pattern"), Animation: collectibleTestAnimationPtr("deleted-pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+4, "deleted-pattern-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+4, "deleted-pattern-two"), Animation: collectibleTestAnimationPtr("deleted-pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Night", BackdropID: 79, CenterColor: 0x010203, EdgeColor: 0x040506, PatternColor: 0x070809, TextColor: 0x0a0b0c, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Day", BackdropID: 80, CenterColor: 0x111213, EdgeColor: 0x141516, PatternColor: 0x171819, TextColor: 0x1a1b1c, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "deleted-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("publish deleted-owner pool: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+
+	purchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: doomed.ID, To: doomedPeer,
+		GiftID: entry.Gift.ID, CommandKey: "deleted-purchase-" + suffix, Date: now, Message: "hello"})
+	purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	if err != nil {
+		t.Fatalf("purchase deleted-owner gift: %v", err)
+	}
+	upgraded, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{
+		UserID: doomed.ID, Ref: domain.SavedStarGiftRef{Owner: doomedPeer, MsgID: purchased.Saved.MsgID},
+		RequirePrepaid: false, ChargeStars: 100, FormID: 92001, KeepOriginalDetails: true,
+		CommandKey: "deleted-upgrade-" + suffix, Date: now + 1,
+	})
+	if err != nil || upgraded.Unique.Slug == "" || upgraded.Unique.Owner != doomedPeer || upgraded.Unique.OfferMinStars <= 0 {
+		t.Fatalf("upgrade deleted-owner gift = %+v err %v", upgraded, err)
+	}
+
+	// The same gift must accept offers while its owner account is alive.
+	live, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92002, Date: now + 2})
+	if err != nil || live.Offer.OfferMsgID <= 0 {
+		t.Fatalf("offer while owner alive = %+v err %v", live, err)
+	}
+	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: doomed.ID, OfferMsgID: live.Offer.OfferMsgID, Decline: true, Date: now + 3,
+	}); err != nil {
+		t.Fatalf("decline pre-deletion offer: %v", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("declined offer refund = %+v err %v", balance, err)
+	}
+
+	if _, err := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, doomed.ID, domain.AccountDeletionManual, "manual", time.Unix(int64(now)+4, 0)); err != nil {
+		t.Fatalf("execute account deletion: %v", err)
+	}
+	if _, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92004, Date: now + 5}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
+		t.Fatalf("offer against deleted owner = %v, want ErrStarGiftOfferInvalid", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("rejected offer must not debit buyer = %+v err %v", balance, err)
+	}
+	var extraOffers int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_offers WHERE buyer_user_id=$1 AND random_id=$2`, buyer.ID, int64(92004)).Scan(&extraOffers); err != nil || extraOffers != 0 {
+		t.Fatalf("rejected offer rows = %d err %v", extraOffers, err)
+	}
+}
+
 func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
