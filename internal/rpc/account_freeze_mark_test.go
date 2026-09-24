@@ -6,6 +6,7 @@ import (
 
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
 	appusers "telesrv/internal/app/users"
@@ -88,5 +89,59 @@ func TestUsersGetFullUserShowsFrozenMarkOnDeletedTombstone(t *testing.T) {
 	}
 	if self.FullUser.BotVerification.Icon != 0 {
 		t.Fatalf("self full user bot_verification = %+v, want none", self.FullUser.BotVerification)
+	}
+}
+
+// TestContactsResolveUsernameHidesFrozenOwnersAccount locks the frozen username
+// resolution at the RPC boundary: every username (editable slot and collectible
+// NFT) of a frozen account must resolve to USERNAME_NOT_OCCUPIED ("not found")
+// for other viewers while the account stays occupied for claimers. Unfreezing
+// restores resolution without any username writes.
+func TestContactsResolveUsernameHidesFrozenOwnersAccount(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewUserStore()
+	viewer, err := store.Create(ctx, domain.User{AccessHash: 3, Phone: "15550001003", FirstName: "Viewer"})
+	if err != nil {
+		t.Fatalf("create viewer: %v", err)
+	}
+	frozen, err := store.Create(ctx, domain.User{AccessHash: 4, Phone: "15550001004", FirstName: "Frozen Username", Username: "frozen_public"})
+	if err != nil {
+		t.Fatalf("create frozen: %v", err)
+	}
+	registry := memory.NewCollectibleUsernameStore()
+	store.AttachUsernameRegistry(registry)
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: frozen.ID}
+	if _, err := registry.SetEditableUsername(ctx, peer, frozen.Username); err != nil {
+		t.Fatalf("seed editable registry: %v", err)
+	}
+	if _, created, err := registry.MintCollectibleUsername(ctx, domain.MintCollectibleUsernameRequest{
+		Username: "frozen_nft",
+		Owner:    peer,
+		Currency: domain.CollectibleCurrencyStars,
+		Amount:   1,
+		Actor:    "test",
+	}); err != nil || !created {
+		t.Fatalf("mint collectible: created=%v err=%v", created, err)
+	}
+	freeze := freezeMarkTestFreezes{items: map[int64]domain.AccountFreeze{
+		frozen.ID: {UserID: frozen.ID, Frozen: true, Version: 9},
+	}}
+	usersService := appusers.NewService(store, appusers.WithAccountFreezeProvider(freeze))
+	r := New(Config{}, Deps{Users: usersService}, zaptest.NewLogger(t), clock.System)
+
+	for _, username := range []string{"frozen_public", "frozen_nft"} {
+		_, err := r.onContactsResolveUsername(WithUserID(ctx, viewer.ID), &tg.ContactsResolveUsernameRequest{Username: username})
+		if !tgerr.Is(err, "USERNAME_NOT_OCCUPIED") {
+			t.Fatalf("resolve frozen %q err = %v, want USERNAME_NOT_OCCUPIED", username, err)
+		}
+	}
+
+	delete(freeze.items, frozen.ID)
+	resolved, err := r.onContactsResolveUsername(WithUserID(ctx, viewer.ID), &tg.ContactsResolveUsernameRequest{Username: "frozen_public"})
+	if err != nil {
+		t.Fatalf("resolve unfrozen: %v", err)
+	}
+	if peer, ok := resolved.Peer.(*tg.PeerUser); !ok || peer.UserID != frozen.ID {
+		t.Fatalf("resolve unfrozen peer = %+v, want user %d", resolved.Peer, frozen.ID)
 	}
 }

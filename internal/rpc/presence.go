@@ -151,6 +151,27 @@ func (p *presenceTracker) clearSession(key presenceSessionKey) {
 	}
 }
 
+// dropUser removes every session presence entry of a user and cancels the
+// pending offline grace timer. Used when an account transitions into the frozen
+// state: the frozen account must never render online toward any peer.
+func (p *presenceTracker) dropUser(userID int64) {
+	if p == nil || userID == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sessions := p.byUser[userID]; len(sessions) > 0 {
+		for key := range sessions {
+			delete(p.bySession, key)
+		}
+		delete(p.byUser, userID)
+	}
+	if t := p.offlineTimers[userID]; t != nil {
+		t.Stop()
+		delete(p.offlineTimers, userID)
+	}
+}
+
 func (p *presenceTracker) removeSessionLocked(key presenceSessionKey, userID int64) {
 	delete(p.bySession, key)
 	sessions := p.byUser[userID]
@@ -239,7 +260,73 @@ func normalizePresenceStatus(status domain.UserStatus, now int) domain.UserStatu
 	return status
 }
 
+// isFrozenPresenceUser reports whether userID is under an account freeze and
+// must never render/broadcast online. Pure in-process mask check, O(1).
+func (r *Router) isFrozenPresenceUser(userID int64) bool {
+	if r == nil || userID == 0 {
+		return false
+	}
+	_, frozen := r.frozenPresence.Load(userID)
+	return frozen
+}
+
+// seedFrozenPresence backfills the freeze presence mask from the durable
+// account-freeze fact. Session binds are the recovery hook after a restart:
+// already-consumed notifications leave no dispatch to re-populate the mask, so
+// the first connection of a frozen account must stop the online watermark here.
+func (r *Router) seedFrozenPresence(ctx context.Context, userID int64) {
+	if r == nil || userID == 0 || r.deps.AccountFreeze == nil {
+		return
+	}
+	if r.isFrozenPresenceUser(userID) {
+		return
+	}
+	freeze, found, err := r.deps.AccountFreeze.AccountFreeze(ctx, userID)
+	if err != nil || !found || !freeze.Frozen {
+		return
+	}
+	r.frozenPresence.Store(userID, struct{}{})
+}
+
+// applyFrozenPresence transitions the in-process presence mask and tracker on a
+// freeze/unfreeze change. Freeze evicts the user's online presence entries and
+// cancels the pending offline grace timer; unfreeze only re-enables presence.
+// It never pushes: the instant admin hook separately broadcasts the one-time
+// offline status, while the durable worker path only re-masks the in-process
+// state so no later read/push can resurrect the online watermark.
+func (r *Router) applyFrozenPresence(userID int64, frozen bool) {
+	if r == nil || userID == 0 {
+		return
+	}
+	if !frozen {
+		r.frozenPresence.Delete(userID)
+		return
+	}
+	r.frozenPresence.Store(userID, struct{}{})
+	if r.presence != nil {
+		r.presence.dropUser(userID)
+	}
+}
+
+// announceFrozenOffline immediately broadcasts an offline status for the frozen
+// account to its own sessions and relevant peers, so previously rendered online
+// states are replaced rather than waiting for the next read.
+func (r *Router) announceFrozenOffline(userID int64) {
+	if r == nil || userID == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r.pushUserStatus(ctx, userID,
+		domain.UserStatus{Kind: domain.UserStatusOffline, WasOnline: int(r.clock.Now().Unix())})
+}
+
 func (r *Router) setPresenceFromContext(ctx context.Context, userID int64, offline bool, persistMode presencePersistMode) (domain.UserStatus, bool) {
+	// 冻结账号永不上线：即使客户端显式 updateStatus(online) 或重连续期，也强制按
+	// offline 处理，内存 tracker 不会重新登记 online，也不得向对端广播在线态。
+	if !offline && r.isFrozenPresenceUser(userID) {
+		offline = true
+	}
 	now := int(r.clock.Now().Unix())
 	status := domain.UserStatus{Kind: domain.UserStatusOffline, WasOnline: now}
 	if !offline {
@@ -256,7 +343,11 @@ func (r *Router) setPresenceFromContext(ctx context.Context, userID int64, offli
 		notify = r.presence.setSessionStatus(key, userID, status)
 	}
 	// 在线续期（!offline）去抖；显式 offline 是权威写，强制落库。
-	if persistMode == presencePersistAsync {
+	// 冻结账号例外：冻结期的会话续期不得刷新 last_seen，否则 users.last_seen_at
+	// 一直保持「刚刚」，任何未走冻结投影的读取都会再次泄漏最近在线。
+	if r.isFrozenPresenceUser(userID) {
+		// no-op: frozen 账号不记录冻结期的并发活动
+	} else if persistMode == presencePersistAsync {
 		r.persistLastSeenAsync(ctx, userID, now, !offline)
 	} else {
 		r.persistLastSeen(ctx, userID, now, !offline)
@@ -275,6 +366,7 @@ func (r *Router) announceSessionOnline(ctx context.Context, userID int64) {
 	if bot, known := r.userBotStatus(ctx, userID); !known || bot {
 		return
 	}
+	r.seedFrozenPresence(ctx, userID)
 	status, notify := r.setPresenceFromContext(ctx, userID, false, presencePersistAsync)
 	if !notify {
 		// 本 session 已在线且在刷新间隔内：跳过「向对端广播在线 + 拉对端在线态给本 session」。
@@ -354,6 +446,13 @@ func (r *Router) userPresenceStatusForUser(u domain.User) domain.UserStatus {
 		domain.UserStatusLastMonth,
 		domain.UserStatusEmpty:
 		return u.Status
+	}
+	// 冻结账号不向任何对端渲染在线/精确 last_seen，也不回落为 Recently：统一采用
+	// deleted 墓碑的 Empty 呈现（客户端显示「很久以前」）。否则冻结前的 LastSeenAt
+	// 会沿 userPresenceStatusForUser 透出「几分钟前/最近在线」，与数秒后 tombstone
+	// invalidation 落地的 Empty 打架，形成短暂的最近在线闪烁。
+	if r.isFrozenPresenceUser(userID) {
+		return domain.UserStatus{Kind: domain.UserStatusEmpty}
 	}
 	now := int(r.clock.Now().Unix())
 	if status, ok := r.presence.statusFor(userID, now); ok {

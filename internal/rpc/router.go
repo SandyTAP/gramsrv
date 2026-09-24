@@ -205,6 +205,12 @@ type Router struct {
 	transientPrivateBigReactions transientPrivateBigReactionCache
 	accountSettings              *accountSettingsCache
 	accountFreezeWake            chan struct{}
+
+	// frozenPresence 记录因账号冻结而不得向任何对端显示/广播在线的 userID。
+	// freeze/unfreeze 由 admin hook 与 durable 通知 worker 即时维护；会话首次绑定时
+	// 用 durable fact 补种（seedFrozenPresence），覆盖重启/漏消息后旧在线水位外泄。
+	// 零值 sync.Map 即可用。值仅为占位，存在即冻结。
+	frozenPresence sync.Map // userID(int64) -> struct{}
 	// webPageResolveSem 是链接预览异步解析的并发信号量（有界）：发送后把 pending 占位
 	// 解析为卡片并就地替换。满则丢弃任务（消息留 pending）。nil=未启用（测试可直接调
 	// resolvePendingWebPage 同步验证）。

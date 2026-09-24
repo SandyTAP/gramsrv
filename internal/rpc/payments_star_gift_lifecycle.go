@@ -1065,6 +1065,8 @@ func starGiftLifecycleErr(err error) error {
 		return tgerr.New(400, "PREMIUM_ACCOUNT_REQUIRED")
 	case errors.Is(err, domain.ErrStarGiftOfferExpired):
 		return tgerr.New(400, "STARGIFT_OFFER_EXPIRED")
+	case errors.Is(err, domain.ErrStarGiftRecipientUnavailable):
+		return userIDInvalidErr()
 	case errors.Is(err, domain.ErrStarGiftOwnerInvalid):
 		return tgerr.New(400, "STARGIFT_OWNER_INVALID")
 	case errors.Is(err, domain.ErrStarGiftWithdrawalUnavailable):
