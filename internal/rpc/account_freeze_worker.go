@@ -57,6 +57,7 @@ func (r *Router) drainAccountFreezeNotifications(ctx context.Context, batch int)
 }
 
 func (r *Router) dispatchAccountFreezeNotification(ctx context.Context, svc AccountFreezeNotificationService, notification domain.AccountFreezeNotification) {
+	r.applyFrozenPresence(notification.FrozenUserID, notification.Frozen)
 	peer := domain.Peer{Type: domain.PeerTypeUser, ID: notification.FrozenUserID}
 	if contacts, ok := r.deps.Contacts.(interface{ InvalidateViewers(...int64) }); ok {
 		contacts.InvalidateViewers(notification.TargetUserID)
