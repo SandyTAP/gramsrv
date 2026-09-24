@@ -343,7 +343,11 @@ func (r *Router) setPresenceFromContext(ctx context.Context, userID int64, offli
 		notify = r.presence.setSessionStatus(key, userID, status)
 	}
 	// 在线续期（!offline）去抖；显式 offline 是权威写，强制落库。
-	if persistMode == presencePersistAsync {
+	// 冻结账号例外：冻结期的会话续期不得刷新 last_seen，否则 users.last_seen_at
+	// 一直保持「刚刚」，任何未走冻结投影的读取都会再次泄漏最近在线。
+	if r.isFrozenPresenceUser(userID) {
+		// no-op: frozen 账号不记录冻结期的并发活动
+	} else if persistMode == presencePersistAsync {
 		r.persistLastSeenAsync(ctx, userID, now, !offline)
 	} else {
 		r.persistLastSeen(ctx, userID, now, !offline)
@@ -443,13 +447,12 @@ func (r *Router) userPresenceStatusForUser(u domain.User) domain.UserStatus {
 		domain.UserStatusEmpty:
 		return u.Status
 	}
-	// 冻结账号不向任何对端渲染在线/精确 last_seen：跳过内存 tracker 与
-	// OnlineUserProvider 叠加，回落为离线/最近在线（tombstone 通道已给 Empty）。
+	// 冻结账号不向任何对端渲染在线/精确 last_seen，也不回落为 Recently：统一采用
+	// deleted 墓碑的 Empty 呈现（客户端显示「很久以前」）。否则冻结前的 LastSeenAt
+	// 会沿 userPresenceStatusForUser 透出「几分钟前/最近在线」，与数秒后 tombstone
+	// invalidation 落地的 Empty 打架，形成短暂的最近在线闪烁。
 	if r.isFrozenPresenceUser(userID) {
-		if u.LastSeenAt > 0 {
-			return domain.UserStatus{Kind: domain.UserStatusOffline, WasOnline: u.LastSeenAt}
-		}
-		return domain.UserStatus{Kind: domain.UserStatusRecently}
+		return domain.UserStatus{Kind: domain.UserStatusEmpty}
 	}
 	now := int(r.clock.Now().Unix())
 	if status, ok := r.presence.statusFor(userID, now); ok {

@@ -142,3 +142,61 @@ func TestFrozenPresenceUnfreezeReenablesPresence(t *testing.T) {
 		t.Fatal("account still frozen after unfreeze")
 	}
 }
+
+// TestFrozenPresenceStatusNeverExposesFreshLastSeen locks the read-path
+// regression where a frozen account briefly rendered "recently"/"N minutes ago"
+// (its pre-freeze last_seen) until the viewer's tombstone projection landed.
+// The frozen read must return the deleted-tombstone Empty ("long time ago")
+// immediately and consistently, and never fall back to Recently.
+func TestFrozenPresenceStatusNeverExposesFreshLastSeen(t *testing.T) {
+	userID := frozenPresenceTestUserID + 1
+	r := New(Config{}, Deps{}, zaptest.NewLogger(t), clock.System)
+	r.applyFrozenPresence(userID, true)
+	freshLastSeen := int(time.Now().Unix()) - 120
+	if st := r.userPresenceStatusForUser(domain.User{ID: userID, LastSeenAt: freshLastSeen}); st.Kind != domain.UserStatusEmpty {
+		t.Fatalf("frozen status with fresh last seen = %+v, want UserStatusEmpty", st)
+	}
+	if st := r.userPresenceStatusForUser(domain.User{ID: userID}); st.Kind != domain.UserStatusEmpty {
+		t.Fatalf("frozen status without last seen = %+v, want UserStatusEmpty (not Recently)", st)
+	}
+	// Unfrozen accounts keep the exact last_seen offline semantics.
+	if st := r.userPresenceStatusForUser(domain.User{ID: userID + 100, LastSeenAt: freshLastSeen}); st.Kind != domain.UserStatusOffline || st.WasOnline != freshLastSeen {
+		t.Fatalf("regular user status = %+v, want offline was_online=%d", st, freshLastSeen)
+	}
+}
+
+type captureLastSeenUpdater struct {
+	mapUsersService
+	calls int
+}
+
+func (u *captureLastSeenUpdater) UpdateLastSeen(_ context.Context, _ int64, _ int) error {
+	u.calls++
+	return nil
+}
+
+// TestFrozenPresenceRenewalDoesNotRefreshLastSeen locks the write-path
+// regression: a frozen account's live sessions keep renewing presence on
+// reconnect/session bind, which used to revisit users.last_seen_at to "just
+// now". That fresh durable value is what the read mask leaked for a moment.
+// Frozen renewals must not persist anything; the value stays at the level it
+// had before the freeze, so the account ages into "long time ago".
+func TestFrozenPresenceRenewalDoesNotRefreshLastSeen(t *testing.T) {
+	userID := frozenPresenceTestUserID + 2
+	updater := &captureLastSeenUpdater{}
+	r := New(Config{}, Deps{Users: updater}, zaptest.NewLogger(t), clock.System)
+	r.applyFrozenPresence(userID, true)
+	if _, notify := r.setPresenceFromContext(WithSessionID(WithUserID(context.Background(), userID), 33), userID, false, presencePersistSync); !notify {
+		t.Fatal("frozen renewal should notify once")
+	}
+	if updater.calls != 0 {
+		t.Fatalf("frozen renewal persisted last seen %d times, want 0", updater.calls)
+	}
+	liveID := userID + 100
+	if _, notify := r.setPresenceFromContext(WithSessionID(WithUserID(context.Background(), liveID), 34), liveID, false, presencePersistSync); !notify {
+		t.Fatal("live renewal should notify once")
+	}
+	if updater.calls != 1 {
+		t.Fatalf("live renewal last-seen writes = %d, want 1", updater.calls)
+	}
+}
