@@ -975,18 +975,55 @@ func TestStarGiftOfferRejectsDeletedOwnerPostgres(t *testing.T) {
 	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
 		OwnerUserID: doomed.ID, OfferMsgID: live.Offer.OfferMsgID, Decline: true, Date: now + 3,
 	}); err != nil {
-		t.Fatalf("decline pre-deletion offer: %v", err)
+		t.Fatalf("decline pre-freeze offer: %v", err)
 	}
 	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
 		t.Fatalf("declined offer refund = %+v err %v", balance, err)
 	}
 
-	if _, err := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, doomed.ID, domain.AccountDeletionManual, "manual", time.Unix(int64(now)+4, 0)); err != nil {
+	admin := NewAdminStore(pool)
+	freeze := domain.AccountFreeze{UserID: doomed.ID, Frozen: true, Since: time.Unix(int64(now), 0),
+		Until: time.Unix(int64(now)+3600, 0), AppealURL: "https://example.test/" + suffix, Reason: "integration", Actor: "integration", CommandID: "freeze-" + suffix}
+	if _, err := admin.SetAccountFreeze(ctx, freeze); err != nil {
+		t.Fatalf("freeze owner account: %v", err)
+	}
+	if _, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92003, Date: now + 4}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
+		t.Fatalf("offer against frozen owner = %v, want ErrStarGiftOfferInvalid", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("frozen-rejected offer must not debit buyer = %+v err %v", balance, err)
+	}
+	var frozenOfferRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_offers WHERE buyer_user_id=$1 AND random_id=$2`, buyer.ID, int64(92003)).Scan(&frozenOfferRows); err != nil || frozenOfferRows != 0 {
+		t.Fatalf("frozen-rejected offer rows = %d err %v", frozenOfferRows, err)
+	}
+	unfrozen, err := admin.SetAccountFreeze(ctx, domain.AccountFreeze{UserID: doomed.ID, Actor: "integration", CommandID: "unfreeze-" + suffix})
+	if err != nil || unfrozen.Frozen {
+		t.Fatalf("unfreeze owner account = %+v err %v", unfrozen, err)
+	}
+	unfrozenOffer, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92005, Date: now + 5})
+	if err != nil || unfrozenOffer.Offer.OfferMsgID <= 0 {
+		t.Fatalf("offer after unfreeze = %+v err %v", unfrozenOffer, err)
+	}
+	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: doomed.ID, OfferMsgID: unfrozenOffer.Offer.OfferMsgID, Decline: true, Date: now + 5,
+	}); err != nil {
+		t.Fatalf("decline post-unfreeze offer: %v", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("post-unfreeze declined refund = %+v err %v", balance, err)
+	}
+
+	if _, err := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, doomed.ID, domain.AccountDeletionManual, "manual", time.Unix(int64(now)+6, 0)); err != nil {
 		t.Fatalf("execute account deletion: %v", err)
 	}
 	if _, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
 		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
-		Duration: 120, RandomID: 92004, Date: now + 5}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
+		Duration: 120, RandomID: 92004, Date: now + 7}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
 		t.Fatalf("offer against deleted owner = %v, want ErrStarGiftOfferInvalid", err)
 	}
 	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {

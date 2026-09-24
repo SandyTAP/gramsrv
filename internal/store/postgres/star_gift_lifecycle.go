@@ -735,14 +735,22 @@ func (s *StarGiftLifecycleStore) SendStarGiftOffer(ctx context.Context, req doma
 			if err != nil || !found || gift.Owner != req.Owner || gift.Burned || gift.OwnerAddress != "" || gift.OfferMinStars <= 0 {
 				return domain.ErrStarGiftOfferInvalid
 			}
-			// 已删除账号的收藏品不能再被下单：账户删除只是逻辑墓碑，unique 行
-			// 仍然保留，但市场不应继续对买家开放。FOR SHARE 与删除事务对 users
-			// 行的 FOR UPDATE 互斥，避免下单与删除并发时的 TOCTOU。
+			// 已删除/已冻结账号的收藏品不能再被下单：两者都作为 deleted 墓碑下发
+			// 给其它用户，但 unique 行与账号限制仍然保留，市场不应继续对买家开放。
+			// FOR SHARE 与删除事务对 users 行的 FOR UPDATE 互斥，避免下单与删除
+			// 并发时的 TOCTOU。
 			var activeOwner bool
 			if err := tx.QueryRow(ctx, `SELECT deleted_at IS NULL FROM users WHERE id=$1 FOR SHARE`, req.Owner.ID).Scan(&activeOwner); err != nil {
 				return err
 			}
 			if !activeOwner {
+				return domain.ErrStarGiftOfferInvalid
+			}
+			var ownerFrozen bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM account_restrictions WHERE user_id=$1 AND frozen)`, req.Owner.ID).Scan(&ownerFrozen); err != nil {
+				return err
+			}
+			if ownerFrozen {
 				return domain.ErrStarGiftOfferInvalid
 			}
 			if req.Price.Currency == domain.StarGiftCurrencyStars && gift.OfferMinStars > 0 && req.Price.Amount < int64(gift.OfferMinStars) {
