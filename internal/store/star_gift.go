@@ -120,6 +120,21 @@ type StarGiftLifecycleStore interface {
 	ChannelTonBalance(ctx context.Context, channelID int64) (int64, error)
 	ChannelTonOverallRevenue(ctx context.Context, channelID int64) (int64, error)
 	ChannelTonTransactions(ctx context.Context, channelID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error)
+	// BotStarsBalance reads a bot's own revenue wallet, which is deliberately
+	// separate from the bot user identity's personal Stars balance.
+	BotStarsBalance(ctx context.Context, botUserID int64) (int64, error)
+	// BotStarsOverallRevenue sums only positive entries: it is lifetime revenue
+	// and stays monotonic across refunds and spends.
+	BotStarsOverallRevenue(ctx context.Context, botUserID int64) (int64, error)
+	BotStarsTransactions(ctx context.Context, botUserID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error)
+	// CreditBotStarsWallet applies one settled invoice atomically and reports
+	// whether the credit was new. A replay of the same InvoiceKey returns the
+	// stored balance with false instead of minting a second credit.
+	CreditBotStarsWallet(ctx context.Context, credit domain.BotStarsCredit) (balance int64, credited bool, err error)
+	// BotStarsRevenueSeries aggregates the bot wallet journal into one row per
+	// UTC day over [fromUnix, toUnix] so the revenue chart can be rendered
+	// without pulling the whole history into memory.
+	BotStarsRevenueSeries(ctx context.Context, botUserID int64, fromUnix, toUnix int) ([]domain.BotStarsRevenuePoint, error)
 	// SweepStarGiftLifecycle advances time-driven offer/auction aggregates and
 	// drains their durable notification/delivery outboxes in bounded batches.
 	SweepStarGiftLifecycle(ctx context.Context, now, limit int) error
