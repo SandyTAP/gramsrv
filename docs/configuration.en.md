@@ -513,6 +513,16 @@ objects, verified size/SHA-256, and updated `file_blobs.backend`.
 |---|---|---|
 | `TELESRV_MAPBOX_TOKEN` | secret string / empty | Mapbox Static Images access token for `upload.getWebFile` map previews. Empty uses deterministic placeholders. |
 | `TELESRV_MAPTILE_CACHE_DIR` | path / `data/maptiles` | Disk cache for fetched map thumbnails, preserving byte-stable chunk downloads and limiting quota use. |
+| `TELESRV_GEOIP_ENDPOINTS` | list / empty | Optional ordered failover chain of backends resolving session IPs to the country/region text shown by `account.getAuthorizations`. Every entry must contain the `{ip}` placeholder and use `http`/`https`; the first entry is the primary and unresolved addresses fall through to the next one. Empty keeps the feature disabled and the session list returns the `Unknown` placeholder. Only public routable peers are sent; private, loopback and link-local addresses never leave the host. Ready-made values: `https://api.ipapi.is/?q={ip}`, `https://reallyfreegeoip.org/json/{ip}`, `https://hackmyip.com/api/lookup?ip={ip}`, `https://get.geojs.io/v1/ip/geo/{ip}.json`. An unrecognised host uses a permissive generic JSON parser, so a self-hosted MaxMind proxy can be added as-is. |
+| `TELESRV_GEOIP_TIMEOUT` | duration / `2s` | Per-request timeout for each GeoIP backend. Must be positive and at most `10s`. |
+| `TELESRV_GEOIP_CONCURRENCY` | int / `4` | Maximum in-flight requests across all backends per session-list batch. Must be `1..32`. |
+| `TELESRV_GEOIP_CACHE_TTL` | duration / `24h` | Validity of a successfully resolved address, whichever backend resolved it. Must be positive and longer than the negative TTL. |
+| `TELESRV_GEOIP_NEGATIVE_TTL` | duration / `5m` | Validity of "no backend had an answer" (rate limit, timeout, network error, unknown IP). Written only after the whole chain has been tried, so one backend's coverage gap does not freeze the address. Must be positive and shorter than `TELESRV_GEOIP_CACHE_TTL`, otherwise one rate-limit window freezes the address until the next day. |
+| `TELESRV_GEOIP_CACHE_SIZE` | int / `4096` | Upper bound on cached addresses. Must be `1..1000000`. |
+| `TELESRV_GEOIP_RATE_LIMIT_THRESHOLD` | int / `3` | Consecutive HTTP 429 responses from one backend before it is skipped. Must be `1..100`. Counters are per backend, so one exhausted provider never affects the others. |
+| `TELESRV_GEOIP_RATE_LIMIT_COOLDOWN` | duration / `2m` | How long a rate-limited backend receives no request at all. Must be positive and at most `1h`. |
+| `TELESRV_GEOIP_DOWN_THRESHOLD` | int / `2` | Consecutive timeouts/5xx before a backend is considered unreachable. Must be `1..100`. |
+| `TELESRV_GEOIP_DOWN_COOLDOWN` | duration / `30s` | How long an unreachable backend is skipped. Must be positive and at most `TELESRV_GEOIP_RATE_LIMIT_COOLDOWN`, since a network hiccup should not take a provider offline as long as a quota window. |
 | `TELESRV_EXTERNAL_MEDIA_ENABLE` | bool / `true` | Enables SSRF-protected fetching of external photo/document URLs. |
 | `TELESRV_EXTERNAL_MEDIA_MAX_BYTES` | int bytes / `10485760` | Maximum response body per external-media fetch. Downstream treats `<=0` as the 10 MiB safe default. |
 | `TELESRV_EXTERNAL_MEDIA_RATE_PER_MIN` | int / `60` | Global external-media fetches per minute. Downstream treats `<=0` as its default. |

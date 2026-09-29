@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/iamxvbaba/td/tg"
 	"go.uber.org/zap"
@@ -13,6 +14,7 @@ import (
 	ioscompat "telesrv/internal/compat/ios"
 	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
+	"telesrv/internal/geoip"
 )
 
 // registerAccount 注册 account.* RPC handler。
@@ -600,8 +602,10 @@ func (r *Router) onAccountGetAuthorizations(ctx context.Context) (*tg.AccountAut
 		return nil, internalErr()
 	}
 	out := &tg.AccountAuthorizations{Authorizations: make([]tg.Authorization, 0, len(items))}
+	locations := r.resolveAuthorizationLocations(ctx, items)
+	now := int(r.clock.Now().Unix())
 	for _, item := range items {
-		out.Authorizations = append(out.Authorizations, tgAuthorization(item, authKeyID, int(r.clock.Now().Unix())))
+		out.Authorizations = append(out.Authorizations, r.tgAuthorization(locations[item.IP], item, authKeyID, now))
 	}
 	return out, nil
 }
@@ -2012,7 +2016,46 @@ func (r *Router) pushSelfUserChangedUpdate(ctx context.Context, u domain.User) {
 	})
 }
 
-func tgAuthorization(a domain.Authorization, currentAuthKeyID [8]byte, now int) tg.Authorization {
+// authorizationLocationUnknown 是国家/地区都解析不出来时的回退文案。
+//
+// 协议层没有 help.requestIpAddress 的对等实现,地理归属只能由部署方自备;没有
+// 解析器、解析器失败或上游查无此 IP 时都必须回落到这里,而不是回传空串——
+// 空串会让客户端把位置渲染成空行,比显示 Unknown 更难解释。
+const authorizationLocationUnknown = "Unknown"
+
+// authorizationLocationLookupTimeout 限制一次会话列表请求里地理解析的总时长。
+//
+// 解析是纯展示增强,拖慢 account.getAuthorizations 没有任何好处,所以给它封顶:
+// 超时后剩余地址按 Unknown 回落,列表照常返回。
+const authorizationLocationLookupTimeout = 3 * time.Second
+
+// resolveAuthorizationLocations 批量解析本次会话列表里出现过的所有 IP。
+//
+// 必须批量:上游一次往返约 0.7s 且限流很凶,逐条解析会把成本乘以设备数。
+// 未注入解析器、或列表里没有任何 IP 时返回 nil,逐条查找会自然回落到占位文案。
+func (r *Router) resolveAuthorizationLocations(ctx context.Context, items []domain.Authorization) map[string]geoip.Location {
+	if r.deps.GeoIP == nil || len(items) == 0 {
+		return nil
+	}
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		// 空白地址同样跳过:解析器会把它判成不可解析,但那仍是一次无谓的调用,
+		// 而上游配额经不起无谓的调用。
+		if strings.TrimSpace(item.IP) != "" {
+			ips = append(ips, item.IP)
+		}
+	}
+	if len(ips) == 0 {
+		return nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, authorizationLocationLookupTimeout)
+	defer cancel()
+	return r.deps.GeoIP.Resolve(lookupCtx, ips)
+}
+
+// tgAuthorization 把一条持久化的授权转成 TL 授权。loc 由调用方预先批量解析,
+// 取不到时退化为零值 -> Unknown。
+func (r *Router) tgAuthorization(loc geoip.Location, a domain.Authorization, currentAuthKeyID [8]byte, now int) tg.Authorization {
 	created := int(a.CreatedAt.Unix())
 	if created == 0 {
 		created = now
@@ -2034,9 +2077,18 @@ func tgAuthorization(a domain.Authorization, currentAuthKeyID [8]byte, now int) 
 		DateCreated:   created,
 		DateActive:    active,
 		IP:            a.IP,
-		Country:       "Unknown",
-		Region:        "Unknown",
+		Country:       authorizationLocationText(loc.Country),
+		Region:        authorizationLocationText(loc.Region),
 	}
+}
+
+// authorizationLocationText 收敛空值到占位文案。上游对查不到的 IP 会返回空的
+// country_name/city,那属于"没查到",不属于"这个 IP 没有国家"。
+func authorizationLocationText(value string) string {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+	return authorizationLocationUnknown
 }
 
 func (r *Router) onAccountGetDefaultProfilePhotoEmojis(ctx context.Context, hash int64) (tg.EmojiListClass, error) {

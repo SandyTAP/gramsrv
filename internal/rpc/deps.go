@@ -9,6 +9,7 @@ import (
 	"github.com/iamxvbaba/td/tlprofile"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/geoip"
 	"telesrv/internal/sfu"
 	"telesrv/internal/store"
 	"telesrv/internal/turnsrv"
@@ -1171,6 +1172,9 @@ type Deps struct {
 	Gifts                      GiftsService
 	Passkey                    PasskeyService
 	Themes                     ThemeService
+	// GeoIP 把会话记录的 IP 解析为 account.getAuthorizations 展示用的国家/地区
+	// 文案。为 nil(未配置地理后端)时列表继续回传占位文案,与启用前一致。
+	GeoIP geoip.Resolver
 }
 
 // ThemeService 抽象自定义云主题(app/themes):创建/更新/查询主题 + 维护每用户已安装列表。

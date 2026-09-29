@@ -1463,6 +1463,95 @@ func TestValidateStarGiftConfigRejectsNegativeInternalTONGrant(t *testing.T) {
 	}
 }
 
+// 未配置端点时必须放行:会话列表继续回传 "Unknown" 占位文案是未启用时的
+// 预期行为,不该让服务起不来。
+func TestValidateGeoIPConfigAllowsDisabledBackend(t *testing.T) {
+	if err := validateGeoIPConfig(Config{}); err != nil {
+		t.Fatalf("empty GeoIP config: %v", err)
+	}
+	// 全是空白的列表等同于未启用,不该把服务卡在启动校验上。
+	if err := validateGeoIPConfig(Config{GeoIPEndpoints: []string{"   ", ""}}); err != nil {
+		t.Fatalf("blank GeoIP endpoints: %v", err)
+	}
+}
+
+func TestValidateGeoIPConfigRejectsUnusableSettings(t *testing.T) {
+	valid := Config{
+		GeoIPEndpoints:          []string{"https://reallyfreegeoip.org/json/{ip}", "https://api.ipapi.is/?q={ip}"},
+		GeoIPTimeout:            2 * time.Second,
+		GeoIPConcurrency:        4,
+		GeoIPCacheTTL:           24 * time.Hour,
+		GeoIPNegativeTTL:        5 * time.Minute,
+		GeoIPCacheSize:          4096,
+		GeoIPRateLimitThreshold: 3,
+		GeoIPRateLimitCooldown:  2 * time.Minute,
+		GeoIPDownThreshold:      2,
+		GeoIPDownCooldown:       30 * time.Second,
+	}
+	if err := validateGeoIPConfig(valid); err != nil {
+		t.Fatalf("valid GeoIP config: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		// failover 链里任何一条坏配置都必须在启动时报出来,而不是等到某次会话列表才发现
+		// 后面那个后端永远不被问。
+		{name: "missing placeholder", mutate: func(c *Config) { c.GeoIPEndpoints[1] = "https://geo.example.test/json" }},
+		{name: "unsupported scheme", mutate: func(c *Config) { c.GeoIPEndpoints[0] = "ftp://geo.example.test/json/{ip}" }},
+		{name: "missing host", mutate: func(c *Config) { c.GeoIPEndpoints[0] = "https:///json/{ip}" }},
+		{name: "zero timeout", mutate: func(c *Config) { c.GeoIPTimeout = 0 }},
+		// 上游正常响应 0.6~1.3s,给到 10s 以上基本是值填错了(比如被当成 duration 串解析),
+		// 那时候每一批解析都会先耗掉整个预算才回落 Unknown。
+		{name: "timeout beyond budget", mutate: func(c *Config) { c.GeoIPTimeout = 30 * time.Second }},
+		{name: "unbounded concurrency", mutate: func(c *Config) { c.GeoIPConcurrency = 33 }},
+		{name: "zero concurrency", mutate: func(c *Config) { c.GeoIPConcurrency = 0 }},
+		// 负缓存必须显著短于正文缓存:长到一样就等于一次限流把该 IP 锁到第二天。
+		{name: "negative ttl not shorter", mutate: func(c *Config) { c.GeoIPNegativeTTL = c.GeoIPCacheTTL }},
+		{name: "zero negative ttl", mutate: func(c *Config) { c.GeoIPNegativeTTL = 0 }},
+		{name: "unbounded cache", mutate: func(c *Config) { c.GeoIPCacheSize = 1_000_001 }},
+		{name: "zero rate limit threshold", mutate: func(c *Config) { c.GeoIPRateLimitThreshold = 0 }},
+		{name: "cooldown too long", mutate: func(c *Config) { c.GeoIPRateLimitCooldown = 2 * time.Hour }},
+		{name: "zero down threshold", mutate: func(c *Config) { c.GeoIPDownThreshold = 0 }},
+		// 短暂抖动不该让后端离线比配额窗口还久。
+		{name: "down cooldown longer than rate limit", mutate: func(c *Config) { c.GeoIPDownCooldown = c.GeoIPRateLimitCooldown + time.Second }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := valid
+			cfg.GeoIPEndpoints = append([]string(nil), valid.GeoIPEndpoints...)
+			tc.mutate(&cfg)
+			if err := validateGeoIPConfig(cfg); err == nil {
+				t.Fatal("unusable GeoIP config was accepted")
+			}
+		})
+	}
+}
+
+// 后端链顺序即 failover 顺序,必须原样保留。重复项交给解析层去重,不该在这里报错。
+func TestLoadGeoIPEndpointsPreservesFailoverOrder(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_GEOIP_ENDPOINTS", "https://a.example/json/{ip}, https://b.example/json/{ip},https://c.example/json/{ip}")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{
+		"https://a.example/json/{ip}",
+		"https://b.example/json/{ip}",
+		"https://c.example/json/{ip}",
+	}
+	if len(cfg.GeoIPEndpoints) != len(want) {
+		t.Fatalf("GeoIPEndpoints = %v, want %v", cfg.GeoIPEndpoints, want)
+	}
+	for i := range want {
+		if cfg.GeoIPEndpoints[i] != want[i] {
+			t.Fatalf("GeoIPEndpoints[%d] = %q, want %q", i, cfg.GeoIPEndpoints[i], want[i])
+		}
+	}
+}
+
 func TestLoadAccountRatingDefaults(t *testing.T) {
 	disableDefaultConfigFile(t)
 

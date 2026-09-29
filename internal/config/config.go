@@ -164,6 +164,29 @@ type Config struct {
 	// granting or dropping rights.
 	AdminScopedTokens []AdminScopedToken
 
+	// GeoIP* 控制 account.getAuthorizations 里会话国家/地区文案的解析。协议层
+	// 没有 help.requestIpAddress 的对等实现,没配这些项时 country/region 继续
+	// 回传 "Unknown" 占位文案,与启用前完全一致。
+	//
+	// GeoIPEndpoints 是按顺序 failover 的后端列表:每个元素是含 {ip} 占位符的 URL
+	// 模板,第一个是主力,上一个查不到或此刻不可用就自动落到下一个。空列表表示未启用。
+	//
+	// 单后端必然会让一部分会话显示 Unknown,实测 2026-09 四家的失效方式各不相同:
+	// reallyfreegeoip.org 连续几次请求后 429(约 60s 恢复);geojs.io 只有 ASN 级
+	// 覆盖,1.1.1.1 那种地址连 country 字段都没有;hackmyip.com 间歇性回 400;
+	// ipapi.is 对保留网段回 is_bogon。所以缓存和熔断不是优化而是必需品,调小
+	// CacheTTL 或 NegativeTTL 会明显提高限流概率。
+	GeoIPEndpoints          []string
+	GeoIPTimeout            time.Duration
+	GeoIPConcurrency        int
+	GeoIPCacheTTL           time.Duration
+	GeoIPNegativeTTL        time.Duration
+	GeoIPCacheSize          int
+	GeoIPRateLimitThreshold int
+	GeoIPRateLimitCooldown  time.Duration
+	GeoIPDownThreshold      int
+	GeoIPDownCooldown       time.Duration
+
 	// PostgresDSN 是业务数据（auth_key / user / authorization 等）持久化的 PostgreSQL 连接串。
 	// 依赖由 deploy/docker-compose.yml 启动；职责划分见 docs/persistence-layer.md。
 	PostgresDSN string
@@ -892,6 +915,16 @@ func Load() (Config, error) {
 		TelegramLoginSweepBatch:               envIntOr("TELESRV_TELEGRAM_LOGIN_SWEEP_BATCH", 500),
 		AdminUIPermissions:                    envListOr("TELESRV_ADMIN_UI_PERMISSIONS", []string{adminPermissionAll}),
 		AdminScopedTokens:                     adminScopedTokens,
+		GeoIPEndpoints:                        envListOr("TELESRV_GEOIP_ENDPOINTS", nil),
+		GeoIPTimeout:                          envDurationOr("TELESRV_GEOIP_TIMEOUT", 2*time.Second),
+		GeoIPConcurrency:                      envIntOr("TELESRV_GEOIP_CONCURRENCY", 4),
+		GeoIPCacheTTL:                         envDurationOr("TELESRV_GEOIP_CACHE_TTL", 24*time.Hour),
+		GeoIPNegativeTTL:                      envDurationOr("TELESRV_GEOIP_NEGATIVE_TTL", 5*time.Minute),
+		GeoIPCacheSize:                        envIntOr("TELESRV_GEOIP_CACHE_SIZE", 4096),
+		GeoIPRateLimitThreshold:               envIntOr("TELESRV_GEOIP_RATE_LIMIT_THRESHOLD", 3),
+		GeoIPRateLimitCooldown:                envDurationOr("TELESRV_GEOIP_RATE_LIMIT_COOLDOWN", 2*time.Minute),
+		GeoIPDownThreshold:                    envIntOr("TELESRV_GEOIP_DOWN_THRESHOLD", 2),
+		GeoIPDownCooldown:                     envDurationOr("TELESRV_GEOIP_DOWN_COOLDOWN", 30*time.Second),
 		AdminUIAddr:                           envOr("TELESRV_ADMIN_UI_ADDR", "127.0.0.1:2600"),
 		AdminUIPassword:                       envOr("TELESRV_ADMIN_UI_PASSWORD", ""),
 		AdminUIToken:                          envOr("TELESRV_ADMIN_UI_TOKEN", ""),
@@ -1196,6 +1229,9 @@ func Load() (Config, error) {
 	if err := validateTelegramLoginConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	if err := validateGeoIPConfig(cfg); err != nil {
+		return Config{}, err
+	}
 	if err := validateBlobStorageConfig(cfg); err != nil {
 		return Config{}, err
 	}
@@ -1407,6 +1443,65 @@ func normalizeAdvertiseIP(raw string) (string, error) {
 		return "", fmt.Errorf("must be a unicast address usable by clients")
 	}
 	return addr.String(), nil
+}
+
+// validateGeoIPConfig 校验会话地理归属后端链。未配置端点时全部放行——
+// 会话列表会继续回传 "Unknown" 占位文案,这是未启用时的预期行为,不该让服务起不来。
+func validateGeoIPConfig(cfg Config) error {
+	configured := 0
+	for _, endpoint := range cfg.GeoIPEndpoints {
+		if strings.TrimSpace(endpoint) == "" {
+			continue
+		}
+		configured++
+		if !strings.Contains(endpoint, "{ip}") {
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entries must contain the {ip} placeholder, got %q", endpoint)
+		}
+		parsed, err := url.Parse(strings.TrimSpace(endpoint))
+		if err != nil {
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q is not a valid URL: %w", endpoint, err)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q must use http or https", endpoint)
+		}
+		if parsed.Host == "" {
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q must include a host", endpoint)
+		}
+	}
+	// 全是空白的列表等同于未启用,不该拖出后面那堆数值校验。
+	if configured == 0 {
+		return nil
+	}
+	// 上游正常响应 0.6~1.3s。给到 10s 以上就说明值填错了(比如误当成 duration
+	// 字符串解析),那时候每一批解析都会先耗掉整个预算才回落 Unknown。
+	if cfg.GeoIPTimeout <= 0 || cfg.GeoIPTimeout > 10*time.Second {
+		return fmt.Errorf("TELESRV_GEOIP_TIMEOUT must be greater than zero and at most 10s")
+	}
+	if cfg.GeoIPConcurrency <= 0 || cfg.GeoIPConcurrency > 32 {
+		return fmt.Errorf("TELESRV_GEOIP_CONCURRENCY must be 1..32")
+	}
+	// 负缓存必须显著短于正文缓存:负缓存过期后只应重试失败的那次解析,长到
+	// 和正文缓存一样就等于一次限流把该 IP 冻到第二天。
+	if cfg.GeoIPNegativeTTL <= 0 || cfg.GeoIPCacheTTL <= 0 || cfg.GeoIPNegativeTTL >= cfg.GeoIPCacheTTL {
+		return fmt.Errorf("TELESRV_GEOIP_NEGATIVE_TTL must be greater than zero and shorter than TELESRV_GEOIP_CACHE_TTL")
+	}
+	if cfg.GeoIPCacheSize <= 0 || cfg.GeoIPCacheSize > 1_000_000 {
+		return fmt.Errorf("TELESRV_GEOIP_CACHE_SIZE must be 1..1000000")
+	}
+	if cfg.GeoIPRateLimitThreshold <= 0 || cfg.GeoIPRateLimitThreshold > 100 {
+		return fmt.Errorf("TELESRV_GEOIP_RATE_LIMIT_THRESHOLD must be 1..100")
+	}
+	if cfg.GeoIPRateLimitCooldown <= 0 || cfg.GeoIPRateLimitCooldown > time.Hour {
+		return fmt.Errorf("TELESRV_GEOIP_RATE_LIMIT_COOLDOWN must be greater than zero and at most 1h")
+	}
+	// 不可达窗口必须比限流窗口短:后端只是抖了一下不该离线比配额窗口还久。
+	if cfg.GeoIPDownThreshold <= 0 || cfg.GeoIPDownThreshold > 100 {
+		return fmt.Errorf("TELESRV_GEOIP_DOWN_THRESHOLD must be 1..100")
+	}
+	if cfg.GeoIPDownCooldown <= 0 || cfg.GeoIPDownCooldown > cfg.GeoIPRateLimitCooldown {
+		return fmt.Errorf("TELESRV_GEOIP_DOWN_COOLDOWN must be greater than zero and at most TELESRV_GEOIP_RATE_LIMIT_COOLDOWN")
+	}
+	return nil
 }
 
 func validateTelegramLoginConfig(cfg Config) error {
