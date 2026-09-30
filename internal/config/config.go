@@ -1449,23 +1449,23 @@ func normalizeAdvertiseIP(raw string) (string, error) {
 // 会话列表会继续回传 "Unknown" 占位文案,这是未启用时的预期行为,不该让服务起不来。
 func validateGeoIPConfig(cfg Config) error {
 	configured := 0
-	for _, endpoint := range cfg.GeoIPEndpoints {
+	for index, endpoint := range cfg.GeoIPEndpoints {
 		if strings.TrimSpace(endpoint) == "" {
 			continue
 		}
 		configured++
 		if !strings.Contains(endpoint, "{ip}") {
-			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entries must contain the {ip} placeholder, got %q", endpoint)
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %d must contain the {ip} placeholder", index+1)
 		}
 		parsed, err := url.Parse(strings.TrimSpace(endpoint))
 		if err != nil {
-			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q is not a valid URL: %w", endpoint, err)
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %d is not a valid URL", index+1)
 		}
 		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q must use http or https", endpoint)
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %d must use http or https", index+1)
 		}
 		if parsed.Host == "" {
-			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %q must include a host", endpoint)
+			return fmt.Errorf("TELESRV_GEOIP_ENDPOINTS entry %d must include a host", index+1)
 		}
 	}
 	// 全是空白的列表等同于未启用,不该拖出后面那堆数值校验。

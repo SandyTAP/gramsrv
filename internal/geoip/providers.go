@@ -126,21 +126,25 @@ func parseHackMyIP(body []byte) (Location, parseOutcome) {
 	}, parseOK
 }
 
-// ipapiISResponse 是 api.ipapi.is /?q={ip} 的响应。免费额度下不带 key 也能用。
+// ipapiISResponse covers both documented tiers: anonymous responses are flat;
+// keyed responses put geolocation under location and company/asn are objects.
+// https://ipapi.is/developers.html
 //
 // is_bogon=true 表示这个地址根本没有地理归属(实测 203.0.113.7 就是:全字段为 null)。
 // 那属于确定的"没有",不该继续问下一个后端,更不该记负缓存之外的东西。
 type ipapiISResponse struct {
-	IP       string   `json:"ip"`
-	IsBogon  bool     `json:"is_bogon"`
-	Company  *string  `json:"company"`
-	ASN      *string  `json:"asn"`
-	City     *string  `json:"city"`
-	Region   *string  `json:"region"`
-	Country  *string  `json:"country"`
-	Lat      *float64 `json:"lat"`
-	Lon      *float64 `json:"lon"`
-	Timezone *string  `json:"timezone"`
+	IsBogon  bool   `json:"is_bogon"`
+	Error    string `json:"error"`
+	City     string `json:"city"`
+	Region   string `json:"region"`
+	Country  string `json:"country"`
+	Timezone string `json:"timezone"`
+	Location *struct {
+		Country  string `json:"country"`
+		City     string `json:"city"`
+		State    string `json:"state"`
+		Timezone string `json:"timezone"`
+	} `json:"location"`
 }
 
 func parseIPAPIS(body []byte) (Location, parseOutcome) {
@@ -148,21 +152,26 @@ func parseIPAPIS(body []byte) (Location, parseOutcome) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return Location{}, parseFailed
 	}
+	if payload.Error != "" {
+		return Location{}, parseFailed
+	}
 	if payload.IsBogon {
 		return Location{}, parseNotFound
 	}
-	country := trimmedOrEmpty(derefString(payload.Country))
-	if country == "" {
+	loc := Location{
+		Country: trimmedOrEmpty(payload.Country),
+		Region:  firstNonEmpty(payload.City, payload.Region, payload.Timezone),
+	}
+	if payload.Location != nil {
+		loc = Location{
+			Country: trimmedOrEmpty(payload.Location.Country),
+			Region:  firstNonEmpty(payload.Location.City, payload.Location.State, payload.Location.Timezone),
+		}
+	}
+	if loc.Country == "" {
 		return Location{}, parseNotFound
 	}
-	return Location{
-		Country: country,
-		Region: firstNonEmpty(
-			derefString(payload.City),
-			derefString(payload.Region),
-			derefString(payload.Timezone),
-		),
-	}, parseOK
+	return loc, parseOK
 }
 
 // genericJSONFieldAliases 是通用解析按优先级尝试的字段名。覆盖上面四个后端以及常见
@@ -304,11 +313,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func derefString(value *string) string {
-	if value == nil {
-		return ""
-	}
-	return *value
 }

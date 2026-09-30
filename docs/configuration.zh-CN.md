@@ -493,11 +493,11 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 |---|---|---|
 | `TELESRV_MAPBOX_TOKEN` | secret string / 空 | `upload.getWebFile` 地图缩略图使用的 Mapbox Static Images token；空值使用确定性占位图。 |
 | `TELESRV_MAPTILE_CACHE_DIR` | path / `data/maptiles` | 地图缩略图磁盘缓存，保证分片下载字节稳定并控制上游配额。 |
-| `TELESRV_GEOIP_ENDPOINTS` | list / 空 | 可选的地理后端有序 failover 链，把会话 IP 解析成 `account.getAuthorizations` 展示用的国家/地区文案。每项必须含 `{ip}` 占位符且使用 `http`/`https`；第一项是主力，未能解析的地址自动落到下一项。空值表示未启用，会话列表继续回传 `Unknown` 占位文案。只发送公网可路由地址；私网、回环、链路本地地址一律不出本机。可直接使用：`https://api.ipapi.is/?q={ip}`、`https://reallyfreegeoip.org/json/{ip}`、`https://hackmyip.com/api/lookup?ip={ip}`、`https://get.geojs.io/v1/ip/geo/{ip}.json`。未识别的主机走通用 JSON 解析，因此自建 MaxMind 代理可以原样填入。 |
+| `TELESRV_GEOIP_ENDPOINTS` | list / 空 | 部署者主动启用的地理后端有序 failover 链，用于 `account.getAuthorizations` 和扫码登录确认所返回授权的国家/地区文案。每项必须含 `{ip}` 且使用 `http`/`https`。代码默认值和 `.env.example` 均为空：位置继续为 `Unknown`，不发 GeoIP 请求。启用会将会话 IP 发送给所选供应商，应先审查其隐私政策或使用自建代理。HTTP 前过滤私网、CGNAT、文档、基准测试、本地与保留地址，包含 IPv4-mapped 形式。可选地址：`https://api.ipapi.is/?q={ip}`、`https://reallyfreegeoip.org/json/{ip}`、`https://hackmyip.com/api/lookup?ip={ip}`、`https://get.geojs.io/v1/ip/geo/{ip}.json`。未识别的主机走通用 JSON 解析。 |
 | `TELESRV_GEOIP_TIMEOUT` | duration / `2s` | 单个地理后端的单次请求超时；必须为正数且不超过 `10s`。 |
 | `TELESRV_GEOIP_CONCURRENCY` | int / `4` | 单批会话列表解析在所有后端上的在途请求总数上限；必须为 `1..32`。 |
 | `TELESRV_GEOIP_CACHE_TTL` | duration / `24h` | 解析成功地址的缓存有效期（不论由哪个后端解析）；必须为正数且长于负缓存 TTL。 |
-| `TELESRV_GEOIP_NEGATIVE_TTL` | duration / `5m` | “整条链都没给出结果”（限流、超时、网络错误、查无此 IP）的负缓存期。只有整条链都试过才写入，因此单个后端的覆盖缺失不会把地址冻住。必须为正数且短于 `TELESRV_GEOIP_CACHE_TTL`，否则一次限流会把该地址冻到第二天。 |
+| `TELESRV_GEOIP_NEGATIVE_TTL` | duration / `5m` | “整条链都没给出结果”（限流、后端请求超时、网络错误、查无此 IP）的负缓存期。只有整条链都试过才写入；调用方取消或 RPC 地理查询总预算到期不写负缓存，也不把后端标为故障。必须为正数且短于 `TELESRV_GEOIP_CACHE_TTL`。 |
 | `TELESRV_GEOIP_CACHE_SIZE` | int / `4096` | 缓存地址条目上限；必须为 `1..1000000`。 |
 | `TELESRV_GEOIP_RATE_LIMIT_THRESHOLD` | int / `3` | 单个后端连续收到多少次 HTTP 429 后被整批跳过；必须为 `1..100`。计数按后端独立，一个供应商配额用尽不会影响其他后端。 |
 | `TELESRV_GEOIP_RATE_LIMIT_COOLDOWN` | duration / `2m` | 被限流后端完全不出网请求的冷却时长；必须为正数且不超过 `1h`。 |
@@ -515,6 +515,19 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_UPLOAD_INFLIGHT_MAX_BYTES` | int64 bytes / `4194304000` | 单用户未组装上传字节上限；`<=0` 表示不限。 |
 | `TELESRV_UPLOAD_INFLIGHT_MAX_PARTS` | int / `8000` | 单用户未组装分片行数上限；`<=0` 表示不限。 |
 | `TELESRV_UPLOAD_INFLIGHT_MAX_FILES` | int / `64` | 单用户并发未组装 `file_id` 上限；`<=0` 表示不限。 |
+
+GeoIP 只增强展示，不改变授权身份、session flags、存储的 IP 或 update 计数。
+地理查询总预算为 3 秒。取消后停止新增任务和后端切换，等待在途任务结束再读取
+结果；已经完成的结果保留，缺失位置仍显示 `Unknown`。IPv6 仅查询原生 global
+unicast；转换/过渡与未分配地址不发送。特殊用途过滤依据
+[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/) 与
+[IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/) 登记册。
+
+`ipapi.is` 同时支持匿名的平面响应和携带 key 时的 `location` 对象，格式依据其
+[API 文档](https://ipapi.is/developers.html)。使用 key 时在 URL 模板追加
+`&key=YOUR_KEY`；地理解析不依赖 ownership/threat 等无关字段。启动和失败日志只
+记录供应商主机名与结构化状态，不记录 URL 凭证、路径、查询参数、原始 HTTP
+错误或响应正文。真实端点和凭证应仅保存在不受版本跟踪的部署配置中。
 
 ## 7. AI compose 与 Business automation
 
