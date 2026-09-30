@@ -1889,7 +1889,7 @@ func run(logger *zap.Logger) error {
 	go router.RunInlineBotPushSubscriber(ctx)
 	go router.RunBotCallbackAnswerSubscriber(ctx)
 	go router.RunEphemeralPushSubscriber(ctx)
-	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, logger.Named("botapi")); err != nil {
+	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, router, logger.Named("botapi")); err != nil {
 		return fmt.Errorf("start bot api: %w", err)
 	}
 	// Scoped tokens carry a bounded permission set; the master token stays

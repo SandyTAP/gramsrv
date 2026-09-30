@@ -818,12 +818,16 @@ type MessageMedia struct {
 	WebPage        *MessageWebPage       `json:"web_page,omitempty"`
 	Giveaway       *MessageGiveaway      `json:"giveaway,omitempty"`
 	Invoice        *PremiumInvoice       `json:"invoice,omitempty"`
-	Spoiler        bool                  `json:"spoiler,omitempty"`
-	TTLSeconds     int                   `json:"ttl_seconds,omitempty"`
-	Nopremium      bool                  `json:"nopremium,omitempty"`
-	Voice          bool                  `json:"voice,omitempty"`
-	Round          bool                  `json:"round,omitempty"`
-	Video          bool                  `json:"video,omitempty"`
+	// ProductInvoice is the generic bot sale shape. It is separate from Invoice
+	// because a Premium invoice carries a plan, not a product, and the two
+	// validate against different rules.
+	ProductInvoice *Invoice `json:"product_invoice,omitempty"`
+	Spoiler        bool     `json:"spoiler,omitempty"`
+	TTLSeconds     int      `json:"ttl_seconds,omitempty"`
+	Nopremium      bool     `json:"nopremium,omitempty"`
+	Voice          bool     `json:"voice,omitempty"`
+	Round          bool     `json:"round,omitempty"`
+	Video          bool     `json:"video,omitempty"`
 	// InvertMedia 映射 message.invert_media：媒体（典型为链接预览）渲染在文本上方。
 	// 存于媒体快照而非消息行，避免新增消息表列；读时投影为 tg.Message.invert_media。
 	InvertMedia bool `json:"invert_media,omitempty"`

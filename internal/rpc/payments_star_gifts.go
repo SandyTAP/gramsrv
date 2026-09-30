@@ -389,7 +389,26 @@ func (r *Router) onPaymentsGetPaymentForm(ctx context.Context, req *tg.PaymentsG
 	}
 
 	switch inv := req.Invoice.(type) {
-	case *tg.InputInvoicePremiumGiftStars, *tg.InputInvoicePremiumGiftCode, *tg.InputInvoiceMessage:
+	case *tg.InputInvoiceMessage:
+		// A bot's own invoice wins over the Premium path: the premium handler
+		// only accepts the built-in Premium bot, so a third-party bot invoice
+		// would otherwise be rejected as an unknown invoice.
+		if form, err := r.botInvoicePaymentForm(ctx, userID, inv.Peer, inv.MsgID); err == nil {
+			return form, nil
+		} else if !isInvoiceLookupMiss(err) {
+			// Logged as well, so a failure here is distinguishable from the
+			// miss path above when reading the server log.
+			if r.log != nil {
+				r.log.Warn("bot invoice form error",
+					zap.Int64("viewer_id", userID),
+					zap.Int("msg_id", inv.MsgID),
+					zap.Error(err),
+				)
+			}
+			return nil, err
+		}
+		return r.premiumPaymentForm(ctx, userID, inv)
+	case *tg.InputInvoicePremiumGiftStars, *tg.InputInvoicePremiumGiftCode:
 		return r.premiumPaymentForm(ctx, userID, inv)
 	case *tg.InputInvoiceStars:
 		if inv != nil {
@@ -590,8 +609,23 @@ func (r *Router) onPaymentsSendStarsForm(ctx context.Context, req *tg.PaymentsSe
 		return nil, internalErr()
 	}
 
+	if msgInv, ok := req.Invoice.(*tg.InputInvoiceMessage); ok {
+		// A bot invoice is settled here too, not only over sendPaymentForm:
+		// TDesktop pays a stars invoice with sendStarsForm, so routing this
+		// straight to the Premium handler answered INVOICE_INVALID for every
+		// bot invoice. A miss falls through so Premium invoices still work.
+		res, handled, err := r.botInvoiceSettle(ctx, userID, &tg.PaymentsSendPaymentFormRequest{
+			FormID:  req.FormID,
+			Invoice: msgInv,
+		}, msgInv)
+		if handled {
+			return res, err
+		}
+		return r.sendPremiumStarsForm(ctx, userID, req.FormID, msgInv)
+	}
+
 	switch inv := req.Invoice.(type) {
-	case *tg.InputInvoicePremiumGiftStars, *tg.InputInvoiceMessage:
+	case *tg.InputInvoicePremiumGiftStars:
 		return r.sendPremiumStarsForm(ctx, userID, req.FormID, inv)
 	case *tg.InputInvoiceStars:
 		if inv != nil {
@@ -723,6 +757,14 @@ func (r *Router) onPaymentsSendPaymentForm(ctx context.Context, req *tg.Payments
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return nil, internalErr()
+	}
+	// A bot invoice is settled for real Stars, so it is handled before the
+	// dev-payment gates below: those require a local WebView provider and
+	// form-bound credentials, which an XTR purchase never carries.
+	if inv, ok := req.Invoice.(*tg.InputInvoiceMessage); ok {
+		if result, settled, err := r.botInvoiceSettle(ctx, userID, req, inv); settled {
+			return result, err
+		}
 	}
 	if err := r.devPaymentsErr(); err != nil {
 		return nil, err

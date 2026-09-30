@@ -34,6 +34,11 @@ type UsersService interface {
 	UpdateEmojiStatus(ctx context.Context, userID int64, status domain.UserEmojiStatus) (domain.User, error)
 }
 
+type InvoiceService interface {
+	BotAPISendInvoice(ctx context.Context, botID, chatID int64, title, description, payload string, amount int64) (domain.Message, error)
+	BotAPIRefundStarPayment(ctx context.Context, botID, userID int64, telegramPaymentChargeID string) (bool, error)
+}
+
 type WebAppService interface {
 	AnswerWebAppQueryFromBotAPI(ctx context.Context, botID int64, webAppQueryID string, result domain.BotInlineResult) (inlineMessageID string, err error)
 	SavePreparedInlineMessageFromBotAPI(ctx context.Context, botID, userID int64, result domain.BotInlineResult, peerTypes []string) (id string, expireDate int, err error)
@@ -102,14 +107,14 @@ type GatewayWebhookControl interface {
 	ConfirmBotAPIWebhookDelivery(ctx context.Context, botID, updateID int64) error
 }
 
-func Start(ctx context.Context, addr string, bots BotsService, users UsersService, webapps WebAppService, gateway GatewayService, logger *zap.Logger) (*http.Server, error) {
+func Start(ctx context.Context, addr string, bots BotsService, users UsersService, webapps WebAppService, invoices InvoiceService, gateway GatewayService, logger *zap.Logger) (*http.Server, error) {
 	if strings.TrimSpace(addr) == "" {
 		return nil, nil
 	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	handler := &handler{bots: bots, users: users, webapps: webapps, gateway: gateway, logger: logger, webhookClient: newWebhookHTTPClient()}
+	handler := &handler{bots: bots, users: users, webapps: webapps, invoices: invoices, gateway: gateway, logger: logger, webhookClient: newWebhookHTTPClient()}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler.routes(),
@@ -140,6 +145,7 @@ func Start(ctx context.Context, addr string, bots BotsService, users UsersServic
 }
 
 type handler struct {
+	invoices      InvoiceService
 	bots          BotsService
 	users         UsersService
 	webapps       WebAppService
@@ -283,6 +289,10 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.savePreparedInlineMessage(w, r, botID)
 	case "giftpremiumsubscription":
 		h.giftPremiumSubscription(w, r, botID)
+	case "sendinvoice":
+		h.sendInvoice(w, r, botID)
+	case "refundstarpayment":
+		h.refundStarPayment(w, r, botID)
 	case "answershippingquery", "answerprecheckoutquery":
 		writeAPIError(w, http.StatusNotImplemented, "BLOCKED_DURABLE_QUERY_STATE_MISSING")
 	default:
@@ -1594,6 +1604,18 @@ func apiErrorDescription(err error) string {
 		"PREMIUM_GIFT_SELF_INVALID",
 		"PREMIUM_GIFT_CODE_INVALID",
 		"PAYMENT_FORM_INVALID",
+		"INVOICE_INVALID",
+		"INVOICE_ALREADY_EXISTS",
+		"INVOICE_ALREADY_PAID",
+		"INVOICE_REFUNDED",
+		"INVOICE_AMOUNT_INVALID",
+		"CURRENCY_INVALID",
+		"AMOUNT_INVALID",
+		"TITLE_INVALID",
+		"DESCRIPTION_INVALID",
+		"PAYLOAD_INVALID",
+		"CHARGE_ID_INVALID",
+		"CHARGE_ID_NOT_FOUND",
 	} {
 		if strings.Contains(text, marker) {
 			return marker

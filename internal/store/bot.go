@@ -45,6 +45,19 @@ type BotStore interface {
 	ReorderBotAppPreviewMedia(ctx context.Context, botUserID, appID int64, mediaIDs []int64) (int, error)
 
 	UpsertAttachMenuBot(ctx context.Context, bot domain.BotAttachMenuBot) (int, error)
+
+	// Bot invoices. CreateBotInvoice records the sale right after the invoice
+	// message is stored, so the payment form can resolve the price later.
+	CreateBotInvoice(ctx context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error)
+	// BotInvoiceByMessage resolves the invoice behind an inputInvoiceMessage.
+	BotInvoiceByMessage(ctx context.Context, botUserID, chatID int64, messageID int) (domain.BotInvoice, bool, error)
+	// SettleBotInvoice marks a paid invoice and binds the charge id the client
+	// reported. A replayed call returns the stored invoice with settled=false
+	// instead of charging the payer twice.
+	SettleBotInvoice(ctx context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error)
+	// RefundBotInvoiceByCharge resolves an invoice by telegram_payment_charge_id
+	// and flags it refunded; an already refunded invoice is a replay-safe no-op.
+	RefundBotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
 	GetAttachMenuBot(ctx context.Context, botUserID int64) (domain.BotAttachMenuBot, bool, error)
 	ListAttachMenuBots(ctx context.Context) ([]domain.BotAttachMenuBot, error)
 	GetAttachMenuState(ctx context.Context, userID, botUserID int64) (domain.BotAttachMenuState, bool, error)
