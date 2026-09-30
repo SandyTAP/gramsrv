@@ -46,6 +46,9 @@ type WebAppService interface {
 
 type GatewayService interface {
 	BotAPISelf(ctx context.Context, botID int64) (domain.User, error)
+	// BotAPIDropPendingUpdates discards the queue the bot has not confirmed, which
+	// is what dropPendingUpdates does in the Bot API.
+	BotAPIDropPendingUpdates(ctx context.Context, botID int64) error
 	BotAPIUpdates(ctx context.Context, botID int64, offset int64) ([]domain.UpdateEvent, error)
 	BotAPISendMessage(ctx context.Context, botID, chatID int64, text string, entities []domain.MessageEntity, replyMarkup *domain.MessageReplyMarkup, disableWebPagePreview, silent bool, replyToMessageID int) (domain.Message, error)
 	BotAPISendRichMessage(ctx context.Context, botID, chatID int64, rich domain.BotAPIRichMessageInput, replyMarkup *domain.MessageReplyMarkup, silent, noForwards bool, replyToMessageID int, effectID int64) (domain.Message, error)
@@ -272,6 +275,8 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.answerCallbackQuery(w, r, botID)
 	case "getfile":
 		h.getFile(w, r, botID)
+	case "droppendingupdates":
+		h.dropPendingUpdates(w, r, botID)
 	case "deletewebhook":
 		h.deleteWebhook(w, r, botID)
 	case "getwebhookinfo":
@@ -542,6 +547,21 @@ func randomBotAPIOwner() string {
 		return fmt.Sprintf("%x", raw[:])
 	}
 	return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+}
+
+// dropPendingUpdates implements the Bot API dropPendingUpdates. It discards the
+// queued updates the bot has not confirmed yet, which is how a bot that fell
+// behind stops trying to work through a backlog.
+func (h *handler) dropPendingUpdates(w http.ResponseWriter, r *http.Request, botID int64) {
+	if h.gateway == nil {
+		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+		return
+	}
+	if err := h.gateway.BotAPIDropPendingUpdates(r.Context(), botID); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR")
+		return
+	}
+	writeAPIOK(w, true)
 }
 
 func (h *handler) deleteWebhook(w http.ResponseWriter, r *http.Request, botID int64) {

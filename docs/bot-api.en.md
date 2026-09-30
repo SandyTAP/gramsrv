@@ -529,6 +529,12 @@ result; replaying it with a different recipient, plan, price, or text is
 `IDEMPOTENCY_KEY_INVALID`. Requests without any key still work, but each
 retry charges again, so always send a key.
 
+### `dropPendingUpdates`
+
+Implemented: discards the bot's unconfirmed queued updates and answers `true`.
+A bot that has fallen behind needs it, otherwise it spends forever working through
+a backlog while `pre_checkout_query`, which lives 10 seconds, quietly expires.
+
 ### `answerPreCheckoutQuery`
 
 Implemented. Before any Stars move, the payer waits for the bot's answer for **at
