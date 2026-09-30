@@ -513,6 +513,16 @@ objects, verified size/SHA-256, and updated `file_blobs.backend`.
 |---|---|---|
 | `TELESRV_MAPBOX_TOKEN` | secret string / empty | Mapbox Static Images access token for `upload.getWebFile` map previews. Empty uses deterministic placeholders. |
 | `TELESRV_MAPTILE_CACHE_DIR` | path / `data/maptiles` | Disk cache for fetched map thumbnails, preserving byte-stable chunk downloads and limiting quota use. |
+| `TELESRV_GEOIP_ENDPOINTS` | list / empty | Opt-in ordered failover chain resolving session IPs to country/region text for `account.getAuthorizations` and the authorization returned by QR login approval. Every entry must contain `{ip}` and use `http`/`https`. Both the code default and `.env.example` leave this empty: locations stay `Unknown` and no GeoIP request is made. Enabling it discloses session IPs to the selected providers; review their policies or use a self-hosted proxy. Private, CGNAT, documentation, benchmarking, local and reserved addresses are filtered before HTTP, including mapped IPv4. Ready-made values: `https://api.ipapi.is/?q={ip}`, `https://reallyfreegeoip.org/json/{ip}`, `https://hackmyip.com/api/lookup?ip={ip}`, `https://get.geojs.io/v1/ip/geo/{ip}.json`. Unrecognised hosts use the generic JSON parser. |
+| `TELESRV_GEOIP_TIMEOUT` | duration / `2s` | Per-request timeout for each GeoIP backend. Must be positive and at most `10s`. |
+| `TELESRV_GEOIP_CONCURRENCY` | int / `4` | Maximum in-flight requests across all backends per session-list batch. Must be `1..32`. |
+| `TELESRV_GEOIP_CACHE_TTL` | duration / `24h` | Validity of a successfully resolved address, whichever backend resolved it. Must be positive and longer than the negative TTL. |
+| `TELESRV_GEOIP_NEGATIVE_TTL` | duration / `5m` | Validity of "no backend had an answer" (rate limit, provider timeout, network error, unknown IP). Written only after the whole chain has been tried. Caller cancellation or the total RPC lookup deadline never writes a negative entry or marks a provider down. Must be positive and shorter than `TELESRV_GEOIP_CACHE_TTL`. |
+| `TELESRV_GEOIP_CACHE_SIZE` | int / `4096` | Upper bound on cached addresses. Must be `1..1000000`. |
+| `TELESRV_GEOIP_RATE_LIMIT_THRESHOLD` | int / `3` | Consecutive HTTP 429 responses from one backend before it is skipped. Must be `1..100`. Counters are per backend, so one exhausted provider never affects the others. |
+| `TELESRV_GEOIP_RATE_LIMIT_COOLDOWN` | duration / `2m` | How long a rate-limited backend receives no request at all. Must be positive and at most `1h`. |
+| `TELESRV_GEOIP_DOWN_THRESHOLD` | int / `2` | Consecutive timeouts/5xx before a backend is considered unreachable. Must be `1..100`. |
+| `TELESRV_GEOIP_DOWN_COOLDOWN` | duration / `30s` | How long an unreachable backend is skipped. Must be positive and at most `TELESRV_GEOIP_RATE_LIMIT_COOLDOWN`, since a network hiccup should not take a provider offline as long as a quota window. |
 | `TELESRV_EXTERNAL_MEDIA_ENABLE` | bool / `true` | Enables SSRF-protected fetching of external photo/document URLs. |
 | `TELESRV_EXTERNAL_MEDIA_MAX_BYTES` | int bytes / `10485760` | Maximum response body per external-media fetch. Downstream treats `<=0` as the 10 MiB safe default. |
 | `TELESRV_EXTERNAL_MEDIA_RATE_PER_MIN` | int / `60` | Global external-media fetches per minute. Downstream treats `<=0` as its default. |
@@ -525,6 +535,23 @@ objects, verified size/SHA-256, and updated `file_blobs.backend`.
 | `TELESRV_UPLOAD_INFLIGHT_MAX_BYTES` | int64 bytes / `4194304000` | Per-user unassembled upload-byte cap; `<=0` means unlimited. |
 | `TELESRV_UPLOAD_INFLIGHT_MAX_PARTS` | int / `8000` | Per-user unassembled upload-part row cap; `<=0` means unlimited. |
 | `TELESRV_UPLOAD_INFLIGHT_MAX_FILES` | int / `64` | Per-user concurrent unassembled `file_id` cap; `<=0` means unlimited. |
+
+GeoIP is display-only: it does not change authorization identity, session flags,
+stored IPs or update counters. The total lookup budget is 3 seconds. Cancellation
+stops new work and failover, joins in-flight workers before reading results, and
+keeps any already completed locations. Missing locations remain `Unknown`.
+IPv6 queries are limited to native global unicast; translation/transition and
+unallocated ranges are not sent. Special-use filtering follows the
+[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/) and
+[IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/) registries.
+
+`ipapi.is` accepts both the flat anonymous response and the keyed `location`
+object described in its [API documentation](https://ipapi.is/developers.html).
+Add `&key=YOUR_KEY` to its URL template when using a key; unused ownership/threat
+fields do not participate in geolocation parsing. Startup and failure diagnostics
+contain provider hostnames and structured status only, never URL credentials,
+paths, query strings, raw HTTP errors or response bodies. Keep real endpoints and
+credentials in the untracked deployment configuration.
 
 ## 7. AI compose and business automation
 
