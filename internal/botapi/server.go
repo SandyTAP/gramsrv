@@ -56,6 +56,7 @@ type GatewayService interface {
 	BotAPIEditInlineRichMessage(ctx context.Context, botID int64, inlineMessageID domain.BotInlineMessageID, rich domain.BotAPIRichMessageInput, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup) (bool, error)
 	BotAPIDeleteMessage(ctx context.Context, botID, chatID int64, messageID int) (bool, error)
 	BotAPIAnswerCallbackQuery(ctx context.Context, botID int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error)
+	BotAPIAnswerPreCheckoutQuery(ctx context.Context, botID int64, queryID string, ok bool, errorMessage string) (bool, error)
 	BotAPIGetFile(ctx context.Context, botID int64, locationKey string, offset int64, limit int) (domain.FileChunk, bool, error)
 }
 
@@ -293,8 +294,12 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.sendInvoice(w, r, botID)
 	case "refundstarpayment":
 		h.refundStarPayment(w, r, botID)
-	case "answershippingquery", "answerprecheckoutquery":
-		writeAPIError(w, http.StatusNotImplemented, "BLOCKED_DURABLE_QUERY_STATE_MISSING")
+	case "answerprecheckoutquery":
+		h.answerPreCheckoutQuery(w, r, botID)
+	case "answershippingquery":
+		// Shipping never becomes part of a Stars purchase: telesrv settles XTR
+		// only, so there is no shipping step to answer.
+		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
 	default:
 		writeAPIError(w, http.StatusNotFound, "METHOD_NOT_FOUND")
 	}
@@ -977,6 +982,32 @@ func (h *handler) deleteMessage(w http.ResponseWriter, r *http.Request, botID in
 		return
 	}
 	ok, err := h.gateway.BotAPIDeleteMessage(r.Context(), botID, chatID, messageID)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
+		return
+	}
+	writeAPIOK(w, ok)
+}
+
+// answerPreCheckoutQuery implements the Bot API answerPreCheckoutQuery. It is the
+// only thing that opens the payment gate: the payer waits up to 10 seconds for it.
+func (h *handler) answerPreCheckoutQuery(w http.ResponseWriter, r *http.Request, botID int64) {
+	if h.gateway == nil {
+		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+		return
+	}
+	values, err := requestValues(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	queryID := strings.TrimSpace(values["pre_checkout_query_id"])
+	if queryID == "" {
+		writeAPIError(w, http.StatusBadRequest, "QUERY_ID_INVALID")
+		return
+	}
+	ok, err := h.gateway.BotAPIAnswerPreCheckoutQuery(r.Context(), botID, queryID,
+		apiBool(values["ok"]), values["error_message"])
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
 		return

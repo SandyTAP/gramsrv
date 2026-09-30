@@ -141,6 +141,20 @@ func TestBotInvoiceChainPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("balance: %v", err)
 	}
+	// The payment gate is answered before the request goes out, mirroring a bot
+	// that approves; the point of this test is the money, not the 10s window.
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if pending := r.preCheckouts.pendingSnapshot(); len(pending) > 0 {
+				req := &tg.MessagesSetBotPrecheckoutResultsRequest{QueryID: pending[0]}
+				req.SetSuccess(true)
+				_, _ = r.onMessagesSetBotPrecheckoutResults(WithUserID(ctx, bot.ID), req)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
 	var payBuf bin.Buffer
 	if err := (&tg.PaymentsSendPaymentFormRequest{
 		Credentials: &tg.InputPaymentCredentials{},

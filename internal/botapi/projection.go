@@ -169,6 +169,32 @@ func apiUpdate(event domain.UpdateEvent) (map[string]any, string, bool) {
 			"update_id":      updateID,
 			"callback_query": query,
 		}, "callback_query", true
+	case domain.UpdateEventBotPreCheckoutQuery:
+		query := event.BotPreCheckout
+		if query == nil || query.ID == 0 || query.UserID <= 0 ||
+			query.Currency == "" || query.TotalAmount <= 0 || query.BotUserID != event.UserID {
+			return nil, "", false
+		}
+		var from domain.User
+		for _, user := range event.Users {
+			if user.ID == query.UserID {
+				from = user
+				break
+			}
+		}
+		if from.ID == 0 {
+			from = domain.User{ID: query.UserID}
+		}
+		return map[string]any{
+			"update_id": updateID,
+			"pre_checkout_query": map[string]any{
+				"id":              strconv.FormatInt(query.ID, 10),
+				"from":            apiUser(from),
+				"currency":        query.Currency,
+				"total_amount":    query.TotalAmount,
+				"invoice_payload": query.Payload,
+			},
+		}, "pre_checkout_query", true
 	default:
 		return nil, "", false
 	}

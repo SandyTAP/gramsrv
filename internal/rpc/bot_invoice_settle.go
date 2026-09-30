@@ -58,6 +58,18 @@ func (r *Router) botInvoiceSettle(ctx context.Context, userID int64, req *tg.Pay
 	if invoice.Refunded {
 		return nil, true, tgerr.New(400, "INVOICE_REFUNDED")
 	}
+	// Pre-checkout runs before anything is marked, not after. Settling first would
+	// leave the invoice flagged as paid even when the bot refuses, and the retry
+	// would then return a receipt with no money behind it.
+	//
+	// An already settled invoice skips the question: the order was approved once
+	// and a replay must not re-ask or re-charge.
+	if !invoice.Settled() {
+		if err := r.runPreCheckout(ctx, invoice.BotUserID, userID,
+			invoice.Currency, invoice.Amount, invoice.Payload); err != nil {
+			return nil, true, err
+		}
+	}
 	now := int(r.clock.Now().Unix())
 	chargeID := botInvoiceChargeID(invoice)
 
@@ -152,6 +164,11 @@ func (r *Router) sendBotInvoicePaidMessage(ctx context.Context, payerID int64, i
 		}
 		return
 	}
+	// Storing the message is not enough: Bot API delivery runs through the update
+	// queue, which the message store does not touch. Without this the message sits
+	// in the bot's chat and getUpdates never mentions it, so the bot never learns
+	// the charge id.
+	r.enqueueBotAPIPrivateMessageUpdate(ctx, res)
 	if res.RecipientMessage.ID > 0 && r.log != nil {
 		r.log.Info("bot invoice paid message sent",
 			zap.Int64("bot_user_id", invoice.BotUserID),

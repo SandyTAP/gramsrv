@@ -31,12 +31,20 @@ func (g *invoiceGifts) CreditBotStarsWallet(_ context.Context, credit domain.Bot
 }
 
 type invoiceChain struct {
-	router  *Router
-	store   *memory.MessageStore
-	stars   *appstars.Service
-	gifts   *invoiceGifts
+	router *Router
+	store  *memory.MessageStore
+	stars  *appstars.Service
+	gifts  *invoiceGifts
+	// updates is the Bot API queue: storing a message in the bot's chat is not
+	// delivery. The successful_payment assertion below reads it, which is the only
+	// thing that stands between "the message exists" and "getUpdates shows it".
+	updates *memory.BotAPIUpdateStore
 	botID   int64
-	buyerID int64
+	// otherBotID is a second real bot. Ownership tests need a genuine second
+	// bot: an arbitrary unused id would be refused by callerBotID as USER_BOT_REQUIRED
+	// and never reach the ownership check being tested.
+	otherBotID int64
+	buyerID    int64
 }
 
 func newInvoiceChain(t *testing.T) *invoiceChain {
@@ -62,12 +70,14 @@ func newInvoiceChain(t *testing.T) *invoiceChain {
 	messages := appmessages.NewService(msgStore, dialogs)
 	stars := appstars.NewService(memory.NewStarsStore(), appstars.WithStartingGrant(5000))
 	gifts := &invoiceGifts{}
+	updates := memory.NewBotAPIUpdateStore()
 	r := New(Config{}, Deps{
-		Users:    appusers.NewService(users),
-		Bots:     bots,
-		Messages: messages,
-		Stars:    stars,
-		Gifts:    gifts,
+		Users:         appusers.NewService(users),
+		Bots:          bots,
+		Messages:      messages,
+		Stars:         stars,
+		Gifts:         gifts,
+		BotAPIUpdates: updates,
 	}, zaptest.NewLogger(t), clock.System)
 
 	// Box ids are allocated per user, not per chat, so a user who has been
@@ -88,7 +98,11 @@ func newInvoiceChain(t *testing.T) *invoiceChain {
 	}); err != nil {
 		t.Fatalf("buyer message: %v", err)
 	}
-	return &invoiceChain{r, msgStore, stars, gifts, bot.ID, buyer.ID}
+	other, _, err := bots.CreateBot(ctx, buyer.ID, "Other Bot", "chain_other_bot")
+	if err != nil {
+		t.Fatalf("create second bot: %v", err)
+	}
+	return &invoiceChain{r, msgStore, stars, gifts, updates, bot.ID, other.ID, buyer.ID}
 }
 
 // buyerInvoiceID finds the invoice as the buyer sees it, by scanning their own
@@ -211,6 +225,7 @@ func (c *invoiceChain) payViaStarsForm(t *testing.T, amount int64) {
 
 	before := c.payerBalance(t)
 	wallet := c.gifts.balance
+	go c.answerNext(c.botID, domain.BotPreCheckoutAnswer{OK: true})
 	res := c.dispatch(t, c.buyerID, &tg.PaymentsSendStarsFormRequest{
 		FormID:  stored.ID + botInvoiceFormIDBase,
 		Invoice: inv,
@@ -247,8 +262,12 @@ func (c *invoiceChain) newestInvoiceID(t *testing.T) int {
 
 // pay settles through the real dispatch, carrying the same form id both times so
 // the repeat exercises idempotency rather than a second purchase.
+// pay settles the invoice as a bot that approves would: the gate is answered
+// before the request goes out, so these tests exercise the money movement rather
+// than the pre-checkout window.
 func (c *invoiceChain) pay(t *testing.T, invoiceID int64, invoice *tg.InputInvoiceMessage) {
 	t.Helper()
+	go c.answerNext(c.botID, domain.BotPreCheckoutAnswer{OK: true})
 	res := c.dispatch(t, c.buyerID, &tg.PaymentsSendPaymentFormRequest{
 		// An XTR purchase carries no card, matching what a real client sends.
 		Credentials: &tg.InputPaymentCredentials{},
@@ -374,6 +393,30 @@ func TestBotInvoicePaidNotifiesBotWithChargeID(t *testing.T) {
 	chain.pay(t, stored.ID, invoice)
 	if after := countPaymentMessages(t, chain); after != before {
 		t.Fatalf("payment messages = %d after a replay, want %d", after, before)
+	}
+
+	// The message existing in the bot's chat is not delivery: getUpdates reads the
+	// queue, so the receipt has to be in it.
+	queued, err := chain.updates.ListBotAPIUpdates(context.Background(), chain.botID, 0, 50)
+	if err != nil {
+		t.Fatalf("read bot api queue: %v", err)
+	}
+	var receipt bool
+	for _, item := range queued {
+		if item.Kind != domain.BotAPIUpdateMessage {
+			continue
+		}
+		got, err := chain.store.GetByIDs(context.Background(), chain.botID, []int{item.MessageID})
+		if err != nil || len(got.Messages) == 0 || got.Messages[0].Media == nil ||
+			got.Messages[0].Media.ServiceAction == nil {
+			continue
+		}
+		if got.Messages[0].Media.ServiceAction.Kind == domain.MessageServiceActionPayment {
+			receipt = true
+		}
+	}
+	if !receipt {
+		t.Fatalf("no successful_payment reached the Bot API queue; the bot would never learn the charge id (%d updates queued)", len(queued))
 	}
 
 	// And the charge id from that message is exactly what a refund needs.

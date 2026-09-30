@@ -120,7 +120,7 @@ credential, ровно как на официальном шлюзе.
 | `CERTIFICATE_PINNING_UNSUPPORTED` | 400 | передан `certificate` или загруженный сертификат |
 | `IP_ADDRESS_UNSUPPORTED` | 400 | передан `ip_address` |
 | `WEBHOOK_UNSUPPORTED` | 501 | шлюз без сервиса webhooks |
-| `BLOCKED_DURABLE_QUERY_STATE_MISSING` | 501 | `answerShippingQuery`, `answerPreCheckoutQuery` |
+| `METHOD_NOT_FOUND` | 501 | `answerShippingQuery` |
 | `BLOCKED_USER_EMOJI_STATUS_SERVICE_MISSING`, `BLOCKED_WEBAPP_QUERY_SERVICE_MISSING`, `BLOCKED_PREPARED_INLINE_SERVICE_MISSING` | 501 | опциональный сервис не собран |
 | `USER_PERMISSION_DENIED` | 403 | emoji status без нужного разрешения пользователя |
 | `PREMIUM_ACCOUNT_REQUIRED` | 400 | emoji status без Premium |
@@ -151,7 +151,7 @@ credential, ровно как на официальном шлюзе.
 | Меню и статус | `setChatMenuButton`, `getChatMenuButton`, `setUserEmojiStatus` |
 | Web apps и inline | `answerWebAppQuery`, `savePreparedInlineMessage` |
 | Платежи | `giftPremiumSubscription` |
-| Заблокировано по design | `answerShippingQuery`, `answerPreCheckoutQuery` (HTTP 501) |
+| Заблокировано по design | `answerShippingQuery` (HTTP 501) |
 
 ## Обновления
 
@@ -529,12 +529,26 @@ Stars-пайплайн, что и MTProto `payments.sendStarsForm`.
 Запросы без ключа тоже работают, но каждый ретрай списывает средства снова,
 поэтому ключ всегда стоит слать.
 
-### `answerShippingQuery`, `answerPreCheckoutQuery`
+### `answerPreCheckoutQuery`
 
-Методы распознаются, но всегда отвечают HTTP `501
-BLOCKED_DURABLE_QUERY_STATE_MISSING`: в telesrv нет надёжного состояния
-shipping/pre-checkout, в которое можно зафиксировать ответ.
+Работает. Перед списанием Stars плательщик ждёт ответа бота **не более 10 секунд**
+(требование Telegram). Бот получает апдейт `pre_checkout_query` и отвечает
+`pre_checkout_query_id` плюс `ok` и, при `ok=false`, `error_message`.
 
+- `ok=true` — Stars списываются, боту приходит `successful_payment`;
+- `ok=false` — оплата отменяется, `error_message` показывается плательщику;
+- нет ответа за 10 секунд — оплата считается несостоявшейся (`PAYMENT_FAILED`).
+
+Таймаут не переходит в «списать напрямую»: не ответивший бот означает отказ, иначе
+pre-checkout ничего бы не проверял. Ответ принимается только от бота, которому
+принадлежит заказ; на устаревший `pre_checkout_query_id` бот получает
+`QUERY_ID_INVALID`. Сумма и `invoice_payload` в запросе не сверяются с тем, что бот
+записывал при `sendInvoice`, — проверка остаётся на стороне бота, как и в Telegram.
+
+### `answerShippingQuery`
+
+Метод распознаётся, но отвечает HTTP `501 METHOD_NOT_FOUND`: оплата Stars не имеет
+шага доставки, отвечать не на что.
 ## Разметка и entities
 
 `reply_markup` принимает ровно один конструктор:

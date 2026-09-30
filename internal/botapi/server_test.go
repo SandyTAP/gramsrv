@@ -1689,6 +1689,10 @@ func (f *fakeBotAPIGateway) BotAPIDeleteMessage(context.Context, int64, int64, i
 	return true, nil
 }
 
+func (f *fakeBotAPIGateway) BotAPIAnswerPreCheckoutQuery(_ context.Context, _ int64, _ string, _ bool, _ string) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeBotAPIGateway) BotAPIAnswerCallbackQuery(_ context.Context, _ int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error) {
 	f.callbackCalled = true
 	f.callbackID = callbackQueryID

@@ -121,7 +121,7 @@ Markers the gateway can return directly:
 | `CERTIFICATE_PINNING_UNSUPPORTED` | 400 | `certificate` / uploaded certificate supplied |
 | `IP_ADDRESS_UNSUPPORTED` | 400 | `ip_address` supplied |
 | `WEBHOOK_UNSUPPORTED` | 501 | gateway without the webhook service |
-| `BLOCKED_DURABLE_QUERY_STATE_MISSING` | 501 | `answerShippingQuery`, `answerPreCheckoutQuery` |
+| `METHOD_NOT_FOUND` | 501 | `answerShippingQuery` |
 | `BLOCKED_USER_EMOJI_STATUS_SERVICE_MISSING`, `BLOCKED_WEBAPP_QUERY_SERVICE_MISSING`, `BLOCKED_PREPARED_INLINE_SERVICE_MISSING` | 501 | optional service not wired |
 | `USER_PERMISSION_DENIED` | 403 | emoji status without the required user grant |
 | `PREMIUM_ACCOUNT_REQUIRED` | 400 | emoji status without Premium |
@@ -152,7 +152,7 @@ Implemented (37 methods + 1 file route):
 | Menus & status | `setChatMenuButton`, `getChatMenuButton`, `setUserEmojiStatus` |
 | Web apps & inline | `answerWebAppQuery`, `savePreparedInlineMessage` |
 | Payments | `giftPremiumSubscription` |
-| Blocked by design | `answerShippingQuery`, `answerPreCheckoutQuery` (HTTP 501) |
+| Blocked by design | `answerShippingQuery` (HTTP 501) |
 
 ## Updates
 
@@ -529,11 +529,27 @@ result; replaying it with a different recipient, plan, price, or text is
 `IDEMPOTENCY_KEY_INVALID`. Requests without any key still work, but each
 retry charges again, so always send a key.
 
-### `answerShippingQuery`, `answerPreCheckoutQuery`
+### `answerPreCheckoutQuery`
 
-Recognized, but always HTTP `501 BLOCKED_DURABLE_QUERY_STATE_MISSING`:
-telesrv has no durable shipping/pre-checkout state to commit the answer to.
+Implemented. Before any Stars move, the payer waits for the bot's answer for **at
+most 10 seconds** (Telegram's requirement). The bot receives a `pre_checkout_query`
+update and answers with `pre_checkout_query_id`, `ok` and, when `ok=false`, an
+`error_message`.
 
+- `ok=true` — the Stars are charged and the bot receives `successful_payment`;
+- `ok=false` — the payment is cancelled and `error_message` is shown to the payer;
+- no answer within 10 seconds — the payment does not go through (`PAYMENT_FAILED`).
+
+The timeout never degrades into charging anyway: a silent bot means a refusal,
+otherwise pre-checkout would verify nothing. Only the bot that owns the order may
+answer; a stale `pre_checkout_query_id` gets `QUERY_ID_INVALID`. The currency and
+`invoice_payload` in the answer are not compared against what the bot recorded at
+`sendInvoice`, so that check stays on the bot side, same as in Telegram.
+
+### `answerShippingQuery`
+
+Recognized, but answers HTTP `501 METHOD_NOT_FOUND`: a Stars payment has no
+shipping step, so there is nothing to answer.
 ## Markup and entities
 
 `reply_markup` accepts exactly one constructor:
