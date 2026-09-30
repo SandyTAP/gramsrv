@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"telesrv/internal/domain"
@@ -73,20 +74,43 @@ func (l *botInvoiceLedger) settle(botUserID, chatID int64, messageID int, payerU
 	return invoice, true, nil
 }
 
-func (l *botInvoiceLedger) refundByCharge(chargeID string) (domain.BotInvoice, bool, error) {
+func (l *botInvoiceLedger) byChargeID(chargeID string) (domain.BotInvoice, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	key, found := l.byCharge[chargeID]
 	if !found {
-		return domain.BotInvoice{}, false, domain.ErrBotInvoiceNotFound
+		return domain.BotInvoice{}, domain.ErrBotInvoiceNotFound
+	}
+	return l.byMsg[key], nil
+}
+
+func (l *botInvoiceLedger) markRefunded(chargeID string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key, found := l.byCharge[chargeID]
+	if !found {
+		return false, domain.ErrBotInvoiceNotFound
 	}
 	invoice := l.byMsg[key]
 	if invoice.Refunded {
-		return invoice, true, nil
+		return false, nil
 	}
 	invoice.Refunded = true
 	l.byMsg[key] = invoice
-	return invoice, false, nil
+	return true, nil
+}
+
+func (l *botInvoiceLedger) releaseRefund(chargeID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key, found := l.byCharge[chargeID]
+	if !found {
+		return domain.ErrBotInvoiceNotFound
+	}
+	invoice := l.byMsg[key]
+	invoice.Refunded = false
+	l.byMsg[key] = invoice
+	return nil
 }
 
 func (s *BotStore) CreateBotInvoice(_ context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error) {
@@ -111,9 +135,30 @@ func (s *BotStore) SettleBotInvoice(_ context.Context, botUserID, chatID int64, 
 	return s.invoices.settle(botUserID, chatID, messageID, payerUserID, chargeID, date)
 }
 
-func (s *BotStore) RefundBotInvoiceByCharge(_ context.Context, chargeID string) (domain.BotInvoice, bool, error) {
+func (s *BotStore) BotInvoiceByCharge(_ context.Context, chargeID string) (domain.BotInvoice, bool, error) {
 	if chargeID == "" {
 		return domain.BotInvoice{}, false, domain.ErrBotInvoiceInvalid
 	}
-	return s.invoices.refundByCharge(chargeID)
+	invoice, err := s.invoices.byChargeID(chargeID)
+	if errors.Is(err, domain.ErrBotInvoiceNotFound) {
+		return domain.BotInvoice{}, false, domain.ErrBotInvoiceNotFound
+	}
+	if err != nil {
+		return domain.BotInvoice{}, false, err
+	}
+	return invoice, true, nil
+}
+
+func (s *BotStore) MarkBotInvoiceRefunded(_ context.Context, chargeID string) (bool, error) {
+	if chargeID == "" {
+		return false, domain.ErrBotInvoiceInvalid
+	}
+	return s.invoices.markRefunded(chargeID)
+}
+
+func (s *BotStore) ReleaseBotInvoiceRefund(_ context.Context, chargeID string) error {
+	if chargeID == "" {
+		return domain.ErrBotInvoiceInvalid
+	}
+	return s.invoices.releaseRefund(chargeID)
 }

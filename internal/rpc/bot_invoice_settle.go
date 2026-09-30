@@ -8,6 +8,7 @@ import (
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
+	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 )
@@ -130,7 +131,11 @@ func botInvoiceChargeID(invoice domain.BotInvoice) string {
 
 // BotAPIRefundStarPayment implements refundStarPayment. It reverses the exact
 // Stars the charge credited: the bot wallet is debited and the buyer refunded.
-func (r *Router) BotAPIRefundStarPayment(ctx context.Context, botID, userID int64, telegramPaymentChargeID string) (bool, error) {
+//
+// Nothing is flagged until the request has proved it owns the charge, because a
+// bot calling this with someone else's charge id would otherwise mark it refunded
+// and permanently deny the real owner the refund.
+func (r *Router) BotAPIRefundStarPayment(ctx context.Context, botID, requestedPayerID int64, telegramPaymentChargeID string) (bool, error) {
 	if r.deps.Bots == nil || r.deps.Stars == nil {
 		return false, notImplementedErr()
 	}
@@ -138,34 +143,74 @@ func (r *Router) BotAPIRefundStarPayment(ctx context.Context, botID, userID int6
 	if chargeID == "" {
 		return false, errors.New("CHARGE_ID_INVALID")
 	}
-	invoice, already, err := r.deps.Bots.RefundBotInvoiceByCharge(ctx, chargeID)
+	invoice, found, err := r.deps.Bots.BotInvoiceByCharge(ctx, chargeID)
 	if err != nil {
 		if errors.Is(err, domain.ErrBotInvoiceNotFound) {
 			return false, errors.New("CHARGE_ID_NOT_FOUND")
 		}
 		return false, err
 	}
-	// A repeated refund is a no-op, not a second reversal.
-	if already {
-		return true, nil
+	if !found {
+		return false, errors.New("CHARGE_ID_NOT_FOUND")
 	}
 	// Only the owning bot may refund its own charge.
 	if invoice.BotUserID != botID {
 		return false, errors.New("CHARGE_ID_NOT_FOUND")
 	}
-	now := int(r.clock.Now().Unix())
-	payer := domain.Peer{Type: domain.PeerTypeUser, ID: invoice.BotUserID}
-	if _, err := r.deps.Stars.Credit(ctx, userID, invoice.Amount,
-		domain.StarsReasonBotRefund, payer, invoice.Title, ""); err != nil {
-		return false, starsErr(err)
+	// user_id from the request body is not trusted to say who gets the money. The
+	// payer is recorded on the invoice, so the two have to agree; otherwise a bot
+	// could refund its own charge into an account it controls.
+	if invoice.PayerID <= 0 || requestedPayerID != invoice.PayerID {
+		return false, errors.New("USER_ID_INVALID")
 	}
-	refund := domain.BotStarsCredit{
+
+	newly, err := r.deps.Bots.MarkBotInvoiceRefunded(ctx, chargeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrBotInvoiceNotFound) {
+			return false, errors.New("CHARGE_ID_NOT_FOUND")
+		}
+		return false, err
+	}
+	if !newly {
+		// A repeated refund is a no-op, not a second reversal.
+		return true, nil
+	}
+
+	now := int(r.clock.Now().Unix())
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: invoice.BotUserID}
+	// The wallet is debited first: it can refuse an overdraft, and refunding the
+	// buyer out of a wallet that cannot cover it would be money from nowhere.
+	if _, _, err := r.creditBotWallet(ctx, domain.BotStarsCredit{
 		BotUserID: invoice.BotUserID, PayerUserID: invoice.PayerID,
 		Amount: -invoice.Amount, Reason: domain.StarsReasonBotRefund,
 		InvoiceKey: chargeID + "-refund", Date: now,
-	}
-	if _, _, err := r.creditBotWallet(ctx, refund); err != nil {
+	}); err != nil {
+		// No money moved, so the flag goes back and the bot can retry.
+		r.releaseBotInvoiceRefund(ctx, chargeID)
 		return false, err
 	}
+	if _, err := r.deps.Stars.Credit(ctx, invoice.PayerID, invoice.Amount,
+		domain.StarsReasonBotRefund, peer, invoice.Title, ""); err != nil {
+		// The wallet is already debited, so put it back before lifting the flag.
+		// If the rollback itself fails the refund stays flagged, which loses the
+		// buyer's Stars but never mints them; either way it is logged.
+		if _, _, rbErr := r.creditBotWallet(ctx, domain.BotStarsCredit{
+			BotUserID: invoice.BotUserID, PayerUserID: invoice.PayerID,
+			Amount: invoice.Amount, Reason: domain.StarsReasonBotRefund,
+			InvoiceKey: chargeID + "-refund-rollback", Date: now,
+		}); rbErr == nil {
+			r.releaseBotInvoiceRefund(ctx, chargeID)
+		}
+		return false, starsErr(err)
+	}
 	return true, nil
+}
+
+// releaseBotInvoiceRefund lifts the refunded flag after a failed refund so the
+// charge is not swallowed as a replay on the next attempt.
+func (r *Router) releaseBotInvoiceRefund(ctx context.Context, chargeID string) {
+	if err := r.deps.Bots.ReleaseBotInvoiceRefund(ctx, chargeID); err != nil && r.log != nil {
+		r.log.Error("release bot invoice refund",
+			zap.String("charge_id", chargeID), zap.Error(err))
+	}
 }

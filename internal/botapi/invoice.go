@@ -60,6 +60,10 @@ func (h *handler) sendInvoice(w http.ResponseWriter, r *http.Request, botID int6
 // refundStarPayment implements the Bot API refundStarPayment method. It reverses
 // the exact Stars the charge credited, in the same transaction order as the
 // original charge: the buyer is refunded and the bot wallet is debited.
+//
+// user_id is the payer per the Bot API contract. It is checked against the payer
+// recorded on the invoice rather than trusted, so a bot cannot redirect its own
+// refund into another account.
 func (h *handler) refundStarPayment(w http.ResponseWriter, r *http.Request, botID int64) {
 	if h.invoices == nil {
 		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")

@@ -381,7 +381,9 @@ type BotsService interface {
 	CreateBotInvoice(ctx context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error)
 	BotInvoiceByMessage(ctx context.Context, botUserID, chatID int64, messageID int) (domain.BotInvoice, bool, error)
 	SettleBotInvoice(ctx context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error)
-	RefundBotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
+	BotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
+	MarkBotInvoiceRefunded(ctx context.Context, chargeID string) (bool, error)
+	ReleaseBotInvoiceRefund(ctx context.Context, chargeID string) error
 	PutWebViewCustomMethodQuery(ctx context.Context, botUserID, userID int64, method, paramsJSON string) (domain.BotWebViewCustomMethodQuery, error)
 }
 

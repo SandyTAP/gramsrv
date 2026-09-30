@@ -62,24 +62,40 @@ func TestBotInvoiceSettlementIsOneShotAndRefundIsReplaySafe(t *testing.T) {
 		t.Fatalf("second settle receipt = %q, want the original charge id", again.ChargeID)
 	}
 
-	// A refunded charge resolves back to the invoice, and refunding twice is a
-	// no-op rather than a second reversal.
-	refunded, already, err := store.RefundBotInvoiceByCharge(ctx, "charge-abc")
-	if err != nil || already || !refunded.Refunded {
-		t.Fatalf("refund = %+v, %v, %v, want a refunded invoice", refunded, already, err)
+	// Looking a charge up changes nothing, so ownership can be checked first.
+	found, foundOK, err := store.BotInvoiceByCharge(ctx, "charge-abc")
+	if err != nil || !foundOK || found.Refunded {
+		t.Fatalf("lookup = %+v, %v, %v, want the unflagged invoice", found, foundOK, err)
 	}
-	_, already, err = store.RefundBotInvoiceByCharge(ctx, "charge-abc")
-	if err != nil || !already {
-		t.Fatalf("second refund already = %v, err = %v, want a no-op", already, err)
+	// Flagging twice is a no-op rather than a second reversal.
+	newly, err := store.MarkBotInvoiceRefunded(ctx, "charge-abc")
+	if err != nil || !newly {
+		t.Fatalf("mark refunded = %v, %v, want the first flag to win", newly, err)
+	}
+	newly, err = store.MarkBotInvoiceRefunded(ctx, "charge-abc")
+	if err != nil || newly {
+		t.Fatalf("second mark refunded = %v, %v, want a no-op", newly, err)
+	}
+	// A failed refund releases the flag so the next attempt is not swallowed.
+	if err := store.ReleaseBotInvoiceRefund(ctx, "charge-abc"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	found, foundOK, err = store.BotInvoiceByCharge(ctx, "charge-abc")
+	if err != nil || !foundOK || found.Refunded {
+		t.Fatalf("after release = %+v, %v, %v, want the flag cleared", found, ok, err)
 	}
 	// A refunded invoice is terminal: it must not be settleable again.
+	// A refunded invoice is terminal: it must not be settleable again.
+	if newly, err = store.MarkBotInvoiceRefunded(ctx, "charge-abc"); err != nil || !newly {
+		t.Fatalf("mark before settle-after-refund = %v, %v", newly, err)
+	}
 	_, ok, err = store.SettleBotInvoice(ctx, bot.ID, payer.ID, 42, payer.ID, "charge-xyz", now)
 	if err != nil || ok {
 		t.Fatalf("settle after refund = %v, %v, want a no-op", ok, err)
 	}
 
 	// An unknown charge id is not found rather than silently succeeding.
-	if _, _, err := store.RefundBotInvoiceByCharge(ctx, "charge-unknown"); !errors.Is(err, domain.ErrBotInvoiceNotFound) {
+	if _, _, err := store.BotInvoiceByCharge(ctx, "charge-unknown"); !errors.Is(err, domain.ErrBotInvoiceNotFound) {
 		t.Fatalf("unknown charge err = %v, want ErrBotInvoiceNotFound", err)
 	}
 }

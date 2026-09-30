@@ -38,11 +38,29 @@ func (s *Service) SettleBotInvoice(ctx context.Context, botUserID, chatID int64,
 	return s.bots.SettleBotInvoice(ctx, botUserID, chatID, messageID, payerUserID, chargeID, date)
 }
 
-// RefundBotInvoiceByCharge resolves an invoice by telegram_payment_charge_id
-// and flags it refunded. already=true means this charge was refunded before.
-func (s *Service) RefundBotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error) {
+// BotInvoiceByCharge resolves an invoice by telegram_payment_charge_id without
+// changing it, so ownership can be checked before anything is flagged.
+func (s *Service) BotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error) {
 	if s == nil || s.bots == nil {
 		return domain.BotInvoice{}, false, domain.ErrBotInvoiceInvalid
 	}
-	return s.bots.RefundBotInvoiceByCharge(ctx, chargeID)
+	return s.bots.BotInvoiceByCharge(ctx, chargeID)
+}
+
+// MarkBotInvoiceRefunded flags the charge refunded and reports whether this call
+// is the one that did it.
+func (s *Service) MarkBotInvoiceRefunded(ctx context.Context, chargeID string) (bool, error) {
+	if s == nil || s.bots == nil {
+		return false, domain.ErrBotInvoiceInvalid
+	}
+	return s.bots.MarkBotInvoiceRefunded(ctx, chargeID)
+}
+
+// ReleaseBotInvoiceRefund clears the refunded flag so a refund whose money
+// movement failed can be retried.
+func (s *Service) ReleaseBotInvoiceRefund(ctx context.Context, chargeID string) error {
+	if s == nil || s.bots == nil {
+		return domain.ErrBotInvoiceInvalid
+	}
+	return s.bots.ReleaseBotInvoiceRefund(ctx, chargeID)
 }

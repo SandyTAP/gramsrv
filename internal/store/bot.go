@@ -55,9 +55,15 @@ type BotStore interface {
 	// reported. A replayed call returns the stored invoice with settled=false
 	// instead of charging the payer twice.
 	SettleBotInvoice(ctx context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error)
-	// RefundBotInvoiceByCharge resolves an invoice by telegram_payment_charge_id
-	// and flags it refunded; an already refunded invoice is a replay-safe no-op.
-	RefundBotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
+	// BotInvoiceByCharge resolves an invoice by telegram_payment_charge_id without
+	// changing it, so the caller can check ownership before acting.
+	BotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
+	// MarkBotInvoiceRefunded flags an invoice refunded and reports whether this
+	// call is the one that did it; false means it was already refunded.
+	MarkBotInvoiceRefunded(ctx context.Context, chargeID string) (bool, error)
+	// ReleaseBotInvoiceRefund clears the refunded flag so a refund whose money
+	// movement failed can be retried instead of being lost forever.
+	ReleaseBotInvoiceRefund(ctx context.Context, chargeID string) error
 	GetAttachMenuBot(ctx context.Context, botUserID int64) (domain.BotAttachMenuBot, bool, error)
 	ListAttachMenuBots(ctx context.Context) ([]domain.BotAttachMenuBot, error)
 	GetAttachMenuState(ctx context.Context, userID, botUserID int64) (domain.BotAttachMenuState, bool, error)

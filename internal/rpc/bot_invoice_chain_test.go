@@ -259,3 +259,61 @@ func (c *invoiceChain) pay(t *testing.T, invoiceID int64, invoice *tg.InputInvoi
 		t.Fatalf("payment result = %T, want *tg.PaymentsPaymentResult", res)
 	}
 }
+
+// A refund has to give the buyer's Stars back, take them out of the bot wallet,
+// survive a repeat without reversing twice, and refuse a bot that does not own
+// the charge - without that refusal flagging the charge and denying the real
+// owner its money.
+func TestBotInvoiceRefundChain(t *testing.T) {
+	chain := newInvoiceChain(t)
+
+	if _, err := chain.router.BotAPISendInvoice(context.Background(),
+		chain.botID, chain.buyerID, "Товар", "Оплата 100 звёздами", "refund-1", 100); err != nil {
+		t.Fatalf("sendInvoice: %v", err)
+	}
+	payerID := chain.newestInvoiceID(t)
+	invoice := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: chain.botID, AccessHash: 1}, MsgID: payerID}
+	stored, found, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.botID, payerID)
+	if err != nil || !found {
+		t.Fatalf("invoice lookup: %v found=%v", err, found)
+	}
+	chain.pay(t, stored.ID, invoice)
+
+	start := chain.payerBalance(t)
+	wallet := chain.gifts.balance
+	chargeID := botInvoiceChargeID(stored)
+
+	// A bot that does not own the charge is refused, and must not consume the
+	// refund: the real owner still has to be able to take it.
+	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID+1, chain.buyerID, chargeID); err == nil {
+		t.Fatal("a foreign bot refunded a charge it does not own")
+	}
+	// The payer named in the request has to be the payer on the invoice.
+	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID+1, chargeID); err == nil {
+		t.Fatal("a refund redirected to another user_id was accepted")
+	}
+	if chain.gifts.balance != wallet {
+		t.Fatalf("wallet moved on a refused refund: %d, want %d", chain.gifts.balance, wallet)
+	}
+
+	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID, chargeID); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	if got := chain.payerBalance(t); got != start+100 {
+		t.Fatalf("buyer balance after refund = %d, want %d", got, start+100)
+	}
+	if chain.gifts.balance != wallet-100 {
+		t.Fatalf("bot wallet after refund = %d, want %d", chain.gifts.balance, wallet-100)
+	}
+
+	// A repeat is a no-op rather than a second reversal.
+	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID, chargeID); err != nil {
+		t.Fatalf("repeat refund: %v", err)
+	}
+	if got := chain.payerBalance(t); got != start+100 {
+		t.Fatalf("buyer balance after repeat = %d, want %d", got, start+100)
+	}
+	if chain.gifts.balance != wallet-100 {
+		t.Fatalf("bot wallet after repeat = %d, want %d", chain.gifts.balance, wallet-100)
+	}
+}
