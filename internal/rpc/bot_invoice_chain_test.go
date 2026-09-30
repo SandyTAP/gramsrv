@@ -317,3 +317,84 @@ func TestBotInvoiceRefundChain(t *testing.T) {
 		t.Fatalf("bot wallet after repeat = %d, want %d", chain.gifts.balance, wallet-100)
 	}
 }
+
+// A settled invoice must reach the bot as a successful_payment carrying the
+// charge id. That object is the only place a bot can learn the charge, so without
+// it refundStarPayment is unreachable no matter how correct it is.
+func TestBotInvoicePaidNotifiesBotWithChargeID(t *testing.T) {
+	chain := newInvoiceChain(t)
+
+	if _, err := chain.router.BotAPISendInvoice(context.Background(),
+		chain.botID, chain.buyerID, "Товар", "Оплата 100 звёздами", "notify-1", 100); err != nil {
+		t.Fatalf("sendInvoice: %v", err)
+	}
+	payerID := chain.newestInvoiceID(t)
+	invoice := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: chain.botID, AccessHash: 1}, MsgID: payerID}
+	stored, _, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.botID, payerID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	chain.pay(t, stored.ID, invoice)
+
+	// The message the bot receives is addressed to the bot and reads from the payer.
+	list, err := chain.store.GetByIDs(context.Background(), chain.botID, []int{1, 2, 3, 4, 5, 6, 7, 8})
+	if err != nil {
+		t.Fatalf("scan bot box: %v", err)
+	}
+	var found bool
+	for _, m := range list.Messages {
+		if m.Media == nil || m.Media.Kind != domain.MessageMediaKindService || m.Media.ServiceAction == nil {
+			continue
+		}
+		action := m.Media.ServiceAction
+		if action.Kind != domain.MessageServiceActionPayment {
+			continue
+		}
+		found = true
+		payment := action.Payment
+		if payment == nil || payment.ChargeID != botInvoiceChargeID(stored) {
+			t.Fatalf("charge id = %+v, want %q", payment, botInvoiceChargeID(stored))
+		}
+		if payment.Currency != domain.PremiumCurrencyStars || payment.TotalAmount != 100 {
+			t.Fatalf("payment = %+v, want 100 XTR", payment)
+		}
+		if payment.Payload != "notify-1" {
+			t.Fatalf("payload = %q, want the invoice payload", payment.Payload)
+		}
+		if m.From.ID != chain.buyerID {
+			t.Fatalf("service message from %d, want the payer %d", m.From.ID, chain.buyerID)
+		}
+	}
+	if !found {
+		t.Fatal("the bot received no payment service message")
+	}
+
+	// Replaying the payment must not announce it twice.
+	before := countPaymentMessages(t, chain)
+	chain.pay(t, stored.ID, invoice)
+	if after := countPaymentMessages(t, chain); after != before {
+		t.Fatalf("payment messages = %d after a replay, want %d", after, before)
+	}
+
+	// And the charge id from that message is exactly what a refund needs.
+	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(),
+		chain.botID, chain.buyerID, botInvoiceChargeID(stored)); err != nil {
+		t.Fatalf("refund with the announced charge id: %v", err)
+	}
+}
+
+func countPaymentMessages(t *testing.T, chain *invoiceChain) int {
+	t.Helper()
+	list, err := chain.store.GetByIDs(context.Background(), chain.botID, []int{1, 2, 3, 4, 5, 6, 7, 8})
+	if err != nil {
+		t.Fatalf("scan bot box: %v", err)
+	}
+	count := 0
+	for _, m := range list.Messages {
+		if m.Media != nil && m.Media.ServiceAction != nil &&
+			m.Media.ServiceAction.Kind == domain.MessageServiceActionPayment {
+			count++
+		}
+	}
+	return count
+}

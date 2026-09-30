@@ -253,6 +253,9 @@ func apiMessageProjectable(msg domain.Message) bool {
 	if msg.Out || msg.ID <= 0 {
 		return false
 	}
+	if apiSuccessfulPayment(msg.Media) != nil {
+		return true
+	}
 	return msg.Body != "" || (msg.RichMessage != nil && len(msg.RichMessage.BotAPIProjection) > 0) || len(apiMessageMedia(msg.Media, nil, nil)) > 0
 }
 
@@ -300,6 +303,11 @@ func apiMessage(msg domain.Message, users []domain.User, channelLists ...[]domai
 			from.Bot = true
 		}
 		out["from"] = apiUser(from)
+	}
+	// A settled invoice reaches the bot as successful_payment, which is where it
+	// gets telegram_payment_charge_id for a later refundStarPayment.
+	if payment := apiSuccessfulPayment(msg.Media); payment != nil {
+		out["successful_payment"] = payment
 	}
 	media := apiMessageMedia(msg.Media, userByID, channelByID)
 	if msg.Body != "" {
@@ -562,6 +570,32 @@ func apiReplyMarkup(markup *domain.MessageReplyMarkup) map[string]any {
 		return nil
 	}
 	return map[string]any{"inline_keyboard": rows}
+}
+
+// apiSuccessfulPayment projects the payment service message into the Bot API's
+// successful_payment object. Both charge ids are exposed because the Bot API
+// documents both on that object.
+func apiSuccessfulPayment(media *domain.MessageMedia) map[string]any {
+	if media == nil || media.Kind != domain.MessageMediaKindService || media.ServiceAction == nil {
+		return nil
+	}
+	if media.ServiceAction.Kind != domain.MessageServiceActionPayment {
+		return nil
+	}
+	payment := media.ServiceAction.Payment
+	if payment == nil || payment.ChargeID == "" {
+		return nil
+	}
+	out := map[string]any{
+		"currency":                   payment.Currency,
+		"total_amount":               payment.TotalAmount,
+		"telegram_payment_charge_id": payment.ChargeID,
+		"provider_payment_charge_id": payment.ProviderChargeID,
+	}
+	if payment.Payload != "" {
+		out["invoice_payload"] = payment.Payload
+	}
+	return out
 }
 
 func apiMessageMedia(media *domain.MessageMedia, users map[int64]domain.User, channels map[int64]domain.Channel) map[string]any {

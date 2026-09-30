@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	"github.com/iamxvbaba/td/tg"
@@ -81,12 +82,82 @@ func (r *Router) botInvoiceSettle(ctx context.Context, userID int64, req *tg.Pay
 		if _, _, err := r.creditBotWallet(ctx, credit); err != nil {
 			return nil, true, err
 		}
+		// Only the first settlement announces the payment, so a replayed form
+		// cannot post the service message twice.
+		r.sendBotInvoicePaidMessage(ctx, userID, invoice, chargeID, now)
 	} else {
 		// Duplicate settlement: the receipt below is the stored one, so the
 		// client sees the same charge id it already has.
 		chargeID = settled.ChargeID
 	}
 	return r.botInvoicePaymentResult(ctx, userID, invoice, chargeID), true, nil
+}
+
+// botInvoicePaidRandomID derives a stable random id from the charge, so that a
+// retried settlement produces the same id and is deduplicated by the message store
+// instead of posting a second service message.
+func botInvoicePaidRandomID(chargeID string) int64 {
+	sum := fnv.New64a()
+	_, _ = sum.Write([]byte(chargeID))
+	return int64(sum.Sum64() >> 1)
+}
+
+// botInvoiceServiceMessagePoster is the optional capability that lets the server
+// post a private service message on behalf of another user.
+type botInvoiceServiceMessagePoster interface {
+	PostPrivateServiceMessage(ctx context.Context, recipientUserID, fromUserID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error)
+}
+
+// sendBotInvoicePaidMessage posts the service message a bot receives once its
+// invoice is paid. It carries the charge id, which is the only way a bot can learn
+// it and therefore the only way refundStarPayment can ever be called: the buyer
+// never sees the charge, and no Bot API method reports it back.
+//
+// A failure here is logged rather than propagated: the payment itself already
+// settled and the money moved, so refusing the result would only hide that.
+func (r *Router) sendBotInvoicePaidMessage(ctx context.Context, payerID int64, invoice domain.BotInvoice, chargeID string, date int) {
+	// Optional rather than part of MessagesService: only this one flow needs to
+	// author a message whose sender is not the acting user, and a stand-in
+	// messages service should not be forced to pretend it can.
+	poster, ok := r.deps.Messages.(botInvoiceServiceMessagePoster)
+	if !ok || poster == nil {
+		return
+	}
+	res, err := poster.PostPrivateServiceMessage(ctx, invoice.BotUserID, payerID, domain.SendPrivateTextRequest{
+		RandomID: botInvoicePaidRandomID(chargeID),
+		Date:     date,
+		Media: &domain.MessageMedia{
+			Kind: domain.MessageMediaKindService,
+			ServiceAction: &domain.MessageServiceAction{
+				Kind: domain.MessageServiceActionPayment,
+				Payment: &domain.MessagePaymentAction{
+					Currency:         invoice.Currency,
+					TotalAmount:      invoice.Amount,
+					Payload:          invoice.Payload,
+					ChargeID:         chargeID,
+					ProviderChargeID: chargeID,
+					Title:            invoice.Title,
+					Description:      invoice.Description,
+				},
+			},
+		},
+	})
+	if err != nil {
+		if r.log != nil {
+			r.log.Error("bot invoice paid message",
+				zap.Int64("bot_user_id", invoice.BotUserID),
+				zap.Int64("payer_id", payerID),
+				zap.String("charge_id", chargeID),
+				zap.Error(err))
+		}
+		return
+	}
+	if res.RecipientMessage.ID > 0 && r.log != nil {
+		r.log.Info("bot invoice paid message sent",
+			zap.Int64("bot_user_id", invoice.BotUserID),
+			zap.Int("msg_id", res.RecipientMessage.ID),
+			zap.String("charge_id", chargeID))
+	}
 }
 
 // botInvoicePaymentResult reports the new balance plus the charge id the client

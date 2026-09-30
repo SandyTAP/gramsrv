@@ -565,6 +565,11 @@ func botAPIMessageMediaProjectable(media *domain.MessageMedia) bool {
 			return media.ServiceAction.WebViewData != nil
 		case domain.MessageServiceActionRequestedPeer:
 			return botAPIRequestedPeerProjectable(media.ServiceAction.RequestedPeer)
+		case domain.MessageServiceActionPayment:
+			// The service message has no media of its own; it is only reachable
+			// as successful_payment, so it would otherwise be filtered out here
+			// and the bot would never learn the charge id.
+			return media.ServiceAction.Payment != nil && media.ServiceAction.Payment.ChargeID != ""
 		default:
 			return false
 		}
