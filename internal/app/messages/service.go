@@ -126,6 +126,26 @@ func (s *Service) SendPrivateText(ctx context.Context, userID int64, req domain.
 	if req.SenderUserID != userID {
 		return domain.SendPrivateTextResult{}, domain.ErrAuthenticatedScopeInvalid
 	}
+	return s.sendPrivateText(ctx, userID, req)
+}
+
+// PostPrivateServiceMessage 让服务端自己落一条私聊服务消息，它的发送者不是当前
+// 认证用户。Bot Stars 付款凭证属于这一类：消息来自付款人，落到 bot 的会话里，
+// 而服务器此时 acting 的身份是 bot 本身，SendPrivateText 的发送者校验无法表达它。
+// 不开认证作用域检查是安全的——调用方是服务端逻辑，没有请求方可控的入口。
+func (s *Service) PostPrivateServiceMessage(ctx context.Context, recipientUserID, fromUserID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error) {
+	if s == nil || s.messages == nil || recipientUserID == 0 || fromUserID == 0 {
+		return domain.SendPrivateTextResult{}, domain.ErrMessageEmpty
+	}
+	if req.Media == nil || req.Media.Kind != domain.MessageMediaKindService {
+		return domain.SendPrivateTextResult{}, domain.ErrMessageEmpty
+	}
+	req.SenderUserID = fromUserID
+	req.RecipientUserID = recipientUserID
+	return s.sendPrivateText(ctx, fromUserID, req)
+}
+
+func (s *Service) sendPrivateText(ctx context.Context, userID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error) {
 	if err := domain.ValidateReplyMarkup(req.ReplyMarkup); err != nil {
 		return domain.SendPrivateTextResult{}, err
 	}

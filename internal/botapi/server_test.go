@@ -1000,6 +1000,16 @@ func TestSetWebhookPersistsConfigReportsInfoAndConflictsWithPolling(t *testing.T
 	if poll.Code != http.StatusConflict || !strings.Contains(poll.Body.String(), "webhook is active") {
 		t.Fatalf("getUpdates status=%d body=%s", poll.Code, poll.Body.String())
 	}
+	// Assert on the effect, not on ok:true: several methods answer ok:true and a
+	// status-only check would pass while the queue was left untouched.
+	gateway.dropPending = false
+	dropOnly := performBotAPIRequest(t, h, bots.profile, "dropPendingUpdates", `{}`)
+	if dropOnly.Code != http.StatusOK || !strings.Contains(dropOnly.Body.String(), `"ok":true`) ||
+		!gateway.dropPending {
+		t.Fatalf("dropPendingUpdates status=%d body=%s drop=%v",
+			dropOnly.Code, dropOnly.Body.String(), gateway.dropPending)
+	}
+
 	del := performBotAPIRequest(t, h, bots.profile, "deleteWebhook", `{}`)
 	if del.Code != http.StatusOK || !gateway.webhookDeleted || gateway.webhookFound {
 		t.Fatalf("deleteWebhook status=%d body=%s deleted=%v", del.Code, del.Body.String(), gateway.webhookDeleted)
@@ -1686,6 +1696,10 @@ func (f *fakeBotAPIGateway) BotAPIEditInlineRichMessage(_ context.Context, _ int
 
 func (f *fakeBotAPIGateway) BotAPIDeleteMessage(context.Context, int64, int64, int) (bool, error) {
 	f.deleteCalled = true
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIAnswerPreCheckoutQuery(_ context.Context, _ int64, _ string, _ bool, _ string) (bool, error) {
 	return true, nil
 }
 

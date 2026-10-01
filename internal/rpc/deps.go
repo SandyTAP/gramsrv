@@ -374,6 +374,16 @@ type BotsService interface {
 	DeleteRequestedWebViewButton(ctx context.Context, botUserID, userID int64, reqID string) error
 	SetBotEmojiStatusPermission(ctx context.Context, botUserID, userID int64, allowed bool) error
 	BotEmojiStatusPermission(ctx context.Context, botUserID, userID int64) (bool, error)
+
+	// Bot XTR invoices. The stored row is the settlement authority: in this
+	// layer payments.sendPaymentForm carries no purpose, so the price is
+	// resolved from the invoice instead of the request.
+	CreateBotInvoice(ctx context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error)
+	BotInvoiceByMessage(ctx context.Context, botUserID, chatID int64, messageID int) (domain.BotInvoice, bool, error)
+	SettleBotInvoice(ctx context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error)
+	BotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
+	MarkBotInvoiceRefunded(ctx context.Context, chargeID string) (bool, error)
+	ReleaseBotInvoiceRefund(ctx context.Context, chargeID string) error
 	PutWebViewCustomMethodQuery(ctx context.Context, botUserID, userID int64, method, paramsJSON string) (domain.BotWebViewCustomMethodQuery, error)
 }
 

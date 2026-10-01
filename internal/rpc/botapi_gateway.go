@@ -1113,6 +1113,27 @@ func (r *Router) BotAPIDeleteMessage(ctx context.Context, botID, chatID int64, m
 
 // BotAPIAnswerCallbackQuery bridges Bot API answerCallbackQuery to the same
 // process-local callback registry used by messages.setBotCallbackAnswer.
+// BotAPIAnswerPreCheckoutQuery answers the Bot API answerPreCheckoutQuery. The
+// payment is held open for at most 10 seconds waiting for exactly this call, so an
+// answer that arrives late is rejected rather than silently applied.
+func (r *Router) BotAPIAnswerPreCheckoutQuery(ctx context.Context, botID int64, queryIDRaw string, ok bool, errorMessage string) (bool, error) {
+	if r == nil || r.preCheckouts == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	queryID, err := strconv.ParseInt(strings.TrimSpace(queryIDRaw), 10, 64)
+	if err != nil || queryID == 0 {
+		return false, errors.New("QUERY_ID_INVALID")
+	}
+	errorMessage = strings.TrimSpace(errorMessage)
+	if !ok && utf8.RuneCountInString(errorMessage) > preCheckoutErrorMaxLen {
+		return false, errors.New("MESSAGE_TOO_LONG")
+	}
+	if !r.preCheckouts.resolve(botID, queryID, domain.BotPreCheckoutAnswer{OK: ok, Error: errorMessage}) {
+		return false, errors.New("QUERY_ID_INVALID")
+	}
+	return true, nil
+}
+
 func (r *Router) BotAPIAnswerCallbackQuery(ctx context.Context, botID int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error) {
 	if r == nil || r.callbacks == nil || botID == 0 {
 		return false, errors.New("BOT_INVALID")

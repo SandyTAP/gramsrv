@@ -160,6 +160,20 @@ func tgMessageMedia(m *domain.MessageMedia) tg.MessageMediaClass {
 		out.SetStars(m.Giveaway.Stars)
 		return out
 	case domain.MessageMediaKindInvoice:
+		// A bot's own product sale and the built-in Premium bot share this media
+		// kind but not their validation rules, so each is checked on its own.
+		if m.ProductInvoice != nil {
+			if !m.ProductInvoice.Valid() {
+				return &tg.MessageMediaEmpty{}
+			}
+			return &tg.MessageMediaInvoice{
+				Title:       m.ProductInvoice.Title,
+				Description: m.ProductInvoice.Description,
+				Currency:    domain.PremiumCurrencyStars,
+				TotalAmount: m.ProductInvoice.AmountStars,
+				StartParam:  m.ProductInvoice.StartParam,
+			}
+		}
 		if m.Invoice == nil || !m.Invoice.Valid() {
 			return &tg.MessageMediaEmpty{}
 		}

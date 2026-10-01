@@ -146,6 +146,23 @@ func tgMessageServiceAction(msg domain.Message) tg.MessageActionClass {
 		return &tg.MessageActionSuggestProfilePhoto{Photo: tgPhoto(*m.ServiceAction.Photo)}
 	case domain.MessageServiceActionPinMessage:
 		return &tg.MessageActionPinMessage{}
+	case domain.MessageServiceActionPayment:
+		payment := m.ServiceAction.Payment
+		if payment == nil || payment.ChargeID == "" {
+			return &tg.MessageActionEmpty{}
+		}
+		// messageActionPaymentSentMe is the bot's copy of a settled invoice.
+		// Charge.ID is what the Bot API calls telegram_payment_charge_id and
+		// refundStarPayment has to be given.
+		return &tg.MessageActionPaymentSentMe{
+			Currency:    payment.Currency,
+			TotalAmount: payment.TotalAmount,
+			Payload:     []byte(payment.Payload),
+			Charge: tg.PaymentCharge{
+				ID:               payment.ChargeID,
+				ProviderChargeID: payment.ProviderChargeID,
+			},
+		}
 	case domain.MessageServiceActionSetChatTheme:
 		return &tg.MessageActionSetChatTheme{
 			Theme: &tg.ChatTheme{Emoticon: m.ServiceAction.ChatThemeEmoticon},

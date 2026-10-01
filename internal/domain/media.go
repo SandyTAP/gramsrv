@@ -619,6 +619,9 @@ const (
 	MessageServiceActionStarGiftOffer         MessageServiceActionKind = "star_gift_offer"
 	MessageServiceActionStarGiftOfferDeclined MessageServiceActionKind = "star_gift_offer_declined"
 	MessageServiceActionGiftPremium           MessageServiceActionKind = "gift_premium"
+	// MessageServiceActionPayment is messageActionPaymentSentMe: a payer settled
+	// an invoice of ours.
+	MessageServiceActionPayment MessageServiceActionKind = "payment_sent_me"
 )
 
 // MessagePhoneCallAction 是 messageActionPhoneCall 的协议中立载荷。
@@ -707,6 +710,23 @@ type MessageServiceAction struct {
 	StarGiftOffer         *MessageStarGiftOfferAction         `json:"star_gift_offer,omitempty"`
 	StarGiftOfferDeclined *MessageStarGiftOfferDeclinedAction `json:"star_gift_offer_declined,omitempty"`
 	GiftPremium           *MessageGiftPremiumAction           `json:"gift_premium,omitempty"`
+	Payment               *MessagePaymentAction               `json:"payment,omitempty"`
+}
+
+// MessagePaymentAction is projected as messageActionPaymentSentMe, which is what
+// a bot receives once a payer settles an invoice. It is the only place a bot
+// learns the charge id, and therefore the only way it can later refund.
+//
+// Without it a payment settles but stays invisible to the bot, so refundStarPayment
+// would be unreachable: nothing would ever supply telegram_payment_charge_id.
+type MessagePaymentAction struct {
+	Currency         string `json:"currency"`
+	TotalAmount      int64  `json:"total_amount"`
+	Payload          string `json:"payload,omitempty"`
+	ChargeID         string `json:"charge_id"`
+	ProviderChargeID string `json:"provider_charge_id"`
+	Title            string `json:"title,omitempty"`
+	Description      string `json:"description,omitempty"`
 }
 
 // MessageGiftPremiumAction is projected as
@@ -818,12 +838,16 @@ type MessageMedia struct {
 	WebPage        *MessageWebPage       `json:"web_page,omitempty"`
 	Giveaway       *MessageGiveaway      `json:"giveaway,omitempty"`
 	Invoice        *PremiumInvoice       `json:"invoice,omitempty"`
-	Spoiler        bool                  `json:"spoiler,omitempty"`
-	TTLSeconds     int                   `json:"ttl_seconds,omitempty"`
-	Nopremium      bool                  `json:"nopremium,omitempty"`
-	Voice          bool                  `json:"voice,omitempty"`
-	Round          bool                  `json:"round,omitempty"`
-	Video          bool                  `json:"video,omitempty"`
+	// ProductInvoice is the generic bot sale shape. It is separate from Invoice
+	// because a Premium invoice carries a plan, not a product, and the two
+	// validate against different rules.
+	ProductInvoice *Invoice `json:"product_invoice,omitempty"`
+	Spoiler        bool     `json:"spoiler,omitempty"`
+	TTLSeconds     int      `json:"ttl_seconds,omitempty"`
+	Nopremium      bool     `json:"nopremium,omitempty"`
+	Voice          bool     `json:"voice,omitempty"`
+	Round          bool     `json:"round,omitempty"`
+	Video          bool     `json:"video,omitempty"`
 	// InvertMedia 映射 message.invert_media：媒体（典型为链接预览）渲染在文本上方。
 	// 存于媒体快照而非消息行，避免新增消息表列；读时投影为 tg.Message.invert_media。
 	InvertMedia bool `json:"invert_media,omitempty"`

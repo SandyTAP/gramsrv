@@ -964,6 +964,56 @@ func (s *Service) ChannelTonTransactions(ctx context.Context, channelID int64, q
 	return s.lifecycle.ChannelTonTransactions(ctx, channelID, query)
 }
 
+// BotStarsBalance returns a bot's own revenue wallet balance. Without the
+// lifecycle store (isolated memory test adapters) the wallet reads zero, which
+// matches a bot that has never been paid.
+func (s *Service) BotStarsBalance(ctx context.Context, botUserID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.BotStarsBalance(ctx, botUserID)
+}
+
+// BotStarsOverallRevenue returns the bot's lifetime positive revenue, which
+// stays monotonic across refunds and spends.
+func (s *Service) BotStarsOverallRevenue(ctx context.Context, botUserID int64) (int64, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, nil
+	}
+	return s.lifecycle.BotStarsOverallRevenue(ctx, botUserID)
+}
+
+func (s *Service) BotStarsTransactions(ctx context.Context, botUserID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error) {
+	if s == nil || s.lifecycle == nil {
+		return domain.StarsTransactionPage{}, nil
+	}
+	query, err := domain.NormalizeStarsTransactionQuery(query)
+	if err != nil {
+		return domain.StarsTransactionPage{}, err
+	}
+	return s.lifecycle.BotStarsTransactions(ctx, botUserID, query)
+}
+
+// CreditBotStarsWallet settles one invoice into the bot's own wallet. The
+// second return value is false when InvoiceKey was already settled, which makes
+// the call safe to retry after a transport timeout.
+func (s *Service) CreditBotStarsWallet(ctx context.Context, credit domain.BotStarsCredit) (int64, bool, error) {
+	if s == nil || s.lifecycle == nil {
+		return 0, false, domain.ErrStarGiftLifecycleInvalid
+	}
+	return s.lifecycle.CreditBotStarsWallet(ctx, credit)
+}
+
+// BotStarsRevenueSeries returns the per-day revenue series backing the bot
+// revenue chart. Without the lifecycle store the series is empty, which the
+// RPC layer projects as a "no data" graph.
+func (s *Service) BotStarsRevenueSeries(ctx context.Context, botUserID int64, fromUnix, toUnix int) ([]domain.BotStarsRevenuePoint, error) {
+	if s == nil || s.lifecycle == nil {
+		return nil, nil
+	}
+	return s.lifecycle.BotStarsRevenueSeries(ctx, botUserID, fromUnix, toUnix)
+}
+
 func (s *Service) SweepLifecycle(ctx context.Context, now, limit int) error {
 	if s == nil || s.lifecycle == nil {
 		return nil

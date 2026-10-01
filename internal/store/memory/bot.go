@@ -29,6 +29,7 @@ type BotStore struct {
 	requestButtons map[requestedButtonKey]domain.BotRequestedWebViewButton
 	emojiPerms     map[[2]int64]bool
 	customMethod   map[string]domain.BotWebViewCustomMethodQuery
+	invoices       *botInvoiceLedger
 }
 
 type botAppShortKey struct {
@@ -58,6 +59,7 @@ func NewBotStore(users *UserStore) *BotStore {
 		requestButtons: make(map[requestedButtonKey]domain.BotRequestedWebViewButton),
 		emojiPerms:     make(map[[2]int64]bool),
 		customMethod:   make(map[string]domain.BotWebViewCustomMethodQuery),
+		invoices:       newBotInvoiceLedger(),
 	}
 	s.byID[domain.BotFatherUserID] = botFatherSeedProfile()
 	s.byID[domain.StickersBotUserID] = stickersSeedProfile()
