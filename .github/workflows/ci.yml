@@ -157,6 +157,9 @@ jobs:
           docker compose version
           sh -n scripts/new-docker-env.sh
           bash -n scripts/start-docker.sh
+          bash -n scripts/backup.sh
+          bash -n scripts/restore.sh
+          bash -n scripts/check-media.sh
           sh -n deploy/docker/docker-entrypoint.sh
           compose=(docker compose -p telesrv-main-ci --project-directory deploy/docker --env-file deploy/docker/.env -f deploy/docker/compose.yaml)
           bridge=("${compose[@]}" -f deploy/docker/compose.bridge-network.yaml)
@@ -176,6 +179,12 @@ jobs:
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/start-docker.ps1", [ref]$tokens, [ref]$errors)
           if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          foreach ($launcher in @("scripts/backup.ps1", "scripts/restore.ps1", "scripts/check-media.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          }
 
       - name: Build application images
         run: |

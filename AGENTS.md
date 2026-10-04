@@ -57,7 +57,7 @@ MTProto client
   ← updates/state          outbox dispatchers, durable delivery, projections
 ```
 
-Binaries in `cmd/`: `telesrv` (server), `telesrv-admin` (admin dashboard), `telesrv-load`, `telesrv-update` (standalone update CDN, defunct in monolith unless `TELESRV_UPDATE_PUBLIC_URL` set), plus fetch/seed utilities (`catalogfetch`, `giftfetch`, `langpackfetch`, `stickerseeddeploy`, `blobmigrate`, `telegramloginkeygen`, `walletminiapp`, `bots/*`).
+Binaries in `cmd/`: `telesrv` (server), `telesrv-admin` (admin dashboard), `telesrv-load`, `telesrv-update` (standalone update CDN, defunct in monolith unless `TELESRV_UPDATE_PUBLIC_URL` set), `gramsrv-backup` (bundle capture/restore/verify; guide in `docs/backup-restore.md`, wrappers in `scripts/backup.{sh,ps1}`, `scripts/restore.{sh,ps1}`, `scripts/check-media.{sh,ps1}`), plus fetch/seed utilities (`catalogfetch`, `giftfetch`, `langpackfetch`, `stickerseeddeploy`, `blobmigrate`, `telegramloginkeygen`, `walletminiapp`, `bots/*`).
 
 ## Module map (find-and-fix guide)
 
