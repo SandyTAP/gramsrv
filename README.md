@@ -70,6 +70,19 @@ uses host networking by default for SFU/TURN; pass `-BridgeNetwork` only when
 host networking is unavailable. The [`v2` Docker deployment runbook](../../blob/v2/docs/docker-deployment.en.md)
 covers the split topology, firewall, backup, upgrade, and remote access.
 
+## Backup and restore
+
+`cmd/gramsrv-backup` captures the database, the media and key tree, Redis, and
+the configuration as a single verifiable bundle, and restores it on another host:
+
+```bash
+./scripts/backup.sh --component all --freeze-units gramsrv.service,gramsrv-admin.service
+./bin/gramsrv-backup verify --from gramsrv-backup-20261004
+./scripts/restore.sh --from gramsrv-backup-20261004 --dry-run
+```
+
+See [docs/backup-restore.md](docs/backup-restore.md) for the migration runbook.
+
 ## Why gramsrv
 
 Most Telegram clones reproduce the interface. `gramsrv` implements the server

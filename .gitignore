@@ -31,5 +31,14 @@ tmp/
 .idea/
 .vscode/
 
+# gramsrv-backup bundles: they contain .env, the server RSA key and the login
+# signing keys. Never commit them.
+/backup/
+/backups/
+/bundle/
+*.tar.zst
+*.sql.zst
+*.rdb.zst
+
 # Internal server deployment script (not part of the public repository)
 /scripts/install.sh
