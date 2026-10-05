@@ -86,6 +86,10 @@ type StarGiftUpgradeStore interface {
 type StarGiftLifecycleStore interface {
 	IssueStarGiftPurchaseForm(ctx context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error)
 	ValidateStarGiftPurchaseForm(ctx context.Context, req domain.StarGiftPurchaseRequest) error
+	// SettledStarGiftPurchase 读取某个 command_key 已结算的礼物购买。它刻意不放
+	// form_id 进比对范围：Bot API 的重试会签发一张全新的支付表单，付款命令表才是
+	// 唯一稳定的锚点。请求指纹不一致时返回 domain.ErrStarGiftIdempotencyConflict。
+	SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error)
 	PurchaseStarGift(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error)
 	ConvertStarGift(ctx context.Context, req domain.StarGiftConvertRequest) (domain.StarGiftConvertResult, error)
 	ListResaleStarGifts(ctx context.Context, filter domain.StarGiftResaleFilter) (domain.StarGiftResalePage, error)

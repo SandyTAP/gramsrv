@@ -108,21 +108,6 @@ func (r *Router) BotAPIGiftPremiumSubscription(
 	return true, nil
 }
 
-// BotAPIAvailableGifts implements the HTTP Bot API getAvailableGifts method on
-// top of the same catalog MTProto payments.getStarGifts serves, so a bot picking
-// a gift id over HTTP picks an id the MTProto checkout would accept.
-//
-// Availability itself is not filtered here: the enabled catalog is returned
-// as-is, including sold-out and not-yet-released gifts, because remaining_count
-// is the signal a bot needs to tell "sold out" from "gone". The purchase
-// transaction behind sendGift is where availability is enforced under a lock.
-func (r *Router) BotAPIAvailableGifts(ctx context.Context) ([]domain.StarGift, error) {
-	if r == nil || r.deps.Gifts == nil {
-		return nil, errors.New("STAR_GIFT_UNAVAILABLE")
-	}
-	return r.deps.Gifts.Catalog(ctx)
-}
-
 var botAPIAuthKeyID = [8]byte{'B', 'O', 'T', 'A', 'P', 'I', 0, 1}
 
 const botAPIChannelChatIDBase int64 = 1000000000000
