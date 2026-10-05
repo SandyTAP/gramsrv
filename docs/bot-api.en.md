@@ -135,7 +135,7 @@ Markers the gateway can return directly:
 
 ## Method summary
 
-Implemented (37 methods + 1 file route):
+Implemented (38 methods + 1 file route):
 
 | Group | Methods |
 |---|---|
@@ -152,6 +152,7 @@ Implemented (37 methods + 1 file route):
 | Menus & status | `setChatMenuButton`, `getChatMenuButton`, `setUserEmojiStatus` |
 | Web apps & inline | `answerWebAppQuery`, `savePreparedInlineMessage` |
 | Payments | `giftPremiumSubscription` |
+| Gifts | `getAvailableGifts` |
 | Blocked by design | `answerShippingQuery` (HTTP 501) |
 
 ## Updates
@@ -508,6 +509,58 @@ answer produced one.
 
 ## Methods: payments
 
+### `getAvailableGifts`
+
+The gift catalog available to the bot. Takes no parameters.
+
+Returns a `Gifts` object whose `gifts` array holds one `Gift` per entry:
+
+| Field | Type | Present when |
+|---|---|---|
+| `id` | string | always; this is the `gift_id` to pass when sending the gift |
+| `sticker` | `Sticker` | always, when the gift carries a sticker |
+| `star_count` | integer | always; the gift price in Stars |
+| `upgrade_star_count` | integer | only while a collectible upgrade is actually purchasable |
+| `total_count` | integer | limited gifts only |
+| `remaining_count` | integer | limited gifts only |
+
+```json
+{
+  "ok": true,
+  "result": {
+    "gifts": [
+      {
+        "id": "123456789",
+        "sticker": {"file_id": "...", "type": "regular", "width": 512, "height": 512},
+        "star_count": 15,
+        "upgrade_star_count": 10,
+        "total_count": 1000,
+        "remaining_count": 734
+      }
+    ]
+  }
+}
+```
+
+The source is the same enabled catalog MTProto `payments.getStarGifts` serves,
+so an `id` read here is also accepted by the MTProto checkout.
+`upgrade_star_count` is omitted once the unique-gift supply is exhausted: a price
+the server would then refuse is worse than no field at all. `total_count` and
+`remaining_count` are limited-gift inventory and are absent for unlimited gifts.
+
+The list is deliberately not filtered by availability: a sold-out gift and a gift
+that has not been released yet both stay in the result, and `remaining_count` is
+what tells a bot they cannot be bought right now. Availability is enforced in the
+purchase transaction.
+
+The intended flow is to read the id rather than hardcode it:
+
+```
+getAvailableGifts() → gifts[] → pick a gift → gift.id → send the gift
+```
+
+A deployment without a gift catalog answers HTTP `501 METHOD_NOT_FOUND`.
+
 ### `giftPremiumSubscription`
 
 Pays for a Premium gift out of the bot's Stars balance, through the same
@@ -625,8 +678,9 @@ commonly reached ones:
   `stopMessageLiveLocation`, `stopPoll`;
 - media groups and the rest of the `send*` surface: `sendMediaGroup`,
   `sendPoll`, `sendDice`, `sendGame`, `sendChatAction`;
-- payments: `createInvoiceLink`, `sendInvoice`, `answerPreCheckoutQuery`,
-  `answerShippingQuery`, `getStarTransactions`, `refundStarPayment`;
+- payments: `createInvoiceLink`, `getStarTransactions`, `getMyStarBalance`;
+- gifts: `sendGift` (the catalog is served by `getAvailableGifts`, but there is
+  no HTTP method to send a Star Gift yet);
 - chat administration: `banChatMember`, `unbanChatMember`,
   `restrictChatMember`, `promoteChatMember`, `setChatPermissions`,
   `setChatPhoto`, `deleteChatPhoto`, `pinChatMessage`, `unpinChatMessage`,

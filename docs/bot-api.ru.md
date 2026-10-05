@@ -134,7 +134,7 @@ credential, ровно как на официальном шлюзе.
 
 ## Сводка методов
 
-Реализовано (37 методов + 1 файловый маршрут):
+Реализовано (38 методов + 1 файловый маршрут):
 
 | Группа | Методы |
 |---|---|
@@ -151,6 +151,7 @@ credential, ровно как на официальном шлюзе.
 | Меню и статус | `setChatMenuButton`, `getChatMenuButton`, `setUserEmojiStatus` |
 | Web apps и inline | `answerWebAppQuery`, `savePreparedInlineMessage` |
 | Платежи | `giftPremiumSubscription` |
+| Подарки | `getAvailableGifts` |
 | Заблокировано по design | `answerShippingQuery` (HTTP 501) |
 
 ## Обновления
@@ -508,6 +509,59 @@ inline). Другие типы результатов — `RESULT_TYPE_INVALID`.
 
 ## Методы: платежи
 
+### `getAvailableGifts`
+
+Каталог подарков, доступных боту. Параметров нет.
+
+Возвращает объект `Gifts` с массивом `gifts`. Каждый элемент — объект `Gift`:
+
+| Поле | Тип | Когда присутствует |
+|---|---|---|
+| `id` | строка | всегда; этот `id` передаётся в `gift_id` при отправке подарка |
+| `sticker` | `Sticker` | всегда, если у подарка есть стикер |
+| `star_count` | целое | всегда; цена подарка в Stars |
+| `upgrade_star_count` | целое | только пока апгрейд до collectible реально доступен |
+| `total_count` | целое | только для limited-подарков |
+| `remaining_count` | целое | только для limited-подарков |
+
+```json
+{
+  "ok": true,
+  "result": {
+    "gifts": [
+      {
+        "id": "123456789",
+        "sticker": {"file_id": "...", "type": "regular", "width": 512, "height": 512},
+        "star_count": 15,
+        "upgrade_star_count": 10,
+        "total_count": 1000,
+        "remaining_count": 734
+      }
+    ]
+  }
+}
+```
+
+Источник данных — тот же включённый каталог, что отдаёт MTProto
+`payments.getStarGifts`, поэтому `id` отсюда принимает и MTProto-чекаут.
+`upgrade_star_count` опускается, когда supply уникальных подарков исчерпан:
+цена, которую сервер потом отвергнет, хуже отсутствующего поля.
+`total_count` и `remaining_count` — инвентарь limited-подарка; у unlimited их
+нет.
+
+Список намеренно не фильтруется по доступности: распроданный подарок и подарок,
+который ещё не вышел, остаются в выдаче, и именно `remaining_count` говорит
+боту, что покупать сейчас нельзя. Проверка доступности живёт в транзакции
+покупки подарка.
+
+Нормальная схема работы — не хардкодить `id`, а читать его отсюда:
+
+```
+getAvailableGifts() → gifts[] → выбрать gift → gift.id → отправить подарок
+```
+
+Если каталог не подключён, метод отвечает HTTP `501 METHOD_NOT_FOUND`.
+
 ### `giftPremiumSubscription`
 
 Оплачивает подарок Premium из Stars-баланса бота через тот же надёжный
@@ -623,8 +677,9 @@ Message entities (для `entities` / `caption_entities`, а также entity
   `stopMessageLiveLocation`, `stopPoll`;
 - медиагруппы и остальной `send*`-набор: `sendMediaGroup`, `sendPoll`,
   `sendDice`, `sendGame`, `sendChatAction`;
-- платежи: `createInvoiceLink`, `sendInvoice`, `answerPreCheckoutQuery`,
-  `answerShippingQuery`, `getStarTransactions`, `refundStarPayment`;
+- платежи: `createInvoiceLink`, `getStarTransactions`, `getMyStarBalance`;
+- подарки: `sendGift` (каталог отдаёт `getAvailableGifts`, но HTTP-метода
+  отправки подарка пока нет);
 - администрирование чатов: `banChatMember`, `unbanChatMember`,
   `restrictChatMember`, `promoteChatMember`, `setChatPermissions`,
   `setChatPhoto`, `deleteChatPhoto`, `pinChatMessage`, `unpinChatMessage`,

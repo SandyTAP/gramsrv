@@ -1542,6 +1542,15 @@ type fakeBotAPIGateway struct {
 	premiumGiftMessage       domain.PremiumGiftMessage
 	premiumGiftRequestID     string
 	premiumGiftResult        bool
+	availableGifts           []domain.StarGift
+	availableGiftsErr        error
+}
+
+func (f *fakeBotAPIGateway) BotAPIAvailableGifts(context.Context) ([]domain.StarGift, error) {
+	if f.availableGiftsErr != nil {
+		return nil, f.availableGiftsErr
+	}
+	return append([]domain.StarGift(nil), f.availableGifts...), nil
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(

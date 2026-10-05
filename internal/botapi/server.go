@@ -69,6 +69,13 @@ type EphemeralGatewayService interface {
 	BotAPIDeleteEphemeral(ctx context.Context, botUserID, chatID, receiverUserID int64, messageID int) (bool, error)
 }
 
+// StarGiftGatewayService exposes the Star Gift catalog to bots. It is optional
+// so a deployment without a gift catalog keeps answering getAvailableGifts with
+// METHOD_NOT_FOUND rather than failing to construct the gateway.
+type StarGiftGatewayService interface {
+	BotAPIAvailableGifts(ctx context.Context) ([]domain.StarGift, error)
+}
+
 // PremiumGatewayService is optional so lightweight Bot API gateways retain the
 // smaller core interface. The production RPC router implements it through the
 // same durable Premium payment pipeline as MTProto payments.sendStarsForm.
@@ -293,6 +300,8 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.answerWebAppQuery(w, r, botID)
 	case "savepreparedinlinemessage":
 		h.savePreparedInlineMessage(w, r, botID)
+	case "getavailablegifts":
+		h.getAvailableGifts(w, r)
 	case "giftpremiumsubscription":
 		h.giftPremiumSubscription(w, r, botID)
 	case "sendinvoice":
