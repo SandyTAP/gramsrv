@@ -1743,7 +1743,8 @@ func issueLifecyclePurchaseForm(t *testing.T, ctx context.Context, lifecycle *St
 	}
 	issued, err := lifecycle.IssueStarGiftPurchaseForm(ctx, domain.StarGiftPurchaseForm{
 		BuyerUserID: req.BuyerUserID, To: req.To, GiftID: req.GiftID, RevisionID: req.RevisionID,
-		IncludeUpgrade: req.IncludeUpgrade, HideName: req.HideName, Message: req.Message, ChargeStars: req.ChargeStars,
+		IncludeUpgrade: req.IncludeUpgrade, HideName: req.HideName, Message: req.Message,
+		MessageEntities: req.MessageEntities, ChargeStars: req.ChargeStars,
 		IssuedAt: req.Date, ExpiresAt: req.Date + 600,
 	})
 	if err != nil {

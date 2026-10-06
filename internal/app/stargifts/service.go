@@ -608,6 +608,17 @@ func (s *Service) IssuePurchaseForm(ctx context.Context, form domain.StarGiftPur
 	return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftUnavailable
 }
 
+// SettledStarGiftPurchase reports an already committed purchase for req.CommandKey.
+// The bounded in-memory branch answers "not found" because it settles nothing: the
+// memory adapter has no command table to replay from, and the caller then takes the
+// normal issue-and-purchase path, which that branch rejects as unavailable anyway.
+func (s *Service) SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error) {
+	if s == nil || s.lifecycle == nil {
+		return domain.StarGiftPurchaseResult{}, false, nil
+	}
+	return s.lifecycle.SettledStarGiftPurchase(ctx, req)
+}
+
 // ValidatePurchaseForm is a read-only preflight used for precise RPC errors.
 // The PostgreSQL purchase transaction repeats this validation while holding a
 // row lock; callers must not treat this preflight as the atomicity boundary.

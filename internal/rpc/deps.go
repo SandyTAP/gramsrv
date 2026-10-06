@@ -1264,6 +1264,9 @@ type GiftsService interface {
 	TonTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.TonTransactionPage, error)
 	IssuePurchaseForm(ctx context.Context, form domain.StarGiftPurchaseForm) (domain.StarGiftPurchaseForm, error)
 	ValidatePurchaseForm(ctx context.Context, req domain.StarGiftPurchaseRequest) error
+	// SettledStarGiftPurchase reports a purchase already committed for
+	// req.CommandKey, so a bot-initiated sendGift retry does not charge twice.
+	SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error)
 	Purchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error)
 }
 

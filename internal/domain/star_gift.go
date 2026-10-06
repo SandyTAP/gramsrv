@@ -411,8 +411,13 @@ type StarGiftPurchaseRequest struct {
 	Date             int
 	RecipientBlocked bool
 	RecipientUnsaved bool
-	OriginAuthKeyID  [8]byte
-	OriginSessionID  int64
+	// BuyerIsBot routes the charge to the bot's own Stars wallet
+	// (bot_stars_balances) instead of the personal stars_balances ledger. A bot's
+	// spendable money is the revenue it earned from settled invoices, and it has no
+	// personal Stars row, so the personal debit would always be refused.
+	BuyerIsBot      bool
+	OriginAuthKeyID [8]byte
+	OriginSessionID int64
 }
 
 // StarGiftPurchaseForm is the server-issued, short-lived payment intent that
@@ -1157,25 +1162,25 @@ var (
 	// ErrStarGiftNotFound 表示找不到该已收到礼物实例。
 	ErrStarGiftNotFound = errors.New("stargift: saved gift not found")
 	// ErrStarGiftAlreadyConverted 表示礼物已转换回 Stars（不可重复转换）。
-	ErrStarGiftAlreadyConverted            = errors.New("stargift: already converted")
-	ErrStarGiftFileInvalid                 = errors.New("stargift: invalid animation file")
-	ErrStarGiftCatalogFull                 = errors.New("stargift: catalog full")
-	ErrStarGiftLifecycleInvalid            = errors.New("stargift: invalid auction or scheduled-release parameters")
-	ErrStarGiftCollectibleUnavailable      = errors.New("stargift: collectible upgrade unavailable")
-	ErrStarGiftAlreadyUpgraded             = errors.New("stargift: already upgraded")
-	ErrStarGiftCollectibleSoldOut          = errors.New("stargift: collectible supply exhausted")
-	ErrStarGiftCollectibleInvalid          = errors.New("stargift: invalid collectible definition")
-	ErrStarGiftCollectionNotFound          = errors.New("stargift: collection not found")
-	ErrStarGiftCollectionsFull             = errors.New("stargift: collections full")
-	ErrStarGiftUnavailable                 = errors.New("stargift: unavailable")
-	ErrStarGiftOwnerInvalid                = errors.New("stargift: owner invalid")
-	ErrStarGiftTransferUnavailable         = errors.New("stargift: transfer unavailable")
-	ErrStarGiftResaleUnavailable           = errors.New("stargift: resale unavailable")
-	ErrStarGiftOfferInvalid                = errors.New("stargift: offer invalid")
-	ErrStarGiftOfferExpired                = errors.New("stargift: offer expired")
+	ErrStarGiftAlreadyConverted       = errors.New("stargift: already converted")
+	ErrStarGiftFileInvalid            = errors.New("stargift: invalid animation file")
+	ErrStarGiftCatalogFull            = errors.New("stargift: catalog full")
+	ErrStarGiftLifecycleInvalid       = errors.New("stargift: invalid auction or scheduled-release parameters")
+	ErrStarGiftCollectibleUnavailable = errors.New("stargift: collectible upgrade unavailable")
+	ErrStarGiftAlreadyUpgraded        = errors.New("stargift: already upgraded")
+	ErrStarGiftCollectibleSoldOut     = errors.New("stargift: collectible supply exhausted")
+	ErrStarGiftCollectibleInvalid     = errors.New("stargift: invalid collectible definition")
+	ErrStarGiftCollectionNotFound     = errors.New("stargift: collection not found")
+	ErrStarGiftCollectionsFull        = errors.New("stargift: collections full")
+	ErrStarGiftUnavailable            = errors.New("stargift: unavailable")
+	ErrStarGiftOwnerInvalid           = errors.New("stargift: owner invalid")
+	ErrStarGiftTransferUnavailable    = errors.New("stargift: transfer unavailable")
+	ErrStarGiftResaleUnavailable      = errors.New("stargift: resale unavailable")
+	ErrStarGiftOfferInvalid           = errors.New("stargift: offer invalid")
+	ErrStarGiftOfferExpired           = errors.New("stargift: offer expired")
 	// ErrStarGiftRecipientUnavailable 表示收礼人对其它用户呈 deleted 墓碑
 	// （冻结账号），礼物不能再被送出。
-	ErrStarGiftRecipientUnavailable = errors.New("stargift: recipient account unavailable")
+	ErrStarGiftRecipientUnavailable        = errors.New("stargift: recipient account unavailable")
 	ErrStarGiftCraftUnavailable            = errors.New("stargift: craft unavailable")
 	ErrStarGiftAuctionUnavailable          = errors.New("stargift: auction unavailable")
 	ErrStarGiftWithdrawalUnavailable       = errors.New("stargift: withdrawal provider unavailable")
@@ -1186,6 +1191,9 @@ var (
 	ErrStarGiftFormExpired                 = errors.New("stargift: payment form expired")
 	ErrStarGiftFormPurposeInvalid          = errors.New("stargift: payment form purpose invalid")
 	ErrStarGiftFormAmountMismatch          = errors.New("stargift: payment form amount mismatch")
+	// ErrStarGiftIdempotencyConflict 同一个 command_key 落在另一个礼物请求上（收礼人、
+	// 礼物、升级或文本任一不同）：这种重放必须报错，不能返回别人的成功结果。
+	ErrStarGiftIdempotencyConflict = errors.New("stargift: idempotency key conflict")
 )
 
 var starGiftCollectibleSlugPrefix = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)
