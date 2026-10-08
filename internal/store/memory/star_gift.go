@@ -433,7 +433,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 		if filter.ExcludeUpgradable && upgradable {
 			continue
 		}
-		if filter.ExcludeUnupgradable && !upgradable {
+		// 桌面端用 exclude_upgradable + exclude_unupgradable 取自己的「可转赠
+		// 收藏品」：两者互斥会得到空列表、标签页消失，所以已收藏（无需升级）
+		// 的礼物与可升级的礼物一起放行。见 postgres 的同名过滤。
+		if filter.ExcludeUnupgradable && !upgradable && g.UniqueGiftID == 0 {
 			continue
 		}
 		if filter.CollectionID > 0 && !containsInt(g.CollectionIDs, filter.CollectionID) {
@@ -453,6 +456,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 				return matched[i].PinnedOrder < matched[j].PinnedOrder
 			}
 		}
+		// 资料页按收到时刻倒序：转移复用同一行，日期会被重置，id 不会。
+		if matched[i].Date != matched[j].Date {
+			return matched[i].Date > matched[j].Date
+		}
 		return matched[i].ID > matched[j].ID
 	})
 	page := domain.SavedStarGiftPage{Count: len(matched)}
@@ -463,10 +470,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 			if profileOrder {
 				if cursor.PinnedOrder > 0 {
 					if g.PinnedOrder > 0 && (g.PinnedOrder < cursor.PinnedOrder ||
-						g.PinnedOrder == cursor.PinnedOrder && g.ID >= cursor.ID) {
+						g.PinnedOrder == cursor.PinnedOrder && atOrBeforeProfileCursor(cursor, g)) {
 						continue
 					}
-				} else if g.PinnedOrder > 0 || g.ID >= cursor.ID {
+				} else if g.PinnedOrder > 0 || atOrBeforeProfileCursor(cursor, g) {
 					continue
 				}
 			} else if g.ID >= cursor.ID {
@@ -485,10 +492,16 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 		if profileOrder {
 			pinnedOrder = last.PinnedOrder
 		}
-		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.ID)
+		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.Date, last.ID)
 	}
 	page.Gifts = out
 	return page, nil
+}
+
+// atOrBeforeProfileCursor reports whether g is already covered by the cursor in
+// the (Date, ID) DESC profile order, i.e. it sorts before or exactly at it.
+func atOrBeforeProfileCursor(cursor domain.SavedStarGiftListCursor, g domain.SavedStarGift) bool {
+	return g.Date > cursor.Date || (g.Date == cursor.Date && g.ID >= cursor.ID)
 }
 
 func (s *StarGiftStore) ResolveSavedIDs(_ context.Context, owner domain.Peer, refs []domain.SavedStarGiftRef) ([]int64, error) {

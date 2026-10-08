@@ -1516,6 +1516,31 @@ WHERE channel_id=$1 AND message::text LIKE '%star_gift_unique%'`, created.Channe
 	if toUserAction == nil || toUserAction.CanCraftAt != upgraded.Saved.CanCraftAt {
 		t.Fatalf("channel-to-user action did not restore Craft readiness: %+v", toUserAction)
 	}
+	// 转移必须重置收到时刻：资料页按收到时刻倒序，沿用旧日期会让被转送的
+	// 礼物停在旧位置，而不是收礼人列表的顶部。
+	if toUser.Saved.Date != now+8 {
+		t.Fatalf("transferred gift date = %d, want %d (transfer must reset the received date)", toUser.Saved.Date, now+8)
+	}
+	userPeer := domain.Peer{Type: domain.PeerTypeUser, ID: actor.ID}
+	profile, err := gifts.ListByOwner(ctx, userPeer, false, "", 100)
+	if err != nil {
+		t.Fatalf("list recipient profile gifts: %v", err)
+	}
+	for i := 1; i < len(profile.Gifts); i++ {
+		if profile.Gifts[i].Date > profile.Gifts[i-1].Date {
+			t.Fatalf("profile gift order = date %d then %d, want received-date DESC",
+				profile.Gifts[i-1].Date, profile.Gifts[i].Date)
+		}
+	}
+	transferredSeen := false
+	for _, gift := range profile.Gifts {
+		if gift.ID == toUser.Saved.ID && gift.Date == now+8 {
+			transferredSeen = true
+		}
+	}
+	if !transferredSeen {
+		t.Fatalf("transferred gift %d not in recipient profile with reset date: %+v", toUser.Saved.ID, profile.Gifts)
+	}
 	backToChannel, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
 		ActorUserID: actor.ID,
 		Ref: domain.SavedStarGiftRef{

@@ -1102,10 +1102,13 @@ type SavedStarGiftPage struct {
 }
 
 // SavedStarGiftListCursor is the composite keyset cursor for the profile gift
-// order: pinned gifts first by PinnedOrder, then unpinned gifts by ID DESC.
-// PinnedOrder == 0 identifies the unpinned segment.
+// order: pinned gifts first by PinnedOrder, then unpinned gifts by
+// (Date, ID) DESC. PinnedOrder == 0 identifies the unpinned segment.
+// Date 必须进游标：礼物实例行在所有权转移时是复用的，资料页按收到时刻
+// （gift_date）倒序，只用 ID 做 keyset 会从翻过的位置错排。
 type SavedStarGiftListCursor struct {
 	PinnedOrder int
+	Date        int
 	ID          int64
 }
 
@@ -1114,6 +1117,12 @@ type SavedStarGiftListCursor struct {
 // zero means all collections. The current catalog is used only to decide whether
 // a regular gift remains upgradable, while its rendered gift snapshot still comes
 // from RevisionID.
+//
+// ExcludeUpgradable and ExcludeUnupgradable are documented as mutually
+// exclusive filters, but Telegram Desktop sends both to load the own-gift
+// ("my collectibles") list of the gift box. They therefore cannot cancel each
+// other out: ExcludeUnupgradable also admits already-collectible gifts, which
+// have nothing left to upgrade.
 type SavedStarGiftFilter struct {
 	Owner               Peer
 	ExcludeUnsaved      bool
@@ -1421,18 +1430,21 @@ func StarGiftCollectionHash(title string, giftIDs []int64) int64 {
 }
 
 // EncodeSavedStarGiftListCursor encodes the exact profile-order key of the last
-// visible gift. The version prefix keeps this cursor distinct from other star
-// gift lists that are ordered only by instance ID.
-func EncodeSavedStarGiftListCursor(pinnedOrder int, id int64) string {
-	if pinnedOrder < 0 || id <= 0 {
+// visible gift (pinned position, received date, instance ID). The version
+// prefix keeps this cursor distinct from other star gift lists that are ordered
+// only by instance ID; v1 (no date) is obsolete once the profile order became
+// date-first and is rejected by the decoder.
+func EncodeSavedStarGiftListCursor(pinnedOrder, date int, id int64) string {
+	if pinnedOrder < 0 || date < 0 || id <= 0 {
 		return ""
 	}
-	raw := "v1:" + strconv.Itoa(pinnedOrder) + ":" + strconv.FormatInt(id, 10)
+	raw := "v2:" + strconv.Itoa(pinnedOrder) + ":" + strconv.Itoa(date) + ":" + strconv.FormatInt(id, 10)
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
 // DecodeSavedStarGiftListCursor decodes a profile gift list cursor. Invalid or
-// obsolete cursor shapes are rejected instead of being normalized on read.
+// obsolete cursor shapes are rejected instead of being normalized on read
+// (the client then restarts from the first page).
 func DecodeSavedStarGiftListCursor(s string) (SavedStarGiftListCursor, bool) {
 	if s == "" {
 		return SavedStarGiftListCursor{}, false
@@ -1442,18 +1454,22 @@ func DecodeSavedStarGiftListCursor(s string) (SavedStarGiftListCursor, bool) {
 		return SavedStarGiftListCursor{}, false
 	}
 	parts := strings.Split(string(raw), ":")
-	if len(parts) != 3 || parts[0] != "v1" {
+	if len(parts) != 4 || parts[0] != "v2" {
 		return SavedStarGiftListCursor{}, false
 	}
 	order, err := strconv.ParseInt(parts[1], 10, 32)
 	if err != nil || order < 0 {
 		return SavedStarGiftListCursor{}, false
 	}
-	id, err := strconv.ParseInt(parts[2], 10, 64)
+	date, err := strconv.ParseInt(parts[2], 10, 32)
+	if err != nil || date < 0 {
+		return SavedStarGiftListCursor{}, false
+	}
+	id, err := strconv.ParseInt(parts[3], 10, 64)
 	if err != nil || id <= 0 {
 		return SavedStarGiftListCursor{}, false
 	}
-	return SavedStarGiftListCursor{PinnedOrder: int(order), ID: id}, true
+	return SavedStarGiftListCursor{PinnedOrder: int(order), Date: int(date), ID: id}, true
 }
 
 // EncodeStarGiftCursor / DecodeStarGiftCursor are simple instance-ID cursors

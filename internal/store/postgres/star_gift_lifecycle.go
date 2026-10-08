@@ -510,10 +510,12 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 	} else if !validLifecyclePeer(unique.Owner) || unique.Owner == req.To {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 	}
-	messageSenderID := domain.OfficialSystemUserID
-	if seller.Type == domain.PeerTypeUser {
-		messageSenderID = seller.ID
-	}
+	// Маркет меняет только владельца: подарок «отправляет» покупатель, а не
+	// продавец. Отправляя сервисное сообщение от продавца, получатель видел
+	// «продавец отправил вам подарок» вместо «покупатель отправил вам подарок».
+	// Остальные пути (покупка каталога, перевод, аукцион, оффер) уже отправляют
+	// сообщение от того, кто распоряжался подарком.
+	messageSenderID := req.BuyerUserID
 	messageRecipientID := req.BuyerUserID
 	if req.To.Type == domain.PeerTypeUser {
 		messageRecipientID = req.To.ID
@@ -606,6 +608,10 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 			msgID, savedID := sent.RecipientMessage.ID, int64(0)
 			if req.To.Type == domain.PeerTypeChannel {
 				msgID, savedID = 0, result.Saved.ID
+			} else if msgID <= 0 {
+				// Покупка себе: сервисное сообщение лежит только в Saved Messages
+				// покупателя, копии в его же входящем боксе нет.
+				msgID = sent.SenderMessage.ID
 			}
 			if req.To.Type == domain.PeerTypeUser && msgID <= 0 {
 				return domain.ErrStarGiftResaleUnavailable
@@ -623,6 +629,11 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 				}
 			} else {
 				notificationMessageID := sent.RecipientMessage.ID
+				if notificationMessageID <= 0 {
+					// Подарок куплен в канал: уведомление лежит в боксе покупателя,
+					// который совпадает с боксом отправителя.
+					notificationMessageID = sent.SenderMessage.ID
+				}
 				if notificationMessageID <= 0 {
 					return fmt.Errorf("channel resale notification missing buyer box")
 				}

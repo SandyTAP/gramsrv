@@ -562,8 +562,12 @@ LEFT JOIN star_gift_collectible_revisions acr
 	if filter.ExcludeUpgradable {
 		conditions = append(conditions, "NOT "+upgradable)
 	}
+	// Telegram Desktop 加载礼物面板「我的收藏品」页签时会把 exclude_upgradable
+	// 和 exclude_unupgradable 一起下发（data_star_gift.cpp 的
+	// MyUniqueGiftsSlice）。两个互斥条件会互相抵消成空列表、页签永不出现，
+	// 所以已经升级过的收藏品（无需再升级）与可升级礼物一起放行。
 	if filter.ExcludeUnupgradable {
-		conditions = append(conditions, upgradable)
+		conditions = append(conditions, "("+upgradable+" OR p.unique_gift_id IS NOT NULL)")
 	}
 	if filter.CollectionID > 0 {
 		args = append(args, filter.CollectionID)
@@ -584,24 +588,26 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 	profileOrder := filter.CollectionID == 0
 	if cursor, ok := domain.DecodeSavedStarGiftListCursor(offset); ok {
 		if profileOrder && cursor.PinnedOrder > 0 {
-			args = append(args, cursor.PinnedOrder, cursor.ID)
+			args = append(args, cursor.PinnedOrder, cursor.Date, cursor.ID)
 			where += fmt.Sprintf(` AND (
     p.pinned_order = 0
-    OR p.pinned_order > $%d
-    OR (p.pinned_order = $%d AND p.id < $%d)
-)`, len(args)-1, len(args)-1, len(args))
+    OR p.pinned_order > $%[1]d
+    OR (p.pinned_order = $%[1]d AND (p.gift_date, p.id) < ($%[2]d, $%[3]d))
+)`, len(args)-2, len(args)-1, len(args))
 		} else {
-			args = append(args, cursor.ID)
+			args = append(args, cursor.Date, cursor.ID)
 			if profileOrder {
-				where += fmt.Sprintf(" AND p.pinned_order = 0 AND p.id < $%d", len(args))
+				where += fmt.Sprintf(" AND p.pinned_order = 0 AND (p.gift_date, p.id) < ($%d, $%d)", len(args)-1, len(args))
 			} else {
 				where += fmt.Sprintf(" AND p.id < $%d", len(args))
 			}
 		}
 	}
+	// 资料页按收到时刻（gift_date）倒序：所有权转移复用同一行，只有日期会
+	// 被重置，按 id 排序会让被转送的礼物停在旧位置。
 	orderBy := "ORDER BY p.id DESC"
 	if profileOrder {
-		orderBy = "ORDER BY (p.pinned_order = 0), p.pinned_order, p.id DESC"
+		orderBy = "ORDER BY (p.pinned_order = 0), p.pinned_order, p.gift_date DESC, p.id DESC"
 	}
 	args = append(args, limit+1)
 	limitPlaceholder := len(args)
@@ -641,7 +647,7 @@ LIMIT $`+fmt.Sprint(limitPlaceholder), args...)
 		if profileOrder {
 			pinnedOrder = last.PinnedOrder
 		}
-		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.ID)
+		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.Date, last.ID)
 	}
 	page.Gifts = gifts
 	return page, nil
