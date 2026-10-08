@@ -65,6 +65,84 @@ func TestStarGiftProfileOrdersByReceivedDate(t *testing.T) {
 	}
 }
 
+// 回归：TDesktop 的礼物盒「Мои коллекционные」页签用
+// exclude_upgradable + exclude_unupgradable 取自己的收藏品。若两个互斥条件
+// 真的互相抵消，结果恒为空，页签永远不出现（data_star_gift.cpp:
+// MyUniqueGiftsSlice 里两个 flag 一起下发）。
+func TestStarGiftUpgradableFiltersDoNotCancelOut(t *testing.T) {
+	ctx := context.Background()
+	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1003}
+	store := NewStarGiftStore()
+	// 有库存的可升级礼物与已升级的收藏品。
+	store.SeedCatalog([]domain.StarGift{
+		{ID: 8001, RevisionID: 9001, Title: "Upgradable", UpgradeStars: 100, UpgradeIssued: 0, UpgradeTotal: 10},
+	})
+
+	upgradable, err := store.Create(ctx, domain.SavedStarGift{
+		Owner: owner, GiftID: 8001, RevisionID: 9001, MsgID: 300, Date: 1700000300,
+	})
+	if err != nil {
+		t.Fatalf("create upgradable gift: %v", err)
+	}
+	collectible, err := store.Create(ctx, domain.SavedStarGift{
+		Owner: owner, GiftID: 8001, RevisionID: 9001, MsgID: 301, Date: 1700000200, UniqueGiftID: 777,
+	})
+	if err != nil {
+		t.Fatalf("create collectible: %v", err)
+	}
+	// 没有升级档的普通礼物：既不可升级，也不是收藏品。
+	if _, err := store.Create(ctx, domain.SavedStarGift{
+		Owner: owner, GiftID: 8002, RevisionID: 9002, MsgID: 302, Date: 1700000100,
+	}); err != nil {
+		t.Fatalf("create plain gift: %v", err)
+	}
+
+	// 桌面端自有礼物请求的原样组合：exclude_unlimited + 两个互斥标志同时下发。
+	// 结果必须是自己的收藏品，而不是恒空的列表。
+	page, err := store.ListByOwnerFiltered(ctx, domain.SavedStarGiftFilter{
+		Owner: owner, ExcludeUnlimited: true, ExcludeUpgradable: true, ExcludeUnupgradable: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list own gifts: %v", err)
+	}
+	if len(page.Gifts) != 1 || page.Gifts[0].ID != collectible {
+		t.Fatalf("own gifts = %+v, want exactly the collectible %d", page.Gifts, collectible)
+	}
+
+	// 单个标志仍然保持原义：exclude_unupgradable 只留可升级 + 已收藏。
+	page, err = store.ListByOwnerFiltered(ctx, domain.SavedStarGiftFilter{
+		Owner: owner, ExcludeUnupgradable: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list upgradable or collectible: %v", err)
+	}
+	ids := make([]int64, 0, len(page.Gifts))
+	for _, gift := range page.Gifts {
+		ids = append(ids, gift.ID)
+	}
+	if !slices.Equal(ids, []int64{upgradable, collectible}) {
+		t.Fatalf("upgradable-or-collectible = %v, want [%d %d]", ids, upgradable, collectible)
+	}
+
+	// exclude_upgradable 单独使用仍然只排除可升级的普通礼物。
+	page, err = store.ListByOwnerFiltered(ctx, domain.SavedStarGiftFilter{
+		Owner: owner, ExcludeUpgradable: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list not upgradable: %v", err)
+	}
+	ids = ids[:0]
+	for _, gift := range page.Gifts {
+		ids = append(ids, gift.ID)
+	}
+	if plain := page.Gifts[len(page.Gifts)-1]; plain.GiftID != 8002 {
+		t.Fatalf("not-upgradable tail = %+v, want the plain gift 8002", plain)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("not-upgradable = %v, want the collectible and the plain gift", ids)
+	}
+}
+
 func TestStarGiftProfilePinOrderAndPagination(t *testing.T) {
 	ctx := context.Background()
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1001}

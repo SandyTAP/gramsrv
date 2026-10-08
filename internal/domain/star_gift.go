@@ -1117,6 +1117,12 @@ type SavedStarGiftListCursor struct {
 // zero means all collections. The current catalog is used only to decide whether
 // a regular gift remains upgradable, while its rendered gift snapshot still comes
 // from RevisionID.
+//
+// ExcludeUpgradable and ExcludeUnupgradable are documented as mutually
+// exclusive filters, but Telegram Desktop sends both to load the own-gift
+// ("my collectibles") list of the gift box. They therefore cannot cancel each
+// other out: ExcludeUnupgradable also admits already-collectible gifts, which
+// have nothing left to upgrade.
 type SavedStarGiftFilter struct {
 	Owner               Peer
 	ExcludeUnsaved      bool

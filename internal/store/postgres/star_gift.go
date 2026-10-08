@@ -562,8 +562,12 @@ LEFT JOIN star_gift_collectible_revisions acr
 	if filter.ExcludeUpgradable {
 		conditions = append(conditions, "NOT "+upgradable)
 	}
+	// Telegram Desktop 加载礼物面板「我的收藏品」页签时会把 exclude_upgradable
+	// 和 exclude_unupgradable 一起下发（data_star_gift.cpp 的
+	// MyUniqueGiftsSlice）。两个互斥条件会互相抵消成空列表、页签永不出现，
+	// 所以已经升级过的收藏品（无需再升级）与可升级礼物一起放行。
 	if filter.ExcludeUnupgradable {
-		conditions = append(conditions, upgradable)
+		conditions = append(conditions, "("+upgradable+" OR p.unique_gift_id IS NOT NULL)")
 	}
 	if filter.CollectionID > 0 {
 		args = append(args, filter.CollectionID)

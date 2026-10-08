@@ -433,7 +433,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 		if filter.ExcludeUpgradable && upgradable {
 			continue
 		}
-		if filter.ExcludeUnupgradable && !upgradable {
+		// 桌面端用 exclude_upgradable + exclude_unupgradable 取自己的「可转赠
+		// 收藏品」：两者互斥会得到空列表、标签页消失，所以已收藏（无需升级）
+		// 的礼物与可升级的礼物一起放行。见 postgres 的同名过滤。
+		if filter.ExcludeUnupgradable && !upgradable && g.UniqueGiftID == 0 {
 			continue
 		}
 		if filter.CollectionID > 0 && !containsInt(g.CollectionIDs, filter.CollectionID) {
