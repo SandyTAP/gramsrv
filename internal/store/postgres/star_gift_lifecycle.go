@@ -393,6 +393,14 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 		req.To == req.Ref.Owner || req.ChargeStars < 0 || req.Date <= 0 || strings.TrimSpace(req.CommandKey) == "" {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
 	}
+	// Идемпотентный ключ привязываем к эпохе владения, иначе повторная передача
+	// того же коллекционного тому же получателю (подарок уже уходил и возвращался)
+	// выглядит как реплей прошлой карточки и молча ничего не делает. Смотрим
+	// текущую строку до отправки: random_id сообщения выводится из ключа, а
+	// пересчитать его уже внутри before слишком поздно для проверки дубликата.
+	if saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref); err == nil && found {
+		req.CommandKey = s.resolveEpochCommandKey(ctx, req.ActorUserID, req.CommandKey, saved)
+	}
 	if req.To.Type != domain.PeerTypeUser {
 		return s.transferStarGiftWithoutPrivateMessage(ctx, req)
 	}
@@ -492,6 +500,14 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 	}
 	seller := unique.Owner
+	// Как и при переводе: ключ покупки привязываем к эпохе владения, иначе
+	// покупка того же коллекционного после круга туда-обратно выглядит как
+	// реплей предыдущей сделки (та же карточка, тот же random_id) и проходит
+	// без перехода владения. Считаем до проверки реплея, чтобы она и запись
+	// команды использовали один и тот же ключ.
+	if current, found, err := savedStarGiftByUniqueID(ctx, s.db, unique.ID); err == nil && found {
+		req.CommandKey = s.resolveEpochCommandKey(ctx, req.BuyerUserID, req.CommandKey, current)
+	}
 	var replayUniqueID, replayFromID, replayToID, replayAmount int64
 	var replayFromType, replayToType, replayCurrency string
 	replayErr := s.db.QueryRow(ctx, `SELECT t.unique_gift_id,t.from_peer_type,t.from_peer_id,t.to_peer_type,t.to_peer_id,
@@ -1826,6 +1842,43 @@ FROM channel_ton_transactions WHERE `+where+` ORDER BY id `+order+` LIMIT $2`, a
 	page.Transactions = items
 	page.Balance, err = s.ChannelTonBalance(ctx, channelID)
 	return page, err
+}
+
+// resolveEpochCommandKey scopes a caller supplied idempotency key to the
+// current ownership epoch of a saved gift.
+//
+// Keys built from (actor, gift, recipient, form) repeat forever once the same
+// collectible goes around a second time, because the payment form id embeds
+// can_transfer_at, which is zeroed by every move and never re-armed. A repeated
+// key is fatal twice over: the private message random id is derived from it, so
+// the send is classified as a duplicate of the old card and the caller is told
+// the gift moved while nothing happened; and star_gift_transfer_commands /
+// star_gift_sales both key on it, so a real second transfer could not even be
+// recorded.
+//
+// Every ownership move rewrites peer_star_gifts.gift_date and stores it as
+// star_gift_transfer_commands.created_at, so the two tell us whether a key we
+// already used belongs to this epoch (a retry, keep the key verbatim) or to an
+// earlier one (a genuinely new transfer, disambiguate it).
+func (s *StarGiftLifecycleStore) resolveEpochCommandKey(
+	ctx context.Context,
+	actorUserID int64,
+	base string,
+	saved domain.SavedStarGift,
+) string {
+	base = strings.TrimSpace(base)
+	if base == "" || saved.Date <= 0 || actorUserID <= 0 || s == nil || s.db == nil {
+		return base
+	}
+	var createdAt int
+	err := s.db.QueryRow(ctx, `SELECT created_at FROM star_gift_transfer_commands
+WHERE actor_user_id=$1 AND command_key=$2`, actorUserID, base).Scan(&createdAt)
+	if err != nil || createdAt == saved.Date {
+		// Either the key is unused, or it belongs to this very epoch: retries
+		// of an in-flight or finished operation must keep replaying.
+		return base
+	}
+	return base + ":e" + strconv.FormatInt(int64(saved.Date), 10)
 }
 
 func lifecycleCommandRandomID(parts ...any) int64 {
