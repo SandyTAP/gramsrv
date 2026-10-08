@@ -453,6 +453,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 				return matched[i].PinnedOrder < matched[j].PinnedOrder
 			}
 		}
+		// 资料页按收到时刻倒序：转移复用同一行，日期会被重置，id 不会。
+		if matched[i].Date != matched[j].Date {
+			return matched[i].Date > matched[j].Date
+		}
 		return matched[i].ID > matched[j].ID
 	})
 	page := domain.SavedStarGiftPage{Count: len(matched)}
@@ -463,10 +467,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 			if profileOrder {
 				if cursor.PinnedOrder > 0 {
 					if g.PinnedOrder > 0 && (g.PinnedOrder < cursor.PinnedOrder ||
-						g.PinnedOrder == cursor.PinnedOrder && g.ID >= cursor.ID) {
+						g.PinnedOrder == cursor.PinnedOrder && atOrBeforeProfileCursor(cursor, g)) {
 						continue
 					}
-				} else if g.PinnedOrder > 0 || g.ID >= cursor.ID {
+				} else if g.PinnedOrder > 0 || atOrBeforeProfileCursor(cursor, g) {
 					continue
 				}
 			} else if g.ID >= cursor.ID {
@@ -485,10 +489,16 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 		if profileOrder {
 			pinnedOrder = last.PinnedOrder
 		}
-		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.ID)
+		page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.Date, last.ID)
 	}
 	page.Gifts = out
 	return page, nil
+}
+
+// atOrBeforeProfileCursor reports whether g is already covered by the cursor in
+// the (Date, ID) DESC profile order, i.e. it sorts before or exactly at it.
+func atOrBeforeProfileCursor(cursor domain.SavedStarGiftListCursor, g domain.SavedStarGift) bool {
+	return g.Date > cursor.Date || (g.Date == cursor.Date && g.ID >= cursor.ID)
 }
 
 func (s *StarGiftStore) ResolveSavedIDs(_ context.Context, owner domain.Peer, refs []domain.SavedStarGiftRef) ([]int64, error) {

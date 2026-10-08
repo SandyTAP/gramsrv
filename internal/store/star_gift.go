@@ -43,7 +43,9 @@ type StarGiftStore interface {
 
 	// Create 写一条收到的礼物实例，返回行 id；频道礼物未显式给 saved_id 时以该行 id 作为 saved_id。
 	Create(ctx context.Context, gift domain.SavedStarGift) (int64, error)
-	// ListByOwner 按 id DESC keyset 分页返回某 owner 未转换的礼物；excludeUnsaved 时只返展示在资料的。
+	// ListByOwner 返回某 owner 未转换的礼物；资料页（无 collection 过滤）按收到时刻
+	// gift_date DESC、id DESC keyset 分页（置顶段在前），collection 视图按 id DESC。
+	// excludeUnsaved 时只返展示在资料的。
 	ListByOwner(ctx context.Context, owner domain.Peer, excludeUnsaved bool, offset string, limit int) (domain.SavedStarGiftPage, error)
 	ListByOwnerFiltered(ctx context.Context, filter domain.SavedStarGiftFilter) (domain.SavedStarGiftPage, error)
 	// GetByRef 按协议引用取礼物实例：用户用 msg_id，频道用 saved_id。
