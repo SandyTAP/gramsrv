@@ -1120,9 +1120,11 @@ type SavedStarGiftListCursor struct {
 //
 // ExcludeUpgradable and ExcludeUnupgradable are documented as mutually
 // exclusive filters, but Telegram Desktop sends both to load the own-gift
-// ("my collectibles") list of the gift box. They therefore cannot cancel each
-// other out: ExcludeUnupgradable also admits already-collectible gifts, which
-// have nothing left to upgrade.
+// ("my collectibles") list of the gift box. Set together they are read as "do
+// not filter by upgradability at all" — the accompanying ExcludeUnlimited is
+// what selects the collectibles — because any other reading cancels out to an
+// empty list. Used on their own they keep their strict meaning, because the
+// profile gift filter expresses its Upgradeable / Limited categories with them.
 type SavedStarGiftFilter struct {
 	Owner               Peer
 	ExcludeUnsaved      bool

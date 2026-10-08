@@ -66,9 +66,10 @@ func TestStarGiftProfileOrdersByReceivedDate(t *testing.T) {
 }
 
 // 回归：TDesktop 的礼物盒「Мои коллекционные」页签用
-// exclude_upgradable + exclude_unupgradable 取自己的收藏品。若两个互斥条件
-// 真的互相抵消，结果恒为空，页签永远不出现（data_star_gift.cpp:
-// MyUniqueGiftsSlice 里两个 flag 一起下发）。
+// exclude_upgradable + exclude_unupgradable 取自己的收藏品。两个互斥条件若真的
+// 互相抵消，结果恒为空，页签永远不出现（data_star_gift.cpp:
+// MyUniqueGiftsSlice 里两个 flag 一起下发）。但放宽单个标志会破坏资料页的
+// Upgradeable / Limited 分类过滤，所以只在两个同时出现时整体放弃过滤。
 func TestStarGiftUpgradableFiltersDoNotCancelOut(t *testing.T) {
 	ctx := context.Background()
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: 1003}
@@ -91,9 +92,10 @@ func TestStarGiftUpgradableFiltersDoNotCancelOut(t *testing.T) {
 		t.Fatalf("create collectible: %v", err)
 	}
 	// 没有升级档的普通礼物：既不可升级，也不是收藏品。
-	if _, err := store.Create(ctx, domain.SavedStarGift{
+	plain, err := store.Create(ctx, domain.SavedStarGift{
 		Owner: owner, GiftID: 8002, RevisionID: 9002, MsgID: 302, Date: 1700000100,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create plain gift: %v", err)
 	}
 
@@ -109,19 +111,20 @@ func TestStarGiftUpgradableFiltersDoNotCancelOut(t *testing.T) {
 		t.Fatalf("own gifts = %+v, want exactly the collectible %d", page.Gifts, collectible)
 	}
 
-	// 单个标志仍然保持原义：exclude_unupgradable 只留可升级 + 已收藏。
+	// 单个标志必须保持原义：exclude_unupgradable 只留「可升级」，收藏品
+	// （没有可升级性）不通过——资料页的 Limited 分类依赖这条。
 	page, err = store.ListByOwnerFiltered(ctx, domain.SavedStarGiftFilter{
 		Owner: owner, ExcludeUnupgradable: true, Limit: 10,
 	})
 	if err != nil {
-		t.Fatalf("list upgradable or collectible: %v", err)
+		t.Fatalf("list upgradable: %v", err)
 	}
 	ids := make([]int64, 0, len(page.Gifts))
 	for _, gift := range page.Gifts {
 		ids = append(ids, gift.ID)
 	}
-	if !slices.Equal(ids, []int64{upgradable, collectible}) {
-		t.Fatalf("upgradable-or-collectible = %v, want [%d %d]", ids, upgradable, collectible)
+	if !slices.Equal(ids, []int64{upgradable}) {
+		t.Fatalf("exclude_unupgradable = %v, want only [%d]", ids, upgradable)
 	}
 
 	// exclude_upgradable 单独使用仍然只排除可升级的普通礼物。
@@ -135,11 +138,8 @@ func TestStarGiftUpgradableFiltersDoNotCancelOut(t *testing.T) {
 	for _, gift := range page.Gifts {
 		ids = append(ids, gift.ID)
 	}
-	if plain := page.Gifts[len(page.Gifts)-1]; plain.GiftID != 8002 {
-		t.Fatalf("not-upgradable tail = %+v, want the plain gift 8002", plain)
-	}
-	if len(ids) != 2 {
-		t.Fatalf("not-upgradable = %v, want the collectible and the plain gift", ids)
+	if !slices.Equal(ids, []int64{collectible, plain}) {
+		t.Fatalf("exclude_upgradable = %v, want [%d %d]", ids, collectible, plain)
 	}
 }
 
