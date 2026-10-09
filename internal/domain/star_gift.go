@@ -1202,6 +1202,9 @@ var (
 	ErrStarGiftFormExpired                 = errors.New("stargift: payment form expired")
 	ErrStarGiftFormPurposeInvalid          = errors.New("stargift: payment form purpose invalid")
 	ErrStarGiftFormAmountMismatch          = errors.New("stargift: payment form amount mismatch")
+	// ErrStarGiftNotConvertible 表示礼物实例不能转换回 Stars：convert_stars <= 0。
+	// 机器人送出的礼物（以及目录中原就没有转换价的礼物）不参与「Обменять на звёзды」。
+	ErrStarGiftNotConvertible = errors.New("stargift: gift is not convertible to stars")
 	// ErrStarGiftIdempotencyConflict 同一个 command_key 落在另一个礼物请求上（收礼人、
 	// 礼物、升级或文本任一不同）：这种重放必须报错，不能返回别人的成功结果。
 	ErrStarGiftIdempotencyConflict = errors.New("stargift: idempotency key conflict")

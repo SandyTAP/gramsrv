@@ -445,8 +445,17 @@ last_sale_date=$2,updated_at=now() WHERE gift_id=$1`, gift.ID, req.Date); err !=
 	if err != nil {
 		return domain.StarGift{}, domain.SavedStarGift{}, domain.StarsBalance{}, err
 	}
+	// 机器人送出的礼物不参与「转换回 Stars」：catalog 的 ConvertStars 是给普通用户
+	// 买家的退款额度，而机器人这一侧的钱是它开票赚来的钱包余额。若照抄，收到礼物的
+	// 对端就能把机器人支出的 Stars 直接兑换回自己的余额，等于给钱包开了一条提现口子。
+	// 这里按付款人身份把它归零：peer_star_gifts.convert_stars 为 0，客户端因此不显示
+	// 转换按钮，ConvertStarGift 也只走 amount==0 的纯归档分支，不产生任何 Credit。
+	convertStars := gift.ConvertStars
+	if req.BuyerIsBot {
+		convertStars = 0
+	}
 	saved := domain.SavedStarGift{Owner: req.To, FromUserID: req.BuyerUserID, GiftID: gift.ID, RevisionID: gift.RevisionID,
-		Date: req.Date, NameHidden: req.HideName, ConvertStars: gift.ConvertStars, PrepaidUpgradeStars: upgradePrice,
+		Date: req.Date, NameHidden: req.HideName, ConvertStars: convertStars, PrepaidUpgradeStars: upgradePrice,
 		PrepaidUpgradeHash: prepayHash, Message: req.Message,
 		MessageEntities: append([]domain.MessageEntity(nil), req.MessageEntities...), Unsaved: req.RecipientUnsaved}
 	return gift, saved, balance, nil

@@ -1346,10 +1346,12 @@ func (r *Router) onPaymentsConvertStarGift(ctx context.Context, ref tg.InputSave
 		case errors.Is(err, domain.ErrStarGiftNotFound),
 			errors.Is(err, domain.ErrStarGiftAlreadyConverted),
 			errors.Is(err, domain.ErrStarGiftAlreadyUpgraded),
+			errors.Is(err, domain.ErrStarGiftNotConvertible),
 			errors.Is(err, domain.ErrStarGiftOwnerInvalid),
 			errors.Is(err, domain.ErrStarGiftUnavailable):
 			// These are known business conditions (e.g. converting an already
-			// upgraded/unique gift). Surface a clean client error instead of a
+			// upgraded/unique gift, or a gift that carries no convert value, like
+			// one a bot sent). Surface a clean client error instead of a
 			// 500 INTERNAL_SERVER_ERROR.
 			return false, starGiftInvalidErr()
 		default:

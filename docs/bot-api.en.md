@@ -603,6 +603,18 @@ Availability is checked twice: here against the catalog, and again under a lock
 in the purchase transaction, so two bots racing for the last limited gift cannot
 drive the remaining count negative.
 
+A gift the bot paid for **cannot be exchanged for Stars**: the delivered
+instance always carries `convert_stars = 0`, so the client offers no exchange
+button and `payments.convertStarGift` answers `STARGIFT_INVALID` for such a
+gift — nothing is archived and nothing is credited. The catalog convert price is
+a refund of the *buyer's* Stars, while a bot's Stars live in
+`bot_stars_balances` — crediting them to the recipient would turn any gift into
+a way to pull money out of the bot's wallet. Gifts a bot sent before this rule
+existed are migrated to the same state (`convert_stars = 0`), and the
+sender-identity guard also covers historical rows the migration has not touched
+yet. A gift bought by a regular user keeps the catalog `convert_stars` and
+converts exactly as before.
+
 Idempotency is the same extension as `giftPremiumSubscription`: send an
 `Idempotency-Key` HTTP header (or the local `request_id` field), charset
 `[A-Za-z0-9]` plus `-`, `_`, `.`, `:` up to 128 characters. Replaying the same

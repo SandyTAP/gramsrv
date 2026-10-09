@@ -65,6 +65,28 @@ func NewStarGiftLifecycleStore(db sqlcgen.DBTX, messages *MessageStore, tonStart
 	return s
 }
 
+// ensureStarGiftConvertible 在转换事务内做最终资格判定。convert_stars 是主要证据
+// （0 即不可转换，覆盖目录中无转换价的礼物）；发送人是机器人则无条件拒绝——这是
+// 0217 修复的本质：bot sendGift 的支出来自 bot_stars_balances 钱包，收礼人若能把
+// 它兑换回自己的余额，就等于用钱包给任意用户铸造 Stars。这一道按发送人身份的检查
+// 不依赖迁移顺序：即使某条旧数据尚未被 0217 归零，也拿不到一分钱。
+func ensureStarGiftConvertible(ctx context.Context, tx pgx.Tx, saved domain.SavedStarGift) error {
+	if saved.ConvertStars <= 0 {
+		return domain.ErrStarGiftNotConvertible
+	}
+	if saved.FromUserID > 0 {
+		var isBot bool
+		if err := tx.QueryRow(ctx, `SELECT sender.is_bot FROM users sender WHERE sender.id=$1`,
+			saved.FromUserID).Scan(&isBot); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if isBot {
+			return domain.ErrStarGiftNotConvertible
+		}
+	}
+	return nil
+}
+
 // ConvertStarGift owns the complete conversion aggregate: saved-gift terminal
 // state, collection membership, owner-scoped Stars balance and transaction log.
 // A channel conversion credits the channel ledger, never ActorUserID's personal
@@ -94,6 +116,13 @@ func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain
 		}
 		if !saved.LifecycleStatus.Live() || saved.UniqueGiftID != 0 {
 			return domain.ErrStarGiftAlreadyUpgraded
+		}
+		// convert_stars 是转换资格的单一事实来源：机器人送出的礼物在购买事务里
+		// 被归零，历史遗留礼物由 0217 迁移统一归零，目录中本来就没有转换价的
+		// 礼物也归 0。为 0 即不可转换——拒绝而不是默默归档，旧客户端如果还显示
+		// 按钮，点下去会得到明确错误而不是把礼物白白抹掉。
+		if err := ensureStarGiftConvertible(ctx, tx, saved); err != nil {
+			return err
 		}
 
 		from := domain.Peer{Type: domain.PeerTypeUser, ID: saved.FromUserID}
