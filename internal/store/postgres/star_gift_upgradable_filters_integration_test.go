@@ -16,7 +16,10 @@ import (
 // exclude_unupgradable together (data_star_gift.cpp, MyUniqueGiftsSlice). The
 // two upgrade flags are documented as mutually exclusive, so a naive
 // implementation returns an empty list and the tab never appears — the "gift box
-// only has All / Collectibles" report.
+// only has All / Collectibles" report. Relaxing either flag on its own is not an
+// option, because the profile gift filter expresses its Upgradeable / Limited
+// categories with exactly these two flags, so the pair is only neutralised when
+// both are present.
 func TestStarGiftOwnGiftsFiltersPostgres(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -113,10 +116,11 @@ func TestStarGiftOwnGiftsFiltersPostgres(t *testing.T) {
 		t.Fatalf("own gift unique id = %+v err %v, want a collectible instance", page.Gifts, err)
 	}
 
-	// 单个标志保持原义。资料页按收到时刻倒序：升级重置了 collectible 的日期，
-	// 所以它排在早到的可升级礼物之前。
-	if got := ids(domain.SavedStarGiftFilter{ExcludeUnupgradable: true}); !slices.Equal(got, []int64{collectible.ID, upgradable.ID}) {
-		t.Fatalf("exclude_unupgradable = %v, want [%d %d]", got, collectible.ID, upgradable.ID)
+	// 单个标志必须保持原义：exclude_unupgradable 只留「可升级」。资料页的
+	// Upgradeable / Limited 分类过滤就是分别用这两个标志表达的
+	// （info_peer_gifts_widget.cpp），放宽其中一个会让资料页筛选错乱。
+	if got := ids(domain.SavedStarGiftFilter{ExcludeUnupgradable: true}); !slices.Equal(got, []int64{upgradable.ID}) {
+		t.Fatalf("exclude_unupgradable = %v, want only [%d]", got, upgradable.ID)
 	}
 	if got := ids(domain.SavedStarGiftFilter{ExcludeUpgradable: true}); !slices.Equal(got, []int64{collectible.ID}) {
 		t.Fatalf("exclude_upgradable = %v, want [%d]", got, collectible.ID)

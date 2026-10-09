@@ -559,15 +559,22 @@ LEFT JOIN star_gift_collectible_revisions acr
 		conditions = append(conditions, "p.unique_gift_id IS NOT NULL")
 	}
 	upgradable := `(p.unique_gift_id IS NULL AND acr.id IS NOT NULL AND acr.upgrade_stars > 0 AND acr.issued < acr.supply_total)`
-	if filter.ExcludeUpgradable {
-		conditions = append(conditions, "NOT "+upgradable)
-	}
 	// Telegram Desktop 加载礼物面板「我的收藏品」页签时会把 exclude_upgradable
 	// 和 exclude_unupgradable 一起下发（data_star_gift.cpp 的
-	// MyUniqueGiftsSlice）。两个互斥条件会互相抵消成空列表、页签永不出现，
-	// 所以已经升级过的收藏品（无需再升级）与可升级礼物一起放行。
-	if filter.ExcludeUnupgradable {
-		conditions = append(conditions, "("+upgradable+" OR p.unique_gift_id IS NOT NULL)")
+	// MyUniqueGiftsSlice）。两个互斥条件同时成立没有一致的含义，只有一种读法：
+	// 「不按可升级性过滤」，真正的选择交给同时下发的 exclude_unlimited
+	// （收藏品才能通过）。所以这一对同时出现时两个条件都不加。
+	//
+	// 单独出现时必须保持原义：资料页礼物过滤器就是分别用这两个标志表达
+	// Upgradeable / Limited 分类（info_peer_gifts_widget.cpp），放宽其中
+	// 一个会把资料页的分类筛选弄乱。
+	switch {
+	case filter.ExcludeUpgradable && filter.ExcludeUnupgradable:
+		// no upgradability filter
+	case filter.ExcludeUpgradable:
+		conditions = append(conditions, "NOT "+upgradable)
+	case filter.ExcludeUnupgradable:
+		conditions = append(conditions, upgradable)
 	}
 	if filter.CollectionID > 0 {
 		args = append(args, filter.CollectionID)
