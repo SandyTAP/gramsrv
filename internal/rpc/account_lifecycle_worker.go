@@ -51,6 +51,13 @@ func (r *Router) runAccountLifecycleOnce(ctx context.Context, batch int) {
 			continue
 		}
 		changed = true
+		r.log.Info("account deleted",
+			zap.Int64("user_id", result.User.ID),
+			zap.String("deletion_source", string(result.User.DeletionSource)),
+			zap.Int("revoked_authorizations", len(result.RevokedAuthorizations)),
+			// NFT usernames that went back to storage instead of dying with the
+			// account; the assets stay reissuable while the name stops resolving.
+			zap.Int("vaulted_collectible_usernames", result.VaultedCollectibleUsernames))
 		r.finishDeletedAccountAuthorizations(context.Background(), result.User.ID, result.RevokedAuthorizations)
 	}
 	if changed {

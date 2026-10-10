@@ -1730,6 +1730,8 @@ func run(logger *zap.Logger) error {
 		UserNotifier:           router,
 		UserModerationNotifier: router,
 		FreezeNotifier:         router,
+		AccountDeletion:        accountLifecycleStore,
+		AccountDeletionNotifier: router,
 		Channels:               channelsService,
 		ChannelNotifier:        router,
 		Messages:               messagesService,
