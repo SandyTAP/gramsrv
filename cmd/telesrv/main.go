@@ -1427,6 +1427,9 @@ func run(logger *zap.Logger) error {
 		messageapp.WithReadModelVersions(readModelVersionStore),
 		messageapp.WithBotResponder(botsService),
 		messageapp.WithSendPermissionChecker(adminService),
+		// The recipient probe only needs the unprojected row, so the users
+		// service reads the tombstone without viewer projection.
+		messageapp.WithRecipientUserReader(userStore),
 		messageapp.WithBusinessAutomation(passwordStore, businessAutomationOptions...),
 	)
 	moderationService := moderationapp.NewService(
