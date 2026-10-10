@@ -231,6 +231,12 @@ func isSystemUserID(id int64) bool {
 	return ok
 }
 
+// deletedAccountDisplayName is what a tombstone presents as on the wire. Clients
+// derive the same string from the deleted flag, but sending it explicitly keeps
+// the name stable across clients whose updateUser handling only merges the photo
+// and never re-reads first_name.
+const deletedAccountDisplayName = "Deleted Account"
+
 // tgDeletedUser builds the tombstone a deleted account is projected as: the id,
 // the deleted flag and an explicit empty avatar. Every other field is stripped.
 //
@@ -241,9 +247,15 @@ func isSystemUserID(id int64) bool {
 // projected for this id again.
 func tgDeletedUser(u domain.User) *tg.User {
 	out := &tg.User{
-		ID:      u.ID,
-		Deleted: true,
-		Photo:   &tg.UserProfilePhotoEmpty{},
+		ID:        u.ID,
+		Deleted:   true,
+		FirstName: deletedAccountDisplayName,
+		Photo:     &tg.UserProfilePhotoEmpty{},
+		// An absent status field is not the same as an empty one: clients keep the
+		// cached presence when the flag is missing, which is how a deleted account
+		// kept showing "last seen recently" right after it appeared as deleted.
+		// An explicit userStatusEmpty is what actually clears it.
+		Status: &tg.UserStatusEmpty{},
 	}
 	applyFrozenUserMark(out, u)
 	return out

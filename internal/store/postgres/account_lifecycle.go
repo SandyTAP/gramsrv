@@ -210,6 +210,12 @@ SET state = 'executed', completed_at = $2, updated_at = $2
 WHERE user_id = $1 AND state = 'pending'`, userID, now); err != nil {
 		return domain.AccountDeletionResult{}, fmt.Errorf("complete account deletion request: %w", err)
 	}
+	// The tombstone is only useful once viewers learn about it. Committing the
+	// audience in the same transaction is what makes the deletion converge for
+	// offline viewers too, instead of relying on an online-only fan-out.
+	if err := enqueueAccountDeletionNotifications(ctx, tx, userID, now); err != nil {
+		return domain.AccountDeletionResult{}, err
+	}
 	u, found, err = NewUserStore(tx).ByID(ctx, userID)
 	if err != nil || !found {
 		if err == nil {

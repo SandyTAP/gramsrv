@@ -59,6 +59,18 @@ func (r *Router) runAccountLifecycleOnce(ctx context.Context, batch int) {
 			// account; the assets stay reissuable while the name stops resolving.
 			zap.Int("vaulted_collectible_usernames", result.VaultedCollectibleUsernames))
 		r.finishDeletedAccountAuthorizations(context.Background(), result.User.ID, result.RevokedAuthorizations)
+		// The due sweep is off-request, so push the tombstone to every online
+		// viewer here: without it the stale cached name and avatar stay visible
+		// until the next authoritative read.
+		if r.deps.Users != nil {
+			if tombstone, found, err := r.deps.Users.ByID(context.Background(), result.User.ID, result.User.ID); err == nil && found {
+				if notifier, ok := r.deps.Users.(interface {
+					NotifyUserModerationFlagsChanged(context.Context, domain.User) error
+				}); ok {
+					_ = notifier.NotifyUserModerationFlagsChanged(context.Background(), tombstone)
+				}
+			}
+		}
 	}
 	if changed {
 		// One flush covers the entire due batch. Per-user predicate invalidation
