@@ -137,7 +137,8 @@ export function AccountRatingsPage({ navigate }: { navigate: Navigate }) {
 
 export function LevelBadge({ level }: { level: number }) {
   const { t } = useI18n();
-  const tone = level >= 10 ? "good" : level >= 5 ? "warn" : "neutral";
+  // The ladder runs to 100, so the tone steps sit on the same scale.
+  const tone = level >= 50 ? "good" : level >= 20 ? "warn" : "neutral";
   return <Badge tone={tone}>{t("rating.levelValue", { level })}</Badge>;
 }
 
