@@ -71,6 +71,9 @@ var (
 	// ErrBotSessionsNotRevoked 表示 token 已轮换但撤销已登录 session 失败
 	//（token 不可回滚，调用方须告知用户重试以确保旧 session 终止）。
 	ErrBotSessionsNotRevoked = errors.New("bot sessions not revoked")
+	// ErrBotDeletionUnsupported 表示当前 store 未实现删号（只有 Postgres 实现），
+	// 调用方须如实告知用户本服不支持，而不是谎称已删除。
+	ErrBotDeletionUnsupported = errors.New("bot deletion unsupported")
 )
 
 const (

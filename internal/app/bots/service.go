@@ -651,7 +651,7 @@ func (s *Service) DeleteBot(ctx context.Context, botUserID int64) (domain.User, 
 	}
 	deleter, ok := s.bots.(botAccountDeleter)
 	if !ok {
-		return domain.User{}, fmt.Errorf("bot deletion is not supported by the configured store")
+		return domain.User{}, domain.ErrBotDeletionUnsupported
 	}
 	// Session revocation is part of the deletion invariant: a deleted bot must
 	// never retain an authenticated connection. Fail closed before tombstoning

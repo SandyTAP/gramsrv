@@ -101,7 +101,7 @@ func TestEmbeddedMigrationsAreContiguousAndReversible(t *testing.T) {
 		// These published timestamp versions follow the original numbered chain.
 		// Pin every predecessor so future additions cannot silently fill a gap.
 		timestampPredecessors := map[uint]uint{
-			20260924140000: 222,
+			20260924140000: 223,
 			20260924150000: 20260924140000,
 			20260926010000: 20260924150000,
 			20260927010000: 20260926010000,

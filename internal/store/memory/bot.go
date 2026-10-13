@@ -78,9 +78,10 @@ func botFatherSeedProfile() domain.BotProfile {
 		Description: "BotFather is the one bot to rule them all. Use it to create new bot accounts and manage your existing bots.",
 		Commands: []domain.BotCommand{
 			{Command: "newbot", Description: "create a new bot"},
-			{Command: "mybots", Description: "list your bots"},
-			{Command: "token", Description: "show a bot's token"},
-			{Command: "revoke", Description: "revoke a bot's token"},
+			{Command: "mybots", Description: "edit your bots"},
+			{Command: "token", Description: "get authorization token"},
+			{Command: "revoke", Description: "revoke bot access token"},
+			{Command: "deletebot", Description: "delete a bot"},
 			{Command: "setlogin", Description: "configure Telegram Login"},
 			{Command: "logininfo", Description: "show Telegram Login configuration"},
 			{Command: "resetloginsecret", Description: "rotate an OIDC Client Secret"},
