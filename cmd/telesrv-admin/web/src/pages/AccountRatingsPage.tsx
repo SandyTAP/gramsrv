@@ -137,7 +137,10 @@ export function AccountRatingsPage({ navigate }: { navigate: Navigate }) {
 
 export function LevelBadge({ level }: { level: number }) {
   const { t } = useI18n();
-  const tone = level >= 10 ? "good" : level >= 5 ? "warn" : "neutral";
+  // The steps follow the old ladder's share of the scale (10/50 and 5/50), which
+  // on the 100-level curve is levels 20 and 10 -- the score thresholds behind the
+  // tones (10k for "good", 2.5k for "warn") are therefore unchanged.
+  const tone = level >= 20 ? "good" : level >= 10 ? "warn" : "neutral";
   return <Badge tone={tone}>{t("rating.levelValue", { level })}</Badge>;
 }
 
