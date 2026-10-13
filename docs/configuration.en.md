@@ -669,12 +669,13 @@ later is not the moment a typo is discovered. The defaults above are exactly the
 is identical whether or not these keys are set. The final score is clamped at zero: penalties can erase a rating but
 never invert it.
 
-**Levels run from 1 to 100**, which is the highest level official clients render for `stars_rating`, and the score for
-level *n* is `25 * n²` -- quadratic, so the first levels arrive quickly and the top ones stay meaningful. Level 100
-therefore costs 250k score, the same ceiling the previous 50-level ladder used, so every stored score was remapped onto
-the finer scale (a score that used to be level *n* is now level 2*n*) by the `20261013010000_rating_level_scale`
-migration instead of drifting until the next recompute. Past level 100 `next_level_stars` is omitted, which is what
-makes a client show the max-level badge instead of a progress bar.
+**Levels run from 0 to 100** (level 0 is any score below 25), and 100 is the highest level official clients render for
+`stars_rating`. The score for level *n* is `25 * n²` -- quadratic, so the first levels arrive quickly and the top ones
+stay meaningful. Level 100 therefore costs 250k score, the same ceiling the previous 50-level ladder used, so every
+stored score was remapped onto the finer scale (a score that used to be level *n* lands on level 2*n* or 2*n*+1; the
+threshold itself maps exactly onto 2*n*) by the `20261013010000_rating_level_scale` migration instead of drifting until
+the next recompute. Past level 100 `next_level_stars` is omitted, which is what makes a client show the max-level badge
+instead of a progress bar.
 
 **Collectible username prices are stored in the smallest units of their currency**, because that is what
 `fragment.collectibleInfo` carries: `amount` is "the total price in the smallest units of the currency (integer, not
