@@ -940,7 +940,13 @@ func (s *CommunityStore) SetCommunityPhoto(_ context.Context, user, id int64, ph
 		var stripped []byte
 		if photo != nil {
 			pid, dc = photo.ID, photo.DCID
+			if dc <= 0 {
+				dc = 2
+			}
 			stripped = domain.StrippedFromSizes(photo.Sizes)
+		}
+		if stripped == nil {
+			stripped = []byte{}
 		}
 		if c.PhotoID == pid && c.PhotoDCID == dc && string(c.PhotoStripped) == string(stripped) {
 			return false

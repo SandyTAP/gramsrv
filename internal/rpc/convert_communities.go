@@ -10,7 +10,11 @@ func tgCommunityPhoto(c domain.Community) tg.ChatPhotoClass {
 	if c.PhotoID == 0 {
 		return &tg.ChatPhotoEmpty{}
 	}
-	out := &tg.ChatPhoto{PhotoID: c.PhotoID, DCID: c.PhotoDCID}
+	dcID := c.PhotoDCID
+	if dcID <= 0 {
+		dcID = 2
+	}
+	out := &tg.ChatPhoto{PhotoID: c.PhotoID, DCID: dcID}
 	if len(c.PhotoStripped) > 0 {
 		out.SetStrippedThumb(c.PhotoStripped)
 	}
@@ -21,11 +25,15 @@ func tgCommunityFullPhoto(c domain.Community) tg.PhotoClass {
 	if c.PhotoID == 0 {
 		return &tg.PhotoEmpty{}
 	}
+	dcID := c.PhotoDCID
+	if dcID <= 0 {
+		dcID = 2
+	}
 	sizes := syntheticAvatarSizes()
 	if len(c.PhotoStripped) > 0 {
 		sizes = append([]tg.PhotoSizeClass{&tg.PhotoStrippedSize{Type: "i", Bytes: c.PhotoStripped}}, sizes...)
 	}
-	return &tg.Photo{ID: c.PhotoID, DCID: c.PhotoDCID, Sizes: sizes}
+	return &tg.Photo{ID: c.PhotoID, DCID: dcID, Sizes: sizes}
 }
 
 func tgCommunityChat(view domain.CommunityView) tg.ChatClass {

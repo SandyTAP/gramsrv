@@ -128,7 +128,11 @@ func (r *Router) communityPeerFromInput(ctx context.Context, userID int64, input
 }
 
 func (r *Router) communityUpdates(view domain.CommunityView) *tg.Updates {
-	return &tg.Updates{Updates: []tg.UpdateClass{}, Users: tgUsers(view.Users), Chats: tgCommunityHydratedChats(view.Self.UserID, view), Date: int(r.clock.Now().Unix())}
+	updates := []tg.UpdateClass{}
+	if view.Community.ID != 0 {
+		updates = append(updates, &tg.UpdateChannel{ChannelID: view.Community.ID})
+	}
+	return &tg.Updates{Updates: updates, Users: tgUsers(view.Users), Chats: tgCommunityHydratedChats(view.Self.UserID, view), Date: int(r.clock.Now().Unix())}
 }
 
 func (r *Router) pushCommunityState(ctx context.Context, userID int64, view domain.CommunityView) {
