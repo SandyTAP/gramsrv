@@ -163,6 +163,16 @@ func (r *Router) onUploadGetFile(ctx context.Context, req *tg.UploadGetFileReque
 func (r *Router) authorizedFileLocationKey(ctx context.Context, location tg.InputFileLocationClass) (string, bool, error) {
 	loc, encrypted := location.(*tg.InputEncryptedFileLocation)
 	if !encrypted {
+		if peerLoc, ok := location.(*tg.InputPeerPhotoFileLocation); ok && peerLoc.PhotoID == 0 && peerLoc.Peer != nil {
+			photoID, err := r.resolvePeerPhotoID(ctx, peerLoc.Peer)
+			if err == nil && photoID != 0 {
+				size := "a"
+				if peerLoc.Big {
+					size = "c"
+				}
+				return fmt.Sprintf("photo:%d:%s", photoID, size), true, nil
+			}
+		}
 		key, ok := fileLocationKey(location)
 		return key, ok, nil
 	}
@@ -397,4 +407,38 @@ func fileSaveErr(err error) error {
 	default:
 		return internalErr()
 	}
+}
+
+func (r *Router) resolvePeerPhotoID(ctx context.Context, peer tg.InputPeerClass) (int64, error) {
+	userID, ok, err := r.currentUserID(ctx)
+	if err != nil || !ok || userID == 0 {
+		return 0, err
+	}
+	if view, isCommunity, err := r.maybeCommunityFromInputPeer(ctx, userID, peer); isCommunity {
+		if err != nil {
+			return 0, err
+		}
+		return view.Community.PhotoID, nil
+	}
+	if ref, ok := inputPeerChannelRef(peer); ok && r.deps.Channels != nil {
+		if resolver, ok := r.deps.Channels.(interface {
+			GetChannelByID(context.Context, int64) (domain.Channel, error)
+		}); ok {
+			ch, err := resolver.GetChannelByID(ctx, ref.ID)
+			if err == nil {
+				return ch.PhotoID, nil
+			}
+		}
+	}
+	if userRef, ok := peer.(*tg.InputPeerUser); ok && r.deps.Users != nil {
+		if u, found, err := r.deps.Users.ByID(ctx, userID, userRef.UserID); err == nil && found {
+			return u.PhotoID, nil
+		}
+	}
+	if _, ok := peer.(*tg.InputPeerSelf); ok && r.deps.Users != nil {
+		if self, err := r.deps.Users.Self(ctx, userID); err == nil {
+			return self.PhotoID, nil
+		}
+	}
+	return 0, nil
 }

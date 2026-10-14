@@ -332,3 +332,158 @@ func TestCommunitiesRPCLayer228Lifecycle(t *testing.T) {
 		t.Fatalf("banned member joined communities = %#v err=%v", joinedResult, err)
 	}
 }
+
+func TestCommunityPhotoUploadAndDownloadLifecycle(t *testing.T) {
+	ctx := WithLayer(context.Background(), communitiesLayer)
+	userStore := memory.NewUserStore()
+	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 701, Phone: "15552000001", FirstName: "Owner"})
+	channelStore := memory.NewChannelStore()
+	channelService := appchannels.NewService(channelStore)
+	initial := communityRPCChannel(t, channelService, owner, "Initial")
+	communityService := appcommunities.NewService(memory.NewCommunityStore(userStore, channelStore, nil, nil))
+	files := &fakeFiles{
+		getFileFound: true,
+		getFileChunk: domain.FileChunk{
+			Bytes:    []byte{1, 2, 3, 4},
+			MimeType: "image/jpeg",
+			Total:    4,
+		},
+		photos: map[int64]domain.Photo{},
+	}
+	r := New(Config{DC: 2}, Deps{
+		Users:       appusers.NewService(userStore),
+		Channels:    channelService,
+		Communities: communityService,
+		Files:       files,
+	}, zaptest.NewLogger(t), clock.System)
+
+	createdResult, err := r.onCommunitiesCreate(WithUserID(ctx, owner.ID), &tg.CommunitiesCreateRequest{
+		Title: "Avatar Community",
+		Peer:  &tg.InputPeerChannel{ChannelID: initial.ID, AccessHash: initial.AccessHash},
+	})
+	if err != nil {
+		t.Fatalf("communities.create: %v", err)
+	}
+	community := createdResult.(*tg.Updates).Chats[0].(*tg.Community)
+	inputCommunity := &tg.InputChannel{ChannelID: community.ID, AccessHash: community.AccessHash}
+
+	// 1. Set community avatar from upload
+	setResult, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+		Channel: inputCommunity,
+		Photo: &tg.InputChatUploadedPhoto{
+			File: &tg.InputFile{ID: 55001, Parts: 1, Name: "community_avatar.jpg"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("channels.editPhoto uploaded photo: %v", err)
+	}
+	updates, ok := setResult.(*tg.Updates)
+	if !ok || len(updates.Chats) == 0 {
+		t.Fatalf("channels.editPhoto result = %#v, want Updates with Chats", setResult)
+	}
+	var hasUpdateChannel bool
+	for _, u := range updates.Updates {
+		if uc, ok := u.(*tg.UpdateChannel); ok && uc.ChannelID == community.ID {
+			hasUpdateChannel = true
+			break
+		}
+	}
+	if !hasUpdateChannel {
+		t.Fatalf("updates.Updates = %+v, want UpdateChannel for community %d", updates.Updates, community.ID)
+	}
+	commChat, ok := updates.Chats[0].(*tg.Community)
+	if !ok {
+		t.Fatalf("chats[0] = %T, want *tg.Community", updates.Chats[0])
+	}
+	chatPhoto, ok := commChat.Photo.(*tg.ChatPhoto)
+	if !ok || chatPhoto.PhotoID != 778 || chatPhoto.DCID != 2 {
+		t.Fatalf("community Photo = %#v, want PhotoID 778 and DCID 2", commChat.Photo)
+	}
+
+	// 2. Full channel check
+	fullResult, err := r.onChannelsGetFullChannel(WithUserID(ctx, owner.ID), inputCommunity)
+	if err != nil {
+		t.Fatalf("channels.getFullChannel: %v", err)
+	}
+	commFull, ok := fullResult.FullChat.(*tg.CommunityFull)
+	if !ok {
+		t.Fatalf("FullChat = %T, want *tg.CommunityFull", fullResult.FullChat)
+	}
+	fullPhoto, ok := commFull.ChatPhoto.(*tg.Photo)
+	if !ok || fullPhoto.ID != 778 || fullPhoto.DCID != 2 {
+		t.Fatalf("fullChat ChatPhoto = %#v, want Photo ID 778 and DCID 2", commFull.ChatPhoto)
+	}
+
+	// 3. Download via upload.getFile with explicit PhotoID
+	downloadSmall, err := r.onUploadGetFile(WithUserID(ctx, owner.ID), &tg.UploadGetFileRequest{
+		Location: &tg.InputPeerPhotoFileLocation{
+			Peer:    &tg.InputPeerChannel{ChannelID: community.ID, AccessHash: community.AccessHash},
+			PhotoID: 778,
+			Big:     false,
+		},
+		Limit: 1024,
+	})
+	if err != nil {
+		t.Fatalf("upload.getFile small: %v", err)
+	}
+	if files.getFileRequest.LocationKey != "photo:778:a" {
+		t.Fatalf("getFile location_key = %q, want photo:778:a", files.getFileRequest.LocationKey)
+	}
+	if len(downloadSmall.(*tg.UploadFile).Bytes) != 4 {
+		t.Fatalf("download bytes len = %d, want 4", len(downloadSmall.(*tg.UploadFile).Bytes))
+	}
+
+	// 4. Download via upload.getFile with Big=true
+	_, err = r.onUploadGetFile(WithUserID(ctx, owner.ID), &tg.UploadGetFileRequest{
+		Location: &tg.InputPeerPhotoFileLocation{
+			Peer:    &tg.InputPeerChannel{ChannelID: community.ID, AccessHash: community.AccessHash},
+			PhotoID: 778,
+			Big:     true,
+		},
+		Limit: 1024,
+	})
+	if err != nil {
+		t.Fatalf("upload.getFile big: %v", err)
+	}
+	if files.getFileRequest.LocationKey != "photo:778:c" {
+		t.Fatalf("getFile big location_key = %q, want photo:778:c", files.getFileRequest.LocationKey)
+	}
+
+	// 5. Download via upload.getFile with PhotoID == 0 (peer resolution)
+	_, err = r.onUploadGetFile(WithUserID(ctx, owner.ID), &tg.UploadGetFileRequest{
+		Location: &tg.InputPeerPhotoFileLocation{
+			Peer:    &tg.InputPeerChannel{ChannelID: community.ID, AccessHash: community.AccessHash},
+			PhotoID: 0,
+			Big:     false,
+		},
+		Limit: 1024,
+	})
+	if err != nil {
+		t.Fatalf("upload.getFile photoID 0: %v", err)
+	}
+	if files.getFileRequest.LocationKey != "photo:778:a" {
+		t.Fatalf("getFile photoID 0 location_key = %q, want photo:778:a", files.getFileRequest.LocationKey)
+	}
+
+	// 6. Clear community photo
+	clearResult, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+		Channel: inputCommunity,
+		Photo:   &tg.InputChatPhotoEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("channels.editPhoto clear: %v", err)
+	}
+	clearUpdates := clearResult.(*tg.Updates)
+	clearCommChat := clearUpdates.Chats[0].(*tg.Community)
+	if _, ok := clearCommChat.Photo.(*tg.ChatPhotoEmpty); !ok {
+		t.Fatalf("cleared community photo = %T, want *tg.ChatPhotoEmpty", clearCommChat.Photo)
+	}
+
+	fullCleared, err := r.onChannelsGetFullChannel(WithUserID(ctx, owner.ID), inputCommunity)
+	if err != nil {
+		t.Fatalf("channels.getFullChannel after clear: %v", err)
+	}
+	if _, ok := fullCleared.FullChat.(*tg.CommunityFull).ChatPhoto.(*tg.PhotoEmpty); !ok {
+		t.Fatalf("cleared fullChat ChatPhoto = %T, want *tg.PhotoEmpty", fullCleared.FullChat.(*tg.CommunityFull).ChatPhoto)
+	}
+}
