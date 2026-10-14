@@ -1658,6 +1658,13 @@ func run(logger *zap.Logger) error {
 				zap.String("channel", string(request.Channel)),
 				zap.Error(err))
 		}),
+		auth.WithSignupAutoJoin(channelsService, cfg.SignupAutoJoinChannelIDs),
+		auth.WithSignupAutoJoinFailureObserver(func(_ context.Context, userID, channelID int64, err error) {
+			logger.Named("signup").Warn("注册后自动订阅失败，账号仍已创建",
+				zap.Int64("user_id", userID),
+				zap.Int64("channel_id", channelID),
+				zap.Error(err))
+		}),
 		auth.WithLoginEmail(auth.LoginEmailOptions{
 			Enabled:      cfg.LoginEmailEnable,
 			RequireSetup: cfg.LoginEmailRequireSetup,

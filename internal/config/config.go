@@ -591,6 +591,11 @@ type Config struct {
 	// PremiumGrantMonths 是新注册账号默认赠送的会员月数；0 关闭赠送。
 	// 存量账号的一次性赠送由迁移 0094 backfill，不受该配置影响。
 	PremiumGrantMonths int
+	// SignupAutoJoinChannelIDs 是新账号注册成功后自动订阅的频道/超级群 id 列表；
+	// 空列表关闭该行为。走 ChannelStore.JoinChannel（自加入语义，inviter=本人），
+	// 因此会话、读水位、服务消息与 welcome 投递全部与真实点「Подписаться」一致。
+	// 单个频道失败只记日志，不阻断注册。
+	SignupAutoJoinChannelIDs []int64
 	// PremiumBotUsername is the public username advertised in app config and
 	// Premium deep links. The reserved bot id remains stable.
 	PremiumBotUsername string
@@ -834,6 +839,7 @@ func Load() (Config, error) {
 	envListOr := fileEnv.envListOr
 	envIntOr := fileEnv.envIntOr
 	envInt64Or := fileEnv.envInt64Or
+	envInt64ListOr := fileEnv.envInt64ListOr
 	envDurationOr := fileEnv.envDurationOr
 	envAllowEmptyOr := fileEnv.envAllowEmptyOr
 	if err := validateStrictMTProtoCapacityEnv(fileEnv); err != nil {
@@ -1226,6 +1232,7 @@ func Load() (Config, error) {
 		CallExpiryInterval:     envDurationOr("TELESRV_CALL_EXPIRY_INTERVAL", time.Second),
 
 		PremiumGrantMonths:               envIntOr("TELESRV_PREMIUM_GRANT_MONTHS", 3),
+		SignupAutoJoinChannelIDs:         envInt64ListOr("TELESRV_SIGNUP_AUTO_JOIN_CHANNEL_IDS", nil),
 		PremiumBotUsername:               premiumBotUsername,
 		PremiumBotUserID:                 premiumBotUserID,
 		PremiumPlans:                     premiumPlans,
@@ -2423,6 +2430,37 @@ func (e envSource) envInt64Or(key string, def int64) int64 {
 		}
 	}
 	return def
+}
+
+// envInt64ListOr 解析逗号分隔的 int64 列表（如 "932,1295,1296"）。空值或解析不出
+// 任何合法正数时回落到默认值；非法 token 被跳过而不是整体失败——运维手写错一个 id
+// 不应该让整个服务端起不来。重复 id 去重且保持首次出现的顺序。
+func (e envSource) envInt64ListOr(key string, def []int64) []int64 {
+	v := e.envOr(key, "")
+	if strings.TrimSpace(v) == "" {
+		return append([]int64(nil), def...)
+	}
+	out := make([]int64, 0, 4)
+	seen := make(map[int64]struct{}, 4)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return append([]int64(nil), def...)
+	}
+	return out
 }
 
 func parsePositiveInt64List(values []string) ([]int64, error) {

@@ -117,6 +117,22 @@ type Service struct {
 	// 不分渠道，故只有一份 env 默认值（而非每渠道一份）。
 	loginCodeMessageIdentity   *identity.Store
 	loginCodeMessageEnvDefault string
+	// signupAutoJoinChannels/signupAutoJoinChannelIDs 配置新账号注册成功后自动
+	// 订阅的频道列表；两者任一为空即关闭该行为。走 ChannelStore.JoinChannel
+	// （自加入语义，inviter=本人），因此 membership、admin log、participants_count、
+	// 服务消息、会话 dialog 与 welcome 投递与用户手点「订阅」完全一致。
+	signupAutoJoinChannels   signupAutoJoinChannelService
+	signupAutoJoinChannelIDs []int64
+	signupAutoJoinFailure    func(context.Context, int64, int64, error)
+}
+
+// signupAutoJoinChannelService 是 auth 包对频道域的最小依赖面：只取注册后自动
+// 订阅需要的那一个方法，不把整个 app/channels 拉进登录包。刻意用 app 层 Service
+// 而不是 store.ChannelStore——Service.JoinChannel 还会失效 activeChannelIDs /
+// participants / activeBotMember 缓存，否则刚注册的用户可能读到「我没在任何频道里」
+// 的陈旧读模型。
+type signupAutoJoinChannelService interface {
+	JoinChannel(ctx context.Context, userID, channelID int64, date int) (domain.CreateChannelResult, error)
 }
 
 type loginEmailStore interface {
@@ -275,6 +291,26 @@ func WithPhoneCodeDelivery(sender otpdelivery.Sender, length int) Option {
 func WithOTPDeliveryFailureObserver(observer func(context.Context, otpdelivery.Request, error)) Option {
 	return func(s *Service) {
 		s.otpDeliveryFailure = observer
+	}
+}
+
+// WithSignupAutoJoin 配置新账号注册成功后自动订阅的频道 id 列表（channels 传
+// app/channels.Service）。空列表或 nil 关闭该行为。只作用于 auth.signUp 的
+// 人类账号；auth.importBotAuthorization 走 SignInBot，不经过这里，所以 bot
+// 账号不会被拉进社区。
+func WithSignupAutoJoin(channels signupAutoJoinChannelService, channelIDs []int64) Option {
+	return func(s *Service) {
+		s.signupAutoJoinChannels = channels
+		s.signupAutoJoinChannelIDs = append([]int64(nil), channelIDs...)
+	}
+}
+
+// WithSignupAutoJoinFailureObserver 观察注册后自动订阅的失败。observer 收到
+// (ctx, userID, channelID, err)。订阅失败绝不回滚注册（账号已经落库且 auth_key
+// 已绑定，撤销比不订阅更糟），因此可观测性是唯一的兜底。
+func WithSignupAutoJoinFailureObserver(observer func(context.Context, int64, int64, error)) Option {
+	return func(s *Service) {
+		s.signupAutoJoinFailure = observer
 	}
 }
 
@@ -1274,7 +1310,36 @@ func (s *Service) SignUp(ctx context.Context, auth domain.Authorization, phone, 
 		}
 	}
 	s.recordWelcomeMessage(ctx, u)
+	s.autoJoinSignupChannels(ctx, u)
 	return u, loginMessage, nil
+}
+
+// autoJoinSignupChannels 在注册成功后把新账号拉进配置好的频道列表。
+//
+// 与 recordWelcomeMessage 同为 best-effort：账号此刻已经落库、auth_key 已绑定，
+// 任何失败都不能回滚 signUp，否则客户端会拿到一个「注册失败」却已存在的账号。
+// 逐个频道独立处理——一个被封/需审批的频道不应阻断其余频道，也不应中断列表。
+//
+// 走 JoinChannel（自加入，inviter=本人）而非 InviteToChannel：语义上就是
+// 「这个用户订阅了这个频道」，客户端据此生成本地服务消息并把广播频道物化进会话
+// 列表；admin 身份出现在 inviter 里会让新账号看起来是被管理员拉进来的。
+func (s *Service) autoJoinSignupChannels(ctx context.Context, u domain.User) {
+	if s == nil || s.signupAutoJoinChannels == nil || len(s.signupAutoJoinChannelIDs) == 0 || u.ID == 0 {
+		return
+	}
+	date := int(time.Now().Unix())
+	for _, channelID := range s.signupAutoJoinChannelIDs {
+		if channelID <= 0 {
+			continue
+		}
+		// ErrUserAlreadyParticipant / ErrChannelUserBanned 是该频道对该账号的稳定
+		// 终态，重试没有意义，只记一次日志便于排查即可。
+		if _, err := s.signupAutoJoinChannels.JoinChannel(ctx, u.ID, channelID, date); err != nil {
+			if s.signupAutoJoinFailure != nil {
+				s.signupAutoJoinFailure(ctx, u.ID, channelID, err)
+			}
+		}
+	}
 }
 
 // SignInBot 处理 auth.importBotAuthorization：校验 bot token 并把当前 auth_key
