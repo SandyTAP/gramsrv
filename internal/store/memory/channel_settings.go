@@ -413,7 +413,7 @@ func (s *ChannelStore) SetChannelPhoto(_ context.Context, userID, channelID int6
 	}, nil
 }
 
-func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64, enabled bool) (domain.Channel, error) {
+func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64, enabled, profilesEnabled bool) (domain.Channel, error) {
 	if userID == 0 || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
@@ -429,6 +429,7 @@ func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64,
 	}
 	prev := channel.Signatures
 	channel.Signatures = enabled
+	channel.SignatureProfiles = enabled && profilesEnabled
 	s.channels[channelID] = channel
 	if prev != enabled {
 		s.appendChannelAdminLogLocked(domain.ChannelAdminLogEvent{
@@ -440,6 +441,7 @@ func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64,
 			NewBool:   enabled,
 		})
 	}
+
 	return channel, nil
 }
 

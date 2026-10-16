@@ -713,12 +713,16 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	signatures, err := r.onChannelsToggleSignatures(WithUserID(ctx, owner.ID), &tg.ChannelsToggleSignaturesRequest{
 		Channel:           input,
 		SignaturesEnabled: true,
+		ProfilesEnabled:   true,
 	})
 	if err != nil {
 		t.Fatalf("toggle signatures: %v", err)
 	}
 	if signed := signatures.(*tg.Updates).Chats[0].(*tg.Channel); !signed.Signatures {
 		t.Fatalf("signed channel = %+v, want signatures enabled", signed)
+	}
+	if signed := signatures.(*tg.Updates).Chats[0].(*tg.Channel); !signed.SignatureProfiles {
+		t.Fatalf("signed channel = %+v, want signature profiles enabled", signed)
 	}
 	if _, err := r.onChannelsToggleSlowMode(WithUserID(ctx, owner.ID), &tg.ChannelsToggleSlowModeRequest{Channel: input, Seconds: 7}); err == nil {
 		t.Fatalf("toggle slow mode invalid seconds err = nil, want SECONDS_INVALID")
