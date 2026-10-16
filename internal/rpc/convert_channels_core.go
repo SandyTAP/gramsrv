@@ -466,6 +466,7 @@ func tgChannel(viewerUserID int64, ch domain.Channel, self *domain.ChannelMember
 		Photo:      tgChatPhoto(ch),
 		Date:       ch.Date,
 	}
+	out.SetSignatureProfiles(ch.SignatureProfiles)
 	out.SetAccessHash(ch.AccessHash)
 	out.SetJoinToSend(ch.JoinToSend)
 	out.SetJoinRequest(ch.JoinRequest)
