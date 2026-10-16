@@ -68,6 +68,13 @@ type ChannelStore interface {
 	SetAntiSpam(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)
 	SetSlowMode(ctx context.Context, userID, channelID int64, seconds int) (domain.Channel, error)
 	SetBoostsToUnblockRestrictions(ctx context.Context, userID, channelID int64, boosts int) (domain.Channel, error)
+	// SetChannelUnderReview puts a channel into moderator review, or clears it
+	// when reason is empty. until is an absolute unix timestamp; 0 means the
+	// review has no deadline. See domain.ChannelReview for the expiry rule.
+	SetChannelUnderReview(ctx context.Context, channelID int64, reason string, until, now int) (domain.ChannelReview, error)
+	// ChannelUnderReview reports the review state and whether it is in force at
+	// now. found=false covers both "not under review" and "no such channel".
+	ChannelUnderReview(ctx context.Context, channelID int64, now int) (domain.ChannelReview, bool, error)
 	SetNoForwards(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)
 	SetJoinToSend(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)
 	SetJoinRequest(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)

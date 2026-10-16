@@ -5,15 +5,15 @@ import (
 	"time"
 )
 
-// TestAccountRatingLevelScale pins the server-local ladder: 100 levels, the
-// top one at 250k score, and every threshold strictly increasing.
+// TestAccountRatingLevelScale pins the ladder: 500 levels, the top one at
+// 6 * 500^2 = 1.5M score, and every threshold strictly increasing.
 func TestAccountRatingLevelScale(t *testing.T) {
-	if MaxAccountRatingLevel != 100 {
-		t.Fatalf("MaxAccountRatingLevel = %d, want 100 (the configured local ceiling)", MaxAccountRatingLevel)
+	if MaxAccountRatingLevel != 500 {
+		t.Fatalf("MaxAccountRatingLevel = %d, want 500", MaxAccountRatingLevel)
 	}
 	top := AccountRatingLevelThreshold(MaxAccountRatingLevel)
-	if top != 250_000 {
-		t.Fatalf("top level threshold = %d, want 250000", top)
+	if top != 1_500_000 {
+		t.Fatalf("top level threshold = %d, want 1500000", top)
 	}
 	previous := int64(0)
 	for level := 1; level <= MaxAccountRatingLevel; level++ {
@@ -23,8 +23,7 @@ func TestAccountRatingLevelScale(t *testing.T) {
 		}
 		previous = threshold
 	}
-	// Beyond the top the curve is clamped rather than extrapolated: a level outside the
-	// local policy must never leak into the wire projection.
+	// Beyond the top the curve is clamped rather than extrapolated.
 	if got := AccountRatingLevelThreshold(MaxAccountRatingLevel + 10); got != top {
 		t.Fatalf("over-max threshold = %d, want the clamped %d", got, top)
 	}
@@ -43,18 +42,18 @@ func TestAccountRatingLevelForStarsBoundary(t *testing.T) {
 		current, next int64
 		hasNext       bool
 	}{
-		{stars: 0, level: 0, current: 0, next: 25, hasNext: true},
-		{stars: 24, level: 0, current: 0, next: 25, hasNext: true},
-		{stars: 25, level: 1, current: 25, next: 100, hasNext: true},
-		{stars: 99, level: 1, current: 25, next: 100, hasNext: true},
-		{stars: 100, level: 2, current: 100, next: 225, hasNext: true},
-		{stars: 2_500, level: 10, current: 2_500, next: 3_025, hasNext: true},
-		{stars: 10_000, level: 20, current: 10_000, next: 11_025, hasNext: true},
-		{stars: 62_500, level: 50, current: 62_500, next: 65_025, hasNext: true},
-		{stars: 249_999, level: 99, current: 245_025, next: 250_000, hasNext: true},
-		{stars: 250_000, level: 100, current: 250_000, next: 0, hasNext: false},
-		{stars: 10_000_000, level: 100, current: 250_000, next: 0, hasNext: false},
-		{stars: -5, level: 0, current: 0, next: 25, hasNext: true},
+		{stars: 0, level: 0, current: 0, next: 6, hasNext: true},
+		{stars: 5, level: 0, current: 0, next: 6, hasNext: true},
+		{stars: 6, level: 1, current: 6, next: 24, hasNext: true},
+		{stars: 23, level: 1, current: 6, next: 24, hasNext: true},
+		{stars: 24, level: 2, current: 24, next: 54, hasNext: true},
+		{stars: 600, level: 10, current: 600, next: 726, hasNext: true},
+		{stars: 2_400, level: 20, current: 2_400, next: 2_646, hasNext: true},
+		{stars: 15_000, level: 50, current: 15_000, next: 15_606, hasNext: true},
+		{stars: 1_499_994, level: 499, current: 1_494_006, next: 1_500_000, hasNext: true},
+		{stars: 1_500_000, level: 500, current: 1_500_000, next: 0, hasNext: false},
+		{stars: 10_000_000, level: 500, current: 1_500_000, next: 0, hasNext: false},
+		{stars: -5, level: 0, current: 0, next: 6, hasNext: true},
 	}
 	for _, tc := range cases {
 		level, current, next, hasNext := AccountRatingLevelForStars(tc.stars)
@@ -65,7 +64,8 @@ func TestAccountRatingLevelForStarsBoundary(t *testing.T) {
 		}
 	}
 	// No score below the top threshold may report itself as the top level, and no
-	// score above one may report anything else: the ladder has exactly 100 rungs.
+	// score above one may report anything else: the ladder has exactly
+	// MaxAccountRatingLevel rungs.
 	for level := 1; level < MaxAccountRatingLevel; level++ {
 		levelAt, _, _, _ := AccountRatingLevelForStars(AccountRatingLevelThreshold(level))
 		if levelAt != level {

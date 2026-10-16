@@ -180,9 +180,10 @@ const (
 	StarsReasonWithdrawal      StarsTransactionReason = "withdrawal"
 	StarsReasonAdjust          StarsTransactionReason = "adjust"           // 兜底/人工调整
 	StarsReasonDonationDeposit StarsTransactionReason = "donation_deposit" // crypto deposit credited after on-chain confirmation
-	StarsReasonBotInvoice      StarsTransactionReason = "bot_invoice"      // 结算 XTR 发票，贷记 bot 钱包
-	StarsReasonBotSpend        StarsTransactionReason = "bot_spend"        // bot 钱包支出
-	StarsReasonBotRefund       StarsTransactionReason = "bot_refund"       // 发票退款，借记 bot 钱包
+	StarsReasonBotInvoice      StarsTransactionReason = "bot_invoice"
+	StarsReasonGiveaway        StarsTransactionReason = "giveaway"   // 结算 XTR 发票，贷记 bot 钱包
+	StarsReasonBotSpend        StarsTransactionReason = "bot_spend"  // bot 钱包支出
+	StarsReasonBotRefund       StarsTransactionReason = "bot_refund" // 发票退款，借记 bot 钱包
 )
 
 // StarsTransaction 是一条账本流水。amount 带符号：贷记 > 0（含 refund/收取），借记 < 0。

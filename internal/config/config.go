@@ -596,6 +596,19 @@ type Config struct {
 	// 因此会话、读水位、服务消息与 welcome 投递全部与真实点「Подписаться」一致。
 	// 单个频道失败只记日志，不阻断注册。
 	SignupAutoJoinChannelIDs []int64
+	// ChatStreakNotifyMode selects how loudly the "огонёк" announces itself in
+	// private chats: daily, milestones, or off. The counter is written either
+	// way -- off only silences the message, it never stops the mechanic.
+	//
+	// An unrecognised value is a configuration error rather than a silent
+	// default: muting a feature by typo is how an operator ends up believing a
+	// reward system is running when it is not.
+	ChatStreakNotifyMode domain.ChatStreakNotifyMode
+	// ChatStreakSenderUserID is the account streak announcements are posted
+	// from. Zero falls back to the official system account, which works before
+	// any bot exists; pointing it at a dedicated bot puts a name in the chat
+	// list instead of "Telegram".
+	ChatStreakSenderUserID int64
 	// PremiumBotUsername is the public username advertised in app config and
 	// Premium deep links. The reserved bot id remains stable.
 	PremiumBotUsername string
@@ -907,6 +920,10 @@ func Load() (Config, error) {
 	countryCode, err := normalizeDefaultCountryCode(envOr("TELESRV_DEFAULT_COUNTRY_CODE", defaultCountryCode))
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_DEFAULT_COUNTRY_CODE: %w", err)
+	}
+	chatStreakNotifyMode, err := normalizeChatStreakNotifyMode(envOr("TELESRV_CHAT_STREAK_NOTIFY_MODE", ""))
+	if err != nil {
+		return Config{}, err
 	}
 	advertiseIP, err := normalizeAdvertiseIP(envOr("TELESRV_ADVERTISE_IP", "127.0.0.1"))
 	if err != nil {
@@ -1233,6 +1250,8 @@ func Load() (Config, error) {
 
 		PremiumGrantMonths:               envIntOr("TELESRV_PREMIUM_GRANT_MONTHS", 3),
 		SignupAutoJoinChannelIDs:         envInt64ListOr("TELESRV_SIGNUP_AUTO_JOIN_CHANNEL_IDS", nil),
+		ChatStreakNotifyMode:             chatStreakNotifyMode,
+		ChatStreakSenderUserID:           int64(envIntOr("TELESRV_CHAT_STREAK_SENDER_USER_ID", 0)),
 		PremiumBotUsername:               premiumBotUsername,
 		PremiumBotUserID:                 premiumBotUserID,
 		PremiumPlans:                     premiumPlans,
@@ -1642,6 +1661,25 @@ func normalizeDefaultCountryCode(raw string) (string, error) {
 		return "", fmt.Errorf("must identify a country or autonomous area")
 	}
 	return region.String(), nil
+}
+
+// normalizeChatStreakNotifyMode validates TELESRV_CHAT_STREAK_NOTIFY_MODE.
+//
+// An empty value means "not configured" and yields the empty mode, which the
+// app layer resolves to the loudest default -- so a server that never heard of
+// the setting still rewards a streak. An explicitly unrecognised value is an
+// error instead: silently coercing "milestonz" to off would leave an operator
+// believing streaks are being announced when they are not.
+func normalizeChatStreakNotifyMode(raw string) (domain.ChatStreakNotifyMode, error) {
+	mode := domain.ChatStreakNotifyMode(strings.ToLower(strings.TrimSpace(raw)))
+	if mode == "" {
+		return "", nil
+	}
+	if !domain.ValidChatStreakNotifyMode(mode) {
+		return "", fmt.Errorf("TELESRV_CHAT_STREAK_NOTIFY_MODE must be one of %q, %q, %q (got %q)",
+			domain.ChatStreakNotifyDaily, domain.ChatStreakNotifyMilestones, domain.ChatStreakNotifyOff, mode)
+	}
+	return mode, nil
 }
 
 func normalizeAdvertiseIP(raw string) (string, error) {
@@ -2379,6 +2417,37 @@ func (e envSource) envIntOr(key string, def int) int {
 	return def
 }
 
+// envInt64ListOr 解析逗号分隔的 int64 列表（如 "932,1295,1296"）。空值或解析不出
+// 任何合法正数时回落到默认值；非法 token 被跳过而不是整体失败——运维手写错一个 id
+// 不应该让整个服务端起不来。重复 id 去重且保持首次出现的顺序。
+func (e envSource) envInt64ListOr(key string, def []int64) []int64 {
+	v := e.envOr(key, "")
+	if strings.TrimSpace(v) == "" {
+		return append([]int64(nil), def...)
+	}
+	out := make([]int64, 0, 4)
+	seen := make(map[int64]struct{}, 4)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return append([]int64(nil), def...)
+	}
+	return out
+}
+
 func validateStrictMTProtoCapacityEnv(e envSource) error {
 	for _, key := range []string{
 		"TELESRV_MTPROTO_MAX_CONNECTIONS",
@@ -2430,37 +2499,6 @@ func (e envSource) envInt64Or(key string, def int64) int64 {
 		}
 	}
 	return def
-}
-
-// envInt64ListOr 解析逗号分隔的 int64 列表（如 "932,1295,1296"）。空值或解析不出
-// 任何合法正数时回落到默认值；非法 token 被跳过而不是整体失败——运维手写错一个 id
-// 不应该让整个服务端起不来。重复 id 去重且保持首次出现的顺序。
-func (e envSource) envInt64ListOr(key string, def []int64) []int64 {
-	v := e.envOr(key, "")
-	if strings.TrimSpace(v) == "" {
-		return append([]int64(nil), def...)
-	}
-	out := make([]int64, 0, 4)
-	seen := make(map[int64]struct{}, 4)
-	for _, part := range strings.Split(v, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		n, err := strconv.ParseInt(part, 10, 64)
-		if err != nil || n <= 0 {
-			continue
-		}
-		if _, dup := seen[n]; dup {
-			continue
-		}
-		seen[n] = struct{}{}
-		out = append(out, n)
-	}
-	if len(out) == 0 {
-		return append([]int64(nil), def...)
-	}
-	return out
 }
 
 func parsePositiveInt64List(values []string) ([]int64, error) {

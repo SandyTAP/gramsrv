@@ -1027,3 +1027,14 @@ func sortBotAPIEntities(entities []domain.MessageEntity) {
 		return entities[i].Type < entities[j].Type
 	})
 }
+
+// ParseOperatorMarkdown converts Telegram's legacy Markdown into plain text plus
+// the entity list that reproduces it in a client.
+//
+// It exists so an operator-authored message can use **bold**, `code` and links
+// and render as formatted text rather than showing the asterisks. The parser is
+// the same one the Bot API receive path uses, so both directions agree on what
+// a construct means instead of each having its own idea.
+func ParseOperatorMarkdown(input string) (string, []domain.MessageEntity, error) {
+	return parseBotAPIMarkdown(input)
+}

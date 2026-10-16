@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"telesrv/internal/app/giftpack"
+	"telesrv/internal/botapi"
 	"telesrv/internal/domain"
 	"telesrv/internal/officialgifts"
 )
@@ -327,6 +329,7 @@ type ChannelsService interface {
 	AdminSetColor(ctx context.Context, channelID int64, forProfile bool, color domain.ChannelPeerColor) (domain.Channel, error)
 	AdminSetEmojiStatus(ctx context.Context, channelID int64, status domain.ChannelEmojiStatus) (domain.Channel, error)
 	AdminSetPhoto(ctx context.Context, channelID int64, photo domain.Photo) (domain.Channel, error)
+	SetChannelUnderReview(ctx context.Context, channelID int64, reason string, until, now int) (domain.ChannelReview, error)
 }
 
 type ChannelNotifier interface {
@@ -334,6 +337,10 @@ type ChannelNotifier interface {
 }
 
 type MessagesService interface {
+	// SendPrivateText lets an operator talk to a user from a known account. It
+	// is the same path BotFather replies take, so the recipient sees an ordinary
+	// message with the usual dialog, unread counter and push notification.
+	SendPrivateText(ctx context.Context, actorUserID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error)
 	GetMessages(ctx context.Context, userID int64, ids []int) (domain.MessageList, error)
 	GetHistory(ctx context.Context, userID int64, filter domain.MessageFilter) (domain.MessageList, error)
 	DeleteMessages(ctx context.Context, userID int64, req domain.DeleteMessagesRequest) (domain.DeleteMessagesResult, error)
@@ -1112,6 +1119,40 @@ type SetUsernameRequest struct {
 	UserID   int64  `json:"user_id"`
 	Username string `json:"username"`
 }
+
+// SetChannelReviewRequest puts a channel into moderator review, or lifts it.
+//
+// UntilSeconds is a duration rather than an absolute time because the panel
+// expresses this as "block it for a day", and letting a browser send a
+// timestamp would let a skewed client write a deadline in the past. Zero
+// means no deadline: the channel stays blocked until an operator clears it.
+type SetChannelReviewRequest struct {
+	CommandMeta
+	ChannelID int64 `json:"channel_id"`
+	// PlaqueText is what viewers are shown on the channel. It is not the audit
+	// reason, which lives in CommandMeta and says why the operator acted.
+	PlaqueText   string `json:"plaque_text"`
+	UntilSeconds int64  `json:"until_seconds"`
+}
+
+// SendNotificationRequest asks for a plain private message from the operator's
+// notification account to one named user.
+type SendNotificationRequest struct {
+	CommandMeta
+	UserID int64  `json:"user_id"`
+	Text   string `json:"text"`
+}
+
+// NotificationSenderUserID is the account operator notifications are sent from.
+//
+// A user account, not a bot: an operator telling someone their channel was
+// blocked for review should read as a person, not as an automated bot. Pinned
+// here rather than accepted from the request, so a malformed or replayed
+// command can never send from an arbitrary account.
+const NotificationSenderUserID int64 = 1780243601
+
+// MaxNotificationTextRunes is the plain text limit a client will render.
+const MaxNotificationTextRunes = 4096
 
 type SetProfileRequest struct {
 	CommandMeta
@@ -5236,4 +5277,155 @@ func messageIDs(messages []domain.Message) []int {
 		out = append(out, msg.ID)
 	}
 	return out
+}
+
+// SendNotification delivers a plain private message from
+// NotificationSenderUserID to the one user named in the request.
+//
+// It goes through the ordinary SendPrivateText path, so the recipient's client
+// shows a normal message in a normal dialog -- there is no separate admin
+// notification channel to keep in sync with the real one.
+//
+// The sender needs no MTProto session of its own: the server writes the message
+// directly, the same mechanism BotFather replies already use. That also means
+// the sender cannot be talked into relaying anything, because it never acts on
+// instructions it receives.
+func (s *Service) SendNotification(ctx context.Context, req SendNotificationRequest) (CommandResult, error) {
+	if req.UserID <= 0 {
+		return CommandResult{}, fmt.Errorf("user_id is required")
+	}
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		return CommandResult{}, fmt.Errorf("text is required")
+	}
+	if runes := len([]rune(text)); runes > MaxNotificationTextRunes {
+		return CommandResult{}, fmt.Errorf("text is %d runes, limit is %d", runes, MaxNotificationTextRunes)
+	}
+	if s == nil || s.messages == nil {
+		return CommandResult{}, fmt.Errorf("admin messages dependency is not configured")
+	}
+
+	return s.runCommand(ctx, req.CommandMeta, "send_notification", req.UserID,
+		domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID}, req,
+		func() (CommandResult, error) {
+			details := map[string]any{
+				"sender_user_id": NotificationSenderUserID,
+				"runes":          len([]rune(text)),
+			}
+			if req.DryRun {
+				return CommandResult{Message: "dry-run completed", Details: details}, nil
+			}
+			// Operator-authored notices are written with Telegram's legacy
+			// Markdown so a bolded heading renders as bold rather than as
+			// literal asterisks in someone's private dialog.
+			rendered, entities, parseErr := botapi.ParseOperatorMarkdown(text)
+			if parseErr != nil {
+				return CommandResult{}, fmt.Errorf("parse notification text: %w", parseErr)
+			}
+
+			sent, err := s.messages.SendPrivateText(ctx, NotificationSenderUserID, domain.SendPrivateTextRequest{
+				SenderUserID:    NotificationSenderUserID,
+				RecipientUserID: req.UserID,
+				// Deriving the random id from the recipient and text makes a
+				// retried command replay the first send rather than notifying
+				// the same person twice.
+				RandomID:     notificationRandomID(req.UserID, text),
+				Message:      rendered,
+				Entities:     entities,
+				Date:         int(time.Now().UTC().Unix()),
+				OriginUserID: NotificationSenderUserID,
+			})
+			if err != nil {
+				return CommandResult{}, err
+			}
+			details["message_id"] = sent.SenderMessage.ID
+			return CommandResult{Message: "notification sent", Details: details}, nil
+		})
+}
+
+// notificationRandomID derives a stable random id from the recipient and the
+// text, so retrying the same command does not send the same notice twice.
+func notificationRandomID(userID int64, text string) int64 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("admin-notification:%d:%s", userID, text)))
+	id := int64(binary.BigEndian.Uint64(sum[:8]) & 0x3fffffffffffffff)
+	if id == 0 {
+		id = 1
+	}
+	return id
+}
+
+// ActionSetChannelReview is the audit action name for the review command.
+const ActionSetChannelReview = "set_channel_review"
+
+// SetChannelReview puts a channel under moderator review, or lifts the review.
+//
+// While a review is in force the channel keeps its profile, member list and
+// boost counters, but its posts stop being readable to ordinary viewers: the
+// history reads are refused and the channel shows a service message saying it
+// is under review. Channel administrators are unaffected by design -- an
+// operator must still be able to read what they are moderating -- and a
+// deadline that passes lifts the block on its own, with no sweep job.
+func (s *Service) SetChannelReview(ctx context.Context, req SetChannelReviewRequest) (CommandResult, error) {
+	if req.ChannelID <= 0 {
+		return CommandResult{}, fmt.Errorf("channel_id is required")
+	}
+	if s == nil || s.channels == nil {
+		return CommandResult{}, fmt.Errorf("admin channel dependency is not configured")
+	}
+	now := int(s.now().Unix())
+
+	reason := strings.TrimSpace(req.PlaqueText)
+	// No plaque text or no duration means "lift it". Treating a cleared duration as
+	// an explicit unblock is what makes the panel's unblock button work without
+	// having to also clear the text field first.
+	clearing := reason == "" || req.UntilSeconds <= 0
+	if clearing {
+		reason = ""
+	}
+	if !clearing && req.UntilSeconds > domain.MaxChannelReviewDays*24*60*60 {
+		return CommandResult{}, fmt.Errorf("until_seconds exceeds the %d day maximum", domain.MaxChannelReviewDays)
+	}
+	until := 0
+	if !clearing {
+		until = now + int(req.UntilSeconds)
+	}
+
+	target := domain.Peer{Type: domain.PeerTypeChannel, ID: req.ChannelID}
+	return s.runCommand(ctx, req.CommandMeta, ActionSetChannelReview, 0, target, req, func() (CommandResult, error) {
+		ch, err := s.channels.GetChannelByID(ctx, req.ChannelID)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		details := map[string]any{
+			"title":         ch.Title,
+			"username":      ch.Username,
+			"broadcast":     ch.Broadcast,
+			"clearing":      clearing,
+			"reason":        reason,
+			"until_seconds": req.UntilSeconds,
+		}
+		if req.DryRun {
+			return CommandResult{Message: "dry-run completed", Details: details}, nil
+		}
+		review, err := s.channels.SetChannelUnderReview(ctx, req.ChannelID, reason, until, now)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		details["started_at"] = review.StartedAt
+		details["until"] = review.Until
+		if s.channelNotifier != nil {
+			// Refresh clients that already hold the channel, so lifting a review
+			// does not depend on the viewer refetching it.
+			if updated, err := s.channels.GetChannelByID(ctx, req.ChannelID); err == nil {
+				if err := s.channelNotifier.NotifyChannelChanged(ctx, updated); err != nil {
+					details["notify_error"] = err.Error()
+				}
+			}
+		}
+		message := "channel review started"
+		if clearing {
+			message = "channel review lifted"
+		}
+		return CommandResult{Message: message, Details: details}, nil
+	})
 }

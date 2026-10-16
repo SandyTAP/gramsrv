@@ -23,6 +23,7 @@ import { DonationsPage } from "./DonationsPage";
 import { PricesPage } from "./PricesPage";
 import { GiftsPage } from "./GiftsPage";
 import { GiveGiftsPage } from "./GiveGiftsPage";
+import { NotificationsPage } from "./NotificationsPage";
 import { ModerationCaseDetailPage } from "./ModerationCaseDetailPage";
 import { ModerationCasesPage } from "./ModerationCasesPage";
 import { PremiumPlansPage } from "./PremiumPlansPage";
@@ -235,6 +236,9 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
 	}
 	if (route.path === "/give-gifts") {
 		return <GiveGiftsPage navigate={navigate} />;
+	}
+	if (route.path === "/notifications") {
+		return <NotificationsPage />;
 	}
 	if (route.path === "/auctions") {
 		return <AuctionsPage navigate={navigate} />;

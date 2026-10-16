@@ -258,6 +258,25 @@ func (s *StarsPurchaseStore) purchaseStarsGiveaway(ctx context.Context, req doma
 			if sent.Message.ID <= 0 || sent.Event.Pts <= 0 || sent.Event.PtsCount != 1 {
 				return fmt.Errorf("settle stars giveaway: invalid channel send receipt")
 			}
+			// Fund the prize pool.
+			//
+			// This used to record the giveaway without ever touching
+			// stars_balances, so the winner payout later credited stars that no
+			// account had paid for. The prize has to leave the buyer's balance
+			// here, inside the same transaction that records the campaign:
+			// a giveaway whose post exists but whose pool is unfunded is exactly
+			// the state where the draw has to mint money.
+			peer := domain.Peer{Type: domain.PeerTypeChannel, ID: giveaway.BoostPeer.ID}
+			if err := debitInTx(ctx, tx, req.BuyerUserID, req.Stars,
+				domain.StarsReasonGiveaway, peer, req.Date, "Giveaway prize",
+				fmt.Sprintf("Funded a giveaway with %d stars", req.Stars)); err != nil {
+				return err
+			}
+			var balanceAfter int64
+			if err := tx.QueryRow(ctx,
+				`SELECT balance FROM stars_balances WHERE user_id = $1`, req.BuyerUserID).Scan(&balanceAfter); err != nil {
+				return fmt.Errorf("read stars balance after giveaway purchase: %w", err)
+			}
 			if _, err := tx.Exec(ctx, `
 INSERT INTO stars_giveaways
 	(buyer_user_id,form_id,channel_id,launch_message_id,random_id,stars,users,per_user_stars,yearly_boosts,
@@ -271,9 +290,9 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)`,
 INSERT INTO stars_purchase_commands
 	(buyer_user_id,form_id,kind,request_fingerprint,recipient_user_id,spend_peer_type,spend_peer_id,purpose_json,stars,currency,amount,
 	 balance_after,transaction_id,created_at)
-VALUES($1,$2,$3,$4,NULL,NULL,NULL,$5,$6,$7,$8,0,$9,$10)`,
+VALUES($1,$2,$3,$4,NULL,NULL,NULL,$5,$6,$7,$8,$9,$10,$11)`,
 				req.BuyerUserID, req.FormID, string(req.Kind), fingerprint[:], purposeJSON,
-				req.Stars, req.Currency, req.Amount, transactionID, req.Date); err != nil {
+				req.Stars, req.Currency, req.Amount, balanceAfter, transactionID, req.Date); err != nil {
 				return fmt.Errorf("insert stars giveaway purchase command: %w", err)
 			}
 			result.ChannelSend = sent

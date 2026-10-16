@@ -1402,3 +1402,15 @@ func (fakeService) AccountRatingEvents(context.Context, int64, int) ([]domain.Ac
 func (fakeService) ListRecentAdminCommands(context.Context, int, string) ([]domain.AdminCommand, error) {
 	return nil, nil
 }
+
+// SendNotification lives on the shared fake so a method added to Service is
+// stubbed once here rather than on every concrete fake in the package.
+func (fakeService) SendNotification(context.Context, admin.SendNotificationRequest) (admin.CommandResult, error) {
+	return admin.CommandResult{}, nil
+}
+
+// SetChannelReview is stubbed here for the same reason: one shared fake rather
+// than a stub per concrete fake in the package.
+func (fakeService) SetChannelReview(context.Context, admin.SetChannelReviewRequest) (admin.CommandResult, error) {
+	return admin.CommandResult{}, nil
+}

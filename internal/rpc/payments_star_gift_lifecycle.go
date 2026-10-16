@@ -11,6 +11,7 @@ import (
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
+	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 )
@@ -619,8 +620,13 @@ func (r *Router) onPaymentsUpdateStarGiftPrice(ctx context.Context, req *tg.Paym
 	}
 	if _, err := r.deps.Gifts.SetListing(ctx, domain.StarGiftListingRequest{ActorUserID: userID, Ref: ref,
 		Amount: amount, Date: int(r.clock.Now().Unix())}); err != nil {
+		r.log.Warn("stars.update_price store_error",
+			zap.Int64("user_id", userID), zap.Error(err),
+			zap.String("ref", starGiftRefValue(ref)))
 		return nil, starGiftLifecycleErr(err)
 	}
+	r.log.Info("stars.update_price ok",
+		zap.Int64("user_id", userID), zap.String("ref", starGiftRefValue(ref)))
 	r.invalidateStarGiftOwner(ref.Owner)
 	return emptyGiftUpdates(r.clock.Now().Unix()), nil
 }

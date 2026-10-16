@@ -13,21 +13,31 @@ import (
 // stored level through userFull's existing rating fields so official clients can
 // render it without a client patch.
 const (
-	// MaxAccountRatingLevel bounds the local rating policy. The TL schema
-	// represents starsRating.level as int; 100 is this server's chosen ceiling,
-	// not a protocol limit or a claim about Telegram's private rating policy.
-	MaxAccountRatingLevel = 100
+	// MaxAccountRatingLevel bounds the local gramsrv level.
+	//
+	// This was 100 while the ladder was tuned to what official clients were
+	// observed to draw. It is now 500: the top rung had moved close enough to
+	// the observed population that accounts were pinned to the ceiling with
+	// nowhere left to go, and the badge a client renders is a presentation
+	// concern -- a client that cannot draw a level degrades to no badge, it does
+	// not misread the projection. Levels above 100 go on the wire unchanged so
+	// a client that does render them shows them.
+	//
+	// If a client is ever confirmed to misbehave on a level it cannot draw (a
+	// wrong parse rather than a missing badge), clamp in tgAccountRatingLevel
+	// instead of lowering this: the stored level, the leaderboard ordering and
+	// the admin leaderboard all key on it.
+	MaxAccountRatingLevel = 500
 	// accountRatingLevelUnit is the score required for level 1. Thresholds grow
 	// quadratically from it: level n needs accountRatingLevelUnit * n^2.
 	//
-	// The unit is chosen so the top rung costs the same score it used to:
-	// accountRatingLevelUnit * MaxAccountRatingLevel^2 is 250k, exactly what the
-	// previous 50-level ladder asked for. Doubling the level count therefore
-	// doubles the resolution of the ladder instead of moving every stored score
-	// further out of reach -- a score that used to be level n is now level 2n --
-	// so the whole existing population spreads across all 100 levels rather than
-	// piling up on the first few with a few whale accounts pinned to the ceiling.
-	accountRatingLevelUnit = 25
+	// The unit decides whether widening the ladder moved the population or just
+	// the ceiling. At 25 the top rung is 6.25M, so widening 100 -> 500 changes
+	// almost nothing a user can see (mean level 11.9 -> 12.7) while leaving the
+	// same two accounts on the ceiling. At 6 the same population lands at a mean
+	// of 26.1 with nobody at the top: the unit's job is to keep the observed
+	// score range inside the ladder, not to make the ladder long.
+	accountRatingLevelUnit = 6
 	// MaxAccountRatingReasonLength matches the event ledger CHECK on reason.
 	MaxAccountRatingReasonLength = 512
 	// MaxAccountRatingActorLength matches the event ledger CHECK on actor.

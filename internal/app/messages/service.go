@@ -2,7 +2,10 @@ package messages
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"time"
 
 	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
@@ -32,8 +35,39 @@ type Service struct {
 	// whether the peer still accepts writes.
 	recipientUsers RecipientUserReader
 	business       *businessAutomationConfig
+	// chatStreaks advances the "огонёк" read model on every accepted private
+	// message. Nil disables the mechanic entirely, which is what every test that
+	// does not opt in relies on.
+	//
+	// It sits here rather than in the RPC layer because sendPrivateText is the
+	// one chokepoint every private write passes through -- client sends,
+	// forwards, bot replies, gift receipts, the Bot API gateway. A hook placed
+	// in messages.sendMessage would silently miss all of them.
+	chatStreaks ChatStreakAdvancer
+	// chatStreakFailure observes a streak advance that did not land. The package
+	// deliberately has no logger -- it is reached on the hot send path and every
+	// existing failure here is reported by a callback the wiring site installs.
+	chatStreakFailure func(context.Context, int64, int64, error)
+	// chatStreakNotifyMode selects which streak moves announce themselves.
+	// Empty means the domain default (daily); an unrecognised value is treated
+	// as off rather than guessed, so a typo in config cannot turn a mechanic
+	// into a spam machine.
+	chatStreakNotifyMode domain.ChatStreakNotifyMode
+	// chatStreakSenderUserID is the account the announcement is posted from.
+	// Zero means the official system account, which is a safe default that works
+	// before an operator has created anything. A dedicated bot reads better in
+	// the chat list and can carry its own name.
+	chatStreakSenderUserID int64
 
 	privateMediaCountCache *privateMediaCountReadModelCache
+}
+
+// ChatStreakAdvancer is the minimal surface the send path needs from the
+// streak mechanic: advance one pair and report what happened. The notification
+// and the admin surfaces live behind their own dependencies, so the hottest
+// path in the server pulls in nothing but the counter.
+type ChatStreakAdvancer interface {
+	AdvanceChatStreak(ctx context.Context, userA, userB int64, now time.Time) (domain.ChatStreak, domain.ChatStreakOutcome, error)
 }
 
 type SendPermissionChecker interface {
@@ -85,6 +119,34 @@ func WithCollectiblePhoneProvider(p userprojection.CollectiblePhoneProvider) Opt
 // WithBotResponder 启用服务端内置 bot（BotFather）对私聊消息的自动应答。
 func WithBotResponder(r BotResponder) Option {
 	return func(s *Service) { s.botResponder = r }
+}
+
+// WithChatStreaks enables the "огонёк" counter on the private send path.
+// Passing nil disables it, which is the default: the mechanic must be wired
+// explicitly so a test that constructs a Service without it cannot start writing
+// rows it never asserts on.
+func WithChatStreaks(a ChatStreakAdvancer) Option {
+	return func(s *Service) { s.chatStreaks = a }
+}
+
+// WithChatStreakFailureObserver reports a streak advance that did not land.
+// It never influences the send result: the message is durable by the time it is
+// called, so the worst a streak failure can cost is one day on a counter.
+func WithChatStreakFailureObserver(observer func(context.Context, int64, int64, error)) Option {
+	return func(s *Service) { s.chatStreakFailure = observer }
+}
+
+// WithChatStreakNotifyMode chooses how loudly a streak announces itself.
+// Unset keeps the domain default; an unmodelled value disables announcements
+// rather than defaulting to the loudest option.
+func WithChatStreakNotifyMode(mode domain.ChatStreakNotifyMode) Option {
+	return func(s *Service) { s.chatStreakNotifyMode = mode }
+}
+
+// WithChatStreakSender selects the account a streak announcement is posted from.
+// Zero keeps the official system account.
+func WithChatStreakSender(userID int64) Option {
+	return func(s *Service) { s.chatStreakSenderUserID = userID }
 }
 
 func WithSendPermissionChecker(c SendPermissionChecker) Option {
@@ -201,7 +263,163 @@ func (s *Service) sendPrivateText(ctx context.Context, userID int64, req domain.
 	if err == nil && !res.Duplicate && req.BusinessAutomationKind == "" && s.botResponder != nil && s.botResponder.HandlesBot(req.RecipientUserID) {
 		s.botResponder.OnPrivateMessage(ctx, req.RecipientUserID, res.RecipientMessage, req.OriginClientSession)
 	}
+	s.advanceChatStreak(ctx, req, res, err)
 	return res, err
+}
+
+// advanceChatStreak advances the "огонёк" for a pair after a private message
+// was accepted.
+//
+// Best effort by construction, and deliberately so: the message is already
+// durable at this point with its own id and pts, so a streak failure can only
+// cost a day on a counter. Failing the send instead would turn a cosmetic
+// read model into a reason a user cannot write to their friend.
+//
+// Three guards keep the mechanic honest:
+//
+//   - A replayed send must not count. res.Duplicate means the message was
+//     already stored by an earlier attempt with the same random_id, and
+//     counting it would let a client that retries on a flaky connection inflate
+//     the pair's streak on its own.
+//   - Neither side may be a built-in service account. A streak is a
+//     conversation between two people; a server service message -- a payment
+//     receipt, a login notice -- lands on this same path and would otherwise
+//     create a permanent day-1 streak nobody earned.
+//   - Service messages are skipped outright for the same reason.
+func (s *Service) advanceChatStreak(ctx context.Context, req domain.SendPrivateTextRequest, res domain.SendPrivateTextResult, sendErr error) {
+	if s == nil || s.chatStreaks == nil || sendErr != nil || res.Duplicate {
+		return
+	}
+	if req.Media != nil && req.Media.Kind == domain.MessageMediaKindService {
+		return
+	}
+	if domain.IsSystemUserID(req.SenderUserID) || domain.IsSystemUserID(req.RecipientUserID) {
+		return
+	}
+	// A note to self is ordinary usage, not an error. The store rejects a
+	// self-pair, and letting that rejection reach the observer turned "Избранное"
+	// -- which routes a send with sender == recipient -- into a steady stream of
+	// WARN lines that all say the same thing.
+	if req.SenderUserID == req.RecipientUserID {
+		return
+	}
+	// A bot is not a person, on either side. The Bot API gateway sends through
+	// this same path, so without checking both ends every bot message would mint
+	// a day-1 streak between the bot and whoever it wrote to -- a number nobody
+	// earned and nobody can grow.
+	if s.isChatStreakBot(ctx, req.SenderUserID) || s.isChatStreakBot(ctx, req.RecipientUserID) {
+		return
+	}
+	streak, outcome, err := s.chatStreaks.AdvanceChatStreak(ctx, req.SenderUserID, req.RecipientUserID, time.Now())
+	if err != nil {
+		if s.chatStreakFailure != nil {
+			s.chatStreakFailure(ctx, req.SenderUserID, req.RecipientUserID, err)
+		}
+		return
+	}
+	s.notifyChatStreak(ctx, req, streak, outcome)
+}
+
+// chatStreakRandomID mints the random_id a streak announcement is sent under.
+//
+// It has to be unique per announcement, not per day: the private-send path keys
+// its idempotency fingerprint on random_id, so reusing one would make the second
+// participant's copy of the same announcement look like a replay of the first
+// and silently never be written. crypto/rand because the value is an
+// idempotency key, not a counter, and a predictable one would let a caller
+// collide with a real send.
+func chatStreakRandomID() (int64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("chat streak random id: %w", err)
+	}
+	id := int64(binary.LittleEndian.Uint64(b[:]))
+	if id == 0 {
+		// Zero is reserved as "no random id" by the send path's validation.
+		id = 1
+	}
+	return id, nil
+}
+
+// isChatStreakBot reports whether an account is a bot or already a tombstone.//
+// The lookup is an unprojected PK read rather than a cached set: the set of bot
+// ids is unbounded and changes whenever someone runs a bot, so any cache here
+// would need invalidation that does not exist. It costs one indexed read on a
+// path that already performs several, and only on the streak-enabled build.
+// A lookup failure is answered "a real person": a transient read error must not
+// silently retire somebody's streak.
+//
+// Deleted accounts are excluded for the same reason as bots. The tombstone is
+// permanent, so a streak against one is a number that can only ever be frozen.
+func (s *Service) isChatStreakBot(ctx context.Context, userID int64) bool {
+	if s == nil || s.recipientUsers == nil {
+		return false
+	}
+	user, found, err := s.recipientUsers.ByID(ctx, userID)
+	if err != nil || !found {
+		return false
+	}
+	return user.Bot || user.Deleted
+}
+
+// notifyChatStreak posts the streak announcement into both participants' private
+// chats. The counter exists to be seen; without this the mechanic writes a row
+// nobody can observe and the only symptom is that nothing appears to happen.
+//
+// Both sides are told because the streak is shared: the person who wrote did not
+// earn it alone, and a badge only on the recipient's side would make the sender
+// wonder what happened to their own number.
+//
+// It goes through the ordinary private-send path -- sendPrivateText -- and that
+// is load-bearing rather than incidental. An earlier version called
+// s.messages.Create and upserted the inbox by hand, mirroring the welcome
+// message. That writes the row and bumps the dialog, and it is why the feature
+// appeared to do nothing: a bare store write emits no entry in user_update_events,
+// so no client is ever told the message exists. The row was there the whole time,
+// invisible to every open client until something else happened to trigger a full
+// dialog refetch. A streak badge nobody receives in real time is the same as no
+// badge at all.
+//
+// Recursion: the announcement itself is a private send, so it re-enters this
+// path. It is stopped upstream by isChatStreakBot -- the sender is a bot -- and
+// the same-day rule would stop it even if that were not true.
+func (s *Service) notifyChatStreak(ctx context.Context, req domain.SendPrivateTextRequest, streak domain.ChatStreak, outcome domain.ChatStreakOutcome) {
+	if s == nil || s.messages == nil {
+		return
+	}
+	mode := s.chatStreakNotifyMode
+	if mode == "" {
+		mode = domain.ChatStreakNotifyDaily
+	}
+	if !domain.ValidChatStreakNotifyMode(mode) || !domain.ShouldNotifyChatStreak(mode, streak, outcome) {
+		return
+	}
+	senderUserID := s.chatStreakSenderUserID
+	if senderUserID <= 0 {
+		senderUserID = domain.OfficialSystemUserID
+	}
+	body := domain.ChatStreakNotificationBody(streak, outcome)
+	if body == "" {
+		return
+	}
+	date := int(time.Now().UTC().Unix())
+	for _, userID := range [...]int64{req.SenderUserID, req.RecipientUserID} {
+		randomID, err := chatStreakRandomID()
+		if err != nil {
+			return
+		}
+		// A failure here is reported and dropped: the streak is already recorded,
+		// and losing an announcement must never cost the user their message.
+		if _, err := s.sendPrivateText(ctx, senderUserID, domain.SendPrivateTextRequest{
+			SenderUserID:    senderUserID,
+			RecipientUserID: userID,
+			RandomID:        randomID,
+			Message:         body,
+			Date:            date,
+		}); err != nil && s.chatStreakFailure != nil {
+			s.chatStreakFailure(ctx, senderUserID, userID, err)
+		}
+	}
 }
 
 // LookupPrivateSendReplay exposes the immutable receipt to the RPC boundary without executing

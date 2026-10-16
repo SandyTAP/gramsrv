@@ -322,7 +322,47 @@ func cloneEntityWithBounds(entity tg.MessageEntityClass, offset, length int) tg.
 	}
 }
 
+// sendSingleSendMessage charges a giveaway entry, then performs the send.
+//
+// Answering a giveaway's launch post is how a client enters it: layer 229 has no
+// joinGiveaway, so participation has to ride on a message the client already
+// sends. The fee is taken before the send and handed straight back if the send
+// fails, which keeps both ends honest -- an unaffordable user never gets a free
+// message posted, and a send rejected by a rate limit or permissions check does
+// not leave a participant who posted nothing.
+//
+// Refunds are made here rather than in the inner function because the inner
+// function has a dozen error returns and this is the only place where "did the
+// message actually land" is decided.
 func (r *Router) sendSingleSendMessage(ctx context.Context, req *tg.MessagesSendMessageRequest, splitFingerprint ...[]byte) (tg.UpdatesClass, bool, error) {
+	refund := func(bool) {}
+	if r.deps.Giveaways != nil {
+		userID, _, err := r.currentUserID(ctx)
+		if err == nil && userID != 0 {
+			if peer, ok := r.domainPeerFromInputPeer(userID, req.Peer); ok && peer.ID != 0 {
+				refund, err = r.giveawayEntryForSend(ctx, userID, peer, giveawayReplyTarget(req.ReplyTo))
+				if err != nil {
+					return nil, false, err
+				}
+			}
+		}
+	}
+	updates, dup, err := r.sendSingleSendMessageInner(ctx, req, splitFingerprint...)
+	refund(err != nil)
+	return updates, dup, err
+}
+
+// giveawayReplyTarget extracts the replied-to message id, ignoring every other
+// reply flavour. Only a plain reply to a message can be a giveaway entry.
+func giveawayReplyTarget(replyTo tg.InputReplyToClass) *domain.MessageReply {
+	message, ok := replyTo.(*tg.InputReplyToMessage)
+	if !ok || message == nil || message.ReplyToMsgID <= 0 {
+		return nil
+	}
+	return &domain.MessageReply{MessageID: message.ReplyToMsgID}
+}
+
+func (r *Router) sendSingleSendMessageInner(ctx context.Context, req *tg.MessagesSendMessageRequest, splitFingerprint ...[]byte) (tg.UpdatesClass, bool, error) {
 	if utf8.RuneCountInString(req.Message) > maxSendMessageTextLength {
 		return nil, false, messageTooLongErr()
 	}

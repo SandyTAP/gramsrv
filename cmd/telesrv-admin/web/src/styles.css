@@ -3,3 +3,32 @@
 @import "./styles/03-entities-and-actions.css";
 @import "./styles/04-modal-and-login.css";
 @import "./styles/05-responsive.css";
+
+/* Notification template chips. Wrapping is deliberate: there are six notices and
+   the labels are long enough that a fixed row would clip on a narrow window. */
+.template-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.template-chip {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.template-chip:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+.template-chip.active {
+  border-color: #2f81f7;
+  background: rgba(47, 129, 247, 0.14);
+}

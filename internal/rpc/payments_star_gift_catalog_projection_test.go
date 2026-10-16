@@ -15,9 +15,9 @@ func TestStarGiftProjectionDropsElapsedLockedUntilDate(t *testing.T) {
 		ID: 8201, Stars: 100, ConvertStars: 85, LockedUntilDate: 1750000000,
 	}
 	tests := []struct {
-		name     string
-		now      int64
-		wantSet  bool
+		name    string
+		now     int64
+		wantSet bool
 	}{
 		{name: "future lock date stays advertised", now: 1740000000, wantSet: true},
 		{name: "elapsed lock date is dropped so the client unblocks the gift", now: 1750000001, wantSet: false},

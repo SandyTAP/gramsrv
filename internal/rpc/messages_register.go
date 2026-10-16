@@ -622,6 +622,12 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 			if err := r.checkFrozenChannelParticipants(ctx, userID, filter.Peer.ID); err != nil {
 				return nil, err
 			}
+			// A channel under moderator review keeps its profile but stops
+			// serving posts to ordinary viewers; the client renders its own
+			// restriction banner from the error below.
+			if err := r.ensureChannelReadableForViewer(ctx, userID, filter.Peer.ID); err != nil {
+				return nil, err
+			}
 			if isLegacyInputPeerChat(req.Peer) {
 				return &tg.MessagesMessages{}, nil
 			}

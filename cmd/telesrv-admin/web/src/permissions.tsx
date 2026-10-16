@@ -12,6 +12,7 @@ export const permissionDonationsManage = "donations.manage";
 // Shop pricing: effective product prices, product kill switches and the stars
 // rate. Separate from premium.manage — this is what a customer is charged.
 export const permissionPricesManage = "prices.manage";
+export const permissionNotifications = "notifications.send";
 export const permissionBotTokenRead = "bots.token.read";
 export const permissionVerificationReview = "verification.review";
 export const permissionVerificationRevoke = "verification.revoke";

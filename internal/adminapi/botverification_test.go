@@ -838,3 +838,9 @@ func TestBotVerificationPermissionNamesAreDistinctFromTheOfficialOnes(t *testing
 		t.Fatal("the wildcard refused a third-party permission")
 	}
 }
+
+// SendNotification is stubbed so this fake keeps satisfying Service; bot
+// verification is unrelated to operator notifications.
+func (captureBotVerificationService) SendNotification(context.Context, admin.SendNotificationRequest) (admin.CommandResult, error) {
+	return admin.CommandResult{}, nil
+}

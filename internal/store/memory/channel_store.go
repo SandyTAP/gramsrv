@@ -74,7 +74,15 @@ func (w channelReadWatermark) advance(userID int64, maxID int) channelReadWaterm
 
 // ChannelStore is an in-memory channel/supergroup store for tests and local development.
 type ChannelStore struct {
-	mu        sync.RWMutex
+	mu sync.RWMutex
+	// reviewMu guards reviews and is deliberately separate from mu: a review is
+	// read on every history fetch, and taking the big store lock for a
+	// moderation lookup would queue unrelated writes behind the hottest read in
+	// the server. Per-store rather than package-level so two stores in one
+	// process -- which is what tests construct -- cannot see each other\'s
+	// moderation state.
+	reviewMu  sync.RWMutex
+	reviews   map[int64]domain.ChannelReview
 	nextID    int64
 	nextHash  int64
 	channels  map[int64]domain.Channel
@@ -144,6 +152,7 @@ func NewChannelStore() *ChannelStore {
 		nextID:                 firstMemoryChannelID,
 		nextHash:               900000000000,
 		channels:               make(map[int64]domain.Channel),
+		reviews:                make(map[int64]domain.ChannelReview),
 		members:                make(map[int64]map[int64]domain.ChannelMember),
 		dialogs:                make(map[int64]map[int64]domain.ChannelDialog),
 		topics:                 make(map[int64]map[int]domain.ChannelForumTopic),

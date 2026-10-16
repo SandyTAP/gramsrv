@@ -1024,6 +1024,8 @@ type fakeMessagesService struct {
 	lastDelete     domain.DeleteMessagesRequest
 	historyCalls   int
 	historyOffsets []int
+	sent           []adminNotificationSend
+	sendErr        error
 }
 
 func (f *fakeMessagesService) GetMessages(_ context.Context, _ int64, _ []int) (domain.MessageList, error) {
@@ -1362,6 +1364,7 @@ func (f *fakeUserModerationNotifier) NotifyUserModerationFlagsChanged(_ context.
 type fakeChannelsService struct {
 	channels      map[int64]domain.Channel
 	verifiedCalls int
+	reviews       []domain.ChannelReview
 }
 
 func (f *fakeChannelsService) GetChannelByID(_ context.Context, channelID int64) (domain.Channel, error) {
@@ -2744,4 +2747,135 @@ func TestResolveUserByPhoneRejectsMissingDependency(t *testing.T) {
 	if _, _, err := svc.ResolveUserByPhone(context.Background(), "+79991234567"); err == nil || !strings.Contains(err.Error(), "user lookup") {
 		t.Fatalf("without dependency err=%v", err)
 	}
+}
+
+// SendPrivateText is part of MessagesService now that an operator can talk to a
+// user. The fake records the send so tests can assert on sender, recipient and
+// text without a database.
+func (f *fakeMessagesService) SendPrivateText(_ context.Context, actorUserID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error) {
+	f.sent = append(f.sent, adminNotificationSend{actor: actorUserID, req: req})
+	return domain.SendPrivateTextResult{
+		SenderMessage: domain.Message{ID: 1 + len(f.sent)},
+	}, f.sendErr
+}
+
+type adminNotificationSend struct {
+	actor int64
+	req   domain.SendPrivateTextRequest
+}
+
+// TestSendNotificationSendsFromTheOperatorAccount pins the one property that
+// defines this feature: the message goes out from the operator's notification
+// account, not from the admin console and not from a bot.
+func TestSendNotificationSendsFromTheOperatorAccount(t *testing.T) {
+	messages := &fakeMessagesService{}
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Messages: messages, Now: fixedNow})
+
+	result, err := svc.SendNotification(context.Background(), SendNotificationRequest{
+		CommandMeta: CommandMeta{CommandID: "notify-1", Actor: "ops", Reason: "channel review"},
+		UserID:      4242,
+		Text:        "Your channel was blocked for review.",
+	})
+	if err != nil {
+		t.Fatalf("SendNotification: %v", err)
+	}
+	if result.Message != "notification sent" {
+		t.Fatalf("message = %q", result.Message)
+	}
+	if len(messages.sent) != 1 {
+		t.Fatalf("sends = %d, want 1", len(messages.sent))
+	}
+	send := messages.sent[0]
+	if send.req.SenderUserID != NotificationSenderUserID {
+		t.Errorf("SenderUserID = %d, want %d", send.req.SenderUserID, NotificationSenderUserID)
+	}
+	if send.actor != NotificationSenderUserID {
+		t.Errorf("actor = %d, want %d", send.actor, NotificationSenderUserID)
+	}
+	if send.req.RecipientUserID != 4242 {
+		t.Errorf("RecipientUserID = %d, want 4242", send.req.RecipientUserID)
+	}
+	if send.req.Message != "Your channel was blocked for review." {
+		t.Errorf("Message = %q", send.req.Message)
+	}
+	if send.req.RandomID == 0 {
+		t.Error("RandomID = 0; a zero id would make the send non-idempotent")
+	}
+}
+
+// TestSendNotificationRejectsBadInput: sending nowhere, or saying nothing, is an
+// operator mistake worth catching before it reaches the message store.
+func TestSendNotificationRejectsBadInput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  SendNotificationRequest
+	}{
+		{"no user", SendNotificationRequest{Text: "hi"}},
+		{"blank text", SendNotificationRequest{UserID: 1, Text: "   "}},
+		{"text too long", SendNotificationRequest{UserID: 1, Text: strings.Repeat("a", MaxNotificationTextRunes+1)}},
+	} {
+		messages := &fakeMessagesService{}
+		svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Messages: messages, Now: fixedNow})
+		if _, err := svc.SendNotification(context.Background(), tc.req); err == nil {
+			t.Errorf("%s: expected an error", tc.name)
+		}
+		if len(messages.sent) != 0 {
+			t.Errorf("%s: a message was sent despite invalid input", tc.name)
+		}
+	}
+}
+
+// TestSendNotificationDryRunSendsNothing: dry-run is how an operator checks a
+// command before committing it.
+func TestSendNotificationDryRunSendsNothing(t *testing.T) {
+	messages := &fakeMessagesService{}
+	svc := NewService(Dependencies{Commands: newMemoryCommandRepo(), Messages: messages, Now: fixedNow})
+
+	result, err := svc.SendNotification(context.Background(), SendNotificationRequest{
+		CommandMeta: CommandMeta{CommandID: "notify-dry", Actor: "ops", Reason: "dry run", DryRun: true},
+		UserID:      4242,
+		Text:        "test",
+	})
+	if err != nil {
+		t.Fatalf("SendNotification: %v", err)
+	}
+	if result.Message != "dry-run completed" {
+		t.Fatalf("message = %q, want dry-run completed", result.Message)
+	}
+	if len(messages.sent) != 0 {
+		t.Fatal("dry-run sent a message")
+	}
+}
+
+// TestNotificationRandomIDIsStable: the same recipient and text must derive the
+// same id, so a retried command replays instead of double-notifying.
+func TestNotificationRandomIDIsStable(t *testing.T) {
+	first := notificationRandomID(4242, "blocked")
+	if first == 0 {
+		t.Fatal("random id is zero")
+	}
+	if again := notificationRandomID(4242, "blocked"); again != first {
+		t.Fatalf("id changed between calls: %d then %d", first, again)
+	}
+	if other := notificationRandomID(4242, "unblocked"); other == first {
+		t.Fatal("different text produced the same id")
+	}
+	if other := notificationRandomID(4243, "blocked"); other == first {
+		t.Fatal("different recipient produced the same id")
+	}
+}
+
+// SetChannelUnderReview records what an operator asked for so tests can assert
+// on the stored review without a database.
+func (f *fakeChannelsService) SetChannelUnderReview(_ context.Context, channelID int64, reason string, until, now int) (domain.ChannelReview, error) {
+	if reason == "" {
+		f.reviews = append(f.reviews, domain.ChannelReview{ChannelID: channelID})
+		return domain.ChannelReview{ChannelID: channelID}, nil
+	}
+	if err := domain.ValidateChannelReview(reason, until, now); err != nil {
+		return domain.ChannelReview{}, err
+	}
+	review := domain.ChannelReview{ChannelID: channelID, Reason: reason, Until: until, StartedAt: now}
+	f.reviews = append(f.reviews, review)
+	return review, nil
 }

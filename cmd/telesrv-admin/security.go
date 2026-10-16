@@ -72,6 +72,12 @@ const (
 	// is a supervisory job, not a working-level one.
 	permissionAuditRead = "audit.read"
 
+	// Operator notifications: sending a message to a user from the platform's own
+	// account. Held apart from messages.manage because it writes into private
+	// dialogs from a pinned sender -- granting it by accident would let an
+	// operator impersonate the platform to any account.
+	permissionNotifications = "notifications.send"
+
 	// Section rights, in read/manage pairs that follow the sidebar. Reading a
 	// section and changing it are separate grants because most of the people
 	// who need to look at this data never need to alter it.
