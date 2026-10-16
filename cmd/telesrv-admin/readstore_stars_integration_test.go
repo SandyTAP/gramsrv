@@ -85,7 +85,7 @@ RETURNING id`, userID, amount, reason, title, int64(now.Unix())).Scan(&id); err 
 	// Alice holds the largest balance with two credits; Bob holds a smaller one
 	// with a single credit. "Drained" had stars but spent them down to zero, so
 	// it must disappear from the leaderboard yet stay findable by search.
-fx.alice = insert("Alice", aliceUser, alicePhone)
+	fx.alice = insert("Alice", aliceUser, alicePhone)
 	fx.alicePhone = alicePhone
 	setBalance(fx.alice, 5000, true)
 	// aliceTxn1 is the newest entry on Alice's ledger (the 2000 grant was the
@@ -123,7 +123,7 @@ func TestStarsTopLeaderboardAndSearch(t *testing.T) {
 	}
 	if rows[0].Balance != 5000 || rows[0].TxnCount != 2 {
 		t.Errorf("alice position wrong: balance=%d txn_count=%d (want 5000/2)", rows[0].Balance, rows[0].TxnCount)
-}
+	}
 	if !rows[0].Granted || rows[0].Phone != fx.alicePhone && rows[0].Phone != "" {
 		t.Errorf("alice flags wrong: granted=%v phone=%q", rows[0].Granted, rows[0].Phone)
 	}
@@ -141,7 +141,7 @@ func TestStarsTopLeaderboardAndSearch(t *testing.T) {
 		t.Errorf("drained balance = %d, want 0 (still findable after spending)", rows[0].Balance)
 	}
 
-// Searches by phone and by numeric user id resolve the same account.
+	// Searches by phone and by numeric user id resolve the same account.
 	rows, _, err = s.ListStarsTopAccounts(ctx, 0, 50, fx.alicePhone)
 	if err != nil {
 		t.Fatalf("search by phone: %v", err)

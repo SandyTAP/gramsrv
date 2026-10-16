@@ -645,6 +645,34 @@ func (s *Service) AdminSetPhoto(ctx context.Context, channelID int64, photo doma
 	return s.channels.SetChannelPhotoAdmin(ctx, channelID, photo)
 }
 
+// SetChannelUnderReview puts a channel into moderator review, or lifts it.
+//
+// until is an absolute unix timestamp; 0 means no deadline. The validation
+// lives in the domain so the admin command and this path cannot disagree about
+// what counts as a usable deadline.
+func (s *Service) SetChannelUnderReview(ctx context.Context, channelID int64, reason string, until, now int) (domain.ChannelReview, error) {
+	if s == nil || s.channels == nil || channelID <= 0 {
+		return domain.ChannelReview{}, domain.ErrChannelInvalid
+	}
+	if reason = strings.TrimSpace(reason); reason != "" {
+		if err := domain.ValidateChannelReview(reason, until, now); err != nil {
+			return domain.ChannelReview{}, err
+		}
+	}
+	return s.channels.SetChannelUnderReview(ctx, channelID, reason, until, now)
+}
+
+// ChannelUnderReview reports a channel's review state and whether it is in
+// force. A lookup failure is swallowed here rather than propagated: this sits on
+// the hot path of every history read, and a moderation check must never be the
+// reason an ordinary read fails.
+func (s *Service) ChannelUnderReview(ctx context.Context, channelID int64, now int) (domain.ChannelReview, bool, error) {
+	if s == nil || s.channels == nil || channelID <= 0 {
+		return domain.ChannelReview{}, false, nil
+	}
+	return s.channels.ChannelUnderReview(ctx, channelID, now)
+}
+
 // ListAdminedPublicChannels returns public channels/supergroups administered by user.
 func (s *Service) ListAdminedPublicChannels(ctx context.Context, userID int64) ([]domain.Channel, error) {
 	if s == nil || s.channels == nil || userID == 0 {

@@ -745,6 +745,10 @@ type ChannelsService interface {
 	CreateMegagroupFromCreateChat(ctx context.Context, userID int64, req domain.CreateChannelRequest) (domain.CreateChannelResult, error)
 	CreateChannel(ctx context.Context, userID int64, req domain.CreateChannelRequest) (domain.CreateChannelResult, error)
 	GetChannel(ctx context.Context, userID, channelID int64) (domain.ChannelView, error)
+	// ChannelUnderReview reports a channel's moderation review state and whether
+	// it is in force right now. A review blocks ordinary viewers from reading the
+	// channel's posts; administrators and expired reviews are not affected.
+	ChannelUnderReview(ctx context.Context, channelID int64, now int) (domain.ChannelReview, bool, error)
 	// ResolveChannel 是 GetChannel 的轻量版（仅访问校验 + Channel/Self，跳过 dialog/boost），
 	// 供 inputPeerFor 等只需 access_hash / 频道标志的解析路径用。
 	ResolveChannel(ctx context.Context, userID, channelID int64) (domain.ChannelView, error)
@@ -1103,6 +1107,18 @@ type AccountRatingService interface {
 	Rating(ctx context.Context, userID int64) (domain.AccountRating, error)
 }
 
+// ChatStreakService is the read side of the "огонёк" mechanic, as the RPC edge
+// needs it: the strongest live streak one viewer shares with one target.
+//
+// It returns the viewer's side of the relationship rather than a list, because
+// the only thing the wire has room for is a single number, and because a viewer
+// reading somebody's profile has exactly one question: do we have a streak, and
+// how long is it. ErrChatStreakNotFound means no, and the caller then projects
+// nothing rather than a zero, so "no streak" is never rendered as "day 0".
+type ChatStreakService interface {
+	StrongestChatStreak(ctx context.Context, viewerUserID, targetUserID int64) (domain.ChatStreak, error)
+}
+
 // BotVerificationService is the third-party bot verification boundary
 // (core.telegram.org/api/bots/verification): a verifier bot marking peers with its
 // own icon and description, which official clients render as a badge distinct from
@@ -1162,6 +1178,7 @@ type Deps struct {
 	Usernames                    UsernameRegistryService
 	CollectiblePhones            CollectiblePhoneService
 	AccountRatings               AccountRatingService
+	ChatStreaks                  ChatStreakService
 	BotVerifications             BotVerificationService
 	TelegramLogin                TelegramLoginService
 	Updates                      UpdatesService
@@ -1196,6 +1213,7 @@ type Deps struct {
 	Metrics                      Metrics
 	SecretChats                  SecretChatService
 	Stars                        StarsService
+	Giveaways                    StarsGiveawayService
 	Gifts                        GiftsService
 	Passkey                      PasskeyService
 	Themes                       ThemeService
@@ -1293,6 +1311,32 @@ type StarsService interface {
 	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	ListTransactions(ctx context.Context, userID int64, query domain.StarsTransactionQuery) (domain.StarsTransactionPage, error)
+}
+
+// StarsGiveawayService records giveaway participation.
+//
+// Kept separate from StarsService because participation has nothing to do with
+// a balance: a boost does not spend stars, it only buys a ticket to a draw that
+// some other account paid for.
+type StarsGiveawayService interface {
+	// EnterForBoost records userID as a participant in whichever giveaway on
+	// channelID is currently active.
+	//
+	// It is a no-op when the channel has no active giveaway, which is the
+	// normal case for boosting and must stay cheap: boosting a channel is not a
+	// giveaway interaction and must not fail if the giveaway tables are unhappy.
+	EnterForBoost(ctx context.Context, userID, channelID int64, now int) error
+
+	// JoinPaid charges the user the flat entry fee and records the entry. A
+	// feeStars value of 0 means the server default.
+	JoinPaid(ctx context.Context, giveawayID, userID, feeStars int64) (domain.StarsGiveawayEntry, error)
+
+	// ActiveGiveawayByMessage reports whether a channel message is the launch
+	// post of a running giveaway.
+	ActiveGiveawayByMessage(ctx context.Context, channelID int64, messageID int, now int) (domain.StarsGiveawayRun, bool, error)
+
+	// RefundEntry reverses a charged entry whose message was never sent.
+	RefundEntry(ctx context.Context, giveawayID, participantUserID, feeStars int64) error
 }
 
 // PremiumService is the domain-only boundary for catalog reads, payment form

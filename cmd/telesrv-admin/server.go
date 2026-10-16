@@ -135,6 +135,8 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/donations/chains", s.scopedRoute(permissionDonationsManage, http.HandlerFunc(s.handleDonationChainsAPI)))
 	mux.Handle("GET /api/donations/deposits", s.scopedRoute(permissionDonationsManage, http.HandlerFunc(s.handleDonationDepositsAPI)))
 	mux.Handle("POST /api/actions/donation-chain-update", s.scopedRoute(permissionDonationsManage, http.HandlerFunc(s.handleUpdateDonationChainAPI)))
+	mux.Handle("POST /api/actions/notification", s.scopedRoute(permissionNotifications, http.HandlerFunc(s.handleSendNotificationAPI)))
+	mux.Handle("GET /api/notification/lookup", s.scopedRoute(permissionNotifications, http.HandlerFunc(s.handleNotificationLookupAPI)))
 	mux.Handle("GET /api/item-prices", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleItemPricesAPI)))
 	mux.Handle("POST /api/actions/item-price-update", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleUpdateItemPriceAPI)))
 	mux.Handle("POST /api/actions/item-price-set-rate", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleSetStarsRateAPI)))

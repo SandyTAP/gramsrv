@@ -1,5 +1,6 @@
 import {
   AtSign,
+  BellRing,
   BadgeCheck,
   BarChart3,
   Bot,
@@ -28,7 +29,7 @@ import {
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
 import { LanguageSwitch, useI18n } from "../i18n";
-import { permissionAuditRead, permissionAdminsManage, permissionBotVerificationReview, permissionDashboardRead, permissionDonationsManage, permissionMessagesRead, permissionPremiumManage, permissionPricesManage, permissionServerManage, permissionStarsRead, permissionVerificationReview, useCan } from "../permissions";
+import { permissionAuditRead, permissionAdminsManage, permissionNotifications, permissionBotVerificationReview, permissionDashboardRead, permissionDonationsManage, permissionMessagesRead, permissionPremiumManage, permissionPricesManage, permissionServerManage, permissionStarsRead, permissionVerificationReview, useCan } from "../permissions";
 import { type Navigate, type RouteState, routeSubtitle, routeTitle } from "../routing";
 import { ThemeSwitch } from "../theme";
 import { AppLink } from "./AppLink";
@@ -79,6 +80,7 @@ export function Shell({
   const canManageAdmins = useCan(permissionAdminsManage);
   const canReadDashboard = useCan(permissionDashboardRead);
   const canReadAudit = useCan(permissionAuditRead);
+  const canSendNotifications = useCan(permissionNotifications);
   const canManageServer = useCan(permissionServerManage);
   const canReadStars = useCan(permissionStarsRead);
   const canManagePrices = useCan(permissionPricesManage);
@@ -264,6 +266,9 @@ export function Shell({
           <NavLink icon={<ShieldAlert size={16} />} href="/moderation" route={route} navigate={navigate}>{t("layout.moderation")}</NavLink>
           {canReadAudit && (
             <NavLink icon={<ScrollText size={16} />} href="/audit-log" route={route} navigate={navigate}>{t("layout.auditLog")}</NavLink>
+          )}
+          {canSendNotifications && (
+            <NavLink icon={<BellRing size={16} />} href="/notifications" route={route} navigate={navigate}>{t("layout.notifications")}</NavLink>
           )}
           {canManageAdmins && (
             <NavLink icon={<UserCog size={16} />} href="/admin-users" route={route} navigate={navigate}>{t("layout.adminUsers")}</NavLink>

@@ -322,6 +322,17 @@ func NormalizePhone(phone string) string {
 	if digits == OfficialSystemPhone {
 		return digits
 	}
+	// Calling codes this deployment sells but no real numbering plan defines.
+	//
+	// These must be matched before libphonenumber sees the number. Handing it a
+	// code it has never heard of makes it either reject the number or, for a
+	// four digit code like 1488, treat the first three digits as the country
+	// code and silently rewrite the identity -- which means the OTP goes to an
+	// account the user never typed. Matched here, the digits are the identity,
+	// exactly as issued.
+	if normalised, ok := normaliseCustomPhone(digits); ok {
+		return normalised
+	}
 	number, err := phonenumbers.Parse("+"+digits, phonenumbers.UNKNOWN_REGION)
 	if err != nil || !phonenumbers.IsPossibleNumber(number) {
 		return ""

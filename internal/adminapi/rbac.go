@@ -74,6 +74,12 @@ const (
 	// separate from premium.manage because a shop price decides what a
 	// customer is charged, not what a grant costs the operator.
 	PermissionPricesManage = "prices.manage"
+
+	// PermissionChannelReview guards putting a channel under moderator review
+	// and lifting it. It is separate from channel settings because a review
+	// makes a channel unreadable to its own audience -- a power worth granting
+	// deliberately.
+	PermissionChannelReview = "channels.review"
 	// PermissionBotTokenRead is intentionally narrower than unrestricted admin
 	// access because it reveals a live credential.
 	PermissionBotTokenRead = "bots.token.read"

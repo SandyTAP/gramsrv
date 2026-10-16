@@ -58,6 +58,7 @@ import (
 	ratingapp "telesrv/internal/app/rating"
 	secretchatapp "telesrv/internal/app/secretchat"
 	"telesrv/internal/app/stargifts"
+	"telesrv/internal/app/stargiveaways"
 	"telesrv/internal/app/stars"
 	storiesapp "telesrv/internal/app/stories"
 	"telesrv/internal/app/systemidentity"
@@ -854,6 +855,7 @@ func run(logger *zap.Logger) error {
 	ephemeralStore := redisstore.NewEphemeralMessageStore(rdb)
 	ephemeralReportStore := postgres.NewEphemeralReportStore(pool)
 	welcomeMessageStore := postgres.NewWelcomeMessageStore(pool)
+	chatStreakStore := postgres.NewChatStreakStore(pool)
 	messageTranscriptionStore := postgres.NewMessageTranscriptionStore(pool)
 	moderationReportStore := postgres.NewModerationReportStore(pool)
 	authDeliveryReportStore := postgres.NewAuthDeliveryReportStore(pool)
@@ -1354,6 +1356,26 @@ func run(logger *zap.Logger) error {
 	if err := premiumService.SyncPlans(ctx, cfg.PremiumPlans); err != nil {
 		return fmt.Errorf("sync Premium plans: %w", err)
 	}
+
+	// Giveaway draw worker. It picks winners for giveaways whose deadline has
+	// passed and pays them; see internal/app/stargiveaways for why a draw
+	// commits exactly once.
+	giveawayWorker := stargiveaways.New(starsStore, starsService, stargiveaways.Options{
+		Log: func(err error) { logger.Error("stars.giveaway.sweep", zap.Error(err)) },
+	})
+	go giveawayWorker.Run(ctx)
+
+	// Giveaway participation, attributed from premium.applyBoost.
+	giveawayEnter := stargiveaways.NewEnterService(starsStore, nil)
+
+	// Register the calling codes this deployment sells but no real numbering
+	// plan defines. Without this, numbers the bot issues in those regions are
+	// rejected by auth and no login code can ever be delivered.
+	if customCodes, err := starsStore.LoadCustomCallingCodes(ctx); err != nil {
+		return fmt.Errorf("load custom calling codes: %w", err)
+	} else if len(customCodes) > 0 {
+		logger.Info("registered custom calling codes", zap.Strings("country_codes", customCodes))
+	}
 	botsService.SetPremium(premiumService)
 	starGiftStore := postgres.NewStarGiftStore(pool)
 	starGiftUpgradeStore := postgres.NewStarGiftUpgradeStore(pool, messageStore, postgres.WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
@@ -1611,6 +1633,19 @@ func run(logger *zap.Logger) error {
 		// service reads the tombstone without viewer projection.
 		messageapp.WithRecipientUserReader(userStore),
 		messageapp.WithBusinessAutomation(passwordStore, businessAutomationOptions...),
+		// "Огонёк": the streak counter advances on every accepted private send.
+		// Best effort by contract -- see messageapp.Service.advanceChatStreak --
+		// so a failure here is reported and swallowed rather than failing a
+		// message that is already durable.
+		messageapp.WithChatStreaks(chatStreakStore),
+		messageapp.WithChatStreakNotifyMode(cfg.ChatStreakNotifyMode),
+		messageapp.WithChatStreakSender(cfg.ChatStreakSenderUserID),
+		messageapp.WithChatStreakFailureObserver(func(_ context.Context, senderUserID, recipientUserID int64, err error) {
+			logger.Named("streak").Warn("огонёк не продлён, сообщение уже сохранено",
+				zap.Int64("sender", senderUserID),
+				zap.Int64("recipient", recipientUserID),
+				zap.Error(err))
+		}),
 	)
 	moderationService := moderationapp.NewService(
 		moderationReportStore,
@@ -1848,6 +1883,7 @@ func run(logger *zap.Logger) error {
 		Usernames:                    usernamesService,
 		CollectiblePhones:            collectiblePhoneStore,
 		AccountRatings:               ratingService,
+		ChatStreaks:                  chatStreakStore,
 		BotVerifications:             botVerificationService,
 		TelegramLogin:                telegramLoginRPCDependency(telegramLoginService),
 		Updates:                      updatesService,
@@ -1872,6 +1908,7 @@ func run(logger *zap.Logger) error {
 		Phone:                        phoneService,
 		SecretChats:                  secretChatService,
 		Stars:                        starsService,
+		Giveaways:                    giveawayEnter,
 		Premium:                      premiumService,
 		Gifts:                        giftsService,
 		Passkey:                      passkeyService,

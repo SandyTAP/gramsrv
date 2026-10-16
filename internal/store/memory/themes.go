@@ -14,7 +14,7 @@ type ThemeStore struct {
 	byID     map[int64]domain.Theme
 	bySlug   map[string]int64
 	installs map[int64]map[int64]themeInstall // userID -> themeID -> 安装项
-	seq      int64                             // 单调序,模拟 postgres installed_at 排序
+	seq      int64                            // 单调序,模拟 postgres installed_at 排序
 }
 
 type themeInstall struct {

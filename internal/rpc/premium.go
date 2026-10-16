@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/iamxvbaba/td/tg"
+	"go.uber.org/zap"
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/domain"
@@ -116,11 +117,39 @@ func (r *Router) onPremiumApplyBoost(ctx context.Context, req *tg.PremiumApplyBo
 	if err != nil {
 		return nil, err
 	}
-	my, err := r.deps.Channels.ApplyPremiumBoost(ctx, userID, view.Channel.ID, slots, int(time.Now().Unix()), premiumUntil)
+	now := int(time.Now().Unix())
+	my, err := r.deps.Channels.ApplyPremiumBoost(ctx, userID, view.Channel.ID, slots, now, premiumUntil)
 	if err != nil {
 		return nil, premiumBoostErr(err)
 	}
+	// The boost is already committed at this point. Recording giveaway
+	// participation afterwards, and never letting its error escape, is
+	// deliberate: premium.applyBoost is the user's own money already spent, so
+	// a giveaway bookkeeping failure must not turn a successful boost into an
+	// error the client shows as a failed payment.
+	r.recordBoostGiveawayEntry(ctx, userID, view.Channel.ID, now)
 	return r.tgPremiumMyBoosts(ctx, userID, my), nil
+}
+
+// recordBoostGiveawayEntry counts a boost as an entry to the channel's running
+// giveaway.
+//
+// Layer 229's premium.applyBoost carries no giveaway_msg_id, so the server
+// cannot be told which post a boost came from; "this account boosted this
+// channel" is the only attribution available. That makes the boost itself the
+// participation event, which is why the entry is written here rather than from
+// a client-supplied message id.
+func (r *Router) recordBoostGiveawayEntry(ctx context.Context, userID, channelID int64, now int) {
+	if r.deps.Giveaways == nil {
+		return
+	}
+	if err := r.deps.Giveaways.EnterForBoost(ctx, userID, channelID, now); err != nil {
+		r.log.Warn("stars.giveaway.boost_entry_failed",
+			zap.Int64("user_id", userID),
+			zap.Int64("channel_id", channelID),
+			zap.Error(err),
+		)
+	}
 }
 
 func (r *Router) onPremiumGetUserBoosts(ctx context.Context, req *tg.PremiumGetUserBoostsRequest) (*tg.PremiumBoostsList, error) {

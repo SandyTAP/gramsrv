@@ -8,15 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"telesrv/internal/admin"
 	"telesrv/internal/domain"
 )
 
 type captureAuditService struct {
 	fakeService
-	limit  int
-	actor  string
-	cmds   []domain.AdminCommand
-	err    error
+	limit int
+	actor string
+	cmds  []domain.AdminCommand
+	err   error
 }
 
 func (s *captureAuditService) ListRecentAdminCommands(_ context.Context, limit int, actor string) ([]domain.AdminCommand, error) {
@@ -116,4 +117,11 @@ func TestAdminCommandsListServiceError(t *testing.T) {
 	if res.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status %d, want 500", res.StatusCode)
 	}
+}
+
+// SendNotification is stubbed so the audit test's fake keeps satisfying Service.
+// This suite is about command auditing, not notification delivery, which has
+// its own tests in internal/admin.
+func (captureAuditService) SendNotification(context.Context, admin.SendNotificationRequest) (admin.CommandResult, error) {
+	return admin.CommandResult{}, nil
 }

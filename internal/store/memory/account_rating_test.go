@@ -46,8 +46,13 @@ func TestSaveAccountRating(t *testing.T) {
 			input:       accountRatingFixture(11, 450, 1, now),
 			wantChanged: true,
 			check: func(t *testing.T, s *AccountRatingStore, stored domain.AccountRating) {
-				if stored.Level != 4 || stored.Stars != 450 || stored.Version != 1 ||
-					stored.CurrentLevelStars != 400 || stored.NextLevelStars != 625 || !stored.HasNextLevel {
+				// The ladder itself is pinned by the domain package's own tests;
+				// re-pinning it here would make every curve change break an
+				// unrelated store test. What this case actually owns is that the
+				// store derives and persists a level alongside the score.
+				wantLevel, wantCurrent, wantNext, wantHasNext := domain.AccountRatingLevelForStars(450)
+				if stored.Level != wantLevel || stored.Stars != 450 || stored.Version != 1 ||
+					stored.CurrentLevelStars != wantCurrent || stored.NextLevelStars != wantNext || stored.HasNextLevel != wantHasNext {
 					t.Fatalf("stored=%+v", stored)
 				}
 				read, err := s.AccountRating(ctx, 11)
@@ -62,7 +67,8 @@ func TestSaveAccountRating(t *testing.T) {
 			input:       accountRatingFixture(11, 1000, 2, now.Add(time.Minute)),
 			wantChanged: true,
 			check: func(t *testing.T, s *AccountRatingStore, stored domain.AccountRating) {
-				if stored.Version != 2 || stored.Stars != 1000 || stored.Level != 6 {
+				wantLevel, _, _, _ := domain.AccountRatingLevelForStars(1000)
+				if stored.Version != 2 || stored.Stars != 1000 || stored.Level != wantLevel {
 					t.Fatalf("stored=%+v", stored)
 				}
 			},
@@ -139,8 +145,9 @@ func TestSaveAccountRating(t *testing.T) {
 			}(),
 			wantChanged: true,
 			check: func(t *testing.T, s *AccountRatingStore, stored domain.AccountRating) {
+				wantLevel, _, _, _ := domain.AccountRatingLevelForStars(950)
 				pending, ok := stored.PendingLevel()
-				if !ok || pending.Stars != 950 || pending.Level != 6 {
+				if !ok || pending.Stars != 950 || pending.Level != wantLevel {
 					t.Fatalf("pending=%+v ok=%v", pending, ok)
 				}
 			},
@@ -243,7 +250,11 @@ func TestAccountRatingReadsAndLeaderboard(t *testing.T) {
 	if err != nil || len(next) != 2 || next[0].UserID != 12 || next[1].UserID != 14 {
 		t.Fatalf("next=%+v err=%v", next, err)
 	}
-	filtered, err := s.ListAccountRatings(ctx, domain.AccountRatingFilter{MinLevel: 5})
+	// MinLevel cuts the board just above user 12. The cut is derived from the
+	// ladder rather than hardcoded so retuning the curve cannot silently turn
+	// this into an assertion that everyone passes.
+	midLevel, _, _, _ := domain.AccountRatingLevelForStars(450)
+	filtered, err := s.ListAccountRatings(ctx, domain.AccountRatingFilter{MinLevel: midLevel + 1})
 	if err != nil || len(filtered) != 2 {
 		t.Fatalf("filtered=%+v err=%v", filtered, err)
 	}

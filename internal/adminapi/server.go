@@ -70,6 +70,8 @@ type Service interface {
 	SetChannelEmojiStatus(ctx context.Context, req admin.SetChannelEmojiStatusRequest) (admin.CommandResult, error)
 	RevokeSessions(ctx context.Context, req admin.RevokeSessionsRequest) (admin.CommandResult, error)
 	DeletePrivateMessages(ctx context.Context, req admin.DeletePrivateMessagesRequest) (admin.CommandResult, error)
+	SendNotification(ctx context.Context, req admin.SendNotificationRequest) (admin.CommandResult, error)
+	SetChannelReview(ctx context.Context, req admin.SetChannelReviewRequest) (admin.CommandResult, error)
 	DeletePrivateHistory(ctx context.Context, req admin.DeletePrivateHistoryRequest) (admin.CommandResult, error)
 	SetStickerSetArchived(ctx context.Context, req admin.SetStickerSetArchivedRequest) (admin.CommandResult, error)
 	SetStickerSetSortOrder(ctx context.Context, req admin.SetStickerSetSortOrderRequest) (admin.CommandResult, error)
@@ -235,6 +237,8 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /v1/accounts/set-frozen", s.authenticated(s.handleSetAccountFrozen))
+	mux.HandleFunc("POST /v1/notifications/send", s.authenticated(s.handleSendNotification))
+	mux.HandleFunc("POST /v1/channels/set-review", s.authorized(PermissionChannelReview, s.handleSetChannelReview))
 	mux.HandleFunc("POST /v1/accounts/delete", s.authenticated(s.handleDeleteAccount))
 	mux.HandleFunc("POST /v1/accounts/grant-premium", s.authorized(PermissionPremiumManage, s.handleGrantPremium))
 	mux.HandleFunc("POST /v1/accounts/refund-premium", s.authorized(PermissionPremiumManage, s.handleRefundPremium))
@@ -556,6 +560,24 @@ func (s *Server) handleSetChannelVerified(w http.ResponseWriter, r *http.Request
 		return
 	}
 	result, err := s.svc.SetChannelVerified(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSendNotification(w http.ResponseWriter, r *http.Request) {
+	var req admin.SendNotificationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SendNotification(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetChannelReview(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetChannelReviewRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetChannelReview(r.Context(), req)
 	writeCommandResult(w, result, err)
 }
 
