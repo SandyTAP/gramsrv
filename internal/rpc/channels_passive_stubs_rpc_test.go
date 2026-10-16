@@ -114,8 +114,8 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get full channel after clearing default send as: %v", err)
 	}
-	if _, ok := fullAfterClear.FullChat.(*tg.ChannelFull).GetDefaultSendAs(); ok {
-		t.Fatalf("full channel default_send_as still set after saving self")
+	if peer, ok := fullAfterClear.FullChat.(*tg.ChannelFull).DefaultSendAs.(*tg.PeerUser); !ok || peer.UserID != owner.ID {
+		t.Fatalf("full channel default_send_as = %#v after saving self", fullAfterClear.FullChat.(*tg.ChannelFull).DefaultSendAs)
 	}
 	if _, err := r.onMessagesSaveDefaultSendAs(ownerCtx, &tg.MessagesSaveDefaultSendAsRequest{
 		Peer:   inputPeerChannel(channel),

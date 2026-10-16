@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// TestAccountRatingLevelScale pins the ladder the clients render: 100 levels, the
+// TestAccountRatingLevelScale pins the server-local ladder: 100 levels, the
 // top one at 250k score, and every threshold strictly increasing.
 func TestAccountRatingLevelScale(t *testing.T) {
 	if MaxAccountRatingLevel != 100 {
-		t.Fatalf("MaxAccountRatingLevel = %d, want 100 (the highest level official clients render)", MaxAccountRatingLevel)
+		t.Fatalf("MaxAccountRatingLevel = %d, want 100 (the configured local ceiling)", MaxAccountRatingLevel)
 	}
 	top := AccountRatingLevelThreshold(MaxAccountRatingLevel)
 	if top != 250_000 {
@@ -23,8 +23,8 @@ func TestAccountRatingLevelScale(t *testing.T) {
 		}
 		previous = threshold
 	}
-	// Beyond the top the curve is clamped rather than extrapolated: a level the
-	// client cannot render must never leak into the wire projection.
+	// Beyond the top the curve is clamped rather than extrapolated: a level outside the
+	// local policy must never leak into the wire projection.
 	if got := AccountRatingLevelThreshold(MaxAccountRatingLevel + 10); got != top {
 		t.Fatalf("over-max threshold = %d, want the clamped %d", got, top)
 	}

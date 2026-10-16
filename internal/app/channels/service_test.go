@@ -2760,7 +2760,7 @@ func TestChannelUsernameAndSignatures(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EditAdmin: %v", err)
 	}
-	signed, err := service.SetSignatures(ctx, 1002, created.Channel.ID, true)
+	signed, err := service.SetSignatures(ctx, 1002, created.Channel.ID, true, false)
 	if err != nil {
 		t.Fatalf("SetSignatures by change-info admin: %v", err)
 	}

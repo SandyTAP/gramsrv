@@ -367,12 +367,12 @@ func TestCommunityPhotoUploadAndDownloadLifecycle(t *testing.T) {
 	community := createdResult.(*tg.Updates).Chats[0].(*tg.Community)
 	inputCommunity := &tg.InputChannel{ChannelID: community.ID, AccessHash: community.AccessHash}
 
-	// 1. Set community avatar from upload
+	// 1. Set community avatar from a decoded upload with the file flag present.
+	upload := &tg.InputChatUploadedPhoto{}
+	upload.SetFile(&tg.InputFile{ID: 55001, Parts: 1, Name: "community_avatar.jpg"})
 	setResult, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
 		Channel: inputCommunity,
-		Photo: &tg.InputChatUploadedPhoto{
-			File: &tg.InputFile{ID: 55001, Parts: 1, Name: "community_avatar.jpg"},
-		},
+		Photo:   upload,
 	})
 	if err != nil {
 		t.Fatalf("channels.editPhoto uploaded photo: %v", err)
@@ -449,7 +449,7 @@ func TestCommunityPhotoUploadAndDownloadLifecycle(t *testing.T) {
 		t.Fatalf("getFile big location_key = %q, want photo:778:c", files.getFileRequest.LocationKey)
 	}
 
-	// 5. Download via upload.getFile with PhotoID == 0 (peer resolution)
+	// 5. A missing photo ID must not discover the peer's current avatar.
 	_, err = r.onUploadGetFile(WithUserID(ctx, owner.ID), &tg.UploadGetFileRequest{
 		Location: &tg.InputPeerPhotoFileLocation{
 			Peer:    &tg.InputPeerChannel{ChannelID: community.ID, AccessHash: community.AccessHash},
@@ -458,11 +458,11 @@ func TestCommunityPhotoUploadAndDownloadLifecycle(t *testing.T) {
 		},
 		Limit: 1024,
 	})
-	if err != nil {
-		t.Fatalf("upload.getFile photoID 0: %v", err)
+	if !tgerr.Is(err, "LOCATION_INVALID") {
+		t.Fatalf("upload.getFile photoID 0: %v, want LOCATION_INVALID", err)
 	}
-	if files.getFileRequest.LocationKey != "photo:778:a" {
-		t.Fatalf("getFile photoID 0 location_key = %q, want photo:778:a", files.getFileRequest.LocationKey)
+	if files.getFileRequest.LocationKey != "photo:778:c" {
+		t.Fatal("missing photo ID reached the file store")
 	}
 
 	// 6. Clear community photo

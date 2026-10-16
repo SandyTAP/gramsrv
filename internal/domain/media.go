@@ -43,7 +43,7 @@ type UploadPart struct {
 	OwnerUserID int64
 	FileID      int64
 	Part        int
-	TotalParts  int // big file 已知总数；small file 为 0
+	TotalParts  int // Big: known positive total or -1 while generating; small: 0.
 	Big         bool
 	Backend     MediaBackend
 	ObjectKey   string

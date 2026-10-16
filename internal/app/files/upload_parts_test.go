@@ -59,6 +59,57 @@ func TestSaveFilePartQuotaRejectsNewFileOverLimit(t *testing.T) {
 	}
 }
 
+func TestGeneratedBigUploadUnknownTotal(t *testing.T) {
+	ctx := context.Background()
+	for _, finalKnown := range []bool{false, true} {
+		t.Run(strconv.FormatBool(finalKnown), func(t *testing.T) {
+			media := newFakeMediaStore()
+			svc, _ := newUploadPartTestService(t, media, domain.UploadPartQuota{})
+			for _, part := range []int{1, 0, 1} {
+				if _, err := svc.SaveBigFilePart(ctx, 10, 200, part, -1, []byte{byte('a' + part)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := svc.readUploadBytes(ctx, 10, 200, 3); !errors.Is(err, domain.ErrFilePartsInvalid) {
+				t.Fatalf("missing final part: %v", err)
+			}
+			total := -1
+			if finalKnown {
+				total = 3
+			}
+			if _, err := svc.SaveBigFilePart(ctx, 10, 200, 2, total, []byte("c")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := svc.readUploadBytes(ctx, 11, 200, 3); !errors.Is(err, domain.ErrFilePartsInvalid) {
+				t.Fatalf("other owner read: %v", err)
+			}
+			body, err := svc.readUploadBytes(ctx, 10, 200, 3)
+			if err != nil || string(body) != "abc" {
+				t.Fatalf("body=%q error=%v", body, err)
+			}
+			for _, invalid := range []int{-1, 0, MaxUploadParts + 1} {
+				if _, err := svc.readUploadBytes(ctx, 10, 200, invalid); !errors.Is(err, domain.ErrFilePartsInvalid) {
+					t.Fatalf("invalid final parts=%d: %v", invalid, err)
+				}
+			}
+			if _, err := svc.SaveBigFilePart(ctx, 10, 200, 0, 4, []byte("a")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := svc.readUploadBytes(ctx, 10, 200, 3); !errors.Is(err, domain.ErrFilePartsInvalid) {
+				t.Fatalf("conflicting total: %v", err)
+			}
+			for _, invalid := range []int{-2, 0, MaxUploadParts + 1} {
+				if _, err := svc.SaveBigFilePart(ctx, 10, 200, 0, invalid, []byte("a")); !errors.Is(err, domain.ErrFilePartsInvalid) {
+					t.Fatalf("total=%d: %v", invalid, err)
+				}
+			}
+			if _, err := svc.SaveBigFilePart(ctx, 10, 200, 3, 3, []byte("a")); !errors.Is(err, domain.ErrFilePartsInvalid) {
+				t.Fatalf("part beyond known total: %v", err)
+			}
+		})
+	}
+}
+
 func TestSaveFilePartQuotaRejectsPartAndByteOverLimit(t *testing.T) {
 	ctx := context.Background()
 	media := newFakeMediaStore()

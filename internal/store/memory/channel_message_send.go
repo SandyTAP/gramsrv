@@ -150,6 +150,7 @@ func (s *ChannelStore) SendChannelMessage(_ context.Context, req domain.SendChan
 		From:              domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID},
 		Date:              req.Date,
 		Post:              channel.Broadcast,
+		ShowMessageSender: channel.Broadcast && channel.SignatureProfiles && sendAs != nil && !(sendAs.Type == domain.PeerTypeChannel && sendAs.ID == channel.ID),
 		PostAuthor:        memoryChannelPostAuthor(channel, req.PostAuthor),
 		Silent:            req.Silent,
 		NoForwards:        req.NoForwards || channel.NoForwards,
@@ -431,7 +432,7 @@ func canSendChannelMessageWithBoost(channel domain.Channel, member domain.Channe
 
 // memoryChannelPostAuthor 仅在 signatures 开启的 broadcast post 上保留签名。
 func memoryChannelPostAuthor(channel domain.Channel, author string) string {
-	if !channel.Broadcast || !channel.Signatures {
+	if !channel.Broadcast || !channel.Signatures || channel.SignatureProfiles {
 		return ""
 	}
 	return author
