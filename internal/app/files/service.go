@@ -252,12 +252,18 @@ func (s *Service) SaveFilePart(ctx context.Context, ownerUserID, fileID int64, p
 	return true, nil
 }
 
-// SaveBigFilePart 累积一个 big file 分片（带已知总分片数）。
+// ValidBigUploadPartCount accepts TDLib's unknown-size generated upload marker.
+// The final inputFileBig must still declare the actual positive part count.
+func ValidBigUploadPartCount(totalParts int) bool {
+	return totalParts == -1 || (totalParts > 0 && totalParts <= MaxUploadParts)
+}
+
+// SaveBigFilePart stores a big-file part, including an in-progress generation.
 func (s *Service) SaveBigFilePart(ctx context.Context, ownerUserID, fileID int64, part, totalParts int, bytes []byte) (bool, error) {
 	if err := validatePart(part, len(bytes)); err != nil {
 		return false, err
 	}
-	if totalParts <= 0 || totalParts > MaxUploadParts {
+	if !ValidBigUploadPartCount(totalParts) || (totalParts > 0 && part >= totalParts) {
 		return false, domain.ErrFilePartsInvalid
 	}
 	if err := s.saveFilePart(ctx, domain.UploadPart{
@@ -674,7 +680,7 @@ func orderDocuments(docs []domain.Document, ids []int64) []domain.Document {
 }
 
 // assembleUpload 把已上传分片按 part 顺序拼成完整字节，并清理分片。
-// expectedParts>0 时校验分片连续且齐全。
+// The final positive part count must match all contiguous stored parts.
 func (s *Service) assembleUpload(ctx context.Context, ownerUserID, fileID int64, expectedParts int) ([]byte, error) {
 	buf, err := s.readUploadBytes(ctx, ownerUserID, fileID, expectedParts)
 	if err != nil {
@@ -745,6 +751,9 @@ func (s *Service) assembleUploadBlob(ctx context.Context, ownerUserID, fileID in
 }
 
 func (s *Service) loadAndValidateUploadParts(ctx context.Context, ownerUserID, fileID int64, expectedParts int) ([]domain.UploadPart, int64, error) {
+	if expectedParts <= 0 || expectedParts > MaxUploadParts {
+		return nil, 0, domain.ErrFilePartsInvalid
+	}
 	parts, err := s.media.LoadFileParts(ctx, ownerUserID, fileID)
 	if err != nil {
 		return nil, 0, err
@@ -752,7 +761,7 @@ func (s *Service) loadAndValidateUploadParts(ctx context.Context, ownerUserID, f
 	if len(parts) == 0 {
 		return nil, 0, domain.ErrFilePartsInvalid
 	}
-	if expectedParts > 0 && len(parts) != expectedParts {
+	if len(parts) != expectedParts {
 		return nil, 0, domain.ErrFilePartsInvalid
 	}
 	var total int64
@@ -761,6 +770,12 @@ func (s *Service) loadAndValidateUploadParts(ctx context.Context, ownerUserID, f
 			return nil, 0, domain.ErrFilePartsInvalid // 缺片或乱序
 		}
 		if p.Size <= 0 || p.Size > MaxUploadPartBytes || p.ObjectKey == "" {
+			return nil, 0, domain.ErrFilePartsInvalid
+		}
+		if p.Big != parts[0].Big ||
+			(p.Big && (!ValidBigUploadPartCount(p.TotalParts) ||
+				(p.TotalParts > 0 && p.TotalParts != expectedParts))) ||
+			(!p.Big && p.TotalParts != 0) {
 			return nil, 0, domain.ErrFilePartsInvalid
 		}
 		total += p.Size

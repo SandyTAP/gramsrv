@@ -84,7 +84,7 @@ func tgChannelMessage(viewerUserID int64, m domain.ChannelMessage) tg.MessageCla
 	peer := &tg.PeerChannel{ChannelID: m.ChannelID}
 	outgoing := m.SenderUserID == viewerUserID && viewerUserID != 0 && (m.SavedPeer.ID != 0 || m.From.Type != domain.PeerTypeChannel)
 	from := tg.PeerClass(nil)
-	if !m.Post && m.SendAs != nil && m.SendAs.ID != 0 {
+	if (!m.Post || m.ShowMessageSender) && m.SendAs != nil && m.SendAs.ID != 0 {
 		from = tgPeer(*m.SendAs)
 	}
 	if !m.Post && from == nil && m.From.ID != 0 {
@@ -450,23 +450,23 @@ func tgChannelForbidden(ch domain.Channel) *tg.ChannelForbidden {
 
 func tgChannel(viewerUserID int64, ch domain.Channel, self *domain.ChannelMember) *tg.Channel {
 	out := &tg.Channel{
-		Creator:    ch.CreatorUserID == viewerUserID && viewerUserID != 0,
-		Verified:   ch.Verified,
-		Scam:       ch.Scam,
-		Fake:       ch.Fake,
-		Gigagroup:  ch.Gigagroup,
-		Broadcast:  ch.Broadcast,
-		Megagroup:  ch.Megagroup,
-		Forum:      ch.Forum,
-		ForumTabs:  ch.ForumTabs,
-		Noforwards: ch.NoForwards,
-		Signatures: ch.Signatures,
-		ID:         ch.ID,
-		Title:      ch.Title,
-		Photo:      tgChatPhoto(ch),
-		Date:       ch.Date,
+		Creator:           ch.CreatorUserID == viewerUserID && viewerUserID != 0,
+		Verified:          ch.Verified,
+		Scam:              ch.Scam,
+		Fake:              ch.Fake,
+		Gigagroup:         ch.Gigagroup,
+		Broadcast:         ch.Broadcast,
+		Megagroup:         ch.Megagroup,
+		Forum:             ch.Forum,
+		ForumTabs:         ch.ForumTabs,
+		Noforwards:        ch.NoForwards,
+		Signatures:        ch.Signatures,
+		SignatureProfiles: ch.SignatureProfiles,
+		ID:                ch.ID,
+		Title:             ch.Title,
+		Photo:             tgChatPhoto(ch),
+		Date:              ch.Date,
 	}
-	out.SetSignatureProfiles(ch.SignatureProfiles)
 	out.SetAccessHash(ch.AccessHash)
 	out.SetJoinToSend(ch.JoinToSend)
 	out.SetJoinRequest(ch.JoinRequest)
@@ -807,6 +807,8 @@ func tgChannelAdminLogEvent(viewerUserID int64, event domain.ChannelAdminLogEven
 		action = &tg.ChannelAdminLogEventActionChangeUsername{PrevValue: event.PrevString, NewValue: event.NewString}
 	case domain.ChannelAdminLogChangeLinkedChat:
 		action = &tg.ChannelAdminLogEventActionChangeLinkedChat{PrevValue: int64(event.PrevInt), NewValue: int64(event.NewInt)}
+	case domain.ChannelAdminLogToggleSignatureProfiles:
+		action = &tg.ChannelAdminLogEventActionToggleSignatureProfiles{NewValue: event.NewBool}
 	case domain.ChannelAdminLogToggleSignatures:
 		action = &tg.ChannelAdminLogEventActionToggleSignatures{NewValue: event.NewBool}
 	case domain.ChannelAdminLogTogglePreHistoryHidden:

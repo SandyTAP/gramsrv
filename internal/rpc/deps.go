@@ -773,7 +773,7 @@ type ChannelsService interface {
 	ListSendAsChannels(ctx context.Context, userID int64) ([]domain.Channel, error)
 	ResolvePublicUsername(ctx context.Context, userID int64, username string) (domain.Channel, bool, error)
 	SearchPublicChannels(ctx context.Context, userID int64, query string, limit int) (domain.PublicChannelSearchResult, error)
-	SetSignatures(ctx context.Context, userID, channelID int64, enabled, profilesEnabled bool) (domain.Channel, error)
+	SetSignatures(ctx context.Context, userID, channelID int64, enabled, profiles bool) (domain.Channel, error)
 	SetPhoto(ctx context.Context, userID, channelID int64, photo *domain.Photo, date int) (domain.SetChannelPhotoResult, error)
 	SetPreHistoryHidden(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)
 	SetParticipantsHidden(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error)

@@ -413,8 +413,8 @@ func (s *ChannelStore) SetChannelPhoto(_ context.Context, userID, channelID int6
 	}, nil
 }
 
-func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64, enabled, profilesEnabled bool) (domain.Channel, error) {
-	if userID == 0 || channelID == 0 {
+func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64, enabled, profiles bool) (domain.Channel, error) {
+	if userID == 0 || channelID == 0 || profiles && !enabled {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
 	s.mu.Lock()
@@ -427,9 +427,13 @@ func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64,
 	if !canChangeChannelInfo(member) {
 		return domain.Channel{}, domain.ErrChannelAdminRequired
 	}
+	if profiles && (!channel.Broadcast || channel.Megagroup) {
+		return domain.Channel{}, domain.ErrChannelInvalid
+	}
+	prevProfiles := channel.SignatureProfiles
 	prev := channel.Signatures
 	channel.Signatures = enabled
-	channel.SignatureProfiles = enabled && profilesEnabled
+	channel.SignatureProfiles = profiles
 	s.channels[channelID] = channel
 	if prev != enabled {
 		s.appendChannelAdminLogLocked(domain.ChannelAdminLogEvent{
@@ -441,7 +445,12 @@ func (s *ChannelStore) SetSignatures(_ context.Context, userID, channelID int64,
 			NewBool:   enabled,
 		})
 	}
-
+	if prevProfiles != profiles {
+		s.appendChannelAdminLogLocked(domain.ChannelAdminLogEvent{
+			ChannelID: channelID, UserID: userID, Date: int(time.Now().Unix()),
+			Type: domain.ChannelAdminLogToggleSignatureProfiles, PrevBool: prevProfiles, NewBool: profiles,
+		})
+	}
 	return channel, nil
 }
 

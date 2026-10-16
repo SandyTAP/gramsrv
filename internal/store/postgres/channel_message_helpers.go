@@ -39,7 +39,7 @@ func scanChannelMessage(row rowScanner) (domain.ChannelMessage, error) {
 		&sendAsType, &sendAsID, &msg.Date, &msg.EditDate, &msg.Post, &msg.Silent, &msg.NoForwards,
 		&msg.Body, &entities, &reply, &replyMsgID, &replyPeerType, &replyPeerID, &replyTopID,
 		&forward, &discussionChannelID, &discussionMessageID, &action, &msg.Pts, &msg.Deleted, &mediaJSON,
-		&replyMarkupJSON, &richMessageJSON, &msg.TTLPeriod, &msg.ExpiresAt, &msg.ViewsCount, &msg.PostAuthor, &msg.Pinned, &msg.ViaBotID, &msg.GroupedID, &msg.FromBoostsApplied, &savedPeerType, &savedPeerID, &msg.PaidMessageStars, &suggestedPostJSON,
+		&replyMarkupJSON, &richMessageJSON, &msg.TTLPeriod, &msg.ExpiresAt, &msg.ViewsCount, &msg.PostAuthor, &msg.Pinned, &msg.ViaBotID, &msg.GroupedID, &msg.FromBoostsApplied, &savedPeerType, &savedPeerID, &msg.PaidMessageStars, &suggestedPostJSON, &msg.ShowMessageSender,
 	); err != nil {
 		return domain.ChannelMessage{}, err
 	}
@@ -98,7 +98,7 @@ func scanChannelMessageWithCount(row rowScanner) (domain.ChannelMessage, int, er
 		&sendAsType, &sendAsID, &msg.Date, &msg.EditDate, &msg.Post, &msg.Silent, &msg.NoForwards,
 		&msg.Body, &entities, &reply, &replyMsgID, &replyPeerType, &replyPeerID, &replyTopID,
 		&forward, &discussionChannelID, &discussionMessageID, &action, &msg.Pts, &msg.Deleted, &mediaJSON,
-		&replyMarkupJSON, &richMessageJSON, &msg.TTLPeriod, &msg.ExpiresAt, &msg.ViewsCount, &msg.PostAuthor, &msg.Pinned, &msg.ViaBotID, &msg.GroupedID, &msg.FromBoostsApplied, &savedPeerType, &savedPeerID, &msg.PaidMessageStars, &suggestedPostJSON, &count,
+		&replyMarkupJSON, &richMessageJSON, &msg.TTLPeriod, &msg.ExpiresAt, &msg.ViewsCount, &msg.PostAuthor, &msg.Pinned, &msg.ViaBotID, &msg.GroupedID, &msg.FromBoostsApplied, &savedPeerType, &savedPeerID, &msg.PaidMessageStars, &suggestedPostJSON, &msg.ShowMessageSender, &count,
 	); err != nil {
 		return domain.ChannelMessage{}, 0, err
 	}

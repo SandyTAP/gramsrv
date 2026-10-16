@@ -502,6 +502,7 @@ type Channel struct {
 	Wallpaper                     []byte
 	Verified                      bool
 	LinkedCommunityID             int64
+	SignatureProfiles             bool
 }
 
 type ChannelAdminLogEvent struct {
@@ -709,6 +710,7 @@ type ChannelMessage struct {
 	RequestFingerprint  []byte
 	SuggestedPost       []byte
 	PaidMessageStars    int64
+	ShowMessageSender   bool
 }
 
 type ChannelMessageMedium struct {

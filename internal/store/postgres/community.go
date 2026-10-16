@@ -1198,6 +1198,9 @@ func (s *CommunityStore) EditCommunityDefaultBannedRights(ctx context.Context, a
 }
 
 func (s *CommunityStore) SetCommunityPhoto(ctx context.Context, actorUserID, communityID int64, photo *domain.Photo, date int) (domain.CommunityView, bool, error) {
+	if photo != nil && (photo.ID == 0 || photo.DCID <= 0) {
+		return domain.CommunityView{}, false, domain.ErrPhotoInvalid
+	}
 	changed, err := withCommunityTx(ctx, s, func(tx pgx.Tx) (bool, error) {
 		c, m, e := lockCommunityActor(ctx, tx, actorUserID, communityID)
 		if e != nil {

@@ -706,13 +706,15 @@ type ChannelMessage struct {
 	Date             int
 	EditDate         int
 	Post             bool
-	Silent           bool
-	NoForwards       bool
-	Body             string
-	Entities         []MessageEntity
-	ReplyTo          *MessageReply
-	Forward          *MessageForward
-	ViaBotID         int64
+	// ShowMessageSender snapshots profile visibility; historical posts remain anonymous.
+	ShowMessageSender bool
+	Silent            bool
+	NoForwards        bool
+	Body              string
+	Entities          []MessageEntity
+	ReplyTo           *MessageReply
+	Forward           *MessageForward
+	ViaBotID          int64
 	// GroupedID 相册分组 id（sendMultiMedia 同组共享非零值，非相册恒 0）。
 	GroupedID   int64
 	ReplyMarkup *MessageReplyMarkup
@@ -1102,29 +1104,30 @@ func FilterChannelUpdateEventForAvailableMinID(event ChannelUpdateEvent, availab
 type ChannelAdminLogEventType string
 
 const (
-	ChannelAdminLogChangeTitle            ChannelAdminLogEventType = "change_title"
-	ChannelAdminLogChangeUsername         ChannelAdminLogEventType = "change_username"
-	ChannelAdminLogChangeLinkedChat       ChannelAdminLogEventType = "change_linked_chat"
-	ChannelAdminLogToggleSignatures       ChannelAdminLogEventType = "toggle_signatures"
-	ChannelAdminLogTogglePreHistoryHidden ChannelAdminLogEventType = "toggle_pre_history_hidden"
-	ChannelAdminLogToggleForum            ChannelAdminLogEventType = "toggle_forum"
-	ChannelAdminLogToggleAutotranslation  ChannelAdminLogEventType = "toggle_autotranslation"
-	ChannelAdminLogToggleAntiSpam         ChannelAdminLogEventType = "toggle_anti_spam"
-	ChannelAdminLogToggleSlowMode         ChannelAdminLogEventType = "toggle_slow_mode"
-	ChannelAdminLogParticipantInvite      ChannelAdminLogEventType = "participant_invite"
-	ChannelAdminLogParticipantJoin        ChannelAdminLogEventType = "participant_join"
-	ChannelAdminLogParticipantLeave       ChannelAdminLogEventType = "participant_leave"
-	ChannelAdminLogParticipantPromote     ChannelAdminLogEventType = "participant_promote"
-	ChannelAdminLogParticipantDemote      ChannelAdminLogEventType = "participant_demote"
-	ChannelAdminLogParticipantEditRank    ChannelAdminLogEventType = "participant_edit_rank"
-	ChannelAdminLogParticipantBan         ChannelAdminLogEventType = "participant_ban"
-	ChannelAdminLogParticipantUnban       ChannelAdminLogEventType = "participant_unban"
-	ChannelAdminLogParticipantKick        ChannelAdminLogEventType = "participant_kick"
-	ChannelAdminLogParticipantUnkick      ChannelAdminLogEventType = "participant_unkick"
-	ChannelAdminLogUpdatePinned           ChannelAdminLogEventType = "update_pinned"
-	ChannelAdminLogSendMessage            ChannelAdminLogEventType = "send_message"
-	ChannelAdminLogEditMessage            ChannelAdminLogEventType = "edit_message"
-	ChannelAdminLogDeleteMessage          ChannelAdminLogEventType = "delete_message"
+	ChannelAdminLogChangeTitle             ChannelAdminLogEventType = "change_title"
+	ChannelAdminLogChangeUsername          ChannelAdminLogEventType = "change_username"
+	ChannelAdminLogChangeLinkedChat        ChannelAdminLogEventType = "change_linked_chat"
+	ChannelAdminLogToggleSignatures        ChannelAdminLogEventType = "toggle_signatures"
+	ChannelAdminLogToggleSignatureProfiles ChannelAdminLogEventType = "toggle_signature_profiles"
+	ChannelAdminLogTogglePreHistoryHidden  ChannelAdminLogEventType = "toggle_pre_history_hidden"
+	ChannelAdminLogToggleForum             ChannelAdminLogEventType = "toggle_forum"
+	ChannelAdminLogToggleAutotranslation   ChannelAdminLogEventType = "toggle_autotranslation"
+	ChannelAdminLogToggleAntiSpam          ChannelAdminLogEventType = "toggle_anti_spam"
+	ChannelAdminLogToggleSlowMode          ChannelAdminLogEventType = "toggle_slow_mode"
+	ChannelAdminLogParticipantInvite       ChannelAdminLogEventType = "participant_invite"
+	ChannelAdminLogParticipantJoin         ChannelAdminLogEventType = "participant_join"
+	ChannelAdminLogParticipantLeave        ChannelAdminLogEventType = "participant_leave"
+	ChannelAdminLogParticipantPromote      ChannelAdminLogEventType = "participant_promote"
+	ChannelAdminLogParticipantDemote       ChannelAdminLogEventType = "participant_demote"
+	ChannelAdminLogParticipantEditRank     ChannelAdminLogEventType = "participant_edit_rank"
+	ChannelAdminLogParticipantBan          ChannelAdminLogEventType = "participant_ban"
+	ChannelAdminLogParticipantUnban        ChannelAdminLogEventType = "participant_unban"
+	ChannelAdminLogParticipantKick         ChannelAdminLogEventType = "participant_kick"
+	ChannelAdminLogParticipantUnkick       ChannelAdminLogEventType = "participant_unkick"
+	ChannelAdminLogUpdatePinned            ChannelAdminLogEventType = "update_pinned"
+	ChannelAdminLogSendMessage             ChannelAdminLogEventType = "send_message"
+	ChannelAdminLogEditMessage             ChannelAdminLogEventType = "edit_message"
+	ChannelAdminLogDeleteMessage           ChannelAdminLogEventType = "delete_message"
 )
 
 // ChannelAdminLogEvent is a channel-scoped audit entry.

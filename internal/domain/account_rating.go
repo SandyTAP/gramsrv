@@ -13,10 +13,9 @@ import (
 // stored level through userFull's existing rating fields so official clients can
 // render it without a client patch.
 const (
-	// MaxAccountRatingLevel bounds the local gramsrv level. Official clients
-	// render starsRating levels up to 100 -- observed client behaviour, the TL
-	// schema itself only says level:int -- so every level the server can award is
-	// a level a client is able to display.
+	// MaxAccountRatingLevel bounds the local rating policy. The TL schema
+	// represents starsRating.level as int; 100 is this server's chosen ceiling,
+	// not a protocol limit or a claim about Telegram's private rating policy.
 	MaxAccountRatingLevel = 100
 	// accountRatingLevelUnit is the score required for level 1. Thresholds grow
 	// quadratically from it: level n needs accountRatingLevelUnit * n^2.
