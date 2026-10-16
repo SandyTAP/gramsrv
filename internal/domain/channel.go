@@ -437,7 +437,6 @@ type Channel struct {
 	JoinToSend               bool
 	JoinRequest              bool
 	Signatures               bool
-	SignatureProfiles        bool
 	PreHistoryHidden         bool
 	ParticipantsHidden       bool
 	AntiSpam                 bool

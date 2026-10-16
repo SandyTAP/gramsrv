@@ -566,7 +566,7 @@ func (s *ChannelStore) ResolvePublicChannelUsername(ctx context.Context, viewerU
 	return ch, true, nil
 }
 
-func (s *ChannelStore) SetSignatures(ctx context.Context, userID, channelID int64, enabled, profilesEnabled bool) (domain.Channel, error) {
+func (s *ChannelStore) SetSignatures(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error) {
 	if userID == 0 || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
@@ -592,12 +592,10 @@ func (s *ChannelStore) SetSignatures(ctx context.Context, userID, channelID int6
 		return domain.Channel{}, domain.ErrChannelAdminRequired
 	}
 	prev := channel.Signatures
-	profilesEnabled = enabled && profilesEnabled
-	if _, err := tx.Exec(ctx, `UPDATE channels SET signatures = $2, signature_profiles = $3, updated_at = now() WHERE id = $1`, channelID, enabled, profilesEnabled); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE channels SET signatures = $2, updated_at = now() WHERE id = $1`, channelID, enabled); err != nil {
 		return domain.Channel{}, fmt.Errorf("update channel signatures: %w", err)
 	}
 	channel.Signatures = enabled
-	channel.SignatureProfiles = profilesEnabled
 	if prev != enabled {
 		if err := s.insertChannelAdminLogTx(ctx, tx, domain.ChannelAdminLogEvent{
 			ChannelID: channelID,
@@ -610,7 +608,6 @@ func (s *ChannelStore) SetSignatures(ctx context.Context, userID, channelID int6
 			return domain.Channel{}, err
 		}
 	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Channel{}, fmt.Errorf("commit toggle channel signatures: %w", err)
 	}

@@ -709,11 +709,11 @@ func (s *Service) SearchPublicChannels(ctx context.Context, userID int64, query 
 }
 
 // SetSignatures toggles channel post signatures.
-func (s *Service) SetSignatures(ctx context.Context, userID, channelID int64, enabled, profilesEnabled bool) (domain.Channel, error) {
+func (s *Service) SetSignatures(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error) {
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
-	return s.channels.SetSignatures(ctx, userID, channelID, enabled, profilesEnabled)
+	return s.channels.SetSignatures(ctx, userID, channelID, enabled)
 }
 
 // SetPhoto 设置/清除频道头像（photo==nil 表示清除）。
