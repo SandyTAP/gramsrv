@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"errors"
-	"time"
 	"unicode/utf8"
 
 	"github.com/iamxvbaba/td/tg"
@@ -456,9 +455,6 @@ func (r *Router) buildUserFullProjection(ctx context.Context, currentUserID int6
 		}
 	}
 	r.applyAccountRatingToUserFull(ctx, currentUserID, u, &full)
-	// The "огонёк" badge outranks the composite rating for one specific viewer:
-	// the person you actually share a streak with. See applyChatStreakToUserFull.
-	r.applyChatStreakToUserFull(ctx, currentUserID, u, &full)
 	// 个人频道（account.updatePersonalChannel）不在此落地：它按 viewer 实时解析，作为缓存后的
 	// overlay 处理（applyPersonalChannelToUserFull），避免烤进 per-(viewer,target) 投影缓存以及
 	// build/chats 两次解析同一频道。
@@ -539,62 +535,6 @@ func (r *Router) applyAccountRatingToUserFull(ctx context.Context, viewerUserID 
 	}
 	full.SetStarsMyPendingRating(tgAccountRatingLevel(pending))
 	full.SetStarsMyPendingRatingDate(int(rating.PendingDate.Unix()))
-}
-
-// applyChatStreakToUserFull projects the "огонёк" badge for the one viewer who is
-// allowed to see it: the account the reader actually shares a live streak with.
-//
-// Why starsRating and nothing else. The TL schema has no streak object, so there
-// is no field to carry a flame. Of the surfaces an official client renders next
-// to a name, only two exist, and both were checked:
-//
-//   - emojiStatus lives on the user object, not userFull -- userFull has no such
-//     field at all -- and there is exactly one of it per account. Making it
-//     viewer-scoped would mean threading a viewer through tgUser and every one of
-//     its callers, and 115 accounts already set a real status that would be
-//     overwritten for everyone else.
-//   - starsRating lives on userFull, which this router already builds per
-//     (viewer, target) and caches at that granularity. It renders beside the
-//     name, and this server owns its policy.
-//
-// So the streak is projected as a star count equal to the number of days, and it
-// only replaces the composite rating for a reader who is a streak partner. Every
-// other reader keeps their account level unchanged -- the badge is the whole
-// point of it being mutual.
-//
-// The composite rating is not lost to its owner: the self-view branch above
-// returns before this runs, so the reader always sees their own level, and the
-// target sees theirs.
-func (r *Router) applyChatStreakToUserFull(ctx context.Context, viewerUserID int64, target domain.User, full *tg.UserFull) {
-	if r.deps.ChatStreaks == nil || full == nil || viewerUserID == 0 || viewerUserID == target.ID {
-		return
-	}
-	// A bot cannot hold a streak (the send path refuses to advance one), so the
-	// lookup would only ever miss. Skipping it keeps bot profile reads free.
-	if !domain.RatableAccount(viewerUserID, false) || !domain.RatableAccount(target.ID, target.Bot) {
-		return
-	}
-	streak, err := r.deps.ChatStreaks.StrongestChatStreak(ctx, viewerUserID, target.ID)
-	if err != nil || streak.Days <= 0 {
-		return
-	}
-	// A streak that ran out of skip budget is no longer burning. Projecting it
-	// would show somebody a flame for a conversation that stopped weeks ago.
-	if streak.ChatStreakExpired(time.Now()) {
-		return
-	}
-	days := int64(streak.Days)
-	out := tg.StarsRating{
-		Level:             int(days),
-		Stars:             days,
-		CurrentLevelStars: days,
-	}
-	// The streak has no top rung: it grows by writing to each other, so the
-	// client is always told what day one more would be. A rating-shaped
-	// progress bar that stops at a maximum would make an open-ended streak look
-	// finished.
-	out.SetNextLevelStars(days + 1)
-	full.SetStarsRating(out)
 }
 
 // tgAccountRatingLevel maps the local level snapshot onto starsRating#1b0e4f07.
