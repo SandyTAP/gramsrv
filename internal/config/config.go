@@ -2245,11 +2245,7 @@ func defaultAIProviderAPIKey(env envSource, name string) string {
 type envSource map[string]string
 
 func loadConfigEnv() (envSource, error) {
-	path, explicit := os.LookupEnv("TELESRV_CONFIG")
-	if !explicit {
-		path = defaultConfigFile
-	}
-	path = strings.TrimSpace(path)
+	path, explicit := configFilePath()
 	if path == "" {
 		return nil, nil
 	}
@@ -2261,6 +2257,18 @@ func loadConfigEnv() (envSource, error) {
 		return nil, fmt.Errorf("config file %q: %w", path, err)
 	}
 	return env, nil
+}
+
+// configFilePath 解析配置文件路径：TELESRV_CONFIG 显式指定，否则用默认 .env；
+// 返回值同时报告该路径是否为显式指定（显式路径缺失是硬错误，缺省缺失则回落到
+// 纯进程环境）。TrimSpace 后为空表示调用方应跳过文件读取。EnvDrift 用同一规则
+// 定位被比对的文件，避免两处口径不一致。
+func configFilePath() (path string, explicit bool) {
+	path, explicit = os.LookupEnv("TELESRV_CONFIG")
+	if !explicit {
+		path = defaultConfigFile
+	}
+	return strings.TrimSpace(path), explicit
 }
 
 func readEnvFile(path string) (envSource, error) {
