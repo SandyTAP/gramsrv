@@ -1096,15 +1096,6 @@ func run(logger *zap.Logger) error {
 			zap.Int64("set_id", freezeseed.SetID),
 		)
 	}
-	if stats, err := filesService.WarmCaches(ctx); err != nil {
-		logger.Warn("媒体资源缓存预热失败", zap.Error(err))
-	} else if stats.StickerSets > 0 || stats.Documents > 0 || stats.Blobs > 0 {
-		logger.Info("媒体资源缓存预热完成",
-			zap.Int("sticker_sets", stats.StickerSets),
-			zap.Int("documents", stats.Documents),
-			zap.Int("blobs", stats.Blobs),
-		)
-	}
 	// 默认 emoji status 系统集：从 animated_emoji 精选合成（幂等，已 seed 的存量
 	// 库重启后自动补上）；缺失时 premium 用户的 status 选择器会是空的。
 	if count, created, err := filesService.EnsureDefaultEmojiStatusSet(ctx); err != nil {
@@ -2333,13 +2324,28 @@ func run(logger *zap.Logger) error {
 				zap.Uint("schema_version", migrationStatus.Version),
 				zap.String("blob_backend", "localfs"),
 			)
+			// 缓存预热是纯优化，且要读几千个 blob。放在监听就绪之后，避免和 seed/langpack
+			// 的磁盘读取抢 I/O 而拖慢启动；epoch 校验保证旧预热快照不会覆盖并发 RPC 修改。
+			go func() {
+				stats, err := filesService.WarmCaches(ctx)
+				if err != nil {
+					logger.Warn("媒体资源缓存预热失败", zap.Error(err))
+				} else if stats.StickerSets > 0 || stats.Documents > 0 || stats.Blobs > 0 {
+					logger.Info("媒体资源缓存预热完成",
+						zap.Int("sticker_sets", stats.StickerSets),
+						zap.Int("documents", stats.Documents),
+						zap.Int("blobs", stats.Blobs),
+					)
+				}
+			}()
 		},
 	})
 	metricRegistry.AddGaugeProvider(func() []obsmetrics.GaugeSample {
 		return mtprotoRuntimeGaugeSamples(srv.RuntimeSnapshot())
 	})
 	// This is intentionally the final startup operation. ListenAndServe owns the
-	// public listener so no seed/prewarm work can run after port 2398 is exposed.
+	// public listener; seeding finishes before port 2398 is exposed, and the
+	// epoch-guarded cache warm-up starts asynchronously in OnServing.
 	return srv.ListenAndServe(ctx, cfg.ListenAddr)
 }
 
